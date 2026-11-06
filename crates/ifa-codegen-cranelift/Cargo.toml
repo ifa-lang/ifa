@@ -12,6 +12,7 @@ ifa-ast.workspace = true
 ifa-span.workspace = true
 ifa-sema.workspace = true
 ifa-fir.workspace = true
+ifa-runtime.workspace = true
 cranelift-codegen.workspace = true
 cranelift-frontend.workspace = true
 cranelift-module.workspace = true

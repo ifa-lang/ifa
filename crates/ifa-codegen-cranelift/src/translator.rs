@@ -301,16 +301,71 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 None
             }
 
+            ValueExpr::GenAlloc { ty, arena } => {
+                let size = crate::types::fir_type_byte_size(ty).max(8);
+                let size_val = self.builder.ins().iconst(self.ptr_type, size as i64);
+                let align_val = self.builder.ins().iconst(self.ptr_type, 8);
+                let arena_val = self
+                    .builder
+                    .ins()
+                    .iconst(types::I32, arena.unwrap_or(0) as i64);
+
+                if let Some(func_id) = self.func_ids.get("ifa_rt_gen_alloc") {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    let call = self
+                        .builder
+                        .ins()
+                        .call(local_func, &[size_val, align_val, arena_val]);
+                    let results = self.builder.inst_results(call);
+                    results.first().copied()
+                } else {
+                    Some(self.builder.ins().iconst(self.ptr_type, 0))
+                }
+            }
+
+            ValueExpr::GenFree { ptr } => {
+                let p = self.value_map[ptr];
+                if let Some(func_id) = self.func_ids.get("ifa_rt_gen_free") {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    self.builder.ins().call(local_func, &[p]);
+                }
+                None
+            }
+
+            ValueExpr::GenCheck { ref_val, redundant } => {
+                if !redundant {
+                    let p = self.value_map[ref_val];
+                    let gen_val = self.builder.ins().iconst(types::I32, 1);
+                    if let Some(func_id) = self.func_ids.get("ifa_rt_gen_check") {
+                        let local_func = self
+                            .module
+                            .declare_func_in_func(*func_id, self.builder.func);
+                        self.builder.ins().call(local_func, &[p, gen_val]);
+                    }
+                }
+                None
+            }
+
+            ValueExpr::Yield => {
+                if let Some(func_id) = self.func_ids.get("ifa_rt_fiber_yield") {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    self.builder.ins().call(local_func, &[]);
+                }
+                None
+            }
+
             ValueExpr::ArrayPush { .. }
             | ValueExpr::StructPushField { .. }
             | ValueExpr::ArrayInit(_)
             | ValueExpr::TupleInit(_)
             | ValueExpr::StructInit { .. }
             | ValueExpr::CoWCheckShared { .. }
-            | ValueExpr::GenAlloc { .. }
-            | ValueExpr::GenFree { .. }
-            | ValueExpr::GenCheck { .. }
-            | ValueExpr::Yield
             | ValueExpr::Spawn { .. }
             | ValueExpr::Call { .. }
             | ValueExpr::GetElement { .. }

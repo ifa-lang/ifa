@@ -491,6 +491,7 @@ dependencies = [
  "ifa-fir",
  "ifa-lexer",
  "ifa-parser",
+ "ifa-runtime",
  "ifa-sema",
  "ifa-span",
  "target-lexicon",
@@ -548,6 +549,13 @@ dependencies = [
  "ifa-lexer",
  "ifa-span",
  "thiserror",
+]
+
+[[package]]
+name = "ifa-runtime"
+version = "0.1.0"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]

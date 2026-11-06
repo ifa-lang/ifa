@@ -1,26 +1,15 @@
 use crate::error::CodegenError;
 use crate::translator::FunctionTranslator;
 use crate::types::fir_signature_to_cranelift;
-use cranelift_codegen::ir::{AbiParam, Signature};
+use cranelift_codegen::ir::{types, AbiParam, Signature};
 use cranelift_codegen::Context;
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 use ifa_fir::FirModule;
+use ifa_runtime::*;
 use ifa_span::INTERNER;
 use std::collections::HashMap;
-
-extern "C" fn ifa_rt_println(ptr: *const u8) {
-    if !ptr.is_null() {
-        unsafe {
-            if let Ok(s) = std::ffi::CStr::from_ptr(ptr as *const i8).to_str() {
-                println!("{}", s);
-            }
-        }
-    } else {
-        println!();
-    }
-}
 
 /// JIT Execution engine compiling FIR SSA into native machine code in-memory.
 pub struct JitEngine {
@@ -42,6 +31,15 @@ impl JitEngine {
 
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         builder.symbol("println", ifa_rt_println as *const u8);
+        builder.symbol("ifa_rt_println", ifa_rt_println as *const u8);
+        builder.symbol("ifa_rt_print", ifa_rt_print as *const u8);
+        builder.symbol("ifa_rt_println_i64", ifa_rt_println_i64 as *const u8);
+        builder.symbol("ifa_rt_print_i64", ifa_rt_print_i64 as *const u8);
+        builder.symbol("ifa_rt_gen_alloc", ifa_rt_gen_alloc as *const u8);
+        builder.symbol("ifa_rt_gen_free", ifa_rt_gen_free as *const u8);
+        builder.symbol("ifa_rt_gen_check", ifa_rt_gen_check as *const u8);
+        builder.symbol("ifa_rt_fiber_yield", ifa_rt_fiber_yield as *const u8);
+
         let module = JITModule::new(builder);
 
         Ok(Self {
@@ -65,6 +63,52 @@ impl JitEngine {
             .declare_function("println", Linkage::Import, &println_sig)
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids.insert("println".into(), println_id);
+
+        let mut print_i64_sig = Signature::new(call_conv);
+        print_i64_sig.params.push(AbiParam::new(types::I64));
+        let print_i64_id = self
+            .module
+            .declare_function("ifa_rt_println_i64", Linkage::Import, &print_i64_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_println_i64".into(), print_i64_id);
+
+        let mut gen_alloc_sig = Signature::new(call_conv);
+        gen_alloc_sig.params.push(AbiParam::new(ptr_type));
+        gen_alloc_sig.params.push(AbiParam::new(ptr_type));
+        gen_alloc_sig.params.push(AbiParam::new(types::I32));
+        gen_alloc_sig.returns.push(AbiParam::new(ptr_type));
+        let gen_alloc_id = self
+            .module
+            .declare_function("ifa_rt_gen_alloc", Linkage::Import, &gen_alloc_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_gen_alloc".into(), gen_alloc_id);
+
+        let mut gen_free_sig = Signature::new(call_conv);
+        gen_free_sig.params.push(AbiParam::new(ptr_type));
+        let gen_free_id = self
+            .module
+            .declare_function("ifa_rt_gen_free", Linkage::Import, &gen_free_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids.insert("ifa_rt_gen_free".into(), gen_free_id);
+
+        let mut gen_check_sig = Signature::new(call_conv);
+        gen_check_sig.params.push(AbiParam::new(ptr_type));
+        gen_check_sig.params.push(AbiParam::new(types::I32));
+        let gen_check_id = self
+            .module
+            .declare_function("ifa_rt_gen_check", Linkage::Import, &gen_check_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_gen_check".into(), gen_check_id);
+
+        let yield_sig = Signature::new(call_conv);
+        let yield_id = self
+            .module
+            .declare_function("ifa_rt_fiber_yield", Linkage::Import, &yield_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids.insert("ifa_rt_fiber_yield".into(), yield_id);
 
         // 1. Declare all functions first to enable mutual recursion and forward calls
         for fir_func in &fir_module.functions {

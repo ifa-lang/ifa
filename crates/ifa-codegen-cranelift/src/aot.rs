@@ -52,7 +52,7 @@ impl AotCompiler {
         let ptr_type = self.module.target_config().pointer_type();
         let call_conv = self.module.target_config().default_call_conv;
 
-        // Declare standard runtime intrinsic: println
+        // Declare standard runtime intrinsics
         let mut println_sig = cranelift_codegen::ir::Signature::new(call_conv);
         println_sig
             .params
@@ -62,6 +62,74 @@ impl AotCompiler {
             .declare_function("println", Linkage::Import, &println_sig)
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids.insert("println".into(), println_id);
+
+        let mut print_i64_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        print_i64_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        let print_i64_id = self
+            .module
+            .declare_function("ifa_rt_println_i64", Linkage::Import, &print_i64_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_println_i64".into(), print_i64_id);
+
+        let mut gen_alloc_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        gen_alloc_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        gen_alloc_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        gen_alloc_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+        gen_alloc_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        let gen_alloc_id = self
+            .module
+            .declare_function("ifa_rt_gen_alloc", Linkage::Import, &gen_alloc_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_gen_alloc".into(), gen_alloc_id);
+
+        let mut gen_free_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        gen_free_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        let gen_free_id = self
+            .module
+            .declare_function("ifa_rt_gen_free", Linkage::Import, &gen_free_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids.insert("ifa_rt_gen_free".into(), gen_free_id);
+
+        let mut gen_check_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        gen_check_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        gen_check_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+        let gen_check_id = self
+            .module
+            .declare_function("ifa_rt_gen_check", Linkage::Import, &gen_check_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_gen_check".into(), gen_check_id);
+
+        let yield_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        let yield_id = self
+            .module
+            .declare_function("ifa_rt_fiber_yield", Linkage::Import, &yield_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids.insert("ifa_rt_fiber_yield".into(), yield_id);
 
         // 1. Declare functions
         for fir_func in &fir_module.functions {
@@ -127,7 +195,55 @@ impl AotCompiler {
         let compilers = ["cc", "gcc", "clang"];
         let mut last_err = String::new();
 
-        let rt_stub = "#include <stdio.h>\nvoid println(const char *s) { if (s) { puts(s); } else { putchar('\\n'); } }\n";
+        let rt_stub = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+void println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } }
+void ifa_rt_println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } }
+void ifa_rt_print(const char *s) { if (s) { fputs(s, stdout); fflush(stdout); } }
+void ifa_rt_println_i64(int64_t n) { printf("%ld\n", n); }
+void ifa_rt_print_i64(int64_t n) { printf("%ld", n); fflush(stdout); }
+
+typedef struct {
+    uint32_t generation_counter;
+    uint16_t allocation_flags;
+    uint16_t arena_id;
+} ifa_gen_header_t;
+
+void* ifa_rt_gen_alloc(size_t size, size_t align, uint16_t arena_id) {
+    (void)align;
+    size_t total = sizeof(ifa_gen_header_t) + size;
+    void* mem = malloc(total);
+    if (!mem) abort();
+    ifa_gen_header_t* h = (ifa_gen_header_t*)mem;
+    h->generation_counter = 1;
+    h->allocation_flags = 1;
+    h->arena_id = arena_id;
+    return (void*)((uint8_t*)mem + sizeof(ifa_gen_header_t));
+}
+
+void ifa_rt_gen_free(void* ptr) {
+    if (!ptr) return;
+    ifa_gen_header_t* h = (ifa_gen_header_t*)((uint8_t*)ptr - sizeof(ifa_gen_header_t));
+    if (!(h->allocation_flags & 1)) abort();
+    h->allocation_flags &= ~1;
+    h->generation_counter++;
+    free(h);
+}
+
+void ifa_rt_gen_check(const void* ptr, uint32_t remembered_gen) {
+    if (!ptr) abort();
+    const ifa_gen_header_t* h = (const ifa_gen_header_t*)((const uint8_t*)ptr - sizeof(ifa_gen_header_t));
+    if (!(h->allocation_flags & 1) || h->generation_counter != remembered_gen) {
+        fprintf(stderr, "\n[IFA RUNTIME ERROR: SAFE INTERCEPTION] Use-After-Free intercepted at %p (actual gen: %u, expected: %u)\n", ptr, h->generation_counter, remembered_gen);
+        abort();
+    }
+}
+
+void ifa_rt_fiber_yield(void) {}
+"#;
         let rt_path =
             std::env::temp_dir().join(format!("ifa_runtime_stub_{}.c", std::process::id()));
         fs::write(&rt_path, rt_stub)?;

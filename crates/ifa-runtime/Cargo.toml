@@ -1,0 +1,15 @@
+[package]
+name = "ifa-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Deterministic zero-GC generational memory allocator, fiber scheduler, and standard runtime for the IFA programming language."
+
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+lazy_static = { workspace = true }

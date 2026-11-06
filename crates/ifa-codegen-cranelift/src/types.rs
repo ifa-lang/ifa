@@ -63,3 +63,32 @@ pub fn fir_signature_to_cranelift(
 
     Ok(sig)
 }
+
+/// Calculate the byte size of a FIR type for native allocation.
+pub fn fir_type_byte_size(ty: &FirType) -> usize {
+    match ty {
+        FirType::Unit => 0,
+        FirType::Bool | FirType::Int(IntType::I8 | IntType::U8) => 1,
+        FirType::Int(IntType::I16 | IntType::U16) => 2,
+        FirType::Int(IntType::I32 | IntType::U32)
+        | FirType::Float(FloatType::F32)
+        | FirType::Char
+        | FirType::Enum(_, _) => 4,
+        FirType::Int(IntType::I64 | IntType::U64 | IntType::ISize | IntType::USize)
+        | FirType::Float(FloatType::F64)
+        | FirType::Str
+        | FirType::String
+        | FirType::Pointer(_)
+        | FirType::GenerationalRef(_)
+        | FirType::Slice(_)
+        | FirType::Function { .. } => 8,
+        FirType::Array(elem_ty, len) => fir_type_byte_size(elem_ty) * (*len as usize),
+        FirType::Struct(_, fields) => fields
+            .iter()
+            .map(|f| fir_type_byte_size(&f.1).max(8))
+            .sum::<usize>()
+            .max(8),
+        FirType::Optional(inner) => fir_type_byte_size(inner) + 1,
+        FirType::ErrorUnion { ok, .. } => fir_type_byte_size(ok) + 8,
+    }
+}

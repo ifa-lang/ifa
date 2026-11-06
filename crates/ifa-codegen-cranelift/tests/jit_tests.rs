@@ -166,3 +166,88 @@ fn test_cranelift_aot_standalone_binary_execution() {
 
     let _ = fs::remove_dir_all(&out_dir);
 }
+
+#[test]
+fn test_cranelift_generational_native_execution() {
+    use ifa_fir::*;
+    use ifa_span::{Span, INTERNER};
+
+    let mod_name = INTERNER.intern("gen_test_mod");
+    let mut fir_module = FirModule::new(mod_name);
+    let fn_sym = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_sym,
+        Vec::new(),
+        FirType::Int(ifa_sema::types::IntType::I64),
+        true,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let v_alloc = func.alloc_value();
+    let v_99 = func.alloc_value();
+    let v_load = func.alloc_value();
+
+    let entry = func.get_block_mut(func.entry_block).unwrap();
+
+    // 1. GenAlloc: allocate a generational 64-bit slot on arena 0
+    entry.push_instruction(Instruction::new(
+        Some(v_alloc),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(ifa_sema::types::IntType::I64),
+            arena: Some(0),
+        },
+        Span::DUMMY,
+    ));
+
+    // 2. GenCheck: 1-cycle check
+    entry.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: v_alloc,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+
+    // 3. SetField: write 99 into field 0
+    entry.push_instruction(Instruction::new(
+        Some(v_99),
+        ValueExpr::Constant(ConstantValue::Int(99, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    entry.push_instruction(Instruction::new(
+        None,
+        ValueExpr::SetField {
+            base: v_alloc,
+            field_idx: 0,
+            val: v_99,
+        },
+        Span::DUMMY,
+    ));
+
+    // 4. GetField: read from field 0
+    let field_sym = INTERNER.intern("data");
+    entry.push_instruction(Instruction::new(
+        Some(v_load),
+        ValueExpr::GetField {
+            base: v_alloc,
+            field_idx: 0,
+            field_name: field_sym,
+        },
+        Span::DUMMY,
+    ));
+
+    // 5. Return loaded value
+    entry.set_terminator(Terminator::Return(Some(v_load)));
+    fir_module.functions.push(func);
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile generational FIR to Cranelift machine code");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 99);
+}

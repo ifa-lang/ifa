@@ -9,6 +9,7 @@ members = [
     "crates/ifa-sema",
     "crates/ifa-comptime",
     "crates/ifa-fir",
+    "crates/ifa-runtime",
     "crates/ifa-codegen-cranelift",
     "crates/ifa-cli",
 ]
@@ -48,4 +49,5 @@ ifa-parser = { path = "crates/ifa-parser" }
 ifa-sema = { path = "crates/ifa-sema" }
 ifa-comptime = { path = "crates/ifa-comptime" }
 ifa-fir = { path = "crates/ifa-fir" }
+ifa-runtime = { path = "crates/ifa-runtime" }
 ifa-codegen-cranelift = { path = "crates/ifa-codegen-cranelift" }

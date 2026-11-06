@@ -140,6 +140,7 @@ Le compilateur IFA est structuré en un workspace modulaire en Rust :
 | `ifa-sema` | Table des symboles, inférence de types, loi d'exclusivité `inout` et analyse d'échappement. |
 | `ifa-comptime` | Machine virtuelle bytecode pour l'évaluation statique à la compilation. |
 | `ifa-fir` | Représentation intermédiaire SSA (FIR), passes d'optimisation CoW et références générationnelles. |
+| `ifa-runtime` | Bibliothèque d'exécution standard et déterministe (allocateur générationnel, ordonnanceur de fibres M:N, conteneurs CoW, flux I/O, ABI C). |
 | `ifa-codegen-cranelift` | Backend de génération de code machine natif AOT (`.o`, ELF) et JIT haute performance via Cranelift. |
 | `ifa-cli` | Binaire CLI unifié (`ifa`) proposant les commandes `check`, `lex`, `parse`, `comptime`, `fir`, `run` et `build`. |
 

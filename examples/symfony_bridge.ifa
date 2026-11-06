@@ -1,0 +1,29 @@
+// IFA FFI Bridge for Symfony 8.1 and PHP 8.4+
+// Zero-GC, deterministic native computation with pure C-ABI compatibility.
+
+pub extern "C" strict fn ifa_fast_hash(seed: u64, iterations: u64) -> u64 {
+    mut hash: u64 = seed;
+    mut i: u64 = 0;
+    while i < iterations {
+        hash = hash ^ 31;
+        hash = hash * 1099511628211;
+        i = i + 1;
+    }
+    return hash;
+}
+
+pub extern "C" strict fn ifa_batch_sum(base: i64, count: i64) -> i64 {
+    mut total: i64 = base;
+    mut idx: i64 = 0;
+    while idx < count {
+        total = total + idx;
+        idx = idx + 1;
+    }
+    return total;
+}
+
+pub fn main() -> i64 {
+    let hash = ifa_fast_hash(14695981039346656037, 100);
+    let sum = ifa_batch_sum(0, 10);
+    return sum;
+}
