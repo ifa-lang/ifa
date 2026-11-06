@@ -169,6 +169,18 @@ pub enum ValueExpr {
     },
     TupleInit(Vec<ValueId>),
     ArrayInit(Vec<ValueId>),
+    ArrayPush {
+        array: ValueId,
+        val: ValueId,
+    },
+    ArrayLen {
+        array: ValueId,
+    },
+    StructPushField {
+        base: ValueId,
+        field_idx: usize,
+        val: ValueId,
+    },
 
     // Value Semantics & Copy-on-Write (CoW) Primitives
     CoWMakeUnique {
@@ -230,6 +242,9 @@ impl ValueExpr {
             ValueExpr::StructInit { fields, .. } => fields.clone(),
             ValueExpr::TupleInit(fields) => fields.clone(),
             ValueExpr::ArrayInit(elements) => elements.clone(),
+            ValueExpr::ArrayPush { array, val } => vec![*array, *val],
+            ValueExpr::ArrayLen { array } => vec![*array],
+            ValueExpr::StructPushField { base, val, .. } => vec![*base, *val],
             ValueExpr::CoWMakeUnique { val }
             | ValueExpr::CoWCheckShared { val }
             | ValueExpr::CoWClone { val } => vec![*val],

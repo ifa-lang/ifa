@@ -11,5 +11,13 @@ fn attach_child(inout parent: WindowNode, mut child: WindowNode) {
 }
 
 pub fn main() {
-    let root = WindowNode(id: "root", title: "Desktop", parent: None, children: List::new());
+    mut root = WindowNode(id: "root", title: "Desktop Manager", parent: None, children: List::new());
+    let term = WindowNode(id: "win-1", title: "Terminal Shell", parent: None, children: List::new());
+    let browser = WindowNode(id: "win-2", title: "Web Navigator", parent: None, children: List::new());
+
+    attach_child(inout root, term);
+    attach_child(inout root, browser);
+
+    println("Tree initialized with root:", root.title);
+    println("Root children count:", root.children.len());
 }

@@ -98,7 +98,7 @@ cargo build --release
 ./target/release/ifa --help
 ```
 
-## **Exécuter ou vérifier un programme**
+## **Exécuter ou compiler un programme**
 
 ```bash
 # Vérifier la syntaxe et la sémantique d'un fichier source
@@ -109,6 +109,19 @@ cargo build --release
 
 # Évaluer des expressions et fonctions comptime
 ./target/release/ifa comptime examples/crc_table.ifa
+
+# Émettre et inspecter le graphe de flot de contrôle FIR SSA
+./target/release/ifa fir examples/window_tree.ifa
+
+# Exécuter un programme via l'interpréteur SSA FIR
+./target/release/ifa run examples/window_tree.ifa
+
+# Exécuter nativement en mémoire via le JIT Cranelift
+./target/release/ifa run --native examples/hello.ifa
+
+# Compiler en exécutable natif autonome (AOT)
+./target/release/ifa build examples/hello.ifa -o hello
+./hello
 ```
 
 ---
@@ -126,7 +139,9 @@ Le compilateur IFA est structuré en un workspace modulaire en Rust :
 | `ifa-parser` | Parseur récursif descendant et parseur d'expressions Pratt. |
 | `ifa-sema` | Table des symboles, inférence de types, loi d'exclusivité `inout` et analyse d'échappement. |
 | `ifa-comptime` | Machine virtuelle bytecode pour l'évaluation statique à la compilation. |
-| `ifa-cli` | Binaire CLI unifié (`ifa`) proposant les commandes `check`, `lex`, `parse`, `comptime` et `run`. |
+| `ifa-fir` | Représentation intermédiaire SSA (FIR), passes d'optimisation CoW et références générationnelles. |
+| `ifa-codegen-cranelift` | Backend de génération de code machine natif AOT (`.o`, ELF) et JIT haute performance via Cranelift. |
+| `ifa-cli` | Binaire CLI unifié (`ifa`) proposant les commandes `check`, `lex`, `parse`, `comptime`, `fir`, `run` et `build`. |
 
 ---
 

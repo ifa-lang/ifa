@@ -1,0 +1,25 @@
+struct GraphNode {
+    id: i64,
+    label: String,
+    target: ?ref GraphNode,
+}
+
+fn link_nodes(inout source: GraphNode, inout target: GraphNode) {
+    source.target = ref target;
+}
+
+pub fn main() {
+    mut node_a = GraphNode(id: 1, label: "Node A", target: None);
+    mut node_b = GraphNode(id: 2, label: "Node B", target: None);
+    mut node_c = GraphNode(id: 3, label: "Node C", target: None);
+
+    // Build cycle: A -> B -> C -> A
+    link_nodes(inout node_a, inout node_b);
+    link_nodes(inout node_b, inout node_c);
+    link_nodes(inout node_c, inout node_a);
+
+    println("Cyclic graph established: A -> B -> C -> A");
+    println("Node A label:", node_a.label);
+    println("Node B label:", node_b.label);
+    println("Node C label:", node_c.label);
+}

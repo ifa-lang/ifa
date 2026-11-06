@@ -1,0 +1,26 @@
+[package]
+name = "ifa-codegen-cranelift"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fast native and JIT code generation backend for the IFA compiler using Cranelift."
+
+[dependencies]
+ifa-ast.workspace = true
+ifa-span.workspace = true
+ifa-sema.workspace = true
+ifa-fir.workspace = true
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-module.workspace = true
+cranelift-native.workspace = true
+cranelift-jit.workspace = true
+cranelift-object.workspace = true
+target-lexicon.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ifa-lexer.workspace = true
+ifa-parser.workspace = true

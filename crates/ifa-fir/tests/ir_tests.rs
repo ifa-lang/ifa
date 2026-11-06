@@ -253,3 +253,81 @@ fn test_fir_interpreter_print_intrinsic() {
     assert_eq!(interp.captured_output.len(), 1);
     assert_eq!(interp.captured_output[0], "Hello, IFA SSA execution!");
 }
+
+#[test]
+fn test_self_referential_window_tree_execution() {
+    let src = r#"
+        struct WindowNode {
+            id: String,
+            title: String,
+            parent: ?ref WindowNode,
+            children: List<WindowNode>
+        }
+
+        fn attach_child(inout parent: WindowNode, mut child: WindowNode) {
+            child.parent = ref parent;
+            parent.children.push(child);
+        }
+
+        pub fn main() -> i64 {
+            mut root = WindowNode(id: "root", title: "Desktop Manager", parent: None, children: List::new());
+            let child1 = WindowNode(id: "c1", title: "Terminal", parent: None, children: List::new());
+            let child2 = WindowNode(id: "c2", title: "Editor", parent: None, children: List::new());
+
+            attach_child(inout root, child1);
+            attach_child(inout root, child2);
+
+            return root.children.len();
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("tree_test.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, _) = ifa_parser::parse(fid, tokens);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(2));
+}
+
+#[test]
+fn test_cyclic_graph_references_and_safety() {
+    let src = r#"
+        struct GraphNode {
+            id: i64,
+            label: String,
+            target: ?ref GraphNode
+        }
+
+        fn link_nodes(inout source: GraphNode, inout target: GraphNode) {
+            source.target = ref target;
+        }
+
+        pub fn main() -> () {
+            mut a = GraphNode(id: 1, label: "Node A", target: None);
+            mut b = GraphNode(id: 2, label: "Node B", target: None);
+            mut c = GraphNode(id: 3, label: "Node C", target: None);
+
+            link_nodes(inout a, inout b);
+            link_nodes(inout b, inout c);
+            link_nodes(inout c, inout a);
+
+            println("Cycle completed successfully");
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("graph_cycle.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, _) = ifa_parser::parse(fid, tokens);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("main", vec![]);
+    assert!(res.is_ok());
+    assert_eq!(interp.captured_output[0], "Cycle completed successfully");
+}

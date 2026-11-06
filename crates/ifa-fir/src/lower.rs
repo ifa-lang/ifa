@@ -111,6 +111,34 @@ impl<'a> FunctionLoweringContext<'a> {
         }
     }
 
+    fn extract_field_index_from_fir_type(&self, ty: &FirType, field: Symbol) -> Option<usize> {
+        match ty {
+            FirType::Struct(_, fields) => fields.iter().position(|(f_name, _)| *f_name == field),
+            FirType::GenerationalRef(inner)
+            | FirType::Pointer(inner)
+            | FirType::Optional(inner) => self.extract_field_index_from_fir_type(inner, field),
+            _ => None,
+        }
+    }
+
+    fn find_field_index(&self, receiver_expr: &Expr, field: Symbol) -> usize {
+        // 1. Check receiver variable type in local scope
+        if let ExprKind::Ident(rec_sym) = &receiver_expr.kind {
+            if let Some(fir_ty) = self.var_types.get(rec_sym) {
+                if let Some(idx) = self.extract_field_index_from_fir_type(fir_ty, field) {
+                    return idx;
+                }
+            }
+        }
+        // 2. Lookup in struct definitions in symbol table
+        for st in self.symbols.structs.values() {
+            if let Some(&idx) = st.field_indices.get(&field) {
+                return idx;
+            }
+        }
+        0
+    }
+
     fn lower(mut self, body: &ifa_ast::Block) -> FirFunction {
         // 1. In entry block, create allocas for parameters and store incoming values
         let entry_params = self.func.params.clone();
@@ -205,11 +233,14 @@ impl<'a> FunctionLoweringContext<'a> {
                         }
                     }
                     ExprKind::FieldAccess { receiver, field } => {
-                        let base_id = self.lower_expr(receiver);
-                        let field_idx = if let Some(sym_st) = self.symbols.lookup_struct(field) {
-                            sym_st.field_indices.get(field).copied().unwrap_or(0)
-                        } else {
-                            0
+                        let field_idx = self.find_field_index(receiver, *field);
+                        let base_id = match &receiver.kind {
+                            ExprKind::Ident(sym) => self
+                                .var_allocas
+                                .get(sym)
+                                .copied()
+                                .unwrap_or_else(|| self.lower_expr(receiver)),
+                            _ => self.lower_expr(receiver),
                         };
                         self.emit(
                             None,
@@ -492,9 +523,16 @@ impl<'a> FunctionLoweringContext<'a> {
             }
 
             ExprKind::Call { callee, args } => {
-                let mut arg_vals = Vec::new();
-                for a in args {
-                    arg_vals.push(self.lower_expr(&a.value));
+                // Check if this is a List::new call
+                if let ExprKind::Path(path) = &callee.kind {
+                    if path.len() >= 2
+                        && INTERNER.resolve(&path[0]) == "List"
+                        && INTERNER.resolve(&path[1]) == "new"
+                    {
+                        let res = self.alloc_value();
+                        self.emit(Some(res), ValueExpr::ArrayInit(Vec::new()), span);
+                        return res;
+                    }
                 }
 
                 let direct_name = match &callee.kind {
@@ -503,6 +541,54 @@ impl<'a> FunctionLoweringContext<'a> {
                     ExprKind::FieldAccess { field, .. } => Some(*field),
                     _ => None,
                 };
+
+                // Check if calling a Struct constructor directly (e.g. WindowNode(id: ..., parent: ...))
+                if let Some(struct_name) = direct_name {
+                    if let Some(st) = self.symbols.lookup_struct(&struct_name) {
+                        let mut ordered_fields = Vec::new();
+                        for field_sym in &st.fields {
+                            if let Some(arg) = args.iter().find(|a| a.name == Some(field_sym.name))
+                            {
+                                ordered_fields.push(self.lower_expr(&arg.value));
+                            } else if let Some(idx) = st.field_indices.get(&field_sym.name) {
+                                if let Some(arg) = args.get(*idx) {
+                                    ordered_fields.push(self.lower_expr(&arg.value));
+                                } else {
+                                    let unit_val = self.alloc_value();
+                                    self.emit(
+                                        Some(unit_val),
+                                        ValueExpr::Constant(ConstantValue::Unit),
+                                        span,
+                                    );
+                                    ordered_fields.push(unit_val);
+                                }
+                            } else {
+                                let unit_val = self.alloc_value();
+                                self.emit(
+                                    Some(unit_val),
+                                    ValueExpr::Constant(ConstantValue::Unit),
+                                    span,
+                                );
+                                ordered_fields.push(unit_val);
+                            }
+                        }
+                        let res = self.alloc_value();
+                        self.emit(
+                            Some(res),
+                            ValueExpr::StructInit {
+                                name: struct_name,
+                                fields: ordered_fields,
+                            },
+                            span,
+                        );
+                        return res;
+                    }
+                }
+
+                let mut arg_vals = Vec::new();
+                for a in args {
+                    arg_vals.push(self.lower_expr(&a.value));
+                }
 
                 if let Some(fn_name) = direct_name {
                     let res = self.alloc_value();
@@ -522,6 +608,91 @@ impl<'a> FunctionLoweringContext<'a> {
                         Some(res),
                         ValueExpr::Call {
                             callee: callee_val,
+                            args: arg_vals,
+                        },
+                        span,
+                    );
+                    res
+                }
+            }
+
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => {
+                let m_name = INTERNER.resolve(method);
+                if m_name == "push" && !args.is_empty() {
+                    let val_to_push = self.lower_expr(&args[0].value);
+                    let res = self.alloc_value();
+
+                    match &receiver.kind {
+                        ExprKind::FieldAccess {
+                            receiver: inner_rec,
+                            field: field_sym,
+                        } => {
+                            let field_idx = self.find_field_index(inner_rec, *field_sym);
+                            let base_id = match &inner_rec.kind {
+                                ExprKind::Ident(sym) => self
+                                    .var_allocas
+                                    .get(sym)
+                                    .copied()
+                                    .unwrap_or_else(|| self.lower_expr(inner_rec)),
+                                _ => self.lower_expr(inner_rec),
+                            };
+                            self.emit(
+                                Some(res),
+                                ValueExpr::StructPushField {
+                                    base: base_id,
+                                    field_idx,
+                                    val: val_to_push,
+                                },
+                                span,
+                            );
+                        }
+                        ExprKind::Ident(sym) => {
+                            let base_id = self
+                                .var_allocas
+                                .get(sym)
+                                .copied()
+                                .unwrap_or_else(|| self.lower_expr(receiver));
+                            self.emit(
+                                Some(res),
+                                ValueExpr::ArrayPush {
+                                    array: base_id,
+                                    val: val_to_push,
+                                },
+                                span,
+                            );
+                        }
+                        _ => {
+                            let base_id = self.lower_expr(receiver);
+                            self.emit(
+                                Some(res),
+                                ValueExpr::ArrayPush {
+                                    array: base_id,
+                                    val: val_to_push,
+                                },
+                                span,
+                            );
+                        }
+                    }
+                    res
+                } else if m_name == "len" {
+                    let base_id = self.lower_expr(receiver);
+                    let res = self.alloc_value();
+                    self.emit(Some(res), ValueExpr::ArrayLen { array: base_id }, span);
+                    res
+                } else {
+                    let mut arg_vals = vec![self.lower_expr(receiver)];
+                    for a in args {
+                        arg_vals.push(self.lower_expr(&a.value));
+                    }
+                    let res = self.alloc_value();
+                    self.emit(
+                        Some(res),
+                        ValueExpr::CallDirect {
+                            name: *method,
                             args: arg_vals,
                         },
                         span,
@@ -556,11 +727,7 @@ impl<'a> FunctionLoweringContext<'a> {
                     base_val
                 };
 
-                let field_idx = if let Some(sym_st) = self.symbols.lookup_struct(field) {
-                    sym_st.field_indices.get(field).copied().unwrap_or(0)
-                } else {
-                    0
-                };
+                let field_idx = self.find_field_index(receiver, *field);
 
                 let res = self.alloc_value();
                 self.emit(
@@ -742,11 +909,19 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
                 }
             }
             Item::Struct(s_ast) => {
-                let fields = s_ast
-                    .fields
-                    .iter()
-                    .map(|f| (f.name, FirType::Int(IntType::I64)))
-                    .collect();
+                let struct_sym = symbols.lookup_struct(&s_ast.name);
+                let fields = if let Some(st) = struct_sym {
+                    st.fields
+                        .iter()
+                        .map(|f| (f.name, FirType::from_sema_type(&f.ty)))
+                        .collect()
+                } else {
+                    s_ast
+                        .fields
+                        .iter()
+                        .map(|f| (f.name, FirType::Int(IntType::I64)))
+                        .collect()
+                };
                 module.structs.push(FirStruct {
                     name: s_ast.name,
                     fields,

@@ -1,4 +1,5 @@
 use clap::{Parser as ClapParser, Subcommand};
+use ifa_codegen_cranelift::{AotCompiler, JitEngine};
 use ifa_comptime::ComptimeVM;
 use ifa_fir::{compile_to_fir, format_module, FirInterpreter};
 use ifa_lexer::tokenize;
@@ -80,10 +81,24 @@ enum Commands {
         #[arg(long)]
         no_gen_opt: bool,
     },
-    /// Compile and run an IFA program via FIR SSA execution engine
+    /// Compile and run an IFA program
     Run {
         /// Source file path (.ifa)
         file: PathBuf,
+        /// Execute directly as machine code via Cranelift JIT
+        #[arg(long)]
+        native: bool,
+    },
+    /// Compile an IFA program to native object file or binary using Cranelift
+    Build {
+        /// Source file path (.ifa)
+        file: PathBuf,
+        /// Output path for binary or object
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Emit native object file (.o) without linking
+        #[arg(long)]
+        emit_obj: bool,
     },
 }
 
@@ -403,7 +418,7 @@ fn main() -> ExitCode {
             }
         }
 
-        Commands::Run { file } => {
+        Commands::Run { file, native } => {
             let src = match fs::read_to_string(&file) {
                 Ok(s) => s,
                 Err(e) => {
@@ -443,16 +458,130 @@ fn main() -> ExitCode {
                 }
             };
 
-            let mut interp = FirInterpreter::new(&fir_module);
-            match interp.execute_function("main", vec![]) {
-                Ok(val) => {
-                    if val != ifa_fir::FirValue::Unit {
-                        println!("Program finished with result: {}", val);
+            if native {
+                match JitEngine::new() {
+                    Ok(mut jit) => {
+                        if let Err(e) = jit.compile_module(&fir_module) {
+                            eprintln!("JIT compilation error: {}", e);
+                            return ExitCode::FAILURE;
+                        }
+                        match jit.run_main() {
+                            Ok(code) => {
+                                println!("Program finished with native exit code: {}", code);
+                                ExitCode::SUCCESS
+                            }
+                            Err(e) => {
+                                eprintln!("JIT execution error: {}", e);
+                                ExitCode::FAILURE
+                            }
+                        }
                     }
-                    ExitCode::SUCCESS
+                    Err(e) => {
+                        eprintln!("Failed to initialize Cranelift JIT engine: {}", e);
+                        ExitCode::FAILURE
+                    }
+                }
+            } else {
+                let mut interp = FirInterpreter::new(&fir_module);
+                match interp.execute_function("main", vec![]) {
+                    Ok(val) => {
+                        if val != ifa_fir::FirValue::Unit {
+                            println!("Program finished with result: {}", val);
+                        }
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("runtime error: {}", e);
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        }
+
+        Commands::Build {
+            file,
+            output,
+            emit_obj,
+        } => {
+            let src = match fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: impossible de lire le fichier {:?}: {}", file, e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let fid = source_map.add_file(file.to_string_lossy(), &src);
+            let tokens = tokenize(fid, &src);
+            let (prog, parse_diags) = parse(fid, tokens);
+
+            if !parse_diags.is_empty() {
+                for diag in &parse_diags {
+                    eprint!("{}", diag.render_to_string(&source_map));
+                }
+                return ExitCode::FAILURE;
+            }
+
+            let analysis = analyze(&source_map, &prog);
+            if !analysis.diagnostics.is_empty() {
+                for diag in &analysis.diagnostics {
+                    eprint!("{}", diag.render_to_string(&source_map));
+                }
+            }
+
+            if analysis.has_errors() {
+                return ExitCode::FAILURE;
+            }
+
+            let fir_module = match compile_to_fir(&prog, &analysis.symbols, true, true) {
+                Ok(m) => m,
+                Err(errors) => {
+                    for err in errors {
+                        eprint!("{}", err.render_to_string(&source_map));
+                    }
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let default_stem = file
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "out".into());
+
+            let target_out = output.unwrap_or_else(|| {
+                if emit_obj {
+                    PathBuf::from(format!("{}.o", default_stem))
+                } else {
+                    PathBuf::from(&default_stem)
+                }
+            });
+
+            match AotCompiler::new() {
+                Ok(aot) => {
+                    if emit_obj {
+                        if let Err(e) = aot.compile_to_object(&fir_module, &target_out) {
+                            eprintln!("Failed to emit native object file: {}", e);
+                            return ExitCode::FAILURE;
+                        }
+                        println!("Emitted native object file: {:?}", target_out);
+                        ExitCode::SUCCESS
+                    } else {
+                        let temp_obj = std::env::temp_dir().join(format!("{}.o", default_stem));
+                        if let Err(e) = aot.compile_to_object(&fir_module, &temp_obj) {
+                            eprintln!("Failed to emit native object file: {}", e);
+                            return ExitCode::FAILURE;
+                        }
+                        if let Err(e) = AotCompiler::link_executable(&temp_obj, &target_out) {
+                            eprintln!("Linker error: {}", e);
+                            let _ = fs::remove_file(&temp_obj);
+                            return ExitCode::FAILURE;
+                        }
+                        let _ = fs::remove_file(&temp_obj);
+                        println!("Compiled standalone native executable: {:?}", target_out);
+                        ExitCode::SUCCESS
+                    }
                 }
                 Err(e) => {
-                    eprintln!("runtime error: {}", e);
+                    eprintln!("Failed to initialize Cranelift AOT compiler: {}", e);
                     ExitCode::FAILURE
                 }
             }

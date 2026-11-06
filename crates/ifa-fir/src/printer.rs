@@ -196,6 +196,23 @@ impl<'a> FirPrinter<'a> {
                 }
                 write!(self.output, ")")
             }
+            ValueExpr::ArrayPush { array, val } => {
+                write!(self.output, "array.push {}, {}", array, val)
+            }
+            ValueExpr::ArrayLen { array } => {
+                write!(self.output, "array.len {}", array)
+            }
+            ValueExpr::StructPushField {
+                base,
+                field_idx,
+                val,
+            } => {
+                write!(
+                    self.output,
+                    "struct.push_field {}.#{}, {}",
+                    base, field_idx, val
+                )
+            }
             ValueExpr::CoWMakeUnique { val } => write!(self.output, "cow.make_unique {}", val),
             ValueExpr::CoWCheckShared { val } => write!(self.output, "cow.is_shared {}", val),
             ValueExpr::CoWClone { val } => write!(self.output, "cow.clone {}", val),
