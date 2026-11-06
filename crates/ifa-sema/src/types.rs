@@ -245,6 +245,11 @@ impl Type {
             }
         }
 
+        // Optional to Optional compatibility
+        if let (Type::Optional(src_inner), Type::Optional(target_inner)) = (self, target) {
+            return src_inner.is_assignable_to(target_inner);
+        }
+
         // T can coerce to Optional(T)
         if let Type::Optional(inner_target) = target {
             if self.is_assignable_to(inner_target) {

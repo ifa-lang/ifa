@@ -59,7 +59,10 @@ fn test_selfhost_compiler_full_pipeline() {
     assert!(test_stdout.contains("test test_selfhost_lexer ... ok"));
     assert!(test_stdout.contains("test test_selfhost_ast_building ... ok"));
     assert!(test_stdout.contains("test test_selfhost_eval ... ok"));
-    assert!(test_stdout.contains("Test result: 3 passed; 0 failed"));
+    assert!(test_stdout.contains("test test_selfhost_recursive_precedence ... ok"));
+    assert!(test_stdout.contains("test test_selfhost_recursive_paren_precedence ... ok"));
+    assert!(test_stdout.contains("test test_selfhost_function_parser_and_eval ... ok"));
+    assert!(test_stdout.contains("Test result: 6 passed; 0 failed"));
 
     // 3. Complete execution via SSA FIR interpreter
     let run_output = Command::new(&ifa_bin)
@@ -87,6 +90,11 @@ fn test_selfhost_compiler_full_pipeline() {
     );
     assert!(
         run_stdout.contains("Evaluated AST function compute(2): 42"),
+        "stdout was: {}",
+        run_stdout
+    );
+    assert!(
+        run_stdout.contains("Evaluated AST function arithmetic(4): 28"),
         "stdout was: {}",
         run_stdout
     );

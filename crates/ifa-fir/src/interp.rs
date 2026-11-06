@@ -946,16 +946,20 @@ impl<'a> FirInterpreter<'a> {
                 let arr_val = env.get(array).ok_or(InterpError::UndefinedValue(*array))?;
                 match arr_val {
                     FirValue::Array(elements) => Ok(FirValue::Int(elements.len() as i128)),
+                    FirValue::String(s) => Ok(FirValue::Int(s.len() as i128)),
                     FirValue::Pointer(addr) => {
                         if let Some(target) = self.stack_memory.get(addr) {
                             match target {
                                 FirValue::Array(elements) => {
                                     Ok(FirValue::Int(elements.len() as i128))
                                 }
+                                FirValue::String(s) => Ok(FirValue::Int(s.len() as i128)),
                                 FirValue::GenRef { slot, generation } => {
                                     self.heap.check(*slot, *generation)?;
                                     if let FirValue::Array(elements) = self.heap.deref(*slot)? {
                                         Ok(FirValue::Int(elements.len() as i128))
+                                    } else if let FirValue::String(s) = self.heap.deref(*slot)? {
+                                        Ok(FirValue::Int(s.len() as i128))
                                     } else {
                                         Ok(FirValue::Int(0))
                                     }
@@ -970,6 +974,8 @@ impl<'a> FirInterpreter<'a> {
                         self.heap.check(*slot, *generation)?;
                         if let FirValue::Array(elements) = self.heap.deref(*slot)? {
                             Ok(FirValue::Int(elements.len() as i128))
+                        } else if let FirValue::String(s) = self.heap.deref(*slot)? {
+                            Ok(FirValue::Int(s.len() as i128))
                         } else {
                             Ok(FirValue::Int(0))
                         }

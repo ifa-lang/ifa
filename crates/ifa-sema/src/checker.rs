@@ -1464,7 +1464,14 @@ impl<'a> SemanticAnalyzer<'a> {
         let rec_ty = self.infer_expr(receiver);
         let m_name = INTERNER.resolve(&method);
 
-        // Standard method handling (e.g. List.push, server.post, etc.)
+        // Standard method handling (e.g. List.push, List.len, String.len, etc.)
+        if m_name == "len" {
+            return Type::Int(IntType::I64);
+        }
+        if m_name == "is_empty" {
+            return Type::Bool;
+        }
+
         match &rec_ty {
             Type::Generic {
                 name,

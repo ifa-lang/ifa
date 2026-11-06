@@ -1,11 +1,14 @@
 // Self-Hosting IFA Bootstrap Testbench
-// First-stage compiler written directly in idiomatic IFA.
+// Complete recursive-descent parser and interpreter for expressions and statements in idiomatic IFA.
 // Demonstrates:
 // 1. Lexical analysis & token stream generation
 // 2. Comptime static classification table evaluation
 // 3. Generational reference AST construction (?ref AstExpr)
 // 4. Inout parameter passing and implicit Copy-on-Write lists
-// 5. Semantic evaluation of abstract syntax trees
+// 5. Recursive-descent expression parser respecting operator precedence (+, -, *, /)
+// 6. Parenthesized sub-expression grouping and precedence inversion
+// 7. Statement and function declaration parsing (let bindings, return statements)
+// 8. Native AST function execution with environment resolution
 
 comptime fn build_keyword_lut() -> [i64; 8] {
     mut lut: [i64; 8] = [0; 8];
@@ -34,7 +37,7 @@ struct AstExpr {
     kind: i64, // 1: Integer Literal, 2: Variable, 3: Binary Operation
     val: i64,
     name: String,
-    op: i64,   // 1: Add (+), 2: Sub (-), 3: Mul (*)
+    op: i64,   // 1: Add (+), 2: Sub (-), 3: Mul (*), 4: Div (/)
     left: ?ref AstExpr,
     right: ?ref AstExpr
 }
@@ -67,7 +70,7 @@ fn advance_token(inout stream: List<Token>, kind: i64, value: i64, lexeme: Strin
 // Build a token stream simulating lexer output for:
 // `fn compute(inout x: i64) -> i64 { let bonus = 40; return x + bonus; }`
 fn tokenize_sample_program() -> List<Token> {
-    mut tokens = List::new();
+    mut tokens: List<Token> = List::new();
 
     advance_token(inout tokens, 1, 0, "fn");
     advance_token(inout tokens, 10, 0, "compute");
@@ -95,50 +98,284 @@ fn tokenize_sample_program() -> List<Token> {
     return tokens;
 }
 
+// Build a token stream simulating lexer output for:
+// `fn arithmetic(inout x: i64) -> i64 { let factor = 3; let offset = 10; return (x + 2) * factor + offset; }`
+fn tokenize_arithmetic_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    advance_token(inout tokens, 1, 0, "fn");
+    advance_token(inout tokens, 10, 0, "arithmetic");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 5, 0, "inout");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 34, 0, ":");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 36, 0, "->");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 2, 0, "let");
+    advance_token(inout tokens, 10, 0, "factor");
+    advance_token(inout tokens, 24, 0, "=");
+    advance_token(inout tokens, 11, 3, "3");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 2, 0, "let");
+    advance_token(inout tokens, 10, 0, "offset");
+    advance_token(inout tokens, 24, 0, "=");
+    advance_token(inout tokens, 11, 10, "10");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 4, 0, "return");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 20, 0, "+");
+    advance_token(inout tokens, 11, 2, "2");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 22, 0, "*");
+    advance_token(inout tokens, 10, 0, "factor");
+    advance_token(inout tokens, 20, 0, "+");
+    advance_token(inout tokens, 10, 0, "offset");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+
+    return tokens;
+}
+
+// Recursive-descent parser: primary expressions (literals, variables, parenthesized sub-trees)
+fn parse_primary(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstExpr {
+    if cursor >= tokens.len() {
+        return AstExpr(kind: 0, val: 0, name: "", op: 0, left: None, right: None);
+    }
+    let tok = tokens[cursor];
+    if tok.kind == 11 {
+        // Integer Literal
+        cursor = cursor + 1;
+        return AstExpr(kind: 1, val: tok.value, name: "", op: 0, left: None, right: None);
+    }
+    if tok.kind == 10 {
+        // Variable Identifier
+        cursor = cursor + 1;
+        return AstExpr(kind: 2, val: 0, name: tok.lexeme, op: 0, left: None, right: None);
+    }
+    if tok.kind == 30 {
+        // Left parenthesis '(' -> recursive sub-expression evaluation
+        cursor = cursor + 1;
+        let inner = parse_additive(inout cursor, tokens, inout pool);
+        if cursor < tokens.len() {
+            let rparen = tokens[cursor];
+            if rparen.kind == 31 {
+                cursor = cursor + 1; // Consume ')'
+            }
+        }
+        return inner;
+    }
+    return AstExpr(kind: 0, val: 0, name: "", op: 0, left: None, right: None);
+}
+
+// Recursive-descent parser: multiplicative expressions (* and /)
+fn parse_multiplicative(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstExpr {
+    mut current = parse_primary(inout cursor, tokens, inout pool);
+    mut parsing = true;
+    while parsing {
+        if cursor >= tokens.len() {
+            parsing = false;
+        } else {
+            let tok = tokens[cursor];
+            if tok.kind == 22 {
+                // Op: * (Multiplication)
+                cursor = cursor + 1;
+                pool.push(current);
+                let left_idx = pool.len() - 1;
+                let right_expr = parse_primary(inout cursor, tokens, inout pool);
+                pool.push(right_expr);
+                let right_idx = pool.len() - 1;
+                current = AstExpr(
+                    kind: 3,
+                    val: 0,
+                    name: "",
+                    op: 3,
+                    left: ref pool[left_idx],
+                    right: ref pool[right_idx]
+                );
+            } else if tok.kind == 23 {
+                // Op: / (Division)
+                cursor = cursor + 1;
+                pool.push(current);
+                let left_idx = pool.len() - 1;
+                let right_expr = parse_primary(inout cursor, tokens, inout pool);
+                pool.push(right_expr);
+                let right_idx = pool.len() - 1;
+                current = AstExpr(
+                    kind: 3,
+                    val: 0,
+                    name: "",
+                    op: 4,
+                    left: ref pool[left_idx],
+                    right: ref pool[right_idx]
+                );
+            } else {
+                parsing = false;
+            }
+        }
+    }
+    return current;
+}
+
+// Recursive-descent parser: additive expressions (+ and -)
+fn parse_additive(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstExpr {
+    mut current = parse_multiplicative(inout cursor, tokens, inout pool);
+    mut parsing = true;
+    while parsing {
+        if cursor >= tokens.len() {
+            parsing = false;
+        } else {
+            let tok = tokens[cursor];
+            if tok.kind == 20 {
+                // Op: + (Addition)
+                cursor = cursor + 1;
+                pool.push(current);
+                let left_idx = pool.len() - 1;
+                let right_expr = parse_multiplicative(inout cursor, tokens, inout pool);
+                pool.push(right_expr);
+                let right_idx = pool.len() - 1;
+                current = AstExpr(
+                    kind: 3,
+                    val: 0,
+                    name: "",
+                    op: 1,
+                    left: ref pool[left_idx],
+                    right: ref pool[right_idx]
+                );
+            } else if tok.kind == 21 {
+                // Op: - (Subtraction)
+                cursor = cursor + 1;
+                pool.push(current);
+                let left_idx = pool.len() - 1;
+                let right_expr = parse_multiplicative(inout cursor, tokens, inout pool);
+                pool.push(right_expr);
+                let right_idx = pool.len() - 1;
+                current = AstExpr(
+                    kind: 3,
+                    val: 0,
+                    name: "",
+                    op: 2,
+                    left: ref pool[left_idx],
+                    right: ref pool[right_idx]
+                );
+            } else {
+                parsing = false;
+            }
+        }
+    }
+    return current;
+}
+
+// Entrypoint for expression parsing
+fn parse_expression(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstExpr {
+    return parse_additive(inout cursor, tokens, inout pool);
+}
+
+// Recursive-descent parser: statement declarations (`let var = expr;` and `return expr;`)
+fn parse_statement(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstStmt {
+    let tok = tokens[cursor];
+    if tok.kind == 2 {
+        // let <var> = <expr>;
+        cursor = cursor + 1;
+        let var_tok = tokens[cursor];
+        let var_name = var_tok.lexeme;
+        cursor = cursor + 1;
+        if cursor < tokens.len() && tokens[cursor].kind == 24 {
+            cursor = cursor + 1; // Consume '='
+        }
+        let expr = parse_expression(inout cursor, tokens, inout pool);
+        pool.push(expr);
+        let expr_idx = pool.len() - 1;
+        if cursor < tokens.len() && tokens[cursor].kind == 35 {
+            cursor = cursor + 1; // Consume ';'
+        }
+        return AstStmt(is_return: false, target_var: var_name, expr: ref pool[expr_idx]);
+    }
+    if tok.kind == 4 {
+        // return <expr>;
+        cursor = cursor + 1;
+        let expr = parse_expression(inout cursor, tokens, inout pool);
+        pool.push(expr);
+        let expr_idx = pool.len() - 1;
+        if cursor < tokens.len() && tokens[cursor].kind == 35 {
+            cursor = cursor + 1; // Consume ';'
+        }
+        return AstStmt(is_return: true, target_var: "", expr: ref pool[expr_idx]);
+    }
+    return AstStmt(is_return: false, target_var: "", expr: None);
+}
+
+// Recursive-descent parser: function declarations (`fn name(param: T) -> R { ... }`)
+fn parse_function(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstFunction {
+    cursor = cursor + 1; // Consume 'fn'
+    let fn_tok = tokens[cursor];
+    let fn_name = fn_tok.lexeme;
+    cursor = cursor + 1; // Consume function name
+    cursor = cursor + 1; // Consume '('
+    if cursor < tokens.len() && tokens[cursor].kind == 5 {
+        cursor = cursor + 1; // Consume optional 'inout'
+    }
+    let param_tok = tokens[cursor];
+    let param_name = param_tok.lexeme;
+    cursor = cursor + 1; // Consume parameter name
+    cursor = cursor + 1; // Consume ':'
+    cursor = cursor + 1; // Consume parameter type
+    cursor = cursor + 1; // Consume ')'
+    cursor = cursor + 1; // Consume '->'
+    cursor = cursor + 1; // Consume return type
+    cursor = cursor + 1; // Consume '{'
+
+    mut stmts: List<AstStmt> = List::new();
+    mut parsing = true;
+    while parsing {
+        if cursor >= tokens.len() {
+            parsing = false;
+        } else if tokens[cursor].kind == 33 {
+            cursor = cursor + 1; // Consume '}'
+            parsing = false;
+        } else {
+            let stmt = parse_statement(inout cursor, tokens, inout pool);
+            stmts.push(stmt);
+        }
+    }
+
+    return AstFunction(name: fn_name, param_name: param_name, statements: stmts);
+}
+
 // AST Expression Evaluator traversing generational references safely
-fn eval_expression(expr: AstExpr, param_val: i64, local_val: i64) -> i64 {
+fn eval_expression(
+    expr: ?ref AstExpr,
+    param_name: String,
+    param_val: i64,
+    v1_name: String,
+    v1_val: i64,
+    v2_name: String,
+    v2_val: i64
+) -> i64 {
     if expr.kind == 1 {
         // Integer Literal
         return expr.val;
     }
     if expr.kind == 2 {
         // Variable resolution
-        if expr.name == "x" {
+        if expr.name == param_name {
             return param_val;
         }
-        if expr.name == "bonus" {
-            return local_val;
+        if expr.name == v1_name {
+            return v1_val;
+        }
+        if expr.name == v2_name {
+            return v2_val;
         }
         return 0;
     }
     if expr.kind == 3 {
-        // Binary operation evaluated directly from left and right ref nodes
-        let left_node = expr.left;
-        let right_node = expr.right;
-        mut left_val: i64 = 0;
-        mut right_val: i64 = 0;
-        if left_node.kind == 1 {
-            left_val = left_node.val;
-        }
-        if left_node.kind == 2 {
-            if left_node.name == "x" {
-                left_val = param_val;
-            }
-            if left_node.name == "bonus" {
-                left_val = local_val;
-            }
-        }
-        if right_node.kind == 1 {
-            right_val = right_node.val;
-        }
-        if right_node.kind == 2 {
-            if right_node.name == "x" {
-                right_val = param_val;
-            }
-            if right_node.name == "bonus" {
-                right_val = local_val;
-            }
-        }
+        // Binary operation evaluated recursively
+        let left_val = eval_expression(expr.left, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
+        let right_val = eval_expression(expr.right, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
 
         if expr.op == 1 {
             return left_val + right_val;
@@ -149,6 +386,38 @@ fn eval_expression(expr: AstExpr, param_val: i64, local_val: i64) -> i64 {
         if expr.op == 3 {
             return left_val * right_val;
         }
+        if expr.op == 4 {
+            if right_val != 0 {
+                return left_val / right_val;
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+// AST Function Executor
+fn execute_ast_function(func: AstFunction, arg_val: i64) -> i64 {
+    mut v1_name = "";
+    mut v1_val: i64 = 0;
+    mut v2_name = "";
+    mut v2_val: i64 = 0;
+
+    mut i: i64 = 0;
+    while i < func.statements.len() {
+        let stmt = func.statements[i];
+        if stmt.is_return {
+            return eval_expression(stmt.expr, func.param_name, arg_val, v1_name, v1_val, v2_name, v2_val);
+        } else {
+            if v1_name == "" {
+                v1_name = stmt.target_var;
+                v1_val = eval_expression(stmt.expr, func.param_name, arg_val, v1_name, v1_val, v2_name, v2_val);
+            } else {
+                v2_name = stmt.target_var;
+                v2_val = eval_expression(stmt.expr, func.param_name, arg_val, v1_name, v1_val, v2_name, v2_val);
+            }
+        }
+        i = i + 1;
     }
     return 0;
 }
@@ -211,7 +480,70 @@ pub fn test_selfhost_eval() -> bool {
         right: ref node_right
     );
 
-    let result = eval_expression(bin_expr, 2, 40);
+    let result = eval_expression(ref bin_expr, "x", 2, "bonus", 40, "", 0);
+    return result == 42;
+}
+
+// Unit test 4: Operator precedence verification (2 + 3 * 4 == 14)
+pub fn test_selfhost_recursive_precedence() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 11, value: 2, lexeme: "2"));
+    tokens.push(Token(kind: 20, value: 0, lexeme: "+"));
+    tokens.push(Token(kind: 11, value: 3, lexeme: "3"));
+    tokens.push(Token(kind: 22, value: 0, lexeme: "*"));
+    tokens.push(Token(kind: 11, value: 4, lexeme: "4"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let root = parse_expression(inout cur, tokens, inout pool);
+
+    if root.op != 1 {
+        return false;
+    }
+    let res = eval_expression(ref root, "", 0, "", 0, "", 0);
+    return res == 14;
+}
+
+// Unit test 5: Parenthesized sub-expression precedence inversion ((2 + 3) * 4 == 20)
+pub fn test_selfhost_recursive_paren_precedence() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 11, value: 2, lexeme: "2"));
+    tokens.push(Token(kind: 20, value: 0, lexeme: "+"));
+    tokens.push(Token(kind: 11, value: 3, lexeme: "3"));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 22, value: 0, lexeme: "*"));
+    tokens.push(Token(kind: 11, value: 4, lexeme: "4"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let root = parse_expression(inout cur, tokens, inout pool);
+
+    if root.op != 3 {
+        return false;
+    }
+    let res = eval_expression(ref root, "", 0, "", 0, "", 0);
+    return res == 20;
+}
+
+// Unit test 6: End-to-end function declaration parsing and execution
+pub fn test_selfhost_function_parser_and_eval() -> bool {
+    let tokens = tokenize_sample_program();
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let parsed_fn = parse_function(inout cur, tokens, inout pool);
+
+    if parsed_fn.name != "compute" {
+        return false;
+    }
+    if parsed_fn.param_name != "x" {
+        return false;
+    }
+    if parsed_fn.statements.len() != 2 {
+        return false;
+    }
+
+    let result = execute_ast_function(parsed_fn, 2);
     return result == 42;
 }
 
@@ -226,21 +558,20 @@ pub fn main() {
     // 2. Comptime Table Validation
     println("Comptime keyword LUT length:", KEYWORD_LUT.len());
 
-    // 3. Generational AST Assembly
-    mut param_node = AstExpr(kind: 2, val: 0, name: "x", op: 0, left: None, right: None);
-    mut bonus_node = AstExpr(kind: 1, val: 40, name: "", op: 0, left: None, right: None);
+    // 3. Generational AST Assembly & Execution (Function 1: compute)
+    mut cur1: i64 = 0;
+    mut pool1: List<AstExpr> = List::new();
+    let fn1 = parse_function(inout cur1, tokens, inout pool1);
+    let evaluated1 = execute_ast_function(fn1, 2);
+    println("Evaluated AST function compute(2):", evaluated1);
 
-    let add_node = AstExpr(
-        kind: 3,
-        val: 0,
-        name: "",
-        op: 1,
-        left: ref param_node,
-        right: ref bonus_node
-    );
+    // 4. Advanced Recursive Parser & Execution (Function 2: arithmetic)
+    let tokens2 = tokenize_arithmetic_program();
+    mut cur2: i64 = 0;
+    mut pool2: List<AstExpr> = List::new();
+    let fn2 = parse_function(inout cur2, tokens2, inout pool2);
+    let evaluated2 = execute_ast_function(fn2, 4);
+    println("Evaluated AST function arithmetic(4):", evaluated2);
 
-    // 4. Semantic Evaluation
-    let evaluated = eval_expression(add_node, 2, 40);
-    println("Evaluated AST function compute(2):", evaluated);
     println("Self-hosting AST and generational reference validation: SUCCESS (42)");
 }

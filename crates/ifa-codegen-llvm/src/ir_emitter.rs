@@ -418,11 +418,13 @@ impl<'a> LlvmIrEmitter<'a> {
             ValueExpr::GenFree { ptr } => {
                 out.push_str(&format!("  call void @ifa_rt_gen_free(ptr %v{})\n", ptr.0));
             }
-            ValueExpr::GenCheck { ref_val, .. } => {
-                out.push_str(&format!(
-                    "  call void @ifa_rt_gen_check(ptr %v{}, i32 1)\n",
-                    ref_val.0
-                ));
+            ValueExpr::GenCheck { ref_val, redundant } => {
+                if !*redundant {
+                    out.push_str(&format!(
+                        "  call void @ifa_rt_gen_check(ptr %v{}, i32 1)\n",
+                        ref_val.0
+                    ));
+                }
             }
             ValueExpr::Yield => {
                 out.push_str("  call void @ifa_rt_fiber_yield()\n");
