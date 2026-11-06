@@ -1,0 +1,18 @@
+[package]
+name = "ifa-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebAssembly & WASI deterministic packaging and runtime toolchain for IFA."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ifa-ast.workspace = true
+ifa-sema.workspace = true
+ifa-span.workspace = true
+ifa-fir.workspace = true
+ifa-codegen-llvm.workspace = true

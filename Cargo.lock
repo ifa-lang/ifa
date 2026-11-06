@@ -522,10 +522,13 @@ dependencies = [
  "ifa-diagnostics",
  "ifa-fir",
  "ifa-lexer",
+ "ifa-lsp",
  "ifa-parser",
  "ifa-sema",
  "ifa-span",
+ "ifa-wasm",
  "kori",
+ "serde_json",
 ]
 
 [[package]]
@@ -606,6 +609,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ifa-lsp"
+version = "0.1.0"
+dependencies = [
+ "ifa-ast",
+ "ifa-diagnostics",
+ "ifa-lexer",
+ "ifa-parser",
+ "ifa-sema",
+ "ifa-span",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ifa-parser"
 version = "0.1.0"
 dependencies = [
@@ -643,6 +660,30 @@ version = "0.1.0"
 dependencies = [
  "lasso",
  "lazy_static",
+]
+
+[[package]]
+name = "ifa-stdlib"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ifa-runtime",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ifa-wasm"
+version = "0.1.0"
+dependencies = [
+ "ifa-ast",
+ "ifa-codegen-llvm",
+ "ifa-fir",
+ "ifa-sema",
+ "ifa-span",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

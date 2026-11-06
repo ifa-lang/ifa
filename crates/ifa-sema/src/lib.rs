@@ -16,7 +16,7 @@ use ifa_ast::Program;
 use ifa_diagnostics::{Diagnostic, Severity};
 use ifa_span::SourceMap;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AnalysisResult {
     pub symbols: SymbolTable,
     pub diagnostics: Vec<Diagnostic>,

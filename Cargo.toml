@@ -14,6 +14,9 @@ members = [
     "crates/ifa-codegen-llvm",
     "crates/ifa-cli",
     "crates/kori",
+    "crates/ifa-lsp",
+    "crates/ifa-wasm",
+    "crates/ifa-stdlib",
 ]
 
 [workspace.package]
@@ -60,3 +63,6 @@ ifa-runtime = { path = "crates/ifa-runtime" }
 ifa-codegen-cranelift = { path = "crates/ifa-codegen-cranelift" }
 ifa-codegen-llvm = { path = "crates/ifa-codegen-llvm" }
 kori = { path = "crates/kori" }
+ifa-lsp = { path = "crates/ifa-lsp" }
+ifa-wasm = { path = "crates/ifa-wasm" }
+ifa-stdlib = { path = "crates/ifa-stdlib" }

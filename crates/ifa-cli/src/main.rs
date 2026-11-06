@@ -132,6 +132,32 @@ enum Commands {
     Tree,
     /// Resolve and pin dependencies into deterministic kori.lock
     Lock,
+    /// Start the IFA Language Server Protocol (LSP 3.17) daemon over stdio
+    Lsp,
+    /// WebAssembly tools: inspect binary modules and package WebAssembly + TypeScript bundles
+    Wasm {
+        #[command(subcommand)]
+        command: WasmCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum WasmCommand {
+    /// Inspect sections, exports, and validate a WebAssembly binary module (.wasm)
+    Inspect {
+        /// Path to the .wasm binary file
+        file: PathBuf,
+    },
+    /// Bundle a WebAssembly binary with TypeScript definitions and JS wrapper into an npm/browser package
+    Bundle {
+        /// Module name
+        name: String,
+        /// Path to the .wasm binary file
+        file: PathBuf,
+        /// Destination output directory (defaults to ./pkg)
+        #[arg(short, long)]
+        out_dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -881,5 +907,100 @@ fn main() -> ExitCode {
                 }
             }
         }
+
+        Commands::Lsp => {
+            let mut server = ifa_lsp::LanguageServer::new();
+            if let Err(e) = server.run_stdio() {
+                eprintln!("error: LSP server failed: {}", e);
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+
+        Commands::Wasm { command } => match command {
+            WasmCommand::Inspect { file } => {
+                let bytes = match fs::read(&file) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("error: failed to read `{}`: {}", file.display(), e);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let inspector = ifa_wasm::WasmModuleInspector::new(&bytes);
+                match inspector.inspect() {
+                    Ok(sections) => {
+                        println!("WebAssembly Module: {}", file.display());
+                        println!(
+                            "Total Size: {} bytes (Valid v1.0 binary header)",
+                            bytes.len()
+                        );
+                        println!("\nSections ({}):", sections.len());
+                        for sec in &sections {
+                            println!(
+                                "  [{:#04x}] {:<12} offset: {:#08x}, size: {} bytes",
+                                sec.id, sec.name, sec.offset, sec.size
+                            );
+                        }
+
+                        if let Ok(exports) = inspector.extract_exports() {
+                            println!("\nExports ({}):", exports.len());
+                            for exp in &exports {
+                                let kind_str = match exp.kind {
+                                    0 => "func",
+                                    1 => "table",
+                                    2 => "mem",
+                                    3 => "global",
+                                    _ => "other",
+                                };
+                                println!(
+                                    "  - {} (kind: {}, index: {})",
+                                    exp.name, kind_str, exp.index
+                                );
+                            }
+                        }
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("error: WebAssembly validation failed: {}", e);
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+
+            WasmCommand::Bundle {
+                name,
+                file,
+                out_dir,
+            } => {
+                let bytes = match fs::read(&file) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("error: failed to read `{}`: {}", file.display(), e);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let out_path = out_dir.unwrap_or_else(|| PathBuf::from("pkg"));
+                let bundler = ifa_wasm::WasmBundler::new(&name, bytes);
+                match bundler.bundle(&out_path) {
+                    Ok(bundle) => {
+                        println!(
+                            "Successfully packaged WebAssembly module `{}` into `{}`",
+                            name,
+                            out_path.display()
+                        );
+                        println!("  WASM: {}", bundle.wasm_file.display());
+                        println!("  JS:   {}", bundle.js_file.display());
+                        println!("  D.TS: {}", bundle.dts_file.display());
+                        println!("  JSON: {}", bundle.package_json_file.display());
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("error: failed to bundle WebAssembly package: {}", e);
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        },
     }
 }

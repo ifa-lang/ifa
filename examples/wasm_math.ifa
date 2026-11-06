@@ -1,0 +1,19 @@
+// IFA WebAssembly Export Example
+// Demonstrates strict pure functions compiled for wasm32-wasi and browser runtime.
+
+pub extern "C" strict fn add(a: i64, b: i64) -> i64 {
+    return a + b
+}
+
+pub extern "C" strict fn multiply(x: i64, factor: i64) -> i64 {
+    return x * factor
+}
+
+pub extern "C" strict fn is_even(n: i64) -> bool {
+    return (n % 2) == 0
+}
+
+pub fn main() -> () {
+    let result = add(40, 2)
+    println("WebAssembly math module initialized")
+}

@@ -1,0 +1,30 @@
+{
+  "name": "ifa-language-support",
+  "displayName": "IFA Programming Language",
+  "description": "Language support, syntax highlighting, and LSP integration for IFA",
+  "version": "0.1.0",
+  "publisher": "ifa-lang",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "ifa",
+        "aliases": ["IFA", "ifa"],
+        "extensions": [".ifa"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "ifa",
+        "scopeName": "source.ifa",
+        "path": "./syntaxes/ifa.tmLanguage.json"
+      }
+    ]
+  }
+}

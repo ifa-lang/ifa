@@ -1,0 +1,12 @@
+# Helix Editor configuration for IFA
+[[language]]
+name = "ifa"
+scope = "source.ifa"
+file-types = ["ifa"]
+comment-token = "//"
+indent = { tab-width = 4, unit = "    " }
+language-servers = [ "ifa-lsp" ]
+
+[language-server.ifa-lsp]
+command = "ifa"
+args = ["lsp"]
