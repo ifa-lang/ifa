@@ -16,3 +16,7 @@ ifa-sema.workspace = true
 ifa-span.workspace = true
 ifa-fir.workspace = true
 ifa-codegen-llvm.workspace = true
+
+[dev-dependencies]
+ifa-lexer.workspace = true
+ifa-parser.workspace = true

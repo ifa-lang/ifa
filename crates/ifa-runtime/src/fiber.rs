@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
 use std::thread;
+#[cfg(not(target_arch = "wasm32"))]
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// Unique identifier for an IFA lightweight fiber.
 pub type FiberId = u64;
@@ -32,7 +34,8 @@ pub struct FiberScheduler {
     completed_fibers: Arc<Mutex<HashMap<FiberId, FiberState>>>,
     notifier: Arc<Condvar>,
     next_fiber_id: AtomicU64,
-    is_running: AtomicBool,
+    is_running: Arc<AtomicBool>,
+    #[cfg(not(target_arch = "wasm32"))]
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -53,12 +56,10 @@ impl FiberScheduler {
         let ready_queue: Arc<Mutex<VecDeque<Fiber>>> = Arc::new(Mutex::new(VecDeque::new()));
         let completed_fibers = Arc::new(Mutex::new(HashMap::new()));
         let notifier = Arc::new(Condvar::new());
-        let is_running = AtomicBool::new(true);
+        let is_running = Arc::new(AtomicBool::new(true));
 
         #[cfg(not(target_arch = "wasm32"))]
         let mut workers = Vec::with_capacity(workers_count);
-        #[cfg(target_arch = "wasm32")]
-        let workers = Vec::new();
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -66,8 +67,8 @@ impl FiberScheduler {
                 let queue = Arc::clone(&ready_queue);
                 let completed = Arc::clone(&completed_fibers);
                 let notif = Arc::clone(&notifier);
+                let is_run = Arc::clone(&is_running);
 
-                let is_run = Arc::new(AtomicBool::new(true));
                 let handle = thread::spawn(move || loop {
                     let task = {
                         let mut lock = queue.lock().unwrap();
@@ -103,6 +104,7 @@ impl FiberScheduler {
             notifier,
             next_fiber_id: AtomicU64::new(1),
             is_running,
+            #[cfg(not(target_arch = "wasm32"))]
             workers: Mutex::new(workers),
         }
     }
@@ -189,14 +191,73 @@ impl FiberScheduler {
         }
     }
 
+    /// Block current context until the specified fiber finishes execution or timeout expires.
+    /// Returns true if fiber completed, false if timed out.
+    pub fn join_timeout(&self, fiber_id: FiberId, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut completed = self.completed_fibers.lock().unwrap();
+            while !completed.contains_key(&fiber_id) {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                let remaining = deadline - now;
+                let (new_completed, wait_res) =
+                    self.notifier.wait_timeout(completed, remaining).unwrap();
+                completed = new_completed;
+                if wait_res.timed_out() && !completed.contains_key(&fiber_id) {
+                    return false;
+                }
+            }
+            true
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            while !self.is_completed(fiber_id) {
+                if std::time::Instant::now() >= deadline || !self.step() {
+                    break;
+                }
+            }
+            self.is_completed(fiber_id)
+        }
+    }
+
     /// Check if scheduler is running.
     pub fn is_running(&self) -> bool {
         self.is_running.load(Ordering::Acquire)
     }
 
+    /// Gracefully shutdown all background worker threads.
+    pub fn shutdown(&self) {
+        self.is_running.store(false, Ordering::Release);
+        self.notifier.notify_all();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut workers = self.workers.lock().unwrap();
+            for handle in workers.drain(..) {
+                let _ = handle.join();
+            }
+        }
+    }
+
     /// Number of worker threads.
     pub fn worker_count(&self) -> usize {
-        self.workers.lock().unwrap().len()
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.workers.lock().unwrap().len()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0
+        }
+    }
+}
+
+impl Drop for FiberScheduler {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -204,22 +265,51 @@ impl FiberScheduler {
 pub struct Channel<T> {
     queue: Mutex<VecDeque<T>>,
     cond: Condvar,
+    capacity: Option<usize>,
 }
 
 impl<T> Channel<T> {
-    /// Create a new channel.
+    /// Create an unbounded communication channel.
     pub fn new() -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
             cond: Condvar::new(),
+            capacity: None,
         }
     }
 
-    /// Send a value to the channel.
+    /// Create a bounded communication channel with backpressure.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            cond: Condvar::new(),
+            capacity: Some(capacity.max(1)),
+        }
+    }
+
+    /// Send a value to the channel (blocks if bounded and full).
     pub fn send(&self, val: T) {
         let mut q = self.queue.lock().unwrap();
+        if let Some(cap) = self.capacity {
+            while q.len() >= cap {
+                q = self.cond.wait(q).unwrap();
+            }
+        }
         q.push_back(val);
-        self.cond.notify_one();
+        self.cond.notify_all();
+    }
+
+    /// Non-blocking send: returns Err(val) if channel capacity is exhausted.
+    pub fn try_send(&self, val: T) -> Result<(), T> {
+        let mut q = self.queue.lock().unwrap();
+        if let Some(cap) = self.capacity {
+            if q.len() >= cap {
+                return Err(val);
+            }
+        }
+        q.push_back(val);
+        self.cond.notify_all();
+        Ok(())
     }
 
     /// Receive a value from the channel, waiting if empty.
@@ -228,7 +318,42 @@ impl<T> Channel<T> {
         while q.is_empty() {
             q = self.cond.wait(q).unwrap();
         }
-        q.pop_front().unwrap()
+        let val = q.pop_front().unwrap();
+        self.cond.notify_all();
+        val
+    }
+
+    /// Non-blocking receive: returns None immediately if empty.
+    pub fn try_recv(&self) -> Option<T> {
+        let mut q = self.queue.lock().unwrap();
+        let val = q.pop_front();
+        if val.is_some() {
+            self.cond.notify_all();
+        }
+        val
+    }
+
+    /// Timed receive: returns None if timeout expires before a value arrives.
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<T> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut q = self.queue.lock().unwrap();
+        while q.is_empty() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline - now;
+            let (new_q, wait_res) = self.cond.wait_timeout(q, remaining).unwrap();
+            q = new_q;
+            if wait_res.timed_out() && q.is_empty() {
+                return None;
+            }
+        }
+        let val = q.pop_front();
+        if val.is_some() {
+            self.cond.notify_all();
+        }
+        val
     }
 }
 

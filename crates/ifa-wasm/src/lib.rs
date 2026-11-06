@@ -1,10 +1,12 @@
 pub mod bindings;
 pub mod bundler;
+pub mod runner;
 pub mod runtime;
 pub mod validator;
 
 pub use bindings::{TypeScriptBindingsGenerator, WasmExportFunction, WasmType};
 pub use bundler::{WasmBundleResult, WasmBundler};
+pub use runner::{WasmEngine, WasmEngineRunner, WasmExecutionResult, WasmRunnerError};
 pub use runtime::{WasiHostEnvironment, WasmLinearMemory, WASM_PAGE_SIZE};
 pub use validator::{WasmExport, WasmModuleInspector, WasmSection, WasmValidationError};
 

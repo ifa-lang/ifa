@@ -108,7 +108,7 @@ enum Commands {
     Build {
         /// Source file path (.ifa) or project directory
         file: Option<PathBuf>,
-        /// Output path for binary or object
+        /// Output path for binary, object, or WebAssembly module
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Emit native object file (.o) without linking
@@ -117,6 +117,9 @@ enum Commands {
         /// Compile in release mode with optimizations
         #[arg(short, long)]
         release: bool,
+        /// Target architecture triple (e.g. wasm32-wasi, x86_64, aarch64)
+        #[arg(short, long)]
+        target: Option<String>,
     },
     /// Add a dependency to the local kori.toml manifest
     Add {
@@ -163,6 +166,20 @@ enum WasmCommand {
         /// Destination output directory (defaults to ./pkg)
         #[arg(short, long)]
         out_dir: Option<PathBuf>,
+    },
+    /// Execute a WebAssembly module function or WASI command via Wasmtime, Wasmer, or internal VM
+    Run {
+        /// Path to the .wasm binary file
+        file: PathBuf,
+        /// Exported function name to invoke (e.g. add, calculate)
+        #[arg(short, long)]
+        function: Option<String>,
+        /// Preferred runtime engine (wasmtime, wasmer, or internal)
+        #[arg(short, long)]
+        engine: Option<String>,
+        /// Arguments passed to the function or module
+        #[arg(last = true)]
+        args: Vec<String>,
     },
 }
 
@@ -694,6 +711,7 @@ fn main() -> ExitCode {
             output,
             emit_obj,
             release,
+            target,
         } => {
             let manifest_dir = if let Some(ref f) = file {
                 if f.is_dir() && f.join("kori.toml").exists() {
@@ -794,6 +812,30 @@ fn main() -> ExitCode {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "out".into());
+
+            let is_wasm = target
+                .as_deref()
+                .map(|t| t.contains("wasm"))
+                .unwrap_or(false)
+                || output
+                    .as_ref()
+                    .and_then(|p| p.extension())
+                    .and_then(|s| s.to_str())
+                    == Some("wasm");
+
+            if is_wasm {
+                let target_cfg = ifa_codegen_llvm::LlvmTargetConfig::wasm32_wasi();
+                let compiler = ifa_codegen_llvm::LlvmCompiler::new(target_cfg);
+                let wasm_dest =
+                    output.unwrap_or_else(|| PathBuf::from(format!("{}.wasm", default_stem)));
+
+                if let Err(e) = compiler.compile_to_wasm(&fir_module, &wasm_dest) {
+                    eprintln!("Failed to compile WebAssembly module: {}", e);
+                    return ExitCode::FAILURE;
+                }
+                println!("Compiled WebAssembly module: {:?}", wasm_dest);
+                return ExitCode::SUCCESS;
+            }
 
             let target_out = output.unwrap_or_else(|| {
                 if emit_obj {
@@ -1060,6 +1102,59 @@ fn main() -> ExitCode {
                     }
                     Err(e) => {
                         eprintln!("error: failed to bundle WebAssembly package: {}", e);
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+
+            WasmCommand::Run {
+                file,
+                function,
+                engine,
+                args,
+            } => {
+                let preferred_engine = match engine.as_deref() {
+                    Some("wasmtime") => ifa_wasm::WasmEngine::Wasmtime,
+                    Some("wasmer") => ifa_wasm::WasmEngine::Wasmer,
+                    Some("internal") => ifa_wasm::WasmEngine::Internal,
+                    Some(other) => {
+                        eprintln!(
+                            "error: unknown WebAssembly engine `{}` (expected wasmtime, wasmer, or internal)",
+                            other
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    None => {
+                        let avail = ifa_wasm::WasmEngineRunner::detect_available_engines();
+                        avail
+                            .into_iter()
+                            .next()
+                            .unwrap_or(ifa_wasm::WasmEngine::Internal)
+                    }
+                };
+
+                match ifa_wasm::WasmEngineRunner::run(
+                    preferred_engine,
+                    &file,
+                    function.as_deref(),
+                    &args,
+                ) {
+                    Ok(res) => {
+                        print!("{}", res.stdout);
+                        if !res.stderr.is_empty() {
+                            eprint!("{}", res.stderr);
+                        }
+                        if let Some(val) = res.return_value {
+                            println!("=> {}", val);
+                        }
+                        if res.exit_code == 0 {
+                            ExitCode::SUCCESS
+                        } else {
+                            ExitCode::FAILURE
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: WebAssembly execution failed: {}", e);
                         ExitCode::FAILURE
                     }
                 }

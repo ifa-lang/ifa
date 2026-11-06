@@ -1,5 +1,5 @@
 use crate::error::LlvmCodegenError;
-use crate::target::LlvmTargetConfig;
+use crate::target::{LlvmTargetConfig, TargetArch};
 use crate::types::fir_to_llvm_type;
 use ifa_fir::{BinaryOp, ConstantValue, FirFunction, FirModule, Terminator, UnaryOp, ValueExpr};
 use ifa_span::INTERNER;
@@ -65,15 +65,60 @@ impl<'a> LlvmIrEmitter<'a> {
         }
 
         // 3. Declare standard runtime intrinsic functions
-        out.push_str("; IFA Runtime Intrinsic Declarations\n");
-        out.push_str("declare void @ifa_rt_println(ptr)\n");
-        out.push_str("declare void @ifa_rt_print(ptr)\n");
-        out.push_str("declare void @ifa_rt_println_i64(i64)\n");
-        out.push_str("declare void @ifa_rt_print_i64(i64)\n");
-        out.push_str("declare ptr @ifa_rt_gen_alloc(i64, i64, i16)\n");
-        out.push_str("declare void @ifa_rt_gen_free(ptr)\n");
-        out.push_str("declare void @ifa_rt_fiber_yield()\n");
-        out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n\n");
+        if self.target.arch == TargetArch::Wasm32Wasi {
+            out.push_str("; WASI Preview 1 standard intrinsics & I/O\n");
+            out.push_str("declare i32 @__wasi_fd_write(i32, ptr, i32, ptr) #2\n\n");
+            out.push_str(
+                "@__ifa_nl = private unnamed_addr constant [1 x i8] c\"\\0A\", align 1\n\n",
+            );
+            out.push_str("define linkonce_odr void @ifa_rt_println(ptr %str) {\n");
+            out.push_str("entry:\n");
+            out.push_str("  br label %len_loop\n");
+            out.push_str("len_loop:\n");
+            out.push_str("  %idx = phi i32 [ 0, %entry ], [ %next_idx, %len_next ]\n");
+            out.push_str("  %p = getelementptr inbounds i8, ptr %str, i32 %idx\n");
+            out.push_str("  %ch = load i8, ptr %p, align 1\n");
+            out.push_str("  %is_zero = icmp eq i8 %ch, 0\n");
+            out.push_str("  br i1 %is_zero, label %write_out, label %len_next\n");
+            out.push_str("len_next:\n");
+            out.push_str("  %next_idx = add i32 %idx, 1\n");
+            out.push_str("  br label %len_loop\n");
+            out.push_str("write_out:\n");
+            out.push_str("  %iov = alloca [4 x i32], align 4\n");
+            out.push_str("  %nwritten = alloca i32, align 4\n");
+            out.push_str("  %p0 = getelementptr inbounds i32, ptr %iov, i32 0\n");
+            out.push_str("  %str_int = ptrtoint ptr %str to i32\n");
+            out.push_str("  store i32 %str_int, ptr %p0, align 4\n");
+            out.push_str("  %p1 = getelementptr inbounds i32, ptr %iov, i32 1\n");
+            out.push_str("  store i32 %idx, ptr %p1, align 4\n");
+            out.push_str("  %p2 = getelementptr inbounds i32, ptr %iov, i32 2\n");
+            out.push_str("  %nl_int = ptrtoint ptr @__ifa_nl to i32\n");
+            out.push_str("  store i32 %nl_int, ptr %p2, align 4\n");
+            out.push_str("  %p3 = getelementptr inbounds i32, ptr %iov, i32 3\n");
+            out.push_str("  store i32 1, ptr %p3, align 4\n");
+            out.push_str(
+                "  %call_res = call i32 @__wasi_fd_write(i32 1, ptr %iov, i32 2, ptr %nwritten)\n",
+            );
+            out.push_str("  ret void\n");
+            out.push_str("}\n\n");
+            out.push_str("declare void @ifa_rt_print(ptr)\n");
+            out.push_str("declare void @ifa_rt_println_i64(i64)\n");
+            out.push_str("declare void @ifa_rt_print_i64(i64)\n");
+            out.push_str("declare ptr @ifa_rt_gen_alloc(i64, i64, i16)\n");
+            out.push_str("declare void @ifa_rt_gen_free(ptr)\n");
+            out.push_str("declare void @ifa_rt_fiber_yield()\n");
+            out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n\n");
+        } else {
+            out.push_str("; IFA Runtime Intrinsic Declarations\n");
+            out.push_str("declare void @ifa_rt_println(ptr)\n");
+            out.push_str("declare void @ifa_rt_print(ptr)\n");
+            out.push_str("declare void @ifa_rt_println_i64(i64)\n");
+            out.push_str("declare void @ifa_rt_print_i64(i64)\n");
+            out.push_str("declare ptr @ifa_rt_gen_alloc(i64, i64, i16)\n");
+            out.push_str("declare void @ifa_rt_gen_free(ptr)\n");
+            out.push_str("declare void @ifa_rt_fiber_yield()\n");
+            out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n\n");
+        }
 
         // Fast-path 1-cycle CPU inlined generation check (alwaysinline with branch weights)
         out.push_str("; Inlined 1-cycle CPU generation check\n");
@@ -92,6 +137,20 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("  unreachable\n");
         out.push_str("}\n\n");
 
+        // WASI entry point wrapper when a main function is defined
+        if self.target.arch == TargetArch::Wasm32Wasi {
+            let has_main = module
+                .functions
+                .iter()
+                .any(|f| INTERNER.resolve(&f.name) == "main");
+            if has_main {
+                out.push_str("; WASI entrypoint wrapper\n");
+                out.push_str(
+                    "define void @_start() {\nentry:\n  call void @main()\n  ret void\n}\n\n",
+                );
+            }
+        }
+
         // 4. Emit function definitions
         for func in &module.functions {
             self.emit_function(func, &mut out)?;
@@ -108,6 +167,11 @@ impl<'a> LlvmIrEmitter<'a> {
             "attributes #1 = {{ \"target-cpu\"=\"{}\" \"target-features\"=\"{}\" }}\n",
             self.target.cpu, self.target.features
         ));
+        if self.target.arch == TargetArch::Wasm32Wasi {
+            out.push_str(
+                "attributes #2 = { \"wasm-import-module\"=\"wasi_snapshot_preview1\" \"wasm-import-name\"=\"fd_write\" }\n",
+            );
+        }
 
         // 6. Metadata for branch weights (predicting nominal 1-cycle CPU execution path)
         out.push_str("\n!0 = !{!\"branch_weights\", i32 1048576, i32 1}\n");

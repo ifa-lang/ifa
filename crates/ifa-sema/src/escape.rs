@@ -1,3 +1,4 @@
+use crate::exclusivity::extract_root_variable;
 use crate::symbol_table::SymbolTable;
 use ifa_ast::{Expr, ExprKind, Function, Stmt, UnaryOp};
 use ifa_diagnostics::Diagnostic;
@@ -29,6 +30,8 @@ pub struct EscapeAnalyzer<'a> {
     pub current_func_is_strict: bool,
     pub current_func_span: Span,
     pub var_info: HashMap<Symbol, VarEscapeInfo>,
+    pub ref_dependencies: HashMap<Symbol, Vec<Symbol>>,
+    pub spawn_depth: usize,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -39,6 +42,8 @@ impl<'a> EscapeAnalyzer<'a> {
             current_func_is_strict: is_strict,
             current_func_span: func_span,
             var_info: HashMap::new(),
+            ref_dependencies: HashMap::new(),
+            spawn_depth: 0,
             diagnostics: Vec::new(),
         }
     }
@@ -76,9 +81,38 @@ impl<'a> EscapeAnalyzer<'a> {
                     self.check_expr(expr);
                 }
             }
-            Stmt::Assign { target, val, .. } => {
+            Stmt::Assign {
+                target, val, span, ..
+            } => {
+                // Static detection of concurrent data race in spawn
+                if self.spawn_depth > 0 {
+                    if let Some((root_sym, root_span)) = extract_root_variable(target) {
+                        if self.var_info.contains_key(&root_sym) {
+                            let var_name = INTERNER.resolve(&root_sym);
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "mutation concurrente interdite : la variable locale '{}' ne peut pas être modifiée au sein d'une fibre 'spawn' sans synchronisation atomique",
+                                    var_name
+                                ))
+                                .with_code("E0025")
+                                .with_primary_label(
+                                    *span,
+                                    format!("mutation concurrente de '{}' dans spawn", var_name),
+                                )
+                                .with_secondary_label(
+                                    root_span,
+                                    format!("'{}' appartient au cadre de pile parent", var_name),
+                                )
+                                .with_note("Les fibres partagent la mémoire de manière non-bloquante et interdisent les courses aux données statiques.")
+                                .with_help("Utilisez un canal 'Channel', un type atomique ou transférez la variable avec 'sink'."),
+                            );
+                        }
+                    }
+                }
+
                 self.check_expr(target);
                 self.check_expr(val);
+
                 // Check if assigning a ref to a struct field (e.g. child.parent = ref parent)
                 if let ExprKind::FieldAccess { receiver, .. } = &target.kind {
                     if let ExprKind::Unary {
@@ -143,12 +177,71 @@ impl<'a> EscapeAnalyzer<'a> {
             ExprKind::Call { callee, args } => {
                 self.check_expr(callee);
                 for arg in args {
+                    // Check for invalid inout passing into concurrent spawn
+                    if self.spawn_depth > 0 {
+                        if let ExprKind::Unary {
+                            op: UnaryOp::InOut,
+                            expr: inner,
+                        } = &arg.value.kind
+                        {
+                            if let Some((root_sym, root_span)) = extract_root_variable(inner) {
+                                if self.var_info.contains_key(&root_sym) {
+                                    let var_name = INTERNER.resolve(&root_sym);
+                                    self.diagnostics.push(
+                                        Diagnostic::error(format!(
+                                            "mutation concurrente interdite : l'argument 'inout {}' crée un accès mutable concurrent au sein d'une fibre 'spawn'",
+                                            var_name
+                                        ))
+                                        .with_code("E0025")
+                                        .with_primary_label(
+                                            arg.value.span,
+                                            "passage inout interdit dans une fibre concurrente",
+                                        )
+                                        .with_secondary_label(
+                                            root_span,
+                                            format!("'{}' appartient au thread parent", var_name),
+                                        )
+                                        .with_help("Transférez la propriété avec 'sink' ou envoyez un message via un canal."),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     self.check_expr(&arg.value);
                 }
             }
             ExprKind::MethodCall { receiver, args, .. } => {
                 self.check_expr(receiver);
                 for arg in args {
+                    if self.spawn_depth > 0 {
+                        if let ExprKind::Unary {
+                            op: UnaryOp::InOut,
+                            expr: inner,
+                        } = &arg.value.kind
+                        {
+                            if let Some((root_sym, root_span)) = extract_root_variable(inner) {
+                                if self.var_info.contains_key(&root_sym) {
+                                    let var_name = INTERNER.resolve(&root_sym);
+                                    self.diagnostics.push(
+                                        Diagnostic::error(format!(
+                                            "mutation concurrente interdite : l'argument 'inout {}' crée un accès mutable concurrent au sein d'une fibre 'spawn'",
+                                            var_name
+                                        ))
+                                        .with_code("E0025")
+                                        .with_primary_label(
+                                            arg.value.span,
+                                            "passage inout interdit dans une fibre concurrente",
+                                        )
+                                        .with_secondary_label(
+                                            root_span,
+                                            format!("'{}' appartient au thread parent", var_name),
+                                        )
+                                        .with_help("Transférez la propriété avec 'sink' ou envoyez un message via un canal."),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     self.check_expr(&arg.value);
                 }
             }
@@ -205,7 +298,20 @@ impl<'a> EscapeAnalyzer<'a> {
                     self.check_expr(item);
                 }
             }
-            ExprKind::Spawn(inner) => self.check_expr(inner),
+            ExprKind::Block(blk) => {
+                for s in &blk.stmts {
+                    self.check_stmt(s);
+                }
+                if let Some(e) = &blk.expr {
+                    self.check_expr(e);
+                }
+            }
+            ExprKind::Spawn(inner) => {
+                let prev_depth = self.spawn_depth;
+                self.spawn_depth += 1;
+                self.check_expr(inner);
+                self.spawn_depth = prev_depth;
+            }
             ExprKind::Comptime(inner) => self.check_expr(inner),
             _ => {}
         }
@@ -231,7 +337,7 @@ impl<'a> EscapeAnalyzer<'a> {
         }
     }
 
-    fn handle_ref_assignment(&mut self, _receiver: &Expr, ref_target: &Expr, span: Span) {
+    fn handle_ref_assignment(&mut self, receiver: &Expr, ref_target: &Expr, span: Span) {
         if self.current_func_is_strict {
             self.diagnostics.push(
                 Diagnostic::error("violation du mode strict : assignation de référence 'ref' interdite en mode strict")
@@ -240,11 +346,68 @@ impl<'a> EscapeAnalyzer<'a> {
             );
         }
 
+        let recv_root = extract_root_variable(receiver).map(|(s, _)| s);
+        let target_root = extract_root_variable(ref_target).map(|(s, _)| s);
+
+        if let (Some(recv), Some(tgt)) = (recv_root, target_root) {
+            self.ref_dependencies.entry(recv).or_default().push(tgt);
+            self.detect_and_handle_cycles();
+        }
+
         if let ExprKind::Ident(sym) = &ref_target.kind {
             if let Some(info) = self.var_info.get_mut(sym) {
                 info.alloc_kind = AllocKind::HeapGenerational;
             }
         }
+    }
+
+    fn detect_and_handle_cycles(&mut self) {
+        let nodes: Vec<Symbol> = self.ref_dependencies.keys().copied().collect();
+        for start_node in nodes {
+            let mut visited = Vec::new();
+            if self.has_cycle(start_node, start_node, &mut visited) {
+                // Promote all participating nodes in the cycle to HeapGenerational
+                for sym in &visited {
+                    if let Some(info) = self.var_info.get_mut(sym) {
+                        info.alloc_kind = AllocKind::HeapGenerational;
+                    }
+                }
+
+                if self.current_func_is_strict {
+                    let names: Vec<String> = visited.iter().map(|s| INTERNER.resolve(s)).collect();
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "violation du mode strict : graphe d'objets cyclique ('{}') interdit en mode strict",
+                            names.join(" -> ")
+                        ))
+                        .with_code("E0020")
+                        .with_primary_label(
+                            self.current_func_span,
+                            "les graphes cycliques par référence 'ref' sont interdits dans une fonction 'strict fn'",
+                        )
+                        .with_note("Le mode strict impose une hiérarchie de pile stricte sans cycles de pointeurs.")
+                        .with_help("Allouez les graphes cycliques dans une arène ou utilisez des indices entiers."),
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    fn has_cycle(&self, current: Symbol, target: Symbol, visited: &mut Vec<Symbol>) -> bool {
+        visited.push(current);
+        if let Some(neighbors) = self.ref_dependencies.get(&current) {
+            for &next in neighbors {
+                if next == target && visited.len() >= 2 {
+                    return true;
+                }
+                if !visited.contains(&next) && self.has_cycle(next, target, visited) {
+                    return true;
+                }
+            }
+        }
+        visited.pop();
+        false
     }
 
     fn check_return_expr(&mut self, expr: &Expr) {

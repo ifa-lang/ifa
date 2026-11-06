@@ -166,6 +166,50 @@ impl LlvmCompiler {
         Ok(())
     }
 
+    /// Compile a FIR module to a standalone WebAssembly (.wasm) binary module using LLVM/Clang and wasm-ld.
+    pub fn compile_to_wasm(
+        &self,
+        module: &FirModule,
+        output_wasm: &Path,
+    ) -> Result<(), LlvmCodegenError> {
+        let wasm_target = LlvmTargetConfig::wasm32_wasi();
+        let mut emitter = LlvmIrEmitter::new(&wasm_target);
+        let ir = emitter.emit_module(module)?;
+
+        let ll_path = output_wasm.with_extension("ll");
+        if let Some(parent) = output_wasm.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&ll_path, &ir)?;
+
+        let clang_status = Command::new("clang")
+            .arg("--target=wasm32-unknown-wasi")
+            .arg("-nostdlib")
+            .arg(format!("-O{}", self.opt_level))
+            .arg(format!("-flto={}", self.lto))
+            .arg("-Wl,--no-entry")
+            .arg("-Wl,--export-all")
+            .arg("-Wl,--allow-undefined")
+            .arg("-o")
+            .arg(output_wasm)
+            .arg(&ll_path)
+            .status();
+
+        let _ = fs::remove_file(&ll_path);
+
+        match clang_status {
+            Ok(s) if s.success() => Ok(()),
+            Ok(s) => Err(LlvmCodegenError::Toolchain(format!(
+                "clang wasm32 compilation failed with exit code: {:?}",
+                s.code()
+            ))),
+            Err(e) => Err(LlvmCodegenError::Toolchain(format!(
+                "Failed to invoke clang for wasm32 compilation (ensure clang and wasm-ld are installed): {}",
+                e
+            ))),
+        }
+    }
+
     /// Link an object file into a standalone executable.
     pub fn link_executable(object_path: &Path, output_bin: &Path) -> Result<(), LlvmCodegenError> {
         ifa_codegen_cranelift::AotCompiler::link_executable(object_path, output_bin)

@@ -25,5 +25,11 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Install LLVM Tools and WebAssembly Runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -q lld clang
+          curl https://wasmtime.dev/install.sh -sSf | bash
+          echo "$HOME/.wasmtime/bin" >> $GITHUB_PATH
       - name: Run Tests
         run: cargo test --workspace -q

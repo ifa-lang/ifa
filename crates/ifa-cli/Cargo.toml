@@ -20,6 +20,7 @@ ifa-comptime.workspace = true
 ifa-fir.workspace = true
 ifa-runtime.workspace = true
 ifa-codegen-cranelift.workspace = true
+ifa-codegen-llvm.workspace = true
 ifa-lsp.workspace = true
 ifa-wasm.workspace = true
 kori.workspace = true

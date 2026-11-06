@@ -191,3 +191,66 @@ fn test_wasi_cooperative_scheduler_and_io() {
     let written = ifa_rt_wasi_write_nonblocking(1, msg.as_ptr(), msg.len());
     assert_eq!(written, msg.len() as isize);
 }
+
+#[test]
+fn test_multithread_interoperability_and_bounded_channels() {
+    let sched = FiberScheduler::new(4);
+    assert_eq!(sched.worker_count(), 4);
+    assert!(sched.is_running());
+
+    // 1. Test bounded channel with try_send and try_recv
+    let chan = std::sync::Arc::new(Channel::with_capacity(2));
+    assert_eq!(chan.try_recv(), None);
+
+    assert!(chan.try_send(1).is_ok());
+    assert!(chan.try_send(2).is_ok());
+    // Capacity 2 full: try_send should fail
+    assert_eq!(chan.try_send(3), Err(3));
+
+    assert_eq!(chan.try_recv(), Some(1));
+    assert_eq!(
+        chan.recv_timeout(std::time::Duration::from_millis(10)),
+        Some(2)
+    );
+    assert_eq!(chan.recv_timeout(std::time::Duration::from_millis(5)), None);
+
+    // 2. High-concurrency producer-consumer dispatching across 4 worker threads
+    let completed_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut fiber_ids = Vec::new();
+
+    // Spawn consumer fiber to drain bounded channel concurrently
+    let ch_cons = std::sync::Arc::clone(&chan);
+    let consumer_fid = sched.spawn(move || {
+        for _ in 0..50 {
+            let _ = ch_cons.recv();
+        }
+    });
+
+    for i in 0..50 {
+        let counter = std::sync::Arc::clone(&completed_count);
+        let ch = std::sync::Arc::clone(&chan);
+        let fid = sched.spawn(move || {
+            ch.send(i);
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        fiber_ids.push(fid);
+    }
+
+    // Join producer fibers with timeout validation
+    for fid in fiber_ids {
+        let ok = sched.join_timeout(fid, std::time::Duration::from_secs(2));
+        assert!(ok, "Fiber {:?} join timed out", fid);
+    }
+
+    let cons_ok = sched.join_timeout(consumer_fid, std::time::Duration::from_secs(2));
+    assert!(cons_ok, "Consumer fiber join timed out");
+
+    assert_eq!(
+        completed_count.load(std::sync::atomic::Ordering::SeqCst),
+        50
+    );
+
+    // 3. Graceful scheduler shutdown
+    sched.shutdown();
+    assert!(!sched.is_running());
+}
