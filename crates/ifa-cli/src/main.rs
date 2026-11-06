@@ -6,9 +6,12 @@ use ifa_lexer::tokenize;
 use ifa_parser::parse;
 use ifa_sema::analyze;
 use ifa_span::{sym, SourceMap, Span, INTERNER};
+use kori::builder::BuildOrchestrator;
+use kori::manifest::{DependencySpec, DetailedDependency, Manifest};
+use kori::resolver::DependencyResolver;
 use std::fs;
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
 
 mod tooling;
 use tooling::{format_source, init_project, lint_program, run_tests};
@@ -81,25 +84,54 @@ enum Commands {
         #[arg(long)]
         no_gen_opt: bool,
     },
-    /// Compile and run an IFA program
+    /// Compile and run an IFA program or package
     Run {
-        /// Source file path (.ifa)
-        file: PathBuf,
+        /// Source file path (.ifa) or project directory
+        file: Option<PathBuf>,
         /// Execute directly as machine code via Cranelift JIT
         #[arg(long)]
         native: bool,
+        /// Compile and run in release mode
+        #[arg(short, long)]
+        release: bool,
+        /// Optional trailing arguments passed directly to the program
+        #[arg(last = true)]
+        args: Vec<String>,
     },
-    /// Compile an IFA program to native object file or binary using Cranelift
+    /// Compile an IFA package or single source file
     Build {
-        /// Source file path (.ifa)
-        file: PathBuf,
+        /// Source file path (.ifa) or project directory
+        file: Option<PathBuf>,
         /// Output path for binary or object
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Emit native object file (.o) without linking
         #[arg(long)]
         emit_obj: bool,
+        /// Compile in release mode with optimizations
+        #[arg(short, long)]
+        release: bool,
     },
+    /// Add a dependency to the local kori.toml manifest
+    Add {
+        /// Dependency package name
+        name: String,
+        /// Optional path to local package directory
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// SemVer version requirement
+        #[arg(short, long)]
+        version: Option<String>,
+    },
+    /// Remove a dependency from the local kori.toml manifest
+    Remove {
+        /// Dependency package name
+        name: String,
+    },
+    /// Display resolved package dependency tree
+    Tree,
+    /// Resolve and pin dependencies into deterministic kori.lock
+    Lock,
 }
 
 fn main() -> ExitCode {
@@ -418,15 +450,85 @@ fn main() -> ExitCode {
             }
         }
 
-        Commands::Run { file, native } => {
-            let src = match fs::read_to_string(&file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: impossible de lire le fichier {:?}: {}", file, e);
+        Commands::Run {
+            file,
+            native,
+            release,
+            args,
+        } => {
+            let manifest_dir = if let Some(ref f) = file {
+                if f.is_dir() && f.join("kori.toml").exists() {
+                    Some(f.clone())
+                } else if f.file_name().and_then(|s| s.to_str()) == Some("kori.toml") {
+                    f.parent().map(|p| p.to_path_buf())
+                } else {
+                    None
+                }
+            } else if Path::new("kori.toml").exists() {
+                Some(PathBuf::from("."))
+            } else {
+                None
+            };
+
+            if let Some(dir) = manifest_dir {
+                match BuildOrchestrator::new(dir) {
+                    Ok(orchestrator) => match orchestrator.build(release, None, false) {
+                        Ok(report) => {
+                            let exe = report
+                                .artifacts
+                                .iter()
+                                .find(|a| a.kind == kori::ArtifactKind::Executable);
+                            if let Some(exe_art) = exe {
+                                let status = Command::new(&exe_art.path).args(&args).status();
+                                match status {
+                                    Ok(s) => {
+                                        return if s.success() {
+                                            ExitCode::SUCCESS
+                                        } else {
+                                            ExitCode::from(s.code().unwrap_or(1) as u8)
+                                        };
+                                    }
+                                    Err(e) => {
+                                        eprintln!("error: execution failed: {}", e);
+                                        return ExitCode::FAILURE;
+                                    }
+                                }
+                            } else {
+                                eprintln!("error: no executable artifact produced by build");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("error: build failed: {}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("error: failed to load package: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+
+            let target_file = match file {
+                Some(f) => f,
+                None => {
+                    eprintln!("error: no input file or kori.toml manifest found");
                     return ExitCode::FAILURE;
                 }
             };
-            let fid = source_map.add_file(file.to_string_lossy(), &src);
+
+            let src = match fs::read_to_string(&target_file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "error: impossible de lire le fichier {:?}: {}",
+                        target_file, e
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            let fid = source_map.add_file(target_file.to_string_lossy(), &src);
             let tokens = tokenize(fid, &src);
             let (prog, parse_diags) = parse(fid, tokens);
 
@@ -502,15 +604,72 @@ fn main() -> ExitCode {
             file,
             output,
             emit_obj,
+            release,
         } => {
-            let src = match fs::read_to_string(&file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: impossible de lire le fichier {:?}: {}", file, e);
+            let manifest_dir = if let Some(ref f) = file {
+                if f.is_dir() && f.join("kori.toml").exists() {
+                    Some(f.clone())
+                } else if f.file_name().and_then(|s| s.to_str()) == Some("kori.toml") {
+                    f.parent().map(|p| p.to_path_buf())
+                } else {
+                    None
+                }
+            } else if Path::new("kori.toml").exists() {
+                Some(PathBuf::from("."))
+            } else {
+                None
+            };
+
+            if let Some(dir) = manifest_dir {
+                match BuildOrchestrator::new(dir) {
+                    Ok(orchestrator) => match orchestrator.build(release, None, false) {
+                        Ok(report) => {
+                            println!(
+                                "Finished {} build in {:.2?}",
+                                if release { "release" } else { "dev" },
+                                report.duration
+                            );
+                            for art in report.artifacts {
+                                println!(
+                                    "  {} {:?} => {}",
+                                    if art.cached { "[cached]" } else { "[built]" },
+                                    art.kind,
+                                    art.path.display()
+                                );
+                            }
+                            return ExitCode::SUCCESS;
+                        }
+                        Err(e) => {
+                            eprintln!("error: build failed: {}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("error: failed to load package: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+
+            let target_file = match file {
+                Some(f) => f,
+                None => {
+                    eprintln!("error: no input file or kori.toml manifest found");
                     return ExitCode::FAILURE;
                 }
             };
-            let fid = source_map.add_file(file.to_string_lossy(), &src);
+
+            let src = match fs::read_to_string(&target_file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "error: impossible de lire le fichier {:?}: {}",
+                        target_file, e
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            let fid = source_map.add_file(target_file.to_string_lossy(), &src);
             let tokens = tokenize(fid, &src);
             let (prog, parse_diags) = parse(fid, tokens);
 
@@ -542,7 +701,7 @@ fn main() -> ExitCode {
                 }
             };
 
-            let default_stem = file
+            let default_stem = target_file
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "out".into());
@@ -582,6 +741,142 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("Failed to initialize Cranelift AOT compiler: {}", e);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+
+        Commands::Add {
+            name,
+            path,
+            version,
+        } => {
+            let manifest_path = Path::new("kori.toml");
+            let mut manifest = match Manifest::from_file(manifest_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let spec = if let Some(p) = path {
+                DependencySpec::Detailed(DetailedDependency {
+                    version,
+                    path: Some(p),
+                    ..Default::default()
+                })
+            } else if let Some(v) = version {
+                DependencySpec::Simple(v)
+            } else {
+                DependencySpec::Simple("0.1.0".to_string())
+            };
+
+            manifest.dependencies.insert(name.clone(), spec);
+            if let Err(e) = manifest.save(manifest_path) {
+                eprintln!("error: failed to update kori.toml: {}", e);
+                return ExitCode::FAILURE;
+            }
+            println!("Added dependency `{}` to kori.toml", name);
+
+            let resolver = DependencyResolver::new(PathBuf::from("."));
+            match resolver.resolve(&manifest, None) {
+                Ok((_, mut lock)) => {
+                    if let Err(e) = lock.save(Path::new("kori.lock")) {
+                        eprintln!("error: failed to save kori.lock: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: dependency resolution failed: {}", e);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+
+        Commands::Remove { name } => {
+            let manifest_path = Path::new("kori.toml");
+            let mut manifest = match Manifest::from_file(manifest_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            if manifest.dependencies.remove(&name).is_some() {
+                if let Err(e) = manifest.save(manifest_path) {
+                    eprintln!("error: failed to update kori.toml: {}", e);
+                    return ExitCode::FAILURE;
+                }
+                println!("Removed dependency `{}` from kori.toml", name);
+
+                let resolver = DependencyResolver::new(PathBuf::from("."));
+                if let Ok((_, mut lock)) = resolver.resolve(&manifest, None) {
+                    let _ = lock.save(Path::new("kori.lock"));
+                }
+                ExitCode::SUCCESS
+            } else {
+                eprintln!("warning: dependency `{}` not found in kori.toml", name);
+                ExitCode::SUCCESS
+            }
+        }
+
+        Commands::Tree => {
+            let manifest_path = Path::new("kori.toml");
+            let manifest = match Manifest::from_file(manifest_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let resolver = DependencyResolver::new(PathBuf::from("."));
+            match resolver.resolve(&manifest, None) {
+                Ok((order, _)) => {
+                    println!("Package Dependency Order (topological):");
+                    for (idx, pkg) in order.iter().enumerate() {
+                        println!(
+                            "  [{}] {} v{} ({})",
+                            idx + 1,
+                            pkg.name,
+                            pkg.version,
+                            pkg.source
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: dependency resolution failed: {}", e);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+
+        Commands::Lock => {
+            let manifest_path = Path::new("kori.toml");
+            let manifest = match Manifest::from_file(manifest_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let resolver = DependencyResolver::new(PathBuf::from("."));
+            match resolver.resolve(&manifest, None) {
+                Ok((_, mut lock)) => {
+                    if let Err(e) = lock.save(Path::new("kori.lock")) {
+                        eprintln!("error: failed to save kori.lock: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                    println!("Synchronized deterministic `kori.lock` successfully");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: failed to resolve dependencies: {}", e);
                     ExitCode::FAILURE
                 }
             }

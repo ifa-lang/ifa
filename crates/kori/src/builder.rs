@@ -1,0 +1,481 @@
+use crate::cache::BuildCache;
+use crate::error::KoriError;
+use crate::ffi_gen::FfiBridgeGenerator;
+use crate::lockfile::Lockfile;
+use crate::manifest::{BackendKind, BinTarget, CrateType, LibTarget, Manifest, ProfileConfig};
+use crate::resolver::{DependencyResolver, ResolvedPackage};
+use ifa_codegen_cranelift::AotCompiler;
+use ifa_codegen_llvm::{LlvmCompiler, LlvmTargetConfig};
+use ifa_fir::compile_to_fir;
+use ifa_lexer::tokenize;
+use ifa_parser::parse;
+use ifa_sema::analyze;
+use ifa_span::SourceMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Instant;
+
+/// Type of artifact built by Kori.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactKind {
+    Executable,
+    SharedLibrary,
+    StaticLibrary,
+    CHeader,
+    PhpBridge,
+}
+
+/// Metadata for a single compiled artifact.
+#[derive(Debug, Clone)]
+pub struct BuiltArtifact {
+    pub name: String,
+    pub path: PathBuf,
+    pub kind: ArtifactKind,
+    pub cached: bool,
+}
+
+/// Compilation and orchestration execution report.
+#[derive(Debug, Clone)]
+pub struct BuildReport {
+    pub packages_resolved: usize,
+    pub artifacts: Vec<BuiltArtifact>,
+    pub duration: std::time::Duration,
+}
+
+/// Multi-target build orchestrator coordinating parsing, FIR lowering, codegen, and FFI bridging.
+pub struct BuildOrchestrator {
+    root_dir: PathBuf,
+    target_dir: PathBuf,
+    manifest: Manifest,
+}
+
+impl BuildOrchestrator {
+    /// Create a build orchestrator rooted at the specified project directory.
+    pub fn new(root_dir: PathBuf) -> Result<Self, KoriError> {
+        let manifest_path = root_dir.join("kori.toml");
+        let mut manifest = Manifest::from_file(&manifest_path)?;
+        manifest.resolve_targets(&root_dir);
+
+        let target_dir = root_dir.join("target");
+        Ok(Self {
+            root_dir,
+            target_dir,
+            manifest,
+        })
+    }
+
+    /// Build all targets under the specified profile (dev or release).
+    pub fn build(
+        &self,
+        release: bool,
+        backend_override: Option<BackendKind>,
+        force: bool,
+    ) -> Result<BuildReport, KoriError> {
+        let start_time = Instant::now();
+        let profile_dir_name = if release { "release" } else { "dev" };
+        let out_dir = self.target_dir.join(profile_dir_name);
+        fs::create_dir_all(&out_dir)?;
+
+        let mut profile = if release {
+            self.manifest.profiles.release.clone()
+        } else {
+            self.manifest.profiles.dev.clone()
+        };
+
+        if let Some(backend) = backend_override {
+            profile.backend = backend;
+        }
+
+        // 1. Dependency resolution and lockfile synchronization
+        let lock_path = self.root_dir.join("kori.lock");
+        let existing_lock = if lock_path.exists() {
+            Lockfile::from_file(&lock_path).ok()
+        } else {
+            None
+        };
+
+        let resolver = DependencyResolver::new(self.root_dir.clone());
+        let (build_order, mut updated_lock) =
+            resolver.resolve(&self.manifest, existing_lock.as_ref())?;
+
+        // Save updated lockfile
+        updated_lock.save(&lock_path)?;
+
+        // 2. Build cache initialization
+        let mut cache = BuildCache::new(&self.target_dir)?;
+
+        let mut all_artifacts = Vec::new();
+
+        // 3. Compile resolved packages in topological order
+        for pkg in &build_order {
+            let pkg_artifacts = self.compile_package(pkg, &profile, &out_dir, &mut cache, force)?;
+            all_artifacts.extend(pkg_artifacts);
+        }
+
+        Ok(BuildReport {
+            packages_resolved: build_order.len(),
+            artifacts: all_artifacts,
+            duration: start_time.elapsed(),
+        })
+    }
+
+    fn compile_package(
+        &self,
+        pkg: &ResolvedPackage,
+        profile: &ProfileConfig,
+        out_dir: &Path,
+        cache: &mut BuildCache,
+        force: bool,
+    ) -> Result<Vec<BuiltArtifact>, KoriError> {
+        let mut manifest = pkg.manifest.clone();
+        manifest.resolve_targets(&pkg.root_dir);
+
+        let mut artifacts = Vec::new();
+
+        // Build binary targets
+        for bin in &manifest.targets.bin {
+            let art = self.build_bin_target(pkg, bin, profile, out_dir, cache, force)?;
+            artifacts.push(art);
+        }
+
+        // Build library targets
+        if let Some(lib) = &manifest.targets.lib {
+            let lib_arts = self.build_lib_target(pkg, lib, profile, out_dir, cache, force)?;
+            artifacts.extend(lib_arts);
+        }
+
+        Ok(artifacts)
+    }
+
+    fn build_bin_target(
+        &self,
+        pkg: &ResolvedPackage,
+        bin: &BinTarget,
+        profile: &ProfileConfig,
+        out_dir: &Path,
+        cache: &mut BuildCache,
+        force: bool,
+    ) -> Result<BuiltArtifact, KoriError> {
+        let target_key = format!("{}:bin:{}", pkg.name, bin.name);
+        let output_bin = out_dir.join(&bin.name);
+        let expected_outputs = [&output_bin as &Path];
+
+        let fingerprint = cache.compute_target_fingerprint(pkg, profile, &[]);
+
+        if !force && cache.is_up_to_date(&target_key, &fingerprint, &expected_outputs) {
+            return Ok(BuiltArtifact {
+                name: bin.name.clone(),
+                path: output_bin,
+                kind: ArtifactKind::Executable,
+                cached: true,
+            });
+        }
+
+        // Compile pipeline
+        let src_path = pkg.root_dir.join(&bin.path);
+        let fir_module = self.compile_source_to_fir(&src_path, &pkg.name)?;
+
+        let obj_path = out_dir.join(format!("{}.o", bin.name));
+
+        match profile.backend {
+            BackendKind::Llvm => {
+                let mut llvm_comp = LlvmCompiler::new(LlvmTargetConfig::host());
+                llvm_comp
+                    .opt_level(profile.opt_level)
+                    .lto(&profile.lto)
+                    .strip_symbols(profile.strip_symbols);
+                llvm_comp
+                    .compile_to_object(&fir_module, &obj_path)
+                    .map_err(|e| {
+                        KoriError::Codegen(format!("LLVM compile to object failed: {}", e))
+                    })?;
+                LlvmCompiler::link_executable(&obj_path, &output_bin).map_err(|e| {
+                    KoriError::Codegen(format!("Failed to link binary `{}`: {}", bin.name, e))
+                })?;
+            }
+            BackendKind::Cranelift => {
+                let compiler = AotCompiler::new().map_err(|e| {
+                    KoriError::Codegen(format!("AOT compiler initialization failed: {}", e))
+                })?;
+
+                compiler
+                    .compile_to_object(&fir_module, &obj_path)
+                    .map_err(|e| {
+                        KoriError::Codegen(format!("Failed to compile to object: {}", e))
+                    })?;
+
+                AotCompiler::link_executable(&obj_path, &output_bin).map_err(|e| {
+                    KoriError::Codegen(format!("Failed to link binary `{}`: {}", bin.name, e))
+                })?;
+            }
+        }
+
+        cache.record_success(&target_key, fingerprint, vec![output_bin.clone()])?;
+
+        Ok(BuiltArtifact {
+            name: bin.name.clone(),
+            path: output_bin,
+            kind: ArtifactKind::Executable,
+            cached: false,
+        })
+    }
+
+    fn build_lib_target(
+        &self,
+        pkg: &ResolvedPackage,
+        lib: &LibTarget,
+        profile: &ProfileConfig,
+        out_dir: &Path,
+        cache: &mut BuildCache,
+        force: bool,
+    ) -> Result<Vec<BuiltArtifact>, KoriError> {
+        let mut artifacts = Vec::new();
+        let src_path = pkg.root_dir.join(&lib.path);
+        let fir_module = self.compile_source_to_fir(&src_path, &pkg.name)?;
+
+        for crate_type in &lib.crate_types {
+            match crate_type {
+                CrateType::Cdylib => {
+                    let so_filename = format!("lib{}.so", lib.name);
+                    let so_path = out_dir.join(&so_filename);
+                    let target_key = format!("{}:cdylib:{}", pkg.name, lib.name);
+                    let fingerprint = cache.compute_target_fingerprint(pkg, profile, &[]);
+
+                    if !force && cache.is_up_to_date(&target_key, &fingerprint, &[&so_path]) {
+                        artifacts.push(BuiltArtifact {
+                            name: lib.name.clone(),
+                            path: so_path.clone(),
+                            kind: ArtifactKind::SharedLibrary,
+                            cached: true,
+                        });
+                    } else {
+                        let obj_path = out_dir.join(format!("{}_cdylib.o", lib.name));
+
+                        match profile.backend {
+                            BackendKind::Llvm => {
+                                let mut llvm_comp = LlvmCompiler::new(LlvmTargetConfig::host());
+                                llvm_comp
+                                    .opt_level(profile.opt_level)
+                                    .lto(&profile.lto)
+                                    .strip_symbols(profile.strip_symbols);
+                                llvm_comp
+                                    .compile_to_object(&fir_module, &obj_path)
+                                    .map_err(|e| {
+                                        KoriError::Codegen(format!(
+                                            "LLVM compile shared object failed: {}",
+                                            e
+                                        ))
+                                    })?;
+                            }
+                            BackendKind::Cranelift => {
+                                let compiler = AotCompiler::new().map_err(|e| {
+                                    KoriError::Codegen(format!(
+                                        "AOT compiler initialization failed: {}",
+                                        e
+                                    ))
+                                })?;
+
+                                compiler.compile_to_object(&fir_module, &obj_path).map_err(
+                                    |e| {
+                                        KoriError::Codegen(format!(
+                                            "Failed to compile shared object: {}",
+                                            e
+                                        ))
+                                    },
+                                )?;
+                            }
+                        }
+
+                        Self::link_shared_library(&obj_path, &so_path)?;
+
+                        cache.record_success(&target_key, fingerprint, vec![so_path.clone()])?;
+
+                        artifacts.push(BuiltArtifact {
+                            name: lib.name.clone(),
+                            path: so_path.clone(),
+                            kind: ArtifactKind::SharedLibrary,
+                            cached: false,
+                        });
+                    }
+
+                    // Automatic FFI generation for PHP 8.4+ / Symfony 8.1 and C header
+                    let ffi_config = pkg.manifest.ffi.clone().unwrap_or_default();
+                    let ffi_gen = FfiBridgeGenerator::new(&pkg.name, ffi_config);
+                    let exported_fns = FfiBridgeGenerator::extract_exported_functions(&fir_module);
+
+                    let (hdr_path, php_path) =
+                        ffi_gen.emit_bindings(&exported_fns, out_dir, &so_filename)?;
+
+                    artifacts.push(BuiltArtifact {
+                        name: format!("{}.h", pkg.name),
+                        path: hdr_path,
+                        kind: ArtifactKind::CHeader,
+                        cached: false,
+                    });
+
+                    artifacts.push(BuiltArtifact {
+                        name: format!("{}Bridge.php", pkg.name),
+                        path: php_path,
+                        kind: ArtifactKind::PhpBridge,
+                        cached: false,
+                    });
+                }
+                CrateType::IfaLib | CrateType::Staticlib | CrateType::Wasm => {
+                    // Supported artifact representations
+                }
+            }
+        }
+
+        Ok(artifacts)
+    }
+
+    fn compile_source_to_fir(
+        &self,
+        source_path: &Path,
+        pkg_name: &str,
+    ) -> Result<ifa_fir::FirModule, KoriError> {
+        let source_text =
+            fs::read_to_string(source_path).map_err(|e| KoriError::CompilationError {
+                package: pkg_name.to_string(),
+                message: format!(
+                    "Failed to read source file `{}`: {}",
+                    source_path.display(),
+                    e
+                ),
+            })?;
+
+        let mut sm = SourceMap::new();
+        let file_id = sm.add_file(source_path.to_string_lossy(), &source_text);
+
+        let tokens = tokenize(file_id, &source_text);
+
+        let (ast_prog, parse_diags) = parse(file_id, tokens);
+        if !parse_diags.is_empty() {
+            let mut msg = String::new();
+            for diag in &parse_diags {
+                msg.push_str(&diag.render_to_string(&sm));
+            }
+            return Err(KoriError::CompilationError {
+                package: pkg_name.to_string(),
+                message: msg,
+            });
+        }
+
+        let analysis = analyze(&sm, &ast_prog);
+        if analysis.has_errors() {
+            let mut msg = String::new();
+            for diag in &analysis.diagnostics {
+                msg.push_str(&diag.render_to_string(&sm));
+            }
+            return Err(KoriError::CompilationError {
+                package: pkg_name.to_string(),
+                message: msg,
+            });
+        }
+
+        let fir_module =
+            compile_to_fir(&ast_prog, &analysis.symbols, true, true).map_err(|errors| {
+                let mut msg = String::new();
+                for diag in &errors {
+                    msg.push_str(&diag.render_to_string(&sm));
+                }
+                KoriError::CompilationError {
+                    package: pkg_name.to_string(),
+                    message: msg,
+                }
+            })?;
+
+        Ok(fir_module)
+    }
+
+    /// Link an object file into a C-ABI compatible dynamic shared library (.so) using host toolchain.
+    pub fn link_shared_library(object_path: &Path, output_so: &Path) -> Result<(), KoriError> {
+        let compilers = ["cc", "gcc", "clang"];
+        let mut last_err = String::new();
+
+        let rt_stub = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+void println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } }
+void ifa_rt_println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } }
+void ifa_rt_print(const char *s) { if (s) { fputs(s, stdout); fflush(stdout); } }
+void ifa_rt_println_i64(int64_t n) { printf("%ld\n", n); }
+void ifa_rt_print_i64(int64_t n) { printf("%ld", n); fflush(stdout); }
+
+typedef struct {
+    uint32_t generation_counter;
+    uint16_t allocation_flags;
+    uint16_t arena_id;
+} ifa_gen_header_t;
+
+void* ifa_rt_gen_alloc(size_t size, size_t align, uint16_t arena_id) {
+    (void)align;
+    size_t total = sizeof(ifa_gen_header_t) + size;
+    void* mem = malloc(total);
+    if (!mem) abort();
+    ifa_gen_header_t* h = (ifa_gen_header_t*)mem;
+    h->generation_counter = 1;
+    h->allocation_flags = 1;
+    h->arena_id = arena_id;
+    return (void*)((uint8_t*)mem + sizeof(ifa_gen_header_t));
+}
+
+void ifa_rt_gen_free(void* ptr) {
+    if (!ptr) return;
+    ifa_gen_header_t* h = (ifa_gen_header_t*)((uint8_t*)ptr - sizeof(ifa_gen_header_t));
+    if (!(h->allocation_flags & 1)) abort();
+    h->allocation_flags &= ~1;
+    h->generation_counter++;
+    free(h);
+}
+
+void ifa_rt_gen_check(const void* ptr, uint32_t remembered_gen) {
+    if (!ptr) abort();
+    const ifa_gen_header_t* h = (const ifa_gen_header_t*)((const uint8_t*)ptr - sizeof(ifa_gen_header_t));
+    if (!(h->allocation_flags & 1) || h->generation_counter != remembered_gen) {
+        fprintf(stderr, "\n[IFA RUNTIME ERROR: SAFE INTERCEPTION] Use-After-Free intercepted at %p (actual gen: %u, expected: %u)\n", ptr, h->generation_counter, remembered_gen);
+        abort();
+    }
+}
+
+void ifa_rt_fiber_yield(void) {}
+"#;
+        let rt_path =
+            std::env::temp_dir().join(format!("ifa_runtime_stub_so_{}.c", std::process::id()));
+        fs::write(&rt_path, rt_stub)?;
+
+        for compiler in &compilers {
+            let status = Command::new(compiler)
+                .arg("-shared")
+                .arg("-fPIC")
+                .arg(object_path)
+                .arg(&rt_path)
+                .arg("-o")
+                .arg(output_so)
+                .status();
+
+            match status {
+                Ok(s) if s.success() => {
+                    let _ = fs::remove_file(&rt_path);
+                    return Ok(());
+                }
+                Ok(s) => {
+                    last_err = format!("Compiler `{}` failed with exit status {}", compiler, s);
+                }
+                Err(e) => {
+                    last_err = format!("Failed to execute `{}`: {}", compiler, e);
+                }
+            }
+        }
+
+        let _ = fs::remove_file(&rt_path);
+        Err(KoriError::Codegen(format!(
+            "Failed to link shared library `{}`: {}",
+            output_so.display(),
+            last_err
+        )))
+    }
+}

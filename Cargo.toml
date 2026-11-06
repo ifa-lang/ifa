@@ -11,7 +11,9 @@ members = [
     "crates/ifa-fir",
     "crates/ifa-runtime",
     "crates/ifa-codegen-cranelift",
+    "crates/ifa-codegen-llvm",
     "crates/ifa-cli",
+    "crates/kori",
 ]
 
 [workspace.package]
@@ -39,6 +41,11 @@ cranelift-native = "0.138.0-rc.1"
 cranelift-jit = "0.138.0-rc.1"
 cranelift-object = "0.138.0-rc.1"
 target-lexicon = "0.13"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+blake3 = "1.5"
+semver = { version = "1.0", features = ["serde"] }
 
 # Internal workspace crates
 ifa-span = { path = "crates/ifa-span" }
@@ -51,3 +58,5 @@ ifa-comptime = { path = "crates/ifa-comptime" }
 ifa-fir = { path = "crates/ifa-fir" }
 ifa-runtime = { path = "crates/ifa-runtime" }
 ifa-codegen-cranelift = { path = "crates/ifa-codegen-cranelift" }
+ifa-codegen-llvm = { path = "crates/ifa-codegen-llvm" }
+kori = { path = "crates/kori" }

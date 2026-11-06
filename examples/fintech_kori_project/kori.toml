@@ -1,0 +1,39 @@
+[package]
+name = "fintech_core"
+version = "0.1.0"
+edition = "2026"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
+license = "MIT OR Apache-2.0"
+description = "Deterministic financial reconciliation and transaction validation service"
+
+[targets]
+bin = [
+    { name = "fintech_cli", path = "src/main.ifa" }
+]
+
+[targets.lib]
+name = "fintech_core"
+path = "src/lib.ifa"
+crate_types = ["cdylib"]
+
+[profiles.dev]
+backend = "cranelift"
+opt_level = 0
+debug_assertions = true
+lto = "none"
+strip_symbols = false
+gen_checks = true
+
+[profiles.release]
+backend = "llvm"
+opt_level = 3
+debug_assertions = false
+lto = "thin"
+strip_symbols = true
+gen_checks = false
+
+[ffi]
+generate_c_headers = true
+generate_php_binding = true
+php_namespace = "App\\Service\\Fintech"
+php_class_name = "FintechNativeBridge"

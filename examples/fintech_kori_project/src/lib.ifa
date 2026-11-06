@@ -1,0 +1,10 @@
+pub extern "C" strict fn calculate_settlement(gross_amount: i64, fee_bps: i64) -> i64 {
+    let fee = (gross_amount * fee_bps) / 10000
+    return gross_amount - fee
+}
+
+pub extern "C" strict fn verify_account_checksum(account_number: i64, branch_code: i64) -> bool {
+    let combined = account_number * 1000 + branch_code
+    let remainder = combined - ((combined / 97) * 97)
+    return remainder == 0
+}

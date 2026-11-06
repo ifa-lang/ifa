@@ -19,4 +19,5 @@ ifa-sema.workspace = true
 ifa-comptime.workspace = true
 ifa-fir.workspace = true
 ifa-codegen-cranelift.workspace = true
+kori.workspace = true
 clap.workspace = true

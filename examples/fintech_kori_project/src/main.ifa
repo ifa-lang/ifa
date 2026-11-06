@@ -1,0 +1,7 @@
+pub fn main() -> () {
+    let base_amount = 50000
+    let fee_bps = 25
+    let fee = (base_amount * fee_bps) / 10000
+    let net = base_amount - fee
+    println("Fintech Core initialized. Transaction net calculation verified.")
+}

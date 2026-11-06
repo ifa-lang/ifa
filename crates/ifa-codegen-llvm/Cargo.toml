@@ -1,0 +1,20 @@
+[package]
+name = "ifa-codegen-llvm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optimizing production LLVM backend for the IFA programming language (x86_64, AArch64, WebAssembly/WASI)."
+
+[dependencies]
+ifa-span.workspace = true
+ifa-fir.workspace = true
+ifa-sema.workspace = true
+ifa-codegen-cranelift.workspace = true
+target-lexicon.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ifa-lexer.workspace = true
+ifa-parser.workspace = true
