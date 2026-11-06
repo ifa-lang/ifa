@@ -233,16 +233,25 @@ pub fn run_tests(prog: &Program, symbols: &SymbolTable) -> (usize, usize, Vec<St
         match interp.execute_function(test_fn, vec![]) {
             Ok(val) => {
                 let duration = start.elapsed();
-                let status_msg = if val == FirValue::Unit || val == FirValue::Bool(true) {
-                    format!("test {} ... ok ({:.2?})", test_fn, duration)
+                if val == FirValue::Unit || val == FirValue::Bool(true) {
+                    let status_msg = format!("test {} ... ok ({:.2?})", test_fn, duration);
+                    logs.push(status_msg);
+                    passed += 1;
+                } else if val == FirValue::Bool(false) {
+                    let status_msg = format!(
+                        "test {} ... FAILED (returned false) ({:.2?})",
+                        test_fn, duration
+                    );
+                    logs.push(status_msg);
+                    failed += 1;
                 } else {
-                    format!(
+                    let status_msg = format!(
                         "test {} ... ok (returned {}) ({:.2?})",
                         test_fn, val, duration
-                    )
-                };
-                logs.push(status_msg);
-                passed += 1;
+                    );
+                    logs.push(status_msg);
+                    passed += 1;
+                }
             }
             Err(e) => {
                 let duration = start.elapsed();

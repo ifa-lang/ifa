@@ -229,9 +229,13 @@ impl FiberScheduler {
         self.is_running.load(Ordering::Acquire)
     }
 
-    /// Gracefully shutdown all background worker threads.
+    /// Gracefully shutdown all background worker threads and clear pending fibers.
     pub fn shutdown(&self) {
         self.is_running.store(false, Ordering::Release);
+        {
+            let mut queue = self.ready_queue.lock().unwrap();
+            queue.clear();
+        }
         self.notifier.notify_all();
         #[cfg(not(target_arch = "wasm32"))]
         {

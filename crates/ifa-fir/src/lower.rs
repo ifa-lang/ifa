@@ -22,11 +22,16 @@ struct FunctionLoweringContext<'a> {
     /// Maps source variables to their FIR type
     var_types: HashMap<Symbol, FirType>,
     symbols: &'a SymbolTable,
+    constants: &'a HashMap<Symbol, &'a Expr>,
     loop_stack: Vec<LoopContext>,
 }
 
 impl<'a> FunctionLoweringContext<'a> {
-    fn new(func_ast: &ifa_ast::Function, symbols: &'a SymbolTable) -> Self {
+    fn new(
+        func_ast: &ifa_ast::Function,
+        symbols: &'a SymbolTable,
+        constants: &'a HashMap<Symbol, &'a Expr>,
+    ) -> Self {
         let ret_ty = func_ast
             .ret_ty
             .as_ref()
@@ -83,6 +88,7 @@ impl<'a> FunctionLoweringContext<'a> {
             var_allocas: HashMap::new(),
             var_types: HashMap::new(),
             symbols,
+            constants,
             loop_stack: Vec::new(),
         }
     }
@@ -113,7 +119,15 @@ impl<'a> FunctionLoweringContext<'a> {
 
     fn extract_field_index_from_fir_type(&self, ty: &FirType, field: Symbol) -> Option<usize> {
         match ty {
-            FirType::Struct(_, fields) => fields.iter().position(|(f_name, _)| *f_name == field),
+            FirType::Struct(name, fields) => {
+                if let Some(pos) = fields.iter().position(|(f_name, _)| *f_name == field) {
+                    Some(pos)
+                } else if let Some(st) = self.symbols.lookup_struct(name) {
+                    st.field_indices.get(&field).copied()
+                } else {
+                    None
+                }
+            }
             FirType::GenerationalRef(inner)
             | FirType::Pointer(inner)
             | FirType::Optional(inner) => self.extract_field_index_from_fir_type(inner, field),
@@ -121,16 +135,117 @@ impl<'a> FunctionLoweringContext<'a> {
         }
     }
 
+    fn infer_expr_fir_type(&self, expr: &Expr) -> Option<FirType> {
+        match &expr.kind {
+            ExprKind::Ident(sym) => {
+                if let Some(ty) = self.var_types.get(sym) {
+                    return Some(ty.clone());
+                }
+                if let Some(var) = self.symbols.lookup_variable(sym) {
+                    return Some(FirType::from_sema_type(&var.ty));
+                }
+                None
+            }
+            ExprKind::FieldAccess { receiver, field } => {
+                let rec_ty = self.infer_expr_fir_type(receiver)?;
+                let mut current = &rec_ty;
+                while let FirType::GenerationalRef(inner)
+                | FirType::Pointer(inner)
+                | FirType::Optional(inner) = current
+                {
+                    current = inner;
+                }
+                let st_name = match current {
+                    FirType::Struct(name, _) => *name,
+                    _ => return None,
+                };
+                if let Some(st) = self.symbols.lookup_struct(&st_name) {
+                    if let Some(f) = st.fields.iter().find(|f| f.name == *field) {
+                        return Some(FirType::from_sema_type(&f.ty));
+                    }
+                }
+                None
+            }
+            ExprKind::Lit(lit) => match lit {
+                Lit::Int(_) => Some(FirType::Int(IntType::I64)),
+                Lit::Float(_) => Some(FirType::Float(FloatType::F64)),
+                Lit::Bool(_) => Some(FirType::Bool),
+                Lit::String(_) => Some(FirType::String),
+                Lit::Char(_) => Some(FirType::Int(IntType::U32)),
+            },
+            ExprKind::Unary {
+                op: UnaryOp::Ref,
+                expr,
+            } => {
+                let inner = self.infer_expr_fir_type(expr)?;
+                Some(FirType::GenerationalRef(Box::new(inner)))
+            }
+            ExprKind::StructInit { name, .. } => {
+                let sym = name.last().copied()?;
+                if let Some(st) = self.symbols.lookup_struct(&sym) {
+                    let fields = st
+                        .fields
+                        .iter()
+                        .map(|f| (f.name, FirType::from_sema_type(&f.ty)))
+                        .collect();
+                    Some(FirType::Struct(sym, fields))
+                } else {
+                    Some(FirType::Struct(sym, Vec::new()))
+                }
+            }
+            ExprKind::Call { callee, .. } => {
+                if let ExprKind::Ident(fn_name) = &callee.kind {
+                    self.symbols
+                        .lookup_function(fn_name)
+                        .map(|func| FirType::from_sema_type(&func.ret_ty))
+                } else {
+                    None
+                }
+            }
+            ExprKind::Binary { op, left, .. } => match op {
+                BinOp::Eq
+                | BinOp::NotEq
+                | BinOp::Lt
+                | BinOp::LtEq
+                | BinOp::Gt
+                | BinOp::GtEq
+                | BinOp::And
+                | BinOp::Or => Some(FirType::Bool),
+                _ => self.infer_expr_fir_type(left),
+            },
+            ExprKind::Index { receiver, .. } => {
+                let rec_ty = self.infer_expr_fir_type(receiver)?;
+                match rec_ty {
+                    FirType::Array(elem, _) | FirType::Slice(elem) => Some(*elem),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn find_field_index(&self, receiver_expr: &Expr, field: Symbol) -> usize {
-        // 1. Check receiver variable type in local scope
+        // 1. Try to infer receiver type directly
+        if let Some(fir_ty) = self.infer_expr_fir_type(receiver_expr) {
+            if let Some(idx) = self.extract_field_index_from_fir_type(&fir_ty, field) {
+                return idx;
+            }
+        }
+        // 2. Check receiver variable type in local scope
         if let ExprKind::Ident(rec_sym) = &receiver_expr.kind {
             if let Some(fir_ty) = self.var_types.get(rec_sym) {
                 if let Some(idx) = self.extract_field_index_from_fir_type(fir_ty, field) {
                     return idx;
                 }
             }
+            if let Some(var_sym) = self.symbols.lookup_variable(rec_sym) {
+                let fir_ty = FirType::from_sema_type(&var_sym.ty);
+                if let Some(idx) = self.extract_field_index_from_fir_type(&fir_ty, field) {
+                    return idx;
+                }
+            }
         }
-        // 2. Lookup in struct definitions in symbol table
+        // 3. Fallback: Lookup in struct definitions in symbol table
         for st in self.symbols.structs.values() {
             if let Some(&idx) = st.field_indices.get(&field) {
                 return idx;
@@ -200,9 +315,21 @@ impl<'a> FunctionLoweringContext<'a> {
                 name, init, span, ..
             } => {
                 let init_val = init.as_ref().map(|e| self.lower_expr(e));
-                let ty = init_val
-                    .map(|_| FirType::Int(IntType::I64))
-                    .unwrap_or(FirType::Unit);
+                let ty = if let Some(init_expr) = init {
+                    if let Some(inferred) = self.infer_expr_fir_type(init_expr) {
+                        inferred
+                    } else if let Some(var_sym) = self.symbols.lookup_variable(name) {
+                        FirType::from_sema_type(&var_sym.ty)
+                    } else {
+                        init_val
+                            .map(|_| FirType::Int(IntType::I64))
+                            .unwrap_or(FirType::Unit)
+                    }
+                } else if let Some(var_sym) = self.symbols.lookup_variable(name) {
+                    FirType::from_sema_type(&var_sym.ty)
+                } else {
+                    FirType::Unit
+                };
 
                 let ptr = self.alloc_value();
                 self.emit(
@@ -253,7 +380,14 @@ impl<'a> FunctionLoweringContext<'a> {
                         );
                     }
                     ExprKind::Index { receiver, index } => {
-                        let base_id = self.lower_expr(receiver);
+                        let base_id = match &receiver.kind {
+                            ExprKind::Ident(sym) => self
+                                .var_allocas
+                                .get(sym)
+                                .copied()
+                                .unwrap_or_else(|| self.lower_expr(receiver)),
+                            _ => self.lower_expr(receiver),
+                        };
                         let idx_id = self.lower_expr(index);
                         self.emit(
                             None,
@@ -420,6 +554,8 @@ impl<'a> FunctionLoweringContext<'a> {
                     let res = self.alloc_value();
                     self.emit(Some(res), ValueExpr::Load { ptr }, span);
                     res
+                } else if let Some(c_expr) = self.constants.get(sym) {
+                    self.lower_expr(c_expr)
                 } else {
                     let res = self.alloc_value();
                     self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), span);
@@ -774,38 +910,68 @@ impl<'a> FunctionLoweringContext<'a> {
                     self.lower_stmt(s);
                 }
                 let then_val = then_branch.expr.as_ref().map(|e| self.lower_expr(e));
-                if let Some(b) = self.func.get_block(self.current_block) {
-                    if !b.is_terminated() {
-                        let args = then_val.map(|v| vec![v]).unwrap_or_default();
-                        self.set_terminator(Terminator::Branch {
-                            target: merge_block,
-                            args,
-                        });
-                    }
-                }
+                let then_end_block = self.current_block;
+                let then_reaches_merge = self
+                    .func
+                    .get_block(then_end_block)
+                    .is_some_and(|b| !b.is_terminated());
 
                 // Else branch
                 self.current_block = else_block;
                 let else_val = else_branch
                     .as_ref()
                     .map(|else_expr| self.lower_expr(else_expr));
-                if let Some(b) = self.func.get_block(self.current_block) {
-                    if !b.is_terminated() {
-                        let args = else_val.map(|v| vec![v]).unwrap_or_default();
-                        self.set_terminator(Terminator::Branch {
-                            target: merge_block,
-                            args,
-                        });
-                    }
+                let else_end_block = self.current_block;
+                let else_reaches_merge = self
+                    .func
+                    .get_block(else_end_block)
+                    .is_some_and(|b| !b.is_terminated());
+
+                let has_phi = else_branch.is_some()
+                    && then_val.is_some()
+                    && else_val.is_some()
+                    && then_reaches_merge
+                    && else_reaches_merge;
+
+                let res = self.alloc_value();
+
+                // Branch from then_end_block if not terminated
+                if then_reaches_merge {
+                    let args = if has_phi {
+                        vec![then_val.unwrap()]
+                    } else {
+                        Vec::new()
+                    };
+                    self.current_block = then_end_block;
+                    self.set_terminator(Terminator::Branch {
+                        target: merge_block,
+                        args,
+                    });
+                }
+
+                // Branch from else_end_block if not terminated
+                if else_reaches_merge {
+                    let args = if has_phi {
+                        vec![else_val.unwrap()]
+                    } else {
+                        Vec::new()
+                    };
+                    self.current_block = else_end_block;
+                    self.set_terminator(Terminator::Branch {
+                        target: merge_block,
+                        args,
+                    });
                 }
 
                 // Merge block
                 self.current_block = merge_block;
-                let res = self.alloc_value();
                 if let Some(mb) = self.func.get_block_mut(merge_block) {
-                    if then_val.is_some() || else_val.is_some() {
+                    if has_phi {
                         mb.push_param(res, FirType::Int(IntType::I64));
                     }
+                }
+                if !has_phi {
+                    self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), span);
                 }
                 res
             }
@@ -854,6 +1020,21 @@ impl<'a> FunctionLoweringContext<'a> {
                 res
             }
 
+            ExprKind::ArrayRepeat(val_expr, count_expr) => {
+                let count: usize = if let ExprKind::Lit(Lit::Int(s)) = &count_expr.kind {
+                    s.as_str().parse().unwrap_or(0)
+                } else {
+                    0
+                };
+                let mut elem_vals = Vec::with_capacity(count);
+                for _ in 0..count {
+                    elem_vals.push(self.lower_expr(val_expr));
+                }
+                let res = self.alloc_value();
+                self.emit(Some(res), ValueExpr::ArrayInit(elem_vals), span);
+                res
+            }
+
             ExprKind::Tuple(elements) => {
                 let mut elem_vals = Vec::new();
                 for e in elements {
@@ -879,6 +1060,8 @@ impl<'a> FunctionLoweringContext<'a> {
                 res
             }
 
+            ExprKind::Comptime(inner) => self.lower_expr(inner),
+
             ExprKind::Unit => {
                 let res = self.alloc_value();
                 self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), span);
@@ -899,11 +1082,18 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
     let module_name = INTERNER.intern("main");
     let mut module = FirModule::new(module_name);
 
+    let mut constants = HashMap::new();
+    for item in &program.items {
+        if let Item::Const(c) = item {
+            constants.insert(c.name, &c.value);
+        }
+    }
+
     for item in &program.items {
         match item {
             Item::Function(func_ast) => {
                 if let Some(body) = &func_ast.body {
-                    let ctx = FunctionLoweringContext::new(func_ast, symbols);
+                    let ctx = FunctionLoweringContext::new(func_ast, symbols, &constants);
                     let fir_func = ctx.lower(body);
                     module.functions.push(fir_func);
                 }

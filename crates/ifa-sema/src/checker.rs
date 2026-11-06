@@ -736,7 +736,21 @@ impl<'a> SemanticAnalyzer<'a> {
                 let rec_ty = self.infer_expr(receiver);
                 match &rec_ty {
                     Type::Struct { name, fields } => {
-                        if let Some((_, fty)) = fields.iter().find(|(n, _)| n == field) {
+                        let actual_fields: Vec<(Symbol, Type)> = if fields.is_empty() {
+                            if let Some(st_def) = self.symbols.lookup_struct(name) {
+                                st_def
+                                    .fields
+                                    .iter()
+                                    .map(|f| (f.name, f.ty.clone()))
+                                    .collect()
+                            } else {
+                                fields.clone()
+                            }
+                        } else {
+                            fields.clone()
+                        };
+
+                        if let Some((_, fty)) = actual_fields.iter().find(|(n, _)| n == field) {
                             fty.clone()
                         } else {
                             let f_name = INTERNER.resolve(field);
@@ -756,15 +770,83 @@ impl<'a> SemanticAnalyzer<'a> {
                         }
                     }
                     Type::Ref(inner) => {
-                        if let Type::Struct { name, fields } = inner.as_ref() {
-                            if let Some((_, fty)) = fields.iter().find(|(n, _)| n == field) {
+                        let actual_struct = match inner.as_ref() {
+                            Type::Struct { name, fields } => Some((*name, fields.clone())),
+                            Type::Optional(opt_inner) => match opt_inner.as_ref() {
+                                Type::Struct { name, fields } => Some((*name, fields.clone())),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some((name, fields)) = actual_struct {
+                            let actual_fields: Vec<(Symbol, Type)> = if fields.is_empty() {
+                                if let Some(st_def) = self.symbols.lookup_struct(&name) {
+                                    st_def
+                                        .fields
+                                        .iter()
+                                        .map(|f| (f.name, f.ty.clone()))
+                                        .collect()
+                                } else {
+                                    fields
+                                }
+                            } else {
+                                fields
+                            };
+
+                            if let Some((_, fty)) = actual_fields.iter().find(|(n, _)| n == field) {
                                 fty.clone()
                             } else {
                                 let f_name = INTERNER.resolve(field);
-                                let s_name = INTERNER.resolve(name);
+                                let s_name = INTERNER.resolve(&name);
                                 self.diagnostics.push(
                                     Diagnostic::error(format!(
                                         "champ '{}' introuvable sur la référence ref {}",
+                                        f_name, s_name
+                                    ))
+                                    .with_code("E0007")
+                                    .with_primary_label(
+                                        expr.span,
+                                        format!("champ '{}' inconnu", f_name),
+                                    ),
+                                );
+                                Type::Unknown
+                            }
+                        } else {
+                            Type::Unknown
+                        }
+                    }
+                    Type::Optional(inner) => {
+                        let actual_struct = match inner.as_ref() {
+                            Type::Struct { name, fields } => Some((*name, fields.clone())),
+                            Type::Ref(ref_inner) => match ref_inner.as_ref() {
+                                Type::Struct { name, fields } => Some((*name, fields.clone())),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some((name, fields)) = actual_struct {
+                            let actual_fields: Vec<(Symbol, Type)> = if fields.is_empty() {
+                                if let Some(st_def) = self.symbols.lookup_struct(&name) {
+                                    st_def
+                                        .fields
+                                        .iter()
+                                        .map(|f| (f.name, f.ty.clone()))
+                                        .collect()
+                                } else {
+                                    fields
+                                }
+                            } else {
+                                fields
+                            };
+
+                            if let Some((_, fty)) = actual_fields.iter().find(|(n, _)| n == field) {
+                                fty.clone()
+                            } else {
+                                let f_name = INTERNER.resolve(field);
+                                let s_name = INTERNER.resolve(&name);
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "champ '{}' introuvable sur l'optionnel {}",
                                         f_name, s_name
                                     ))
                                     .with_code("E0007")
@@ -813,6 +895,11 @@ impl<'a> SemanticAnalyzer<'a> {
                 match &rec_ty {
                     Type::Array(elem, _) => *elem.clone(),
                     Type::Slice(elem) => *elem.clone(),
+                    Type::Generic { name, args }
+                        if INTERNER.resolve(name) == "List" && !args.is_empty() =>
+                    {
+                        args[0].clone()
+                    }
                     _ => {
                         self.diagnostics.push(
                             Diagnostic::error(format!("le type '{}' n'est pas indexable", rec_ty))

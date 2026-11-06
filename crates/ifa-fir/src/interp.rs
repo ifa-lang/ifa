@@ -248,6 +248,21 @@ impl<'a> FirInterpreter<'a> {
             .find(|s| INTERNER.resolve(&s.name) == name)
     }
 
+    /// Resolve field position for a known struct or fallback to precalculated index.
+    fn resolve_struct_field_index(
+        &self,
+        struct_name: Symbol,
+        fallback_idx: usize,
+        field_name: Symbol,
+    ) -> usize {
+        if let Some(st) = self.module.structs.iter().find(|s| s.name == struct_name) {
+            if let Some(pos) = st.fields.iter().position(|(f, _)| *f == field_name) {
+                return pos;
+            }
+        }
+        fallback_idx
+    }
+
     /// Execute a function by name with provided arguments.
     pub fn execute_function(
         &mut self,
@@ -514,17 +529,21 @@ impl<'a> FirInterpreter<'a> {
             }
 
             ValueExpr::GetField {
-                base, field_idx, ..
+                base,
+                field_idx,
+                field_name,
             } => {
                 let base_val = env.get(base).ok_or(InterpError::UndefinedValue(*base))?;
                 match base_val {
-                    FirValue::Struct { fields, .. } => {
-                        if let Some(f) = fields.get(*field_idx) {
+                    FirValue::Struct { name, fields } => {
+                        let actual_idx =
+                            self.resolve_struct_field_index(*name, *field_idx, *field_name);
+                        if let Some(f) = fields.get(actual_idx) {
                             Ok(f.clone())
                         } else {
                             Err(InterpError::Panic(format!(
                                 "Field index {} out of bounds",
-                                field_idx
+                                actual_idx
                             )))
                         }
                     }
@@ -541,26 +560,36 @@ impl<'a> FirInterpreter<'a> {
                     FirValue::Pointer(addr) => {
                         if let Some(target) = self.stack_memory.get(addr) {
                             match target {
-                                FirValue::Struct { fields, .. } => {
-                                    if let Some(f) = fields.get(*field_idx) {
+                                FirValue::Struct { name, fields } => {
+                                    let actual_idx = self.resolve_struct_field_index(
+                                        *name,
+                                        *field_idx,
+                                        *field_name,
+                                    );
+                                    if let Some(f) = fields.get(actual_idx) {
                                         Ok(f.clone())
                                     } else {
                                         Err(InterpError::Panic(format!(
                                             "Field index {} out of bounds",
-                                            field_idx
+                                            actual_idx
                                         )))
                                     }
                                 }
                                 FirValue::GenRef { slot, generation } => {
                                     self.heap.check(*slot, *generation)?;
                                     let heap_val = self.heap.deref(*slot)?;
-                                    if let FirValue::Struct { fields, .. } = heap_val {
-                                        if let Some(f) = fields.get(*field_idx) {
+                                    if let FirValue::Struct { name, fields } = heap_val {
+                                        let actual_idx = self.resolve_struct_field_index(
+                                            *name,
+                                            *field_idx,
+                                            *field_name,
+                                        );
+                                        if let Some(f) = fields.get(actual_idx) {
                                             Ok(f.clone())
                                         } else {
                                             Err(InterpError::Panic(format!(
                                                 "Field index {} out of bounds",
-                                                field_idx
+                                                actual_idx
                                             )))
                                         }
                                     } else {
@@ -580,13 +609,15 @@ impl<'a> FirInterpreter<'a> {
                     FirValue::GenRef { slot, generation } => {
                         self.heap.check(*slot, *generation)?;
                         let heap_val = self.heap.deref(*slot)?;
-                        if let FirValue::Struct { fields, .. } = heap_val {
-                            if let Some(f) = fields.get(*field_idx) {
+                        if let FirValue::Struct { name, fields } = heap_val {
+                            let actual_idx =
+                                self.resolve_struct_field_index(*name, *field_idx, *field_name);
+                            if let Some(f) = fields.get(actual_idx) {
                                 Ok(f.clone())
                             } else {
                                 Err(InterpError::Panic(format!(
                                     "Field index {} out of bounds",
-                                    field_idx
+                                    actual_idx
                                 )))
                             }
                         } else {

@@ -13,6 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod doc;
 mod tooling;
 use tooling::{format_source, init_project, lint_program, run_tests};
 
@@ -49,6 +50,17 @@ enum Commands {
     Test {
         /// Source file path (.ifa)
         file: PathBuf,
+    },
+    /// Generate canonical documentation (Markdown and HTML) for an IFA program or package
+    Doc {
+        /// Source file path (.ifa) or project directory
+        path: Option<PathBuf>,
+        /// Output directory for documentation (defaults to docs/)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Output format: all, markdown, or html (defaults to all)
+        #[arg(short, long, default_value = "all")]
+        format: String,
     },
     /// Run automated performance benchmarks measuring generational safety overhead vs C/Rust
     Bench {
@@ -298,6 +310,27 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
+            }
+        }
+
+        Commands::Doc {
+            path,
+            output,
+            format,
+        } => {
+            let target_path = path.unwrap_or_else(|| PathBuf::from("."));
+            match doc::generate_docs(&target_path, output.as_deref(), &format) {
+                Ok(out_dir) => {
+                    println!(
+                        "Documentation successfully generated in `{}`",
+                        out_dir.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("Error: {}", err);
+                    ExitCode::FAILURE
+                }
             }
         }
 
