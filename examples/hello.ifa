@@ -1,0 +1,13 @@
+import std::io;
+
+fn add(a: u32, inout b: u32) -> u32 {
+    mut res = a + b;
+    return res;
+}
+
+pub fn main() {
+    mut count: u32 = 40;
+    let delta: u32 = 2;
+    let total = add(delta, inout count);
+    io::println("Hello, IFA!");
+}

@@ -1,0 +1,19 @@
+[package]
+name = "ifa-sema"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Semantic analyzer, type checker, exclusivity checker and escape analysis for the IFA language."
+
+[dependencies]
+ifa-span.workspace = true
+ifa-diagnostics.workspace = true
+ifa-ast.workspace = true
+ifa-comptime.workspace = true
+thiserror.workspace = true
+lasso.workspace = true
+
+[dev-dependencies]
+ifa-lexer.workspace = true
+ifa-parser.workspace = true

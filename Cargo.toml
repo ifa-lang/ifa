@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ifa-span",
+    "crates/ifa-diagnostics",
+    "crates/ifa-lexer",
+    "crates/ifa-ast",
+    "crates/ifa-parser",
+    "crates/ifa-sema",
+    "crates/ifa-comptime",
+    "crates/ifa-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ifa-lang/ifa"
+homepage = "https://github.com/ifa-lang/ifa"
+readme = "README.md"
+description = "IFA Programming Language: deterministic, zero GC, zero borrow-checker systems programming language."
+
+[workspace.dependencies]
+lasso = { version = "0.7", features = ["multi-threaded"] }
+lazy_static = "1.4"
+ariadne = "0.4"
+logos = "0.14"
+thiserror = "2.0"
+clap = { version = "4.5", features = ["derive"] }
+
+# Internal workspace crates
+ifa-span = { path = "crates/ifa-span" }
+ifa-diagnostics = { path = "crates/ifa-diagnostics" }
+ifa-lexer = { path = "crates/ifa-lexer" }
+ifa-ast = { path = "crates/ifa-ast" }
+ifa-parser = { path = "crates/ifa-parser" }
+ifa-sema = { path = "crates/ifa-sema" }
+ifa-comptime = { path = "crates/ifa-comptime" }

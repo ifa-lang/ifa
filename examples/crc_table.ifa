@@ -1,0 +1,26 @@
+// Génération d'une table de hachage CRC statique à la compilation
+comptime fn generate_crc_table() -> [u32; 256] {
+    mut table: [u32; 256] = [0u32; 256];
+    mut i: u32 = 0;
+    while i < 256 {
+        mut crc: u32 = i;
+        mut j: u32 = 0;
+        while j < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc = crc >> 1;
+            }
+            j = j + 1;
+        }
+        table[i] = crc;
+        i = i + 1;
+    }
+    return table;
+}
+
+const CRC_TABLE = generate_crc_table();
+
+pub fn main() {
+    let checksum = crc32("IFA programming language");
+}

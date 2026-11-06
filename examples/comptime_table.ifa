@@ -1,0 +1,9 @@
+comptime fn generate_crc_table() -> [u32; 8] {
+    mut table = [0u32; 8];
+    table[0] = 0x12345678;
+    return table;
+}
+
+pub fn main() {
+    let table = comptime generate_crc_table();
+}

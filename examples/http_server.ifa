@@ -1,0 +1,25 @@
+import net::http;
+import std::io;
+import encoding::json;
+
+struct PaymentPayload {
+    merchant_id: String,
+    amount_xof: u64,
+    currency: String
+}
+
+pub fn main() {
+    let port: u16 = 8080;
+    mut server = http::Server::new(port: port);
+
+    server.post("/api/v1/charge", fn(req, res) {
+        let payload = json::decode(req.body()) catch err {
+            return res.status(400).json({ error: "Payload invalide" });
+        };
+
+        io::println("Paiement validé");
+        res.status(200).json({ status: "success", tx_ref: "FA-TX-99482" });
+    });
+
+    server.listen();
+}

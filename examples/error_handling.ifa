@@ -1,0 +1,21 @@
+import std::io;
+
+struct IoError {
+    code: u32,
+    message: String
+}
+
+fn read_config(path: String) -> IoError!String {
+    if path == "" {
+        fail IoError(code: 1, message: "Chemin vide");
+    }
+    return "configuration_data";
+}
+
+pub fn main() {
+    let conf = read_config("config.ifa") catch err {
+        io::println("Erreur de chargement");
+        return;
+    };
+    io::println("Configuration chargee");
+}

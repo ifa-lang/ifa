@@ -1,0 +1,8 @@
+/target
+/scripts
+/logs
+**/*.rs.bk
+*.swp
+*.bak
+.DS_Store
+*.orig

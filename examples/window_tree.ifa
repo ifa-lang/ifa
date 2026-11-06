@@ -1,0 +1,15 @@
+struct WindowNode {
+    id: String,
+    title: String,
+    parent: ?ref WindowNode,
+    children: List<WindowNode>
+}
+
+fn attach_child(inout parent: WindowNode, mut child: WindowNode) {
+    child.parent = ref parent;
+    parent.children.push(child);
+}
+
+pub fn main() {
+    let root = WindowNode(id: "root", title: "Desktop", parent: None, children: List::new());
+}

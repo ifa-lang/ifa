@@ -1,0 +1,20 @@
+[package]
+name = "ifa-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ifa"
+path = "src/main.rs"
+
+[dependencies]
+ifa-span.workspace = true
+ifa-diagnostics.workspace = true
+ifa-lexer.workspace = true
+ifa-ast.workspace = true
+ifa-parser.workspace = true
+ifa-sema.workspace = true
+ifa-comptime.workspace = true
+clap.workspace = true

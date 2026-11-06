@@ -1,0 +1,10 @@
+[package]
+name = "ifa-span"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+lasso.workspace = true
+lazy_static.workspace = true

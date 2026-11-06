@@ -1,0 +1,9 @@
+[package]
+name = "ifa-ast"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ifa-span.workspace = true
