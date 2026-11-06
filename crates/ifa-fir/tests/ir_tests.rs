@@ -178,3 +178,78 @@ fn test_generational_opt_elimination_pass() {
     let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true);
     assert!(fir_module.is_ok());
 }
+
+#[test]
+fn test_fir_interpreter_arithmetic_execution() {
+    let src = r#"
+        fn add(a: i64, b: i64) -> i64 {
+            let res = a + b
+            return res
+        }
+
+        pub fn main() -> i64 {
+            let sum = add(30, 12)
+            return sum
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("calc.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, _) = ifa_parser::parse(fid, tokens);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&module);
+    let result = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(result, FirValue::Int(42));
+}
+
+#[test]
+fn test_fir_interpreter_generational_use_after_free_detection() {
+    let module = FirModule::new(ifa_span::INTERNER.intern("gen_test"));
+    let mut interp = FirInterpreter::new(&module);
+
+    // Alloue un slot sur le tas générationnel
+    let (slot, gen1) = interp.heap.alloc(FirValue::Int(1337));
+    assert_eq!(gen1, 1);
+    assert!(interp.heap.check(slot, gen1).is_ok());
+    assert_eq!(interp.heap.deref(slot).unwrap(), &FirValue::Int(1337));
+
+    // Libère le slot: génération incrémentée à 2
+    interp.heap.free(slot).unwrap();
+
+    // Toute tentative d'accès avec l'ancienne référence (gen 1) déclenche UseAfterFree !
+    let check_res = interp.heap.check(slot, gen1);
+    assert_eq!(
+        check_res,
+        Err(InterpError::UseAfterFree {
+            slot,
+            expected_gen: 1,
+            actual_gen: 2,
+        })
+    );
+}
+
+#[test]
+fn test_fir_interpreter_print_intrinsic() {
+    let src = r#"
+        pub fn main() -> () {
+            println("Hello, IFA SSA execution!")
+            return ()
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("print_test.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, _) = ifa_parser::parse(fid, tokens);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("main", vec![]);
+    assert!(res.is_ok());
+    assert_eq!(interp.captured_output.len(), 1);
+    assert_eq!(interp.captured_output[0], "Hello, IFA SSA execution!");
+}

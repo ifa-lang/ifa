@@ -1,0 +1,21 @@
+fn add(a: i64, b: i64) -> i64 {
+    return a + b;
+}
+
+fn multiply(a: i64, b: i64) -> i64 {
+    return a * b;
+}
+
+pub fn test_addition() -> bool {
+    let result = add(20, 22);
+    return result == 42;
+}
+
+pub fn test_multiplication() -> bool {
+    let result = multiply(6, 7);
+    return result == 42;
+}
+
+pub fn main() {
+    println("Exécuter `ifa test examples/unit_tests.ifa` pour lancer la suite de tests.");
+}

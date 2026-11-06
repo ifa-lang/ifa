@@ -1,6 +1,6 @@
 use clap::{Parser as ClapParser, Subcommand};
 use ifa_comptime::ComptimeVM;
-use ifa_fir::{compile_to_fir, format_module};
+use ifa_fir::{compile_to_fir, format_module, FirInterpreter};
 use ifa_lexer::tokenize;
 use ifa_parser::parse;
 use ifa_sema::analyze;
@@ -8,6 +8,9 @@ use ifa_span::{sym, SourceMap, Span, INTERNER};
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+mod tooling;
+use tooling::{format_source, init_project, lint_program, run_tests};
 
 #[derive(ClapParser)]
 #[command(name = "ifa")]
@@ -20,6 +23,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize a new IFA package with kori.toml manifest and canonical src/main.ifa
+    New {
+        /// Project directory name
+        name: String,
+    },
+    /// Format IFA source file canonically
+    Fmt {
+        /// Source file path (.ifa)
+        file: PathBuf,
+        /// Check if file is formatted without modifying
+        #[arg(long)]
+        check: bool,
+    },
+    /// Run static analysis and linting checks on an IFA program
+    Lint {
+        /// Source file path (.ifa)
+        file: PathBuf,
+    },
+    /// Run unit tests defined in an IFA file
+    Test {
+        /// Source file path (.ifa)
+        file: PathBuf,
+    },
     /// Tokenize and inspect tokens of a source file
     Lex {
         /// Source file path (.ifa)
@@ -54,7 +80,7 @@ enum Commands {
         #[arg(long)]
         no_gen_opt: bool,
     },
-    /// Run an IFA program
+    /// Compile and run an IFA program via FIR SSA execution engine
     Run {
         /// Source file path (.ifa)
         file: PathBuf,
@@ -66,6 +92,119 @@ fn main() -> ExitCode {
     let mut source_map = SourceMap::new();
 
     match cli.command {
+        Commands::New { name } => match init_project(&name) {
+            Ok(()) => {
+                println!(
+                    "Created new IFA package `{}` (kori.toml + src/main.ifa)",
+                    name
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: failed to create package `{}`: {}", name, e);
+                ExitCode::FAILURE
+            }
+        },
+
+        Commands::Fmt { file, check } => {
+            let src = match fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: impossible de lire le fichier {:?}: {}", file, e);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let formatted = format_source(&src);
+            if check {
+                if formatted != src {
+                    eprintln!("error: {:?} is not canonically formatted", file);
+                    return ExitCode::FAILURE;
+                }
+                println!("{:?} is properly formatted", file);
+            } else {
+                if let Err(e) = fs::write(&file, formatted) {
+                    eprintln!("error: failed to write formatted file {:?}: {}", file, e);
+                    return ExitCode::FAILURE;
+                }
+                println!("Formatted {:?}", file);
+            }
+            ExitCode::SUCCESS
+        }
+
+        Commands::Lint { file } => {
+            let src = match fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: impossible de lire le fichier {:?}: {}", file, e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let fid = source_map.add_file(file.to_string_lossy(), &src);
+            let tokens = tokenize(fid, &src);
+            let (prog, parse_diags) = parse(fid, tokens);
+
+            for diag in &parse_diags {
+                eprint!("{}", diag.render_to_string(&source_map));
+            }
+            if !parse_diags.is_empty() {
+                return ExitCode::FAILURE;
+            }
+
+            let warnings = lint_program(&prog, &source_map);
+            if warnings.is_empty() {
+                println!("Lint passed: zero style warnings for {:?}", file);
+                ExitCode::SUCCESS
+            } else {
+                for w in &warnings {
+                    println!("{}", w);
+                }
+                ExitCode::SUCCESS
+            }
+        }
+
+        Commands::Test { file } => {
+            let src = match fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: impossible de lire le fichier {:?}: {}", file, e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let fid = source_map.add_file(file.to_string_lossy(), &src);
+            let tokens = tokenize(fid, &src);
+            let (prog, parse_diags) = parse(fid, tokens);
+
+            for diag in &parse_diags {
+                eprint!("{}", diag.render_to_string(&source_map));
+            }
+            if !parse_diags.is_empty() {
+                return ExitCode::FAILURE;
+            }
+
+            let analysis = analyze(&source_map, &prog);
+            for diag in &analysis.diagnostics {
+                eprint!("{}", diag.render_to_string(&source_map));
+            }
+            if analysis.has_errors() {
+                return ExitCode::FAILURE;
+            }
+
+            println!("\nRunning tests in {:?}:", file);
+            let (passed, failed, logs) = run_tests(&prog, &analysis.symbols);
+            for log in logs {
+                println!("  {}", log);
+            }
+
+            println!("\nTest result: {} passed; {} failed\n", passed, failed);
+
+            if failed > 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+
         Commands::Lex { file } => {
             let src = match fs::read_to_string(&file) {
                 Ok(s) => s,
@@ -86,6 +225,7 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+
         Commands::Parse { file } => {
             let src = match fs::read_to_string(&file) {
                 Ok(s) => s,
@@ -98,22 +238,21 @@ fn main() -> ExitCode {
             let tokens = tokenize(fid, &src);
             let (prog, diags) = parse(fid, tokens);
 
-            if !diags.is_empty() {
-                for diag in &diags {
-                    eprint!("{}", diag.render_to_string(&source_map));
-                }
-                return ExitCode::FAILURE;
+            for diag in &diags {
+                eprint!("{}", diag.render_to_string(&source_map));
             }
 
-            println!(
-                "AST généré avec succès ({} déclarations) :",
-                prog.items.len()
-            );
-            for (idx, item) in prog.items.iter().enumerate() {
-                println!("  [{}] {:?}", idx, item);
+            if diags.is_empty() {
+                println!("AST pour {:?} ({} items):", file, prog.items.len());
+                for item in &prog.items {
+                    println!("  {:#?}", item);
+                }
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
             }
-            ExitCode::SUCCESS
         }
+
         Commands::Check { file } => {
             let src = match fs::read_to_string(&file) {
                 Ok(s) => s,
@@ -126,35 +265,32 @@ fn main() -> ExitCode {
             let tokens = tokenize(fid, &src);
             let (prog, parse_diags) = parse(fid, tokens);
 
-            if !parse_diags.is_empty() {
-                for diag in &parse_diags {
-                    eprint!("{}", diag.render_to_string(&source_map));
-                }
+            let mut has_errors = false;
+            for diag in &parse_diags {
+                eprint!("{}", diag.render_to_string(&source_map));
+                has_errors = true;
+            }
+
+            if has_errors {
                 return ExitCode::FAILURE;
             }
 
             let analysis = analyze(&source_map, &prog);
-            if !analysis.diagnostics.is_empty() {
-                for diag in &analysis.diagnostics {
-                    eprint!("{}", diag.render_to_string(&source_map));
-                }
+            for diag in &analysis.diagnostics {
+                eprint!("{}", diag.render_to_string(&source_map));
             }
 
             if analysis.has_errors() {
-                return ExitCode::FAILURE;
+                ExitCode::FAILURE
+            } else {
+                println!(
+                    "Analyse sémantique réussie pour {:?}. Aucune erreur détectée.",
+                    file
+                );
+                ExitCode::SUCCESS
             }
-
-            let func_count = analysis.symbols.functions.len();
-            let struct_count = analysis.symbols.structs.len();
-            println!(
-                "Vérification réussie : {:?} ({} déclarations, {} fonctions, {} structures, 0 erreur)",
-                file,
-                prog.items.len(),
-                func_count,
-                struct_count
-            );
-            ExitCode::SUCCESS
         }
+
         Commands::Comptime { file, function } => {
             let src = match fs::read_to_string(&file) {
                 Ok(s) => s,
@@ -217,6 +353,7 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+
         Commands::Fir {
             file,
             no_cow,
@@ -265,6 +402,7 @@ fn main() -> ExitCode {
                 }
             }
         }
+
         Commands::Run { file } => {
             let src = match fs::read_to_string(&file) {
                 Ok(s) => s,
@@ -295,13 +433,29 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            println!(
-                "Programme IFA vérifié et validé : {:?} ({} items)",
-                file,
-                prog.items.len()
-            );
-            println!("(Backend d'exécution JIT Cranelift en cours d'intégration)");
-            ExitCode::SUCCESS
+            let fir_module = match compile_to_fir(&prog, &analysis.symbols, true, true) {
+                Ok(m) => m,
+                Err(errors) => {
+                    for err in errors {
+                        eprint!("{}", err.render_to_string(&source_map));
+                    }
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let mut interp = FirInterpreter::new(&fir_module);
+            match interp.execute_function("main", vec![]) {
+                Ok(val) => {
+                    if val != ifa_fir::FirValue::Unit {
+                        println!("Program finished with result: {}", val);
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("runtime error: {}", e);
+                    ExitCode::FAILURE
+                }
+            }
         }
     }
 }

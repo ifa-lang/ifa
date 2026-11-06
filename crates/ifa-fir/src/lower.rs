@@ -115,25 +115,31 @@ impl<'a> FunctionLoweringContext<'a> {
         // 1. In entry block, create allocas for parameters and store incoming values
         let entry_params = self.func.params.clone();
         for p in entry_params {
-            let ptr_val = self.alloc_value();
-            self.emit(
-                Some(ptr_val),
-                ValueExpr::Alloca {
-                    ty: p.ty.clone(),
-                    name: Some(p.name),
-                },
-                self.func.span,
-            );
-            self.emit(
-                None,
-                ValueExpr::Store {
-                    ptr: ptr_val,
-                    val: p.val,
-                },
-                self.func.span,
-            );
-            self.var_allocas.insert(p.name, ptr_val);
-            self.var_types.insert(p.name, p.ty);
+            if p.mode == ifa_ast::ParamMode::InOut {
+                // InOut parameter is an l-value pointer projection passed directly by the caller
+                self.var_allocas.insert(p.name, p.val);
+                self.var_types.insert(p.name, p.ty);
+            } else {
+                let ptr_val = self.alloc_value();
+                self.emit(
+                    Some(ptr_val),
+                    ValueExpr::Alloca {
+                        ty: p.ty.clone(),
+                        name: Some(p.name),
+                    },
+                    self.func.span,
+                );
+                self.emit(
+                    None,
+                    ValueExpr::Store {
+                        ptr: ptr_val,
+                        val: p.val,
+                    },
+                    self.func.span,
+                );
+                self.var_allocas.insert(p.name, ptr_val);
+                self.var_types.insert(p.name, p.ty);
+            }
         }
 
         // 2. Lower all statements in the body
@@ -491,12 +497,19 @@ impl<'a> FunctionLoweringContext<'a> {
                     arg_vals.push(self.lower_expr(&a.value));
                 }
 
-                if let ExprKind::Ident(fn_name) = &callee.kind {
+                let direct_name = match &callee.kind {
+                    ExprKind::Ident(fn_name) => Some(*fn_name),
+                    ExprKind::Path(path) => path.last().copied(),
+                    ExprKind::FieldAccess { field, .. } => Some(*field),
+                    _ => None,
+                };
+
+                if let Some(fn_name) = direct_name {
                     let res = self.alloc_value();
                     self.emit(
                         Some(res),
                         ValueExpr::CallDirect {
-                            name: *fn_name,
+                            name: fn_name,
                             args: arg_vals,
                         },
                         span,
