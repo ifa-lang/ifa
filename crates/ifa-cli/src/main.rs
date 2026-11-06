@@ -1,5 +1,6 @@
 use clap::{Parser as ClapParser, Subcommand};
 use ifa_comptime::ComptimeVM;
+use ifa_fir::{compile_to_fir, format_module};
 use ifa_lexer::tokenize;
 use ifa_parser::parse;
 use ifa_sema::analyze;
@@ -41,6 +42,17 @@ enum Commands {
         /// Optional comptime function name to evaluate
         #[arg(short, long)]
         function: Option<String>,
+    },
+    /// Generate and inspect FIR SSA (IFA Intermediate Representation)
+    Fir {
+        /// Source file path (.ifa)
+        file: PathBuf,
+        /// Disable implicit Copy-on-Write transformation pass
+        #[arg(long)]
+        no_cow: bool,
+        /// Disable generational check elimination pass
+        #[arg(long)]
+        no_gen_opt: bool,
     },
     /// Run an IFA program
     Run {
@@ -203,6 +215,54 @@ fn main() -> ExitCode {
                     println!("  const {} = {}", INTERNER.resolve(name), val);
                 }
                 ExitCode::SUCCESS
+            }
+        }
+        Commands::Fir {
+            file,
+            no_cow,
+            no_gen_opt,
+        } => {
+            let src = match fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: impossible de lire le fichier {:?}: {}", file, e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let fid = source_map.add_file(file.to_string_lossy(), &src);
+            let tokens = tokenize(fid, &src);
+            let (prog, parse_diags) = parse(fid, tokens);
+
+            if !parse_diags.is_empty() {
+                for diag in &parse_diags {
+                    eprint!("{}", diag.render_to_string(&source_map));
+                }
+                return ExitCode::FAILURE;
+            }
+
+            let analysis = analyze(&source_map, &prog);
+            if !analysis.diagnostics.is_empty() {
+                for diag in &analysis.diagnostics {
+                    eprint!("{}", diag.render_to_string(&source_map));
+                }
+            }
+
+            if analysis.has_errors() {
+                return ExitCode::FAILURE;
+            }
+
+            match compile_to_fir(&prog, &analysis.symbols, !no_cow, !no_gen_opt) {
+                Ok(fir_module) => {
+                    let formatted = format_module(&fir_module);
+                    print!("{}", formatted);
+                    ExitCode::SUCCESS
+                }
+                Err(errors) => {
+                    for err in errors {
+                        eprint!("{}", err.render_to_string(&source_map));
+                    }
+                    ExitCode::FAILURE
+                }
             }
         }
         Commands::Run { file } => {

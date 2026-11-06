@@ -8,6 +8,7 @@ members = [
     "crates/ifa-parser",
     "crates/ifa-sema",
     "crates/ifa-comptime",
+    "crates/ifa-fir",
     "crates/ifa-cli",
 ]
 
@@ -28,6 +29,7 @@ ariadne = "0.4"
 logos = "0.14"
 thiserror = "2.0"
 clap = { version = "4.5", features = ["derive"] }
+petgraph = "0.7"
 
 # Internal workspace crates
 ifa-span = { path = "crates/ifa-span" }
@@ -37,3 +39,4 @@ ifa-ast = { path = "crates/ifa-ast" }
 ifa-parser = { path = "crates/ifa-parser" }
 ifa-sema = { path = "crates/ifa-sema" }
 ifa-comptime = { path = "crates/ifa-comptime" }
+ifa-fir = { path = "crates/ifa-fir" }

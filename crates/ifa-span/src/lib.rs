@@ -180,6 +180,16 @@ impl SourceMap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Symbol(pub Spur);
 
+impl Symbol {
+    pub fn as_str(&self) -> String {
+        INTERNER.resolve(self)
+    }
+
+    pub fn resolve(&self) -> String {
+        INTERNER.resolve(self)
+    }
+}
+
 impl fmt::Display for Symbol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", INTERNER.resolve(self))

@@ -17,4 +17,5 @@ ifa-ast.workspace = true
 ifa-parser.workspace = true
 ifa-sema.workspace = true
 ifa-comptime.workspace = true
+ifa-fir.workspace = true
 clap.workspace = true
