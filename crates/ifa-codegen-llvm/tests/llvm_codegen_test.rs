@@ -128,3 +128,49 @@ pub fn main() -> () {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_lto_cross_module_compilation() {
+    let temp_dir = std::env::temp_dir().join(format!("llvm_lto_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let src1 = r#"
+pub extern "C" fn calculate_tax(amount: i64) -> i64 {
+    let tax = amount / 5
+    return tax
+}
+"#;
+
+    let src2 = r#"
+pub fn main() -> () {
+    let total = 1000
+    println("LTO module execution completed.")
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid1 = sm.add_file("math_mod.ifa".to_string(), src1);
+    let (prog1, _) = parse(fid1, tokenize(fid1, src1));
+    let analysis1 = analyze(&sm, &prog1);
+    let fir1 = compile_to_fir(&prog1, &analysis1.symbols, true, true).unwrap();
+
+    let fid2 = sm.add_file("main_mod.ifa".to_string(), src2);
+    let (prog2, _) = parse(fid2, tokenize(fid2, src2));
+    let analysis2 = analyze(&sm, &prog2);
+    let fir2 = compile_to_fir(&prog2, &analysis2.symbols, true, true).unwrap();
+
+    let mut compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    compiler.lto("thin").opt_level(3);
+
+    let lto_obj = temp_dir.join("lto_combined.o");
+    compiler
+        .compile_modules_lto(&[&fir1, &fir2], &lto_obj)
+        .expect("LTO compilation failed");
+
+    assert!(lto_obj.exists());
+    let metadata = fs::metadata(&lto_obj).unwrap();
+    assert!(metadata.len() > 0);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

@@ -3,7 +3,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
+#[cfg(not(target_arch = "wasm32"))]
+use std::thread;
+use std::thread::JoinHandle;
 
 /// Unique identifier for an IFA lightweight fiber.
 pub type FiberId = u64;
@@ -37,6 +39,7 @@ pub struct FiberScheduler {
 impl FiberScheduler {
     /// Create a new fiber scheduler configured with standard worker threads.
     pub fn new(num_workers: usize) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
         let workers_count = if num_workers == 0 {
             std::thread::available_parallelism()
                 .map(|p| p.get())
@@ -44,46 +47,54 @@ impl FiberScheduler {
         } else {
             num_workers
         };
+        #[cfg(target_arch = "wasm32")]
+        let _ = num_workers;
 
         let ready_queue: Arc<Mutex<VecDeque<Fiber>>> = Arc::new(Mutex::new(VecDeque::new()));
         let completed_fibers = Arc::new(Mutex::new(HashMap::new()));
         let notifier = Arc::new(Condvar::new());
         let is_running = AtomicBool::new(true);
 
+        #[cfg(not(target_arch = "wasm32"))]
         let mut workers = Vec::with_capacity(workers_count);
+        #[cfg(target_arch = "wasm32")]
+        let workers = Vec::new();
 
-        for _ in 0..workers_count {
-            let queue = Arc::clone(&ready_queue);
-            let completed = Arc::clone(&completed_fibers);
-            let notif = Arc::clone(&notifier);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            for _ in 0..workers_count {
+                let queue = Arc::clone(&ready_queue);
+                let completed = Arc::clone(&completed_fibers);
+                let notif = Arc::clone(&notifier);
 
-            let is_run = Arc::new(AtomicBool::new(true));
-            let handle = thread::spawn(move || loop {
-                let task = {
-                    let mut lock = queue.lock().unwrap();
-                    while lock.is_empty() && is_run.load(Ordering::Relaxed) {
-                        lock = notif.wait(lock).unwrap();
+                let is_run = Arc::new(AtomicBool::new(true));
+                let handle = thread::spawn(move || loop {
+                    let task = {
+                        let mut lock = queue.lock().unwrap();
+                        while lock.is_empty() && is_run.load(Ordering::Relaxed) {
+                            lock = notif.wait(lock).unwrap();
+                        }
+                        if !is_run.load(Ordering::Relaxed) && lock.is_empty() {
+                            break;
+                        }
+                        lock.pop_front()
+                    };
+
+                    if let Some(mut fiber) = task {
+                        if let Some(exec) = fiber.task.take() {
+                            fiber.state = FiberState::Running;
+                            exec();
+                            fiber.state = FiberState::Completed;
+
+                            let mut comp = completed.lock().unwrap();
+                            comp.insert(fiber.id, FiberState::Completed);
+                            notif.notify_all();
+                        }
                     }
-                    if !is_run.load(Ordering::Relaxed) && lock.is_empty() {
-                        break;
-                    }
-                    lock.pop_front()
-                };
+                });
 
-                if let Some(mut fiber) = task {
-                    if let Some(exec) = fiber.task.take() {
-                        fiber.state = FiberState::Running;
-                        exec();
-                        fiber.state = FiberState::Completed;
-
-                        let mut comp = completed.lock().unwrap();
-                        comp.insert(fiber.id, FiberState::Completed);
-                        notif.notify_all();
-                    }
-                }
-            });
-
-            workers.push(handle);
+                workers.push(handle);
+            }
         }
 
         Self {
@@ -119,14 +130,62 @@ impl FiberScheduler {
 
     /// Cooperative yield: relinquishes current execution slice to allow other fibers to run.
     pub fn yield_now(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
         thread::yield_now();
+        #[cfg(target_arch = "wasm32")]
+        let _ = self.step();
+    }
+
+    /// Execute a single fiber from the ready queue cooperatively.
+    /// Returns true if a task was executed, false if the queue was empty.
+    pub fn step(&self) -> bool {
+        let task = {
+            let mut queue = self.ready_queue.lock().unwrap();
+            queue.pop_front()
+        };
+
+        if let Some(mut fiber) = task {
+            if let Some(exec) = fiber.task.take() {
+                fiber.state = FiberState::Running;
+                exec();
+                fiber.state = FiberState::Completed;
+
+                let mut comp = self.completed_fibers.lock().unwrap();
+                comp.insert(fiber.id, FiberState::Completed);
+                self.notifier.notify_all();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Run all queued fibers sequentially until no runnable fibers remain.
+    pub fn run_until_idle(&self) {
+        while self.step() {}
+    }
+
+    /// Check if a specific fiber has completed execution.
+    pub fn is_completed(&self, fiber_id: FiberId) -> bool {
+        let completed = self.completed_fibers.lock().unwrap();
+        completed.contains_key(&fiber_id)
     }
 
     /// Block current context until the specified fiber has finished execution.
     pub fn join(&self, fiber_id: FiberId) {
-        let mut completed = self.completed_fibers.lock().unwrap();
-        while !completed.contains_key(&fiber_id) {
-            completed = self.notifier.wait(completed).unwrap();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut completed = self.completed_fibers.lock().unwrap();
+            while !completed.contains_key(&fiber_id) {
+                completed = self.notifier.wait(completed).unwrap();
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            while !self.is_completed(fiber_id) {
+                if !self.step() {
+                    break;
+                }
+            }
         }
     }
 

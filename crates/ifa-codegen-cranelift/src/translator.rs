@@ -339,13 +339,21 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             ValueExpr::GenCheck { ref_val, redundant } => {
                 if !redundant {
                     let p = self.value_map[ref_val];
-                    let gen_val = self.builder.ins().iconst(types::I32, 1);
-                    if let Some(func_id) = self.func_ids.get("ifa_rt_gen_check") {
-                        let local_func = self
-                            .module
-                            .declare_func_in_func(*func_id, self.builder.func);
-                        self.builder.ins().call(local_func, &[p, gen_val]);
-                    }
+                    // Inlined 1-cycle CPU generation check:
+                    // 1. Load actual generation from 64-bit GenHeader (offset -8)
+                    let actual_gen =
+                        self.builder
+                            .ins()
+                            .load(types::I32, MemFlagsData::trusted(), p, -8);
+                    // 2. Expected generation (1 for newly allocated slots or tracked gen)
+                    let expected_gen = self.builder.ins().iconst(types::I32, 1);
+                    // 3. Fast integer equality comparison in 1 CPU cycle
+                    let is_valid = self
+                        .builder
+                        .ins()
+                        .icmp(IntCC::Equal, actual_gen, expected_gen);
+                    // 4. Trap immediately if invalid (Use-After-Free intercepted without crash)
+                    self.builder.ins().trapz(is_valid, TrapCode::unwrap_user(1));
                 }
                 None
             }

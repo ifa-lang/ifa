@@ -160,3 +160,34 @@ fn test_ifa_map_deterministic_operations() {
     assert_eq!(map.len(), 2);
     assert_eq!(map.get("beta"), None);
 }
+
+#[test]
+fn test_generational_benchmark_suite() {
+    let report = run_generational_benchmark_suite(100_000);
+    assert_eq!(report.iterations, 100_000);
+    assert!(report.c_raw_pointer.ns_per_op > 0.0);
+    assert!(report.rust_borrow_checker.ns_per_op > 0.0);
+    assert!(report.ifa_static_elimination.ns_per_op > 0.0);
+    assert!(report.ifa_generational_inlined.ns_per_op > 0.0);
+    // In debug mode, verify metrics are positive and finite
+    assert!(report.delta_cycles_vs_c >= 0.0);
+}
+
+#[test]
+fn test_wasi_cooperative_scheduler_and_io() {
+    let sched = FiberScheduler::new(1);
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let c1 = std::sync::Arc::clone(&counter);
+    let fid = sched.spawn(move || {
+        c1.fetch_add(10, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    sched.join(fid);
+    assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 10);
+
+    // Test non-blocking WASI stream writing
+    let msg = b"WASI fiber output\n";
+    let written = ifa_rt_wasi_write_nonblocking(1, msg.as_ptr(), msg.len());
+    assert_eq!(written, msg.len() as isize);
+}

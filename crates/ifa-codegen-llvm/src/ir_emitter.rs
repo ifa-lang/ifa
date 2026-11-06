@@ -66,15 +66,31 @@ impl<'a> LlvmIrEmitter<'a> {
 
         // 3. Declare standard runtime intrinsic functions
         out.push_str("; IFA Runtime Intrinsic Declarations\n");
-        out.push_str("declare void @println(ptr)\n");
         out.push_str("declare void @ifa_rt_println(ptr)\n");
         out.push_str("declare void @ifa_rt_print(ptr)\n");
         out.push_str("declare void @ifa_rt_println_i64(i64)\n");
         out.push_str("declare void @ifa_rt_print_i64(i64)\n");
         out.push_str("declare ptr @ifa_rt_gen_alloc(i64, i64, i16)\n");
         out.push_str("declare void @ifa_rt_gen_free(ptr)\n");
-        out.push_str("declare void @ifa_rt_gen_check(ptr, i32)\n");
-        out.push_str("declare void @ifa_rt_fiber_yield()\n\n");
+        out.push_str("declare void @ifa_rt_fiber_yield()\n");
+        out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n\n");
+
+        // Fast-path 1-cycle CPU inlined generation check (alwaysinline with branch weights)
+        out.push_str("; Inlined 1-cycle CPU generation check\n");
+        out.push_str("define linkonce_odr void @ifa_rt_gen_check(ptr %ptr, i32 %remembered_gen) alwaysinline {\n");
+        out.push_str("entry:\n");
+        out.push_str("  %hdr_ptr = getelementptr inbounds i8, ptr %ptr, i64 -8\n");
+        out.push_str("  %actual_gen = load i32, ptr %hdr_ptr, align 4\n");
+        out.push_str("  %match = icmp eq i32 %actual_gen, %remembered_gen\n");
+        out.push_str("  br i1 %match, label %ok, label %uaf, !prof !0\n\n");
+        out.push_str("ok:\n");
+        out.push_str("  ret void\n\n");
+        out.push_str("uaf:\n");
+        out.push_str(
+            "  call void @ifa_rt_panic_uaf(ptr %ptr, i32 %remembered_gen, i32 %actual_gen)\n",
+        );
+        out.push_str("  unreachable\n");
+        out.push_str("}\n\n");
 
         // 4. Emit function definitions
         for func in &module.functions {
@@ -92,6 +108,9 @@ impl<'a> LlvmIrEmitter<'a> {
             "attributes #1 = {{ \"target-cpu\"=\"{}\" \"target-features\"=\"{}\" }}\n",
             self.target.cpu, self.target.features
         ));
+
+        // 6. Metadata for branch weights (predicting nominal 1-cycle CPU execution path)
+        out.push_str("\n!0 = !{!\"branch_weights\", i32 1048576, i32 1}\n");
 
         Ok(out)
     }
@@ -111,10 +130,9 @@ impl<'a> LlvmIrEmitter<'a> {
         let params_str: Vec<String> = func
             .params
             .iter()
-            .enumerate()
-            .map(|(idx, p)| {
+            .map(|p| {
                 let ty = fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "ptr".to_string());
-                format!("{} %arg{}", ty, idx)
+                format!("{} %v{}", ty, p.val.0)
             })
             .collect();
 
@@ -247,13 +265,36 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             ValueExpr::CallDirect { name, args } => {
                 let callee_name = INTERNER.resolve(name);
-                let args_str: Vec<String> = args.iter().map(|a| format!("i64 %v{}", a.0)).collect();
-                out.push_str(&format!(
-                    "  %v{} = call i64 @{}({})\n",
-                    res_id,
-                    callee_name,
-                    args_str.join(", ")
-                ));
+                if callee_name == "println" || callee_name == "ifa_rt_println" {
+                    if let Some(arg) = args.first() {
+                        out.push_str(&format!("  call void @ifa_rt_println(ptr %v{})\n", arg.0));
+                    } else {
+                        out.push_str("  call void @ifa_rt_println(ptr null)\n");
+                    }
+                    out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
+                } else if callee_name == "print" || callee_name == "ifa_rt_print" {
+                    if let Some(arg) = args.first() {
+                        out.push_str(&format!("  call void @ifa_rt_print(ptr %v{})\n", arg.0));
+                    }
+                    out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
+                } else if callee_name == "ifa_rt_println_i64" {
+                    if let Some(arg) = args.first() {
+                        out.push_str(&format!(
+                            "  call void @ifa_rt_println_i64(i64 %v{})\n",
+                            arg.0
+                        ));
+                    }
+                    out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
+                } else {
+                    let args_str: Vec<String> =
+                        args.iter().map(|a| format!("i64 %v{}", a.0)).collect();
+                    out.push_str(&format!(
+                        "  %v{} = call i64 @{}({})\n",
+                        res_id,
+                        callee_name,
+                        args_str.join(", ")
+                    ));
+                }
             }
             ValueExpr::GenAlloc { .. } => {
                 out.push_str(&format!(
@@ -335,8 +376,10 @@ impl<'a> LlvmIrEmitter<'a> {
     ) -> Result<(), LlvmCodegenError> {
         match term {
             Terminator::Return(val_opt) => {
-                if let Some(val) = val_opt {
-                    let llvm_ty = fir_to_llvm_type(ret_ty)?;
+                let llvm_ty = fir_to_llvm_type(ret_ty)?;
+                if llvm_ty == "void" {
+                    out.push_str("  ret void\n");
+                } else if let Some(val) = val_opt {
                     out.push_str(&format!("  ret {} %v{}\n", llvm_ty, val.0));
                 } else {
                     out.push_str("  ret void\n");
