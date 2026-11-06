@@ -6,6 +6,7 @@ pub mod interp;
 pub mod ir;
 pub mod lower;
 pub mod printer;
+pub mod sroa;
 pub mod types;
 pub mod verify;
 
@@ -17,6 +18,7 @@ pub use interp::{FirInterpreter, FirValue, GenHeader, GenHeap, InterpError};
 pub use ir::*;
 pub use lower::lower_program;
 pub use printer::{format_function, format_module, FirPrinter};
+pub use sroa::{SroaPass, SroaStats};
 pub use types::FirType;
 pub use verify::{FirVerifier, FirVerifyError};
 
@@ -25,14 +27,30 @@ use ifa_diagnostics::Diagnostic;
 use ifa_sema::SymbolTable;
 
 /// High-level entrypoint: Lowers an AST + SymbolTable into SSA FIR, optionally executing
-/// Copy-on-Write and Generational Reference elimination passes, and verifying SSA invariants.
+/// Copy-on-Write, Generational Reference elimination, and SROA passes, and verifying SSA invariants.
 pub fn compile_to_fir(
     program: &Program,
     symbols: &SymbolTable,
     opt_cow: bool,
     opt_gen: bool,
 ) -> Result<FirModule, Vec<Diagnostic>> {
+    compile_to_fir_with_opts(program, symbols, opt_cow, opt_gen, true)
+}
+
+/// Extended compilation entrypoint allowing granular control over all FIR optimization passes.
+pub fn compile_to_fir_with_opts(
+    program: &Program,
+    symbols: &SymbolTable,
+    opt_cow: bool,
+    opt_gen: bool,
+    opt_sroa: bool,
+) -> Result<FirModule, Vec<Diagnostic>> {
     let mut module = lower_program(program, symbols);
+
+    if opt_sroa {
+        let mut sroa_pass = SroaPass::new();
+        sroa_pass.run_on_module(&mut module);
+    }
 
     if opt_cow {
         let mut cow_pass = CowPass::new();

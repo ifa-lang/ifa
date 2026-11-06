@@ -195,9 +195,18 @@ impl<'a> FunctionLoweringContext<'a> {
             }
             ExprKind::Call { callee, .. } => {
                 if let ExprKind::Ident(fn_name) = &callee.kind {
-                    self.symbols
-                        .lookup_function(fn_name)
-                        .map(|func| FirType::from_sema_type(&func.ret_ty))
+                    if let Some(func) = self.symbols.lookup_function(fn_name) {
+                        Some(FirType::from_sema_type(&func.ret_ty))
+                    } else if let Some(st) = self.symbols.lookup_struct(fn_name) {
+                        let fields = st
+                            .fields
+                            .iter()
+                            .map(|f| (f.name, FirType::from_sema_type(&f.ty)))
+                            .collect();
+                        Some(FirType::Struct(*fn_name, fields))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
