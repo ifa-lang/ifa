@@ -13,7 +13,7 @@ pub mod test_runner;
 pub use builder::{ArtifactKind, BuildOrchestrator, BuildReport, BuiltArtifact};
 pub use cache::BuildCache;
 pub use error::KoriError;
-pub use ffi_gen::{ExportedFunction, FfiBridgeGenerator};
+pub use ffi_gen::{ExportedFunction, ExportedParam, FfiArtifacts, FfiBridgeGenerator};
 pub use lockfile::{LockedPackage, Lockfile};
 pub use manifest::{
     BackendKind, BinTarget, CrateType, DependencySpec, LibTarget, Manifest, PackageMetadata,

@@ -53,6 +53,23 @@ typedef struct {
     void*   value;  /**< Pointer or scalar payload */
 } ifa_error_union_t;
 
+/**
+ * Immutable contiguous byte/data slice for zero-copy FFI data exchange.
+ */
+typedef struct {
+    const char* ptr; /**< Pointer to contiguous memory buffer */
+    size_t      len; /**< Length in bytes */
+} ifa_slice_t;
+
+/**
+ * Mutable contiguous byte/data slice with capacity for zero-copy FFI buffer exchange.
+ */
+typedef struct {
+    char*  ptr; /**< Mutable pointer to allocated buffer */
+    size_t len; /**< Length of written content in bytes */
+    size_t cap; /**< Total allocated capacity in bytes */
+} ifa_mut_slice_t;
+
 /* --- Generational Memory Allocator API --- */
 
 /**
@@ -85,6 +102,33 @@ void ifa_rt_arena_reset(uint16_t arena_id);
  * Destroy an arena and free all associated pages.
  */
 void ifa_rt_arena_destroy(uint16_t arena_id);
+
+/**
+ * Allocate memory directly inside a scoped generational arena.
+ */
+void* ifa_rt_arena_alloc(uint16_t arena_id, size_t size, size_t align);
+
+/* --- Zero-Copy Slices & Buffers API --- */
+
+/**
+ * Construct an immutable slice from a raw pointer and length without memory copy.
+ */
+ifa_slice_t ifa_rt_slice_from_raw(const char* ptr, size_t len);
+
+/**
+ * Allocate a mutable zero-copy buffer on the generational heap or specified arena.
+ */
+ifa_mut_slice_t ifa_rt_slice_alloc(size_t len, uint16_t arena_id);
+
+/**
+ * Deallocate a mutable zero-copy buffer.
+ */
+void ifa_rt_slice_free(ifa_mut_slice_t slice);
+
+/**
+ * Returns a static null-terminated C string identifying the IFA runtime engine.
+ */
+const char* ifa_rt_version_string(void);
 
 /* --- Concurrency & Colorless Fibers API --- */
 

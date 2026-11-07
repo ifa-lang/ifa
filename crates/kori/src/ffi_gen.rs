@@ -15,10 +15,21 @@ pub struct ExportedFunction {
     pub return_type: FirType,
 }
 
+/// Metadata for a single parameter in an exported function.
 #[derive(Debug, Clone)]
 pub struct ExportedParam {
     pub name: String,
     pub ty: FirType,
+}
+
+/// Collection of generated FFI bridge artifacts.
+#[derive(Debug, Clone)]
+pub struct FfiArtifacts {
+    pub header_path: PathBuf,
+    pub php_path: PathBuf,
+    pub preload_path: Option<PathBuf>,
+    pub symfony_config_path: Option<PathBuf>,
+    pub class_name: String,
 }
 
 /// Generator for C-ABI headers (.h) and PHP 8.4+ / Symfony 8.1 FFI service bridges.
@@ -157,12 +168,13 @@ impl FfiBridgeGenerator {
             " * Deterministic Native Bridge for `{}`.\n",
             self.package_name
         ));
-        out.push_str(" * Built for PHP 8.4+ and Symfony 8.1 FFI integration.\n");
+        out.push_str(" * Built for PHP 8.4+ and Symfony 8.1 FFI integration with zero-copy memory exchange.\n");
         out.push_str(" */\n");
         out.push_str(&format!("final class {}\n", class_name));
         out.push_str("{\n");
         out.push_str("    private FFI $ffi;\n");
-        out.push_str("    private static ?FFI $preloadedFfi = null;\n\n");
+        out.push_str("    private static ?FFI $preloadedFfi = null;\n");
+        out.push_str("    private ?int $currentArenaId = null;\n\n");
 
         // Embedded C declarations for direct FFI::cdef initialization without external header dependencies
         out.push_str("    private const CDEF = <<< 'CDEF_BLOCK'\n");
@@ -175,6 +187,44 @@ impl FfiBridgeGenerator {
         out.push_str("typedef signed char int8_t;\n");
         out.push_str("typedef unsigned char uint8_t;\n");
         out.push_str("typedef _Bool bool;\n\n");
+
+        out.push_str("typedef struct {\n");
+        out.push_str("    const char* ptr;\n");
+        out.push_str("    size_t len;\n");
+        out.push_str("} ifa_slice_t;\n\n");
+
+        out.push_str("typedef struct {\n");
+        out.push_str("    char* ptr;\n");
+        out.push_str("    size_t len;\n");
+        out.push_str("    size_t cap;\n");
+        out.push_str("} ifa_mut_slice_t;\n\n");
+
+        out.push_str("typedef struct {\n");
+        out.push_str("    uint32_t generation_counter;\n");
+        out.push_str("    uint16_t allocation_flags;\n");
+        out.push_str("    uint16_t arena_id;\n");
+        out.push_str("} ifa_gen_header_t;\n\n");
+
+        out.push_str("typedef struct {\n");
+        out.push_str("    void* ptr;\n");
+        out.push_str("    uint32_t remembered_gen;\n");
+        out.push_str("    uint16_t arena_id;\n");
+        out.push_str("    uint16_t _reserved;\n");
+        out.push_str("} ifa_gen_ref_t;\n\n");
+
+        out.push_str("typedef struct {\n");
+        out.push_str("    int64_t status;\n");
+        out.push_str("    void* value;\n");
+        out.push_str("} ifa_error_union_t;\n\n");
+
+        out.push_str("uint16_t ifa_rt_arena_create(size_t capacity);\n");
+        out.push_str("void ifa_rt_arena_reset(uint16_t arena_id);\n");
+        out.push_str("void ifa_rt_arena_destroy(uint16_t arena_id);\n");
+        out.push_str("void* ifa_rt_arena_alloc(uint16_t arena_id, size_t size, size_t align);\n");
+        out.push_str("ifa_slice_t ifa_rt_slice_from_raw(const char* ptr, size_t len);\n");
+        out.push_str("ifa_mut_slice_t ifa_rt_slice_alloc(size_t len, uint16_t arena_id);\n");
+        out.push_str("void ifa_rt_slice_free(ifa_mut_slice_t slice);\n");
+        out.push_str("const char* ifa_rt_version_string(void);\n\n");
 
         for func in functions {
             let ret_str = fir_type_to_c(&func.return_type);
@@ -194,28 +244,142 @@ impl FfiBridgeGenerator {
         out.push_str("CDEF_BLOCK;\n\n");
 
         // Constructor
-        out.push_str("    public function __construct(?string $libraryPath = null, ?string $headerPath = null)\n");
-        out.push_str("    {\n");
+        out.push_str("    public function __construct(\n");
+        out.push_str("        ?string $libraryPath = null,\n");
+        out.push_str("        ?string $headerPath = null,\n");
+        out.push_str("        bool $autoArena = false,\n");
+        out.push_str("    ) {\n");
         out.push_str("        if (self::$preloadedFfi !== null) {\n");
         out.push_str("            $this->ffi = self::$preloadedFfi;\n");
-        out.push_str("            return;\n");
+        out.push_str("        } else {\n");
+        out.push_str("            $lib = $libraryPath ?? self::defaultLibraryPath();\n");
+        out.push_str("            if (!file_exists($lib)) {\n");
+        out.push_str("                throw new RuntimeException(sprintf('IFA native shared library not found at: %s', $lib));\n");
+        out.push_str("            }\n\n");
+        out.push_str("            $cdef = self::CDEF;\n");
+        out.push_str("            if ($headerPath !== null) {\n");
+        out.push_str("                if (!file_exists($headerPath)) {\n");
+        out.push_str("                    throw new RuntimeException(sprintf('IFA C-ABI header definition not found at: %s', $headerPath));\n");
+        out.push_str("                }\n");
+        out.push_str("                $rawHeader = file_get_contents($headerPath);\n");
+        out.push_str("                if ($rawHeader === false) {\n");
+        out.push_str("                    throw new RuntimeException(sprintf('Failed to read IFA C-ABI header at: %s', $headerPath));\n");
+        out.push_str("                }\n");
+        out.push_str("                $cdef = self::sanitizeCdef($rawHeader);\n");
+        out.push_str("            }\n\n");
+        out.push_str("            $this->ffi = FFI::cdef($cdef, $lib);\n");
         out.push_str("        }\n\n");
-        out.push_str("        $lib = $libraryPath ?? self::defaultLibraryPath();\n");
-        out.push_str("        if (!file_exists($lib)) {\n");
-        out.push_str("            throw new RuntimeException(sprintf('IFA native shared library not found at: %s', $lib));\n");
-        out.push_str("        }\n\n");
-        out.push_str("        $cdef = self::CDEF;\n");
-        out.push_str("        if ($headerPath !== null) {\n");
-        out.push_str("            if (!file_exists($headerPath)) {\n");
-        out.push_str("                throw new RuntimeException(sprintf('IFA C-ABI header definition not found at: %s', $headerPath));\n");
+        out.push_str("        if ($autoArena) {\n");
+        out.push_str("            $this->currentArenaId = $this->createArena();\n");
+        out.push_str("        }\n");
+        out.push_str("    }\n\n");
+
+        // Destructor
+        out.push_str("    public function __destruct()\n");
+        out.push_str("    {\n");
+        out.push_str("        if ($this->currentArenaId !== null) {\n");
+        out.push_str("            try {\n");
+        out.push_str("                $this->ffi->ifa_rt_arena_destroy($this->currentArenaId);\n");
+        out.push_str("            } catch (\\Throwable) {\n");
+        out.push_str("                // Suppress exception during shutdown\n");
         out.push_str("            }\n");
-        out.push_str("            $rawHeader = file_get_contents($headerPath);\n");
-        out.push_str("            if ($rawHeader === false) {\n");
-        out.push_str("                throw new RuntimeException(sprintf('Failed to read IFA C-ABI header at: %s', $headerPath));\n");
-        out.push_str("            }\n");
-        out.push_str("            $cdef = self::sanitizeCdef($rawHeader);\n");
-        out.push_str("        }\n\n");
-        out.push_str("        $this->ffi = FFI::cdef($cdef, $lib);\n");
+        out.push_str("            $this->currentArenaId = null;\n");
+        out.push_str("        }\n");
+        out.push_str("    }\n\n");
+
+        // Request Arena lifecycle management
+        out.push_str("    /**\n");
+        out.push_str("     * Create a scoped generational arena for request-level allocations.\n");
+        out.push_str("     */\n");
+        out.push_str("    public function createArena(int $capacity = 65536): int\n");
+        out.push_str("    {\n");
+        out.push_str("        return (int) $this->ffi->ifa_rt_arena_create($capacity);\n");
+        out.push_str("    }\n\n");
+
+        out.push_str("    /**\n");
+        out.push_str("     * Reset an arena in O(1), instantly invalidating all contained generational references.\n");
+        out.push_str("     */\n");
+        out.push_str("    public function resetArena(int $arenaId): void\n");
+        out.push_str("    {\n");
+        out.push_str("        $this->ffi->ifa_rt_arena_reset($arenaId);\n");
+        out.push_str("    }\n\n");
+
+        out.push_str("    /**\n");
+        out.push_str("     * Destroy an arena and deallocate its underlying memory pages.\n");
+        out.push_str("     */\n");
+        out.push_str("    public function destroyArena(int $arenaId): void\n");
+        out.push_str("    {\n");
+        out.push_str("        $this->ffi->ifa_rt_arena_destroy($arenaId);\n");
+        out.push_str("        if ($this->currentArenaId === $arenaId) {\n");
+        out.push_str("            $this->currentArenaId = null;\n");
+        out.push_str("        }\n");
+        out.push_str("    }\n\n");
+
+        out.push_str("    /**\n");
+        out.push_str("     * Symfony ResetInterface hook: automatically invoked by Symfony between HTTP requests\n");
+        out.push_str(
+            "     * or Messenger jobs (FrankenPHP, RoadRunner, Swoole, long-running workers).\n",
+        );
+        out.push_str("     */\n");
+        out.push_str("    public function reset(): void\n");
+        out.push_str("    {\n");
+        out.push_str("        if ($this->currentArenaId !== null) {\n");
+        out.push_str("            $this->resetArena($this->currentArenaId);\n");
+        out.push_str("        }\n");
+        out.push_str("    }\n\n");
+
+        out.push_str("    public function getCurrentArenaId(): ?int\n");
+        out.push_str("    {\n");
+        out.push_str("        return $this->currentArenaId;\n");
+        out.push_str("    }\n\n");
+
+        // Zero-copy buffer exchange helpers
+        out.push_str("    /**\n");
+        out.push_str("     * Create an immutable zero-copy byte slice (ifa_slice_t) referencing a PHP string.\n");
+        out.push_str("     * Passes raw contiguous memory directly to IFA native execution without heap allocation.\n");
+        out.push_str("     */\n");
+        out.push_str("    public function createSlice(string &$data): \\FFI\\CData\n");
+        out.push_str("    {\n");
+        out.push_str("        $len = strlen($data);\n");
+        out.push_str("        if ($len === 0) {\n");
+        out.push_str("            $slice = $this->ffi->new('ifa_slice_t');\n");
+        out.push_str("            $slice->ptr = null;\n");
+        out.push_str("            $slice->len = 0;\n");
+        out.push_str("            return $slice;\n");
+        out.push_str("        }\n");
+        out.push_str("        return $this->ffi->ifa_rt_slice_from_raw($data, $len);\n");
+        out.push_str("    }\n\n");
+
+        out.push_str("    /**\n");
+        out.push_str(
+            "     * Convert an immutable zero-copy byte slice (ifa_slice_t) into a PHP string.\n",
+        );
+        out.push_str("     */\n");
+        out.push_str("    public function readSlice(\\FFI\\CData $slice): string\n");
+        out.push_str("    {\n");
+        out.push_str("        if ($slice->ptr === null || $slice->len === 0) {\n");
+        out.push_str("            return '';\n");
+        out.push_str("        }\n");
+        out.push_str("        return FFI::string($slice->ptr, (int) $slice->len);\n");
+        out.push_str("    }\n\n");
+
+        out.push_str("    /**\n");
+        out.push_str("     * Allocate a mutable zero-copy buffer on the IFA generational heap or request arena.\n");
+        out.push_str("     */\n");
+        out.push_str(
+            "    public function allocateBuffer(int $size, ?int $arenaId = null): \\FFI\\CData\n",
+        );
+        out.push_str("    {\n");
+        out.push_str("        $arena = $arenaId ?? $this->currentArenaId ?? 0;\n");
+        out.push_str("        return $this->ffi->ifa_rt_slice_alloc($size, $arena);\n");
+        out.push_str("    }\n\n");
+
+        out.push_str("    /**\n");
+        out.push_str("     * Free a mutable zero-copy buffer allocated by allocateBuffer.\n");
+        out.push_str("     */\n");
+        out.push_str("    public function freeBuffer(\\FFI\\CData $slice): void\n");
+        out.push_str("    {\n");
+        out.push_str("        $this->ffi->ifa_rt_slice_free($slice);\n");
         out.push_str("    }\n\n");
 
         // Sanitize helper
@@ -232,7 +396,31 @@ impl FfiBridgeGenerator {
             "        $clean = str_replace(['extern \"C\" {', 'extern \"C\"'], '', $clean);\n",
         );
         out.push_str("        $clean = preg_replace('/^\\s*\\}\\s*$/m', '', $clean) ?? $clean;\n");
-        out.push_str("        return \"typedef long int64_t;\\ntypedef unsigned long uint64_t;\\ntypedef int int32_t;\\ntypedef unsigned int uint32_t;\\ntypedef short int16_t;\\ntypedef unsigned short uint16_t;\\ntypedef signed char int8_t;\\ntypedef unsigned char uint8_t;\\ntypedef _Bool bool;\\n\" . $clean;\n");
+        out.push_str("        $types = <<< 'TYPES_BLOCK'\n");
+        out.push_str("typedef long int64_t;\n");
+        out.push_str("typedef unsigned long uint64_t;\n");
+        out.push_str("typedef int int32_t;\n");
+        out.push_str("typedef unsigned int uint32_t;\n");
+        out.push_str("typedef short int16_t;\n");
+        out.push_str("typedef unsigned short uint16_t;\n");
+        out.push_str("typedef signed char int8_t;\n");
+        out.push_str("typedef unsigned char uint8_t;\n");
+        out.push_str("typedef _Bool bool;\n");
+        out.push_str("typedef struct { const char* ptr; size_t len; } ifa_slice_t;\n");
+        out.push_str("typedef struct { char* ptr; size_t len; size_t cap; } ifa_mut_slice_t;\n");
+        out.push_str("typedef struct { uint32_t generation_counter; uint16_t allocation_flags; uint16_t arena_id; } ifa_gen_header_t;\n");
+        out.push_str("typedef struct { void* ptr; uint32_t remembered_gen; uint16_t arena_id; uint16_t _reserved; } ifa_gen_ref_t;\n");
+        out.push_str("typedef struct { int64_t status; void* value; } ifa_error_union_t;\n");
+        out.push_str("uint16_t ifa_rt_arena_create(size_t capacity);\n");
+        out.push_str("void ifa_rt_arena_reset(uint16_t arena_id);\n");
+        out.push_str("void ifa_rt_arena_destroy(uint16_t arena_id);\n");
+        out.push_str("void* ifa_rt_arena_alloc(uint16_t arena_id, size_t size, size_t align);\n");
+        out.push_str("ifa_slice_t ifa_rt_slice_from_raw(const char* ptr, size_t len);\n");
+        out.push_str("ifa_mut_slice_t ifa_rt_slice_alloc(size_t len, uint16_t arena_id);\n");
+        out.push_str("void ifa_rt_slice_free(ifa_mut_slice_t slice);\n");
+        out.push_str("const char* ifa_rt_version_string(void);\n");
+        out.push_str("TYPES_BLOCK;\n");
+        out.push_str("        return $types . \"\\n\" . $clean;\n");
         out.push_str("    }\n\n");
 
         // Preload support
@@ -269,8 +457,6 @@ impl FfiBridgeGenerator {
                 .iter()
                 .map(|p| format!("{} ${}", fir_type_to_php(&p.ty), p.name))
                 .collect();
-            let args_call: Vec<String> =
-                func.params.iter().map(|p| format!("${}", p.name)).collect();
 
             out.push_str(&format!(
                 "    public function {}({}): {}\n",
@@ -279,6 +465,23 @@ impl FfiBridgeGenerator {
                 php_ret
             ));
             out.push_str("    {\n");
+
+            // Prepare slice conversions if necessary
+            let mut args_call: Vec<String> = Vec::new();
+            for p in &func.params {
+                if matches!(p.ty, FirType::Slice(_)) {
+                    let slice_var = format!("$__slice_{}", p.name);
+                    out.push_str(&format!(
+                        "        {} = is_string(${p_name}) ? $this->createSlice(${p_name}) : ${p_name};\n",
+                        slice_var,
+                        p_name = p.name
+                    ));
+                    args_call.push(slice_var);
+                } else {
+                    args_call.push(format!("${}", p.name));
+                }
+            }
+
             if matches!(func.return_type, FirType::ErrorUnion { .. }) {
                 out.push_str(&format!(
                     "        $res = $this->ffi->{}({});\n",
@@ -304,6 +507,13 @@ impl FfiBridgeGenerator {
                 } else {
                     out.push_str("        return $res->value;\n");
                 }
+            } else if matches!(func.return_type, FirType::Slice(_)) {
+                out.push_str(&format!(
+                    "        $res = $this->ffi->{}({});\n",
+                    func.name,
+                    args_call.join(", ")
+                ));
+                out.push_str("        return $this->readSlice($res);\n");
             } else if func.return_type == FirType::Unit {
                 out.push_str(&format!(
                     "        $this->ffi->{}({});\n",
@@ -332,13 +542,83 @@ impl FfiBridgeGenerator {
         out
     }
 
-    /// Emit both C header and PHP bridge file to the target output directory.
+    /// Generate an OPcache preload script for PHP 8.4+ / Symfony 8.1.
+    pub fn generate_preload_script(
+        &self,
+        class_name: &str,
+        header_rel_path: &str,
+        lib_rel_path: &str,
+    ) -> String {
+        let mut out = String::new();
+        out.push_str("<?php\n\n");
+        out.push_str("declare(strict_types=1);\n\n");
+        out.push_str("/**\n");
+        out.push_str(" * OPcache Preload Script for Symfony 8.1 / PHP 8.4+\n");
+        out.push_str(
+            " * Pre-binds IFA shared library into process memory during engine startup.\n",
+        );
+        out.push_str(" */\n\n");
+        out.push_str("use FFI;\n\n");
+        out.push_str(&format!(
+            "$libPath = __DIR__ . '/{}';\n",
+            lib_rel_path.trim_start_matches('/')
+        ));
+        out.push_str(&format!(
+            "$headerPath = __DIR__ . '/{}';\n\n",
+            header_rel_path.trim_start_matches('/')
+        ));
+        out.push_str("if (file_exists($libPath) && file_exists($headerPath)) {\n");
+        out.push_str("    $rawHeader = file_get_contents($headerPath);\n");
+        out.push_str("    if ($rawHeader !== false) {\n");
+        out.push_str(&format!(
+            "        $cdef = \\{}\\{}::sanitizeCdef($rawHeader);\n",
+            self.config.php_namespace, class_name
+        ));
+        out.push_str("        $ffi = FFI::cdef($cdef, $libPath);\n");
+        out.push_str(&format!(
+            "        \\{}\\{}::setPreloadedInstance($ffi);\n",
+            self.config.php_namespace, class_name
+        ));
+        out.push_str("    }\n");
+        out.push_str("}\n");
+        out
+    }
+
+    /// Generate Symfony 8.1 Dependency Injection YAML configuration (`services.yaml`).
+    pub fn generate_symfony_service_config(
+        &self,
+        class_name: &str,
+        header_rel_path: &str,
+        lib_rel_path: &str,
+    ) -> String {
+        let full_class = format!("{}\\{}", self.config.php_namespace, class_name);
+        let mut out = String::new();
+        out.push_str("# Symfony 8.1 Dependency Injection Configuration\n");
+        out.push_str("# Autogenerated by Kori for high-performance IFA native FFI execution\n");
+        out.push_str("services:\n");
+        out.push_str(&format!("  {}:\n", full_class));
+        out.push_str("    arguments:\n");
+        out.push_str(&format!(
+            "      $libraryPath: '%kernel.project_dir%/var/ifa/{}'\n",
+            lib_rel_path.trim_start_matches('/')
+        ));
+        out.push_str(&format!(
+            "      $headerPath: '%kernel.project_dir%/var/ifa/{}'\n",
+            header_rel_path.trim_start_matches('/')
+        ));
+        out.push_str("      $autoArena: true\n");
+        out.push_str("    tags:\n");
+        out.push_str("      - { name: 'kernel.reset', method: 'reset' }\n");
+        out
+    }
+
+    /// Emit C header, PHP bridge, preload script, and Symfony 8.1 configuration.
     pub fn emit_bindings(
         &self,
         functions: &[ExportedFunction],
         output_dir: &Path,
         shared_lib_filename: &str,
-    ) -> Result<(PathBuf, PathBuf), KoriError> {
+    ) -> Result<FfiArtifacts, KoriError> {
         fs::create_dir_all(output_dir)?;
 
         let header_filename = format!("{}.h", self.package_name.replace('-', "_"));
@@ -362,7 +642,36 @@ impl FfiBridgeGenerator {
         );
         fs::write(&php_path, php_content)?;
 
-        Ok((header_path, php_path))
+        let preload_path = if self.config.generate_preload_script {
+            let p_path = output_dir.join("preload.php");
+            let p_content =
+                self.generate_preload_script(&class_name, &header_filename, shared_lib_filename);
+            fs::write(&p_path, p_content)?;
+            Some(p_path)
+        } else {
+            None
+        };
+
+        let symfony_config_path = if self.config.generate_symfony_config {
+            let s_path = output_dir.join("services.yaml");
+            let s_content = self.generate_symfony_service_config(
+                &class_name,
+                &header_filename,
+                shared_lib_filename,
+            );
+            fs::write(&s_path, s_content)?;
+            Some(s_path)
+        } else {
+            None
+        };
+
+        Ok(FfiArtifacts {
+            header_path,
+            php_path,
+            preload_path,
+            symfony_config_path,
+            class_name,
+        })
     }
 }
 
@@ -384,6 +693,7 @@ pub fn fir_type_to_c(ty: &FirType) -> &'static str {
         FirType::Char => "char",
         FirType::Str => "const char*",
         FirType::String => "const char*",
+        FirType::Slice(_) => "ifa_slice_t",
         FirType::Pointer(_) => "void*",
         FirType::GenerationalRef(_) => "ifa_gen_ref_t",
         FirType::Struct(..) => "void*",
@@ -400,6 +710,7 @@ pub fn fir_type_to_php(ty: &FirType) -> &'static str {
         FirType::Int(_) => "int",
         FirType::Float(_) => "float",
         FirType::Char | FirType::Str | FirType::String => "string",
+        FirType::Slice(_) => "string|\\FFI\\CData",
         FirType::Pointer(_) => "\\FFI\\CData",
         FirType::GenerationalRef(_) => "\\FFI\\CData",
         FirType::Struct(..) => "\\FFI\\CData",

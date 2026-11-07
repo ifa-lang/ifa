@@ -214,6 +214,10 @@ pub struct FfiConfig {
     pub php_namespace: String,
     pub php_class_name: Option<String>,
     pub output_dir: Option<PathBuf>,
+    #[serde(default = "default_true")]
+    pub generate_preload_script: bool,
+    #[serde(default = "default_true")]
+    pub generate_symfony_config: bool,
 }
 
 fn default_true() -> bool {
@@ -232,6 +236,8 @@ impl Default for FfiConfig {
             php_namespace: default_php_namespace(),
             php_class_name: None,
             output_dir: None,
+            generate_preload_script: true,
+            generate_symfony_config: true,
         }
     }
 }

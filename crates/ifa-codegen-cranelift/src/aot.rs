@@ -119,6 +119,59 @@ int64_t ifa_rt_channel_select(void** channels, size_t num_channels, int32_t has_
     if (has_default) return (int64_t)num_channels;
     return 0;
 }
+
+typedef struct {
+    const char* ptr;
+    size_t len;
+} ifa_slice_t;
+
+typedef struct {
+    char* ptr;
+    size_t len;
+    size_t cap;
+} ifa_mut_slice_t;
+
+uint16_t ifa_rt_arena_create(size_t capacity) {
+    (void)capacity;
+    return 1;
+}
+
+void ifa_rt_arena_reset(uint16_t arena_id) {
+    (void)arena_id;
+}
+
+void ifa_rt_arena_destroy(uint16_t arena_id) {
+    (void)arena_id;
+}
+
+void* ifa_rt_arena_alloc(uint16_t arena_id, size_t size, size_t align) {
+    return ifa_rt_gen_alloc(size, align, arena_id);
+}
+
+ifa_slice_t ifa_rt_slice_from_raw(const char* ptr, size_t len) {
+    ifa_slice_t s;
+    s.ptr = ptr;
+    s.len = len;
+    return s;
+}
+
+ifa_mut_slice_t ifa_rt_slice_alloc(size_t len, uint16_t arena_id) {
+    ifa_mut_slice_t s;
+    s.ptr = (char*)ifa_rt_gen_alloc(len > 0 ? len : 1, 8, arena_id);
+    s.len = 0;
+    s.cap = len > 0 ? len : 1;
+    return s;
+}
+
+void ifa_rt_slice_free(ifa_mut_slice_t slice) {
+    if (slice.ptr) {
+        ifa_rt_gen_free((void*)slice.ptr);
+    }
+}
+
+const char* ifa_rt_version_string(void) {
+    return "IFA Runtime 0.1.0 (Zero-GC Generational Concurrency)";
+}
 "#;
 
 /// Ahead-of-Time (AOT) compiler producing native object files (.o) and linked ELF binaries.

@@ -245,6 +245,8 @@ fn test_ffi_c_header_and_php_bridge_generation() {
         php_namespace: "App\\Bridge\\NativeBridge".to_string(),
         php_class_name: Some("NativeCryptoService".to_string()),
         output_dir: None,
+        generate_preload_script: true,
+        generate_symfony_config: true,
     };
 
     let gen = FfiBridgeGenerator::new("crypto-engine", ffi_config);
@@ -324,6 +326,165 @@ fn test_ffi_c_header_and_php_bridge_generation() {
     assert!(php_class.contains("throw new \\RuntimeException"));
     assert!(php_class.contains("return (int) $res->value;"));
     assert!(php_class.contains("public static function setPreloadedInstance(FFI $ffi): void"));
+
+    // Verify zero-copy buffer methods
+    assert!(php_class.contains("public function createSlice(string &$data): \\FFI\\CData"));
+    assert!(php_class.contains("public function readSlice(\\FFI\\CData $slice): string"));
+    assert!(php_class
+        .contains("public function allocateBuffer(int $size, ?int $arenaId = null): \\FFI\\CData"));
+    assert!(php_class.contains("public function freeBuffer(\\FFI\\CData $slice): void"));
+
+    // Verify Symfony request-scoped arena lifecycle hooks
+    assert!(php_class.contains("public function createArena(int $capacity = 65536): int"));
+    assert!(php_class.contains("public function resetArena(int $arenaId): void"));
+    assert!(php_class.contains("public function destroyArena(int $arenaId): void"));
+    assert!(php_class.contains("public function reset(): void"));
+
+    // Verify OPcache preload generation
+    let preload_script = gen.generate_preload_script(
+        "NativeCryptoService",
+        "crypto_engine.h",
+        "libcrypto_engine.so",
+    );
+    assert!(preload_script.contains("OPcache Preload Script for Symfony 8.1 / PHP 8.4+"));
+    assert!(preload_script
+        .contains("\\App\\Bridge\\NativeBridge\\NativeCryptoService::setPreloadedInstance($ffi);"));
+
+    // Verify Symfony 8.1 Dependency Injection configuration
+    let symfony_yaml = gen.generate_symfony_service_config(
+        "NativeCryptoService",
+        "crypto_engine.h",
+        "libcrypto_engine.so",
+    );
+    assert!(symfony_yaml.contains("App\\Bridge\\NativeBridge\\NativeCryptoService:"));
+    assert!(symfony_yaml.contains("$autoArena: true"));
+    assert!(symfony_yaml.contains("- { name: 'kernel.reset', method: 'reset' }"));
+}
+
+#[test]
+fn test_zero_copy_php_ffi_symfony_service_integration() {
+    let ffi_config = kori::manifest::FfiConfig {
+        generate_c_headers: true,
+        generate_php_binding: true,
+        php_namespace: "App\\Bridge\\DataGateway".to_string(),
+        php_class_name: Some("ZeroCopyGateway".to_string()),
+        output_dir: None,
+        generate_preload_script: true,
+        generate_symfony_config: true,
+    };
+
+    let gen = FfiBridgeGenerator::new("data-gateway", ffi_config);
+
+    let exported_fns = vec![ExportedFunction {
+        name: "ifa_rt_version_string".to_string(),
+        is_strict: true,
+        params: vec![],
+        return_type: FirType::Str,
+    }];
+
+    let c_header = gen.generate_c_header(&exported_fns);
+    assert!(c_header.contains("const char* ifa_rt_version_string(void);"));
+
+    let php_class = gen.generate_php_class(
+        "ZeroCopyGateway",
+        &exported_fns,
+        "data_gateway.h",
+        "libdata_gateway.so",
+    );
+
+    assert!(php_class.contains("namespace App\\Bridge\\DataGateway;"));
+    assert!(php_class.contains("public function ifa_rt_version_string(): string"));
+    assert!(php_class.contains("return (string) $this->ffi->ifa_rt_version_string();"));
+
+    // If PHP is available on the host system, verify end-to-end execution of zero-copy slice and buffer primitives
+    if let Ok(php_check) = std::process::Command::new("php").arg("-v").output() {
+        if php_check.status.success() {
+            let temp_dir = std::env::temp_dir().join(format!("kori_ffi_zc_{}", std::process::id()));
+            let _ = fs::remove_dir_all(&temp_dir);
+            fs::create_dir_all(&temp_dir).unwrap();
+
+            let artifacts = gen
+                .emit_bindings(
+                    &exported_fns,
+                    &temp_dir,
+                    "/root/ifa/target/debug/libifa_runtime.so",
+                )
+                .expect("Failed to emit bindings");
+
+            assert!(artifacts.header_path.exists());
+            assert!(artifacts.php_path.exists());
+            assert!(artifacts.preload_path.unwrap().exists());
+            assert!(artifacts.symfony_config_path.unwrap().exists());
+
+            let php_test = format!(
+                r#"
+require_once '{php_file}';
+
+$gateway = new App\Bridge\DataGateway\ZeroCopyGateway(
+    libraryPath: '/root/ifa/target/debug/libifa_runtime.so',
+    autoArena: true
+);
+
+// 1. Verify Request-scoped Generational Arena
+$arenaId = $gateway->getCurrentArenaId();
+if ($arenaId === null || $arenaId === 0) {{
+    fwrite(STDERR, "Arena ID initialization failed\n");
+    exit(1);
+}}
+
+// 2. Verify Zero-Copy Slice Creation and String Reading
+$testString = "High-Throughput Zero-Copy Payload for Symfony 8.1";
+$slice = $gateway->createSlice($testString);
+if ($slice->len !== strlen($testString)) {{
+    fwrite(STDERR, "Slice length mismatch\n");
+    exit(2);
+}}
+$roundtrip = $gateway->readSlice($slice);
+if ($roundtrip !== $testString) {{
+    fwrite(STDERR, "Zero-copy roundtrip text mismatch: " . $roundtrip . "\n");
+    exit(3);
+}}
+
+// 3. Verify Native Buffer Allocation and Free
+$buffer = $gateway->allocateBuffer(256);
+if ($buffer->cap < 256) {{
+    fwrite(STDERR, "Buffer capacity insufficient\n");
+    exit(4);
+}}
+$gateway->freeBuffer($buffer);
+
+// 4. Verify Symfony reset hook
+$gateway->reset();
+if ($gateway->getCurrentArenaId() !== $arenaId) {{
+    fwrite(STDERR, "Arena ID changed after reset\n");
+    exit(5);
+}}
+
+// 5. Verify C-ABI function call returning string
+$ver = $gateway->ifa_rt_version_string();
+if (!str_contains($ver, "IFA Runtime")) {{
+    fwrite(STDERR, "Runtime version string mismatch: " . $ver . "\n");
+    exit(6);
+}}
+"#,
+                php_file = artifacts.php_path.display()
+            );
+
+            let test_output = std::process::Command::new("php")
+                .arg("-r")
+                .arg(&php_test)
+                .output()
+                .expect("Failed to invoke PHP CLI");
+
+            assert!(
+                test_output.status.success(),
+                "PHP Zero-Copy FFI validation failed: {}",
+                String::from_utf8_lossy(&test_output.stderr)
+            );
+
+            let _ = fs::remove_dir_all(&temp_dir);
+        }
+    }
 }
 
 #[test]
@@ -418,11 +579,31 @@ pub extern "C" strict fn compute_hash(seed: i64, multiplier: i64) -> i64 {
     assert!(php_content.contains("final class MathBridge"));
     assert!(php_content.contains("public function compute_hash(int $seed, int $multiplier): int"));
 
+    // Verify OPcache preload script and Symfony 8.1 services.yaml were created
+    let preload_art = report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::PreloadScript)
+        .expect("Preload script artifact missing");
+    assert!(preload_art.path.exists());
+    let preload_content = fs::read_to_string(&preload_art.path).unwrap();
+    assert!(preload_content.contains("OPcache Preload Script for Symfony 8.1 / PHP 8.4+"));
+
+    let symfony_art = report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::SymfonyService)
+        .expect("Symfony service artifact missing");
+    assert!(symfony_art.path.exists());
+    let symfony_content = fs::read_to_string(&symfony_art.path).unwrap();
+    assert!(symfony_content.contains("App\\Service\\Native\\MathBridge:"));
+    assert!(symfony_content.contains("- { name: 'kernel.reset', method: 'reset' }"));
+
     // If PHP is available on the host system, verify end-to-end execution via PHP FFI
     if let Ok(php_check) = std::process::Command::new("php").arg("-v").output() {
         if php_check.status.success() {
             let php_script = format!(
-                "require_once '{}';\n$bridge = new App\\Service\\Native\\MathBridge('{}', '{}');\n$res = $bridge->compute_hash(10, 3);\nif ($res !== 37) {{ exit(1); }}\n",
+                "require_once '{}';\n$bridge = new App\\Service\\Native\\MathBridge('{}', '{}', true);\n$res = $bridge->compute_hash(10, 3);\nif ($res !== 37) {{ exit(1); }}\nif ($bridge->getCurrentArenaId() === null) {{ exit(2); }}\n$bridge->reset();\n",
                 php_art.path.display(),
                 so_art.path.display(),
                 header_art.path.display()

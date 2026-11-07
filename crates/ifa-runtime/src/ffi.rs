@@ -143,6 +143,12 @@ pub extern "C" fn ifa_rt_arena_destroy(arena_id: u16) {
     GLOBAL_ALLOCATOR.destroy_arena(arena_id);
 }
 
+/// Allocate memory directly in a specified generational arena.
+#[no_mangle]
+pub extern "C" fn ifa_rt_arena_alloc(arena_id: u16, size: usize, align: usize) -> *mut u8 {
+    GLOBAL_ALLOCATOR.alloc(size, align.max(8), arena_id)
+}
+
 /// Spawn a new colorless fiber running an `extern "C"` function pointer with argument.
 #[no_mangle]
 pub extern "C" fn ifa_rt_fiber_spawn(entry: extern "C" fn(*mut u8), arg: *mut u8) -> u64 {
@@ -352,6 +358,103 @@ impl IfaErrorUnion {
     pub fn is_err(&self) -> bool {
         self.status != 0
     }
+}
+
+/// Immutable contiguous byte/data slice for zero-copy FFI data exchange.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IfaSlice {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+impl IfaSlice {
+    pub fn new(ptr: *const u8, len: usize) -> Self {
+        Self { ptr, len }
+    }
+
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &[u8] {
+        if self.ptr.is_null() || self.len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+}
+
+/// Mutable contiguous byte/data slice with capacity for zero-copy FFI buffer exchange.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IfaMutSlice {
+    pub ptr: *mut u8,
+    pub len: usize,
+    pub cap: usize,
+}
+
+impl IfaMutSlice {
+    pub fn new(ptr: *mut u8, len: usize, cap: usize) -> Self {
+        Self { ptr, len, cap }
+    }
+
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &[u8] {
+        if self.ptr.is_null() || self.len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_capacity_bytes_mut(&mut self) -> &mut [u8] {
+        if self.ptr.is_null() || self.cap == 0 {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.cap) }
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_mut_bytes(&mut self) -> &mut [u8] {
+        if self.ptr.is_null() || self.len == 0 {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        }
+    }
+}
+
+/// Construct an immutable zero-copy byte slice from a raw pointer and length.
+#[no_mangle]
+pub extern "C" fn ifa_rt_slice_from_raw(ptr: *const u8, len: usize) -> IfaSlice {
+    IfaSlice { ptr, len }
+}
+
+/// Allocate a mutable zero-copy buffer on the generational heap or request arena.
+#[no_mangle]
+pub extern "C" fn ifa_rt_slice_alloc(len: usize, arena_id: u16) -> IfaMutSlice {
+    let actual_size = len.max(1);
+    let ptr = GLOBAL_ALLOCATOR.alloc(actual_size, 8, arena_id);
+    IfaMutSlice {
+        ptr,
+        len: 0,
+        cap: actual_size,
+    }
+}
+
+/// Release a mutable zero-copy buffer previously allocated by `ifa_rt_slice_alloc`.
+#[no_mangle]
+pub extern "C" fn ifa_rt_slice_free(slice: IfaMutSlice) {
+    if !slice.ptr.is_null() {
+        GLOBAL_ALLOCATOR.free(slice.ptr);
+    }
+}
+
+/// Static IFA runtime version identifier for foreign interfaces and diagnostic health checks.
+#[no_mangle]
+pub extern "C" fn ifa_rt_version_string() -> *const std::os::raw::c_char {
+    c"IFA Runtime 0.1.0 (Zero-GC Generational Concurrency)".as_ptr()
 }
 
 /// Opaque wrapper around an IFA runtime channel for C-ABI FFI.

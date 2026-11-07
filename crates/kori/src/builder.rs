@@ -27,6 +27,8 @@ pub enum ArtifactKind {
     WebAssemblyBundle,
     CHeader,
     PhpBridge,
+    PreloadScript,
+    SymfonyService,
     IfaArchive,
 }
 
@@ -309,22 +311,40 @@ impl BuildOrchestrator {
                     let ffi_gen = FfiBridgeGenerator::new(&pkg.name, ffi_config);
                     let exported_fns = FfiBridgeGenerator::extract_exported_functions(&fir_module);
 
-                    let (hdr_path, php_path) =
+                    let ffi_artifacts =
                         ffi_gen.emit_bindings(&exported_fns, out_dir, &so_filename)?;
 
                     artifacts.push(BuiltArtifact {
                         name: format!("{}.h", pkg.name),
-                        path: hdr_path,
+                        path: ffi_artifacts.header_path,
                         kind: ArtifactKind::CHeader,
                         cached: false,
                     });
 
                     artifacts.push(BuiltArtifact {
-                        name: format!("{}Bridge.php", pkg.name),
-                        path: php_path,
+                        name: format!("{}.php", ffi_artifacts.class_name),
+                        path: ffi_artifacts.php_path,
                         kind: ArtifactKind::PhpBridge,
                         cached: false,
                     });
+
+                    if let Some(preload_path) = ffi_artifacts.preload_path {
+                        artifacts.push(BuiltArtifact {
+                            name: "preload.php".to_string(),
+                            path: preload_path,
+                            kind: ArtifactKind::PreloadScript,
+                            cached: false,
+                        });
+                    }
+
+                    if let Some(symfony_path) = ffi_artifacts.symfony_config_path {
+                        artifacts.push(BuiltArtifact {
+                            name: "services.yaml".to_string(),
+                            path: symfony_path,
+                            kind: ArtifactKind::SymfonyService,
+                            cached: false,
+                        });
+                    }
                 }
                 CrateType::Staticlib => {
                     let a_filename = format!("lib{}.a", lib.name);

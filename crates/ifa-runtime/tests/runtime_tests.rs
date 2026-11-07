@@ -505,3 +505,62 @@ fn test_stackless_native_coroutine_spawn_scheduler() {
 
     ifa_rt_coro_destroy(coro);
 }
+
+#[test]
+fn test_zero_copy_slice_ffi() {
+    use ifa_runtime::ffi::{
+        ifa_rt_slice_alloc, ifa_rt_slice_free, ifa_rt_slice_from_raw, ifa_rt_version_string,
+    };
+
+    let sample_data = b"Zero-Copy High Performance FFI Bridge";
+    let slice = ifa_rt_slice_from_raw(sample_data.as_ptr(), sample_data.len());
+    assert_eq!(slice.len, sample_data.len());
+    assert_eq!(slice.as_bytes(), sample_data);
+
+    // Allocate mutable buffer in default arena (0)
+    let mut mut_slice = ifa_rt_slice_alloc(64, 0);
+    assert_eq!(mut_slice.len, 0);
+    assert!(mut_slice.cap >= 64);
+    assert!(!mut_slice.ptr.is_null());
+
+    let payload = b"Hello from Symfony 8.1 FFI";
+    mut_slice.as_capacity_bytes_mut()[..payload.len()].copy_from_slice(payload);
+    mut_slice.len = payload.len();
+    assert_eq!(&mut_slice.as_bytes()[..payload.len()], payload);
+
+    ifa_rt_slice_free(mut_slice);
+
+    // Verify version string
+    let ver_ptr = ifa_rt_version_string();
+    assert!(!ver_ptr.is_null());
+    let ver_cstr = unsafe { std::ffi::CStr::from_ptr(ver_ptr) };
+    assert!(ver_cstr.to_str().unwrap().contains("IFA Runtime 0.1.0"));
+}
+
+#[test]
+fn test_arena_alloc_and_reset_ffi() {
+    use ifa_runtime::ffi::{
+        ifa_rt_arena_alloc, ifa_rt_arena_create, ifa_rt_arena_destroy, ifa_rt_arena_reset,
+        ifa_rt_gen_check,
+    };
+
+    let arena = ifa_rt_arena_create(65536);
+    assert!(arena > 0);
+
+    let ptr1 = ifa_rt_arena_alloc(arena, 128, 8);
+    assert!(!ptr1.is_null());
+
+    let ptr2 = ifa_rt_arena_alloc(arena, 256, 8);
+    assert!(!ptr2.is_null());
+    assert_ne!(ptr1, ptr2);
+
+    // Check generational validity
+    ifa_rt_gen_check(ptr1, 1);
+    ifa_rt_gen_check(ptr2, 1);
+
+    // Reset arena
+    ifa_rt_arena_reset(arena);
+
+    // Destroy arena
+    ifa_rt_arena_destroy(arena);
+}
