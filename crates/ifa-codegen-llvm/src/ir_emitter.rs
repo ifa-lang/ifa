@@ -601,8 +601,16 @@ impl<'a> LlvmIrEmitter<'a> {
     ) -> Result<(), LlvmCodegenError> {
         let fn_name = INTERNER.resolve(&func.name);
         let raw_ret_ty = fir_to_llvm_type(&func.ret_ty)?;
+        let is_coro = func.is_coroutine();
+        let coro_attr = if is_coro { "presplitcoroutine " } else { "" };
         let is_main_unit = fn_name == "main" && raw_ret_ty == "void";
-        let ret_ty = if is_main_unit { "i32" } else { &raw_ret_ty };
+        let ret_ty = if is_coro {
+            "ptr"
+        } else if is_main_unit {
+            "i32"
+        } else {
+            &raw_ret_ty
+        };
 
         let linkage = if func.is_pub {
             "dso_local "
@@ -627,8 +635,9 @@ impl<'a> LlvmIrEmitter<'a> {
             .collect();
 
         out.push_str(&format!(
-            "define {}{} @{}({}) {} {{\n",
+            "define {}{}{} @{}({}) {} {{\n",
             linkage,
+            coro_attr,
             ret_ty,
             fn_name,
             params_str.join(", "),
@@ -880,6 +889,7 @@ impl<'a> LlvmIrEmitter<'a> {
         }
 
         // Basic blocks
+        let mut coro_yield_idx: usize = 0;
         for (b_idx, block) in func.blocks.iter().enumerate() {
             let label = if b_idx == 0 {
                 "entry".to_string()
@@ -887,6 +897,19 @@ impl<'a> LlvmIrEmitter<'a> {
                 format!("bb{}", block.id.0)
             };
             out.push_str(&format!("{}:\n", label));
+
+            if is_coro && b_idx == 0 {
+                out.push_str(
+                    "  %coro.id = call token @llvm.coro.id(i32 0, ptr null, ptr null, ptr null)\n",
+                );
+                out.push_str("  %coro.size = call i64 @llvm.coro.size.i64()\n");
+                out.push_str(
+                    "  %coro.alloc = call ptr @ifa_rt_gen_alloc(i64 %coro.size, i64 8, i16 0)\n",
+                );
+                out.push_str(
+                    "  %coro.hdl = call ptr @llvm.coro.begin(token %coro.id, ptr %coro.alloc)\n",
+                );
+            }
 
             // Emit PHI nodes for block arguments
             if b_idx > 0 && !block.params.is_empty() {
@@ -938,6 +961,8 @@ impl<'a> LlvmIrEmitter<'a> {
                         module,
                         &value_types,
                         &array_allocas,
+                        is_coro,
+                        &mut coro_yield_idx,
                         out,
                     )?;
                 }
@@ -949,12 +974,23 @@ impl<'a> LlvmIrEmitter<'a> {
                     term,
                     &func.ret_ty,
                     is_main_unit,
+                    is_coro,
                     block.vector_hint.as_ref(),
                     out,
                 )?;
             } else {
                 out.push_str("  unreachable\n");
             }
+        }
+
+        if is_coro {
+            out.push_str("coro.cleanup:\n");
+            out.push_str("  %coro.mem = call ptr @llvm.coro.free(token %coro.id, ptr %coro.hdl)\n");
+            out.push_str("  call void @ifa_rt_gen_free(ptr %coro.mem)\n");
+            out.push_str("  br label %coro.susp_ret\n");
+            out.push_str("coro.susp_ret:\n");
+            out.push_str("  call i1 @llvm.coro.end(ptr %coro.hdl, i1 false, token none)\n");
+            out.push_str("  ret ptr %coro.hdl\n");
         }
 
         out.push_str("}\n");
@@ -1670,7 +1706,34 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             ValueExpr::Spawn { target, args } => {
                 let callee = INTERNER.resolve(target);
-                if args.is_empty() {
+                let is_target_coro = module
+                    .functions
+                    .iter()
+                    .find(|f| f.name == *target)
+                    .map(|f| f.is_coroutine())
+                    .unwrap_or(false);
+
+                if is_target_coro {
+                    if args.is_empty() {
+                        out.push_str(&format!(
+                            "  %coro_hdl_{} = call ptr @{}()\n",
+                            res_id, callee
+                        ));
+                    } else {
+                        let args_llvm: Vec<String> =
+                            args.iter().map(|a| format!("i64 %v{}", a.0)).collect();
+                        out.push_str(&format!(
+                            "  %coro_hdl_{} = call ptr @{}({})\n",
+                            res_id,
+                            callee,
+                            args_llvm.join(", ")
+                        ));
+                    }
+                    out.push_str(&format!(
+                        "  %v{} = call i64 @ifa_coro_llvm_spawn(ptr %coro_hdl_{})\n",
+                        res_id, res_id
+                    ));
+                } else if args.is_empty() {
                     out.push_str(&format!(
                         "  %v{} = call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr null)\n",
                         res_id, callee
@@ -1950,12 +2013,15 @@ impl<'a> LlvmIrEmitter<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_effectful_instruction(
         &self,
         expr: &ValueExpr,
         module: &FirModule,
         value_types: &HashMap<ifa_fir::ValueId, ifa_fir::FirType>,
         array_allocas: &HashMap<ifa_fir::ValueId, ifa_fir::ValueId>,
+        is_coro: bool,
+        coro_yield_idx: &mut usize,
         out: &mut String,
     ) -> Result<(), LlvmCodegenError> {
         match expr {
@@ -2104,7 +2170,21 @@ impl<'a> LlvmIrEmitter<'a> {
                 }
             }
             ValueExpr::Yield => {
-                out.push_str("  call void @ifa_rt_fiber_yield()\n");
+                if is_coro {
+                    let y_id = *coro_yield_idx;
+                    *coro_yield_idx += 1;
+                    out.push_str(&format!(
+                        "  %coro.susp_{} = call i8 @llvm.coro.suspend(token none, i1 false)\n",
+                        y_id
+                    ));
+                    out.push_str(&format!(
+                        "  switch i8 %coro.susp_{}, label %coro.susp_ret [ i8 0, label %coro.resume_{} i8 1, label %coro.cleanup ]\n",
+                        y_id, y_id
+                    ));
+                    out.push_str(&format!("coro.resume_{}:\n", y_id));
+                } else {
+                    out.push_str("  call void @ifa_rt_fiber_yield()\n");
+                }
             }
             ValueExpr::ChanSend { chan, val } => {
                 out.push_str(&format!(
@@ -2188,7 +2268,27 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             ValueExpr::Spawn { target, args } => {
                 let callee = INTERNER.resolve(target);
-                if args.is_empty() {
+                let is_target_coro = module
+                    .functions
+                    .iter()
+                    .find(|f| f.name == *target)
+                    .map(|f| f.is_coroutine())
+                    .unwrap_or(false);
+
+                if is_target_coro {
+                    if args.is_empty() {
+                        out.push_str(&format!("  %coro_eff_hdl = call ptr @{}()\n", callee));
+                    } else {
+                        let args_llvm: Vec<String> =
+                            args.iter().map(|a| format!("i64 %v{}", a.0)).collect();
+                        out.push_str(&format!(
+                            "  %coro_eff_hdl = call ptr @{}({})\n",
+                            callee,
+                            args_llvm.join(", ")
+                        ));
+                    }
+                    out.push_str("  call i64 @ifa_coro_llvm_spawn(ptr %coro_eff_hdl)\n");
+                } else if args.is_empty() {
                     out.push_str(&format!(
                         "  call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr null)\n",
                         callee
@@ -2304,11 +2404,16 @@ impl<'a> LlvmIrEmitter<'a> {
         term: &Terminator,
         ret_ty: &ifa_fir::FirType,
         is_main_unit: bool,
+        is_coro: bool,
         vector_hint: Option<&ifa_fir::LoopVectorHint>,
         out: &mut String,
     ) -> Result<(), LlvmCodegenError> {
         match term {
             Terminator::Return(val_opt) => {
+                if is_coro {
+                    out.push_str("  br label %coro.cleanup\n");
+                    return Ok(());
+                }
                 if is_main_unit {
                     out.push_str("  ret i32 0\n");
                     return Ok(());
