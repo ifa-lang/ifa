@@ -1,0 +1,114 @@
+// IFA Ecosystem Web OS Reactive Window Manager & Microservice
+// Demonstrates cyclic graph referencing via generational refs (ref), lock-free window events, and deterministic desktop composition.
+
+struct WindowMetrics {
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+    z_index: i64
+}
+
+struct WindowNode {
+    id: String,
+    app_name: String,
+    title: String,
+    metrics: WindowMetrics,
+    is_focused: bool,
+    is_minimized: bool,
+    parent_desktop: ?ref DesktopSession,
+    children: List<WindowNode>
+}
+
+struct DesktopSession {
+    session_id: String,
+    user_id: String,
+    theme: String,
+    active_window_id: String,
+    windows: List<WindowNode>
+}
+
+fn create_window(
+    inout desktop: DesktopSession,
+    id: String,
+    app_name: String,
+    title: String,
+    w: i64,
+    h: i64,
+    z: i64
+) -> WindowNode {
+    let metrics = WindowMetrics(x: 100, y: 100, width: w, height: h, z_index: z);
+    let win = WindowNode(
+        id: id,
+        app_name: app_name,
+        title: title,
+        metrics: metrics,
+        is_focused: true,
+        is_minimized: false,
+        parent_desktop: ref desktop,
+        children: List::new()
+    );
+    desktop.active_window_id = id;
+    return win;
+}
+
+fn attach_subview(inout parent: WindowNode, mut child: WindowNode) {
+    parent.children.push(child);
+}
+
+pub fn main() {
+    println("=== IFA WEB OS WINDOW MANAGER ===");
+
+    mut desktop = DesktopSession(
+        session_id: "sess_webos_001",
+        user_id: "usr_lead_architect",
+        theme: "dark_emerald",
+        active_window_id: "none",
+        windows: List::new()
+    );
+
+    println("Session de bureau initialisée pour l'utilisateur:", desktop.user_id);
+
+    // Fenêtre 1: Terminal de commande système
+    mut term_window = create_window(
+        inout desktop,
+        "win-term-01",
+        "Terminal Shell",
+        "ifa-sh -- session active",
+        800,
+        500,
+        1
+    );
+
+    // Fenêtre 2: Visualisateur de transactions fintech
+    let fintech_window = create_window(
+        inout desktop,
+        "win-fintech-02",
+        "Payment Monitor",
+        "Transactions en temps réel (XOF)",
+        1024,
+        640,
+        2
+    );
+
+    // Vue imbriquée: Console d'audit dans le terminal
+    let term_console = WindowNode(
+        id: "view-audit-sub",
+        app_name: "AuditLogger",
+        title: "Flux d'audit E/S",
+        metrics: WindowMetrics(x: 10, y: 10, width: 780, height: 200, z_index: 1),
+        is_focused: false,
+        is_minimized: false,
+        parent_desktop: None,
+        children: List::new()
+    );
+
+    attach_subview(inout term_window, term_console);
+
+    desktop.windows.push(term_window);
+    desktop.windows.push(fintech_window);
+
+    println("Nombre total de fenêtres actives sur le bureau:", desktop.windows.len());
+    println("Fenêtre active au premier plan:", desktop.active_window_id);
+    println("Composition du bureau virtuel terminée avec succès.");
+}

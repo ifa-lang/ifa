@@ -1,5 +1,7 @@
 //! Slab and generational memory allocator providing deterministic zero-GC safety.
 
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use crate::header::{GenHeader, FLAG_ACTIVE, FLAG_ARENA_SCOPED};
 use std::alloc::{alloc, dealloc, Layout};
 use std::collections::HashMap;
@@ -76,7 +78,7 @@ impl SizeClassPool {
         }
     }
 
-    fn allocate(&mut self, arena_id: u16) -> *mut u8 {
+    fn allocate(&mut self, arena_id: u16, class_idx: usize) -> *mut u8 {
         if self.free_head.is_null() {
             self.grow();
         }
@@ -87,13 +89,23 @@ impl SizeClassPool {
             let payload_ptr = node as *mut u8;
             let header_ptr = (payload_ptr as *mut GenHeader).sub(1);
             let current_gen = (*header_ptr).generation_counter;
+            let class_flag = (((class_idx + 1) as u16) << crate::header::FLAG_CLASS_SHIFT)
+                & crate::header::FLAG_CLASS_MASK;
             *header_ptr = GenHeader {
                 generation_counter: if current_gen == 0 { 1 } else { current_gen },
-                allocation_flags: FLAG_ACTIVE,
+                allocation_flags: FLAG_ACTIVE | class_flag,
                 arena_id,
             };
             payload_ptr
         }
+    }
+
+    fn allocate_batch(&mut self, arena_id: u16, class_idx: usize, count: usize) -> Vec<*mut u8> {
+        let mut slots = Vec::with_capacity(count);
+        for _ in 0..count {
+            slots.push(self.allocate(arena_id, class_idx));
+        }
+        slots
     }
 
     fn recycle(&mut self, payload_ptr: *mut u8) {
@@ -101,6 +113,12 @@ impl SizeClassPool {
             let node = payload_ptr as *mut FreeNode;
             (*node).next = self.free_head;
             self.free_head = node;
+        }
+    }
+
+    fn recycle_batch(&mut self, slots: &[*mut u8]) {
+        for &slot in slots {
+            self.recycle(slot);
         }
     }
 
@@ -193,7 +211,7 @@ impl GlobalGenAllocatorInner {
         let class_idx = SIZE_CLASSES.iter().position(|&s| s >= size);
 
         let ptr = if let Some(idx) = class_idx {
-            self.pools[idx].allocate(arena_id)
+            self.pools[idx].allocate(arena_id, idx)
         } else {
             // Direct large allocation
             self.alloc_large(size, arena_id)
@@ -212,6 +230,36 @@ impl GlobalGenAllocatorInner {
         ptr
     }
 
+    /// Allocate a batch of generational slots for a specific payload size class.
+    pub fn alloc_batch(
+        &mut self,
+        size: usize,
+        arena_id: u16,
+        count: usize,
+    ) -> (Vec<*mut u8>, usize) {
+        let class_idx = SIZE_CLASSES.iter().position(|&s| s >= size);
+        if let Some(idx) = class_idx {
+            (self.pools[idx].allocate_batch(arena_id, idx, count), idx)
+        } else {
+            let mut list = Vec::with_capacity(count);
+            for _ in 0..count {
+                list.push(self.alloc_large(size, arena_id));
+            }
+            (list, usize::MAX)
+        }
+    }
+
+    /// Recycle a batch of slots back into their designated size-class pool.
+    pub fn recycle_batch(&mut self, class_idx: usize, slots: &[*mut u8]) {
+        if class_idx < self.pools.len() {
+            self.pools[class_idx].recycle_batch(slots);
+        } else {
+            for &slot in slots {
+                self.free(slot);
+            }
+        }
+    }
+
     /// Deallocate an active generational memory slot.
     pub fn free(&mut self, ptr: *mut u8) {
         if ptr.is_null() {
@@ -228,22 +276,31 @@ impl GlobalGenAllocatorInner {
             // Invalidate slot generation
             (*header).mark_freed();
 
-            // Locate size class or large allocation
-            let addr = ptr as usize;
-            if let Some((layout, _)) = self.large_allocations.remove(&addr) {
-                let raw_ptr = header as *mut u8;
-                dealloc(raw_ptr, layout);
-            } else {
-                // For slab pool recycling, find matching size class
-                // Here we find the pool that owns this pointer address
-                for pool in &mut self.pools {
-                    for page in &pool.pages {
-                        let page_start = page.memory as usize;
-                        let page_end = page_start + page.layout.size();
-                        if (header as usize) >= page_start && (header as usize) < page_end {
-                            pool.recycle(ptr);
-                            return;
-                        }
+            self.recycle_raw(ptr, header);
+        }
+    }
+
+    /// Internal recycling after header invalidation.
+    pub(crate) unsafe fn recycle_raw(&mut self, ptr: *mut u8, header: *mut GenHeader) {
+        // Locate size class or large allocation
+        let addr = ptr as usize;
+        if let Some((layout, _)) = self.large_allocations.remove(&addr) {
+            let raw_ptr = header as *mut u8;
+            dealloc(raw_ptr, layout);
+        } else {
+            let class_code = (*header).size_class_id();
+            if class_code >= 1 && class_code <= self.pools.len() {
+                self.pools[class_code - 1].recycle(ptr);
+                return;
+            }
+            // Fallback scan if size class is unclassified
+            for pool in &mut self.pools {
+                for page in &pool.pages {
+                    let page_start = page.memory as usize;
+                    let page_end = page_start + page.layout.size();
+                    if (header as usize) >= page_start && (header as usize) < page_end {
+                        pool.recycle(ptr);
+                        return;
                     }
                 }
             }
@@ -275,6 +332,20 @@ impl GlobalGenAllocatorInner {
     }
 }
 
+/// Batch allocation count fetched by thread-local cache from global pool on miss.
+pub const THREAD_CACHE_BATCH_SIZE: usize = 32;
+/// Maximum slots cached per size-class before returning a batch to the global pool.
+pub const THREAD_CACHE_MAX_CAPACITY: usize = 64;
+
+#[derive(Default)]
+struct ThreadLocalSlabCache {
+    bins: [Vec<*mut u8>; SIZE_CLASSES.len()],
+}
+
+thread_local! {
+    static LOCAL_CACHE: std::cell::RefCell<ThreadLocalSlabCache> = std::cell::RefCell::new(ThreadLocalSlabCache::default());
+}
+
 /// Global thread-safe generational allocator instance.
 pub struct GlobalGenAllocator {
     inner: Mutex<GlobalGenAllocatorInner>,
@@ -294,6 +365,45 @@ impl GlobalGenAllocator {
     /// Allocate a slot on the generational heap.
     pub fn alloc(&self, size: usize, align: usize, arena_id: u16) -> *mut u8 {
         self.allocated_bytes.fetch_add(size, Ordering::Relaxed);
+
+        // Fast-path for non-arena standard slab size classes via thread-local cache
+        if arena_id == 0 {
+            if let Some(idx) = SIZE_CLASSES.iter().position(|&s| s >= size) {
+                let cached_ptr = LOCAL_CACHE.with(|cache| {
+                    let mut c = cache.borrow_mut();
+                    c.bins[idx].pop()
+                });
+
+                if let Some(ptr) = cached_ptr {
+                    unsafe {
+                        let header = (ptr as *mut GenHeader).sub(1);
+                        let cur_gen = (*header).generation_counter;
+                        let class_flag = (((idx + 1) as u16) << crate::header::FLAG_CLASS_SHIFT)
+                            & crate::header::FLAG_CLASS_MASK;
+                        *header = GenHeader {
+                            generation_counter: if cur_gen == 0 { 1 } else { cur_gen },
+                            allocation_flags: FLAG_ACTIVE | class_flag,
+                            arena_id: 0,
+                        };
+                    }
+                    return ptr;
+                }
+
+                // Batch refill from global pool under single lock
+                let mut inner = self.inner.lock().unwrap();
+                let (mut batch, _) = inner.alloc_batch(size, arena_id, THREAD_CACHE_BATCH_SIZE);
+                if let Some(ptr) = batch.pop() {
+                    if !batch.is_empty() {
+                        LOCAL_CACHE.with(|cache| {
+                            let mut c = cache.borrow_mut();
+                            c.bins[idx].extend(batch);
+                        });
+                    }
+                    return ptr;
+                }
+            }
+        }
+
         let mut inner = self.inner.lock().unwrap();
         inner.alloc(size, align, arena_id)
     }
@@ -303,8 +413,47 @@ impl GlobalGenAllocator {
         if ptr.is_null() {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
-        inner.free(ptr);
+
+        unsafe {
+            let header = (ptr as *mut GenHeader).sub(1);
+            if !(*header).is_active() {
+                crate::ffi::ifa_rt_panic_double_free(ptr);
+            }
+
+            let class_code = (*header).size_class_id();
+            let is_arena = (*header).is_arena_scoped();
+
+            // Invalidate slot generation
+            (*header).mark_freed();
+
+            // Fast-path thread-local recycling for standard slab classes
+            if !is_arena && class_code >= 1 && class_code <= SIZE_CLASSES.len() {
+                let class_idx = class_code - 1;
+                let flush_slots = LOCAL_CACHE.with(|cache| {
+                    let mut c = cache.borrow_mut();
+                    c.bins[class_idx].push(ptr);
+                    if c.bins[class_idx].len() >= THREAD_CACHE_MAX_CAPACITY {
+                        let drain_count = THREAD_CACHE_BATCH_SIZE;
+                        Some(
+                            c.bins[class_idx]
+                                .drain(0..drain_count)
+                                .collect::<Vec<*mut u8>>(),
+                        )
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(flushed) = flush_slots {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.recycle_batch(class_idx, &flushed);
+                }
+                return;
+            }
+
+            let mut inner = self.inner.lock().unwrap();
+            inner.recycle_raw(ptr, header);
+        }
     }
 
     /// Create a new scoped arena.

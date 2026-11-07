@@ -1,0 +1,128 @@
+// IFA Ecosystem Payment API Microservice
+// Demonstrates strict stack crypto verification, generational memory arenas, CoW transactions, and error propagation.
+
+struct PaymentTransaction {
+    tx_ref: String,
+    merchant_id: String,
+    customer_phone: String,
+    amount_cents: u64,
+    currency: String,
+    gateway_channel: String,
+    status: String,
+    created_at: u64
+}
+
+struct MerchantAccount {
+    merchant_id: String,
+    company_name: String,
+    balance_cents: u64,
+    active: bool,
+    secret_key_id: String
+}
+
+struct PaymentAuditLog {
+    log_id: String,
+    tx_ref: String,
+    action: String,
+    verified: bool,
+    timestamp: u64
+}
+
+// Mode strict: Deterministic stack-allocated cryptographic checksum verification (zero heap allocation)
+strict fn verify_payload_hmac(payload: Slice<u8>, secret: Slice<u8>, expected_checksum: u8) -> bool {
+    mut accumulator: u8 = 0u8;
+    for b in payload {
+        accumulator ^= b;
+    }
+    for k in secret {
+        accumulator = accumulator + k;
+    }
+    return accumulator == expected_checksum;
+}
+
+// In-place account settlement using IFA value semantics and inout projection
+fn settle_transaction(inout merchant: MerchantAccount, amount: u64) {
+    merchant.balance_cents = merchant.balance_cents + amount;
+}
+
+// Process a payment transaction with generational arena isolation and error checking
+fn process_incoming_charge(
+    inout merchant: MerchantAccount,
+    tx_ref: String,
+    phone: String,
+    amount: u64,
+    channel: String,
+    signature: u8
+) -> PaymentTransaction {
+    let raw_payload = [101u8, 102u8, 103u8, 104u8];
+    let secret = [42u8, 99u8];
+
+    let is_valid = verify_payload_hmac(raw_payload, secret, signature);
+    if !is_valid {
+        println("Avertissement: Signature cryptographique invalide pour la transaction:", tx_ref);
+        return PaymentTransaction(
+            tx_ref: tx_ref,
+            merchant_id: merchant.merchant_id,
+            customer_phone: phone,
+            amount_cents: amount,
+            currency: "XOF",
+            gateway_channel: channel,
+            status: "REJECTED_INVALID_SIGNATURE",
+            created_at: 1773000000
+        );
+    }
+
+    settle_transaction(inout merchant, amount);
+
+    return PaymentTransaction(
+        tx_ref: tx_ref,
+        merchant_id: merchant.merchant_id,
+        customer_phone: phone,
+        amount_cents: amount,
+        currency: "XOF",
+        gateway_channel: channel,
+        status: "SETTLED_SUCCESS",
+        created_at: 1773000000
+    );
+}
+
+pub fn main() {
+    println("=== IFA PAYMENT GATEWAY ENGINE ===");
+
+    mut merchant = MerchantAccount(
+        merchant_id: "MRC-BENIN-094",
+        company_name: "Sahel Fintech SARL",
+        balance_cents: 15000000,
+        active: true,
+        secret_key_id: "sec_live_9981"
+    );
+
+    println("Compte marchand initialisé:", merchant.company_name);
+    println("Solde marchand initial (centimes):", merchant.balance_cents);
+
+    // Transaction 1: MTN Mobile Money Payment
+    let tx1 = process_incoming_charge(
+        inout merchant,
+        "TX-MOMO-882190",
+        "+22997000001",
+        2500000,
+        "MTN_MOMO",
+        137u8
+    );
+    println("Statut transaction 1:", tx1.status);
+    println("Nouveau solde marchand:", merchant.balance_cents);
+
+    // Transaction 2: Moov Money Payment
+    let tx2 = process_incoming_charge(
+        inout merchant,
+        "TX-MOOV-441029",
+        "+22995000002",
+        5000000,
+        "MOOV_MONEY",
+        137u8
+    );
+    println("Statut transaction 2:", tx2.status);
+    println("Nouveau solde marchand:", merchant.balance_cents);
+
+    println("Règlement clôturé avec succès.");
+}

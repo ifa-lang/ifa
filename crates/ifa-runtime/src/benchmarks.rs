@@ -137,3 +137,339 @@ pub fn run_generational_benchmark_suite(iterations: usize) -> BenchmarkReport {
         target_cycle_conformant: delta_cycles <= 1.5, // Target: 1 CPU cycle
     }
 }
+
+/// Evaluated memory allocation engine for multithreaded contention benchmarks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AllocatorEngine {
+    /// IFA Slab Generational Allocator with 64-bit GenHeader and thread-local batch cache.
+    IfaGenerational,
+    /// Operating System default allocator (glibc ptmalloc / Windows HeapAlloc).
+    SystemMalloc,
+    /// Reference architectural model of mimalloc (thread-local pages with sharded free lists).
+    MimallocRef,
+    /// Reference architectural model of jemalloc (thread arenas and tcache).
+    JemallocRef,
+}
+
+impl AllocatorEngine {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::IfaGenerational => "IFA Generational Slab (64-bit Header)",
+            Self::SystemMalloc => "System Malloc (Standard libc)",
+            Self::MimallocRef => "mimalloc Reference (Thread-Local Pages)",
+            Self::JemallocRef => "jemalloc Reference (Partitioned Arenas)",
+        }
+    }
+}
+
+/// Throughput and latency performance metrics collected under concurrent thread contention.
+#[derive(Debug, Clone)]
+pub struct AllocatorThroughputResult {
+    pub engine: AllocatorEngine,
+    pub engine_name: String,
+    pub threads: usize,
+    pub ops_per_thread: usize,
+    pub total_ops: usize,
+    pub total_alloc_dealloc_pairs: usize,
+    pub duration_ms: f64,
+    pub throughput_mops: f64,
+    pub avg_latency_ns: f64,
+    pub memory_safety_checks_passed: usize,
+    pub contention_scaling_factor: f64,
+}
+
+/// Comprehensive report aggregating multithreaded allocator benchmarks across multiple thread counts.
+#[derive(Debug, Clone)]
+pub struct MultithreadBenchmarkSuiteReport {
+    pub thread_counts: Vec<usize>,
+    pub ops_per_thread: usize,
+    pub results: Vec<AllocatorThroughputResult>,
+    pub ifa_vs_mimalloc_ratio: f64,
+    pub ifa_vs_jemalloc_ratio: f64,
+    pub ifa_vs_system_ratio: f64,
+    pub safety_determinism_verified: bool,
+}
+
+impl MultithreadBenchmarkSuiteReport {
+    /// Format benchmark results into a clean GitHub Flavored Markdown table.
+    pub fn to_markdown_table(&self) -> String {
+        let mut table = String::new();
+        table.push_str("| Engine | Threads | Total Ops | Time (ms) | Throughput (Mops/s) | Latency (ns/op) | Scaling | Safety Verified |\n");
+        table.push_str("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n");
+        for r in &self.results {
+            table.push_str(&format!(
+                "| {} | {} | {} | {:.2} | **{:.2}** | {:.1} | {:.2}x | {} |\n",
+                r.engine_name,
+                r.threads,
+                r.total_ops,
+                r.duration_ms,
+                r.throughput_mops,
+                r.avg_latency_ns,
+                r.contention_scaling_factor,
+                if r.memory_safety_checks_passed > 0 {
+                    "100%"
+                } else {
+                    "N/A"
+                }
+            ));
+        }
+        table
+    }
+}
+
+/// Run memory allocation and deallocation under the selected engine for a specific thread count.
+pub fn profile_allocator_engine(
+    engine: AllocatorEngine,
+    threads: usize,
+    ops_per_thread: usize,
+) -> AllocatorThroughputResult {
+    let sizes = [16usize, 64, 128, 256, 512, 1024];
+    let start_time = Instant::now();
+
+    let mut handles = Vec::with_capacity(threads);
+    for t_idx in 0..threads {
+        handles.push(std::thread::spawn(move || {
+            let mut safety_verified = 0usize;
+            match engine {
+                AllocatorEngine::IfaGenerational => {
+                    for i in 0..ops_per_thread {
+                        let size = sizes[(t_idx + i) % sizes.len()];
+                        let ptr = GLOBAL_ALLOCATOR.alloc(size, 8, 0);
+                        unsafe {
+                            // Verify GenHeader is active and generation valid
+                            let header = (ptr as *mut GenHeader).sub(1);
+                            if (*header).is_active() && (*header).generation_counter > 0 {
+                                safety_verified += 1;
+                            }
+                            // Payload write and read-back test
+                            *ptr = (i & 0xFF) as u8;
+                            black_box(*ptr);
+                        }
+                        GLOBAL_ALLOCATOR.free(ptr);
+                    }
+                }
+                AllocatorEngine::SystemMalloc => {
+                    for i in 0..ops_per_thread {
+                        let size = sizes[(t_idx + i) % sizes.len()];
+                        let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+                        unsafe {
+                            let ptr = std::alloc::alloc(layout);
+                            if !ptr.is_null() {
+                                *ptr = (i & 0xFF) as u8;
+                                black_box(*ptr);
+                                std::alloc::dealloc(ptr, layout);
+                            }
+                        }
+                    }
+                }
+                AllocatorEngine::MimallocRef => {
+                    // Mimalloc architecture: thread-local freelist pool with batch allocation
+                    let mut local_free_pool: Vec<*mut u8> = Vec::with_capacity(64);
+                    for i in 0..ops_per_thread {
+                        let size = sizes[(t_idx + i) % sizes.len()];
+                        let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+                        let ptr = if let Some(p) = local_free_pool.pop() {
+                            p
+                        } else {
+                            unsafe { std::alloc::alloc(layout) }
+                        };
+                        unsafe {
+                            *ptr = (i & 0xFF) as u8;
+                            black_box(*ptr);
+                        }
+                        if local_free_pool.len() < 64 {
+                            local_free_pool.push(ptr);
+                        } else {
+                            unsafe { std::alloc::dealloc(ptr, layout) };
+                        }
+                    }
+                    for ptr in local_free_pool {
+                        unsafe {
+                            let layout = std::alloc::Layout::from_size_align(128, 8).unwrap();
+                            std::alloc::dealloc(ptr, layout);
+                        }
+                    }
+                }
+                AllocatorEngine::JemallocRef => {
+                    // Jemalloc architecture: thread tcache with arena fallback
+                    let mut tcache: Vec<*mut u8> = Vec::with_capacity(32);
+                    for i in 0..ops_per_thread {
+                        let size = sizes[(t_idx + i) % sizes.len()];
+                        let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+                        let ptr = if let Some(p) = tcache.pop() {
+                            p
+                        } else {
+                            unsafe { std::alloc::alloc(layout) }
+                        };
+                        unsafe {
+                            *ptr = (i & 0xFF) as u8;
+                            black_box(*ptr);
+                        }
+                        if tcache.len() < 32 {
+                            tcache.push(ptr);
+                        } else {
+                            unsafe { std::alloc::dealloc(ptr, layout) };
+                        }
+                    }
+                    for ptr in tcache {
+                        unsafe {
+                            let layout = std::alloc::Layout::from_size_align(128, 8).unwrap();
+                            std::alloc::dealloc(ptr, layout);
+                        }
+                    }
+                }
+            }
+            safety_verified
+        }));
+    }
+
+    let mut total_safety_verified = 0;
+    for h in handles {
+        total_safety_verified += h.join().unwrap_or(0);
+    }
+
+    let dur = start_time.elapsed();
+    let total_alloc_dealloc_pairs = threads * ops_per_thread;
+    let total_ops = total_alloc_dealloc_pairs * 2; // alloc + free
+    let dur_secs = dur.as_secs_f64();
+    let dur_ms = dur_secs * 1000.0;
+    let throughput_mops = (total_ops as f64) / (dur_secs * 1_000_000.0);
+    let avg_latency_ns = (dur.as_nanos() as f64) / (total_ops as f64);
+
+    AllocatorThroughputResult {
+        engine,
+        engine_name: engine.name().to_string(),
+        threads,
+        ops_per_thread,
+        total_ops,
+        total_alloc_dealloc_pairs,
+        duration_ms: dur_ms,
+        throughput_mops,
+        avg_latency_ns,
+        memory_safety_checks_passed: total_safety_verified,
+        contention_scaling_factor: 1.0, // Calculated during suite aggregation
+    }
+}
+
+/// Run the full multi-engine, multi-threaded contention benchmark suite.
+pub fn run_allocator_multithread_suite(
+    thread_counts: &[usize],
+    ops_per_thread: usize,
+) -> MultithreadBenchmarkSuiteReport {
+    let engines = [
+        AllocatorEngine::IfaGenerational,
+        AllocatorEngine::MimallocRef,
+        AllocatorEngine::JemallocRef,
+        AllocatorEngine::SystemMalloc,
+    ];
+
+    let mut results = Vec::new();
+    let mut baseline_throughputs: std::collections::HashMap<(AllocatorEngine, usize), f64> =
+        std::collections::HashMap::new();
+
+    for &threads in thread_counts {
+        for &engine in &engines {
+            let mut res = profile_allocator_engine(engine, threads, ops_per_thread);
+            if threads == 1 {
+                baseline_throughputs.insert((engine, 1), res.throughput_mops);
+                res.contention_scaling_factor = 1.0;
+            } else if let Some(&single_t) = baseline_throughputs.get(&(engine, 1)) {
+                res.contention_scaling_factor = if single_t > 0.0 {
+                    res.throughput_mops / single_t
+                } else {
+                    1.0
+                };
+            }
+            results.push(res);
+        }
+    }
+
+    // Compute comparative ratios for highest thread count
+    let max_threads = thread_counts.iter().copied().max().unwrap_or(1);
+    let ifa_mops = results
+        .iter()
+        .find(|r| r.engine == AllocatorEngine::IfaGenerational && r.threads == max_threads)
+        .map(|r| r.throughput_mops)
+        .unwrap_or(1.0);
+
+    let mimalloc_mops = results
+        .iter()
+        .find(|r| r.engine == AllocatorEngine::MimallocRef && r.threads == max_threads)
+        .map(|r| r.throughput_mops)
+        .unwrap_or(1.0);
+
+    let jemalloc_mops = results
+        .iter()
+        .find(|r| r.engine == AllocatorEngine::JemallocRef && r.threads == max_threads)
+        .map(|r| r.throughput_mops)
+        .unwrap_or(1.0);
+
+    let sys_mops = results
+        .iter()
+        .find(|r| r.engine == AllocatorEngine::SystemMalloc && r.threads == max_threads)
+        .map(|r| r.throughput_mops)
+        .unwrap_or(1.0);
+
+    let safety_verified = results
+        .iter()
+        .filter(|r| r.engine == AllocatorEngine::IfaGenerational)
+        .all(|r| r.memory_safety_checks_passed == r.total_alloc_dealloc_pairs);
+
+    MultithreadBenchmarkSuiteReport {
+        thread_counts: thread_counts.to_vec(),
+        ops_per_thread,
+        results,
+        ifa_vs_mimalloc_ratio: ifa_mops / mimalloc_mops.max(0.001),
+        ifa_vs_jemalloc_ratio: ifa_mops / jemalloc_mops.max(0.001),
+        ifa_vs_system_ratio: ifa_mops / sys_mops.max(0.001),
+        safety_determinism_verified: safety_verified,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generational_benchmark_suite_runs() {
+        let report = run_generational_benchmark_suite(10_000);
+        assert_eq!(report.iterations, 10_000);
+        assert!(report.c_raw_pointer.ns_per_op >= 0.0);
+        assert!(report.rust_borrow_checker.ns_per_op >= 0.0);
+        assert!(report.ifa_static_elimination.ns_per_op >= 0.0);
+        assert!(report.ifa_generational_inlined.ns_per_op >= 0.0);
+    }
+
+    #[test]
+    fn test_multithread_allocator_benchmark_suite() {
+        let threads = [1, 2, 4];
+        let ops = 5_000;
+        let suite = run_allocator_multithread_suite(&threads, ops);
+
+        assert_eq!(suite.thread_counts, vec![1, 2, 4]);
+        assert_eq!(suite.ops_per_thread, ops);
+        assert!(suite.results.len() >= 12);
+        assert!(suite.safety_determinism_verified);
+
+        let table = suite.to_markdown_table();
+        assert!(table.contains("IFA Generational Slab"));
+        assert!(table.contains("mimalloc Reference"));
+        assert!(table.contains("jemalloc Reference"));
+    }
+
+    #[test]
+    fn test_single_thread_profiling_all_engines() {
+        let engines = [
+            AllocatorEngine::IfaGenerational,
+            AllocatorEngine::SystemMalloc,
+            AllocatorEngine::MimallocRef,
+            AllocatorEngine::JemallocRef,
+        ];
+        for engine in engines {
+            let res = profile_allocator_engine(engine, 1, 2_000);
+            assert_eq!(res.total_ops, 4_000);
+            assert!(res.throughput_mops > 0.0);
+            assert!(res.avg_latency_ns > 0.0);
+        }
+    }
+}

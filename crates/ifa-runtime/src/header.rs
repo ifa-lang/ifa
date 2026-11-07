@@ -11,6 +11,10 @@ pub const FLAG_PINNED: u16 = 0x0002;
 pub const FLAG_READONLY: u16 = 0x0004;
 pub const FLAG_ARENA_SCOPED: u16 = 0x0008;
 
+/// Bitshift and mask for encoding size-class ID within allocation flags.
+pub const FLAG_CLASS_SHIFT: u16 = 8;
+pub const FLAG_CLASS_MASK: u16 = 0xFF00;
+
 /// 64-bit Generational Header placed immediately before each allocated payload.
 #[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +42,25 @@ impl GenHeader {
     #[inline(always)]
     pub const fn is_active(&self) -> bool {
         (self.allocation_flags & FLAG_ACTIVE) != 0
+    }
+
+    /// Check if the slot belongs to an explicit scoped arena.
+    #[inline(always)]
+    pub const fn is_arena_scoped(&self) -> bool {
+        (self.allocation_flags & FLAG_ARENA_SCOPED) != 0
+    }
+
+    /// Retrieve the encoded size-class ID (1-based, 0 if unclassified/large).
+    #[inline(always)]
+    pub const fn size_class_id(&self) -> usize {
+        ((self.allocation_flags & FLAG_CLASS_MASK) >> FLAG_CLASS_SHIFT) as usize
+    }
+
+    /// Store a 1-based size-class ID into the header flags.
+    #[inline(always)]
+    pub fn set_size_class_id(&mut self, class_id: usize) {
+        self.allocation_flags = (self.allocation_flags & !FLAG_CLASS_MASK)
+            | (((class_id as u16) << FLAG_CLASS_SHIFT) & FLAG_CLASS_MASK);
     }
 
     /// Mark slot as freed and increment generation counter safely.

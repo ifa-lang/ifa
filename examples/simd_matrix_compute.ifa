@@ -1,0 +1,61 @@
+// IFA Ecosystem High-Performance SIMD Matrix & Vector Compute Suite
+// Demonstrates strict stack-allocated compute loops, zero-GC vectorization, and LLVM SIMD optimizations.
+
+// Mode strict: Compute Euclidean dot product with continuous slice memory access (zero heap allocation)
+strict fn dot_product_4(a: Slice<f64>, b: Slice<f64>) -> f64 {
+    mut sum: f64 = 0.0;
+    mut i: usize = 0;
+    while i < 4 {
+        sum = sum + (a[i] * b[i]);
+        i = i + 1;
+    }
+    return sum;
+}
+
+// Mode strict: Compute squared Euclidean norm of a vector
+strict fn vector_norm_squared(v: Slice<f64>) -> f64 {
+    mut norm_sq: f64 = 0.0;
+    for val in v {
+        norm_sq = norm_sq + (val * val);
+    }
+    return norm_sq;
+}
+
+// Mode strict: Dense 2x2 matrix multiplication directly in place
+strict fn matmul_2x2(a: Slice<f64>, b: Slice<f64>) -> [f64; 4] {
+    mut res = [0.0, 0.0, 0.0, 0.0];
+    res[0] = (a[0] * b[0]) + (a[1] * b[2]);
+    res[1] = (a[0] * b[1]) + (a[1] * b[3]);
+    res[2] = (a[2] * b[0]) + (a[3] * b[2]);
+    res[3] = (a[2] * b[1]) + (a[3] * b[3]);
+    return res;
+}
+
+pub fn main() {
+    println("=== IFA HIGH-PERFORMANCE SIMD COMPUTE ===");
+
+    // Vector operations
+    let v1 = [1.5, 2.0, 3.5, 4.0];
+    let v2 = [2.0, 0.5, 1.0, 3.0];
+
+    let dot = dot_product_4(v1, v2);
+    println("Produit scalaire SIMD (v1 . v2) calculé:");
+    println("Résultat:", dot);
+
+    let norm_sq = vector_norm_squared(v1);
+    println("Norme carrée L2 de v1 calculée:");
+    println("Résultat:", norm_sq);
+
+    // Matrix operations
+    let m1 = [1.0, 2.0, 3.0, 4.0];
+    let m2 = [5.0, 6.0, 7.0, 8.0];
+
+    let m_res = matmul_2x2(m1, m2);
+    println("Multiplication matricielle dense (2x2) terminée:");
+    println("C[0,0]:", m_res[0]);
+    println("C[0,1]:", m_res[1]);
+    println("C[1,0]:", m_res[2]);
+    println("C[1,1]:", m_res[3]);
+
+    println("Calculs matriciels vectorisés validés avec zéro overhead GC.");
+}

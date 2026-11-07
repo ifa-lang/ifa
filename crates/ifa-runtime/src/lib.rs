@@ -12,7 +12,11 @@ pub mod string;
 pub mod wasi;
 
 pub use allocator::{GenArena, GlobalGenAllocator, GLOBAL_ALLOCATOR};
-pub use benchmarks::{run_generational_benchmark_suite, BenchmarkReport, BenchmarkResult};
+pub use benchmarks::{
+    profile_allocator_engine, run_allocator_multithread_suite, run_generational_benchmark_suite,
+    AllocatorEngine, AllocatorThroughputResult, BenchmarkReport, BenchmarkResult,
+    MultithreadBenchmarkSuiteReport,
+};
 pub use collections::{IfaList, IfaMap};
 pub use ffi::*;
 pub use fiber::{
