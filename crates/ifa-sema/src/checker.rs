@@ -2,11 +2,12 @@ use crate::escape::EscapeAnalyzer;
 use crate::exclusivity::{check_assignment_target, check_call_exclusivity};
 use crate::symbol_table::{
     ConstSymbol, EnumSymbol, FieldSymbol, FunctionSymbol, ParamSymbol, StructSymbol, SymbolTable,
+    TraitMethodSymbol, TraitSymbol,
 };
 use crate::types::{IntType, Type};
 use ifa_ast::{
-    Arg, BinOp, Block, Expr, ExprKind, Function, Item, Lit, ParamMode, Program, Stmt, Struct,
-    UnaryOp,
+    Arg, BinOp, Block, Expr, ExprKind, Function, GenericParam, Impl, Item, Lit, ParamMode, Program,
+    Stmt, Struct, Trait, UnaryOp,
 };
 use ifa_diagnostics::Diagnostic;
 use ifa_span::{SourceMap, Span, Symbol, INTERNER};
@@ -18,7 +19,7 @@ pub struct SemanticAnalyzer<'a> {
     pub diagnostics: Vec<Diagnostic>,
     pub current_func_ret_ty: Option<Type>,
     pub current_func_is_strict: bool,
-    pub current_func_generics: Vec<Symbol>,
+    pub current_func_generics: Vec<GenericParam>,
     pub expr_types: HashMap<Span, Type>,
     pub moved_vars: HashMap<Symbol, Span>,
     pub comptime_vm: ifa_comptime::ComptimeVM,
@@ -61,6 +62,7 @@ impl<'a> SemanticAnalyzer<'a> {
             match item {
                 Item::Struct(st) => self.declare_struct(st),
                 Item::Enum(en) => self.declare_enum(en),
+                Item::Trait(tr) => self.declare_trait(tr),
                 _ => {}
             }
         }
@@ -126,6 +128,54 @@ impl<'a> SemanticAnalyzer<'a> {
             span: en.span,
         };
         if let Err(diag) = self.symbols.define_enum(enum_sym) {
+            self.diagnostics.push(diag);
+        }
+    }
+
+    fn declare_trait(&mut self, tr: &Trait) {
+        let known_structs = self.get_known_struct_types();
+        let known_enums = self.get_known_enum_types();
+
+        let mut methods = Vec::new();
+        for m in &tr.methods {
+            let mut params = Vec::new();
+            for p in &m.params {
+                let ty = match Type::from_ast(&p.ty, &known_structs, &known_enums) {
+                    Ok(t) => t,
+                    Err(d) => {
+                        self.diagnostics.push(d);
+                        Type::Unknown
+                    }
+                };
+                params.push(ParamSymbol {
+                    mode: p.mode,
+                    name: p.name,
+                    ty,
+                    span: p.span,
+                });
+            }
+
+            let ret_ty = if let Some(ret) = &m.ret_ty {
+                Type::from_ast(ret, &known_structs, &known_enums).unwrap_or(Type::Unknown)
+            } else {
+                Type::Unit
+            };
+
+            methods.push(TraitMethodSymbol {
+                name: m.name,
+                params,
+                ret_ty,
+                span: m.span,
+            });
+        }
+
+        let trait_sym = TraitSymbol {
+            name: tr.name,
+            is_pub: tr.is_pub,
+            methods,
+            span: tr.span,
+        };
+        if let Err(diag) = self.symbols.define_trait(trait_sym) {
             self.diagnostics.push(diag);
         }
     }
@@ -248,7 +298,75 @@ impl<'a> SemanticAnalyzer<'a> {
                         self.diagnostics.push(diag);
                     }
                 }
+                Item::Impl(im) => {
+                    self.declare_impl(im);
+                }
                 _ => {}
+            }
+        }
+    }
+
+    fn declare_impl(&mut self, im: &Impl) {
+        let known_structs = self.get_known_struct_types();
+        let known_enums = self.get_known_enum_types();
+
+        let target_ty = match Type::from_ast(&im.target_ty, &known_structs, &known_enums) {
+            Ok(t) => t,
+            Err(d) => {
+                self.diagnostics.push(d);
+                Type::Unknown
+            }
+        };
+
+        if let Some(tr_name) = im.trait_name {
+            self.symbols.register_trait_impl(tr_name, target_ty);
+        }
+
+        // Register each method in impl block into symbol table
+        for f in &im.methods {
+            let mut params = Vec::new();
+            for p in &f.params {
+                let ty = match Type::from_ast_with_generics(
+                    &p.ty,
+                    &known_structs,
+                    &known_enums,
+                    &f.generics,
+                ) {
+                    Ok(t) => t,
+                    Err(d) => {
+                        self.diagnostics.push(d);
+                        Type::Unknown
+                    }
+                };
+                params.push(ParamSymbol {
+                    mode: p.mode,
+                    name: p.name,
+                    ty,
+                    span: p.span,
+                });
+            }
+
+            let ret_ty = if let Some(ret) = &f.ret_ty {
+                Type::from_ast_with_generics(ret, &known_structs, &known_enums, &f.generics)
+                    .unwrap_or(Type::Unit)
+            } else {
+                Type::Unit
+            };
+
+            let fn_sym = FunctionSymbol {
+                name: f.name,
+                is_pub: f.is_pub,
+                is_strict: f.is_strict,
+                is_comptime: f.is_comptime,
+                is_extern: f.is_extern.clone(),
+                generics: f.generics.clone(),
+                params,
+                ret_ty,
+                span: f.span,
+            };
+
+            if let Err(diag) = self.symbols.define_function(fn_sym) {
+                self.diagnostics.push(diag);
             }
         }
     }
@@ -262,6 +380,11 @@ impl<'a> SemanticAnalyzer<'a> {
             match item {
                 Item::Function(f) => self.check_function(f),
                 Item::Const(c) => self.check_const(c),
+                Item::Impl(im) => {
+                    for m in &im.methods {
+                        self.check_function(m);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1003,10 +1126,48 @@ impl<'a> SemanticAnalyzer<'a> {
                                     );
                                 }
                             }
+                            for g in &st.generics {
+                                if let Some(concrete_ty) = type_param_map.get(&g.name) {
+                                    for bound in &g.bounds {
+                                        let is_satisfied = match concrete_ty {
+                                            Type::TypeParam(caller_p) => {
+                                                self.current_func_generics.iter().any(|cg| {
+                                                    cg.name == *caller_p
+                                                        && cg.bounds.contains(bound)
+                                                })
+                                            }
+                                            _ => self
+                                                .symbols
+                                                .type_implements_trait(concrete_ty, bound),
+                                        };
+
+                                        if !is_satisfied {
+                                            let bound_name = INTERNER.resolve(bound);
+                                            let ty_str = format!("{}", concrete_ty);
+                                            self.diagnostics.push(
+                                                Diagnostic::error(format!(
+                                                    "le type '{}' ne satisfait pas la contrainte de trait '{}' requise par la structure '{}'",
+                                                    ty_str, bound_name, s_name_str
+                                                ))
+                                                .with_code("E0030")
+                                                .with_primary_label(
+                                                    expr.span,
+                                                    format!("le type '{}' n'implémente pas le contrat '{}'", ty_str, bound_name),
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             let concrete_args: Vec<Type> = st
                                 .generics
                                 .iter()
-                                .map(|g| type_param_map.get(g).cloned().unwrap_or(Type::Unknown))
+                                .map(|g| {
+                                    type_param_map
+                                        .get(&g.name)
+                                        .cloned()
+                                        .unwrap_or(Type::Unknown)
+                                })
                                 .collect();
                             Type::Generic {
                                 name: *struct_name,
@@ -1316,7 +1477,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 if let Some(st_def) = self.symbols.lookup_struct(name) {
                     let mut mapping = HashMap::new();
                     for (param, concrete) in st_def.generics.iter().zip(args.iter()) {
-                        mapping.insert(*param, concrete.clone());
+                        mapping.insert(param.name, concrete.clone());
                     }
                     let fields = st_def
                         .fields
@@ -1337,7 +1498,7 @@ impl<'a> SemanticAnalyzer<'a> {
         &mut self,
         st: &StructSymbol,
         args: &[Arg],
-        _span: Span,
+        span: Span,
     ) -> Type {
         let s_name = INTERNER.resolve(&st.name);
 
@@ -1380,10 +1541,45 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
             }
 
+            for g in &st.generics {
+                if let Some(concrete_ty) = type_param_map.get(&g.name) {
+                    for bound in &g.bounds {
+                        let is_satisfied = match concrete_ty {
+                            Type::TypeParam(caller_p) => self
+                                .current_func_generics
+                                .iter()
+                                .any(|cg| cg.name == *caller_p && cg.bounds.contains(bound)),
+                            _ => self.symbols.type_implements_trait(concrete_ty, bound),
+                        };
+
+                        if !is_satisfied {
+                            let bound_name = INTERNER.resolve(bound);
+                            let ty_str = format!("{}", concrete_ty);
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "le type '{}' ne satisfait pas la contrainte de trait '{}' requise par la structure '{}'",
+                                    ty_str, bound_name, s_name
+                                ))
+                                .with_code("E0030")
+                                .with_primary_label(
+                                    span,
+                                    format!("le type '{}' n'implémente pas le contrat '{}'", ty_str, bound_name),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+
             let concrete_args: Vec<Type> = st
                 .generics
                 .iter()
-                .map(|g| type_param_map.get(g).cloned().unwrap_or(Type::Unknown))
+                .map(|g| {
+                    type_param_map
+                        .get(&g.name)
+                        .cloned()
+                        .unwrap_or(Type::Unknown)
+                })
                 .collect();
             Type::Generic {
                 name: st.name,
@@ -1520,6 +1716,39 @@ impl<'a> SemanticAnalyzer<'a> {
             }
         }
 
+        if !f.generics.is_empty() {
+            for g in &f.generics {
+                if let Some(concrete_ty) = type_param_map.get(&g.name) {
+                    for bound in &g.bounds {
+                        let is_satisfied = match concrete_ty {
+                            Type::TypeParam(caller_p) => self
+                                .current_func_generics
+                                .iter()
+                                .any(|cg| cg.name == *caller_p && cg.bounds.contains(bound)),
+                            _ => self.symbols.type_implements_trait(concrete_ty, bound),
+                        };
+
+                        if !is_satisfied {
+                            let bound_name = INTERNER.resolve(bound);
+                            let ty_str = format!("{}", concrete_ty);
+                            let fn_name = INTERNER.resolve(&f.name);
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "le type '{}' ne satisfait pas la contrainte de trait '{}' requise par la fonction '{}'",
+                                    ty_str, bound_name, fn_name
+                                ))
+                                .with_code("E0030")
+                                .with_primary_label(
+                                    span,
+                                    format!("le type '{}' n'implémente pas le contrat '{}'", ty_str, bound_name),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         if type_param_map.is_empty() {
             f.ret_ty.clone()
         } else {
@@ -1543,6 +1772,29 @@ impl<'a> SemanticAnalyzer<'a> {
         }
         if m_name == "is_empty" {
             return Type::Bool;
+        }
+
+        // Bounded generic type parameter method resolution:
+        if let Type::TypeParam(p_name) = &rec_ty {
+            let mut trait_ret_ty = None;
+            for gp in &self.current_func_generics {
+                if gp.name == *p_name {
+                    for bound in &gp.bounds {
+                        if let Some(tr) = self.symbols.lookup_trait(bound) {
+                            if let Some(tm) = tr.methods.iter().find(|m| m.name == method) {
+                                trait_ret_ty = Some(tm.ret_ty.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(ret) = trait_ret_ty {
+                for arg in args {
+                    self.infer_expr(&arg.value);
+                }
+                return ret;
+            }
         }
 
         match &rec_ty {

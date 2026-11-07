@@ -779,3 +779,169 @@ fn test_unknown_method_call_rejected() {
         "Expected E0008 diagnostic for unknown method"
     );
 }
+
+#[test]
+fn test_generic_trait_bound_satisfied() {
+    let code = r#"
+        trait Serializable {
+            fn serialize(self) -> String;
+        }
+
+        struct Book {
+            title: String,
+        }
+
+        fn serialize(b: Book) -> String {
+            return b.title;
+        }
+
+        struct Container<T: Serializable> {
+            item: T,
+        }
+
+        pub fn main() {
+            let b = Book(title: "The Rust & IFA Bible");
+            let c = Container(item: b);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Generic struct with satisfied trait bound must succeed, diagnostics: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_generic_trait_bound_violation_rejected() {
+    let code = r#"
+        trait Serializable {
+            fn serialize(self) -> String;
+        }
+
+        struct SecretKey {
+            key_id: i64,
+        }
+
+        struct Container<T: Serializable> {
+            item: T,
+        }
+
+        pub fn main() {
+            let k = SecretKey(key_id: 12345);
+            let c = Container(item: k);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Generic struct with unfulfilled trait bound must be rejected"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0030")),
+        "Expected E0030 diagnostic for trait bound violation, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_generic_function_trait_bound_satisfied() {
+    let code = r#"
+        interface Printable {
+            fn print_repr(self) -> String;
+        }
+
+        struct User {
+            name: String,
+        }
+
+        fn print_repr(u: User) -> String {
+            return u.name;
+        }
+
+        fn display_item<T: Printable>(item: T) -> String {
+            return item.print_repr();
+        }
+
+        pub fn main() {
+            let u = User(name: "Dieudonne");
+            let s = display_item(u);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Generic function with satisfied trait bound must succeed, diagnostics: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_generic_function_trait_bound_violation_rejected() {
+    let code = r#"
+        trait Printable {
+            fn print_repr(self) -> String;
+        }
+
+        struct RawBytes {
+            len: i64,
+        }
+
+        fn display_item<T: Printable>(item: T) -> String {
+            return "ok";
+        }
+
+        pub fn main() {
+            let b = RawBytes(len: 16);
+            let s = display_item(b);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Calling generic function with type violating trait bound must fail"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0030")),
+        "Expected E0030 diagnostic for trait bound violation, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_impl_trait_for_type_satisfaction() {
+    let code = r#"
+        trait Renderable {
+            fn render(self) -> String;
+        }
+
+        struct Widget {
+            id: i64,
+        }
+
+        impl Renderable for Widget {
+            fn render(w: Widget) -> String {
+                return "widget";
+            }
+        }
+
+        struct View<T: Renderable> {
+            root: T,
+        }
+
+        pub fn main() {
+            let w = Widget(id: 1);
+            let v = View(root: w);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Explicit impl Trait for Type must satisfy generic trait bound, diagnostics: {:?}",
+        res.diagnostics
+    );
+}

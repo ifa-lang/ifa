@@ -1,5 +1,5 @@
 use crate::types::Type;
-use ifa_ast::ParamMode;
+use ifa_ast::{GenericParam, ParamMode};
 use ifa_diagnostics::Diagnostic;
 use ifa_span::{Span, Symbol, INTERNER};
 use std::collections::HashMap;
@@ -31,7 +31,7 @@ pub struct FunctionSymbol {
     pub is_strict: bool,
     pub is_comptime: bool,
     pub is_extern: Option<String>,
-    pub generics: Vec<Symbol>,
+    pub generics: Vec<GenericParam>,
     pub params: Vec<ParamSymbol>,
     pub ret_ty: Type,
     pub span: Span,
@@ -49,7 +49,7 @@ pub struct FieldSymbol {
 pub struct StructSymbol {
     pub name: Symbol,
     pub is_pub: bool,
-    pub generics: Vec<Symbol>,
+    pub generics: Vec<GenericParam>,
     pub fields: Vec<FieldSymbol>,
     pub field_indices: HashMap<Symbol, usize>,
     pub span: Span,
@@ -59,7 +59,7 @@ impl StructSymbol {
     pub fn new(
         name: Symbol,
         is_pub: bool,
-        generics: Vec<Symbol>,
+        generics: Vec<GenericParam>,
         fields: Vec<FieldSymbol>,
         span: Span,
     ) -> Self {
@@ -80,6 +80,22 @@ impl StructSymbol {
     pub fn get_field(&self, name: &Symbol) -> Option<&FieldSymbol> {
         self.field_indices.get(name).map(|&idx| &self.fields[idx])
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitMethodSymbol {
+    pub name: Symbol,
+    pub params: Vec<ParamSymbol>,
+    pub ret_ty: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitSymbol {
+    pub name: Symbol,
+    pub is_pub: bool,
+    pub methods: Vec<TraitMethodSymbol>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +140,8 @@ pub struct SymbolTable {
     pub structs: HashMap<Symbol, StructSymbol>,
     pub enums: HashMap<Symbol, EnumSymbol>,
     pub consts: HashMap<Symbol, ConstSymbol>,
+    pub traits: HashMap<Symbol, TraitSymbol>,
+    pub trait_impls: HashMap<Symbol, Vec<Type>>,
     next_var_id: u32,
 }
 
@@ -135,6 +153,8 @@ impl SymbolTable {
             structs: HashMap::new(),
             enums: HashMap::new(),
             consts: HashMap::new(),
+            traits: HashMap::new(),
+            trait_impls: HashMap::new(),
             next_var_id: 1,
         };
         table.init_builtins();
@@ -296,6 +316,71 @@ impl SymbolTable {
 
     pub fn lookup_const(&self, name: &Symbol) -> Option<&ConstSymbol> {
         self.consts.get(name)
+    }
+
+    pub fn define_trait(&mut self, tr: TraitSymbol) -> Result<(), Diagnostic> {
+        if let Some(existing) = self.traits.get(&tr.name) {
+            let tr_name = INTERNER.resolve(&tr.name);
+            return Err(
+                Diagnostic::error(format!("trait '{}' déjà défini", tr_name))
+                    .with_code("E0007")
+                    .with_primary_label(tr.span, "redéfinition du trait")
+                    .with_secondary_label(existing.span, "première définition ici"),
+            );
+        }
+        self.traits.insert(tr.name, tr);
+        Ok(())
+    }
+
+    pub fn lookup_trait(&self, name: &Symbol) -> Option<&TraitSymbol> {
+        self.traits.get(name)
+    }
+
+    pub fn register_trait_impl(&mut self, trait_name: Symbol, ty: Type) {
+        self.trait_impls.entry(trait_name).or_default().push(ty);
+    }
+
+    pub fn type_implements_trait(&self, ty: &Type, trait_name: &Symbol) -> bool {
+        // Unknown suppresses cascading errors
+        if matches!(ty, Type::Unknown) {
+            return true;
+        }
+
+        // Direct explicit registration
+        if let Some(types) = self.trait_impls.get(trait_name) {
+            for impl_ty in types {
+                if ty.is_assignable_to(impl_ty) || ty == impl_ty {
+                    return true;
+                }
+            }
+        }
+
+        // If trait definition exists, check structural / method conformity
+        if let Some(tr) = self.traits.get(trait_name) {
+            if tr.methods.is_empty() {
+                return true;
+            }
+
+            for req_m in &tr.methods {
+                let mut found = false;
+                if let Some(f) = self.lookup_function(&req_m.name) {
+                    if let Some(first_p) = f.params.first() {
+                        if ty.is_assignable_to(&first_p.ty)
+                            || matches!(&first_p.ty, Type::Ref(inner) if ty.is_assignable_to(inner))
+                            || matches!(&first_p.ty, Type::TypeParam(_))
+                        {
+                            found = true;
+                        }
+                    }
+                }
+                if !found {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        false
     }
 }
 

@@ -65,7 +65,8 @@ fn test_selfhost_compiler_full_pipeline() {
     assert!(test_stdout.contains("test test_selfhost_fir_codegen_expression ... ok"));
     assert!(test_stdout.contains("test test_selfhost_fir_codegen_function ... ok"));
     assert!(test_stdout.contains("test test_selfhost_polymorphic_method ... ok"));
-    assert!(test_stdout.contains("Test result: 9 passed; 0 failed"));
+    assert!(test_stdout.contains("test test_selfhost_generic_trait_bound ... ok"));
+    assert!(test_stdout.contains("Test result: 10 passed; 0 failed"));
 
     // 3. Complete execution via SSA FIR interpreter
     let run_output = Command::new(&ifa_bin)
@@ -129,6 +130,13 @@ fn test_selfhost_compiler_full_pipeline() {
     assert!(run_stdout.contains("ret %t5"), "stdout was: {}", run_stdout);
     assert!(
         run_stdout.contains("Wrapped & method-unwrapped AST result: 42"),
+        "stdout was: {}",
+        run_stdout
+    );
+    assert!(
+        run_stdout.contains(
+            "Reported diagnostic via trait bound: type mismatch verified via trait bound"
+        ),
         "stdout was: {}",
         run_stdout
     );

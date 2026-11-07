@@ -1,4 +1,4 @@
-use ifa_ast::{ParamMode, Type as AstType, TypeKind as AstTypeKind};
+use ifa_ast::{GenericParam, ParamMode, Type as AstType, TypeKind as AstTypeKind};
 use ifa_diagnostics::Diagnostic;
 use ifa_span::{Symbol, INTERNER};
 use std::collections::HashMap;
@@ -439,12 +439,12 @@ impl Type {
         ast_ty: &AstType,
         known_structs: &HashMap<Symbol, Type>,
         known_enums: &HashMap<Symbol, Type>,
-        generics: &[Symbol],
+        generics: &[GenericParam],
     ) -> Result<Type, Diagnostic> {
         match &ast_ty.kind {
             AstTypeKind::Unit => Ok(Type::Unit),
             AstTypeKind::Named(sym) => {
-                if generics.contains(sym) {
+                if generics.iter().any(|g| g.name == *sym) {
                     return Ok(Type::TypeParam(*sym));
                 }
                 let name = INTERNER.resolve(sym);

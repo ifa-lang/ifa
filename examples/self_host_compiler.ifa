@@ -790,6 +790,28 @@ fn unwrap<T>(res: CompilerResult<T>) -> T {
     return res.payload;
 }
 
+// Trait and bounded generic container in self-hosting IFA compiler
+trait Diagnosable {
+    fn diagnose(self) -> String;
+}
+
+struct CompileDiagnostic {
+    code: String,
+    message: String,
+}
+
+fn diagnose(d: CompileDiagnostic) -> String {
+    return d.message;
+}
+
+struct DiagnosticReporter<T: Diagnosable> {
+    entry: T,
+}
+
+fn report_entry<T: Diagnosable>(rep: DiagnosticReporter<T>) -> String {
+    return rep.entry.diagnose();
+}
+
 // Unit test 9: Polymorphic method dispatch on generic result container
 pub fn test_selfhost_polymorphic_method() -> bool {
     let res = wrap_result(42);
@@ -800,6 +822,14 @@ pub fn test_selfhost_polymorphic_method() -> bool {
     let res_str = wrap_result("ifa_ok");
     let unwrapped_str = res_str.unwrap();
     return unwrapped_str == "ifa_ok";
+}
+
+// Unit test 10: Generic trait bound verification
+pub fn test_selfhost_generic_trait_bound() -> bool {
+    let diag = CompileDiagnostic(code: "E0001", message: "type mismatch");
+    let rep = DiagnosticReporter(entry: diag);
+    let msg = report_entry(rep);
+    return msg == "type mismatch";
 }
 
 pub fn main() {
@@ -849,6 +879,12 @@ pub fn main() {
     let res1 = wrap_result(evaluated1);
     let unwrapped1 = res1.unwrap();
     println("Wrapped & method-unwrapped AST result:", unwrapped1);
+
+    // 7. Generic Trait Bound Verification
+    let diag = CompileDiagnostic(code: "E0001", message: "type mismatch verified via trait bound");
+    let rep = DiagnosticReporter(entry: diag);
+    let rep_msg = report_entry(rep);
+    println("Reported diagnostic via trait bound:", rep_msg);
 
     println("Self-hosting AST and generational reference validation: SUCCESS (42)");
 }

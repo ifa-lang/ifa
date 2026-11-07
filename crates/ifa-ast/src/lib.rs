@@ -14,6 +14,8 @@ pub enum Item {
     Enum(Enum),
     Import(Import),
     Const(Const),
+    Trait(Trait),
+    Impl(Impl),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,13 +48,34 @@ pub struct Param {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct GenericParam {
+    pub name: Symbol,
+    pub bounds: Vec<Symbol>,
+    pub span: Span,
+}
+
+impl GenericParam {
+    pub fn new(name: Symbol, span: Span) -> Self {
+        Self {
+            name,
+            bounds: Vec::new(),
+            span,
+        }
+    }
+
+    pub fn with_bounds(name: Symbol, bounds: Vec<Symbol>, span: Span) -> Self {
+        Self { name, bounds, span }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     pub is_pub: bool,
     pub is_strict: bool,
     pub is_comptime: bool,
     pub is_extern: Option<String>,
     pub name: Symbol,
-    pub generics: Vec<Symbol>,
+    pub generics: Vec<GenericParam>,
     pub params: Vec<Param>,
     pub ret_ty: Option<Type>,
     pub body: Option<Block>,
@@ -71,7 +94,7 @@ pub struct StructField {
 pub struct Struct {
     pub is_pub: bool,
     pub name: Symbol,
-    pub generics: Vec<Symbol>,
+    pub generics: Vec<GenericParam>,
     pub fields: Vec<StructField>,
     pub span: Span,
 }
@@ -104,6 +127,30 @@ pub struct Const {
     pub name: Symbol,
     pub ty: Option<Type>,
     pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitMethod {
+    pub name: Symbol,
+    pub params: Vec<Param>,
+    pub ret_ty: Option<Type>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trait {
+    pub is_pub: bool,
+    pub name: Symbol,
+    pub methods: Vec<TraitMethod>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Impl {
+    pub trait_name: Option<Symbol>,
+    pub target_ty: Type,
+    pub methods: Vec<Function>,
     pub span: Span,
 }
 
@@ -379,6 +426,8 @@ pub trait Visitor<'ast>: Sized {
             Item::Enum(e) => self.visit_enum(e),
             Item::Import(i) => self.visit_import(i),
             Item::Const(c) => self.visit_const(c),
+            Item::Trait(t) => self.visit_trait(t),
+            Item::Impl(i) => self.visit_impl(i),
         }
     }
 
@@ -393,6 +442,12 @@ pub trait Visitor<'ast>: Sized {
     fn visit_import(&mut self, _im: &'ast Import) {}
     fn visit_const(&mut self, c: &'ast Const) {
         self.visit_expr(&c.value);
+    }
+    fn visit_trait(&mut self, _t: &'ast Trait) {}
+    fn visit_impl(&mut self, i: &'ast Impl) {
+        for m in &i.methods {
+            self.visit_function(m);
+        }
     }
 
     fn visit_block(&mut self, block: &'ast Block) {

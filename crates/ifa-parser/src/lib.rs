@@ -161,12 +161,14 @@ impl Parser {
             TokenKind::Enum => self.parse_enum(is_pub).map(Item::Enum),
             TokenKind::Import => self.parse_import().map(Item::Import),
             TokenKind::Const => self.parse_const(is_pub).map(Item::Const),
+            TokenKind::Trait | TokenKind::Interface => self.parse_trait(is_pub).map(Item::Trait),
+            TokenKind::Impl => self.parse_impl().map(Item::Impl),
             _ => {
                 let cur = self.current();
                 let diag = Diagnostic::error(format!("déclaration inattendue '{}'", cur.kind))
                     .with_primary_label(
                         cur.span,
-                        "déclaration attendue (fn, struct, enum, import, const)",
+                        "déclaration attendue (fn, struct, enum, import, const, trait, interface, impl)",
                     );
                 self.diagnostics.push(diag.clone());
                 Err(diag)
@@ -196,20 +198,8 @@ impl Parser {
             }
         };
 
-        // Generics <T, U>
-        let mut generics = Vec::new();
-        if self.match_token(&TokenKind::Lt) {
-            while !self.check(&TokenKind::Gt) && !self.check(&TokenKind::Eof) {
-                if let TokenKind::Ident(g) = self.current().kind {
-                    self.advance();
-                    generics.push(g);
-                }
-                if !self.match_token(&TokenKind::Comma) {
-                    break;
-                }
-            }
-            self.expect(TokenKind::Gt)?;
-        }
+        // Generics <T, U> or <T: Trait1 + Trait2>
+        let generics = self.parse_generic_params()?;
 
         // Parameters (inout a: T, sink b: U)
         self.expect(TokenKind::OpenParen)?;
@@ -313,20 +303,8 @@ impl Parser {
             }
         };
 
-        // Optional generics <T, U>
-        let mut generics = Vec::new();
-        if self.match_token(&TokenKind::Lt) {
-            while !self.check(&TokenKind::Gt) && !self.check(&TokenKind::Eof) {
-                if let TokenKind::Ident(g) = self.current().kind {
-                    self.advance();
-                    generics.push(g);
-                }
-                if !self.match_token(&TokenKind::Comma) {
-                    break;
-                }
-            }
-            self.expect(TokenKind::Gt)?;
-        }
+        // Optional generics <T, U> or <T: Trait1 + Trait2>
+        let generics = self.parse_generic_params()?;
 
         self.expect(TokenKind::OpenBrace)?;
         let mut fields = Vec::new();
@@ -506,6 +484,221 @@ impl Parser {
             ty,
             value,
             span: Span::new(self.file_id, const_tok.span.start, end_pos),
+        })
+    }
+
+    fn parse_generic_params(&mut self) -> Result<Vec<GenericParam>, Diagnostic> {
+        let mut generics = Vec::new();
+        if self.match_token(&TokenKind::Lt) {
+            while !self.check(&TokenKind::Gt) && !self.check(&TokenKind::Eof) {
+                let start = self.current().span.start;
+                let name = match self.current().kind {
+                    TokenKind::Ident(g) => {
+                        self.advance();
+                        g
+                    }
+                    _ => {
+                        let cur = self.current();
+                        let diag = Diagnostic::error("nom de paramètre générique attendu")
+                            .with_primary_label(cur.span, "identifiant attendu");
+                        self.diagnostics.push(diag.clone());
+                        return Err(diag);
+                    }
+                };
+
+                let mut bounds = Vec::new();
+                let mut end = self.current().span.end;
+                if self.match_token(&TokenKind::Colon) {
+                    while !self.check(&TokenKind::Comma)
+                        && !self.check(&TokenKind::Gt)
+                        && !self.check(&TokenKind::Eof)
+                    {
+                        match self.current().kind {
+                            TokenKind::Ident(b) => {
+                                let b_tok = self.advance();
+                                bounds.push(b);
+                                end = b_tok.span.end;
+                            }
+                            _ => {
+                                let cur = self.current();
+                                let diag = Diagnostic::error(
+                                    "nom de trait ou interface attendu pour la contrainte générique",
+                                )
+                                .with_primary_label(cur.span, "identifiant attendu");
+                                self.diagnostics.push(diag.clone());
+                                return Err(diag);
+                            }
+                        }
+                        if !self.match_token(&TokenKind::Plus) {
+                            break;
+                        }
+                    }
+                }
+
+                generics.push(GenericParam {
+                    name,
+                    bounds,
+                    span: Span::new(self.file_id, start, end),
+                });
+
+                if !self.match_token(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::Gt)?;
+        }
+        Ok(generics)
+    }
+
+    fn parse_trait(&mut self, is_pub: bool) -> Result<Trait, Diagnostic> {
+        let kw_tok = self.advance(); // consume 'trait' or 'interface'
+        let name = match self.current().kind {
+            TokenKind::Ident(s) => {
+                self.advance();
+                s
+            }
+            _ => {
+                let cur = self.current();
+                let diag = Diagnostic::error("nom de trait ou interface attendu")
+                    .with_primary_label(cur.span, "identifiant attendu");
+                self.diagnostics.push(diag.clone());
+                return Err(diag);
+            }
+        };
+
+        self.expect(TokenKind::OpenBrace)?;
+        let mut methods = Vec::new();
+        while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
+            let fn_tok = self.expect(TokenKind::Fn)?;
+            let method_name = match self.current().kind {
+                TokenKind::Ident(s) => {
+                    self.advance();
+                    s
+                }
+                _ => {
+                    let cur = self.current();
+                    let diag = Diagnostic::error("nom de méthode attendu dans le contrat de trait")
+                        .with_primary_label(cur.span, "identifiant attendu");
+                    self.diagnostics.push(diag.clone());
+                    return Err(diag);
+                }
+            };
+
+            self.expect(TokenKind::OpenParen)?;
+            let mut params = Vec::new();
+            while !self.check(&TokenKind::CloseParen) && !self.check(&TokenKind::Eof) {
+                let start_param = self.current().span.start;
+                let mut mode = ParamMode::In;
+                if self.match_token(&TokenKind::InOut) {
+                    mode = ParamMode::InOut;
+                } else if self.match_token(&TokenKind::Sink) {
+                    mode = ParamMode::Sink;
+                } else if self.match_token(&TokenKind::Comptime) {
+                    mode = ParamMode::Comptime;
+                } else if self.match_token(&TokenKind::In) {
+                    mode = ParamMode::In;
+                } else if self.match_token(&TokenKind::Mut) {
+                    mode = ParamMode::Mut;
+                }
+
+                let param_name = match self.current().kind {
+                    TokenKind::Ident(s) => {
+                        self.advance();
+                        s
+                    }
+                    _ => {
+                        let cur = self.current();
+                        let diag = Diagnostic::error("nom de paramètre attendu dans la méthode")
+                            .with_primary_label(cur.span, "identifiant attendu");
+                        self.diagnostics.push(diag.clone());
+                        return Err(diag);
+                    }
+                };
+
+                let ty = if self.match_token(&TokenKind::Colon) {
+                    self.parse_type()?
+                } else {
+                    Type {
+                        kind: TypeKind::Named(sym("auto")),
+                        span: self.current().span,
+                    }
+                };
+
+                let end_param = ty.span.end;
+                params.push(Param {
+                    mode,
+                    name: param_name,
+                    ty,
+                    span: Span::new(self.file_id, start_param, end_param),
+                });
+
+                if !self.match_token(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::CloseParen)?;
+
+            let ret_ty = if self.match_token(&TokenKind::Arrow) {
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+
+            let end_pos = ret_ty
+                .as_ref()
+                .map(|t| t.span.end)
+                .unwrap_or(self.current().span.end);
+            self.eat_semicolons();
+
+            methods.push(TraitMethod {
+                name: method_name,
+                params,
+                ret_ty,
+                span: Span::new(self.file_id, fn_tok.span.start, end_pos),
+            });
+        }
+        let close = self.expect(TokenKind::CloseBrace)?;
+
+        Ok(Trait {
+            is_pub,
+            name,
+            methods,
+            span: Span::new(self.file_id, kw_tok.span.start, close.span.end),
+        })
+    }
+
+    fn parse_impl(&mut self) -> Result<Impl, Diagnostic> {
+        let impl_tok = self.expect(TokenKind::Impl)?;
+        let first_ty = self.parse_type()?;
+        let (trait_name, target_ty) = if self.match_token(&TokenKind::For) {
+            let tr_name = match &first_ty.kind {
+                TypeKind::Named(s) => *s,
+                _ => {
+                    let diag = Diagnostic::error("nom de trait simple attendu avant 'for'")
+                        .with_primary_label(first_ty.span, "identifiant de trait attendu");
+                    self.diagnostics.push(diag.clone());
+                    return Err(diag);
+                }
+            };
+            let target = self.parse_type()?;
+            (Some(tr_name), target)
+        } else {
+            (None, first_ty)
+        };
+
+        self.expect(TokenKind::OpenBrace)?;
+        let mut methods = Vec::new();
+        while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
+            let m_pub = self.match_token(&TokenKind::Pub);
+            methods.push(self.parse_function(m_pub, false, false, None)?);
+        }
+        let close = self.expect(TokenKind::CloseBrace)?;
+
+        Ok(Impl {
+            trait_name,
+            target_ty,
+            methods,
+            span: Span::new(self.file_id, impl_tok.span.start, close.span.end),
         })
     }
 

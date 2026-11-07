@@ -1141,6 +1141,15 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
                     span: e_ast.span,
                 });
             }
+            Item::Impl(im) => {
+                for func_ast in &im.methods {
+                    if let Some(body) = &func_ast.body {
+                        let ctx = FunctionLoweringContext::new(func_ast, symbols, &constants);
+                        let fir_func = ctx.lower(body);
+                        module.functions.push(fir_func);
+                    }
+                }
+            }
             _ => {}
         }
     }

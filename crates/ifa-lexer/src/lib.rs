@@ -61,6 +61,9 @@ impl<'a> Lexer<'a> {
                     RawToken::Try => TokenKind::Try,
                     RawToken::Catch => TokenKind::Catch,
                     RawToken::Spawn => TokenKind::Spawn,
+                    RawToken::Trait => TokenKind::Trait,
+                    RawToken::Interface => TokenKind::Interface,
+                    RawToken::Impl => TokenKind::Impl,
                     RawToken::True => TokenKind::True,
                     RawToken::False => TokenKind::False,
 

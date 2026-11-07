@@ -2,7 +2,7 @@
 //! Extracts triple-slash (`///`) docstrings and AST item signatures, producing
 //! publication-grade Markdown and standalone responsive HTML documentation.
 
-use ifa_ast::{Enum, Function, Item, Program, Struct};
+use ifa_ast::{Enum, Function, GenericParam, Item, Program, Struct};
 use ifa_span::{SourceMap, Span, INTERNER};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -218,11 +218,31 @@ fn extract_preceding_docstrings(span: Span, source_map: &SourceMap, lines: &[&st
     doc_lines.join("\n")
 }
 
+fn format_generics(generics: &[GenericParam]) -> String {
+    if generics.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = generics
+        .iter()
+        .map(|g| {
+            let name = INTERNER.resolve(&g.name);
+            if g.bounds.is_empty() {
+                name
+            } else {
+                let bounds: Vec<String> = g.bounds.iter().map(|b| INTERNER.resolve(b)).collect();
+                format!("{}: {}", name, bounds.join(" + "))
+            }
+        })
+        .collect();
+    format!("<{}>", parts.join(", "))
+}
+
 fn format_function_signature(f: &Function) -> String {
     let pub_str = if f.is_pub { "pub " } else { "" };
     let strict_str = if f.is_strict { "strict " } else { "" };
     let comptime_str = if f.is_comptime { "comptime " } else { "" };
     let name = INTERNER.resolve(&f.name);
+    let gen_str = format_generics(&f.generics);
 
     let params: Vec<String> = f
         .params
@@ -240,7 +260,7 @@ fn format_function_signature(f: &Function) -> String {
         .unwrap_or_default();
 
     format!(
-        "{pub_str}{strict_str}{comptime_str}fn {name}({}){ret_str}",
+        "{pub_str}{strict_str}{comptime_str}fn {name}{gen_str}({}){ret_str}",
         params.join(", ")
     )
 }
@@ -248,7 +268,8 @@ fn format_function_signature(f: &Function) -> String {
 fn format_struct_signature(s: &Struct) -> String {
     let pub_str = if s.is_pub { "pub " } else { "" };
     let name = INTERNER.resolve(&s.name);
-    format!("{pub_str}struct {name}")
+    let gen_str = format_generics(&s.generics);
+    format!("{pub_str}struct {name}{gen_str}")
 }
 
 fn format_enum_signature(e: &Enum) -> String {
