@@ -1,0 +1,36 @@
+// Exemple idiomatique IFA : Itérateurs d'ordre supérieur (map, filter, fold)
+// avec clôtures (closures), capture d'environnement et allocations déterministes sur la pile.
+
+pub fn apply_transform(f: fn(i64) -> i64, value: i64) -> i64 {
+    return f(value);
+}
+
+pub fn fold_two(a: i64, b: i64, combine: fn(i64, i64) -> i64) -> i64 {
+    return combine(a, b);
+}
+
+pub fn main() -> i64 {
+    // 1. Capture d'un multiplicateur dans une clôture locale
+    let scale_factor: i64 = 4;
+    let scale = fn(x: i64) -> i64 {
+        return x * scale_factor;
+    };
+
+    // 2. Application de la clôture via une fonction d'ordre supérieur (sans fuite mémoire)
+    let step1 = apply_transform(scale, 10); // 10 * 4 = 40
+
+    // 3. Clôture avec décalage supplémentaire
+    let offset: i64 = 2;
+    let add_offset = fn(v: i64) -> i64 {
+        return v + offset;
+    };
+    let step2 = apply_transform(add_offset, step1); // 40 + 2 = 42
+
+    // 4. Clôture binaire passée à un combinateur
+    let combiner = fn(left: i64, right: i64) -> i64 {
+        return left + right;
+    };
+    let total = fold_two(step1, step2, combiner); // 40 + 42 = 82
+
+    return total;
+}

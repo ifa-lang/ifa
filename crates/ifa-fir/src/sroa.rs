@@ -708,7 +708,7 @@ impl SroaPass {
     }
 
     /// Resolves substitution chains transitively until a fixpoint is reached.
-    fn resolve_substitution_chains(substitutions: &mut HashMap<ValueId, ValueId>) {
+    pub(crate) fn resolve_substitution_chains(substitutions: &mut HashMap<ValueId, ValueId>) {
         let keys: Vec<ValueId> = substitutions.keys().copied().collect();
         for k in keys {
             let mut target = substitutions[&k];
@@ -726,7 +726,7 @@ impl SroaPass {
     }
 
     /// Substitutes all input operands in an instruction according to the substitution map.
-    fn substitute_instruction_operands(
+    pub(crate) fn substitute_instruction_operands(
         inst: &mut Instruction,
         substitutions: &HashMap<ValueId, ValueId>,
     ) {
@@ -844,7 +844,7 @@ impl SroaPass {
     }
 
     /// Substitutes operands in terminators.
-    fn substitute_terminator_operands(
+    pub(crate) fn substitute_terminator_operands(
         term: &mut Terminator,
         substitutions: &HashMap<ValueId, ValueId>,
     ) {
@@ -969,56 +969,70 @@ impl SroaPass {
 
     /// Directly folds field projections (`GetField`) on known SSA aggregates (`StructInit` / `TupleInit`).
     fn optimize_aggregate_projections(&mut self, func: &mut FirFunction) {
-        let mut aggregate_inits: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
-        let mut substitutions: HashMap<ValueId, ValueId> = HashMap::new();
+        let mut loop_count = 0;
+        loop {
+            loop_count += 1;
+            if loop_count > 16 {
+                break;
+            }
 
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                if let Some(res) = inst.result {
-                    match &inst.expr {
-                        ValueExpr::StructInit { fields, .. } | ValueExpr::TupleInit(fields) => {
-                            aggregate_inits.insert(res, fields.clone());
+            let mut aggregate_inits: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+            let mut substitutions: HashMap<ValueId, ValueId> = HashMap::new();
+
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Some(res) = inst.result {
+                        match &inst.expr {
+                            ValueExpr::StructInit { fields, .. } | ValueExpr::TupleInit(fields) => {
+                                aggregate_inits.insert(res, fields.clone());
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
-        }
 
-        if aggregate_inits.is_empty() {
-            return;
-        }
+            if aggregate_inits.is_empty() {
+                break;
+            }
 
-        for block in &mut func.blocks {
-            for inst in &mut block.instructions {
-                if let Some(res) = inst.result {
-                    if let ValueExpr::GetField {
-                        base, field_idx, ..
-                    } = &inst.expr
-                    {
-                        let actual_base = substitutions.get(base).copied().unwrap_or(*base);
-                        if let Some(fields) = aggregate_inits.get(&actual_base) {
-                            if let Some(&field_val) = fields.get(*field_idx) {
-                                let actual_val =
-                                    substitutions.get(&field_val).copied().unwrap_or(field_val);
-                                substitutions.insert(res, actual_val);
-                                self.stats.forwarded_payloads += 1;
+            let mut changed = false;
+            for block in &mut func.blocks {
+                for inst in &mut block.instructions {
+                    if let Some(res) = inst.result {
+                        if let ValueExpr::GetField {
+                            base, field_idx, ..
+                        } = &inst.expr
+                        {
+                            let actual_base = substitutions.get(base).copied().unwrap_or(*base);
+                            if let Some(fields) = aggregate_inits.get(&actual_base) {
+                                if let Some(&field_val) = fields.get(*field_idx) {
+                                    let actual_val =
+                                        substitutions.get(&field_val).copied().unwrap_or(field_val);
+                                    substitutions.insert(res, actual_val);
+                                    self.stats.forwarded_payloads += 1;
+                                    changed = true;
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        if !substitutions.is_empty() {
-            Self::resolve_substitution_chains(&mut substitutions);
-            for block in &mut func.blocks {
-                for inst in &mut block.instructions {
-                    Self::substitute_instruction_operands(inst, &substitutions);
+            if !substitutions.is_empty() {
+                Self::resolve_substitution_chains(&mut substitutions);
+                for block in &mut func.blocks {
+                    for inst in &mut block.instructions {
+                        Self::substitute_instruction_operands(inst, &substitutions);
+                    }
+                    if let Some(term) = &mut block.terminator {
+                        Self::substitute_terminator_operands(term, &substitutions);
+                    }
                 }
-                if let Some(term) = &mut block.terminator {
-                    Self::substitute_terminator_operands(term, &substitutions);
-                }
+            }
+
+            if !changed {
+                break;
             }
         }
     }

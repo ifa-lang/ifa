@@ -2133,6 +2133,7 @@ impl<'a> FunctionLoweringContext<'a> {
                 let direct_name = match &callee.kind {
                     ExprKind::Ident(fn_name) => {
                         if self.var_allocas.contains_key(fn_name)
+                            || self.var_types.contains_key(fn_name)
                             || self.symbols.lookup_variable(fn_name).is_some()
                         {
                             None
@@ -2294,11 +2295,19 @@ impl<'a> FunctionLoweringContext<'a> {
                 } else {
                     let callee_val = self.lower_expr(callee);
                     let is_closure_val = match &callee.kind {
-                        ExprKind::Ident(sym) => self
+                        ExprKind::Ident(sym) => {
+                            self.var_types
+                                .get(sym)
+                                .is_some_and(|t| matches!(t, FirType::Function { .. }))
+                                || self.symbols.lookup_variable(sym).is_some_and(|v| {
+                                    matches!(v.ty, ifa_sema::types::Type::Fn { .. })
+                                })
+                        }
+                        _ => self
                             .symbols
-                            .lookup_variable(sym)
-                            .is_some_and(|v| matches!(v.ty, ifa_sema::types::Type::Fn { .. })),
-                        _ => false,
+                            .expr_types
+                            .get(&callee.span)
+                            .is_some_and(|t| matches!(t, ifa_sema::types::Type::Fn { .. })),
                     };
 
                     let res = self.alloc_value();

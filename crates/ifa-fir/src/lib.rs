@@ -1,4 +1,5 @@
 pub mod cfg;
+pub mod closure_opt;
 pub mod cow;
 pub mod dominance;
 pub mod gen_opt;
@@ -12,6 +13,7 @@ pub mod vectorize;
 pub mod verify;
 
 pub use cfg::ControlFlowGraph;
+pub use closure_opt::{ClosureAllocationKind, ClosureEscapeStats, ClosureOptPass};
 pub use cow::{CowPass, SharingState};
 pub use dominance::DominanceTree;
 pub use gen_opt::{GenOptStats, GenerationalOptPass, NaturalLoop};
@@ -54,6 +56,12 @@ pub fn compile_to_fir_with_opts(
     if opt_sroa {
         let mut sroa_pass = SroaPass::new();
         sroa_pass.run_on_module(&mut module);
+
+        let mut closure_pass = ClosureOptPass::new();
+        closure_pass.run_on_module(&mut module);
+
+        let mut sroa_pass2 = SroaPass::new();
+        sroa_pass2.run_on_module(&mut module);
     }
 
     if opt_cow {
