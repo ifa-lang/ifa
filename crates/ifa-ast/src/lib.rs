@@ -334,6 +334,13 @@ pub enum Pattern {
         has_rest: bool,
         span: Span,
     },
+    Or(Vec<Pattern>, Span),
+    Range {
+        start: Option<Box<Pattern>>,
+        end: Option<Box<Pattern>>,
+        inclusive: bool,
+        span: Span,
+    },
 }
 
 impl Pattern {
@@ -345,6 +352,8 @@ impl Pattern {
             Pattern::Variant { span, .. } => *span,
             Pattern::Tuple(_, sp) => *sp,
             Pattern::Struct { span, .. } => *span,
+            Pattern::Or(_, sp) => *sp,
+            Pattern::Range { span, .. } => *span,
         }
     }
 }

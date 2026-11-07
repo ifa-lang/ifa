@@ -717,3 +717,48 @@ fn test_cranelift_jit_tuple_and_struct_match_destructuring() {
     // c1: 10, c2: 40, p1: 20, p2: 30, p3: 15 => 10 + 40 + 20 + 30 + 15 = 115
     assert_eq!(result, 115);
 }
+
+#[test]
+fn test_cranelift_jit_or_and_range_pattern_matching() {
+    let src = r#"
+        fn classify_val(v: i64) -> i64 {
+            return match v {
+                1 | 3 | 5 => 10,
+                10..=20 => 50,
+                21..=25 | 30..=35 => 100,
+                _ => 0,
+            }
+        }
+
+        pub fn main() -> i64 {
+            let r1 = classify_val(3);
+            let r2 = classify_val(15);
+            let r3 = classify_val(23);
+            let r4 = classify_val(31);
+            let r5 = classify_val(99);
+
+            return r1 + r2 + r3 + r4 + r5;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("cranelift_or_range.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    // r1: 10, r2: 50, r3: 100, r4: 100, r5: 0 => 10 + 50 + 100 + 100 + 0 = 260
+    assert_eq!(result, 260);
+}

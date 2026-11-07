@@ -1688,3 +1688,152 @@ fn test_nested_recursive_tuple_and_struct_patterns() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_or_patterns_semantic_valid() {
+    let code = r#"
+        enum Coin {
+            Heads,
+            Tails,
+            Edge
+        }
+
+        fn is_valid_flip(c: Coin) -> bool {
+            return match c {
+                Coin::Heads | Coin::Tails => true,
+                Coin::Edge => false,
+            }
+        }
+
+        fn classify_digit(d: i64) -> i64 {
+            return match d {
+                1 | 3 | 5 | 7 | 9 => 1,
+                0 | 2 | 4 | 6 | 8 => 2,
+                _ => 0,
+            }
+        }
+
+        pub fn main() {
+            let f = is_valid_flip(Coin::Heads);
+            let d = classify_digit(3);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Or-patterns without bindings must be accepted: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_or_patterns_with_shared_bindings_valid() {
+    let code = r#"
+        enum ResultVal {
+            Success(i64),
+            Cached(i64),
+            Failure
+        }
+
+        fn extract_or_default(res: ResultVal) -> i64 {
+            return match res {
+                ResultVal::Success(v) | ResultVal::Cached(v) => v,
+                ResultVal::Failure => -1,
+            }
+        }
+
+        pub fn main() {
+            let val = extract_or_default(ResultVal::Cached(100));
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Or-patterns with consistent bindings must succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_or_patterns_divergent_bindings_rejected() {
+    let code = r#"
+        enum ResultVal {
+            Success(i64),
+            Cached(i64),
+            Failure
+        }
+
+        fn bad_or(res: ResultVal) -> i64 {
+            return match res {
+                ResultVal::Success(v) | ResultVal::Failure => 0,
+                _ => -1,
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Or-patterns with missing variable bindings in alternative must fail"
+    );
+    assert!(res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0045")));
+}
+
+#[test]
+fn test_range_patterns_semantic_valid() {
+    let code = r#"
+        fn classify_age(age: i64) -> i64 {
+            return match age {
+                0..=12 => 1,
+                13..=17 => 2,
+                18..=64 => 3,
+                _ => 4,
+            }
+        }
+
+        fn combined_ranges_and_or(val: i64) -> i64 {
+            return match val {
+                1..=5 | 10..=15 => 100,
+                _ => 0,
+            }
+        }
+
+        pub fn main() {
+            let a = classify_age(15);
+            let c = combined_ranges_and_or(12);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Range patterns and combinations with or-patterns must succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_range_pattern_non_scalar_rejected() {
+    let code = r#"
+        struct Point {
+            x: i64
+        }
+
+        fn bad_range(p: Point) -> i64 {
+            return match p {
+                Point { x: 1 }..=Point { x: 2 } => 0,
+                _ => 1,
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Range pattern on non-scalar struct must fail with E0036"
+    );
+    assert!(res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0036")));
+}

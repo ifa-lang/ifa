@@ -126,6 +126,7 @@ impl<'a> Lexer<'a> {
                     RawToken::Colon => TokenKind::Colon,
                     RawToken::Semicolon => TokenKind::Semicolon,
                     RawToken::Comma => TokenKind::Comma,
+                    RawToken::DotDotEq => TokenKind::DotDotEq,
                     RawToken::DotDot => TokenKind::DotDot,
                     RawToken::Dot => TokenKind::Dot,
 

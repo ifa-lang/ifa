@@ -2529,6 +2529,9 @@ impl<'a> FunctionLoweringContext<'a> {
                 let total_arms = arms.len();
 
                 for (arm_idx, arm) in arms.iter().enumerate() {
+                    let saved_allocas = self.var_allocas.clone();
+                    let saved_types = self.var_types.clone();
+
                     let is_last = arm_idx + 1 == total_arms;
                     let arm_check_block = next_arm_block;
                     let arm_body_block = self.alloc_block();
@@ -2593,6 +2596,9 @@ impl<'a> FunctionLoweringContext<'a> {
                             });
                         }
                     }
+
+                    self.var_allocas = saved_allocas;
+                    self.var_types = saved_types;
                 }
 
                 self.current_block = exit_block;
@@ -2885,15 +2891,26 @@ impl<'a> FunctionLoweringContext<'a> {
                 });
             }
             Pattern::Ident(sym, p_span) => {
-                let var_ptr = self.alloc_value();
-                self.emit(
-                    Some(var_ptr),
-                    ValueExpr::Alloca {
-                        ty: target_ty.clone(),
-                        name: Some(*sym),
-                    },
-                    *p_span,
-                );
+                let var_ptr = if let Some(existing_ptr) = self.var_allocas.get(sym).copied() {
+                    existing_ptr
+                } else {
+                    let ptr = self.alloc_value();
+                    let inst = Instruction::new(
+                        Some(ptr),
+                        ValueExpr::Alloca {
+                            ty: target_ty.clone(),
+                            name: Some(*sym),
+                        },
+                        *p_span,
+                    );
+                    let entry = self.func.entry_block;
+                    if let Some(block) = self.func.get_block_mut(entry) {
+                        block.instructions.insert(0, inst);
+                    }
+                    self.var_allocas.insert(*sym, ptr);
+                    self.var_types.insert(*sym, target_ty.clone());
+                    ptr
+                };
                 self.emit(
                     None,
                     ValueExpr::Store {
@@ -2902,8 +2919,6 @@ impl<'a> FunctionLoweringContext<'a> {
                     },
                     *p_span,
                 );
-                self.var_allocas.insert(*sym, var_ptr);
-                self.var_types.insert(*sym, target_ty.clone());
 
                 self.set_terminator(Terminator::Branch {
                     target: success_target,
@@ -3140,6 +3155,174 @@ impl<'a> FunctionLoweringContext<'a> {
                         fail_target,
                         *s_span,
                     );
+                }
+            }
+            Pattern::Or(sub_patterns, or_span) => {
+                if sub_patterns.is_empty() {
+                    self.set_terminator(Terminator::Branch {
+                        target: fail_target,
+                        args: Vec::new(),
+                    });
+                    return;
+                }
+
+                let total = sub_patterns.len();
+                let mut check_blocks = Vec::with_capacity(total);
+                check_blocks.push(self.current_block);
+                for _ in 0..total - 1 {
+                    check_blocks.push(self.alloc_block());
+                }
+
+                for (idx, sub_pat) in sub_patterns.iter().enumerate() {
+                    self.current_block = check_blocks[idx];
+                    let sub_fail_target = if idx + 1 < total {
+                        check_blocks[idx + 1]
+                    } else {
+                        fail_target
+                    };
+
+                    self.lower_pattern_match(
+                        target_val,
+                        target_ty,
+                        sub_pat,
+                        success_target,
+                        sub_fail_target,
+                        *or_span,
+                    );
+                }
+            }
+            Pattern::Range {
+                start,
+                end,
+                inclusive,
+                span: r_span,
+            } => {
+                let eval_bound = |lowerer: &mut Self, pat: &Pattern| -> ValueId {
+                    match pat {
+                        Pattern::Lit(lit, l_span) => {
+                            let lit_const = match lit {
+                                Lit::Int(s) => {
+                                    let v: i128 = s.as_str().replace('_', "").parse().unwrap_or(0);
+                                    ConstantValue::Int(v, IntType::I64)
+                                }
+                                Lit::Float(s) => {
+                                    let v: f64 = s.as_str().parse().unwrap_or(0.0);
+                                    ConstantValue::Float(v, FloatType::F64)
+                                }
+                                Lit::Bool(b) => ConstantValue::Bool(*b),
+                                Lit::Char(c) => ConstantValue::Char(*c),
+                                Lit::String(s) => ConstantValue::String(*s),
+                                Lit::Null => ConstantValue::Null,
+                            };
+                            let lit_val = lowerer.alloc_value();
+                            lowerer.emit(Some(lit_val), ValueExpr::Constant(lit_const), *l_span);
+                            lit_val
+                        }
+                        _ => lowerer.alloc_value(),
+                    }
+                };
+
+                match (start, end) {
+                    (Some(s_pat), Some(e_pat)) => {
+                        let start_val = eval_bound(self, s_pat);
+                        let end_val = eval_bound(self, e_pat);
+
+                        let ge_cond = self.alloc_value();
+                        self.emit(
+                            Some(ge_cond),
+                            ValueExpr::Binary {
+                                op: BinaryOp::Ge,
+                                lhs: target_val,
+                                rhs: start_val,
+                            },
+                            *r_span,
+                        );
+
+                        let check_end_block = self.alloc_block();
+                        self.set_terminator(Terminator::BranchCond {
+                            cond: ge_cond,
+                            then_block: check_end_block,
+                            then_args: Vec::new(),
+                            else_block: fail_target,
+                            else_args: Vec::new(),
+                        });
+
+                        self.current_block = check_end_block;
+                        let end_op = if *inclusive {
+                            BinaryOp::Le
+                        } else {
+                            BinaryOp::Lt
+                        };
+                        let end_cond = self.alloc_value();
+                        self.emit(
+                            Some(end_cond),
+                            ValueExpr::Binary {
+                                op: end_op,
+                                lhs: target_val,
+                                rhs: end_val,
+                            },
+                            *r_span,
+                        );
+
+                        self.set_terminator(Terminator::BranchCond {
+                            cond: end_cond,
+                            then_block: success_target,
+                            then_args: Vec::new(),
+                            else_block: fail_target,
+                            else_args: Vec::new(),
+                        });
+                    }
+                    (Some(s_pat), None) => {
+                        let start_val = eval_bound(self, s_pat);
+                        let ge_cond = self.alloc_value();
+                        self.emit(
+                            Some(ge_cond),
+                            ValueExpr::Binary {
+                                op: BinaryOp::Ge,
+                                lhs: target_val,
+                                rhs: start_val,
+                            },
+                            *r_span,
+                        );
+                        self.set_terminator(Terminator::BranchCond {
+                            cond: ge_cond,
+                            then_block: success_target,
+                            then_args: Vec::new(),
+                            else_block: fail_target,
+                            else_args: Vec::new(),
+                        });
+                    }
+                    (None, Some(e_pat)) => {
+                        let end_val = eval_bound(self, e_pat);
+                        let end_op = if *inclusive {
+                            BinaryOp::Le
+                        } else {
+                            BinaryOp::Lt
+                        };
+                        let end_cond = self.alloc_value();
+                        self.emit(
+                            Some(end_cond),
+                            ValueExpr::Binary {
+                                op: end_op,
+                                lhs: target_val,
+                                rhs: end_val,
+                            },
+                            *r_span,
+                        );
+                        self.set_terminator(Terminator::BranchCond {
+                            cond: end_cond,
+                            then_block: success_target,
+                            then_args: Vec::new(),
+                            else_block: fail_target,
+                            else_args: Vec::new(),
+                        });
+                    }
+                    (None, None) => {
+                        self.set_terminator(Terminator::Branch {
+                            target: success_target,
+                            args: Vec::new(),
+                        });
+                    }
                 }
             }
         }

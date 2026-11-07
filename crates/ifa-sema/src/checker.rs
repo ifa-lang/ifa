@@ -2207,6 +2207,128 @@ impl<'a> SemanticAnalyzer<'a> {
                     }
                 }
             }
+            Pattern::Or(patterns, _span) => {
+                if patterns.is_empty() {
+                    return;
+                }
+
+                let mut all_bindings: Vec<HashMap<Symbol, (Type, Span)>> =
+                    Vec::with_capacity(patterns.len());
+
+                for sub_pat in patterns {
+                    self.symbols.enter_scope(false, false);
+                    self.check_pattern(sub_pat, target_ty);
+
+                    let mut sub_bindings = HashMap::new();
+                    if let Some(scope) = self.symbols.scopes.last() {
+                        for (name, var) in &scope.variables {
+                            sub_bindings.insert(*name, (var.ty.clone(), var.span));
+                        }
+                    }
+                    self.symbols.exit_scope();
+                    all_bindings.push(sub_bindings);
+                }
+
+                // Verify that all alternatives bind identical variables with compatible types
+                let first_bindings = &all_bindings[0];
+                for (i, other_bindings) in all_bindings.iter().enumerate().skip(1) {
+                    for (var_name, (var_ty, var_span)) in first_bindings {
+                        if let Some((other_ty, _)) = other_bindings.get(var_name) {
+                            if !var_ty.is_assignable_to(other_ty)
+                                && !other_ty.is_assignable_to(var_ty)
+                            {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "la variable '{}' est liée avec des types incompatibles dans les alternatives du motif ('{}' vs '{}')",
+                                        INTERNER.resolve(var_name),
+                                        var_ty,
+                                        other_ty
+                                    ))
+                                    .with_code("E0045")
+                                    .with_primary_label(
+                                        *var_span,
+                                        "type de variable divergent dans l'alternative",
+                                    ),
+                                );
+                            }
+                        } else {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "la variable '{}' n'est pas liée dans toutes les alternatives du motif",
+                                    INTERNER.resolve(var_name)
+                                ))
+                                .with_code("E0045")
+                                .with_primary_label(
+                                    patterns[i].span(),
+                                    format!(
+                                        "variable '{}' manquante ici",
+                                        INTERNER.resolve(var_name)
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                    for (var_name, (_, var_span)) in other_bindings {
+                        if !first_bindings.contains_key(var_name) {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "la variable '{}' n'est pas liée dans toutes les alternatives du motif",
+                                    INTERNER.resolve(var_name)
+                                ))
+                                .with_code("E0045")
+                                .with_primary_label(
+                                    *var_span,
+                                    format!(
+                                        "variable '{}' présente uniquement dans cette alternative",
+                                        INTERNER.resolve(var_name)
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                }
+
+                // Define bindings in the current arm scope
+                for (var_name, (var_ty, var_span)) in first_bindings {
+                    let _ = self.symbols.define_variable(
+                        *var_name,
+                        var_ty.clone(),
+                        false,
+                        true,
+                        None,
+                        *var_span,
+                    );
+                }
+            }
+            Pattern::Range {
+                start,
+                end,
+                inclusive: _,
+                span,
+            } => {
+                let is_scalar = matches!(
+                    target_ty,
+                    Type::Int(_) | Type::Float(_) | Type::Char | Type::Unknown
+                );
+                if !is_scalar {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "le motif de plage est incompatible avec le type non-scalaire '{}'",
+                            target_ty
+                        ))
+                        .with_code("E0036")
+                        .with_primary_label(*span, "type de motif incompatible"),
+                    );
+                    return;
+                }
+
+                if let Some(s) = start {
+                    self.check_pattern(s, target_ty);
+                }
+                if let Some(e) = end {
+                    self.check_pattern(e, target_ty);
+                }
+            }
         }
     }
 

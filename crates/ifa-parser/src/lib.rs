@@ -1514,6 +1514,93 @@ impl Parser {
     }
 
     pub fn parse_pattern(&mut self) -> Result<Pattern, Diagnostic> {
+        let _ = self.match_token(&TokenKind::Pipe);
+        let first = self.parse_range_pattern()?;
+        if self.check(&TokenKind::Pipe) {
+            let mut pats = vec![first];
+            while self.match_token(&TokenKind::Pipe) {
+                pats.push(self.parse_range_pattern()?);
+            }
+            let span = Span::new(
+                self.file_id,
+                pats[0].span().start,
+                pats.last().unwrap().span().end,
+            );
+            Ok(Pattern::Or(pats, span))
+        } else {
+            Ok(first)
+        }
+    }
+
+    pub fn parse_range_pattern(&mut self) -> Result<Pattern, Diagnostic> {
+        let cur = self.current();
+        if self.match_token(&TokenKind::DotDotEq) {
+            let end = self.parse_primary_pattern()?;
+            let span = Span::new(self.file_id, cur.span.start, end.span().end);
+            Ok(Pattern::Range {
+                start: None,
+                end: Some(Box::new(end)),
+                inclusive: true,
+                span,
+            })
+        } else if self.match_token(&TokenKind::DotDot) {
+            let end = self.parse_primary_pattern()?;
+            let span = Span::new(self.file_id, cur.span.start, end.span().end);
+            Ok(Pattern::Range {
+                start: None,
+                end: Some(Box::new(end)),
+                inclusive: false,
+                span,
+            })
+        } else {
+            let start = self.parse_primary_pattern()?;
+            if self.match_token(&TokenKind::DotDotEq) {
+                let end = self.parse_primary_pattern()?;
+                let span = Span::new(self.file_id, start.span().start, end.span().end);
+                Ok(Pattern::Range {
+                    start: Some(Box::new(start)),
+                    end: Some(Box::new(end)),
+                    inclusive: true,
+                    span,
+                })
+            } else if self.match_token(&TokenKind::DotDot) {
+                let span_start = start.span().start;
+                let has_end = !self.check(&TokenKind::FatArrow)
+                    && !self.check(&TokenKind::Pipe)
+                    && !self.check(&TokenKind::Comma)
+                    && !self.check(&TokenKind::If)
+                    && !self.check(&TokenKind::CloseBrace)
+                    && !self.check(&TokenKind::CloseParen)
+                    && !self.check(&TokenKind::Eof);
+                if has_end {
+                    let end = self.parse_primary_pattern()?;
+                    let span = Span::new(self.file_id, span_start, end.span().end);
+                    Ok(Pattern::Range {
+                        start: Some(Box::new(start)),
+                        end: Some(Box::new(end)),
+                        inclusive: false,
+                        span,
+                    })
+                } else {
+                    let span = Span::new(
+                        self.file_id,
+                        span_start,
+                        self.tokens[self.cursor - 1].span.end,
+                    );
+                    Ok(Pattern::Range {
+                        start: Some(Box::new(start)),
+                        end: None,
+                        inclusive: false,
+                        span,
+                    })
+                }
+            } else {
+                Ok(start)
+            }
+        }
+    }
+
+    pub fn parse_primary_pattern(&mut self) -> Result<Pattern, Diagnostic> {
         let cur = self.current();
         let pat_start = cur.span.start;
         match cur.kind {

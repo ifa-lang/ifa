@@ -189,6 +189,8 @@ pub enum RawToken {
     Semicolon,
     #[token(",")]
     Comma,
+    #[token("..=")]
+    DotDotEq,
     #[token("..")]
     DotDot,
     #[token(".")]
@@ -301,6 +303,7 @@ pub enum TokenKind {
     Colon,
     Semicolon,
     Comma,
+    DotDotEq,
     DotDot,
     Dot,
 
@@ -406,6 +409,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Colon => write!(f, ":"),
             TokenKind::Semicolon => write!(f, ";"),
             TokenKind::Comma => write!(f, ","),
+            TokenKind::DotDotEq => write!(f, "..="),
             TokenKind::DotDot => write!(f, ".."),
             TokenKind::Dot => write!(f, "."),
 

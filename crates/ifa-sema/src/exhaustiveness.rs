@@ -32,7 +32,173 @@ fn is_irrefutable_pattern(pat: &Pattern) -> bool {
         Pattern::Wildcard(_) | Pattern::Ident(_, _) => true,
         Pattern::Tuple(elems, _) => elems.iter().all(is_irrefutable_pattern),
         Pattern::Struct { fields, .. } => fields.iter().all(|f| is_irrefutable_pattern(&f.pattern)),
-        Pattern::Variant { .. } | Pattern::Lit(_, _) => false,
+        Pattern::Or(pats, _) => pats.iter().any(is_irrefutable_pattern),
+        Pattern::Variant { .. } | Pattern::Lit(_, _) | Pattern::Range { .. } => false,
+    }
+}
+
+/// Helper holding the accumulated coverage state during exhaustiveness checking.
+struct CoverageState<'a> {
+    target_ty: &'a Type,
+    enum_variants_info: &'a Option<Vec<(Symbol, Option<Type>)>>,
+    fully_covered_variants: HashSet<Symbol>,
+    variant_payload_literals: HashMap<Symbol, HashSet<String>>,
+    covered_literals: HashSet<String>,
+    covered_true: bool,
+    covered_false: bool,
+}
+
+impl<'a> CoverageState<'a> {
+    fn new(
+        target_ty: &'a Type,
+        enum_variants_info: &'a Option<Vec<(Symbol, Option<Type>)>>,
+    ) -> Self {
+        Self {
+            target_ty,
+            enum_variants_info,
+            fully_covered_variants: HashSet::new(),
+            variant_payload_literals: HashMap::new(),
+            covered_literals: HashSet::new(),
+            covered_true: false,
+            covered_false: false,
+        }
+    }
+
+    /// Helper determining if a pattern is already subsumed by earlier patterns.
+    fn is_pattern_subsumed(&self, pat: &Pattern) -> bool {
+        match pat {
+            Pattern::Wildcard(_) | Pattern::Ident(_, _) => {
+                if let Some(ref all_variants) = self.enum_variants_info {
+                    all_variants
+                        .iter()
+                        .all(|(v, _)| self.fully_covered_variants.contains(v))
+                } else if *self.target_ty == Type::Bool {
+                    self.covered_true && self.covered_false
+                } else {
+                    false
+                }
+            }
+            Pattern::Variant { variant, inner, .. } => {
+                if self.fully_covered_variants.contains(variant) {
+                    return true;
+                }
+                if let Some(inner_pat) = inner {
+                    if let Pattern::Lit(lit, _) = inner_pat.as_ref() {
+                        let lit_key = lit_to_string(lit);
+                        if let Some(lits) = self.variant_payload_literals.get(variant) {
+                            return lits.contains(&lit_key);
+                        }
+                    }
+                }
+                false
+            }
+            Pattern::Lit(Lit::Bool(b), _) => {
+                (*b && self.covered_true) || (!*b && self.covered_false)
+            }
+            Pattern::Lit(lit, _) => {
+                let key = lit_to_string(lit);
+                self.covered_literals.contains(&key)
+            }
+            Pattern::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => {
+                if let (Some(s_pat), Some(e_pat)) = (start, end) {
+                    if let (Pattern::Lit(Lit::Int(s1), _), Pattern::Lit(Lit::Int(s2), _)) =
+                        (s_pat.as_ref(), e_pat.as_ref())
+                    {
+                        if let (Ok(v1), Ok(v2)) = (
+                            s1.as_str().replace('_', "").parse::<i128>(),
+                            s2.as_str().replace('_', "").parse::<i128>(),
+                        ) {
+                            let upper = if *inclusive { v2 } else { v2 - 1 };
+                            if upper >= v1 && upper - v1 <= 10_000 {
+                                return (v1..=upper).all(|v| {
+                                    self.covered_literals.contains(&format!("int:{}", v))
+                                });
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            Pattern::Or(pats, _) => pats.iter().all(|p| self.is_pattern_subsumed(p)),
+            _ => false,
+        }
+    }
+
+    /// Helper accumulating pattern coverage into tracked sets.
+    fn accumulate_coverage(&mut self, pat: &Pattern) {
+        match pat {
+            Pattern::Wildcard(_)
+            | Pattern::Ident(_, _)
+            | Pattern::Tuple(_, _)
+            | Pattern::Struct { .. } => {}
+            Pattern::Variant { variant, inner, .. } => match inner.as_deref() {
+                None | Some(Pattern::Wildcard(_)) | Some(Pattern::Ident(_, _)) => {
+                    self.fully_covered_variants.insert(*variant);
+                }
+                Some(p) if is_irrefutable_pattern(p) => {
+                    self.fully_covered_variants.insert(*variant);
+                }
+                Some(Pattern::Lit(lit, _)) => {
+                    let lit_key = lit_to_string(lit);
+                    self.variant_payload_literals
+                        .entry(*variant)
+                        .or_default()
+                        .insert(lit_key);
+                }
+                Some(Pattern::Variant { .. })
+                | Some(Pattern::Tuple(_, _))
+                | Some(Pattern::Struct { .. })
+                | Some(Pattern::Or(_, _))
+                | Some(Pattern::Range { .. }) => {}
+            },
+            Pattern::Lit(lit, _) => {
+                if *self.target_ty == Type::Bool {
+                    if let Lit::Bool(b) = lit {
+                        if *b {
+                            self.covered_true = true;
+                        } else {
+                            self.covered_false = true;
+                        }
+                    }
+                } else {
+                    self.covered_literals.insert(lit_to_string(lit));
+                }
+            }
+            Pattern::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => {
+                if let (Some(s_pat), Some(e_pat)) = (start, end) {
+                    if let (Pattern::Lit(Lit::Int(s1), _), Pattern::Lit(Lit::Int(s2), _)) =
+                        (s_pat.as_ref(), e_pat.as_ref())
+                    {
+                        if let (Ok(v1), Ok(v2)) = (
+                            s1.as_str().replace('_', "").parse::<i128>(),
+                            s2.as_str().replace('_', "").parse::<i128>(),
+                        ) {
+                            let upper = if *inclusive { v2 } else { v2 - 1 };
+                            if upper >= v1 && upper - v1 <= 10_000 {
+                                for v in v1..=upper {
+                                    self.covered_literals.insert(format!("int:{}", v));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Pattern::Or(pats, _) => {
+                for p in pats {
+                    self.accumulate_coverage(p);
+                }
+            }
+        }
     }
 }
 
@@ -60,15 +226,7 @@ pub fn check_match_exhaustiveness(
     };
 
     let mut has_universal_catch_all = false;
-
-    // Type-specific coverage tracking
-    let mut fully_covered_variants: HashSet<Symbol> = HashSet::new();
-    let mut variant_payload_literals: HashMap<Symbol, HashSet<String>> = HashMap::new();
-
-    let mut covered_true = false;
-    let mut covered_false = false;
-
-    let mut covered_literals: HashSet<String> = HashSet::new();
+    let mut state = CoverageState::new(target_ty, &enum_variants_info);
 
     for arm in arms {
         let is_guarded = arm.guard.is_some();
@@ -83,100 +241,29 @@ pub fn check_match_exhaustiveness(
             continue;
         }
 
-        if let Some(ref all_variants) = enum_variants_info {
-            match &arm.pattern {
-                Pattern::Wildcard(_) | Pattern::Ident(_, _) => {
-                    let all_covered = all_variants
-                        .iter()
-                        .all(|(v, _)| fully_covered_variants.contains(v));
-                    if all_covered {
-                        diagnostics.push(
-                            Diagnostic::error("motif inaccessible : tous les variants de l'énumération ont déjà été couverts")
-                                .with_code("E0044")
-                                .with_primary_label(arm.span, "branche inaccessible"),
-                        );
-                        continue;
-                    }
-                }
-                Pattern::Variant {
-                    variant,
-                    inner,
-                    span,
-                    ..
-                } => {
-                    if fully_covered_variants.contains(variant) {
-                        diagnostics.push(
-                            Diagnostic::error(format!(
-                                "motif inaccessible : le variant '{}' a déjà été intégralement couvert par une branche précédente",
-                                INTERNER.resolve(variant)
-                            ))
+        if let Pattern::Or(pats, _) = &arm.pattern {
+            let mut any_useful = false;
+            for p in pats {
+                if state.is_pattern_subsumed(p) {
+                    diagnostics.push(
+                        Diagnostic::error("motif inaccessible : cette alternative a déjà été couverte par une branche ou alternative précédente")
                             .with_code("E0044")
-                            .with_primary_label(*span, "branche inaccessible"),
-                        );
-                        continue;
-                    }
-
-                    if let Some(inner_pat) = inner {
-                        if let Pattern::Lit(lit, lit_span) = inner_pat.as_ref() {
-                            let lit_key = lit_to_string(lit);
-                            if let Some(lits) = variant_payload_literals.get(variant) {
-                                if lits.contains(&lit_key) {
-                                    diagnostics.push(
-                                        Diagnostic::error(format!(
-                                            "motif inaccessible : la valeur pour le variant '{}' a déjà été couverte",
-                                            INTERNER.resolve(variant)
-                                        ))
-                                        .with_code("E0044")
-                                        .with_primary_label(*lit_span, "valeur déjà filtrée"),
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        } else if *target_ty == Type::Bool {
-            match &arm.pattern {
-                Pattern::Lit(Lit::Bool(b), b_span)
-                    if (*b && covered_true) || (!*b && covered_false) =>
-                {
-                    diagnostics.push(
-                        Diagnostic::error(format!(
-                            "motif inaccessible : la valeur '{}' a déjà été couverte",
-                            b
-                        ))
-                        .with_code("E0044")
-                        .with_primary_label(*b_span, "valeur booléenne déjà filtrée"),
+                            .with_primary_label(p.span(), "alternative inaccessible"),
                     );
-                    continue;
-                }
-                Pattern::Wildcard(_) | Pattern::Ident(_, _) if covered_true && covered_false => {
-                    diagnostics.push(
-                        Diagnostic::error("motif inaccessible : toutes les valeurs possibles ('true', 'false') ont déjà été couvertes")
-                            .with_code("E0044")
-                            .with_primary_label(arm.span, "branche inaccessible"),
-                    );
-                    continue;
-                }
-                _ => {}
-            }
-        } else {
-            // Numeric, string, or open scalar types
-            if let Pattern::Lit(lit, lit_span) = &arm.pattern {
-                let key = lit_to_string(lit);
-                if covered_literals.contains(&key) {
-                    diagnostics.push(
-                        Diagnostic::error(
-                            "motif inaccessible : cette valeur a déjà été couverte par une branche précédente",
-                        )
-                        .with_code("E0044")
-                        .with_primary_label(*lit_span, "valeur déjà filtrée"),
-                    );
-                    continue;
+                } else {
+                    any_useful = true;
                 }
             }
+            if !any_useful {
+                continue;
+            }
+        } else if state.is_pattern_subsumed(&arm.pattern) {
+            diagnostics.push(
+                Diagnostic::error("motif inaccessible : cette branche ne sera jamais atteinte car les motifs précédents couvrent déjà ces valeurs")
+                    .with_code("E0044")
+                    .with_primary_label(arm.span, "branche inaccessible"),
+            );
+            continue;
         }
 
         // 2. Accumulate Coverage (ONLY for unguarded arms)
@@ -185,56 +272,16 @@ pub fn check_match_exhaustiveness(
                 has_universal_catch_all = true;
                 if let Some(ref all_variants) = enum_variants_info {
                     for (v, _) in all_variants {
-                        fully_covered_variants.insert(*v);
+                        state.fully_covered_variants.insert(*v);
                     }
                 }
                 if *target_ty == Type::Bool {
-                    covered_true = true;
-                    covered_false = true;
+                    state.covered_true = true;
+                    state.covered_false = true;
                 }
             }
 
-            match &arm.pattern {
-                Pattern::Wildcard(_)
-                | Pattern::Ident(_, _)
-                | Pattern::Tuple(_, _)
-                | Pattern::Struct { .. } => {}
-                Pattern::Variant { variant, inner, .. } => {
-                    match inner.as_deref() {
-                        None | Some(Pattern::Wildcard(_)) | Some(Pattern::Ident(_, _)) => {
-                            fully_covered_variants.insert(*variant);
-                        }
-                        Some(p) if is_irrefutable_pattern(p) => {
-                            fully_covered_variants.insert(*variant);
-                        }
-                        Some(Pattern::Lit(lit, _)) => {
-                            let lit_key = lit_to_string(lit);
-                            variant_payload_literals
-                                .entry(*variant)
-                                .or_default()
-                                .insert(lit_key);
-                        }
-                        Some(Pattern::Variant { .. })
-                        | Some(Pattern::Tuple(_, _))
-                        | Some(Pattern::Struct { .. }) => {
-                            // Sub-pattern does not fully cover unless irrefutable
-                        }
-                    }
-                }
-                Pattern::Lit(lit, _) => {
-                    if *target_ty == Type::Bool {
-                        if let Lit::Bool(b) = lit {
-                            if *b {
-                                covered_true = true;
-                            } else {
-                                covered_false = true;
-                            }
-                        }
-                    } else {
-                        covered_literals.insert(lit_to_string(lit));
-                    }
-                }
-            }
+            state.accumulate_coverage(&arm.pattern);
         }
     }
 
@@ -246,7 +293,7 @@ pub fn check_match_exhaustiveness(
     if let Some(ref all_variants) = enum_variants_info {
         let missing: Vec<String> = all_variants
             .iter()
-            .filter(|(v, _)| !fully_covered_variants.contains(v))
+            .filter(|(v, _)| !state.fully_covered_variants.contains(v))
             .map(|(v, _)| INTERNER.resolve(v).to_string())
             .collect();
 
@@ -262,10 +309,10 @@ pub fn check_match_exhaustiveness(
         }
     } else if *target_ty == Type::Bool {
         let mut missing = Vec::new();
-        if !covered_true {
+        if !state.covered_true {
             missing.push("true".to_string());
         }
-        if !covered_false {
+        if !state.covered_false {
             missing.push("false".to_string());
         }
         if !missing.is_empty() {

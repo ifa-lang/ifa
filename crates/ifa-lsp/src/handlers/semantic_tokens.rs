@@ -173,6 +173,7 @@ pub fn handle_semantic_tokens(doc: &Document) -> SemanticTokens {
             | TokenKind::CloseBrace
             | TokenKind::Semicolon
             | TokenKind::Comma
+            | TokenKind::DotDotEq
             | TokenKind::DotDot
             | TokenKind::Dot
             | TokenKind::Error

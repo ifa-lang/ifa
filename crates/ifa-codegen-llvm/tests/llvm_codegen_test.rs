@@ -788,3 +788,71 @@ pub fn main() -> i64 {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_or_and_range_pattern_matching_native() {
+    let src = r#"
+fn classify_val(v: i64) -> i64 {
+    return match v {
+        1 | 3 | 5 => 10,
+        10..=20 => 20,
+        21..=25 | 30..=35 => 40,
+        _ => 0,
+    }
+}
+
+pub fn main() -> i64 {
+    let r1 = classify_val(3);
+    let r2 = classify_val(15);
+    let r3 = classify_val(23);
+    let r4 = classify_val(31);
+    let r5 = classify_val(99);
+
+    return r1 + r2 + r3 + r4 + r5;
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_or_range.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir = std::env::temp_dir().join(format!("llvm_or_range_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("or_range.o");
+    let bin_path = temp_dir.join("or_range_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(110),
+        "Native binary output exit code must be 110 (10 + 20 + 40 + 40 + 0)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

@@ -1,0 +1,65 @@
+enum HttpStatus {
+    Ok,
+    Created,
+    Accepted,
+    MovedPermanently,
+    Found,
+    BadRequest,
+    Unauthorized,
+    NotFound,
+    InternalServerError,
+}
+
+enum ServerEvent {
+    Request(i64),
+    Cached(i64),
+    Ping,
+}
+
+struct RequestContext {
+    status_code: i64,
+    retry_count: i64,
+}
+
+fn classify_status(status: HttpStatus) -> str {
+    return match status {
+        HttpStatus::Ok | HttpStatus::Created | HttpStatus::Accepted => "2xx Success",
+        HttpStatus::MovedPermanently | HttpStatus::Found => "3xx Redirection",
+        HttpStatus::BadRequest | HttpStatus::Unauthorized | HttpStatus::NotFound => "4xx Client Error",
+        HttpStatus::InternalServerError => "5xx Server Error",
+    }
+}
+
+fn classify_http_code(code: i64) -> str {
+    return match code {
+        200..=299 => "Success range",
+        300..=399 => "Redirection range",
+        400..=499 => "Client error range",
+        500..=599 => "Server error range",
+        _ => "Unknown HTTP status",
+    }
+}
+
+fn process_event(ev: ServerEvent) -> i64 {
+    return match ev {
+        ServerEvent::Request(id) | ServerEvent::Cached(id) => id * 10,
+        ServerEvent::Ping => 0,
+    }
+}
+
+fn route_context(ctx: RequestContext) -> i64 {
+    return match ctx {
+        RequestContext { status_code: 200 | 201, retry_count: 0..=3 } => 1,
+        RequestContext { status_code: 400..=499, retry_count } => retry_count + 100,
+        _ => -1,
+    }
+}
+
+pub fn main() -> i64 {
+    let s = classify_status(HttpStatus::Ok);
+    let c = classify_http_code(404);
+    let e = process_event(ServerEvent::Cached(42));
+    let r = route_context(RequestContext(status_code: 200, retry_count: 2));
+
+    return e + r;
+}

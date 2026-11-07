@@ -423,3 +423,158 @@ fn test_sroa_aggregate_projection_folding() {
     let res = interp.execute_function("compute_proj", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(33));
 }
+
+#[test]
+fn test_or_pattern_execution() {
+    let src = r#"
+        enum Coin {
+            Heads,
+            Tails,
+            Edge
+        }
+
+        fn eval_coin(c: Coin) -> i64 {
+            return match c {
+                Coin::Heads | Coin::Tails => 1,
+                Coin::Edge => 2,
+            }
+        }
+
+        fn classify_int(n: i64) -> i64 {
+            return match n {
+                1 | 3 | 5 | 7 | 9 => 11,
+                2 | 4 | 6 | 8 => 22,
+                _ => 99,
+            }
+        }
+
+        pub fn main() -> i64 {
+            let r1 = eval_coin(Coin::Heads);
+            let r2 = eval_coin(Coin::Tails);
+            let r3 = eval_coin(Coin::Edge);
+            let r4 = classify_int(5);
+            let r5 = classify_int(4);
+            let r6 = classify_int(100);
+            return r1 + r2 + r3 + r4 + r5 + r6;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("or_pattern.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    // r1: 1, r2: 1, r3: 2, r4: 11, r5: 22, r6: 99 => sum = 136
+    assert_eq!(res, FirValue::Int(136));
+}
+
+#[test]
+fn test_range_pattern_execution() {
+    let src = r#"
+        fn classify_grade(score: i64) -> i64 {
+            return match score {
+                90..=100 => 4,
+                80..=89 => 3,
+                70..=79 => 2,
+                0..=69 => 1,
+                _ => 0,
+            }
+        }
+
+        fn combined_match(val: i64) -> i64 {
+            return match val {
+                1..=5 | 10..=15 => 100,
+                20..=25 | 30..=35 => 200,
+                _ => -1,
+            }
+        }
+
+        pub fn main() -> i64 {
+            let g1 = classify_grade(95);
+            let g2 = classify_grade(85);
+            let g3 = classify_grade(60);
+            let c1 = combined_match(3);
+            let c2 = combined_match(12);
+            let c3 = combined_match(33);
+            let c4 = combined_match(50);
+            return g1 + g2 + g3 + c1 + c2 + c3 + c4;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("range_pattern.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    // g1: 4, g2: 3, g3: 1, c1: 100, c2: 100, c3: 200, c4: -1 => sum = 407
+    assert_eq!(res, FirValue::Int(407));
+}
+
+#[test]
+fn test_or_pattern_with_shared_bindings_execution() {
+    let src = r#"
+        enum ResultVal {
+            Success(i64),
+            Cached(i64),
+            Failure
+        }
+
+        fn extract_val(res: ResultVal) -> i64 {
+            return match res {
+                ResultVal::Success(v) | ResultVal::Cached(v) => v * 2,
+                ResultVal::Failure => 0,
+            }
+        }
+
+        pub fn main() -> i64 {
+            let r1 = extract_val(ResultVal::Success(21));
+            let r2 = extract_val(ResultVal::Cached(50));
+            let r3 = extract_val(ResultVal::Failure);
+            return r1 + r2 + r3;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("or_pattern_bindings.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    // r1: 42, r2: 100, r3: 0 => sum = 142
+    assert_eq!(res, FirValue::Int(142));
+}
