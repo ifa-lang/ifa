@@ -2126,14 +2126,28 @@ impl<'a> FunctionLoweringContext<'a> {
             }
 
             ExprKind::Spawn(e) => {
-                let _ = self.lower_expr(e);
                 let res = self.alloc_value();
-                let sym = INTERNER.intern("task");
+                let (target_sym, arg_vals) = match &e.kind {
+                    ExprKind::Call { callee, args } => {
+                        let target = match &callee.kind {
+                            ExprKind::Ident(sym) => *sym,
+                            _ => INTERNER.intern("task"),
+                        };
+                        let lowered_args: Vec<ValueId> =
+                            args.iter().map(|arg| self.lower_expr(&arg.value)).collect();
+                        (target, lowered_args)
+                    }
+                    ExprKind::Ident(sym) => (*sym, Vec::new()),
+                    _ => {
+                        let _ = self.lower_expr(e);
+                        (INTERNER.intern("task"), Vec::new())
+                    }
+                };
                 self.emit(
                     Some(res),
                     ValueExpr::Spawn {
-                        target: sym,
-                        args: Vec::new(),
+                        target: target_sym,
+                        args: arg_vals,
                     },
                     span,
                 );

@@ -20,8 +20,9 @@ pub use benchmarks::{
 pub use collections::{IfaList, IfaMap};
 pub use ffi::*;
 pub use fiber::{
-    AtomicRingBuffer, Channel, FiberId, FiberScheduler, FiberState, RecvError, SendError,
-    TryRecvError, TrySendError, GLOBAL_SCHEDULER,
+    AtomicRingBuffer, Channel, CoroDestroyFn, CoroResumeFn, CoroStatus, FiberId, FiberScheduler,
+    FiberState, FiberStepResult, FiberTask, RecvError, SendError, StacklessCoro, TryRecvError,
+    TrySendError, GLOBAL_SCHEDULER,
 };
 pub use header::{
     GenHeader, GenRef, FLAG_ACTIVE, FLAG_ARENA_SCOPED, FLAG_FREE, FLAG_PINNED, FLAG_READONLY,

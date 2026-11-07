@@ -105,6 +105,51 @@ void ifa_rt_fiber_yield(void);
  */
 void ifa_rt_fiber_join(uint64_t fiber_id);
 
+/* --- Stackless Native Coroutines & Continuous Fibers API --- */
+
+#define IFA_CORO_STATUS_SUSPENDED 0
+#define IFA_CORO_STATUS_COMPLETED 1
+#define IFA_CORO_STATUS_PANICKED  2
+
+typedef int32_t (*ifa_coro_resume_fn)(void* frame);
+typedef void (*ifa_coro_destroy_fn)(void* frame);
+typedef struct ifa_coroutine ifa_coroutine_t;
+
+/**
+ * Allocate and initialize a stackless native coroutine.
+ */
+ifa_coroutine_t* ifa_rt_coro_create(size_t frame_size, ifa_coro_resume_fn resume_fn, ifa_coro_destroy_fn destroy_fn);
+
+/**
+ * Resume execution of a stackless coroutine for one cooperative step.
+ */
+int32_t ifa_rt_coro_resume(ifa_coroutine_t* coro);
+
+/**
+ * Spawn a stackless coroutine into the global M:N scheduler for continuous execution.
+ */
+uint64_t ifa_rt_coro_spawn(ifa_coroutine_t* coro);
+
+/**
+ * Destroy a stackless coroutine and release its frame.
+ */
+void ifa_rt_coro_destroy(ifa_coroutine_t* coro);
+
+/**
+ * Check if a stackless coroutine has completed.
+ */
+int32_t ifa_rt_coro_is_done(ifa_coroutine_t* coro);
+
+/**
+ * Get the current status code of a stackless coroutine.
+ */
+int32_t ifa_rt_coro_status(ifa_coroutine_t* coro);
+
+/**
+ * Access the state memory frame of a stackless coroutine.
+ */
+void* ifa_rt_coro_frame(ifa_coroutine_t* coro);
+
 /* --- Concurrency Channels API --- */
 
 typedef struct ifa_channel_handle ifa_channel_handle_t;

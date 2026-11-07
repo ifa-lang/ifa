@@ -390,3 +390,118 @@ fn test_c_abi_channel_select() {
     ifa_rt_channel_destroy(ch1);
     ifa_rt_channel_destroy(ch2);
 }
+
+#[test]
+fn test_stackless_fiber_resumable_scheduler() {
+    let sched = FiberScheduler::new(2);
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let c = std::sync::Arc::clone(&counter);
+    let mut step = 0;
+    let fid = sched.spawn_resumable(move || {
+        step += 1;
+        c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if step < 5 {
+            CoroStatus::Suspended
+        } else {
+            CoroStatus::Completed
+        }
+    });
+
+    sched.join(fid);
+    assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 5);
+    assert!(sched.is_completed(fid));
+}
+
+#[repr(C)]
+struct MockCoroFrame {
+    stage: i32,
+    accumulator: i64,
+}
+
+extern "C" fn mock_coro_resume(frame_ptr: *mut u8) -> i32 {
+    let frame = unsafe { &mut *(frame_ptr as *mut MockCoroFrame) };
+    match frame.stage {
+        0 => {
+            frame.accumulator += 10;
+            frame.stage = 1;
+            0 // CoroStatus::Suspended
+        }
+        1 => {
+            frame.accumulator += 20;
+            frame.stage = 2;
+            0 // CoroStatus::Suspended
+        }
+        2 => {
+            frame.accumulator += 30;
+            frame.stage = 3;
+            1 // CoroStatus::Completed
+        }
+        _ => 1,
+    }
+}
+
+static DESTROY_CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn mock_coro_destroy(_frame_ptr: *mut u8) {
+    DESTROY_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[test]
+fn test_stackless_native_coroutine_c_abi() {
+    DESTROY_CALLED.store(false, std::sync::atomic::Ordering::SeqCst);
+    let coro = ifa_rt_coro_create(
+        std::mem::size_of::<MockCoroFrame>(),
+        mock_coro_resume,
+        Some(mock_coro_destroy),
+    );
+    assert!(!coro.is_null());
+    assert_eq!(ifa_rt_coro_is_done(coro), 0);
+    assert_eq!(ifa_rt_coro_status(coro), 0);
+
+    // Step 0 -> stage 1, acc = 10, Suspended
+    let s1 = ifa_rt_coro_resume(coro);
+    assert_eq!(s1, 0);
+    assert_eq!(ifa_rt_coro_is_done(coro), 0);
+    let frame1 = unsafe { &*(ifa_rt_coro_frame(coro) as *const MockCoroFrame) };
+    assert_eq!(frame1.stage, 1);
+    assert_eq!(frame1.accumulator, 10);
+
+    // Step 1 -> stage 2, acc = 30, Suspended
+    let s2 = ifa_rt_coro_resume(coro);
+    assert_eq!(s2, 0);
+    assert_eq!(ifa_rt_coro_is_done(coro), 0);
+    let frame2 = unsafe { &*(ifa_rt_coro_frame(coro) as *const MockCoroFrame) };
+    assert_eq!(frame2.stage, 2);
+    assert_eq!(frame2.accumulator, 30);
+
+    // Step 2 -> stage 3, acc = 60, Completed
+    let s3 = ifa_rt_coro_resume(coro);
+    assert_eq!(s3, 1);
+    assert_eq!(ifa_rt_coro_is_done(coro), 1);
+    let frame3 = unsafe { &*(ifa_rt_coro_frame(coro) as *const MockCoroFrame) };
+    assert_eq!(frame3.stage, 3);
+    assert_eq!(frame3.accumulator, 60);
+
+    ifa_rt_coro_destroy(coro);
+    assert!(DESTROY_CALLED.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn test_stackless_native_coroutine_spawn_scheduler() {
+    let coro = ifa_rt_coro_create(std::mem::size_of::<MockCoroFrame>(), mock_coro_resume, None);
+    assert!(!coro.is_null());
+
+    let fid = ifa_rt_coro_spawn(coro);
+    assert!(fid > 0);
+
+    // Join should wait until the stackless coroutine transitions across all stages to Completed
+    ifa_rt_fiber_join(fid);
+
+    assert_eq!(ifa_rt_coro_is_done(coro), 1);
+    let frame = unsafe { &*(ifa_rt_coro_frame(coro) as *const MockCoroFrame) };
+    assert_eq!(frame.accumulator, 60);
+    assert_eq!(frame.stage, 3);
+
+    ifa_rt_coro_destroy(coro);
+}

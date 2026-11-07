@@ -345,3 +345,75 @@ fn test_llvm_simd_slice_vectorization() {
     assert!(ir.contains("!\"llvm.loop.vectorize.width\", i32 8"));
     assert!(ir.contains("\"no-trapping-math\"=\"true\""));
 }
+
+#[test]
+fn test_llvm_stackless_fibers_and_coroutine_intrinsics() {
+    let src = r#"
+        pub fn worker_coro() -> () {
+            println("Worker fiber active");
+        }
+
+        pub fn main() -> () {
+            spawn worker_coro();
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("coro_test.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).expect("FIR lowering failed");
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&module).expect("Emission failed");
+
+    // 1. Verify LLVM Standard Coroutine Intrinsics
+    assert!(ir.contains("declare token @llvm.coro.id(i32, ptr, ptr, ptr)"));
+    assert!(ir.contains("declare i64 @llvm.coro.size.i64()"));
+    assert!(ir.contains("declare ptr @llvm.coro.begin(token, ptr)"));
+    assert!(ir.contains("declare i8 @llvm.coro.suspend(token, i1)"));
+    assert!(ir.contains("declare i1 @llvm.coro.end(ptr, i1, token)"));
+    assert!(ir.contains("declare void @llvm.coro.resume(ptr)"));
+    assert!(ir.contains("declare void @llvm.coro.destroy(ptr)"));
+    assert!(ir.contains("declare i1 @llvm.coro.done(ptr)"));
+
+    // 2. Verify IFA Native Coroutine Runtime Declarations
+    assert!(ir.contains("declare ptr @ifa_rt_coro_create(i64, ptr, ptr)"));
+    assert!(ir.contains("declare i32 @ifa_rt_coro_resume(ptr)"));
+    assert!(ir.contains("declare i64 @ifa_rt_coro_spawn(ptr)"));
+    assert!(ir.contains("declare void @ifa_rt_coro_destroy(ptr)"));
+    assert!(ir.contains("declare i32 @ifa_rt_coro_status(ptr)"));
+    assert!(ir.contains("declare i32 @ifa_rt_coro_is_done(ptr)"));
+    assert!(ir.contains("declare ptr @ifa_rt_coro_frame(ptr)"));
+    assert!(ir.contains("declare i64 @ifa_rt_fiber_spawn(ptr, ptr)"));
+    assert!(ir.contains("declare void @ifa_rt_fiber_join(i64)"));
+
+    // 3. Verify Continuous Coroutine Runner linkonce helper
+    assert!(ir.contains("@ifa_coro_run_continuous(ptr %coro)"));
+    assert!(ir.contains("@ifa_coro_poll(ptr %coro)"));
+
+    // 4. Verify Stackless Fiber Spawn instruction
+    assert!(ir.contains("call i64 @ifa_rt_fiber_spawn(ptr @worker_coro, ptr null)"));
+
+    // 5. Verify LLVM compilation to object file works smoothly
+    let temp_dir = std::env::temp_dir().join(format!("llvm_coro_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("coro_test.o");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

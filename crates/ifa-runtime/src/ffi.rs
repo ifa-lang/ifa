@@ -3,7 +3,10 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::allocator::GLOBAL_ALLOCATOR;
-use crate::fiber::{Channel, TryRecvError, TrySendError, GLOBAL_SCHEDULER};
+use crate::fiber::{
+    Channel, CoroDestroyFn, CoroResumeFn, CoroStatus, FiberId, TryRecvError, TrySendError,
+    GLOBAL_SCHEDULER,
+};
 use crate::header::GenHeader;
 
 /// Allocate a generational memory slot.
@@ -160,6 +163,139 @@ pub extern "C" fn ifa_rt_fiber_yield() {
 #[no_mangle]
 pub extern "C" fn ifa_rt_fiber_join(fiber_id: u64) {
     GLOBAL_SCHEDULER.join(fiber_id);
+}
+
+/// Opaque handle representing an allocated stackless native coroutine.
+pub struct IfaCoroutine {
+    pub frame: *mut u8,
+    pub resume_fn: CoroResumeFn,
+    pub destroy_fn: Option<CoroDestroyFn>,
+    pub status: CoroStatus,
+    pub fiber_id: Option<FiberId>,
+}
+
+unsafe impl Send for IfaCoroutine {}
+unsafe impl Sync for IfaCoroutine {}
+
+/// Create a stackless native coroutine with an allocated memory frame.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_create(
+    frame_size: usize,
+    resume_fn: extern "C" fn(*mut u8) -> i32,
+    destroy_fn: Option<extern "C" fn(*mut u8)>,
+) -> *mut IfaCoroutine {
+    let actual_size = frame_size.max(16);
+    let frame = GLOBAL_ALLOCATOR.alloc(actual_size, 8, 0);
+    unsafe {
+        std::ptr::write_bytes(frame, 0, actual_size);
+    }
+    let coro = Box::new(IfaCoroutine {
+        frame,
+        resume_fn,
+        destroy_fn,
+        status: CoroStatus::Suspended,
+        fiber_id: None,
+    });
+    Box::into_raw(coro)
+}
+
+/// Resume execution of a stackless coroutine for one cooperative step.
+/// Returns CoroStatus as i32 (0 = Suspended, 1 = Completed, 2 = Panicked).
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_resume(coro: *mut IfaCoroutine) -> i32 {
+    if coro.is_null() {
+        return CoroStatus::Panicked as i32;
+    }
+    let c = unsafe { &mut *coro };
+    if c.status == CoroStatus::Completed {
+        return CoroStatus::Completed as i32;
+    }
+    let res = (c.resume_fn)(c.frame);
+    if res == CoroStatus::Completed as i32 {
+        c.status = CoroStatus::Completed;
+    } else if res == CoroStatus::Suspended as i32 {
+        c.status = CoroStatus::Suspended;
+    } else {
+        c.status = CoroStatus::Panicked;
+    }
+    res
+}
+
+/// Spawn a stackless coroutine into the global M:N scheduler for continuous cooperative execution.
+/// Returns the assigned FiberId.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_spawn(coro: *mut IfaCoroutine) -> u64 {
+    if coro.is_null() {
+        return 0;
+    }
+    let c = unsafe { &mut *coro };
+    let coro_ptr = coro as usize;
+    let fid = GLOBAL_SCHEDULER.spawn_resumable(move || {
+        let raw_coro = coro_ptr as *mut IfaCoroutine;
+        let res = ifa_rt_coro_resume(raw_coro);
+        if res == CoroStatus::Completed as i32 {
+            CoroStatus::Completed
+        } else if res == CoroStatus::Suspended as i32 {
+            CoroStatus::Suspended
+        } else {
+            CoroStatus::Panicked
+        }
+    });
+    c.fiber_id = Some(fid);
+    fid
+}
+
+/// Destroy a stackless coroutine and free its state frame.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_destroy(coro: *mut IfaCoroutine) {
+    if !coro.is_null() {
+        unsafe {
+            let mut c = Box::from_raw(coro);
+            if let Some(destroy) = c.destroy_fn {
+                if !c.frame.is_null() {
+                    destroy(c.frame);
+                }
+            }
+            if !c.frame.is_null() {
+                GLOBAL_ALLOCATOR.free(c.frame);
+                c.frame = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+/// Check if a stackless coroutine has completed execution.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_is_done(coro: *mut IfaCoroutine) -> i32 {
+    if coro.is_null() {
+        return 1;
+    }
+    let c = unsafe { &*coro };
+    if c.status == CoroStatus::Completed {
+        1
+    } else {
+        0
+    }
+}
+
+/// Get current execution status of a stackless coroutine.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_status(coro: *mut IfaCoroutine) -> i32 {
+    if coro.is_null() {
+        return CoroStatus::Panicked as i32;
+    }
+    let c = unsafe { &*coro };
+    c.status as i32
+}
+
+/// Get raw memory frame pointer of a stackless coroutine.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_frame(coro: *mut IfaCoroutine) -> *mut u8 {
+    if coro.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*coro).frame }
+    }
 }
 
 /// Print a null-terminated UTF-8 string.

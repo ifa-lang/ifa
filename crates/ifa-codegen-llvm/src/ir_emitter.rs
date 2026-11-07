@@ -109,6 +109,15 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare ptr @ifa_rt_gen_alloc(i64, i64, i16)\n");
             out.push_str("declare void @ifa_rt_gen_free(ptr)\n");
             out.push_str("declare void @ifa_rt_fiber_yield()\n");
+            out.push_str("declare i64 @ifa_rt_fiber_spawn(ptr, ptr)\n");
+            out.push_str("declare void @ifa_rt_fiber_join(i64)\n");
+            out.push_str("declare ptr @ifa_rt_coro_create(i64, ptr, ptr)\n");
+            out.push_str("declare i32 @ifa_rt_coro_resume(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_coro_spawn(ptr)\n");
+            out.push_str("declare void @ifa_rt_coro_destroy(ptr)\n");
+            out.push_str("declare i32 @ifa_rt_coro_status(ptr)\n");
+            out.push_str("declare i32 @ifa_rt_coro_is_done(ptr)\n");
+            out.push_str("declare ptr @ifa_rt_coro_frame(ptr)\n");
             out.push_str("declare ptr @ifa_rt_channel_create(i64)\n");
             out.push_str("declare void @ifa_rt_channel_destroy(ptr)\n");
             out.push_str("declare i32 @ifa_rt_channel_send(ptr, ptr)\n");
@@ -125,6 +134,15 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare ptr @ifa_rt_gen_alloc(i64, i64, i16)\n");
             out.push_str("declare void @ifa_rt_gen_free(ptr)\n");
             out.push_str("declare void @ifa_rt_fiber_yield()\n");
+            out.push_str("declare i64 @ifa_rt_fiber_spawn(ptr, ptr)\n");
+            out.push_str("declare void @ifa_rt_fiber_join(i64)\n");
+            out.push_str("declare ptr @ifa_rt_coro_create(i64, ptr, ptr)\n");
+            out.push_str("declare i32 @ifa_rt_coro_resume(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_coro_spawn(ptr)\n");
+            out.push_str("declare void @ifa_rt_coro_destroy(ptr)\n");
+            out.push_str("declare i32 @ifa_rt_coro_status(ptr)\n");
+            out.push_str("declare i32 @ifa_rt_coro_is_done(ptr)\n");
+            out.push_str("declare ptr @ifa_rt_coro_frame(ptr)\n");
             out.push_str("declare ptr @ifa_rt_channel_create(i64)\n");
             out.push_str("declare void @ifa_rt_channel_destroy(ptr)\n");
             out.push_str("declare i32 @ifa_rt_channel_send(ptr, ptr)\n");
@@ -133,6 +151,32 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_channel_select(ptr, i64, i32)\n");
             out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n\n");
         }
+
+        // LLVM Standard Coroutine Intrinsics
+        out.push_str("; LLVM Standard Coroutine Intrinsics\n");
+        out.push_str("declare token @llvm.coro.id(i32, ptr, ptr, ptr)\n");
+        out.push_str("declare i64 @llvm.coro.size.i64()\n");
+        out.push_str("declare ptr @llvm.coro.begin(token, ptr)\n");
+        out.push_str("declare i8 @llvm.coro.suspend(token, i1)\n");
+        out.push_str("declare i1 @llvm.coro.end(ptr, i1, token)\n");
+        out.push_str("declare void @llvm.coro.resume(ptr)\n");
+        out.push_str("declare void @llvm.coro.destroy(ptr)\n");
+        out.push_str("declare i1 @llvm.coro.done(ptr)\n\n");
+
+        // IFA Stackless Fiber Continuous Execution Helpers
+        out.push_str("; IFA Stackless Fiber Continuous Execution Helpers\n");
+        out.push_str(
+            "define linkonce_odr void @ifa_coro_run_continuous(ptr %coro) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  br label %step_loop\n");
+        out.push_str("step_loop:\n  %status = call i32 @ifa_rt_coro_resume(ptr %coro)\n  %is_done = icmp eq i32 %status, 1\n  br i1 %is_done, label %done, label %suspend_step\n");
+        out.push_str("suspend_step:\n  call void @ifa_rt_fiber_yield()\n  br label %step_loop\n");
+        out.push_str("done:\n  call void @ifa_rt_coro_destroy(ptr %coro)\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr i32 @ifa_coro_poll(ptr %coro) alwaysinline {\n");
+        out.push_str(
+            "entry:\n  %res = call i32 @ifa_rt_coro_resume(ptr %coro)\n  ret i32 %res\n}\n\n",
+        );
 
         // SIMD Vector Reduction Intrinsics
         out.push_str("; LLVM Vector Reduction Intrinsics\n");
@@ -897,6 +941,45 @@ impl<'a> LlvmIrEmitter<'a> {
                     if *has_default { 1 } else { 0 }
                 ));
             }
+            ValueExpr::Spawn { target, args } => {
+                let callee = INTERNER.resolve(target);
+                if args.is_empty() {
+                    out.push_str(&format!(
+                        "  %v{} = call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr null)\n",
+                        res_id, callee
+                    ));
+                } else if args.len() == 1 {
+                    let arg = args[0];
+                    out.push_str(&format!(
+                        "  %spawn_arg_ptr_{} = inttoptr i64 %v{} to ptr\n",
+                        res_id, arg.0
+                    ));
+                    out.push_str(&format!(
+                        "  %v{} = call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr %spawn_arg_ptr_{})\n",
+                        res_id, callee, res_id
+                    ));
+                } else {
+                    let buf_size = args.len() * 8;
+                    out.push_str(&format!(
+                        "  %spawn_arg_buf_{} = call ptr @ifa_rt_gen_alloc(i64 {}, i64 8, i16 0)\n",
+                        res_id, buf_size
+                    ));
+                    for (i, arg) in args.iter().enumerate() {
+                        out.push_str(&format!(
+                            "  %spawn_slot_{}_{} = getelementptr inbounds i64, ptr %spawn_arg_buf_{}, i32 {}\n",
+                            res_id, i, res_id, i
+                        ));
+                        out.push_str(&format!(
+                            "  store i64 %v{}, ptr %spawn_slot_{}_{}, align 8\n",
+                            arg.0, res_id, i
+                        ));
+                    }
+                    out.push_str(&format!(
+                        "  %v{} = call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr %spawn_arg_buf_{})\n",
+                        res_id, callee, res_id
+                    ));
+                }
+            }
             _ => {
                 // Default fallback for intermediate structures
                 out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
@@ -1052,6 +1135,46 @@ impl<'a> LlvmIrEmitter<'a> {
                     "  store i64 %v{}, ptr %gep_set_{}\n",
                     val.0, val.0
                 ));
+            }
+            ValueExpr::Spawn { target, args } => {
+                let callee = INTERNER.resolve(target);
+                if args.is_empty() {
+                    out.push_str(&format!(
+                        "  call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr null)\n",
+                        callee
+                    ));
+                } else if args.len() == 1 {
+                    let arg = args[0];
+                    out.push_str(&format!(
+                        "  %spawn_arg_ptr_{} = inttoptr i64 %v{} to ptr\n",
+                        arg.0, arg.0
+                    ));
+                    out.push_str(&format!(
+                        "  call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr %spawn_arg_ptr_{})\n",
+                        callee, arg.0
+                    ));
+                } else {
+                    let buf_size = args.len() * 8;
+                    let first_arg = args[0].0;
+                    out.push_str(&format!(
+                        "  %spawn_arg_buf_{} = call ptr @ifa_rt_gen_alloc(i64 {}, i64 8, i16 0)\n",
+                        first_arg, buf_size
+                    ));
+                    for (i, arg) in args.iter().enumerate() {
+                        out.push_str(&format!(
+                            "  %spawn_slot_{}_{} = getelementptr inbounds i64, ptr %spawn_arg_buf_{}, i32 {}\n",
+                            first_arg, i, first_arg, i
+                        ));
+                        out.push_str(&format!(
+                            "  store i64 %v{}, ptr %spawn_slot_{}_{}, align 8\n",
+                            arg.0, first_arg, i
+                        ));
+                    }
+                    out.push_str(&format!(
+                        "  call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr %spawn_arg_buf_{})\n",
+                        callee, first_arg
+                    ));
+                }
             }
             _ => {}
         }

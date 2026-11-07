@@ -22,11 +22,118 @@ pub enum FiberState {
     Completed,
 }
 
+/// Execution outcome of resuming a stackless fiber / coroutine.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoroStatus {
+    /// Coroutine yielded/suspended execution and can be resumed later.
+    Suspended = 0,
+    /// Coroutine completed execution normally.
+    Completed = 1,
+    /// Coroutine terminated due to an error or panic.
+    Panicked = 2,
+}
+
+/// Function signature for resuming a stackless native coroutine.
+/// Receives the coroutine state frame pointer, returns CoroStatus as i32.
+pub type CoroResumeFn = extern "C" fn(frame: *mut u8) -> i32;
+
+/// Function signature for destroying a stackless native coroutine frame.
+pub type CoroDestroyFn = extern "C" fn(frame: *mut u8);
+
+/// A stackless native coroutine context without system call stacks.
+pub struct StacklessCoro {
+    pub frame: *mut u8,
+    pub resume_fn: CoroResumeFn,
+    pub destroy_fn: Option<CoroDestroyFn>,
+    pub status: CoroStatus,
+}
+
+unsafe impl Send for StacklessCoro {}
+unsafe impl Sync for StacklessCoro {}
+
+impl Drop for StacklessCoro {
+    fn drop(&mut self) {
+        if let Some(destroy) = self.destroy_fn {
+            if !self.frame.is_null() {
+                destroy(self.frame);
+                self.frame = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+/// Dynamic task carried by an IFA fiber.
+pub enum FiberTask {
+    /// One-off closure running to completion.
+    Once(Box<dyn FnOnce() + Send + 'static>),
+    /// Resumable closure called repeatedly across scheduler cycles until completion.
+    Resumable(Box<dyn FnMut() -> CoroStatus + Send + 'static>),
+    /// Stackless native C-ABI coroutine frame.
+    Stackless(StacklessCoro),
+}
+
+/// Result of executing a single step of a fiber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FiberStepResult {
+    Completed,
+    Suspended,
+}
+
 /// A lightweight unit of execution running cooperatively or on worker pools.
 pub struct Fiber {
     pub id: FiberId,
     pub state: FiberState,
-    task: Option<Box<dyn FnOnce() + Send + 'static>>,
+    pub task: Option<FiberTask>,
+}
+
+impl Fiber {
+    /// Execute one step of the fiber.
+    pub fn step(&mut self) -> FiberStepResult {
+        match &mut self.task {
+            Some(FiberTask::Once(_)) => {
+                let task = self.task.take().unwrap();
+                if let FiberTask::Once(exec) = task {
+                    self.state = FiberState::Running;
+                    exec();
+                    self.state = FiberState::Completed;
+                }
+                FiberStepResult::Completed
+            }
+            Some(FiberTask::Resumable(closure)) => {
+                self.state = FiberState::Running;
+                let status = closure();
+                if status == CoroStatus::Completed {
+                    self.state = FiberState::Completed;
+                    FiberStepResult::Completed
+                } else if status == CoroStatus::Suspended {
+                    self.state = FiberState::Suspended;
+                    FiberStepResult::Suspended
+                } else {
+                    self.state = FiberState::Completed;
+                    FiberStepResult::Completed
+                }
+            }
+            Some(FiberTask::Stackless(coro)) => {
+                self.state = FiberState::Running;
+                let res = (coro.resume_fn)(coro.frame);
+                if res == CoroStatus::Completed as i32 {
+                    coro.status = CoroStatus::Completed;
+                    self.state = FiberState::Completed;
+                    FiberStepResult::Completed
+                } else if res == CoroStatus::Suspended as i32 {
+                    coro.status = CoroStatus::Suspended;
+                    self.state = FiberState::Suspended;
+                    FiberStepResult::Suspended
+                } else {
+                    coro.status = CoroStatus::Panicked;
+                    self.state = FiberState::Completed;
+                    FiberStepResult::Completed
+                }
+            }
+            None => FiberStepResult::Completed,
+        }
+    }
 }
 
 /// Global M:N Fiber Scheduler managing colorless asynchronous tasks without GC.
@@ -83,14 +190,19 @@ impl FiberScheduler {
                     };
 
                     if let Some(mut fiber) = task {
-                        if let Some(exec) = fiber.task.take() {
-                            fiber.state = FiberState::Running;
-                            exec();
-                            fiber.state = FiberState::Completed;
-
-                            let mut comp = completed.lock().unwrap();
-                            comp.insert(fiber.id, FiberState::Completed);
-                            notif.notify_all();
+                        let step_res = fiber.step();
+                        match step_res {
+                            FiberStepResult::Completed => {
+                                let mut comp = completed.lock().unwrap();
+                                comp.insert(fiber.id, FiberState::Completed);
+                                notif.notify_all();
+                            }
+                            FiberStepResult::Suspended => {
+                                let mut q = queue.lock().unwrap();
+                                fiber.state = FiberState::Ready;
+                                q.push_back(fiber);
+                                notif.notify_one();
+                            }
                         }
                     }
                 });
@@ -119,7 +231,46 @@ impl FiberScheduler {
         let fiber = Fiber {
             id,
             state: FiberState::Ready,
-            task: Some(Box::new(task)),
+            task: Some(FiberTask::Once(Box::new(task))),
+        };
+
+        {
+            let mut queue = self.ready_queue.lock().unwrap();
+            queue.push_back(fiber);
+        }
+        self.notifier.notify_one();
+
+        id
+    }
+
+    /// Spawn a new resumable task called repeatedly across scheduler cycles until completion.
+    pub fn spawn_resumable<F>(&self, task: F) -> FiberId
+    where
+        F: FnMut() -> CoroStatus + Send + 'static,
+    {
+        let id = self.next_fiber_id.fetch_add(1, Ordering::SeqCst);
+        let fiber = Fiber {
+            id,
+            state: FiberState::Ready,
+            task: Some(FiberTask::Resumable(Box::new(task))),
+        };
+
+        {
+            let mut queue = self.ready_queue.lock().unwrap();
+            queue.push_back(fiber);
+        }
+        self.notifier.notify_one();
+
+        id
+    }
+
+    /// Spawn a native stackless coroutine without system call stacks.
+    pub fn spawn_coro(&self, coro: StacklessCoro) -> FiberId {
+        let id = self.next_fiber_id.fetch_add(1, Ordering::SeqCst);
+        let fiber = Fiber {
+            id,
+            state: FiberState::Ready,
+            task: Some(FiberTask::Stackless(coro)),
         };
 
         {
@@ -148,15 +299,21 @@ impl FiberScheduler {
         };
 
         if let Some(mut fiber) = task {
-            if let Some(exec) = fiber.task.take() {
-                fiber.state = FiberState::Running;
-                exec();
-                fiber.state = FiberState::Completed;
-
-                let mut comp = self.completed_fibers.lock().unwrap();
-                comp.insert(fiber.id, FiberState::Completed);
-                self.notifier.notify_all();
-                return true;
+            let step_res = fiber.step();
+            match step_res {
+                FiberStepResult::Completed => {
+                    let mut comp = self.completed_fibers.lock().unwrap();
+                    comp.insert(fiber.id, FiberState::Completed);
+                    self.notifier.notify_all();
+                    return true;
+                }
+                FiberStepResult::Suspended => {
+                    let mut queue = self.ready_queue.lock().unwrap();
+                    fiber.state = FiberState::Ready;
+                    queue.push_back(fiber);
+                    self.notifier.notify_one();
+                    return true;
+                }
             }
         }
         false
