@@ -13,6 +13,57 @@ use ifa_diagnostics::Diagnostic;
 use ifa_span::{SourceMap, Span, Symbol, INTERNER};
 use std::collections::HashMap;
 
+/// Control-flow sensitive type narrowing facts deduced from conditional expressions.
+#[derive(Debug, Clone, Default)]
+pub struct NarrowingFacts {
+    pub true_facts: Vec<(Symbol, Type)>,
+    pub false_facts: Vec<(Symbol, Type)>,
+}
+
+fn is_null_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Lit(Lit::Null) => true,
+        ExprKind::Ident(sym) => {
+            let name = INTERNER.resolve(sym);
+            name == "null" || name == "None"
+        }
+        _ => false,
+    }
+}
+
+fn extract_var_ident(expr: &Expr) -> Option<Symbol> {
+    match &expr.kind {
+        ExprKind::Ident(sym) => {
+            let name = INTERNER.resolve(sym);
+            if name == "null" || name == "None" || name == "true" || name == "false" {
+                None
+            } else {
+                Some(*sym)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn block_always_terminates(block: &Block) -> bool {
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::Return(..) | Stmt::Fail(..) | Stmt::Break(..) | Stmt::Continue(..) => {
+                return true
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn expr_always_terminates(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Block(b) => block_always_terminates(b),
+        _ => false,
+    }
+}
+
 pub struct SemanticAnalyzer<'a> {
     pub source_map: &'a SourceMap,
     pub symbols: SymbolTable,
@@ -600,15 +651,153 @@ impl<'a> SemanticAnalyzer<'a> {
         self.current_func_generics = prev_generics;
     }
 
+    fn extract_narrowing_facts(&self, expr: &Expr) -> NarrowingFacts {
+        match &expr.kind {
+            ExprKind::Binary { op, left, right } => match op {
+                BinOp::NotEq => {
+                    let mut facts = NarrowingFacts::default();
+                    if is_null_expr(right) {
+                        if let Some(var_sym) = extract_var_ident(left) {
+                            if let Some(var) = self.symbols.lookup_variable(&var_sym) {
+                                if let Type::Optional(inner) = &var.ty {
+                                    facts.true_facts.push((var_sym, *inner.clone()));
+                                }
+                            }
+                        }
+                    } else if is_null_expr(left) {
+                        if let Some(var_sym) = extract_var_ident(right) {
+                            if let Some(var) = self.symbols.lookup_variable(&var_sym) {
+                                if let Type::Optional(inner) = &var.ty {
+                                    facts.true_facts.push((var_sym, *inner.clone()));
+                                }
+                            }
+                        }
+                    }
+                    facts
+                }
+                BinOp::Eq => {
+                    let mut facts = NarrowingFacts::default();
+                    if is_null_expr(right) {
+                        if let Some(var_sym) = extract_var_ident(left) {
+                            if let Some(var) = self.symbols.lookup_variable(&var_sym) {
+                                if let Type::Optional(inner) = &var.ty {
+                                    facts.false_facts.push((var_sym, *inner.clone()));
+                                }
+                            }
+                        }
+                    } else if is_null_expr(left) {
+                        if let Some(var_sym) = extract_var_ident(right) {
+                            if let Some(var) = self.symbols.lookup_variable(&var_sym) {
+                                if let Type::Optional(inner) = &var.ty {
+                                    facts.false_facts.push((var_sym, *inner.clone()));
+                                }
+                            }
+                        }
+                    }
+                    facts
+                }
+                BinOp::And => {
+                    let left_facts = self.extract_narrowing_facts(left);
+                    let right_facts = self.extract_narrowing_facts(right);
+                    let mut true_facts = left_facts.true_facts;
+                    for (sym, ty) in right_facts.true_facts {
+                        if !true_facts.iter().any(|(s, _)| s == &sym) {
+                            true_facts.push((sym, ty));
+                        }
+                    }
+                    let mut false_facts = Vec::new();
+                    for (sym_a, ty_a) in &left_facts.false_facts {
+                        if right_facts
+                            .false_facts
+                            .iter()
+                            .any(|(sym_b, _)| sym_b == sym_a)
+                        {
+                            false_facts.push((*sym_a, ty_a.clone()));
+                        }
+                    }
+                    NarrowingFacts {
+                        true_facts,
+                        false_facts,
+                    }
+                }
+                BinOp::Or => {
+                    let left_facts = self.extract_narrowing_facts(left);
+                    let right_facts = self.extract_narrowing_facts(right);
+                    let mut false_facts = left_facts.false_facts;
+                    for (sym, ty) in right_facts.false_facts {
+                        if !false_facts.iter().any(|(s, _)| s == &sym) {
+                            false_facts.push((sym, ty));
+                        }
+                    }
+                    let mut true_facts = Vec::new();
+                    for (sym_a, ty_a) in &left_facts.true_facts {
+                        if right_facts
+                            .true_facts
+                            .iter()
+                            .any(|(sym_b, _)| sym_b == sym_a)
+                        {
+                            true_facts.push((*sym_a, ty_a.clone()));
+                        }
+                    }
+                    NarrowingFacts {
+                        true_facts,
+                        false_facts,
+                    }
+                }
+                _ => NarrowingFacts::default(),
+            },
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                expr: inner,
+            } => {
+                let inner_facts = self.extract_narrowing_facts(inner);
+                NarrowingFacts {
+                    true_facts: inner_facts.false_facts,
+                    false_facts: inner_facts.true_facts,
+                }
+            }
+            _ => NarrowingFacts::default(),
+        }
+    }
+
     fn check_block(&mut self, block: &Block, expected_ret: Option<&Type>) -> Type {
         for stmt in &block.stmts {
             self.check_stmt(stmt);
+
+            // Flow-sensitive early return guards:
+            // if cond { return / fail / break / continue; }
+            if let Stmt::Expr(expr) = stmt {
+                if let ExprKind::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                } = &expr.kind
+                {
+                    if else_branch.is_none() && block_always_terminates(then_branch) {
+                        let facts = self.extract_narrowing_facts(cond);
+                        for (sym, ty) in facts.false_facts {
+                            self.symbols.narrow_variable_in_current_scope(sym, ty);
+                        }
+                    } else if let Some(el) = else_branch {
+                        if expr_always_terminates(el) && !block_always_terminates(then_branch) {
+                            let facts = self.extract_narrowing_facts(cond);
+                            for (sym, ty) in facts.true_facts {
+                                self.symbols.narrow_variable_in_current_scope(sym, ty);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if let Some(expr) = &block.expr {
             let actual = self.check_expr(expr, expected_ret);
             if let Some(expected) = expected_ret {
-                if !expected.is_unit() && !actual.is_assignable_to(expected) {
+                if !expected.is_unit()
+                    && !expected.is_never()
+                    && !actual.is_never()
+                    && !actual.is_assignable_to(expected)
+                {
                     self.diagnostics.push(
                         Diagnostic::error(format!(
                             "type de retour incompatible : attendu {}, trouvé {}",
@@ -621,6 +810,8 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
             }
             actual
+        } else if block_always_terminates(block) {
+            Type::Never
         } else {
             Type::Unit
         }
@@ -712,7 +903,14 @@ impl<'a> SemanticAnalyzer<'a> {
                     }
                 }
 
-                let target_ty = self.infer_expr(target);
+                let declared_target_ty = if let ExprKind::Ident(target_sym) = &target.kind {
+                    self.symbols
+                        .lookup_variable(target_sym)
+                        .map(|v| v.original_ty.as_ref().unwrap_or(&v.ty).clone())
+                } else {
+                    None
+                };
+                let target_ty = declared_target_ty.unwrap_or_else(|| self.infer_expr(target));
                 let val_ty = self.check_expr(val, Some(&target_ty));
 
                 if !val_ty.is_assignable_to(&target_ty) {
@@ -725,6 +923,14 @@ impl<'a> SemanticAnalyzer<'a> {
                         .with_primary_label(val.span, format!("valeur de type {}", val_ty))
                         .with_secondary_label(target.span, format!("cible de type {}", target_ty)),
                     );
+                } else if let ExprKind::Ident(target_sym) = &target.kind {
+                    if matches!(val_ty, Type::Optional(_)) || is_null_expr(val) {
+                        if let Some(var) = self.symbols.lookup_variable_mut(target_sym) {
+                            if let Some(orig) = var.original_ty.clone() {
+                                var.ty = orig;
+                            }
+                        }
+                    }
                 }
             }
             Stmt::Expr(expr) => {
@@ -810,7 +1016,12 @@ impl<'a> SemanticAnalyzer<'a> {
                         .with_primary_label(cond.span, "condition non booléenne"),
                     );
                 }
+                let facts = self.extract_narrowing_facts(cond);
                 self.symbols.enter_scope(true, false);
+                for (sym, ty) in &facts.true_facts {
+                    self.symbols
+                        .narrow_variable_in_current_scope(*sym, ty.clone());
+                }
                 self.check_block(body, None);
                 self.symbols.exit_scope();
             }
@@ -1276,12 +1487,30 @@ impl<'a> SemanticAnalyzer<'a> {
                         .with_primary_label(cond.span, "condition non booléenne"),
                     );
                 }
+                let facts = self.extract_narrowing_facts(cond);
+
                 self.symbols.enter_scope(false, false);
+                for (sym, ty) in &facts.true_facts {
+                    self.symbols
+                        .narrow_variable_in_current_scope(*sym, ty.clone());
+                }
                 let then_ty = self.check_block(then_branch, expected);
                 self.symbols.exit_scope();
 
                 if let Some(el) = else_branch {
-                    let else_ty = self.check_expr(el, Some(&then_ty));
+                    self.symbols.enter_scope(false, false);
+                    for (sym, ty) in &facts.false_facts {
+                        self.symbols
+                            .narrow_variable_in_current_scope(*sym, ty.clone());
+                    }
+                    let expected_else = if then_ty.is_never() {
+                        expected
+                    } else {
+                        expected.or(Some(&then_ty))
+                    };
+                    let else_ty = self.check_expr(el, expected_else);
+                    self.symbols.exit_scope();
+
                     if !then_ty.is_never()
                         && !else_ty.is_never()
                         && !else_ty.is_assignable_to(&then_ty)
@@ -1296,7 +1525,11 @@ impl<'a> SemanticAnalyzer<'a> {
                             .with_secondary_label(then_branch.span, format!("branche 'then' de type {}", then_ty)),
                         );
                     }
-                    then_ty
+                    if then_ty.is_never() {
+                        else_ty
+                    } else {
+                        then_ty
+                    }
                 } else {
                     Type::Unit
                 }
@@ -1772,9 +2005,28 @@ impl<'a> SemanticAnalyzer<'a> {
                 let _ = self.check_expr(right, Some(&l_ty));
                 Type::Bool
             }
-            BinOp::And | BinOp::Or => {
+            BinOp::And => {
                 self.check_expr(left, Some(&Type::Bool));
+                let left_facts = self.extract_narrowing_facts(left);
+                self.symbols.enter_scope(false, false);
+                for (sym, ty) in &left_facts.true_facts {
+                    self.symbols
+                        .narrow_variable_in_current_scope(*sym, ty.clone());
+                }
                 self.check_expr(right, Some(&Type::Bool));
+                self.symbols.exit_scope();
+                Type::Bool
+            }
+            BinOp::Or => {
+                self.check_expr(left, Some(&Type::Bool));
+                let left_facts = self.extract_narrowing_facts(left);
+                self.symbols.enter_scope(false, false);
+                for (sym, ty) in &left_facts.false_facts {
+                    self.symbols
+                        .narrow_variable_in_current_scope(*sym, ty.clone());
+                }
+                self.check_expr(right, Some(&Type::Bool));
+                self.symbols.exit_scope();
                 Type::Bool
             }
             BinOp::Coalesce => {

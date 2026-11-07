@@ -1113,3 +1113,196 @@ fn test_module_private_member_access_rejected() {
         diagnostics
     );
 }
+
+#[test]
+fn test_flow_sensitive_narrowing_if_not_null() {
+    let code = r#"
+        struct Node {
+            val: i64,
+        }
+
+        pub fn main() {
+            let opt_node: ?ref Node = null;
+            if opt_node != null {
+                let v: i64 = opt_node.val;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Direct member access inside 'if x != null' should succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_flow_sensitive_narrowing_outside_scope_fails() {
+    let code = r#"
+        struct Node {
+            val: i64,
+        }
+
+        pub fn main() {
+            let opt_node: ?ref Node = null;
+            if opt_node != null {
+                let v: i64 = opt_node.val;
+            }
+            let v_after: i64 = opt_node.val;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Direct member access outside guarded scope must fail"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0007")),
+        "Expected E0007 on unguarded access after 'if'"
+    );
+}
+
+#[test]
+fn test_flow_sensitive_narrowing_if_else() {
+    let code = r#"
+        struct Node {
+            val: i64,
+        }
+
+        pub fn main() {
+            let opt_node: ?ref Node = null;
+            if opt_node == null {
+                let fallback = 0;
+            } else {
+                let v: i64 = opt_node.val;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Direct member access inside 'else' of 'if x == null' should succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_flow_sensitive_narrowing_early_return() {
+    let code = r#"
+        struct Node {
+            val: i64,
+        }
+
+        pub fn get_value(opt_node: ?ref Node) -> i64 {
+            if opt_node == null {
+                return 0;
+            }
+            let v: i64 = opt_node.val;
+            return v;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Direct member access following early return guard should succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_flow_sensitive_narrowing_while() {
+    let code = r#"
+        struct Node {
+            val: i64,
+        }
+
+        pub fn main() {
+            mut opt_node: ?ref Node = null;
+            while opt_node != null {
+                let v: i64 = opt_node.val;
+                opt_node = null;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Direct member access inside 'while x != null' should succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_flow_sensitive_narrowing_short_circuit_and() {
+    let code = r#"
+        struct Node {
+            val: i64,
+        }
+
+        pub fn main() {
+            let opt_node: ?ref Node = null;
+            if opt_node != null && opt_node.val > 0 {
+                let v: i64 = opt_node.val;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Short-circuit 'x != null && x.val > 0' should narrow in right operand and then-branch: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_flow_sensitive_narrowing_not_equal_null() {
+    let code = r#"
+        struct Node {
+            val: i64,
+        }
+
+        pub fn main() {
+            let opt_node: ?ref Node = null;
+            if !(opt_node == null) {
+                let v: i64 = opt_node.val;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Inverted condition '!(x == null)' should narrow in then-branch: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_flow_sensitive_narrowing_reassigned_null_invalidated() {
+    let code = r#"
+        struct Node {
+            val: i64,
+        }
+
+        pub fn main() {
+            mut opt_node: ?ref Node = null;
+            if opt_node != null {
+                let v1: i64 = opt_node.val;
+                opt_node = null;
+                let v2: i64 = opt_node.val;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Direct member access after reassigning null inside guarded scope must fail"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0007")),
+        "Expected E0007 on access after reassigning null"
+    );
+}

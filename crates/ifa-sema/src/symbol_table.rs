@@ -9,6 +9,7 @@ pub struct VariableSymbol {
     pub id: u32,
     pub name: Symbol,
     pub ty: Type,
+    pub original_ty: Option<Type>,
     pub is_mut: bool,
     pub is_initialized: bool,
     pub mode: Option<ParamMode>,
@@ -971,6 +972,7 @@ impl SymbolTable {
             id,
             name,
             ty,
+            original_ty: None,
             is_mut,
             is_initialized,
             mode,
@@ -980,6 +982,29 @@ impl SymbolTable {
 
         current_scope.variables.insert(name, var_sym);
         Ok(id)
+    }
+
+    /// Injects a type-narrowed version of an existing variable into the current scope.
+    ///
+    /// Preserves the variable ID, mutability, initialization status, and declaration span,
+    /// but updates the static type for the duration of this guarded scope.
+    pub fn narrow_variable_in_current_scope(&mut self, name: Symbol, narrowed_ty: Type) {
+        if let Some(existing) = self.lookup_variable(&name).cloned() {
+            let current_depth = self.current_depth();
+            let current_scope = self
+                .scopes
+                .last_mut()
+                .expect("At least one scope must exist");
+            let orig = existing
+                .original_ty
+                .clone()
+                .unwrap_or_else(|| existing.ty.clone());
+            let mut narrowed = existing;
+            narrowed.original_ty = Some(orig);
+            narrowed.ty = narrowed_ty;
+            narrowed.scope_depth = current_depth;
+            current_scope.variables.insert(name, narrowed);
+        }
     }
 
     pub fn lookup_variable(&self, name: &Symbol) -> Option<&VariableSymbol> {

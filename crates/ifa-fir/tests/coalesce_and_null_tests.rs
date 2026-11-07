@@ -287,3 +287,63 @@ fn test_constant_folding_and_dead_branch_elimination() {
     let res = interp.execute_function("main", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(111));
 }
+
+#[test]
+fn test_flow_sensitive_narrowing_fir_execution() {
+    let src = r#"
+        struct User {
+            id: i64,
+            score: i64,
+        }
+
+        fn check_user(u: ?ref User) -> i64 {
+            if u != null {
+                return u.score + 10;
+            }
+            return 0;
+        }
+
+        fn check_user_else(u: ?ref User) -> i64 {
+            if u == null {
+                return 0;
+            } else {
+                return u.score + 20;
+            }
+        }
+
+        fn check_user_early_ret(u: ?ref User) -> i64 {
+            if u == null {
+                return 0;
+            }
+            let s = u.score;
+            return s + 30;
+        }
+
+        fn main() -> i64 {
+            let user = User(id: 1, score: 90);
+            let r1 = check_user(ref user);
+            let r2 = check_user(null);
+            let r3 = check_user_else(ref user);
+            let r4 = check_user_early_ret(ref user);
+            return r1 + r2 + r3 + r4;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("narrowing_fir.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(330));
+}
