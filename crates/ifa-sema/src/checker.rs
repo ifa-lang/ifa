@@ -52,7 +52,7 @@ fn is_null_expr(expr: &Expr) -> bool {
         ExprKind::Lit(Lit::Null) => true,
         ExprKind::Ident(sym) => {
             let name = INTERNER.resolve(sym);
-            name == "null" || name == "None"
+            name == "null" || name == "None" || name == "nil"
         }
         _ => false,
     }
@@ -62,7 +62,12 @@ fn extract_var_ident(expr: &Expr) -> Option<Symbol> {
     match &expr.kind {
         ExprKind::Ident(sym) => {
             let name = INTERNER.resolve(sym);
-            if name == "null" || name == "None" || name == "true" || name == "false" {
+            if name == "null"
+                || name == "None"
+                || name == "nil"
+                || name == "true"
+                || name == "false"
+            {
                 None
             } else {
                 Some(*sym)
@@ -1332,6 +1337,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 let elem_ty = match &iter_ty {
                     Type::Array(elem, _) => *elem.clone(),
                     Type::Slice(elem) => *elem.clone(),
+                    Type::Range { elem, .. } => *elem.clone(),
                     Type::Generic { name, args }
                         if INTERNER.resolve(name) == "List" && !args.is_empty() =>
                     {
@@ -1427,7 +1433,7 @@ impl<'a> SemanticAnalyzer<'a> {
             },
             ExprKind::Ident(sym) => {
                 let name = INTERNER.resolve(sym);
-                if name == "None" || name == "null" {
+                if name == "None" || name == "null" || name == "nil" {
                     if let Some(Type::Optional(inner)) = expected {
                         Type::Optional(inner.clone())
                     } else if let Some(Type::Ref(inner)) = expected {
@@ -1708,32 +1714,62 @@ impl<'a> SemanticAnalyzer<'a> {
             }
             ExprKind::Index { receiver, index } => {
                 let rec_ty = self.infer_expr(receiver);
-                let idx_ty = self.check_expr(index, Some(&Type::Int(IntType::USize)));
-                if !idx_ty.is_integer() {
-                    self.diagnostics.push(
-                        Diagnostic::error(format!(
-                            "l'index doit être un entier, mais trouvé {}",
-                            idx_ty
-                        ))
-                        .with_code("E0001")
-                        .with_primary_label(index.span, "index non entier"),
-                    );
-                }
-                match &rec_ty {
-                    Type::Array(elem, _) => *elem.clone(),
-                    Type::Slice(elem) => *elem.clone(),
-                    Type::Generic { name, args }
-                        if INTERNER.resolve(name) == "List" && !args.is_empty() =>
-                    {
-                        args[0].clone()
-                    }
-                    _ => {
+                let idx_ty = self.infer_expr(index);
+                if let Type::Range { elem, .. } = &idx_ty {
+                    if !elem.is_integer() {
                         self.diagnostics.push(
-                            Diagnostic::error(format!("le type '{}' n'est pas indexable", rec_ty))
+                            Diagnostic::error(format!(
+                                "les bornes d'indexation par intervalle doivent être des entiers, mais trouvé {}",
+                                elem
+                            ))
+                            .with_code("E0001")
+                            .with_primary_label(index.span, "intervalle non entier"),
+                        );
+                    }
+                    match &rec_ty {
+                        Type::Array(elem, _) | Type::Slice(elem) => Type::Slice(elem.clone()),
+                        _ => {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "le sous-découpage par intervalle n'est supporté que sur les tableaux et les tranches, mais trouvé '{}'",
+                                    rec_ty
+                                ))
+                                .with_code("E0001")
+                                .with_primary_label(receiver.span, "expression non découpable"),
+                            );
+                            Type::Unknown
+                        }
+                    }
+                } else {
+                    if !idx_ty.is_integer() {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "l'index doit être un entier, mais trouvé {}",
+                                idx_ty
+                            ))
+                            .with_code("E0001")
+                            .with_primary_label(index.span, "index non entier"),
+                        );
+                    }
+                    match &rec_ty {
+                        Type::Array(elem, _) => *elem.clone(),
+                        Type::Slice(elem) => *elem.clone(),
+                        Type::Generic { name, args }
+                            if INTERNER.resolve(name) == "List" && !args.is_empty() =>
+                        {
+                            args[0].clone()
+                        }
+                        _ => {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "le type '{}' n'est pas indexable",
+                                    rec_ty
+                                ))
                                 .with_code("E0001")
                                 .with_primary_label(receiver.span, "expression non indexable"),
-                        );
-                        Type::Unknown
+                            );
+                            Type::Unknown
+                        }
                     }
                 }
             }
@@ -2250,6 +2286,89 @@ impl<'a> SemanticAnalyzer<'a> {
                     Type::Str
                 } else {
                     Type::String
+                }
+            }
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                let start_ty = start.as_ref().map(|s| self.infer_expr(s));
+                let end_ty = end.as_ref().map(|e| {
+                    if let Some(st) = &start_ty {
+                        self.check_expr(e, Some(st))
+                    } else {
+                        self.infer_expr(e)
+                    }
+                });
+
+                let elem_ty = match (start_ty, end_ty) {
+                    (Some(s), Some(e)) => {
+                        let eff_s = s.resolve_defaults();
+                        let eff_e = e.resolve_defaults();
+                        if eff_s.is_integer() && eff_e.is_integer() {
+                            if matches!(eff_s, Type::IntegerLiteral(_))
+                                && !matches!(eff_e, Type::IntegerLiteral(_))
+                            {
+                                eff_e
+                            } else {
+                                eff_s
+                            }
+                        } else {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "les bornes d'intervalle doivent être des entiers, mais trouvé '{}' et '{}'",
+                                    s, e
+                                ))
+                                .with_code("E0001")
+                                .with_primary_label(expr.span, "bornes non entières"),
+                            );
+                            Type::Int(IntType::I64)
+                        }
+                    }
+                    (Some(s), None) => {
+                        let s_res = s.resolve_defaults();
+                        if s_res.is_integer() {
+                            s_res
+                        } else {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "la borne inférieure de l'intervalle doit être un entier, mais trouvé '{}'",
+                                    s
+                                ))
+                                .with_code("E0001")
+                                .with_primary_label(expr.span, "borne non entière"),
+                            );
+                            Type::Int(IntType::I64)
+                        }
+                    }
+                    (None, Some(e)) => {
+                        let e_res = e.resolve_defaults();
+                        if e_res.is_integer() {
+                            e_res
+                        } else {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "la borne supérieure de l'intervalle doit être un entier, mais trouvé '{}'",
+                                    e
+                                ))
+                                .with_code("E0001")
+                                .with_primary_label(expr.span, "borne non entière"),
+                            );
+                            Type::Int(IntType::I64)
+                        }
+                    }
+                    (None, None) => Type::Int(IntType::USize),
+                };
+
+                let final_elem_ty = match elem_ty {
+                    Type::IntegerLiteral(_) => Type::Int(IntType::I64),
+                    other => other,
+                };
+
+                Type::Range {
+                    elem: Box::new(final_elem_ty),
+                    inclusive: *inclusive,
                 }
             }
             ExprKind::Match {
@@ -4738,6 +4857,14 @@ fn collect_captures_in_expr(
         ExprKind::InterpolatedString(parts) => {
             for part in parts {
                 collect_captures_in_expr(part, parent_depth, symbols, local_vars, seen, captured);
+            }
+        }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(s) = start {
+                collect_captures_in_expr(s, parent_depth, symbols, local_vars, seen, captured);
+            }
+            if let Some(e) = end {
+                collect_captures_in_expr(e, parent_depth, symbols, local_vars, seen, captured);
             }
         }
         ExprKind::Catch {

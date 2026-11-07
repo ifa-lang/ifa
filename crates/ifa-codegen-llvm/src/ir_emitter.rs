@@ -1668,6 +1668,14 @@ impl<'a> LlvmIrEmitter<'a> {
                     }
                 }
             }
+            ValueExpr::ArrayLen { array } => match value_types.get(array) {
+                Some(ifa_fir::FirType::Array(_, len)) => {
+                    out.push_str(&format!("  %v{} = add i64 {}, 0\n", res_id, len));
+                }
+                _ => {
+                    out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
+                }
+            },
             _ => {
                 // Default fallback for intermediate structures
                 out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));

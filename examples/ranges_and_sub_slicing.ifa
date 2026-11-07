@@ -1,0 +1,51 @@
+// Exemple idiomatique IFA : Intervalles numériques (Ranges) et sous-découpage de tranches (Sub-Slicing).
+// Démonstration des boucles de comptage directes sans allocation et de l'indexation de sous-tranches.
+
+struct BatchMetrics {
+    total_processed: i64,
+    total_amount: i64,
+    window_checksum: i64
+}
+
+pub fn main() -> i64 {
+    // 1. Boucle sur intervalle exclusif (0..10) : de 0 à 9 inclus
+    mut count_exclusive: i64 = 0;
+    for i in 0..10 {
+        count_exclusive = count_exclusive + i; // 0 + 1 + ... + 9 = 45
+    }
+
+    // 2. Boucle sur intervalle inclusif (1..=10) : de 1 à 10 inclus
+    mut count_inclusive: i64 = 0;
+    for i in 1..=10 {
+        count_inclusive = count_inclusive + i; // 1 + 2 + ... + 10 = 55
+    }
+
+    // 3. Découpage de tranches en mémoire contiguë
+    let ledger_entries: [i64; 8] = [100, 250, 400, 750, 900, 1200, 1500, 2000];
+
+    // Sous-tranche de la fenêtre active : index 2 à 5 (valeurs: 400, 750, 900)
+    let active_window = ledger_entries[2..5];
+    mut window_sum: i64 = 0;
+    for entry in active_window {
+        window_sum = window_sum + entry; // 400 + 750 + 900 = 2050
+    }
+
+    // Sous-tranche avec intervalle inclusif : index 0 à 2 inclus (valeurs: 100, 250, 400)
+    let initial_batch = ledger_entries[0..=2];
+    mut initial_sum: i64 = 0;
+    for entry in initial_batch {
+        initial_sum = initial_sum + entry; // 100 + 250 + 400 = 750
+    }
+
+    let metrics = BatchMetrics {
+        total_processed: count_exclusive + count_inclusive, // 45 + 55 = 100
+        total_amount: window_sum + initial_sum,              // 2050 + 750 = 2800
+        window_checksum: window_sum
+    };
+
+    if metrics.total_processed == 100 && metrics.window_checksum == 2050 {
+        return 0;
+    }
+
+    return 1;
+}

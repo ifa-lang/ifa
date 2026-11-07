@@ -76,6 +76,8 @@ struct FunctionLoweringContext<'a> {
     var_lambda_names: HashMap<Symbol, Symbol>,
     captures_to_unpack: Vec<(usize, Symbol, FirType)>,
     emitted_exprs: HashMap<ValueId, ValueExpr>,
+    slice_lens: HashMap<ValueId, ValueId>,
+    var_slice_lens: HashMap<Symbol, ValueId>,
 }
 
 impl<'a> FunctionLoweringContext<'a> {
@@ -180,6 +182,8 @@ impl<'a> FunctionLoweringContext<'a> {
             var_lambda_names: HashMap::new(),
             captures_to_unpack: Vec::new(),
             emitted_exprs: HashMap::new(),
+            slice_lens: HashMap::new(),
+            var_slice_lens: HashMap::new(),
         }
     }
 
@@ -233,6 +237,8 @@ impl<'a> FunctionLoweringContext<'a> {
             var_lambda_names: HashMap::new(),
             captures_to_unpack,
             emitted_exprs: HashMap::new(),
+            slice_lens: HashMap::new(),
+            var_slice_lens: HashMap::new(),
         }
     }
 
@@ -680,12 +686,39 @@ impl<'a> FunctionLoweringContext<'a> {
                 | BinOp::Or => Some(FirType::Bool),
                 _ => self.infer_expr_fir_type(left),
             },
-            ExprKind::Index { receiver, .. } => {
+            ExprKind::Index { receiver, index } => {
                 let rec_ty = self.infer_expr_fir_type(receiver)?;
-                match rec_ty {
-                    FirType::Array(elem, _) | FirType::Slice(elem) => Some(*elem),
-                    _ => None,
+                let idx_ty = self.infer_expr_fir_type(index);
+                if matches!(idx_ty, Some(FirType::Range { .. }))
+                    || matches!(index.kind, ExprKind::Range { .. })
+                {
+                    match rec_ty {
+                        FirType::Array(elem, _) | FirType::Slice(elem) => {
+                            Some(FirType::Slice(elem))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    match rec_ty {
+                        FirType::Array(elem, _) | FirType::Slice(elem) => Some(*elem),
+                        _ => None,
+                    }
                 }
+            }
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                let elem_ty = start
+                    .as_ref()
+                    .and_then(|s| self.infer_expr_fir_type(s))
+                    .or_else(|| end.as_ref().and_then(|e| self.infer_expr_fir_type(e)))
+                    .unwrap_or(FirType::Int(IntType::I64));
+                Some(FirType::Range {
+                    elem: Box::new(elem_ty),
+                    inclusive: *inclusive,
+                })
             }
             ExprKind::MethodCall {
                 receiver, method, ..
@@ -846,7 +879,8 @@ impl<'a> FunctionLoweringContext<'a> {
         match &expr.kind {
             ExprKind::Lit(Lit::Null) => true,
             ExprKind::Ident(sym) => {
-                INTERNER.resolve(sym) == "null" || self.known_null_vars.contains(sym)
+                let s = INTERNER.resolve(sym);
+                s == "null" || s == "nil" || s == "None" || self.known_null_vars.contains(sym)
             }
             _ => false,
         }
@@ -1145,6 +1179,9 @@ impl<'a> FunctionLoweringContext<'a> {
 
                         if let Some(val) = init_val {
                             self.emit(None, ValueExpr::Store { ptr, val }, *p_span);
+                            if let Some(&s_len) = self.slice_lens.get(&val) {
+                                self.var_slice_lens.insert(*name, s_len);
+                            }
                         }
 
                         if let Some(init_expr) = init {
@@ -1759,6 +1796,221 @@ impl<'a> FunctionLoweringContext<'a> {
                 body,
                 span,
             } => {
+                let iter_ty = self.infer_expr_fir_type(iterable);
+                let is_range = matches!(iterable.kind, ExprKind::Range { .. })
+                    || matches!(iter_ty, Some(FirType::Range { .. }));
+
+                if is_range {
+                    let (start_opt, end_opt, inclusive) = match &iterable.kind {
+                        ExprKind::Range {
+                            start,
+                            end,
+                            inclusive,
+                        } => (start.as_deref(), end.as_deref(), *inclusive),
+                        _ => (None, None, false),
+                    };
+
+                    let elem_ty = match &iter_ty {
+                        Some(FirType::Range { elem, .. }) => (**elem).clone(),
+                        _ => FirType::Int(IntType::I64),
+                    };
+
+                    let start_val = if let Some(s) = start_opt {
+                        self.lower_expr(s)
+                    } else {
+                        let zero = self.alloc_value();
+                        self.emit(
+                            Some(zero),
+                            ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                            *span,
+                        );
+                        zero
+                    };
+
+                    let end_val = if let Some(e) = end_opt {
+                        self.lower_expr(e)
+                    } else {
+                        let max_v = self.alloc_value();
+                        self.emit(
+                            Some(max_v),
+                            ValueExpr::Constant(ConstantValue::Int(i64::MAX as i128, IntType::I64)),
+                            *span,
+                        );
+                        max_v
+                    };
+
+                    let idx_ptr = self.alloc_value();
+                    self.emit(
+                        Some(idx_ptr),
+                        ValueExpr::Alloca {
+                            ty: elem_ty.clone(),
+                            name: Some(
+                                INTERNER.intern(&format!(
+                                    "__for_range_idx_{}",
+                                    self.func.next_value_id
+                                )),
+                            ),
+                        },
+                        *span,
+                    );
+                    self.emit(
+                        None,
+                        ValueExpr::Store {
+                            ptr: idx_ptr,
+                            val: start_val,
+                        },
+                        *span,
+                    );
+
+                    let simple_var_info = match pattern {
+                        Pattern::Ident(var, p_span)
+                        | Pattern::Binding {
+                            mode: BindingMode::Value | BindingMode::Mut,
+                            name: var,
+                            span: p_span,
+                        } => {
+                            let var_ptr = self.alloc_value();
+                            self.emit(
+                                Some(var_ptr),
+                                ValueExpr::Alloca {
+                                    ty: elem_ty.clone(),
+                                    name: Some(*var),
+                                },
+                                *p_span,
+                            );
+                            self.var_allocas.insert(*var, var_ptr);
+                            self.var_types.insert(*var, elem_ty.clone());
+                            Some((*p_span, var_ptr))
+                        }
+                        _ => None,
+                    };
+
+                    let cond_block = self.alloc_block();
+                    let body_block = self.alloc_block();
+                    let step_block = self.alloc_block();
+                    let exit_block = self.alloc_block();
+
+                    self.set_terminator(Terminator::Branch {
+                        target: cond_block,
+                        args: Vec::new(),
+                    });
+
+                    // Condition block
+                    self.current_block = cond_block;
+                    let cur_idx = self.alloc_value();
+                    self.emit(Some(cur_idx), ValueExpr::Load { ptr: idx_ptr }, *span);
+                    let cond_val = self.alloc_value();
+                    let comp_op = if inclusive {
+                        BinaryOp::Le
+                    } else {
+                        BinaryOp::Lt
+                    };
+                    self.emit(
+                        Some(cond_val),
+                        ValueExpr::Binary {
+                            op: comp_op,
+                            lhs: cur_idx,
+                            rhs: end_val,
+                        },
+                        *span,
+                    );
+                    self.set_terminator(Terminator::BranchCond {
+                        cond: cond_val,
+                        then_block: body_block,
+                        then_args: Vec::new(),
+                        else_block: exit_block,
+                        else_args: Vec::new(),
+                    });
+
+                    // Body block
+                    self.current_block = body_block;
+                    self.loop_stack.push(LoopContext {
+                        continue_block: step_block,
+                        break_block: exit_block,
+                    });
+
+                    let elem_val = cur_idx;
+                    if let Some((p_span, var_ptr)) = simple_var_info {
+                        self.emit(
+                            None,
+                            ValueExpr::Store {
+                                ptr: var_ptr,
+                                val: elem_val,
+                            },
+                            p_span,
+                        );
+                    } else if !matches!(pattern, Pattern::Wildcard(_)) {
+                        let match_body_block = self.alloc_block();
+                        let match_fail_block = step_block;
+
+                        self.lower_pattern_match(
+                            elem_val,
+                            &elem_ty,
+                            pattern,
+                            match_body_block,
+                            match_fail_block,
+                            *span,
+                        );
+
+                        self.current_block = match_body_block;
+                    }
+
+                    for s in &body.stmts {
+                        self.lower_stmt(s);
+                    }
+                    if let Some(trailing) = &body.expr {
+                        let _ = self.lower_expr(trailing);
+                    }
+
+                    if let Some(b) = self.func.get_block(self.current_block) {
+                        if !b.is_terminated() {
+                            self.set_terminator(Terminator::Branch {
+                                target: step_block,
+                                args: Vec::new(),
+                            });
+                        }
+                    }
+
+                    self.loop_stack.pop();
+
+                    // Step block
+                    self.current_block = step_block;
+                    let cur = self.alloc_value();
+                    self.emit(Some(cur), ValueExpr::Load { ptr: idx_ptr }, *span);
+                    let one_val = self.alloc_value();
+                    self.emit(
+                        Some(one_val),
+                        ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+                        *span,
+                    );
+                    let next_val = self.alloc_value();
+                    self.emit(
+                        Some(next_val),
+                        ValueExpr::Binary {
+                            op: BinaryOp::Add,
+                            lhs: cur,
+                            rhs: one_val,
+                        },
+                        *span,
+                    );
+                    self.emit(
+                        None,
+                        ValueExpr::Store {
+                            ptr: idx_ptr,
+                            val: next_val,
+                        },
+                        *span,
+                    );
+                    self.set_terminator(Terminator::Branch {
+                        target: cond_block,
+                        args: Vec::new(),
+                    });
+
+                    // Exit block
+                    self.current_block = exit_block;
+                    return;
+                }
+
                 let iter_val = self.lower_expr(iterable);
                 let iter_ty = self.infer_expr_fir_type(iterable);
 
@@ -1770,6 +2022,18 @@ impl<'a> FunctionLoweringContext<'a> {
                         *span,
                     );
                     lim
+                } else if let ExprKind::Ident(var_name) = &iterable.kind {
+                    if let Some(&var_len) = self.var_slice_lens.get(var_name) {
+                        var_len
+                    } else if let Some(&s_len) = self.slice_lens.get(&iter_val) {
+                        s_len
+                    } else {
+                        let lim = self.alloc_value();
+                        self.emit(Some(lim), ValueExpr::ArrayLen { array: iter_val }, *span);
+                        lim
+                    }
+                } else if let Some(&s_len) = self.slice_lens.get(&iter_val) {
+                    s_len
                 } else {
                     let lim = self.alloc_value();
                     self.emit(Some(lim), ValueExpr::ArrayLen { array: iter_val }, *span);
@@ -1987,7 +2251,7 @@ impl<'a> FunctionLoweringContext<'a> {
             }
 
             ExprKind::Ident(sym) => {
-                if sym.as_str() == "null" || sym.as_str() == "None" {
+                if sym.as_str() == "null" || sym.as_str() == "None" || sym.as_str() == "nil" {
                     let res = self.alloc_value();
                     self.emit(Some(res), ValueExpr::Constant(ConstantValue::Null), span);
                     res
@@ -2998,10 +3262,79 @@ impl<'a> FunctionLoweringContext<'a> {
 
             ExprKind::Index { receiver, index } => {
                 let base = self.lower_expr(receiver);
-                let idx = self.lower_expr(index);
-                let res = self.alloc_value();
-                self.emit(Some(res), ValueExpr::GetElement { base, index: idx }, span);
-                res
+                if let ExprKind::Range {
+                    start,
+                    end,
+                    inclusive,
+                } = &index.kind
+                {
+                    let start_val = if let Some(s) = start {
+                        self.lower_expr(s)
+                    } else {
+                        let zero = self.alloc_value();
+                        self.emit(
+                            Some(zero),
+                            ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                            span,
+                        );
+                        zero
+                    };
+                    let end_val = if let Some(e) = end {
+                        let ev = self.lower_expr(e);
+                        if *inclusive {
+                            let one = self.alloc_value();
+                            self.emit(
+                                Some(one),
+                                ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+                                span,
+                            );
+                            let plus_one = self.alloc_value();
+                            self.emit(
+                                Some(plus_one),
+                                ValueExpr::Binary {
+                                    op: BinaryOp::Add,
+                                    lhs: ev,
+                                    rhs: one,
+                                },
+                                span,
+                            );
+                            plus_one
+                        } else {
+                            ev
+                        }
+                    } else {
+                        let lim = self.alloc_value();
+                        self.emit(Some(lim), ValueExpr::ArrayLen { array: base }, span);
+                        lim
+                    };
+                    let len_val = self.alloc_value();
+                    self.emit(
+                        Some(len_val),
+                        ValueExpr::Binary {
+                            op: BinaryOp::Sub,
+                            lhs: end_val,
+                            rhs: start_val,
+                        },
+                        span,
+                    );
+                    let res = self.alloc_value();
+                    self.emit(
+                        Some(res),
+                        ValueExpr::SliceSub {
+                            base,
+                            start: start_val,
+                            end: end_val,
+                        },
+                        span,
+                    );
+                    self.slice_lens.insert(res, len_val);
+                    res
+                } else {
+                    let idx = self.lower_expr(index);
+                    let res = self.alloc_value();
+                    self.emit(Some(res), ValueExpr::GetElement { base, index: idx }, span);
+                    res
+                }
             }
 
             ExprKind::If {
@@ -3254,34 +3587,53 @@ impl<'a> FunctionLoweringContext<'a> {
             ExprKind::Block(b) => self.lower_block(b),
 
             ExprKind::StructInit { name, fields } => {
-                let mut field_vals = Vec::new();
-                for (_, f_expr) in fields {
-                    field_vals.push(self.lower_expr(f_expr));
-                }
                 let sym_name = name
                     .last()
                     .copied()
                     .unwrap_or_else(|| INTERNER.intern("Struct"));
-                let target_struct_name = if let Some(st) = self.symbols.lookup_struct(&sym_name) {
-                    if !st.generics.is_empty() {
-                        if let Some(call_args) = self.symbols.call_instantiations.get(&span) {
-                            let concrete_args: Vec<_> = call_args
-                                .iter()
-                                .map(|t| t.substitute(&self.type_subst))
-                                .collect();
-                            crate::types::mangle_instantiation_symbol(
-                                &INTERNER.resolve(&sym_name),
-                                &concrete_args,
-                            )
+                let (target_struct_name, field_vals) =
+                    if let Some(st) = self.symbols.lookup_struct(&sym_name) {
+                        let mangled_name = if !st.generics.is_empty() {
+                            if let Some(call_args) = self.symbols.call_instantiations.get(&span) {
+                                let concrete_args: Vec<_> = call_args
+                                    .iter()
+                                    .map(|t| t.substitute(&self.type_subst))
+                                    .collect();
+                                crate::types::mangle_instantiation_symbol(
+                                    &INTERNER.resolve(&sym_name),
+                                    &concrete_args,
+                                )
+                            } else {
+                                sym_name
+                            }
                         } else {
                             sym_name
+                        };
+
+                        let mut ordered_fields = Vec::new();
+                        for field_def in &st.fields {
+                            if let Some((_, f_expr)) =
+                                fields.iter().find(|(f_sym, _)| *f_sym == field_def.name)
+                            {
+                                ordered_fields.push(self.lower_expr(f_expr));
+                            } else {
+                                let unit_val = self.alloc_value();
+                                self.emit(
+                                    Some(unit_val),
+                                    ValueExpr::Constant(ConstantValue::Unit),
+                                    span,
+                                );
+                                ordered_fields.push(unit_val);
+                            }
                         }
+                        (mangled_name, ordered_fields)
                     } else {
-                        sym_name
-                    }
-                } else {
-                    sym_name
-                };
+                        let mut vals = Vec::new();
+                        for (_, f_expr) in fields {
+                            vals.push(self.lower_expr(f_expr));
+                        }
+                        (sym_name, vals)
+                    };
 
                 let res = self.alloc_value();
                 self.emit(
@@ -4123,6 +4475,48 @@ impl<'a> FunctionLoweringContext<'a> {
                     part_vals.push(formatted_v);
                 }
                 self.emit_format_string(part_vals, span)
+            }
+
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                let s_val = if let Some(s) = start {
+                    self.lower_expr(s)
+                } else {
+                    let zero = self.alloc_value();
+                    self.emit(
+                        Some(zero),
+                        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                        span,
+                    );
+                    zero
+                };
+                let e_val = if let Some(e) = end {
+                    self.lower_expr(e)
+                } else {
+                    let zero = self.alloc_value();
+                    self.emit(
+                        Some(zero),
+                        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                        span,
+                    );
+                    zero
+                };
+                let inc_val = self.alloc_value();
+                self.emit(
+                    Some(inc_val),
+                    ValueExpr::Constant(ConstantValue::Bool(*inclusive)),
+                    span,
+                );
+                let res = self.alloc_value();
+                self.emit(
+                    Some(res),
+                    ValueExpr::TupleInit(vec![s_val, e_val, inc_val]),
+                    span,
+                );
+                res
             }
 
             _ => {

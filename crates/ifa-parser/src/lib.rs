@@ -1233,6 +1233,9 @@ impl Parser {
                 TokenKind::AndAnd => 30,
                 TokenKind::OrOr => 20,
 
+                // Range Operators (15)
+                TokenKind::DotDot | TokenKind::DotDotEq => 15,
+
                 // Coalescing & Catch (10)
                 TokenKind::QuestionQuestion | TokenKind::Catch => 10,
 
@@ -1776,6 +1779,31 @@ impl Parser {
                     span,
                 ))
             }
+            TokenKind::DotDot | TokenKind::DotDotEq => {
+                let op_tok = self.advance();
+                let inclusive = op_tok.kind == TokenKind::DotDotEq;
+                let has_end = !self.check(&TokenKind::CloseBracket)
+                    && !self.check(&TokenKind::CloseParen)
+                    && !self.check(&TokenKind::CloseBrace)
+                    && !self.check(&TokenKind::Comma)
+                    && !self.check(&TokenKind::Semicolon)
+                    && !self.check(&TokenKind::Eof);
+                let end = if has_end {
+                    Some(Box::new(self.parse_expr_precedence(16)?))
+                } else {
+                    None
+                };
+                let end_pos = end.as_ref().map(|e| e.span.end).unwrap_or(op_tok.span.end);
+                let span = Span::new(self.file_id, op_tok.span.start, end_pos);
+                Ok(Expr::new(
+                    ExprKind::Range {
+                        start: None,
+                        end,
+                        inclusive,
+                    },
+                    span,
+                ))
+            }
             TokenKind::Ident(s) => {
                 self.advance();
                 // Check if path: Ident::Ident or StructInit Ident { ... }
@@ -1784,6 +1812,41 @@ impl Parser {
                     if let TokenKind::Ident(next_id) = self.current().kind {
                         self.advance();
                         path.push(next_id);
+                    }
+                }
+
+                // Check if struct literal initialization: Path { field: expr, ... }
+                if self.check(&TokenKind::OpenBrace) {
+                    let is_struct_init = if self.cursor + 2 < self.tokens.len() {
+                        let next1 = &self.tokens[self.cursor + 1];
+                        let next2 = &self.tokens[self.cursor + 2];
+                        matches!(next1.kind, TokenKind::Ident(_))
+                            && matches!(next2.kind, TokenKind::Colon)
+                    } else {
+                        false
+                    };
+
+                    if is_struct_init {
+                        let _open = self.advance();
+                        let mut fields = Vec::new();
+                        while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
+                            let f_name = match self.current().kind {
+                                TokenKind::Ident(sym) => {
+                                    self.advance();
+                                    sym
+                                }
+                                _ => break,
+                            };
+                            self.expect(TokenKind::Colon)?;
+                            let f_val = self.parse_expr()?;
+                            fields.push((f_name, f_val));
+                            if !self.match_token(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                        let close = self.expect(TokenKind::CloseBrace)?;
+                        let span = Span::new(self.file_id, cur.span.start, close.span.end);
+                        return Ok(Expr::new(ExprKind::StructInit { name: path, fields }, span));
                     }
                 }
 
@@ -2461,6 +2524,32 @@ impl Parser {
                     span,
                 ))
             }
+            // Range Infix Operators: start..end, start..=end, start..
+            TokenKind::DotDot | TokenKind::DotDotEq => {
+                let op_tok = self.advance();
+                let inclusive = op_tok.kind == TokenKind::DotDotEq;
+                let has_end = !self.check(&TokenKind::CloseBracket)
+                    && !self.check(&TokenKind::CloseParen)
+                    && !self.check(&TokenKind::CloseBrace)
+                    && !self.check(&TokenKind::Comma)
+                    && !self.check(&TokenKind::Semicolon)
+                    && !self.check(&TokenKind::Eof);
+                let end = if has_end {
+                    Some(Box::new(self.parse_expr_precedence(16)?))
+                } else {
+                    None
+                };
+                let end_pos = end.as_ref().map(|e| e.span.end).unwrap_or(op_tok.span.end);
+                let span = Span::new(self.file_id, left.span.start, end_pos);
+                Ok(Expr::new(
+                    ExprKind::Range {
+                        start: Some(Box::new(left)),
+                        end,
+                        inclusive,
+                    },
+                    span,
+                ))
+            }
             // Binary Operators
             _ => {
                 let op = match cur.kind {
@@ -2958,6 +3047,64 @@ mod tests {
             } else {
                 panic!("expected assign pattern with else");
             }
+        }
+    }
+
+    #[test]
+    fn test_parse_range_expressions_and_struct_init() {
+        let src = r#"
+            fn test_func() {
+                let r1 = 0..10;
+                let r2 = 1..=20;
+                let pt = Point { x: 42, y: 84 };
+            }
+        "#;
+        let fid = FileId(0);
+        let tokens = tokenize(fid, src);
+        let (prog, diags) = parse(fid, tokens);
+        assert!(diags.is_empty(), "Parse diags: {:?}", diags);
+        assert_eq!(prog.items.len(), 1);
+
+        if let Item::Function(f) = &prog.items[0] {
+            let body = f.body.as_ref().unwrap();
+            assert_eq!(body.stmts.len(), 3);
+
+            if let Stmt::Let { init: Some(e), .. } = &body.stmts[0] {
+                assert!(matches!(
+                    e.kind,
+                    ExprKind::Range {
+                        inclusive: false,
+                        ..
+                    }
+                ));
+            } else {
+                panic!("Expected range exclusive");
+            }
+
+            if let Stmt::Let { init: Some(e), .. } = &body.stmts[1] {
+                assert!(matches!(
+                    e.kind,
+                    ExprKind::Range {
+                        inclusive: true,
+                        ..
+                    }
+                ));
+            } else {
+                panic!("Expected range inclusive");
+            }
+
+            if let Stmt::Let { init: Some(e), .. } = &body.stmts[2] {
+                if let ExprKind::StructInit { name, fields } = &e.kind {
+                    assert_eq!(name.len(), 1);
+                    assert_eq!(fields.len(), 2);
+                } else {
+                    panic!("Expected StructInit, found {:?}", e.kind);
+                }
+            } else {
+                panic!("Expected struct init let");
+            }
+        } else {
+            panic!("Expected function");
         }
     }
 }

@@ -27,6 +27,7 @@ pub fn fir_type_to_cranelift(ty: &FirType, ptr_type: types::Type) -> Option<type
         | FirType::Channel(_)
         | FirType::Struct(_, _)
         | FirType::Array(_, _)
+        | FirType::Range { .. }
         | FirType::Slice(_) => Some(ptr_type),
         FirType::Optional(inner) => fir_type_to_cranelift(inner, ptr_type),
         FirType::ErrorUnion { .. } => Some(ptr_type),
@@ -98,6 +99,7 @@ pub fn fir_type_byte_size(ty: &FirType) -> usize {
         | FirType::Channel(_)
         | FirType::Slice(_)
         | FirType::Function { .. } => 8,
+        FirType::Range { elem, .. } => fir_type_byte_size(elem) * 2 + 8,
         FirType::Array(elem_ty, len) => fir_type_byte_size(elem_ty) * (*len as usize),
         FirType::Struct(_, fields) => fields
             .iter()

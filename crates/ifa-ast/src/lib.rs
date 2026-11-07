@@ -618,6 +618,11 @@ pub enum ExprKind {
     },
     Comptime(Box<Expr>),
     InterpolatedString(Vec<Expr>),
+    Range {
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+        inclusive: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -840,6 +845,14 @@ pub trait Visitor<'ast>: Sized {
             ExprKind::InterpolatedString(parts) => {
                 for part in parts {
                     self.visit_expr(part);
+                }
+            }
+            ExprKind::Range { start, end, .. } => {
+                if let Some(s) = start {
+                    self.visit_expr(s);
+                }
+                if let Some(e) = end {
+                    self.visit_expr(e);
                 }
             }
         }

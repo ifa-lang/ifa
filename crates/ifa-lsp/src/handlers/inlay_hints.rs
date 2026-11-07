@@ -224,6 +224,14 @@ impl<'a, 'ast> Visitor<'ast> for InlayHintVisitor<'a> {
                     self.visit_expr(part);
                 }
             }
+            ExprKind::Range { start, end, .. } => {
+                if let Some(s) = start {
+                    self.visit_expr(s);
+                }
+                if let Some(e) = end {
+                    self.visit_expr(e);
+                }
+            }
         }
     }
 }

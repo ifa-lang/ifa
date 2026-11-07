@@ -19,6 +19,10 @@ pub enum FirType {
     Enum(Symbol, Vec<(Symbol, Option<FirType>)>),
     Array(Box<FirType>, u32),
     Slice(Box<FirType>),
+    Range {
+        elem: Box<FirType>,
+        inclusive: bool,
+    },
     Optional(Box<FirType>),
     ErrorUnion {
         err: Box<FirType>,
@@ -61,6 +65,10 @@ impl FirType {
                 FirType::Array(Box::new(Self::from_sema_type(inner)), *size)
             }
             SemaType::Slice(inner) => FirType::Slice(Box::new(Self::from_sema_type(inner))),
+            SemaType::Range { elem, inclusive } => FirType::Range {
+                elem: Box::new(Self::from_sema_type(elem)),
+                inclusive: *inclusive,
+            },
             SemaType::Optional(inner) => FirType::Optional(Box::new(Self::from_sema_type(inner))),
             SemaType::ErrorUnion { err, ok } => FirType::ErrorUnion {
                 err: Box::new(Self::from_sema_type(err)),
@@ -132,6 +140,9 @@ impl fmt::Display for FirType {
             FirType::Enum(name, _) => write!(f, "{}", name.as_str()),
             FirType::Array(inner, size) => write!(f, "[{}; {}]", inner, size),
             FirType::Slice(inner) => write!(f, "Slice<{}>", inner),
+            FirType::Range { elem, inclusive } => {
+                write!(f, "Range<{}{}>", if *inclusive { "=" } else { "" }, elem)
+            }
             FirType::Optional(inner) => write!(f, "?{}", inner),
             FirType::ErrorUnion { err, ok } => write!(f, "{}!{}", err, ok),
             FirType::Channel(inner) => write!(f, "chan<{}>", inner),

@@ -86,6 +86,10 @@ pub enum Type {
     Optional(Box<Type>),
     Slice(Box<Type>),
     Array(Box<Type>, u32),
+    Range {
+        elem: Box<Type>,
+        inclusive: bool,
+    },
     ErrorUnion {
         err: Box<Type>,
         ok: Box<Type>,
@@ -208,6 +212,10 @@ impl Type {
             Type::Optional(inner) => Type::Optional(Box::new(inner.resolve_defaults())),
             Type::Slice(inner) => Type::Slice(Box::new(inner.resolve_defaults())),
             Type::Array(inner, n) => Type::Array(Box::new(inner.resolve_defaults()), *n),
+            Type::Range { elem, inclusive } => Type::Range {
+                elem: Box::new(elem.resolve_defaults()),
+                inclusive: *inclusive,
+            },
             Type::ErrorUnion { err, ok } => Type::ErrorUnion {
                 err: Box::new(err.resolve_defaults()),
                 ok: Box::new(ok.resolve_defaults()),
@@ -266,6 +274,22 @@ impl Type {
         // Array [T; N] can coerce to Slice<T>
         if let (Type::Array(src_elem, _), Type::Slice(target_elem)) = (self, target) {
             if src_elem.is_assignable_to(target_elem) {
+                return true;
+            }
+        }
+
+        if let (
+            Type::Range {
+                elem: s_elem,
+                inclusive: s_inc,
+            },
+            Type::Range {
+                elem: t_elem,
+                inclusive: t_inc,
+            },
+        ) = (self, target)
+        {
+            if s_inc == t_inc && s_elem.is_assignable_to(t_elem) {
                 return true;
             }
         }
@@ -376,6 +400,10 @@ impl Type {
             Type::Optional(inner) => Type::Optional(Box::new(inner.substitute(mapping))),
             Type::Slice(inner) => Type::Slice(Box::new(inner.substitute(mapping))),
             Type::Array(inner, n) => Type::Array(Box::new(inner.substitute(mapping)), *n),
+            Type::Range { elem, inclusive } => Type::Range {
+                elem: Box::new(elem.substitute(mapping)),
+                inclusive: *inclusive,
+            },
             Type::ErrorUnion { err, ok } => Type::ErrorUnion {
                 err: Box::new(err.substitute(mapping)),
                 ok: Box::new(ok.substitute(mapping)),
@@ -437,6 +465,18 @@ impl Type {
                 inner.unify_type_params(c_inner, mapping);
             }
             (Type::Array(inner, _), Type::Array(c_inner, _)) => {
+                inner.unify_type_params(c_inner, mapping);
+            }
+            (
+                Type::Range {
+                    elem: inner,
+                    inclusive: inc1,
+                },
+                Type::Range {
+                    elem: c_inner,
+                    inclusive: inc2,
+                },
+            ) if inc1 == inc2 => {
                 inner.unify_type_params(c_inner, mapping);
             }
             (Type::Generic { name: n1, args: a1 }, Type::Generic { name: n2, args: a2 })
@@ -608,6 +648,9 @@ impl fmt::Display for Type {
             Type::Optional(inner) => write!(f, "?{}", inner),
             Type::Slice(inner) => write!(f, "Slice<{}>", inner),
             Type::Array(inner, n) => write!(f, "[{}; {}]", inner, n),
+            Type::Range { elem, inclusive } => {
+                write!(f, "Range<{}{}>", if *inclusive { "=" } else { "" }, elem)
+            }
             Type::ErrorUnion { err, ok } => write!(f, "{}!{}", err, ok),
             Type::Struct { name, .. } => write!(f, "{}", INTERNER.resolve(name)),
             Type::Enum { name, .. } => write!(f, "{}", INTERNER.resolve(name)),

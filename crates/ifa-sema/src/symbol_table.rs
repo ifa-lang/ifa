@@ -345,6 +345,7 @@ impl SymbolTable {
             Type::Ref(inner)
             | Type::Array(inner, _)
             | Type::Slice(inner)
+            | Type::Range { elem: inner, .. }
             | Type::Optional(inner) => {
                 self.register_type_if_generic_instance(inner);
             }

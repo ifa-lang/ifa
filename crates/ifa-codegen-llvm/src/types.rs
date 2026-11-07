@@ -32,6 +32,10 @@ pub fn fir_to_llvm_type(ty: &FirType) -> Result<String, LlvmCodegenError> {
             Ok(format!("[{} x {}]", count, inner))
         }
         FirType::Slice(_) => Ok("{ ptr, i64 }".to_string()),
+        FirType::Range { elem, .. } => {
+            let inner = fir_to_llvm_type(elem)?;
+            Ok(format!("{{ {}, {}, i1 }}", inner, inner))
+        }
         FirType::Optional(elem) => {
             let inner = fir_to_llvm_type(elem)?;
             Ok(format!("{{ i1, {} }}", inner))

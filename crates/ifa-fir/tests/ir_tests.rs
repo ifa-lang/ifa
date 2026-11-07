@@ -816,3 +816,80 @@ fn test_fir_comptime_constant_folding() {
     });
     assert!(has_constant_42, "Expected folded constant 42 in FIR");
 }
+
+#[test]
+fn test_fir_for_loop_over_range() {
+    let src = r#"
+        pub fn sum_exclusive(n: i64) -> i64 {
+            mut acc: i64 = 0;
+            for i in 0..n {
+                acc = acc + i;
+            }
+            return acc;
+        }
+
+        pub fn sum_inclusive(n: i64) -> i64 {
+            mut acc: i64 = 0;
+            for i in 1..=n {
+                acc = acc + i;
+            }
+            return acc;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("range_for_test.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, parse_diags) = ifa_parser::parse(fid, tokens);
+    assert!(parse_diags.is_empty(), "Parse diags: {:?}", parse_diags);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&module);
+    let res_excl = interp
+        .execute_function("sum_exclusive", vec![FirValue::Int(10)])
+        .unwrap();
+    assert_eq!(res_excl, FirValue::Int(45));
+
+    let res_incl = interp
+        .execute_function("sum_inclusive", vec![FirValue::Int(10)])
+        .unwrap();
+    assert_eq!(res_incl, FirValue::Int(55));
+}
+
+#[test]
+fn test_fir_sub_slice_range_indexing() {
+    let src = r#"
+        pub fn slice_sum() -> i64 {
+            let data: [i64; 6] = [10, 20, 30, 40, 50, 60];
+            let sub = data[1..4];
+            mut total: i64 = 0;
+            for val in sub {
+                total = total + val;
+            }
+            return total;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("sub_slice_test.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, parse_diags) = ifa_parser::parse(fid, tokens);
+    assert!(parse_diags.is_empty(), "Parse diags: {:?}", parse_diags);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("slice_sum", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(90));
+}

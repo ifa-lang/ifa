@@ -1744,3 +1744,68 @@ fn test_llvm_string_interpolation_and_concatenation() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_range_for_loop_and_sub_slicing_execution() {
+    let src = r#"
+        pub fn main() -> i64 {
+            mut sum: i64 = 0;
+            for i in 1..=10 {
+                sum = sum + i;
+            }
+
+            let data: [i64; 5] = [1, 2, 3, 4, 5];
+            let sub = data[1..3];
+            mut sub_sum: i64 = 0;
+            for v in sub {
+                sub_sum = sub_sum + v;
+            }
+
+            return sum + sub_sum;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("range_exec_test.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse diags: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let llvm_ir = emitter.emit_module(&fir_module).unwrap();
+
+    assert!(llvm_ir.contains("getelementptr inbounds i64, ptr"));
+
+    let temp_dir = std::env::temp_dir().join(format!("ifa_llvm_range_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("range.o");
+    let bin_path = temp_dir.join("range_exec");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&fir_module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(output.status.code(), Some(60));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

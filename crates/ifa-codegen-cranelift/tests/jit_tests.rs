@@ -1326,3 +1326,44 @@ fn test_cranelift_jit_string_interpolation_and_concatenation() {
     let result = jit.run_main().expect("Failed to execute native main");
     assert_eq!(result, 88);
 }
+
+#[test]
+fn test_cranelift_jit_range_for_loop_and_sub_slicing() {
+    let src = r#"
+        pub fn main() -> i64 {
+            mut sum: i64 = 0;
+            for i in 1..=10 {
+                sum = sum + i;
+            }
+
+            let data: [i64; 5] = [1, 2, 3, 4, 5];
+            let sub = data[1..3];
+            mut sub_sum: i64 = 0;
+            for v in sub {
+                sub_sum = sub_sum + v;
+            }
+
+            return sum + sub_sum;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("jit_range.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 60);
+}

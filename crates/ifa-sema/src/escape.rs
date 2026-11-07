@@ -12,6 +12,7 @@ pub fn type_contains_ref(ty: &Type) -> bool {
         Type::Optional(inner) => type_contains_ref(inner),
         Type::Slice(inner) => type_contains_ref(inner),
         Type::Array(inner, _) => type_contains_ref(inner),
+        Type::Range { elem, .. } => type_contains_ref(elem),
         Type::ErrorUnion { err, ok } => type_contains_ref(err) || type_contains_ref(ok),
         Type::Tuple(elems) => elems.iter().any(type_contains_ref),
         Type::Generic { args, .. } => args.iter().any(type_contains_ref),
@@ -733,6 +734,14 @@ impl<'a> EscapeAnalyzer<'a> {
                 self.spawn_depth = prev_depth;
             }
             ExprKind::Comptime(inner) => self.check_expr(inner),
+            ExprKind::Range { start, end, .. } => {
+                if let Some(s) = start {
+                    self.check_expr(s);
+                }
+                if let Some(e) = end {
+                    self.check_expr(e);
+                }
+            }
             ExprKind::InterpolatedString(parts) => {
                 for part in parts {
                     self.check_expr(part);
