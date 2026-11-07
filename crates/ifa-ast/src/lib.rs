@@ -165,6 +165,10 @@ pub enum TypeKind {
     Array(Box<Type>, u32),            // [T; N]
     ErrorUnion(Box<Type>, Box<Type>), // Error!Success
     Tuple(Vec<Type>),
+    Fn {
+        params: Vec<(ParamMode, Type)>,
+        ret: Box<Type>,
+    },
     Unit,
 }
 
@@ -609,6 +613,7 @@ pub enum ExprKind {
     Unit,
     Lambda {
         params: Vec<Param>,
+        ret_ty: Option<Type>,
         body: Block,
     },
     Comptime(Box<Expr>),

@@ -1733,6 +1733,28 @@ impl<'a> FirInterpreter<'a> {
                             env,
                         )
                     }
+                    FirValue::Struct { fields, .. } if !fields.is_empty() => {
+                        if let FirValue::String(name) = &fields[0] {
+                            let sym = INTERNER.intern(name);
+                            let mut full_args = Vec::new();
+                            let mut child_env = env.clone();
+                            if fields.len() > 1 {
+                                let env_vid = ValueId(u32::MAX - 1000 - callee.0);
+                                child_env.insert(env_vid, fields[1].clone());
+                                full_args.push(env_vid);
+                            }
+                            full_args.extend_from_slice(args);
+                            self.evaluate_expr(
+                                &ValueExpr::CallDirect {
+                                    name: sym,
+                                    args: full_args,
+                                },
+                                &child_env,
+                            )
+                        } else {
+                            Ok(FirValue::Unit)
+                        }
+                    }
                     _ => Ok(FirValue::Unit),
                 }
             }

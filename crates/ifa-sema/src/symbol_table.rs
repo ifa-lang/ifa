@@ -178,6 +178,14 @@ impl Scope {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedVariable {
+    pub name: Symbol,
+    pub ty: Type,
+    pub is_ref: bool,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct SymbolTable {
     pub scopes: Vec<Scope>,
@@ -198,6 +206,9 @@ pub struct SymbolTable {
     pub call_instantiations: HashMap<Span, Vec<Type>>,
     pub comptime_values: HashMap<Symbol, ifa_comptime::Value>,
     pub comptime_expr_values: HashMap<Span, ifa_comptime::Value>,
+    pub lambda_captures: HashMap<Span, Vec<CapturedVariable>>,
+    pub lambda_ids: HashMap<Span, u32>,
+    pub next_lambda_id: u32,
     next_var_id: u32,
 }
 
@@ -222,6 +233,9 @@ impl SymbolTable {
             call_instantiations: HashMap::new(),
             comptime_values: HashMap::new(),
             comptime_expr_values: HashMap::new(),
+            lambda_captures: HashMap::new(),
+            lambda_ids: HashMap::new(),
+            next_lambda_id: 0,
             next_var_id: 1,
         };
         table.init_builtins();

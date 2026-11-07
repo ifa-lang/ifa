@@ -1,0 +1,35 @@
+// Exemple idiomatique IFA : Clôtures anonymes (closures/lambdas), captures d'environnement
+// et inférence bidirectionnelle de types.
+
+pub fn main() -> i64 {
+    // 1. Clôture avec inférence bidirectionnelle de signature
+    let add_constant: fn(i64) -> i64 = fn(x) {
+        return x + 10;
+    };
+
+    // 2. Clôture capturant une variable de l'environnement parent
+    let scale_factor: i64 = 3;
+    let scale = fn(val: i64) -> i64 {
+        return val * scale_factor;
+    };
+
+    // 3. Clôture avec captures multiples
+    let base_offset: i64 = 100;
+    let multiplier: i64 = 5;
+    let affine_transform = fn(v: i64) -> i64 {
+        return base_offset + v * multiplier;
+    };
+
+    // 4. Clôture anonyme appelée directement en ligne
+    let direct_res = (fn(a: i64, b: i64) -> i64 {
+        return a * b;
+    })(4, 5);
+
+    let v1 = add_constant(15);       // 15 + 10 = 25
+    let v2 = scale(8);               // 8 * 3 = 24
+    let v3 = affine_transform(10);   // 100 + 10 * 5 = 150
+
+    // Somme totale attendue : 25 + 24 + 150 + 20 = 219
+    let total = v1 + v2 + v3 + direct_res;
+    return total;
+}

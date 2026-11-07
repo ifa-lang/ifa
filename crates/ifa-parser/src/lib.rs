@@ -792,6 +792,48 @@ impl Parser {
                     span: Span::new(self.file_id, start, close.span.end),
                 }
             }
+        } else if self.match_token(&TokenKind::Fn) {
+            // Function type signature: fn(T1, inout T2, ...) -> Ret
+            self.expect(TokenKind::OpenParen)?;
+            let mut param_types = Vec::new();
+            while !self.check(&TokenKind::CloseParen) && !self.check(&TokenKind::Eof) {
+                let mode = if self.match_token(&TokenKind::InOut) {
+                    ParamMode::InOut
+                } else if self.match_token(&TokenKind::Sink) {
+                    ParamMode::Sink
+                } else if self.match_token(&TokenKind::Mut) {
+                    ParamMode::Mut
+                } else {
+                    let _ = self.match_token(&TokenKind::In);
+                    ParamMode::In
+                };
+                let pty = self.parse_type()?;
+                param_types.push((mode, pty));
+                if !self.match_token(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            let close = self.expect(TokenKind::CloseParen)?;
+            let (ret, end_span) = if self.match_token(&TokenKind::Arrow) {
+                let ret_ty = self.parse_type()?;
+                let end = ret_ty.span.end;
+                (Box::new(ret_ty), end)
+            } else {
+                (
+                    Box::new(Type {
+                        kind: TypeKind::Unit,
+                        span: Span::new(self.file_id, close.span.end, close.span.end),
+                    }),
+                    close.span.end,
+                )
+            };
+            Type {
+                kind: TypeKind::Fn {
+                    params: param_types,
+                    ret,
+                },
+                span: Span::new(self.file_id, start, end_span),
+            }
         } else {
             // Named or Path or Generic
             let mut path = Vec::new();
@@ -1534,26 +1576,37 @@ impl Parser {
                 Ok(Expr::new(ExprKind::Comptime(Box::new(expr)), span))
             }
             TokenKind::Fn => {
-                // Anonymous lambda: fn(args) { body }
+                // Anonymous lambda: fn(args) [-> ret_ty] { body }
                 let fn_tok = self.advance();
                 self.expect(TokenKind::OpenParen)?;
                 let mut params = Vec::new();
                 while !self.check(&TokenKind::CloseParen) && !self.check(&TokenKind::Eof) {
+                    let cur = self.current();
+                    let mode = if self.match_token(&TokenKind::InOut) {
+                        ParamMode::InOut
+                    } else if self.match_token(&TokenKind::Sink) {
+                        ParamMode::Sink
+                    } else if self.match_token(&TokenKind::Mut) {
+                        ParamMode::Mut
+                    } else {
+                        let _ = self.match_token(&TokenKind::In);
+                        ParamMode::In
+                    };
                     if let TokenKind::Ident(s) = self.current().kind {
-                        self.advance();
+                        let p_cur = self.advance();
                         let ty = if self.match_token(&TokenKind::Colon) {
                             self.parse_type()?
                         } else {
                             Type {
                                 kind: TypeKind::Named(sym("auto")),
-                                span: cur.span,
+                                span: p_cur.span,
                             }
                         };
                         params.push(Param {
-                            mode: ParamMode::In,
+                            mode,
                             name: s,
                             ty,
-                            span: cur.span,
+                            span: Span::new(self.file_id, cur.span.start, p_cur.span.end),
                         });
                     }
                     if !self.match_token(&TokenKind::Comma) {
@@ -1561,9 +1614,21 @@ impl Parser {
                     }
                 }
                 self.expect(TokenKind::CloseParen)?;
+                let ret_ty = if self.match_token(&TokenKind::Arrow) {
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
                 let body = self.parse_block()?;
                 let span = Span::new(self.file_id, fn_tok.span.start, body.span.end);
-                Ok(Expr::new(ExprKind::Lambda { params, body }, span))
+                Ok(Expr::new(
+                    ExprKind::Lambda {
+                        params,
+                        ret_ty,
+                        body,
+                    },
+                    span,
+                ))
             }
             // Unary Prefix Ops: -, !, try, ref, inout, sink
             TokenKind::Minus

@@ -13,7 +13,9 @@ pub use escape::{
     EscapeStatus, VarEscapeInfo, VarOrigin,
 };
 pub use exclusivity::check_call_exclusivity;
-pub use symbol_table::{FunctionSymbol, StructSymbol, SymbolTable, VariableSymbol};
+pub use symbol_table::{
+    CapturedVariable, FunctionSymbol, StructSymbol, SymbolTable, VariableSymbol,
+};
 pub use types::{FloatType, IntType, Type};
 
 use ifa_ast::Program;

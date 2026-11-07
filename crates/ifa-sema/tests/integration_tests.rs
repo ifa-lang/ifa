@@ -623,13 +623,85 @@ fn test_optional_direct_access_rejected() {
 fn test_lambda_type_checking() {
     let code = r#"
         pub fn main() {
-            let square = fn(x: u32) { return x * x; };
+            let square = fn(x: u32) -> u32 { return x * x; };
+            let res = square(5);
         }
     "#;
     let res = run_analysis(code);
     assert!(
         !res.has_errors(),
         "Lambda expression should typecheck: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_closure_bidirectional_type_inference() {
+    let code = r#"
+        pub fn main() {
+            let transform: fn(i32) -> i32 = fn(x) { return x * 2; };
+            let result: i32 = transform(21);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Bidirectional type inference on closure should succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_closure_environment_capture_ref() {
+    let code = r#"
+        pub fn main() {
+            let factor = 10;
+            let multiplier = fn(x: i32) -> i32 {
+                return x * factor;
+            };
+            let result = multiplier(5);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Closure capturing environment by ref should succeed: {:?}",
+        res.diagnostics
+    );
+    // Verify that 'factor' was captured
+    let has_capture = res.symbols.lambda_captures.values().any(|caps| {
+        caps.iter()
+            .any(|c| ifa_span::INTERNER.resolve(&c.name) == "factor" && c.is_ref)
+    });
+    assert!(
+        has_capture,
+        "Lambda should have registered 'factor' as a captured variable"
+    );
+}
+
+#[test]
+fn test_closure_capturing_sink_moved_var_fails() {
+    let code = r#"
+        pub fn consume(sink x: i32) {}
+
+        pub fn main() {
+            let val = 42;
+            consume(sink val);
+            let bad_closure = fn() -> i32 {
+                return val;
+            };
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Capturing a moved/sinked variable in a closure should fail with E0020"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0020")),
+        "Expected E0020 error diagnostic: {:?}",
         res.diagnostics
     );
 }

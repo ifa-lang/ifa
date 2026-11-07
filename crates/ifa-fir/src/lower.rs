@@ -71,6 +71,10 @@ struct FunctionLoweringContext<'a> {
     defer_stack: Vec<Block>,
     known_null_vars: HashSet<Symbol>,
     known_non_null_vars: HashSet<Symbol>,
+    lifted_functions: Vec<FirFunction>,
+    lifted_structs: Vec<FirStruct>,
+    var_lambda_names: HashMap<Symbol, Symbol>,
+    captures_to_unpack: Vec<(usize, Symbol, FirType)>,
 }
 
 impl<'a> FunctionLoweringContext<'a> {
@@ -170,6 +174,62 @@ impl<'a> FunctionLoweringContext<'a> {
             defer_stack: Vec::new(),
             known_null_vars: HashSet::new(),
             known_non_null_vars: HashSet::new(),
+            lifted_functions: Vec::new(),
+            lifted_structs: Vec::new(),
+            var_lambda_names: HashMap::new(),
+            captures_to_unpack: Vec::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_lambda(
+        name: Symbol,
+        params: Vec<FirParam>,
+        ret_ty: FirType,
+        captures_to_unpack: Vec<(usize, Symbol, FirType)>,
+        symbols: &'a SymbolTable,
+        constants: &'a HashMap<Symbol, &'a Expr>,
+        type_subst: HashMap<Symbol, ifa_sema::types::Type>,
+        module_structs: &'a [FirStruct],
+        module_enums: &'a [FirEnum],
+        span: Span,
+    ) -> Self {
+        let entry_id = BlockId(0);
+        let entry_block = BasicBlock::new(entry_id);
+        let next_value_id = params.len() as u32;
+        let func = FirFunction {
+            name,
+            params,
+            ret_ty,
+            blocks: vec![entry_block],
+            entry_block: entry_id,
+            is_strict: false,
+            is_pub: false,
+            is_comptime: false,
+            is_extern: None,
+            span,
+            next_value_id,
+            next_block_id: 1,
+        };
+        Self {
+            func,
+            current_block: entry_id,
+            var_allocas: HashMap::new(),
+            val_ptrs: HashMap::new(),
+            var_types: HashMap::new(),
+            symbols,
+            constants,
+            loop_stack: Vec::new(),
+            type_subst,
+            module_structs,
+            module_enums,
+            defer_stack: Vec::new(),
+            known_null_vars: HashSet::new(),
+            known_non_null_vars: HashSet::new(),
+            lifted_functions: Vec::new(),
+            lifted_structs: Vec::new(),
+            var_lambda_names: HashMap::new(),
+            captures_to_unpack,
         }
     }
 
@@ -687,7 +747,7 @@ impl<'a> FunctionLoweringContext<'a> {
         }
     }
 
-    fn lower(mut self, body: &ifa_ast::Block) -> FirFunction {
+    fn lower(mut self, body: &ifa_ast::Block) -> (FirFunction, Vec<FirFunction>, Vec<FirStruct>) {
         // 1. In entry block, create allocas for parameters and store incoming values
         let entry_params = self.func.params.clone();
         for p in entry_params {
@@ -716,6 +776,41 @@ impl<'a> FunctionLoweringContext<'a> {
                 self.var_allocas.insert(p.name, ptr_val);
                 self.var_types.insert(p.name, p.ty);
             }
+        }
+
+        // 1b. Unpack captured environment variables from param 0 (__env)
+        let captures = self.captures_to_unpack.clone();
+        for (idx, name, ty) in captures {
+            let env_val = ValueId(0);
+            let get_val = self.alloc_value();
+            self.emit(
+                Some(get_val),
+                ValueExpr::GetField {
+                    base: env_val,
+                    field_idx: idx,
+                    field_name: name,
+                },
+                self.func.span,
+            );
+            let ptr_val = self.alloc_value();
+            self.emit(
+                Some(ptr_val),
+                ValueExpr::Alloca {
+                    ty: ty.clone(),
+                    name: Some(name),
+                },
+                self.func.span,
+            );
+            self.emit(
+                None,
+                ValueExpr::Store {
+                    ptr: ptr_val,
+                    val: get_val,
+                },
+                self.func.span,
+            );
+            self.var_allocas.insert(name, ptr_val);
+            self.var_types.insert(name, ty);
         }
 
         // 2. Lower all statements in the body
@@ -762,7 +857,7 @@ impl<'a> FunctionLoweringContext<'a> {
             }
         }
 
-        self.func
+        (self.func, self.lifted_functions, self.lifted_structs)
     }
 
     fn lower_block(&mut self, b: &Block) -> ValueId {
@@ -844,6 +939,17 @@ impl<'a> FunctionLoweringContext<'a> {
                         }
 
                         if let Some(init_expr) = init {
+                            if matches!(init_expr.kind, ExprKind::Lambda { .. }) {
+                                let lambda_id = self
+                                    .symbols
+                                    .lambda_ids
+                                    .get(&init_expr.span)
+                                    .copied()
+                                    .unwrap_or(init_expr.span.start.0);
+                                let lambda_fn_name =
+                                    INTERNER.intern(&format!("__ifa_lambda_{}", lambda_id));
+                                self.var_lambda_names.insert(*name, lambda_fn_name);
+                            }
                             if self.is_expr_null(init_expr) {
                                 self.known_null_vars.insert(*name);
                                 self.known_non_null_vars.remove(name);
@@ -1981,8 +2087,59 @@ impl<'a> FunctionLoweringContext<'a> {
                     }
                 }
 
+                // Check if callee is a known closure variable or inline lambda
+                let closure_target = match &callee.kind {
+                    ExprKind::Ident(fn_name) => self.var_lambda_names.get(fn_name).copied(),
+                    ExprKind::Lambda { .. } => {
+                        let lambda_id = self
+                            .symbols
+                            .lambda_ids
+                            .get(&callee.span)
+                            .copied()
+                            .unwrap_or(callee.span.start.0);
+                        Some(INTERNER.intern(&format!("__ifa_lambda_{}", lambda_id)))
+                    }
+                    _ => None,
+                };
+
+                if let Some(lambda_fn_name) = closure_target {
+                    let closure_val = self.lower_expr(callee);
+                    let env_val = self.alloc_value();
+                    self.emit(
+                        Some(env_val),
+                        ValueExpr::GetField {
+                            base: closure_val,
+                            field_idx: 1,
+                            field_name: INTERNER.intern("__ifa_env"),
+                        },
+                        span,
+                    );
+                    let mut full_args = vec![env_val];
+                    for a in args {
+                        full_args.push(self.lower_expr(&a.value));
+                    }
+                    let res = self.alloc_value();
+                    self.emit(
+                        Some(res),
+                        ValueExpr::CallDirect {
+                            name: lambda_fn_name,
+                            args: full_args,
+                        },
+                        span,
+                    );
+                    return res;
+                }
+
                 let direct_name = match &callee.kind {
-                    ExprKind::Ident(fn_name) => Some(*fn_name),
+                    ExprKind::Ident(fn_name) => {
+                        if self.var_allocas.contains_key(fn_name)
+                            || self.symbols.lookup_variable(fn_name).is_some()
+                        {
+                            None
+                        } else {
+                            Some(*fn_name)
+                        }
+                    }
                     ExprKind::Path(path) => path.last().copied(),
                     ExprKind::FieldAccess { field, .. } => Some(*field),
                     _ => None,
@@ -2136,15 +2293,56 @@ impl<'a> FunctionLoweringContext<'a> {
                     res
                 } else {
                     let callee_val = self.lower_expr(callee);
+                    let is_closure_val = match &callee.kind {
+                        ExprKind::Ident(sym) => self
+                            .symbols
+                            .lookup_variable(sym)
+                            .is_some_and(|v| matches!(v.ty, ifa_sema::types::Type::Fn { .. })),
+                        _ => false,
+                    };
+
                     let res = self.alloc_value();
-                    self.emit(
-                        Some(res),
-                        ValueExpr::Call {
-                            callee: callee_val,
-                            args: arg_vals,
-                        },
-                        span,
-                    );
+                    if is_closure_val {
+                        let fn_name_val = self.alloc_value();
+                        self.emit(
+                            Some(fn_name_val),
+                            ValueExpr::GetField {
+                                base: callee_val,
+                                field_idx: 0,
+                                field_name: INTERNER.intern("__ifa_fn"),
+                            },
+                            span,
+                        );
+                        let env_val = self.alloc_value();
+                        self.emit(
+                            Some(env_val),
+                            ValueExpr::GetField {
+                                base: callee_val,
+                                field_idx: 1,
+                                field_name: INTERNER.intern("__ifa_env"),
+                            },
+                            span,
+                        );
+                        let mut full_args = vec![env_val];
+                        full_args.extend(arg_vals);
+                        self.emit(
+                            Some(res),
+                            ValueExpr::Call {
+                                callee: fn_name_val,
+                                args: full_args,
+                            },
+                            span,
+                        );
+                    } else {
+                        self.emit(
+                            Some(res),
+                            ValueExpr::Call {
+                                callee: callee_val,
+                                args: arg_vals,
+                            },
+                            span,
+                        );
+                    }
                     res
                 }
             }
@@ -2875,6 +3073,193 @@ impl<'a> FunctionLoweringContext<'a> {
                     span,
                 );
                 res
+            }
+
+            ExprKind::Lambda {
+                params,
+                ret_ty,
+                body,
+            } => {
+                let lambda_id = self
+                    .symbols
+                    .lambda_ids
+                    .get(&expr.span)
+                    .copied()
+                    .unwrap_or(expr.span.start.0);
+                let lambda_fn_name = INTERNER.intern(&format!("__ifa_lambda_{}", lambda_id));
+                let captures = self
+                    .symbols
+                    .lambda_captures
+                    .get(&expr.span)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let env_struct_name = INTERNER.intern(&format!("__ifa_closure_env_{}", lambda_id));
+                let mut env_fields = Vec::new();
+                let mut captures_to_unpack = Vec::new();
+
+                for (idx, c) in captures.iter().enumerate() {
+                    let sema_ty = &c.ty;
+                    let fir_ty = FirType::from_sema_type(sema_ty);
+                    env_fields.push((c.name, fir_ty.clone()));
+                    captures_to_unpack.push((idx, c.name, fir_ty));
+                }
+
+                if !env_fields.is_empty() {
+                    self.lifted_structs.push(FirStruct {
+                        name: env_struct_name,
+                        fields: env_fields.clone(),
+                        is_pub: false,
+                        span: expr.span,
+                    });
+                }
+
+                let env_param_name = INTERNER.intern("__env");
+                let env_param_ty = if env_fields.is_empty() {
+                    FirType::Int(IntType::I64)
+                } else {
+                    FirType::Struct(env_struct_name, env_fields.clone())
+                };
+
+                let mut lifted_params = Vec::new();
+                lifted_params.push(FirParam {
+                    name: env_param_name,
+                    ty: env_param_ty.clone(),
+                    mode: ifa_ast::ParamMode::In,
+                    val: ValueId(0),
+                });
+
+                let known_structs = HashMap::new();
+                let known_enums = HashMap::new();
+
+                for (idx, p) in params.iter().enumerate() {
+                    let is_auto = match &p.ty.kind {
+                        ifa_ast::TypeKind::Named(s) => INTERNER.resolve(s) == "auto",
+                        _ => false,
+                    };
+                    let sema_ty = if is_auto {
+                        self.symbols
+                            .lookup_variable(&p.name)
+                            .map(|v| v.ty.clone())
+                            .unwrap_or(ifa_sema::types::Type::Int(IntType::I64))
+                    } else {
+                        ifa_sema::types::Type::from_ast(&p.ty, &known_structs, &known_enums)
+                            .ok()
+                            .or_else(|| self.symbols.lookup_variable(&p.name).map(|v| v.ty.clone()))
+                            .unwrap_or(ifa_sema::types::Type::Int(IntType::I64))
+                    };
+                    let p_fir_ty = FirType::from_sema_type(&sema_ty);
+                    lifted_params.push(FirParam {
+                        name: p.name,
+                        ty: p_fir_ty,
+                        mode: p.mode,
+                        val: ValueId((idx + 1) as u32),
+                    });
+                }
+
+                let ret_fir_ty = ret_ty
+                    .as_ref()
+                    .and_then(|rt| {
+                        ifa_sema::types::Type::from_ast(rt, &known_structs, &known_enums).ok()
+                    })
+                    .map(|st| FirType::from_sema_type(&st))
+                    .or_else(|| {
+                        self.symbols
+                            .expr_types
+                            .get(&expr.span)
+                            .and_then(|t| match t {
+                                ifa_sema::types::Type::Fn { ret, .. } => {
+                                    Some(FirType::from_sema_type(ret))
+                                }
+                                _ => None,
+                            })
+                    })
+                    .unwrap_or(FirType::Int(IntType::I64));
+
+                let child_ctx = FunctionLoweringContext::new_lambda(
+                    lambda_fn_name,
+                    lifted_params,
+                    ret_fir_ty,
+                    captures_to_unpack,
+                    self.symbols,
+                    self.constants,
+                    self.type_subst.clone(),
+                    self.module_structs,
+                    self.module_enums,
+                    expr.span,
+                );
+
+                let (lifted_func, sub_funcs, sub_structs) = child_ctx.lower(body);
+                self.lifted_functions.push(lifted_func);
+                self.lifted_functions.extend(sub_funcs);
+                self.lifted_structs.extend(sub_structs);
+
+                // Construct env value in current function
+                let env_inst_val = if env_fields.is_empty() {
+                    let zero = self.alloc_value();
+                    self.emit(
+                        Some(zero),
+                        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                        expr.span,
+                    );
+                    zero
+                } else {
+                    let mut cap_vals = Vec::new();
+                    for c in &captures {
+                        if let Some(alloca) = self.var_allocas.get(&c.name).copied() {
+                            let loaded = self.alloc_value();
+                            self.emit(Some(loaded), ValueExpr::Load { ptr: alloca }, expr.span);
+                            cap_vals.push(loaded);
+                        } else {
+                            let zero = self.alloc_value();
+                            self.emit(
+                                Some(zero),
+                                ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                                expr.span,
+                            );
+                            cap_vals.push(zero);
+                        }
+                    }
+                    let env_res = self.alloc_value();
+                    self.emit(
+                        Some(env_res),
+                        ValueExpr::StructInit {
+                            name: env_struct_name,
+                            fields: cap_vals,
+                        },
+                        expr.span,
+                    );
+                    env_res
+                };
+
+                let closure_struct_name = INTERNER.intern(&format!("__ifa_closure_{}", lambda_id));
+                let closure_fields = vec![
+                    (INTERNER.intern("__ifa_fn"), FirType::String),
+                    (INTERNER.intern("__ifa_env"), env_param_ty),
+                ];
+                self.lifted_structs.push(FirStruct {
+                    name: closure_struct_name,
+                    fields: closure_fields,
+                    is_pub: false,
+                    span: expr.span,
+                });
+
+                let fn_sym_val = self.alloc_value();
+                self.emit(
+                    Some(fn_sym_val),
+                    ValueExpr::Constant(ConstantValue::String(lambda_fn_name)),
+                    expr.span,
+                );
+                let closure_val = self.alloc_value();
+                self.emit(
+                    Some(closure_val),
+                    ValueExpr::StructInit {
+                        name: closure_struct_name,
+                        fields: vec![fn_sym_val, env_inst_val],
+                    },
+                    expr.span,
+                );
+                closure_val
             }
 
             ExprKind::Comptime(inner) => {
@@ -4608,8 +4993,10 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
                         &module.structs,
                         &module.enums,
                     );
-                    let fir_func = ctx.lower(body);
+                    let (fir_func, lifted_funcs, lifted_structs) = ctx.lower(body);
                     module.functions.push(fir_func);
+                    module.functions.extend(lifted_funcs);
+                    module.structs.extend(lifted_structs);
                 }
             }
         }
@@ -4646,8 +5033,10 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
                     &module.structs,
                     &module.enums,
                 );
-                let fir_func = ctx.lower(body);
+                let (fir_func, lifted_funcs, lifted_structs) = ctx.lower(body);
                 module.functions.push(fir_func);
+                module.functions.extend(lifted_funcs);
+                module.structs.extend(lifted_structs);
             }
         }
     }

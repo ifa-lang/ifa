@@ -345,6 +345,26 @@ impl Type {
             return n1 == n2;
         }
 
+        // First-class functions and closures compatibility
+        if let (
+            Type::Fn {
+                params: p1,
+                ret: r1,
+            },
+            Type::Fn {
+                params: p2,
+                ret: r2,
+            },
+        ) = (self, target)
+        {
+            if p1.len() == p2.len() {
+                let params_match = p1.iter().zip(p2.iter()).all(|((m1, t1), (m2, t2))| {
+                    m1 == m2 && (t2.is_assignable_to(t1) || t1.is_assignable_to(t2))
+                });
+                return params_match && r1.is_assignable_to(r2);
+            }
+        }
+
         false
     }
 
@@ -554,6 +574,21 @@ impl Type {
                     .map(|t| Type::from_ast_with_generics(t, known_structs, known_enums, generics))
                     .collect();
                 Ok(Type::Tuple(resolved?))
+            }
+            AstTypeKind::Fn { params, ret } => {
+                let resolved_params: Result<Vec<(ParamMode, Type)>, Diagnostic> = params
+                    .iter()
+                    .map(|(mode, t)| {
+                        Type::from_ast_with_generics(t, known_structs, known_enums, generics)
+                            .map(|res| (*mode, res))
+                    })
+                    .collect();
+                let resolved_ret =
+                    Type::from_ast_with_generics(ret, known_structs, known_enums, generics)?;
+                Ok(Type::Fn {
+                    params: resolved_params?,
+                    ret: Box::new(resolved_ret),
+                })
             }
         }
     }

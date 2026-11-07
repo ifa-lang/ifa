@@ -1,8 +1,8 @@
 use crate::escape::EscapeAnalyzer;
 use crate::exclusivity::{check_assignment_target, check_call_exclusivity};
 use crate::symbol_table::{
-    ConstSymbol, EnumSymbol, FieldSymbol, FunctionSymbol, ParamSymbol, StructSymbol, SymbolTable,
-    TraitMethodSymbol, TraitSymbol,
+    CapturedVariable, ConstSymbol, EnumSymbol, FieldSymbol, FunctionSymbol, ParamSymbol,
+    StructSymbol, SymbolTable, TraitMethodSymbol, TraitSymbol,
 };
 use crate::types::{IntType, Type};
 use ifa_ast::{
@@ -2103,26 +2103,109 @@ impl<'a> SemanticAnalyzer<'a> {
                 Type::Tuple(types)
             }
             ExprKind::Unit => Type::Unit,
-            ExprKind::Lambda { params, body } => {
-                self.symbols.enter_scope(false, false);
+            ExprKind::Lambda {
+                params,
+                ret_ty,
+                body,
+            } => {
+                let lambda_id = self.symbols.next_lambda_id;
+                self.symbols.next_lambda_id += 1;
+                self.symbols.lambda_ids.insert(expr.span, lambda_id);
+
+                let (exp_params_opt, exp_ret_opt) = match expected {
+                    Some(Type::Fn {
+                        params: ep,
+                        ret: er,
+                    }) => (Some(ep), Some(er.as_ref())),
+                    Some(Type::Ref(inner)) => match inner.as_ref() {
+                        Type::Fn {
+                            params: ep,
+                            ret: er,
+                        } => (Some(ep), Some(er.as_ref())),
+                        _ => (None, None),
+                    },
+                    _ => (None, None),
+                };
+
+                let parent_depth = self.symbols.current_depth();
+                self.symbols.enter_scope(false, true);
+
                 let known_structs = self.get_known_struct_types();
                 let known_enums = self.get_known_enum_types();
                 let mut param_types = Vec::new();
-                for p in params {
-                    let ty = Type::from_ast(&p.ty, &known_structs, &known_enums)
-                        .unwrap_or(Type::Unknown);
-                    let _ =
-                        self.symbols
-                            .define_variable(p.name, ty.clone(), false, true, None, p.span);
+                let mut param_names = Vec::new();
+
+                for (i, p) in params.iter().enumerate() {
+                    param_names.push(p.name);
+                    let is_auto = match &p.ty.kind {
+                        ifa_ast::TypeKind::Named(s) => INTERNER.resolve(s) == "auto",
+                        _ => false,
+                    };
+
+                    let ty = if is_auto {
+                        if let Some(exp_params) = exp_params_opt {
+                            if let Some((_, exp_ty)) = exp_params.get(i) {
+                                exp_ty.clone()
+                            } else {
+                                Type::Int(IntType::I64)
+                            }
+                        } else {
+                            Type::Int(IntType::I64)
+                        }
+                    } else {
+                        Type::from_ast(&p.ty, &known_structs, &known_enums).unwrap_or(Type::Unknown)
+                    };
+
+                    let _ = self.symbols.define_variable(
+                        p.name,
+                        ty.clone(),
+                        false,
+                        true,
+                        Some(p.mode),
+                        p.span,
+                    );
                     param_types.push((p.mode, ty));
                 }
+
+                // Collect and register captured environment variables by generational ref
+                let captures =
+                    collect_lambda_free_variables(body, &param_names, parent_depth, &self.symbols);
+                for cap in &captures {
+                    if let Some(moved_span) = self.moved_vars.get(&cap.name) {
+                        let name_str = INTERNER.resolve(&cap.name);
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "capture de la variable déplacée '{}' impossible : la valeur a déjà été consommée par un transfert de propriété 'sink'",
+                                name_str
+                            ))
+                            .with_code("E0020")
+                            .with_primary_label(expr.span, "tentative de capture dans une clôture")
+                            .with_secondary_label(*moved_span, "valeur consommée par 'sink' ici"),
+                        );
+                    }
+                }
+                self.symbols.lambda_captures.insert(expr.span, captures);
+
+                let explicit_ret = ret_ty
+                    .as_ref()
+                    .and_then(|rt| Type::from_ast(rt, &known_structs, &known_enums).ok());
+                let expected_body_ret = explicit_ret.as_ref().or(exp_ret_opt);
+
                 let prev_ret = self.current_func_ret_ty.take();
-                let ret = self.check_block(body, None);
+                self.current_func_ret_ty = expected_body_ret.cloned();
+                let body_ty = self.check_block(body, expected_body_ret);
+                let inferred_ret = self.current_func_ret_ty.take();
                 self.current_func_ret_ty = prev_ret;
+
+                let final_ret = explicit_ret
+                    .or(exp_ret_opt.cloned())
+                    .or(inferred_ret)
+                    .unwrap_or(body_ty);
                 self.symbols.exit_scope();
+
                 Type::Fn {
                     params: param_types,
-                    ret: Box::new(ret),
+                    ret: Box::new(final_ret),
                 }
             }
             ExprKind::Spawn(inner) => {
@@ -3617,7 +3700,7 @@ impl<'a> SemanticAnalyzer<'a> {
             };
         }
 
-        // Check if callee is a known function
+        // Check if callee is a known function in the symbol table
         let fn_match = match &callee.kind {
             ExprKind::Ident(sym) => self.symbols.lookup_function(sym).cloned(),
             ExprKind::Path(path) => {
@@ -3629,6 +3712,89 @@ impl<'a> SemanticAnalyzer<'a> {
             }
             _ => None,
         };
+
+        // Check if callee is a local variable, closure, or expression of Type::Fn
+        let first_class_fn = match &callee.kind {
+            ExprKind::Ident(sym) => self.symbols.lookup_variable(sym).map(|v| v.ty.clone()),
+            _ => None,
+        }
+        .or_else(|| {
+            if fn_match.is_none() && !matches!(&callee.kind, ExprKind::Ident(_) | ExprKind::Path(_))
+            {
+                let inferred = self.infer_expr(callee);
+                if matches!(inferred, Type::Fn { .. } | Type::Ref(_)) {
+                    Some(inferred)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+
+        if let Some(ty) = first_class_fn {
+            let fn_sig = match ty {
+                Type::Fn { params, ret } => Some((params, *ret)),
+                Type::Ref(inner) => match *inner {
+                    Type::Fn { params, ret } => Some((params, *ret)),
+                    _ => None,
+                },
+                _ => None,
+            };
+
+            if let Some((sig_params, sig_ret)) = fn_sig {
+                let param_modes: Vec<ParamMode> = sig_params.iter().map(|(m, _)| *m).collect();
+                check_call_exclusivity(args, &param_modes, &self.symbols, &mut self.diagnostics);
+
+                if args.len() != sig_params.len() {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "la clôture attend {} argument(s), mais {} ont été fournis",
+                            sig_params.len(),
+                            args.len()
+                        ))
+                        .with_code("E0040")
+                        .with_primary_label(
+                            span,
+                            "nombre d'arguments incompatible pour l'appel de clôture",
+                        ),
+                    );
+                }
+
+                for (idx, arg) in args.iter().enumerate() {
+                    let expected_arg_ty = sig_params.get(idx).map(|(_, t)| t);
+                    let actual_ty = self.check_expr(&arg.value, expected_arg_ty);
+                    if let Some((_, expected_ty)) = sig_params.get(idx) {
+                        if !actual_ty.is_assignable_to(expected_ty) && actual_ty != Type::Unknown {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "type d'argument invalide à la position {} : attendu '{}', trouvé '{}'",
+                                    idx + 1,
+                                    expected_ty,
+                                    actual_ty
+                                ))
+                                .with_code("E0005")
+                                .with_primary_label(arg.span, "type d'argument incompatible"),
+                            );
+                        }
+                    }
+                    if matches!(
+                        &arg.value.kind,
+                        ExprKind::Unary {
+                            op: UnaryOp::Sink,
+                            ..
+                        }
+                    ) {
+                        if let Some((root_sym, _)) =
+                            crate::exclusivity::extract_root_variable(&arg.value)
+                        {
+                            self.moved_vars.insert(root_sym, arg.value.span);
+                        }
+                    }
+                }
+                return sig_ret;
+            }
+        }
 
         if let Some(f) = fn_match {
             self.check_function_call(&f, args, false, span)
@@ -4199,5 +4365,391 @@ impl<'a> SemanticAnalyzer<'a> {
         }
 
         Type::Unknown
+    }
+}
+
+/// Traverses an AST block to identify all free variables belonging to enclosing parent scopes
+/// that are captured by this lambda, returning them as generational reference captures.
+fn collect_lambda_free_variables(
+    body: &Block,
+    local_params: &[Symbol],
+    parent_depth: usize,
+    symbols: &SymbolTable,
+) -> Vec<CapturedVariable> {
+    let mut captured = Vec::new();
+    let mut seen = HashSet::new();
+    let mut local_vars = HashSet::new();
+    for p in local_params {
+        local_vars.insert(*p);
+    }
+    collect_captures_in_block(
+        body,
+        parent_depth,
+        symbols,
+        &mut local_vars,
+        &mut seen,
+        &mut captured,
+    );
+    captured
+}
+
+fn collect_captures_in_block(
+    block: &Block,
+    parent_depth: usize,
+    symbols: &SymbolTable,
+    local_vars: &mut HashSet<Symbol>,
+    seen: &mut HashSet<Symbol>,
+    captured: &mut Vec<CapturedVariable>,
+) {
+    let mut scope_locals = local_vars.clone();
+    for stmt in &block.stmts {
+        collect_captures_in_stmt(
+            stmt,
+            parent_depth,
+            symbols,
+            &mut scope_locals,
+            seen,
+            captured,
+        );
+    }
+    if let Some(e) = &block.expr {
+        collect_captures_in_expr(e, parent_depth, symbols, &scope_locals, seen, captured);
+    }
+}
+
+fn collect_captures_in_stmt(
+    stmt: &Stmt,
+    parent_depth: usize,
+    symbols: &SymbolTable,
+    local_vars: &mut HashSet<Symbol>,
+    seen: &mut HashSet<Symbol>,
+    captured: &mut Vec<CapturedVariable>,
+) {
+    match stmt {
+        Stmt::Let {
+            pattern,
+            init,
+            else_block,
+            ..
+        } => {
+            if let Some(e) = init {
+                collect_captures_in_expr(e, parent_depth, symbols, local_vars, seen, captured);
+            }
+            if let Some(eb) = else_block {
+                collect_captures_in_block(eb, parent_depth, symbols, local_vars, seen, captured);
+            }
+            for (sym, _) in pattern.bound_variables() {
+                local_vars.insert(sym);
+            }
+        }
+        Stmt::Assign { target, val, .. } => {
+            collect_captures_in_expr(target, parent_depth, symbols, local_vars, seen, captured);
+            collect_captures_in_expr(val, parent_depth, symbols, local_vars, seen, captured);
+        }
+        Stmt::AssignPattern {
+            pattern,
+            val,
+            else_block,
+            ..
+        } => {
+            collect_captures_in_expr(val, parent_depth, symbols, local_vars, seen, captured);
+            if let Some(eb) = else_block {
+                collect_captures_in_block(eb, parent_depth, symbols, local_vars, seen, captured);
+            }
+            for (sym, _) in pattern.bound_variables() {
+                local_vars.insert(sym);
+            }
+        }
+        Stmt::Expr(e) => {
+            collect_captures_in_expr(e, parent_depth, symbols, local_vars, seen, captured)
+        }
+        Stmt::Defer(b, _) => {
+            collect_captures_in_block(b, parent_depth, symbols, local_vars, seen, captured)
+        }
+        Stmt::Return(e, _) => {
+            if let Some(expr) = e {
+                collect_captures_in_expr(expr, parent_depth, symbols, local_vars, seen, captured);
+            }
+        }
+        Stmt::Fail(e, _) => {
+            collect_captures_in_expr(e, parent_depth, symbols, local_vars, seen, captured)
+        }
+        Stmt::While { cond, body, .. } => {
+            collect_captures_in_expr(cond, parent_depth, symbols, local_vars, seen, captured);
+            collect_captures_in_block(body, parent_depth, symbols, local_vars, seen, captured);
+        }
+        Stmt::WhileLet {
+            pattern,
+            expr,
+            guard,
+            body,
+            ..
+        } => {
+            collect_captures_in_expr(expr, parent_depth, symbols, local_vars, seen, captured);
+            let mut loop_locals = local_vars.clone();
+            for (sym, _) in pattern.bound_variables() {
+                loop_locals.insert(sym);
+            }
+            if let Some(g) = guard {
+                collect_captures_in_expr(g, parent_depth, symbols, &loop_locals, seen, captured);
+            }
+            collect_captures_in_block(
+                body,
+                parent_depth,
+                symbols,
+                &mut loop_locals,
+                seen,
+                captured,
+            );
+        }
+        Stmt::For {
+            pattern,
+            iterable,
+            body,
+            ..
+        } => {
+            collect_captures_in_expr(iterable, parent_depth, symbols, local_vars, seen, captured);
+            let mut loop_locals = local_vars.clone();
+            for (sym, _) in pattern.bound_variables() {
+                loop_locals.insert(sym);
+            }
+            collect_captures_in_block(
+                body,
+                parent_depth,
+                symbols,
+                &mut loop_locals,
+                seen,
+                captured,
+            );
+        }
+        Stmt::Loop(b, _) => {
+            collect_captures_in_block(b, parent_depth, symbols, local_vars, seen, captured)
+        }
+        Stmt::Break(_) | Stmt::Continue(_) => {}
+    }
+}
+
+fn collect_captures_in_expr(
+    expr: &Expr,
+    parent_depth: usize,
+    symbols: &SymbolTable,
+    local_vars: &HashSet<Symbol>,
+    seen: &mut HashSet<Symbol>,
+    captured: &mut Vec<CapturedVariable>,
+) {
+    match &expr.kind {
+        ExprKind::Ident(sym) => {
+            if !local_vars.contains(sym) && seen.insert(*sym) {
+                if let Some(var) = symbols.lookup_variable(sym) {
+                    if var.scope_depth <= parent_depth {
+                        captured.push(CapturedVariable {
+                            name: *sym,
+                            ty: var.ty.clone(),
+                            is_ref: true,
+                            span: var.span,
+                        });
+                    }
+                }
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_captures_in_expr(left, parent_depth, symbols, local_vars, seen, captured);
+            collect_captures_in_expr(right, parent_depth, symbols, local_vars, seen, captured);
+        }
+        ExprKind::Unary { expr: inner, .. } => {
+            collect_captures_in_expr(inner, parent_depth, symbols, local_vars, seen, captured);
+        }
+        ExprKind::Call { callee, args } => {
+            collect_captures_in_expr(callee, parent_depth, symbols, local_vars, seen, captured);
+            for a in args {
+                collect_captures_in_expr(
+                    &a.value,
+                    parent_depth,
+                    symbols,
+                    local_vars,
+                    seen,
+                    captured,
+                );
+            }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            collect_captures_in_expr(receiver, parent_depth, symbols, local_vars, seen, captured);
+            for a in args {
+                collect_captures_in_expr(
+                    &a.value,
+                    parent_depth,
+                    symbols,
+                    local_vars,
+                    seen,
+                    captured,
+                );
+            }
+        }
+        ExprKind::FieldAccess { receiver, .. } => {
+            collect_captures_in_expr(receiver, parent_depth, symbols, local_vars, seen, captured);
+        }
+        ExprKind::Index { receiver, index } => {
+            collect_captures_in_expr(receiver, parent_depth, symbols, local_vars, seen, captured);
+            collect_captures_in_expr(index, parent_depth, symbols, local_vars, seen, captured);
+        }
+        ExprKind::Array(elems) => {
+            for e in elems {
+                collect_captures_in_expr(e, parent_depth, symbols, local_vars, seen, captured);
+            }
+        }
+        ExprKind::ArrayRepeat(val, count) => {
+            collect_captures_in_expr(val, parent_depth, symbols, local_vars, seen, captured);
+            collect_captures_in_expr(count, parent_depth, symbols, local_vars, seen, captured);
+        }
+        ExprKind::Record(fields) => {
+            for (_, val) in fields {
+                collect_captures_in_expr(val, parent_depth, symbols, local_vars, seen, captured);
+            }
+        }
+        ExprKind::Block(blk) => {
+            let mut blk_locals = local_vars.clone();
+            collect_captures_in_block(blk, parent_depth, symbols, &mut blk_locals, seen, captured);
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_captures_in_expr(cond, parent_depth, symbols, local_vars, seen, captured);
+            let mut then_locals = local_vars.clone();
+            collect_captures_in_block(
+                then_branch,
+                parent_depth,
+                symbols,
+                &mut then_locals,
+                seen,
+                captured,
+            );
+            if let Some(el) = else_branch {
+                collect_captures_in_expr(el, parent_depth, symbols, local_vars, seen, captured);
+            }
+        }
+        ExprKind::IfLet {
+            pattern,
+            expr: inner,
+            guard,
+            then_branch,
+            else_branch,
+        } => {
+            collect_captures_in_expr(inner, parent_depth, symbols, local_vars, seen, captured);
+            let mut branch_locals = local_vars.clone();
+            for (sym, _) in pattern.bound_variables() {
+                branch_locals.insert(sym);
+            }
+            if let Some(g) = guard {
+                collect_captures_in_expr(g, parent_depth, symbols, &branch_locals, seen, captured);
+            }
+            collect_captures_in_block(
+                then_branch,
+                parent_depth,
+                symbols,
+                &mut branch_locals,
+                seen,
+                captured,
+            );
+            if let Some(el) = else_branch {
+                collect_captures_in_expr(el, parent_depth, symbols, local_vars, seen, captured);
+            }
+        }
+        ExprKind::Match { expr: inner, arms } => {
+            collect_captures_in_expr(inner, parent_depth, symbols, local_vars, seen, captured);
+            for arm in arms {
+                let mut arm_locals = local_vars.clone();
+                for (sym, _) in arm.pattern.bound_variables() {
+                    arm_locals.insert(sym);
+                }
+                if let Some(g) = &arm.guard {
+                    collect_captures_in_expr(g, parent_depth, symbols, &arm_locals, seen, captured);
+                }
+                collect_captures_in_expr(
+                    &arm.body,
+                    parent_depth,
+                    symbols,
+                    &arm_locals,
+                    seen,
+                    captured,
+                );
+            }
+        }
+        ExprKind::Select { arms } => {
+            for arm in arms {
+                if let Some(chan) = &arm.channel {
+                    collect_captures_in_expr(
+                        chan,
+                        parent_depth,
+                        symbols,
+                        local_vars,
+                        seen,
+                        captured,
+                    );
+                }
+                let mut arm_locals = local_vars.clone();
+                if let Some(pat) = &arm.pattern {
+                    for (sym, _) in pat.bound_variables() {
+                        arm_locals.insert(sym);
+                    }
+                }
+                collect_captures_in_expr(
+                    &arm.body,
+                    parent_depth,
+                    symbols,
+                    &arm_locals,
+                    seen,
+                    captured,
+                );
+            }
+        }
+        ExprKind::Spawn(e) | ExprKind::Comptime(e) => {
+            collect_captures_in_expr(e, parent_depth, symbols, local_vars, seen, captured);
+        }
+        ExprKind::Catch {
+            expr: inner,
+            err_var,
+            body,
+        } => {
+            collect_captures_in_expr(inner, parent_depth, symbols, local_vars, seen, captured);
+            let mut catch_locals = local_vars.clone();
+            if let Some(ev) = err_var {
+                catch_locals.insert(*ev);
+            }
+            collect_captures_in_block(
+                body,
+                parent_depth,
+                symbols,
+                &mut catch_locals,
+                seen,
+                captured,
+            );
+        }
+        ExprKind::StructInit { fields, .. } => {
+            for (_, val) in fields {
+                collect_captures_in_expr(val, parent_depth, symbols, local_vars, seen, captured);
+            }
+        }
+        ExprKind::Tuple(elems) => {
+            for e in elems {
+                collect_captures_in_expr(e, parent_depth, symbols, local_vars, seen, captured);
+            }
+        }
+        ExprKind::Lambda { params, body, .. } => {
+            let mut nested_locals = local_vars.clone();
+            for p in params {
+                nested_locals.insert(p.name);
+            }
+            collect_captures_in_block(
+                body,
+                parent_depth,
+                symbols,
+                &mut nested_locals,
+                seen,
+                captured,
+            );
+        }
+        _ => {}
     }
 }

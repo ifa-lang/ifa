@@ -70,6 +70,13 @@ pub fn format_ast_type(ty: &ifa_ast::Type) -> String {
             let parts: Vec<String> = types.iter().map(format_ast_type).collect();
             format!("({})", parts.join(", "))
         }
+        ifa_ast::TypeKind::Fn { params, ret } => {
+            let parts: Vec<String> = params
+                .iter()
+                .map(|(m, t)| format!("{}{}", m, format_ast_type(t)))
+                .collect();
+            format!("fn({}) -> {}", parts.join(", "), format_ast_type(ret))
+        }
         ifa_ast::TypeKind::Unit => "()".to_string(),
     }
 }
