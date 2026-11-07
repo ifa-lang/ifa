@@ -2598,3 +2598,70 @@ fn test_destructuring_assignment_refutable_error() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_duplicate_pattern_binding_error() {
+    let code = r#"
+        pub fn main() {
+            let (x, x) = (10, 20);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Duplicate pattern binding 'x' must produce error E0048"
+    );
+    let has_e0048 = res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0048"));
+    assert!(has_e0048, "Expected E0048, got: {:?}", res.diagnostics);
+}
+
+#[test]
+fn test_inout_binding_on_immutable_source_error() {
+    let code = r#"
+        struct Point {
+            x: i64,
+            y: i64,
+        }
+
+        pub fn main() {
+            let p = Point(x: 1, y: 2);
+            let Point { inout x, y } = p;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Inout binding on immutable variable 'p' must produce error E0010"
+    );
+    let has_e0010 = res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0010"));
+    assert!(has_e0010, "Expected E0010, got: {:?}", res.diagnostics);
+}
+
+#[test]
+fn test_inout_and_mut_binding_patterns_valid() {
+    let code = r#"
+        struct Point {
+            x: i64,
+            y: i64,
+        }
+
+        pub fn main() {
+            mut p = Point(x: 10, y: 20);
+            let Point { inout x, mut y } = p;
+            x = x + 5;
+            y = y + 10;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Valid inout and mut pattern bindings should succeed: {:?}",
+        res.diagnostics
+    );
+}

@@ -143,12 +143,21 @@ pub enum ValueExpr {
         field_idx: usize,
         field_name: Symbol,
     },
+    GetFieldPtr {
+        base: ValueId,
+        field_idx: usize,
+        field_name: Symbol,
+    },
     SetField {
         base: ValueId,
         field_idx: usize,
         val: ValueId,
     },
     GetElement {
+        base: ValueId,
+        index: ValueId,
+    },
+    GetElementPtr {
         base: ValueId,
         index: ValueId,
     },
@@ -272,9 +281,13 @@ impl ValueExpr {
             ValueExpr::Store { ptr, val } => vec![*ptr, *val],
             ValueExpr::Binary { lhs, rhs, .. } => vec![*lhs, *rhs],
             ValueExpr::Unary { val, .. } => vec![*val],
-            ValueExpr::GetField { base, .. } => vec![*base],
+            ValueExpr::GetField { base, .. } | ValueExpr::GetFieldPtr { base, .. } => {
+                vec![*base]
+            }
             ValueExpr::SetField { base, val, .. } => vec![*base, *val],
-            ValueExpr::GetElement { base, index } => vec![*base, *index],
+            ValueExpr::GetElement { base, index } | ValueExpr::GetElementPtr { base, index } => {
+                vec![*base, *index]
+            }
             ValueExpr::SetElement { base, index, val } => vec![*base, *index, *val],
             ValueExpr::Call { callee, args } => {
                 let mut u = vec![*callee];

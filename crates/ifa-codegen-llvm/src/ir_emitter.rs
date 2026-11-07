@@ -1187,6 +1187,20 @@ impl<'a> LlvmIrEmitter<'a> {
                     out.push_str(&format!("  %v{} = load i64, ptr %gep_{}\n", res_id, res_id));
                 }
             }
+            ValueExpr::GetFieldPtr {
+                base, field_idx, ..
+            } => {
+                out.push_str(&format!(
+                    "  %v{} = getelementptr inbounds i64, ptr %v{}, i32 {}\n",
+                    res_id, base.0, field_idx
+                ));
+            }
+            ValueExpr::GetElementPtr { base, index } => {
+                out.push_str(&format!(
+                    "  %v{} = getelementptr inbounds i64, ptr %v{}, i64 %v{}\n",
+                    res_id, base.0, index.0
+                ));
+            }
             ValueExpr::GetElement { base, index } => {
                 let (elem_ty_str, align) = match value_types.get(base) {
                     Some(ifa_fir::FirType::Array(inner, _))

@@ -1121,3 +1121,105 @@ fn test_destructuring_assignment_struct_and_slice_interp() {
     let res = interp.execute_function("main", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(100));
 }
+
+#[test]
+fn test_pattern_binding_mode_inout_struct_interp() {
+    let src = r#"
+        struct Counter {
+            count: i64,
+            tag: i64,
+        }
+
+        pub fn main() -> i64 {
+            mut c = Counter(count: 40, tag: 2);
+            let Counter { inout count, tag } = c;
+            count = count + 2;
+            return c.count + tag;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("binding_mode_inout.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(44));
+}
+
+#[test]
+fn test_pattern_binding_mode_mut_interp() {
+    let src = r#"
+        pub fn main() -> i64 {
+            let (mut a, b) = (10, 20);
+            a = a + 5;
+            return a + b;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("binding_mode_mut.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(35));
+}
+
+#[test]
+fn test_pattern_binding_match_inout_interp() {
+    let src = r#"
+        struct Point {
+            x: i64,
+            y: i64,
+        }
+
+        pub fn main() -> i64 {
+            mut pt = Point(x: 15, y: 30);
+            match pt {
+                Point { inout x, .. } => {
+                    x = x * 2;
+                }
+            }
+            return pt.x + pt.y;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("binding_mode_match_inout.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(60));
+}

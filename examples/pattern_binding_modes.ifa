@@ -1,0 +1,36 @@
+// Exemples idiomatiques des modes de liaison dans les motifs IFA: `mut`, `ref` et `inout`.
+// Illustre la mutation locale directe, l'emprunt et la mise à jour exclusive en place.
+
+struct DeviceState {
+    device_id: i64,
+    power_level: i64,
+    status_code: i64,
+}
+
+fn update_device_in_place(inout device: DeviceState) -> i64 {
+    // Liaison exclusive inout directement sur le champ power_level
+    let DeviceState { inout power_level, status_code, .. } = device;
+    power_level = power_level + 15;
+    return power_level + status_code;
+}
+
+fn calibrate_offsets(coords: (i64, i64)) -> i64 {
+    // Liaison mutable locale `mut x` au sein d'un tuple
+    let (mut x, y) = coords;
+    x = x + 100;
+    return x + y;
+}
+
+pub fn main() -> i64 {
+    let pair_sum = calibrate_offsets((50, 25)); // 150 + 25 = 175
+
+    mut dev = DeviceState(
+        device_id: 101,
+        power_level: 80,
+        status_code: 200,
+    );
+
+    let dev_metric = update_device_in_place(inout dev); // power_level devient 95, metric = 95 + 200 = 295
+
+    return pair_sum + dev_metric + dev.power_level; // 175 + 295 + 95 = 565
+}

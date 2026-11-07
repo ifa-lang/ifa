@@ -1,7 +1,8 @@
 use crate::ir::*;
 use crate::types::FirType;
 use ifa_ast::{
-    AssignOp, BinOp, Block, Expr, ExprKind, Item, Lit, Pattern, Program, SelectArm, Stmt, UnaryOp,
+    AssignOp, BinOp, BindingMode, Block, Expr, ExprKind, Item, Lit, Pattern, Program, SelectArm,
+    Stmt, UnaryOp,
 };
 use ifa_sema::types::{FloatType, IntType};
 use ifa_sema::SymbolTable;
@@ -21,6 +22,29 @@ fn comptime_val_to_constant(val: &ifa_comptime::Value) -> Option<ConstantValue> 
     }
 }
 
+fn pattern_needs_pointer(pat: &Pattern) -> bool {
+    match pat {
+        Pattern::Binding { mode, .. } => matches!(mode, BindingMode::InOut | BindingMode::Ref),
+        Pattern::Tuple(elems, _) | Pattern::Or(elems, _) => elems.iter().any(pattern_needs_pointer),
+        Pattern::Struct { fields, .. } => fields.iter().any(|f| pattern_needs_pointer(&f.pattern)),
+        Pattern::Slice {
+            prefix,
+            rest,
+            suffix,
+            ..
+        } => {
+            prefix.iter().any(pattern_needs_pointer)
+                || rest
+                    .as_ref()
+                    .and_then(|r| r.as_ref())
+                    .is_some_and(|p| pattern_needs_pointer(p))
+                || suffix.iter().any(pattern_needs_pointer)
+        }
+        Pattern::Variant { inner: Some(p), .. } => pattern_needs_pointer(p),
+        _ => false,
+    }
+}
+
 /// Loop control flow contexts for break and continue statements.
 #[derive(Debug, Clone)]
 struct LoopContext {
@@ -34,6 +58,8 @@ struct FunctionLoweringContext<'a> {
     current_block: BlockId,
     /// Maps source variables to their alloca pointer in SSA FIR
     var_allocas: HashMap<Symbol, ValueId>,
+    /// Maps loaded/derived SSA values to their underlying memory alloca or derived pointer
+    val_ptrs: HashMap<ValueId, ValueId>,
     /// Maps source variables to their FIR type
     var_types: HashMap<Symbol, FirType>,
     symbols: &'a SymbolTable,
@@ -133,6 +159,7 @@ impl<'a> FunctionLoweringContext<'a> {
             func,
             current_block: entry,
             var_allocas: HashMap::new(),
+            val_ptrs: HashMap::new(),
             var_types: HashMap::new(),
             symbols,
             constants,
@@ -738,7 +765,12 @@ impl<'a> FunctionLoweringContext<'a> {
                 let init_val = init.as_ref().map(|e| self.lower_expr(e));
 
                 match pattern {
-                    Pattern::Ident(name, p_span) => {
+                    Pattern::Ident(name, p_span)
+                    | Pattern::Binding {
+                        mode: BindingMode::Value | BindingMode::Mut,
+                        name,
+                        span: p_span,
+                    } => {
                         let ty = if let Some(init_expr) = init {
                             if let Some(inferred) = self.infer_expr_fir_type(init_expr) {
                                 inferred
@@ -783,6 +815,110 @@ impl<'a> FunctionLoweringContext<'a> {
 
                         self.var_allocas.insert(*name, ptr);
                         self.var_types.insert(*name, ty);
+                    }
+                    Pattern::Binding {
+                        mode: BindingMode::InOut,
+                        name,
+                        span: p_span,
+                    } => {
+                        let ty = if let Some(init_expr) = init {
+                            if let Some(inferred) = self.infer_expr_fir_type(init_expr) {
+                                inferred
+                            } else if let Some(var_sym) = self.symbols.lookup_variable(name) {
+                                let substituted = var_sym.ty.substitute(&self.type_subst);
+                                FirType::from_sema_type(&substituted)
+                            } else {
+                                FirType::Int(IntType::I64)
+                            }
+                        } else {
+                            FirType::Int(IntType::I64)
+                        };
+
+                        let ptr = if let Some(val) = init_val {
+                            if let Some(src_ptr) = self.val_ptrs.get(&val).copied() {
+                                src_ptr
+                            } else {
+                                let p = self.alloc_value();
+                                self.emit(
+                                    Some(p),
+                                    ValueExpr::Alloca {
+                                        ty: ty.clone(),
+                                        name: Some(*name),
+                                    },
+                                    *p_span,
+                                );
+                                self.emit(None, ValueExpr::Store { ptr: p, val }, *p_span);
+                                p
+                            }
+                        } else {
+                            let p = self.alloc_value();
+                            self.emit(
+                                Some(p),
+                                ValueExpr::Alloca {
+                                    ty: ty.clone(),
+                                    name: Some(*name),
+                                },
+                                *p_span,
+                            );
+                            p
+                        };
+                        self.var_allocas.insert(*name, ptr);
+                        self.var_types.insert(*name, ty);
+                    }
+                    Pattern::Binding {
+                        mode: BindingMode::Ref,
+                        name,
+                        span: p_span,
+                    } => {
+                        let inner_ty = if let Some(init_expr) = init {
+                            if let Some(inferred) = self.infer_expr_fir_type(init_expr) {
+                                inferred
+                            } else {
+                                FirType::Int(IntType::I64)
+                            }
+                        } else {
+                            FirType::Int(IntType::I64)
+                        };
+                        let ref_ty = FirType::Pointer(Box::new(inner_ty));
+
+                        let ptr_to_ref = if let Some(val) = init_val {
+                            self.val_ptrs.get(&val).copied().unwrap_or(val)
+                        } else {
+                            let zero = self.alloc_value();
+                            self.emit(
+                                Some(zero),
+                                ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                                *p_span,
+                            );
+                            zero
+                        };
+
+                        let gen_ref = self.alloc_value();
+                        self.emit(
+                            Some(gen_ref),
+                            ValueExpr::GenRef { ptr: ptr_to_ref },
+                            *p_span,
+                        );
+
+                        let var_ptr = self.alloc_value();
+                        self.emit(
+                            Some(var_ptr),
+                            ValueExpr::Alloca {
+                                ty: ref_ty.clone(),
+                                name: Some(*name),
+                            },
+                            *p_span,
+                        );
+                        self.emit(
+                            None,
+                            ValueExpr::Store {
+                                ptr: var_ptr,
+                                val: gen_ref,
+                            },
+                            *p_span,
+                        );
+                        self.var_allocas.insert(*name, var_ptr);
+                        self.var_types.insert(*name, ref_ty);
                     }
                     _ => {
                         if let Some(val) = init_val {
@@ -1421,6 +1557,7 @@ impl<'a> FunctionLoweringContext<'a> {
                 } else if let Some(&ptr) = self.var_allocas.get(sym) {
                     let res = self.alloc_value();
                     self.emit(Some(res), ValueExpr::Load { ptr }, span);
+                    self.val_ptrs.insert(res, ptr);
                     res
                 } else if let Some(val) = self.symbols.comptime_values.get(sym) {
                     if let Some(c) = comptime_val_to_constant(val) {
@@ -3248,6 +3385,129 @@ impl<'a> FunctionLoweringContext<'a> {
                     args: Vec::new(),
                 });
             }
+            Pattern::Binding {
+                mode,
+                name: sym,
+                span: p_span,
+            } => match mode {
+                BindingMode::InOut => {
+                    let var_ptr = if let Some(derived_ptr) = self.val_ptrs.get(&target_val).copied()
+                    {
+                        derived_ptr
+                    } else if let Some(existing_ptr) = self.var_allocas.get(sym).copied() {
+                        existing_ptr
+                    } else {
+                        let ptr = self.alloc_value();
+                        let inst = Instruction::new(
+                            Some(ptr),
+                            ValueExpr::Alloca {
+                                ty: target_ty.clone(),
+                                name: Some(*sym),
+                            },
+                            *p_span,
+                        );
+                        let entry = self.func.entry_block;
+                        if let Some(block) = self.func.get_block_mut(entry) {
+                            block.instructions.insert(0, inst);
+                        }
+                        self.emit(
+                            None,
+                            ValueExpr::Store {
+                                ptr,
+                                val: target_val,
+                            },
+                            *p_span,
+                        );
+                        ptr
+                    };
+                    self.var_allocas.insert(*sym, var_ptr);
+                    self.var_types.insert(*sym, target_ty.clone());
+                    self.set_terminator(Terminator::Branch {
+                        target: success_target,
+                        args: Vec::new(),
+                    });
+                }
+                BindingMode::Ref => {
+                    let ref_ty = FirType::Pointer(Box::new(target_ty.clone()));
+                    let var_ptr = if let Some(existing_ptr) = self.var_allocas.get(sym).copied() {
+                        existing_ptr
+                    } else {
+                        let ptr = self.alloc_value();
+                        let inst = Instruction::new(
+                            Some(ptr),
+                            ValueExpr::Alloca {
+                                ty: ref_ty.clone(),
+                                name: Some(*sym),
+                            },
+                            *p_span,
+                        );
+                        let entry = self.func.entry_block;
+                        if let Some(block) = self.func.get_block_mut(entry) {
+                            block.instructions.insert(0, inst);
+                        }
+                        self.var_allocas.insert(*sym, ptr);
+                        self.var_types.insert(*sym, ref_ty);
+                        ptr
+                    };
+                    let ptr_to_ref = self
+                        .val_ptrs
+                        .get(&target_val)
+                        .copied()
+                        .unwrap_or(target_val);
+                    let gen_ref = self.alloc_value();
+                    self.emit(
+                        Some(gen_ref),
+                        ValueExpr::GenRef { ptr: ptr_to_ref },
+                        *p_span,
+                    );
+                    self.emit(
+                        None,
+                        ValueExpr::Store {
+                            ptr: var_ptr,
+                            val: gen_ref,
+                        },
+                        *p_span,
+                    );
+                    self.set_terminator(Terminator::Branch {
+                        target: success_target,
+                        args: Vec::new(),
+                    });
+                }
+                BindingMode::Value | BindingMode::Mut => {
+                    let var_ptr = if let Some(existing_ptr) = self.var_allocas.get(sym).copied() {
+                        existing_ptr
+                    } else {
+                        let ptr = self.alloc_value();
+                        let inst = Instruction::new(
+                            Some(ptr),
+                            ValueExpr::Alloca {
+                                ty: target_ty.clone(),
+                                name: Some(*sym),
+                            },
+                            *p_span,
+                        );
+                        let entry = self.func.entry_block;
+                        if let Some(block) = self.func.get_block_mut(entry) {
+                            block.instructions.insert(0, inst);
+                        }
+                        self.var_allocas.insert(*sym, ptr);
+                        self.var_types.insert(*sym, target_ty.clone());
+                        ptr
+                    };
+                    self.emit(
+                        None,
+                        ValueExpr::Store {
+                            ptr: var_ptr,
+                            val: target_val,
+                        },
+                        *p_span,
+                    );
+                    self.set_terminator(Terminator::Branch {
+                        target: success_target,
+                        args: Vec::new(),
+                    });
+                }
+            },
             Pattern::Variant {
                 enum_name,
                 variant,
@@ -3380,6 +3640,48 @@ impl<'a> FunctionLoweringContext<'a> {
                         *t_span,
                     );
 
+                    if pattern_needs_pointer(sub_pat) {
+                        let base_ptr = self.val_ptrs.get(&target_val).copied().or_else(|| {
+                            let ptr = self.alloc_value();
+                            let inst = Instruction::new(
+                                Some(ptr),
+                                ValueExpr::Alloca {
+                                    ty: target_ty.clone(),
+                                    name: None,
+                                },
+                                *t_span,
+                            );
+                            let entry = self.func.entry_block;
+                            if let Some(block) = self.func.get_block_mut(entry) {
+                                block.instructions.insert(0, inst);
+                            }
+                            self.emit(
+                                None,
+                                ValueExpr::Store {
+                                    ptr,
+                                    val: target_val,
+                                },
+                                *t_span,
+                            );
+                            self.val_ptrs.insert(target_val, ptr);
+                            Some(ptr)
+                        });
+
+                        if let Some(bp) = base_ptr {
+                            let elem_ptr = self.alloc_value();
+                            self.emit(
+                                Some(elem_ptr),
+                                ValueExpr::GetFieldPtr {
+                                    base: bp,
+                                    field_idx: idx,
+                                    field_name,
+                                },
+                                *t_span,
+                            );
+                            self.val_ptrs.insert(elem_val, elem_ptr);
+                        }
+                    }
+
                     self.lower_pattern_match(
                         elem_val,
                         &elem_fir_ty,
@@ -3469,6 +3771,48 @@ impl<'a> FunctionLoweringContext<'a> {
                         },
                         f.span,
                     );
+
+                    if pattern_needs_pointer(&f.pattern) {
+                        let base_ptr = self.val_ptrs.get(&target_val).copied().or_else(|| {
+                            let ptr = self.alloc_value();
+                            let inst = Instruction::new(
+                                Some(ptr),
+                                ValueExpr::Alloca {
+                                    ty: target_ty.clone(),
+                                    name: None,
+                                },
+                                *s_span,
+                            );
+                            let entry = self.func.entry_block;
+                            if let Some(block) = self.func.get_block_mut(entry) {
+                                block.instructions.insert(0, inst);
+                            }
+                            self.emit(
+                                None,
+                                ValueExpr::Store {
+                                    ptr,
+                                    val: target_val,
+                                },
+                                *s_span,
+                            );
+                            self.val_ptrs.insert(target_val, ptr);
+                            Some(ptr)
+                        });
+
+                        if let Some(bp) = base_ptr {
+                            let f_ptr = self.alloc_value();
+                            self.emit(
+                                Some(f_ptr),
+                                ValueExpr::GetFieldPtr {
+                                    base: bp,
+                                    field_idx,
+                                    field_name: f.name,
+                                },
+                                f.span,
+                            );
+                            self.val_ptrs.insert(field_val, f_ptr);
+                        }
+                    }
 
                     self.lower_pattern_match(
                         field_val,
@@ -3779,6 +4123,21 @@ impl<'a> FunctionLoweringContext<'a> {
                         p.span(),
                     );
 
+                    if pattern_needs_pointer(p) {
+                        if let Some(bp) = self.val_ptrs.get(&target_val).copied() {
+                            let elem_ptr = self.alloc_value();
+                            self.emit(
+                                Some(elem_ptr),
+                                ValueExpr::GetElementPtr {
+                                    base: bp,
+                                    index: idx_val,
+                                },
+                                p.span(),
+                            );
+                            self.val_ptrs.insert(elem_val, elem_ptr);
+                        }
+                    }
+
                     self.lower_pattern_match(
                         elem_val,
                         &elem_fir_ty,
@@ -3938,6 +4297,21 @@ impl<'a> FunctionLoweringContext<'a> {
                         },
                         s.span(),
                     );
+
+                    if pattern_needs_pointer(s) {
+                        if let Some(bp) = self.val_ptrs.get(&target_val).copied() {
+                            let elem_ptr = self.alloc_value();
+                            self.emit(
+                                Some(elem_ptr),
+                                ValueExpr::GetElementPtr {
+                                    base: bp,
+                                    index: idx_val,
+                                },
+                                s.span(),
+                            );
+                            self.val_ptrs.insert(elem_val, elem_ptr);
+                        }
+                    }
 
                     self.lower_pattern_match(
                         elem_val,

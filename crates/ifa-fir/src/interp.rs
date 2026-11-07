@@ -13,6 +13,14 @@ pub enum FirValue {
     Float(f64),
     String(String),
     Pointer(usize),
+    FieldPointer {
+        base_addr: usize,
+        field_idx: usize,
+    },
+    ElementPointer {
+        base_addr: usize,
+        index: usize,
+    },
     GenRef {
         slot: usize,
         generation: u32,
@@ -62,6 +70,13 @@ impl fmt::Display for FirValue {
             FirValue::Float(fl) => write!(f, "{}", fl),
             FirValue::String(s) => write!(f, "{}", s),
             FirValue::Pointer(addr) => write!(f, "ptr(0x{:x})", addr),
+            FirValue::FieldPointer {
+                base_addr,
+                field_idx,
+            } => write!(f, "field_ptr(0x{:x}.#{})", base_addr, field_idx),
+            FirValue::ElementPointer { base_addr, index } => {
+                write!(f, "elem_ptr(0x{:x}[{}])", base_addr, index)
+            }
             FirValue::GenRef { slot, generation } => {
                 write!(f, "ref(slot={}, gen={})", slot, generation)
             }
@@ -517,6 +532,55 @@ impl<'a> FirInterpreter<'a> {
                         self.stack_memory.insert(*addr, val_to_store);
                         Ok(FirValue::Unit)
                     }
+                    FirValue::FieldPointer {
+                        base_addr,
+                        field_idx,
+                    } => {
+                        let target = self
+                            .stack_memory
+                            .get_mut(base_addr)
+                            .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                        match target {
+                            FirValue::Struct { fields, .. } | FirValue::Tuple(fields) => {
+                                if let Some(slot) = fields.get_mut(*field_idx) {
+                                    *slot = val_to_store;
+                                    Ok(FirValue::Unit)
+                                } else {
+                                    Err(InterpError::Panic(format!(
+                                        "Field index {} out of bounds",
+                                        field_idx
+                                    )))
+                                }
+                            }
+                            other => Err(InterpError::TypeMismatch(format!(
+                                "FieldPointer target must be struct or tuple, got {}",
+                                other
+                            ))),
+                        }
+                    }
+                    FirValue::ElementPointer { base_addr, index } => {
+                        let target = self
+                            .stack_memory
+                            .get_mut(base_addr)
+                            .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                        match target {
+                            FirValue::Array(elements) => {
+                                if let Some(slot) = elements.get_mut(*index) {
+                                    *slot = val_to_store;
+                                    Ok(FirValue::Unit)
+                                } else {
+                                    Err(InterpError::Panic(format!(
+                                        "Element index {} out of bounds",
+                                        index
+                                    )))
+                                }
+                            }
+                            other => Err(InterpError::TypeMismatch(format!(
+                                "ElementPointer target must be array, got {}",
+                                other
+                            ))),
+                        }
+                    }
                     FirValue::GenRef { slot, generation } => {
                         self.heap.check(*slot, *generation)?;
                         let target = self.heap.deref_mut(*slot)?;
@@ -540,6 +604,53 @@ impl<'a> FirInterpreter<'a> {
                             .cloned()
                             .unwrap_or(FirValue::Unit);
                         Ok(val)
+                    }
+                    FirValue::FieldPointer {
+                        base_addr,
+                        field_idx,
+                    } => {
+                        let target = self
+                            .stack_memory
+                            .get(base_addr)
+                            .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                        match target {
+                            FirValue::Struct { fields, .. } | FirValue::Tuple(fields) => {
+                                if let Some(f) = fields.get(*field_idx) {
+                                    Ok(f.clone())
+                                } else {
+                                    Err(InterpError::Panic(format!(
+                                        "Field index {} out of bounds",
+                                        field_idx
+                                    )))
+                                }
+                            }
+                            other => Err(InterpError::TypeMismatch(format!(
+                                "FieldPointer target must be struct or tuple, got {}",
+                                other
+                            ))),
+                        }
+                    }
+                    FirValue::ElementPointer { base_addr, index } => {
+                        let target = self
+                            .stack_memory
+                            .get(base_addr)
+                            .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                        match target {
+                            FirValue::Array(elements) => {
+                                if let Some(el) = elements.get(*index) {
+                                    Ok(el.clone())
+                                } else {
+                                    Err(InterpError::Panic(format!(
+                                        "Element index {} out of bounds",
+                                        index
+                                    )))
+                                }
+                            }
+                            other => Err(InterpError::TypeMismatch(format!(
+                                "ElementPointer target must be array, got {}",
+                                other
+                            ))),
+                        }
                     }
                     FirValue::GenRef { slot, generation } => {
                         self.heap.check(*slot, *generation)?;
@@ -672,6 +783,40 @@ impl<'a> FirInterpreter<'a> {
                     }
                     other => Err(InterpError::TypeMismatch(format!(
                         "Cannot access field of {}",
+                        other
+                    ))),
+                }
+            }
+
+            ValueExpr::GetFieldPtr {
+                base,
+                field_idx,
+                field_name,
+            } => {
+                let base_val = env.get(base).ok_or(InterpError::UndefinedValue(*base))?;
+                match base_val {
+                    FirValue::Pointer(addr) => {
+                        let actual_idx = if let Some(FirValue::Struct { name, .. }) =
+                            self.stack_memory.get(addr)
+                        {
+                            self.resolve_struct_field_index(*name, *field_idx, *field_name)
+                        } else {
+                            *field_idx
+                        };
+                        Ok(FirValue::FieldPointer {
+                            base_addr: *addr,
+                            field_idx: actual_idx,
+                        })
+                    }
+                    FirValue::FieldPointer {
+                        base_addr,
+                        field_idx: _,
+                    } => Ok(FirValue::FieldPointer {
+                        base_addr: *base_addr,
+                        field_idx: *field_idx,
+                    }),
+                    other => Err(InterpError::TypeMismatch(format!(
+                        "GetFieldPtr requires pointer base, got {}",
                         other
                     ))),
                 }
@@ -845,6 +990,25 @@ impl<'a> FirInterpreter<'a> {
                     }
                     other => Err(InterpError::TypeMismatch(format!(
                         "Cannot index into {}",
+                        other
+                    ))),
+                }
+            }
+
+            ValueExpr::GetElementPtr { base, index } => {
+                let base_val = env.get(base).ok_or(InterpError::UndefinedValue(*base))?;
+                let idx_val = env.get(index).ok_or(InterpError::UndefinedValue(*index))?;
+                let idx = match idx_val {
+                    FirValue::Int(i) => *i as usize,
+                    _ => return Err(InterpError::TypeMismatch("Index must be an integer".into())),
+                };
+                match base_val {
+                    FirValue::Pointer(addr) => Ok(FirValue::ElementPointer {
+                        base_addr: *addr,
+                        index: idx,
+                    }),
+                    other => Err(InterpError::TypeMismatch(format!(
+                        "GetElementPtr requires pointer base, got {}",
                         other
                     ))),
                 }

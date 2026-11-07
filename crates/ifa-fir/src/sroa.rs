@@ -131,6 +131,19 @@ impl SroaPass {
                     ValueExpr::GetField { base, .. } => {
                         let _ = base;
                     }
+                    ValueExpr::GetFieldPtr { base, .. } => {
+                        if alloca_info.contains_key(base) {
+                            escaping.insert(*base);
+                        }
+                    }
+                    ValueExpr::GetElementPtr { base, index } => {
+                        if alloca_info.contains_key(base) {
+                            escaping.insert(*base);
+                        }
+                        if alloca_info.contains_key(index) {
+                            escaping.insert(*index);
+                        }
+                    }
                     ValueExpr::SetField { base: _, val, .. } => {
                         if alloca_info.contains_key(val) {
                             escaping.insert(*val);
@@ -735,12 +748,12 @@ impl SroaPass {
                 replace(rhs);
             }
             ValueExpr::Unary { val, .. } => replace(val),
-            ValueExpr::GetField { base, .. } => replace(base),
+            ValueExpr::GetField { base, .. } | ValueExpr::GetFieldPtr { base, .. } => replace(base),
             ValueExpr::SetField { base, val, .. } => {
                 replace(base);
                 replace(val);
             }
-            ValueExpr::GetElement { base, index } => {
+            ValueExpr::GetElement { base, index } | ValueExpr::GetElementPtr { base, index } => {
                 replace(base);
                 replace(index);
             }
@@ -1048,6 +1061,8 @@ impl SroaPass {
                                 | ValueExpr::TupleInit(_)
                                 | ValueExpr::ArrayInit(_)
                                 | ValueExpr::GetField { .. }
+                                | ValueExpr::GetFieldPtr { .. }
+                                | ValueExpr::GetElementPtr { .. }
                                 | ValueExpr::Alloca { .. }
                         );
 

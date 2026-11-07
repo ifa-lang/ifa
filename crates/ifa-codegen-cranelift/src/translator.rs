@@ -331,6 +331,21 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 )
             }
 
+            ValueExpr::GetFieldPtr {
+                base, field_idx, ..
+            } => {
+                let p = self.value_map[base];
+                let offset = (*field_idx * 8) as i64;
+                Some(self.builder.ins().iadd_imm_s(p, offset))
+            }
+
+            ValueExpr::GetElementPtr { base, index } => {
+                let p = self.value_map[base];
+                let idx = self.value_map[index];
+                let scaled = self.builder.ins().imul_imm_s(idx, 8);
+                Some(self.builder.ins().iadd(p, scaled))
+            }
+
             ValueExpr::SetField {
                 base,
                 field_idx,

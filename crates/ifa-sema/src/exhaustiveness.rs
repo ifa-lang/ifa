@@ -29,7 +29,7 @@ fn format_missing_list(items: &[String]) -> String {
 /// Helper returning whether a pattern unconditionally matches any value of its type.
 fn is_irrefutable_pattern(pat: &Pattern) -> bool {
     match pat {
-        Pattern::Wildcard(_) | Pattern::Ident(_, _) => true,
+        Pattern::Wildcard(_) | Pattern::Ident(_, _) | Pattern::Binding { .. } => true,
         Pattern::Tuple(elems, _) => elems.iter().all(is_irrefutable_pattern),
         Pattern::Struct { fields, .. } => fields.iter().all(|f| is_irrefutable_pattern(&f.pattern)),
         Pattern::Or(pats, _) => pats.iter().any(is_irrefutable_pattern),
@@ -51,7 +51,7 @@ fn is_irrefutable_pattern(pat: &Pattern) -> bool {
 /// Helper returning whether a pattern unconditionally matches any value of the target type.
 pub(crate) fn is_irrefutable_pattern_for_type(pat: &Pattern, target_ty: &Type) -> bool {
     match pat {
-        Pattern::Wildcard(_) | Pattern::Ident(_, _) => true,
+        Pattern::Wildcard(_) | Pattern::Ident(_, _) | Pattern::Binding { .. } => true,
         Pattern::Tuple(elems, _) => match target_ty {
             Type::Tuple(expected) if expected.len() == elems.len() => elems
                 .iter()
@@ -145,7 +145,7 @@ impl<'a> CoverageState<'a> {
     /// Helper determining if a pattern is already subsumed by earlier patterns.
     fn is_pattern_subsumed(&self, pat: &Pattern) -> bool {
         match pat {
-            Pattern::Wildcard(_) | Pattern::Ident(_, _) => {
+            Pattern::Wildcard(_) | Pattern::Ident(_, _) | Pattern::Binding { .. } => {
                 if let Some(ref all_variants) = self.enum_variants_info {
                     all_variants
                         .iter()
@@ -212,11 +212,15 @@ impl<'a> CoverageState<'a> {
         match pat {
             Pattern::Wildcard(_)
             | Pattern::Ident(_, _)
+            | Pattern::Binding { .. }
             | Pattern::Tuple(_, _)
             | Pattern::Struct { .. }
             | Pattern::Slice { .. } => {}
             Pattern::Variant { variant, inner, .. } => match inner.as_deref() {
-                None | Some(Pattern::Wildcard(_)) | Some(Pattern::Ident(_, _)) => {
+                None
+                | Some(Pattern::Wildcard(_))
+                | Some(Pattern::Ident(_, _))
+                | Some(Pattern::Binding { .. }) => {
                     self.fully_covered_variants.insert(*variant);
                 }
                 Some(p) if is_irrefutable_pattern(p) => {

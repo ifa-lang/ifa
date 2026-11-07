@@ -140,7 +140,7 @@ impl Compiler {
                 } else {
                     self.chunk.emit(OpCode::Unit, *span);
                 }
-                if let Pattern::Ident(name, _) = pattern {
+                if let Pattern::Ident(name, _) | Pattern::Binding { name, .. } = pattern {
                     let slot = self.define_local(*name);
                     self.chunk.emit(OpCode::StoreLocal(slot), *span);
                 } else {

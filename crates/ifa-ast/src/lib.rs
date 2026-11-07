@@ -343,11 +343,35 @@ pub struct StructPatternField {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindingMode {
+    Value,
+    Mut,
+    Ref,
+    InOut,
+}
+
+impl fmt::Display for BindingMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BindingMode::Value => Ok(()),
+            BindingMode::Mut => write!(f, "mut "),
+            BindingMode::Ref => write!(f, "ref "),
+            BindingMode::InOut => write!(f, "inout "),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     Wildcard(Span),
     Lit(Lit, Span),
     Ident(Symbol, Span),
+    Binding {
+        mode: BindingMode,
+        name: Symbol,
+        span: Span,
+    },
     Variant {
         enum_name: Option<Symbol>,
         variant: Symbol,
@@ -382,6 +406,7 @@ impl Pattern {
             Pattern::Wildcard(sp) => *sp,
             Pattern::Lit(_, sp) => *sp,
             Pattern::Ident(_, sp) => *sp,
+            Pattern::Binding { span, .. } => *span,
             Pattern::Variant { span, .. } => *span,
             Pattern::Tuple(_, sp) => *sp,
             Pattern::Struct { span, .. } => *span,
@@ -401,6 +426,7 @@ impl Pattern {
     fn collect_bound_variables(&self, vars: &mut Vec<(Symbol, Span)>) {
         match self {
             Pattern::Ident(sym, span) => vars.push((*sym, *span)),
+            Pattern::Binding { name, span, .. } => vars.push((*name, *span)),
             Pattern::Tuple(elems, _) | Pattern::Or(elems, _) => {
                 for e in elems {
                     e.collect_bound_variables(vars);

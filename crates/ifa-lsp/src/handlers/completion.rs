@@ -61,7 +61,9 @@ pub fn handle_completion(doc: &Document, position: Position) -> CompletionList {
                             if let Some(body) = &f.body {
                                 for stmt in &body.stmts {
                                     if let ifa_ast::Stmt::Let {
-                                        pattern: ifa_ast::Pattern::Ident(name, _),
+                                        pattern:
+                                            ifa_ast::Pattern::Ident(name, _)
+                                            | ifa_ast::Pattern::Binding { name, .. },
                                         ty,
                                         ..
                                     } = stmt

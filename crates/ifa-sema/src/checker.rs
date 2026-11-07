@@ -6,12 +6,39 @@ use crate::symbol_table::{
 };
 use crate::types::{IntType, Type};
 use ifa_ast::{
-    Arg, BinOp, Block, Expr, ExprKind, Function, GenericParam, Impl, Item, Lit, ParamMode, Pattern,
-    Program, Stmt, Struct, Trait, UnaryOp,
+    Arg, BinOp, BindingMode, Block, Expr, ExprKind, Function, GenericParam, Impl, Item, Lit,
+    ParamMode, Pattern, Program, Stmt, Struct, Trait, UnaryOp,
 };
 use ifa_diagnostics::Diagnostic;
 use ifa_span::{SourceMap, Span, Symbol, INTERNER};
 use std::collections::{HashMap, HashSet};
+
+/// Returns whether a pattern contains an exclusive inout binding.
+fn pattern_has_inout(pat: &Pattern) -> bool {
+    match pat {
+        Pattern::Binding {
+            mode: BindingMode::InOut,
+            ..
+        } => true,
+        Pattern::Tuple(elems, _) | Pattern::Or(elems, _) => elems.iter().any(pattern_has_inout),
+        Pattern::Struct { fields, .. } => fields.iter().any(|f| pattern_has_inout(&f.pattern)),
+        Pattern::Slice {
+            prefix,
+            rest,
+            suffix,
+            ..
+        } => {
+            prefix.iter().any(pattern_has_inout)
+                || rest
+                    .as_ref()
+                    .and_then(|r| r.as_ref())
+                    .is_some_and(|p| pattern_has_inout(p))
+                || suffix.iter().any(pattern_has_inout)
+        }
+        Pattern::Variant { inner: Some(p), .. } => pattern_has_inout(p),
+        _ => false,
+    }
+}
 
 /// Control-flow sensitive type narrowing facts deduced from conditional expressions.
 #[derive(Debug, Clone, Default)]
@@ -904,10 +931,11 @@ impl<'a> SemanticAnalyzer<'a> {
                     let inferred = self.check_expr(init_expr, declared_ty.as_ref());
                     if let Some(expected) = &declared_ty {
                         if !inferred.is_assignable_to(expected) {
-                            let pat_desc = if let Pattern::Ident(name, _) = pattern {
-                                format!(" pour '{}'", INTERNER.resolve(name))
-                            } else {
-                                String::new()
+                            let pat_desc = match pattern {
+                                Pattern::Ident(name, _) | Pattern::Binding { name, .. } => {
+                                    format!(" pour '{}'", INTERNER.resolve(name))
+                                }
+                                _ => String::new(),
                             };
                             self.diagnostics.push(
                                 Diagnostic::error(format!(
@@ -932,7 +960,9 @@ impl<'a> SemanticAnalyzer<'a> {
                     declared_ty.unwrap_or(Type::Unknown)
                 };
 
-                if init.is_none() && !matches!(pattern, Pattern::Ident(_, _)) {
+                if init.is_none()
+                    && !matches!(pattern, Pattern::Ident(_, _) | Pattern::Binding { .. })
+                {
                     self.diagnostics.push(
                         Diagnostic::error(
                             "la déstructuration requiert une expression d'initialisation",
@@ -965,6 +995,11 @@ impl<'a> SemanticAnalyzer<'a> {
                             "les motifs réfutables ne sont autorisés que dans les instructions 'match' ou 'if let'",
                         ),
                     );
+                }
+
+                self.check_pattern_binding_duplicates(pattern);
+                if let Some(init_expr) = init {
+                    self.check_inout_source_mutability(pattern, init_expr);
                 }
 
                 self.check_pattern_with_mut(pattern, &actual_ty, *is_mut, init.is_some());
@@ -1163,6 +1198,8 @@ impl<'a> SemanticAnalyzer<'a> {
                     );
                 }
 
+                self.check_pattern_binding_duplicates(pattern);
+                self.check_inout_source_mutability(pattern, expr);
                 self.symbols.enter_scope(true, false);
                 self.check_pattern(pattern, &cond_ty);
                 if let Some(g) = guard {
@@ -1724,6 +1761,8 @@ impl<'a> SemanticAnalyzer<'a> {
                     );
                 }
 
+                self.check_pattern_binding_duplicates(pattern);
+                self.check_inout_source_mutability(pattern, cond_expr);
                 self.symbols.enter_scope(false, false);
                 self.check_pattern(pattern, &cond_ty);
                 if let Some(g) = guard {
@@ -2019,6 +2058,8 @@ impl<'a> SemanticAnalyzer<'a> {
                 } else {
                     let mut arm_types = Vec::new();
                     for arm in arms {
+                        self.check_pattern_binding_duplicates(&arm.pattern);
+                        self.check_inout_source_mutability(&arm.pattern, target_expr);
                         self.symbols.enter_scope(false, false);
                         self.check_pattern(&arm.pattern, &target_ty);
                         if let Some(guard) = &arm.guard {
@@ -2158,7 +2199,10 @@ impl<'a> SemanticAnalyzer<'a> {
                     );
                 }
             }
-            Pattern::Ident(sym, span) => {
+            Pattern::Ident(sym, span)
+            | Pattern::Binding {
+                name: sym, span, ..
+            } => {
                 let var_name = INTERNER.resolve(sym);
                 if let Some(var) = self.symbols.lookup_variable(sym).cloned() {
                     if !var.is_mut && var.is_initialized {
@@ -2456,6 +2500,24 @@ impl<'a> SemanticAnalyzer<'a> {
                     is_mut,
                     is_initialized,
                     None,
+                    *span,
+                ) {
+                    self.diagnostics.push(diag);
+                }
+            }
+            Pattern::Binding { mode, name, span } => {
+                let (var_ty, var_mut, param_mode) = match mode {
+                    BindingMode::Value => (target_ty.clone(), is_mut, None),
+                    BindingMode::Mut => (target_ty.clone(), true, Some(ParamMode::Mut)),
+                    BindingMode::Ref => (Type::Ref(Box::new(target_ty.clone())), false, None),
+                    BindingMode::InOut => (target_ty.clone(), true, Some(ParamMode::InOut)),
+                };
+                if let Err(diag) = self.symbols.define_variable(
+                    *name,
+                    var_ty,
+                    var_mut,
+                    is_initialized,
+                    param_mode,
                     *span,
                 ) {
                     self.diagnostics.push(diag);
@@ -2879,6 +2941,103 @@ impl<'a> SemanticAnalyzer<'a> {
 
                 for s in suffix {
                     self.check_pattern_with_mut(s, &elem_ty, is_mut, is_initialized);
+                }
+            }
+        }
+    }
+
+    fn check_pattern_binding_duplicates(&mut self, pat: &Pattern) {
+        let mut seen = HashMap::new();
+        self.collect_pattern_bindings_unique(pat, &mut seen);
+    }
+
+    fn collect_pattern_bindings_unique(&mut self, pat: &Pattern, seen: &mut HashMap<Symbol, Span>) {
+        match pat {
+            Pattern::Ident(sym, span)
+            | Pattern::Binding {
+                name: sym, span, ..
+            } => {
+                if let Some(prev_span) = seen.insert(*sym, *span) {
+                    let var_name = INTERNER.resolve(sym);
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "l'identifiant '{}' est lié plusieurs fois dans le même motif",
+                            var_name
+                        ))
+                        .with_code("E0048")
+                        .with_primary_label(*span, "identifiant déjà lié dans ce motif")
+                        .with_secondary_label(prev_span, "première liaison ici"),
+                    );
+                }
+            }
+            Pattern::Tuple(elems, _) => {
+                for e in elems {
+                    self.collect_pattern_bindings_unique(e, seen);
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                for f in fields {
+                    self.collect_pattern_bindings_unique(&f.pattern, seen);
+                }
+            }
+            Pattern::Slice {
+                prefix,
+                rest,
+                suffix,
+                ..
+            } => {
+                for p in prefix {
+                    self.collect_pattern_bindings_unique(p, seen);
+                }
+                if let Some(Some(r)) = rest {
+                    self.collect_pattern_bindings_unique(r, seen);
+                }
+                for s in suffix {
+                    self.collect_pattern_bindings_unique(s, seen);
+                }
+            }
+            Pattern::Variant { inner: Some(p), .. } => {
+                self.collect_pattern_bindings_unique(p, seen);
+            }
+            Pattern::Or(pats, _) => {
+                for p in pats {
+                    let mut branch_seen = HashMap::new();
+                    self.collect_pattern_bindings_unique(p, &mut branch_seen);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_inout_source_mutability(&mut self, pat: &Pattern, source_expr: &Expr) {
+        if pattern_has_inout(pat) {
+            if let Some((root_sym, _)) = crate::exclusivity::extract_root_variable(source_expr) {
+                if let Some(var) = self.symbols.lookup_variable(&root_sym) {
+                    if !var.is_mut {
+                        let var_name = INTERNER.resolve(&root_sym);
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "impossible de créer une liaison mutable exclusive 'inout' sur la variable immuable '{}'",
+                                var_name
+                            ))
+                            .with_code("E0010")
+                            .with_primary_label(
+                                pat.span(),
+                                format!(
+                                    "liaison exclusive 'inout' interdite sur la variable immuable '{}'",
+                                    var_name
+                                ),
+                            )
+                            .with_secondary_label(
+                                var.span,
+                                format!(
+                                    "la variable '{}' a été déclarée immuable avec 'let' (utilisez 'mut')",
+                                    var_name
+                                ),
+                            )
+                            .with_help("Changez la déclaration en 'mut' pour autoriser l'emprunt mutable exclusif 'inout'."),
+                        );
+                    }
                 }
             }
         }

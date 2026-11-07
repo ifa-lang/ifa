@@ -1699,6 +1699,66 @@ impl Parser {
         let cur = self.current();
         let pat_start = cur.span.start;
         match cur.kind {
+            TokenKind::Mut => {
+                self.advance();
+                let next = self.current();
+                if let TokenKind::Ident(s) = next.kind {
+                    self.advance();
+                    let span = Span::new(self.file_id, pat_start, next.span.end);
+                    Ok(Pattern::Binding {
+                        mode: BindingMode::Mut,
+                        name: s,
+                        span,
+                    })
+                } else {
+                    let diag = Diagnostic::error("identifiant attendu après 'mut' dans un motif")
+                        .with_primary_label(next.span, "identifiant attendu");
+                    self.diagnostics.push(diag.clone());
+                    Err(diag)
+                }
+            }
+            TokenKind::Ref => {
+                self.advance();
+                let is_mut = self.match_token(&TokenKind::Mut);
+                let mode = if is_mut {
+                    BindingMode::InOut
+                } else {
+                    BindingMode::Ref
+                };
+                let next = self.current();
+                if let TokenKind::Ident(s) = next.kind {
+                    self.advance();
+                    let span = Span::new(self.file_id, pat_start, next.span.end);
+                    Ok(Pattern::Binding {
+                        mode,
+                        name: s,
+                        span,
+                    })
+                } else {
+                    let diag = Diagnostic::error("identifiant attendu après 'ref' dans un motif")
+                        .with_primary_label(next.span, "identifiant attendu");
+                    self.diagnostics.push(diag.clone());
+                    Err(diag)
+                }
+            }
+            TokenKind::InOut => {
+                self.advance();
+                let next = self.current();
+                if let TokenKind::Ident(s) = next.kind {
+                    self.advance();
+                    let span = Span::new(self.file_id, pat_start, next.span.end);
+                    Ok(Pattern::Binding {
+                        mode: BindingMode::InOut,
+                        name: s,
+                        span,
+                    })
+                } else {
+                    let diag = Diagnostic::error("identifiant attendu après 'inout' dans un motif")
+                        .with_primary_label(next.span, "identifiant attendu");
+                    self.diagnostics.push(diag.clone());
+                    Err(diag)
+                }
+            }
             TokenKind::OpenBracket => {
                 self.advance();
                 if self.match_token(&TokenKind::CloseBracket) {
@@ -1830,10 +1890,98 @@ impl Parser {
                                 break;
                             }
                             let f_tok = self.current();
-                            let f_name = match f_tok.kind {
+                            let (f_name, f_pat, f_start, f_end) = match f_tok.kind {
+                                TokenKind::Mut => {
+                                    let f_start = f_tok.span.start;
+                                    self.advance();
+                                    let name_tok = self.current();
+                                    if let TokenKind::Ident(name) = name_tok.kind {
+                                        self.advance();
+                                        let pat = Pattern::Binding {
+                                            mode: BindingMode::Mut,
+                                            name,
+                                            span: Span::new(
+                                                self.file_id,
+                                                f_start,
+                                                name_tok.span.end,
+                                            ),
+                                        };
+                                        (name, pat, f_start, name_tok.span.end)
+                                    } else {
+                                        let diag = Diagnostic::error(
+                                            "nom de champ attendu après 'mut' dans le motif de structure",
+                                        )
+                                        .with_primary_label(name_tok.span, "nom de champ attendu");
+                                        self.diagnostics.push(diag.clone());
+                                        return Err(diag);
+                                    }
+                                }
+                                TokenKind::Ref => {
+                                    let f_start = f_tok.span.start;
+                                    self.advance();
+                                    let is_mut = self.match_token(&TokenKind::Mut);
+                                    let mode = if is_mut {
+                                        BindingMode::InOut
+                                    } else {
+                                        BindingMode::Ref
+                                    };
+                                    let name_tok = self.current();
+                                    if let TokenKind::Ident(name) = name_tok.kind {
+                                        self.advance();
+                                        let pat = Pattern::Binding {
+                                            mode,
+                                            name,
+                                            span: Span::new(
+                                                self.file_id,
+                                                f_start,
+                                                name_tok.span.end,
+                                            ),
+                                        };
+                                        (name, pat, f_start, name_tok.span.end)
+                                    } else {
+                                        let diag = Diagnostic::error(
+                                            "nom de champ attendu après 'ref' dans le motif de structure",
+                                        )
+                                        .with_primary_label(name_tok.span, "nom de champ attendu");
+                                        self.diagnostics.push(diag.clone());
+                                        return Err(diag);
+                                    }
+                                }
+                                TokenKind::InOut => {
+                                    let f_start = f_tok.span.start;
+                                    self.advance();
+                                    let name_tok = self.current();
+                                    if let TokenKind::Ident(name) = name_tok.kind {
+                                        self.advance();
+                                        let pat = Pattern::Binding {
+                                            mode: BindingMode::InOut,
+                                            name,
+                                            span: Span::new(
+                                                self.file_id,
+                                                f_start,
+                                                name_tok.span.end,
+                                            ),
+                                        };
+                                        (name, pat, f_start, name_tok.span.end)
+                                    } else {
+                                        let diag = Diagnostic::error(
+                                            "nom de champ attendu après 'inout' dans le motif de structure",
+                                        )
+                                        .with_primary_label(name_tok.span, "nom de champ attendu");
+                                        self.diagnostics.push(diag.clone());
+                                        return Err(diag);
+                                    }
+                                }
                                 TokenKind::Ident(name) => {
                                     self.advance();
-                                    name
+                                    let (pat, end) = if self.match_token(&TokenKind::Colon) {
+                                        let p = self.parse_pattern()?;
+                                        let end = p.span().end;
+                                        (p, end)
+                                    } else {
+                                        (Pattern::Ident(name, f_tok.span), f_tok.span.end)
+                                    };
+                                    (name, pat, f_tok.span.start, end)
                                 }
                                 _ => {
                                     let diag = Diagnostic::error(
@@ -1844,17 +1992,10 @@ impl Parser {
                                     return Err(diag);
                                 }
                             };
-                            let (f_pat, f_end) = if self.match_token(&TokenKind::Colon) {
-                                let pat = self.parse_pattern()?;
-                                let end = pat.span().end;
-                                (pat, end)
-                            } else {
-                                (Pattern::Ident(f_name, f_tok.span), f_tok.span.end)
-                            };
                             fields.push(StructPatternField {
                                 name: f_name,
                                 pattern: f_pat,
-                                span: Span::new(self.file_id, f_tok.span.start, f_end),
+                                span: Span::new(self.file_id, f_start, f_end),
                             });
                             if !self.match_token(&TokenKind::Comma) {
                                 break;

@@ -143,6 +143,17 @@ impl<'a> FirPrinter<'a> {
                 field_name.as_str(),
                 field_idx
             ),
+            ValueExpr::GetFieldPtr {
+                base,
+                field_idx,
+                field_name,
+            } => write!(
+                self.output,
+                "getfield_ptr {}.{} (#{})",
+                base,
+                field_name.as_str(),
+                field_idx
+            ),
             ValueExpr::SetField {
                 base,
                 field_idx,
@@ -150,6 +161,9 @@ impl<'a> FirPrinter<'a> {
             } => write!(self.output, "setfield {}.#{}, {}", base, field_idx, val),
             ValueExpr::GetElement { base, index } => {
                 write!(self.output, "getelem {}[{}]", base, index)
+            }
+            ValueExpr::GetElementPtr { base, index } => {
+                write!(self.output, "getelem_ptr {}[{}]", base, index)
             }
             ValueExpr::SetElement { base, index, val } => {
                 write!(self.output, "setelem {}[{}], {}", base, index, val)
