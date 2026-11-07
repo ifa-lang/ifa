@@ -1,9 +1,11 @@
 use crate::error::LlvmCodegenError;
 use crate::target::{LlvmTargetConfig, TargetArch};
 use crate::types::fir_to_llvm_type;
-use ifa_fir::{BinaryOp, ConstantValue, FirFunction, FirModule, Terminator, UnaryOp, ValueExpr};
+use ifa_fir::{
+    BinaryOp, BlockId, ConstantValue, FirFunction, FirModule, Terminator, UnaryOp, ValueExpr,
+};
 use ifa_span::INTERNER;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Emits canonical textual LLVM IR (.ll) from FIR SSA modules.
 pub struct LlvmIrEmitter<'a> {
@@ -233,12 +235,20 @@ impl<'a> LlvmIrEmitter<'a> {
             let has_main = module
                 .functions
                 .iter()
-                .any(|f| INTERNER.resolve(&f.name) == "main");
-            if has_main {
+                .find(|f| INTERNER.resolve(&f.name) == "main");
+            if let Some(main_fn) = has_main {
+                let is_unit = matches!(main_fn.ret_ty, ifa_fir::FirType::Unit);
+                let call_str = if is_unit {
+                    "  call i32 @main()\n".to_string()
+                } else {
+                    let ty = fir_to_llvm_type(&main_fn.ret_ty)?;
+                    format!("  call {} @main()\n", ty)
+                };
                 out.push_str("; WASI entrypoint wrapper\n");
-                out.push_str(
-                    "define void @_start() {\nentry:\n  call void @main()\n  ret void\n}\n\n",
-                );
+                out.push_str(&format!(
+                    "define void @_start() {{\nentry:\n{}  ret void\n}}\n\n",
+                    call_str
+                ));
             }
         }
 
@@ -300,7 +310,9 @@ impl<'a> LlvmIrEmitter<'a> {
         out: &mut String,
     ) -> Result<(), LlvmCodegenError> {
         let fn_name = INTERNER.resolve(&func.name);
-        let ret_ty = fir_to_llvm_type(&func.ret_ty)?;
+        let raw_ret_ty = fir_to_llvm_type(&func.ret_ty)?;
+        let is_main_unit = fn_name == "main" && raw_ret_ty == "void";
+        let ret_ty = if is_main_unit { "i32" } else { &raw_ret_ty };
 
         let linkage = if func.is_pub {
             "dso_local "
@@ -408,6 +420,56 @@ impl<'a> LlvmIrEmitter<'a> {
             }
         }
 
+        // Precompute predecessors and incoming block arguments for phi nodes
+        let mut predecessors: HashMap<BlockId, Vec<(BlockId, Vec<ifa_fir::ValueId>)>> =
+            HashMap::new();
+        for b in &func.blocks {
+            if let Some(ref term) = b.terminator {
+                match term {
+                    Terminator::Branch { target, args } => {
+                        predecessors
+                            .entry(*target)
+                            .or_default()
+                            .push((b.id, args.clone()));
+                    }
+                    Terminator::BranchCond {
+                        then_block,
+                        then_args,
+                        else_block,
+                        else_args,
+                        ..
+                    } => {
+                        predecessors
+                            .entry(*then_block)
+                            .or_default()
+                            .push((b.id, then_args.clone()));
+                        predecessors
+                            .entry(*else_block)
+                            .or_default()
+                            .push((b.id, else_args.clone()));
+                    }
+                    Terminator::Switch {
+                        cases,
+                        default_block,
+                        default_args,
+                        ..
+                    } => {
+                        for (_, c_block, c_args) in cases {
+                            predecessors
+                                .entry(*c_block)
+                                .or_default()
+                                .push((b.id, c_args.clone()));
+                        }
+                        predecessors
+                            .entry(*default_block)
+                            .or_default()
+                            .push((b.id, default_args.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Basic blocks
         for (b_idx, block) in func.blocks.iter().enumerate() {
             let label = if b_idx == 0 {
@@ -416,6 +478,39 @@ impl<'a> LlvmIrEmitter<'a> {
                 format!("bb{}", block.id.0)
             };
             out.push_str(&format!("{}:\n", label));
+
+            // Emit PHI nodes for block arguments
+            if b_idx > 0 && !block.params.is_empty() {
+                if let Some(preds) = predecessors.get(&block.id) {
+                    for (p_idx, (param_val, param_ty)) in block.params.iter().enumerate() {
+                        let ty_str = fir_to_llvm_type(param_ty)?;
+                        if ty_str != "void" {
+                            let mut incoming_pairs = Vec::new();
+                            let mut seen_preds = HashSet::new();
+                            for (pred_id, pred_args) in preds {
+                                if seen_preds.insert(*pred_id) && p_idx < pred_args.len() {
+                                    let incoming_val = pred_args[p_idx];
+                                    let pred_label = if *pred_id == func.entry_block {
+                                        "entry".to_string()
+                                    } else {
+                                        format!("bb{}", pred_id.0)
+                                    };
+                                    incoming_pairs
+                                        .push(format!("[ %v{}, %{} ]", incoming_val.0, pred_label));
+                                }
+                            }
+                            if !incoming_pairs.is_empty() {
+                                out.push_str(&format!(
+                                    "  %v{} = phi {} {}\n",
+                                    param_val.0,
+                                    ty_str,
+                                    incoming_pairs.join(", ")
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
 
             // SSA Instructions
             for inst in &block.instructions {
@@ -428,7 +523,7 @@ impl<'a> LlvmIrEmitter<'a> {
 
             // Terminator
             if let Some(ref term) = block.terminator {
-                self.emit_terminator(term, &func.ret_ty, out)?;
+                self.emit_terminator(term, &func.ret_ty, is_main_unit, out)?;
             } else {
                 out.push_str("  unreachable\n");
             }
@@ -961,10 +1056,15 @@ impl<'a> LlvmIrEmitter<'a> {
         &self,
         term: &Terminator,
         ret_ty: &ifa_fir::FirType,
+        is_main_unit: bool,
         out: &mut String,
     ) -> Result<(), LlvmCodegenError> {
         match term {
             Terminator::Return(val_opt) => {
+                if is_main_unit {
+                    out.push_str("  ret i32 0\n");
+                    return Ok(());
+                }
                 let llvm_ty = fir_to_llvm_type(ret_ty)?;
                 if llvm_ty == "void" {
                     out.push_str("  ret void\n");

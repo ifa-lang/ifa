@@ -222,9 +222,38 @@ impl LlvmCompiler {
         }
     }
 
+    /// Link an object file into a standalone executable with optional LTO optimization flags.
+    pub fn link_executable_with_lto(
+        object_path: &Path,
+        output_bin: &Path,
+        lto: &str,
+    ) -> Result<(), LlvmCodegenError> {
+        let rt_path =
+            std::env::temp_dir().join(format!("ifa_llvm_runtime_stub_{}.c", std::process::id()));
+        let _ = fs::write(&rt_path, ifa_codegen_cranelift::RUNTIME_STUB_C);
+
+        let mut clang_cmd = Command::new("clang");
+        clang_cmd.arg(object_path).arg(&rt_path).arg("-no-pie");
+        if !lto.is_empty() && lto != "none" {
+            clang_cmd.arg(format!("-flto={}", lto));
+        }
+        clang_cmd.arg("-o").arg(output_bin);
+
+        let status = clang_cmd.status();
+        let _ = fs::remove_file(&rt_path);
+
+        match status {
+            Ok(s) if s.success() => Ok(()),
+            _ => {
+                // If clang with LTO fails or clang is absent, fallback to standard link_executable
+                ifa_codegen_cranelift::AotCompiler::link_executable(object_path, output_bin)
+                    .map_err(|e| LlvmCodegenError::Toolchain(e.to_string()))
+            }
+        }
+    }
+
     /// Link an object file into a standalone executable.
     pub fn link_executable(object_path: &Path, output_bin: &Path) -> Result<(), LlvmCodegenError> {
-        ifa_codegen_cranelift::AotCompiler::link_executable(object_path, output_bin)
-            .map_err(|e| LlvmCodegenError::Toolchain(e.to_string()))
+        Self::link_executable_with_lto(object_path, output_bin, "none")
     }
 }

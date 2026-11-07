@@ -408,6 +408,7 @@ impl<'a> SemanticAnalyzer<'a> {
                         name: c.name,
                         is_pub: c.is_pub,
                         ty,
+                        value: None,
                         span: c.span,
                     };
                     if let Err(diag) = self.symbols.define_const(c_sym) {
@@ -536,7 +537,13 @@ impl<'a> SemanticAnalyzer<'a> {
 
         // Static compile-time evaluation check
         match self.comptime_vm.eval_expr(&c.value) {
-            Ok(val) => self.comptime_vm.register_constant(c.name, val),
+            Ok(val) => {
+                self.comptime_vm.register_constant(c.name, val.clone());
+                self.symbols.comptime_values.insert(c.name, val.clone());
+                if let Some(cs) = self.symbols.consts.get_mut(&c.name) {
+                    cs.value = Some(val);
+                }
+            }
             Err(comptime_err) => self.diagnostics.push(comptime_err.to_diagnostic()),
         }
     }
@@ -1470,8 +1477,13 @@ impl<'a> SemanticAnalyzer<'a> {
             }
             ExprKind::Comptime(inner) => {
                 let ty = self.check_expr(inner, expected);
-                if let Err(comptime_err) = self.comptime_vm.eval_expr(inner) {
-                    self.diagnostics.push(comptime_err.to_diagnostic());
+                match self.comptime_vm.eval_expr(inner) {
+                    Ok(val) => {
+                        self.symbols.comptime_expr_values.insert(expr.span, val);
+                    }
+                    Err(comptime_err) => {
+                        self.diagnostics.push(comptime_err.to_diagnostic());
+                    }
                 }
                 ty
             }

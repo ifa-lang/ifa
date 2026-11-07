@@ -593,6 +593,7 @@ name = "ifa-fir"
 version = "0.1.0"
 dependencies = [
  "ifa-ast",
+ "ifa-comptime",
  "ifa-diagnostics",
  "ifa-lexer",
  "ifa-parser",

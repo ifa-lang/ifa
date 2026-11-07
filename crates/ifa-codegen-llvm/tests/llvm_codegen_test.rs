@@ -172,6 +172,15 @@ pub fn main() -> () {
     let metadata = fs::metadata(&lto_obj).unwrap();
     assert!(metadata.len() > 0);
 
+    let bin_path = temp_dir.join("lto_exec");
+    let link_res = LlvmCompiler::link_executable_with_lto(&lto_obj, &bin_path, "thin");
+    if link_res.is_ok() && bin_path.exists() {
+        let output = std::process::Command::new(&bin_path)
+            .output()
+            .expect("Failed to run LTO binary");
+        assert!(output.status.success());
+    }
+
     let _ = fs::remove_dir_all(&temp_dir);
 }
 

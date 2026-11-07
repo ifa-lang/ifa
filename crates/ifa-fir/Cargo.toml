@@ -12,6 +12,7 @@ ifa-span.workspace = true
 ifa-diagnostics.workspace = true
 ifa-ast.workspace = true
 ifa-sema.workspace = true
+ifa-comptime.workspace = true
 petgraph.workspace = true
 thiserror.workspace = true
 

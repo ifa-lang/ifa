@@ -111,6 +111,7 @@ pub struct ConstSymbol {
     pub name: Symbol,
     pub is_pub: bool,
     pub ty: Type,
+    pub value: Option<ifa_comptime::Value>,
     pub span: Span,
 }
 
@@ -191,6 +192,8 @@ pub struct SymbolTable {
     pub generic_function_instances: HashMap<Symbol, Vec<Vec<Type>>>,
     pub generic_struct_instances: HashMap<Symbol, Vec<Vec<Type>>>,
     pub call_instantiations: HashMap<Span, Vec<Type>>,
+    pub comptime_values: HashMap<Symbol, ifa_comptime::Value>,
+    pub comptime_expr_values: HashMap<Span, ifa_comptime::Value>,
     next_var_id: u32,
 }
 
@@ -210,6 +213,8 @@ impl SymbolTable {
             generic_function_instances: HashMap::new(),
             generic_struct_instances: HashMap::new(),
             call_instantiations: HashMap::new(),
+            comptime_values: HashMap::new(),
+            comptime_expr_values: HashMap::new(),
             next_var_id: 1,
         };
         table.init_builtins();
@@ -827,6 +832,7 @@ impl SymbolTable {
             name: INTERNER.intern("PI"),
             is_pub: true,
             ty: f64_ty,
+            value: Some(ifa_comptime::Value::Float(std::f64::consts::PI)),
             span: dummy,
         });
         self.modules.insert(math_name, math_mod);

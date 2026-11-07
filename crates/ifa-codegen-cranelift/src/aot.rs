@@ -12,6 +12,115 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+/// Minimal C runtime stub provided during standalone linking of native executables.
+pub const RUNTIME_STUB_C: &str = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+void println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } }
+void ifa_rt_println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } }
+void ifa_rt_print(const char *s) { if (s) { fputs(s, stdout); fflush(stdout); } }
+void ifa_rt_println_i64(int64_t n) { printf("%ld\n", n); }
+void ifa_rt_print_i64(int64_t n) { printf("%ld", n); fflush(stdout); }
+
+typedef struct {
+    uint32_t generation_counter;
+    uint16_t allocation_flags;
+    uint16_t arena_id;
+} ifa_gen_header_t;
+
+void* ifa_rt_gen_alloc(size_t size, size_t align, uint16_t arena_id) {
+    (void)align;
+    size_t total = sizeof(ifa_gen_header_t) + size;
+    void* mem = malloc(total);
+    if (!mem) abort();
+    ifa_gen_header_t* h = (ifa_gen_header_t*)mem;
+    h->generation_counter = 1;
+    h->allocation_flags = 1;
+    h->arena_id = arena_id;
+    return (void*)((uint8_t*)mem + sizeof(ifa_gen_header_t));
+}
+
+void ifa_rt_gen_free(void* ptr) {
+    if (!ptr) return;
+    ifa_gen_header_t* h = (ifa_gen_header_t*)((uint8_t*)ptr - sizeof(ifa_gen_header_t));
+    if (!(h->allocation_flags & 1)) abort();
+    h->allocation_flags &= ~1;
+    h->generation_counter++;
+    free(h);
+}
+
+void ifa_rt_gen_check(const void* ptr, uint32_t remembered_gen) {
+    if (!ptr) abort();
+    const ifa_gen_header_t* h = (const ifa_gen_header_t*)((const uint8_t*)ptr - sizeof(ifa_gen_header_t));
+    if (!(h->allocation_flags & 1) || h->generation_counter != remembered_gen) {
+        fprintf(stderr, "\n[IFA RUNTIME ERROR: SAFE INTERCEPTION] Use-After-Free intercepted at %p (actual gen: %u, expected: %u)\n", ptr, h->generation_counter, remembered_gen);
+        abort();
+    }
+}
+
+void ifa_rt_fiber_yield(void) {}
+
+typedef struct ifa_channel_stub {
+    void* val;
+    int has_val;
+    int closed;
+} ifa_channel_stub_t;
+
+void* ifa_rt_channel_create(size_t capacity) {
+    (void)capacity;
+    ifa_channel_stub_t* c = (ifa_channel_stub_t*)calloc(1, sizeof(ifa_channel_stub_t));
+    return c;
+}
+
+void ifa_rt_channel_destroy(void* chan) {
+    if (chan) free(chan);
+}
+
+int32_t ifa_rt_channel_send(void* chan, void* val) {
+    if (!chan) return -1;
+    ifa_channel_stub_t* c = (ifa_channel_stub_t*)chan;
+    if (c->closed) return -2;
+    c->val = val;
+    c->has_val = 1;
+    return 0;
+}
+
+int32_t ifa_rt_channel_recv(void* chan, void** out_val) {
+    if (!chan || !out_val) return -1;
+    ifa_channel_stub_t* c = (ifa_channel_stub_t*)chan;
+    if (c->has_val) {
+        *out_val = c->val;
+        c->has_val = 0;
+        return 0;
+    }
+    if (c->closed) return -2;
+    *out_val = NULL;
+    return 0;
+}
+
+int32_t ifa_rt_channel_try_recv(void* chan, void** out_val) {
+    return ifa_rt_channel_recv(chan, out_val);
+}
+
+void ifa_rt_channel_close(void* chan) {
+    if (!chan) return;
+    ifa_channel_stub_t* c = (ifa_channel_stub_t*)chan;
+    c->closed = 1;
+}
+
+int64_t ifa_rt_channel_select(void** channels, size_t num_channels, int32_t has_default) {
+    if (!channels || num_channels == 0) return has_default ? 0 : -2;
+    for (size_t i = 0; i < num_channels; i++) {
+        ifa_channel_stub_t* c = (ifa_channel_stub_t*)channels[i];
+        if (c && c->has_val) return (int64_t)i;
+    }
+    if (has_default) return (int64_t)num_channels;
+    return 0;
+}
+"#;
+
 /// Ahead-of-Time (AOT) compiler producing native object files (.o) and linked ELF binaries.
 pub struct AotCompiler {
     builder_context: FunctionBuilderContext,
@@ -305,113 +414,7 @@ impl AotCompiler {
         let compilers = ["cc", "gcc", "clang"];
         let mut last_err = String::new();
 
-        let rt_stub = r#"
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-
-void println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } }
-void ifa_rt_println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } }
-void ifa_rt_print(const char *s) { if (s) { fputs(s, stdout); fflush(stdout); } }
-void ifa_rt_println_i64(int64_t n) { printf("%ld\n", n); }
-void ifa_rt_print_i64(int64_t n) { printf("%ld", n); fflush(stdout); }
-
-typedef struct {
-    uint32_t generation_counter;
-    uint16_t allocation_flags;
-    uint16_t arena_id;
-} ifa_gen_header_t;
-
-void* ifa_rt_gen_alloc(size_t size, size_t align, uint16_t arena_id) {
-    (void)align;
-    size_t total = sizeof(ifa_gen_header_t) + size;
-    void* mem = malloc(total);
-    if (!mem) abort();
-    ifa_gen_header_t* h = (ifa_gen_header_t*)mem;
-    h->generation_counter = 1;
-    h->allocation_flags = 1;
-    h->arena_id = arena_id;
-    return (void*)((uint8_t*)mem + sizeof(ifa_gen_header_t));
-}
-
-void ifa_rt_gen_free(void* ptr) {
-    if (!ptr) return;
-    ifa_gen_header_t* h = (ifa_gen_header_t*)((uint8_t*)ptr - sizeof(ifa_gen_header_t));
-    if (!(h->allocation_flags & 1)) abort();
-    h->allocation_flags &= ~1;
-    h->generation_counter++;
-    free(h);
-}
-
-void ifa_rt_gen_check(const void* ptr, uint32_t remembered_gen) {
-    if (!ptr) abort();
-    const ifa_gen_header_t* h = (const ifa_gen_header_t*)((const uint8_t*)ptr - sizeof(ifa_gen_header_t));
-    if (!(h->allocation_flags & 1) || h->generation_counter != remembered_gen) {
-        fprintf(stderr, "\n[IFA RUNTIME ERROR: SAFE INTERCEPTION] Use-After-Free intercepted at %p (actual gen: %u, expected: %u)\n", ptr, h->generation_counter, remembered_gen);
-        abort();
-    }
-}
-
-void ifa_rt_fiber_yield(void) {}
-
-typedef struct ifa_channel_stub {
-    void* val;
-    int has_val;
-    int closed;
-} ifa_channel_stub_t;
-
-void* ifa_rt_channel_create(size_t capacity) {
-    (void)capacity;
-    ifa_channel_stub_t* c = (ifa_channel_stub_t*)calloc(1, sizeof(ifa_channel_stub_t));
-    return c;
-}
-
-void ifa_rt_channel_destroy(void* chan) {
-    if (chan) free(chan);
-}
-
-int32_t ifa_rt_channel_send(void* chan, void* val) {
-    if (!chan) return -1;
-    ifa_channel_stub_t* c = (ifa_channel_stub_t*)chan;
-    if (c->closed) return -2;
-    c->val = val;
-    c->has_val = 1;
-    return 0;
-}
-
-int32_t ifa_rt_channel_recv(void* chan, void** out_val) {
-    if (!chan || !out_val) return -1;
-    ifa_channel_stub_t* c = (ifa_channel_stub_t*)chan;
-    if (c->has_val) {
-        *out_val = c->val;
-        c->has_val = 0;
-        return 0;
-    }
-    if (c->closed) return -2;
-    *out_val = NULL;
-    return 0;
-}
-
-int32_t ifa_rt_channel_try_recv(void* chan, void** out_val) {
-    return ifa_rt_channel_recv(chan, out_val);
-}
-
-void ifa_rt_channel_close(void* chan) {
-    if (!chan) return;
-    ifa_channel_stub_t* c = (ifa_channel_stub_t*)chan;
-    c->closed = 1;
-}
-
-int64_t ifa_rt_channel_select(void** channels, size_t num_channels, int32_t has_default) {
-    if (!channels || num_channels == 0) return has_default ? 0 : -2;
-    for (size_t i = 0; i < num_channels; i++) {
-        ifa_channel_stub_t* c = (ifa_channel_stub_t*)channels[i];
-        if (c && c->has_val) return (int64_t)i;
-    }
-    if (has_default) return (int64_t)num_channels;
-    return 0;
-}
-"#;
+        let rt_stub = RUNTIME_STUB_C;
         let rt_path =
             std::env::temp_dir().join(format!("ifa_runtime_stub_{}.c", std::process::id()));
         fs::write(&rt_path, rt_stub)?;

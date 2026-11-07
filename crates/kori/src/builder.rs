@@ -194,9 +194,10 @@ impl BuildOrchestrator {
                     .map_err(|e| {
                         KoriError::Codegen(format!("LLVM compile to object failed: {}", e))
                     })?;
-                LlvmCompiler::link_executable(&obj_path, &output_bin).map_err(|e| {
-                    KoriError::Codegen(format!("Failed to link binary `{}`: {}", bin.name, e))
-                })?;
+                LlvmCompiler::link_executable_with_lto(&obj_path, &output_bin, &profile.lto)
+                    .map_err(|e| {
+                        KoriError::Codegen(format!("Failed to link binary `{}`: {}", bin.name, e))
+                    })?;
             }
             BackendKind::Cranelift => {
                 let compiler = AotCompiler::new().map_err(|e| {
@@ -666,58 +667,10 @@ impl BuildOrchestrator {
 
     /// Link an object file into a C-ABI compatible dynamic shared library (.so) using host toolchain.
     pub fn link_shared_library(object_path: &Path, output_so: &Path) -> Result<(), KoriError> {
-        let compilers = ["cc", "gcc", "clang"];
+        let compilers = ["clang", "gcc", "cc"];
         let mut last_err = String::new();
 
-        let rt_stub = r#"
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-
-void println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } }
-void ifa_rt_println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } }
-void ifa_rt_print(const char *s) { if (s) { fputs(s, stdout); fflush(stdout); } }
-void ifa_rt_println_i64(int64_t n) { printf("%ld\n", n); }
-void ifa_rt_print_i64(int64_t n) { printf("%ld", n); fflush(stdout); }
-
-typedef struct {
-    uint32_t generation_counter;
-    uint16_t allocation_flags;
-    uint16_t arena_id;
-} ifa_gen_header_t;
-
-void* ifa_rt_gen_alloc(size_t size, size_t align, uint16_t arena_id) {
-    (void)align;
-    size_t total = sizeof(ifa_gen_header_t) + size;
-    void* mem = malloc(total);
-    if (!mem) abort();
-    ifa_gen_header_t* h = (ifa_gen_header_t*)mem;
-    h->generation_counter = 1;
-    h->allocation_flags = 1;
-    h->arena_id = arena_id;
-    return (void*)((uint8_t*)mem + sizeof(ifa_gen_header_t));
-}
-
-void ifa_rt_gen_free(void* ptr) {
-    if (!ptr) return;
-    ifa_gen_header_t* h = (ifa_gen_header_t*)((uint8_t*)ptr - sizeof(ifa_gen_header_t));
-    if (!(h->allocation_flags & 1)) abort();
-    h->allocation_flags &= ~1;
-    h->generation_counter++;
-    free(h);
-}
-
-void ifa_rt_gen_check(const void* ptr, uint32_t remembered_gen) {
-    if (!ptr) abort();
-    const ifa_gen_header_t* h = (const ifa_gen_header_t*)((const uint8_t*)ptr - sizeof(ifa_gen_header_t));
-    if (!(h->allocation_flags & 1) || h->generation_counter != remembered_gen) {
-        fprintf(stderr, "\n[IFA RUNTIME ERROR: SAFE INTERCEPTION] Use-After-Free intercepted at %p (actual gen: %u, expected: %u)\n", ptr, h->generation_counter, remembered_gen);
-        abort();
-    }
-}
-
-void ifa_rt_fiber_yield(void) {}
-"#;
+        let rt_stub = ifa_codegen_cranelift::RUNTIME_STUB_C;
         let rt_path =
             std::env::temp_dir().join(format!("ifa_runtime_stub_so_{}.c", std::process::id()));
         fs::write(&rt_path, rt_stub)?;

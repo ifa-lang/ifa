@@ -779,3 +779,40 @@ fn test_fir_channel_select_execution() {
     let res = interp.execute_function("select_test", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(100));
 }
+
+#[test]
+fn test_fir_comptime_constant_folding() {
+    let src = r#"
+        const BASE_OFFSET: i64 = 100;
+
+        pub fn main() -> i64 {
+            let folded = comptime (20 * 2 + 2);
+            return BASE_OFFSET + folded;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("comptime_test.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, parse_diags) = ifa_parser::parse(fid, tokens);
+    assert!(parse_diags.is_empty());
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(142));
+
+    let main_fn = module
+        .functions
+        .iter()
+        .find(|f| INTERNER.resolve(&f.name) == "main")
+        .unwrap();
+    let has_constant_42 = main_fn.blocks.iter().any(|b| {
+        b.instructions
+            .iter()
+            .any(|inst| matches!(&inst.expr, ValueExpr::Constant(ConstantValue::Int(42, _))))
+    });
+    assert!(has_constant_42, "Expected folded constant 42 in FIR");
+}

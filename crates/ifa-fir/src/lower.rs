@@ -8,6 +8,19 @@ use ifa_sema::SymbolTable;
 use ifa_span::{Span, Symbol, INTERNER};
 use std::collections::HashMap;
 
+fn comptime_val_to_constant(val: &ifa_comptime::Value) -> Option<ConstantValue> {
+    match val {
+        ifa_comptime::Value::Unit => Some(ConstantValue::Unit),
+        ifa_comptime::Value::Bool(b) => Some(ConstantValue::Bool(*b)),
+        ifa_comptime::Value::Int(i) => Some(ConstantValue::Int(*i as i128, IntType::I64)),
+        ifa_comptime::Value::UInt(u) => Some(ConstantValue::Int(*u as i128, IntType::U64)),
+        ifa_comptime::Value::Float(f) => Some(ConstantValue::Float(*f, FloatType::F64)),
+        ifa_comptime::Value::Char(c) => Some(ConstantValue::Char(*c)),
+        ifa_comptime::Value::String(s) => Some(ConstantValue::String(INTERNER.intern(s))),
+        _ => None,
+    }
+}
+
 /// Loop control flow contexts for break and continue statements.
 #[derive(Debug, Clone)]
 struct LoopContext {
@@ -896,6 +909,18 @@ impl<'a> FunctionLoweringContext<'a> {
                     let res = self.alloc_value();
                     self.emit(Some(res), ValueExpr::Load { ptr }, span);
                     res
+                } else if let Some(val) = self.symbols.comptime_values.get(sym) {
+                    if let Some(c) = comptime_val_to_constant(val) {
+                        let res = self.alloc_value();
+                        self.emit(Some(res), ValueExpr::Constant(c), span);
+                        res
+                    } else if let Some(c_expr) = self.constants.get(sym) {
+                        self.lower_expr(c_expr)
+                    } else {
+                        let res = self.alloc_value();
+                        self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), span);
+                        res
+                    }
                 } else if let Some(c_expr) = self.constants.get(sym) {
                     self.lower_expr(c_expr)
                 } else if let Some(disc) = self.lookup_variant_discriminant(*sym) {
@@ -1586,7 +1611,16 @@ impl<'a> FunctionLoweringContext<'a> {
                 res
             }
 
-            ExprKind::Comptime(inner) => self.lower_expr(inner),
+            ExprKind::Comptime(inner) => {
+                if let Some(val) = self.symbols.comptime_expr_values.get(&expr.span) {
+                    if let Some(c) = comptime_val_to_constant(val) {
+                        let res = self.alloc_value();
+                        self.emit(Some(res), ValueExpr::Constant(c), span);
+                        return res;
+                    }
+                }
+                self.lower_expr(inner)
+            }
 
             ExprKind::Catch {
                 expr: inner_expr,
@@ -2077,6 +2111,43 @@ impl<'a> FunctionLoweringContext<'a> {
                 let final_res = self.alloc_value();
                 self.emit(Some(final_res), ValueExpr::Load { ptr: res_ptr }, span);
                 final_res
+            }
+
+            ExprKind::Path(path) => {
+                if let Some(val) = self.symbols.comptime_expr_values.get(&expr.span) {
+                    if let Some(c) = comptime_val_to_constant(val) {
+                        let res = self.alloc_value();
+                        self.emit(Some(res), ValueExpr::Constant(c), span);
+                        return res;
+                    }
+                }
+                if path.len() >= 2 {
+                    if let Some(m) = self.symbols.lookup_module(&path[0]) {
+                        if let Some(c) = m.consts.get(&path[1]) {
+                            if let Some(val) = &c.value {
+                                if let Some(cv) = comptime_val_to_constant(val) {
+                                    let res = self.alloc_value();
+                                    self.emit(Some(res), ValueExpr::Constant(cv), span);
+                                    return res;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(last_sym) = path.last() {
+                        if let Some(disc) = self.lookup_variant_discriminant(*last_sym) {
+                            let res = self.alloc_value();
+                            self.emit(
+                                Some(res),
+                                ValueExpr::Constant(ConstantValue::Int(disc as i128, IntType::I64)),
+                                span,
+                            );
+                            return res;
+                        }
+                    }
+                }
+                let res = self.alloc_value();
+                self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), span);
+                res
             }
 
             ExprKind::Unit => {

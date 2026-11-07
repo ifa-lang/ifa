@@ -9,7 +9,7 @@ pub mod jit;
 pub mod translator;
 pub mod types;
 
-pub use aot::AotCompiler;
+pub use aot::{AotCompiler, RUNTIME_STUB_C};
 pub use error::CodegenError;
 pub use jit::JitEngine;
 pub use translator::FunctionTranslator;
