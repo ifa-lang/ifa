@@ -1,0 +1,60 @@
+// Exemples idiomatiques d'assignation par déstructuration de motifs en IFA.
+// Illustre la réassignation inconditionnelle de variables existantes sans redéclaration :
+// 1. Échange direct (swap) de variables mutables sans temporaire : `(a, b) = (b, a)`.
+// 2. Déstructuration de tuples avec filtrage par joker (wildcard) : `(x, _) = pair`.
+// 3. Déstructuration de structures sur variables existantes : `Point { x, y } = get_point()`.
+// 4. Déstructuration de tranches/tableaux avec reste : `[first, .., last] = dataset`.
+// 5. Ignorer délibérément un résultat d'expression : `_ = calculate()`.
+
+struct GeoPoint {
+    latitude: i64,
+    longitude: i64,
+    altitude: i64,
+}
+
+fn fetch_new_coordinates() -> GeoPoint {
+    return GeoPoint(latitude: 48, longitude: 2, altitude: 35);
+}
+
+fn fetch_dataset() -> [i64; 5] {
+    return [10, 20, 30, 40, 50];
+}
+
+fn compute_and_discard() -> i64 {
+    return 999;
+}
+
+pub fn main() -> i64 {
+    // 1. Swap direct de variables mutables
+    mut a = 10;
+    mut b = 20;
+    (a, b) = (b, a);
+    // Ici a = 20, b = 10
+
+    // 2. Déstructuration de tuple avec wildcard
+    mut key = 0;
+    (key, _) = (42, 9999);
+    // Ici key = 42
+
+    // 3. Ignorer un calcul avec wildcard global
+    _ = compute_and_discard();
+
+    // 4. Déstructuration de structure sur des variables mutables existantes
+    mut user_lat = 0;
+    mut user_lon = 0;
+    mut user_alt = 0;
+    GeoPoint { latitude: user_lat, longitude: user_lon, altitude: user_alt } = fetch_new_coordinates();
+    // Ici user_lat = 48, user_lon = 2, user_alt = 35
+
+    // 5. Déstructuration de tableau/tranche avec motif de reste
+    mut head = 0;
+    mut tail = 0;
+    let data = fetch_dataset();
+    [head, .., tail] = data;
+    // Ici head = 10, tail = 50
+
+    // Somme de vérification :
+    // a (20) + b (10) + key (42) + user_lat (48) + user_lon (2) + user_alt (35) + head (10) + tail (50)
+    // = 217
+    return a + b + key + user_lat + user_lon + user_alt + head + tail;
+}

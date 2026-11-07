@@ -196,6 +196,11 @@ pub enum Stmt {
         val: Expr,
         span: Span,
     },
+    AssignPattern {
+        pattern: Pattern,
+        val: Expr,
+        span: Span,
+    },
     Expr(Expr),
     Defer(Block, Span),
     Return(Option<Expr>, Span),
@@ -228,6 +233,7 @@ impl Stmt {
         match self {
             Stmt::Let { span, .. } => *span,
             Stmt::Assign { span, .. } => *span,
+            Stmt::AssignPattern { span, .. } => *span,
             Stmt::Expr(e) => e.span,
             Stmt::Defer(_, span) => *span,
             Stmt::Return(_, span) => *span,
@@ -601,6 +607,9 @@ pub trait Visitor<'ast>: Sized {
             }
             Stmt::Assign { target, val, .. } => {
                 self.visit_expr(target);
+                self.visit_expr(val);
+            }
+            Stmt::AssignPattern { val, .. } => {
                 self.visit_expr(val);
             }
             Stmt::Expr(e) => self.visit_expr(e),

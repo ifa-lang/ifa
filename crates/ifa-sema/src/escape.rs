@@ -409,6 +409,30 @@ impl<'a> EscapeAnalyzer<'a> {
                     self.handle_ref_assignment(target, ref_target, val.span);
                 }
             }
+            Stmt::AssignPattern { pattern, val, span } => {
+                if self.spawn_depth > 0 {
+                    for (root_sym, root_span) in pattern.bound_variables() {
+                        if self.var_info.contains_key(&root_sym) {
+                            let var_name = INTERNER.resolve(&root_sym);
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "mutation concurrente interdite : la variable locale '{}' ne peut pas être modifiée au sein d'une fibre 'spawn' sans synchronisation atomique",
+                                    var_name
+                                ))
+                                .with_code("E0025")
+                                .with_primary_label(*span, format!("mutation concurrente de '{}' dans spawn", var_name))
+                                .with_secondary_label(
+                                    root_span,
+                                    format!("'{}' appartient au cadre de pile parent", var_name),
+                                )
+                                .with_note("Les fibres partagent la mémoire de manière non-bloquante et interdisent les courses aux données statiques.")
+                                .with_help("Utilisez un canal 'Channel', un type atomique ou transférez la variable avec 'sink'."),
+                            );
+                        }
+                    }
+                }
+                self.check_expr(val);
+            }
             Stmt::Expr(expr) => self.check_expr(expr),
             Stmt::Return(ret_expr, _) => {
                 if let Some(expr) = ret_expr {

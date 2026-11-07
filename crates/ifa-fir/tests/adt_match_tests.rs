@@ -1047,3 +1047,77 @@ fn test_if_let_nested_patterns_and_guard_execution() {
     let res = interp.execute_function("main", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(41));
 }
+
+#[test]
+fn test_destructuring_assignment_tuple_swap_interp() {
+    let src = r#"
+        pub fn main() -> i64 {
+            mut a = 100;
+            mut b = 200;
+            (a, b) = (b, a);
+            (a, _) = (300, 999);
+            return a * 1000 + b;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("destruct_assign_swap.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(300100));
+}
+
+#[test]
+fn test_destructuring_assignment_struct_and_slice_interp() {
+    let src = r#"
+        struct Vector3 {
+            x: i64,
+            y: i64,
+            z: i64,
+        }
+
+        pub fn main() -> i64 {
+            mut vx = 0;
+            mut vy = 0;
+            mut vz = 0;
+            Vector3 { x: vx, y: vy, z: vz } = Vector3(x: 10, y: 20, z: 30);
+
+            mut first = 0;
+            mut last = 0;
+            let dataset: [i64; 4] = [5, 15, 25, 35];
+            [first, .., last] = dataset;
+
+            return vx + vy + vz + first + last;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("destruct_assign_struct.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(100));
+}

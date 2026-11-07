@@ -2459,3 +2459,142 @@ fn test_if_let_nested_patterns_with_guard() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_destructuring_assignment_tuple_and_swap() {
+    let code = r#"
+        pub fn main() -> i64 {
+            mut a = 10;
+            mut b = 20;
+            (a, b) = (b, a);
+            (a, _) = (100, 200);
+            _ = (1, 2);
+            return a + b;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Tuple destructuring assignment and swap should validate successfully: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_destructuring_assignment_struct_and_slice() {
+    let code = r#"
+        struct Coordinate {
+            lat: i64,
+            lon: i64,
+        }
+
+        pub fn main() -> i64 {
+            mut x = 0;
+            mut y = 0;
+            Coordinate { lat: x, lon: y } = Coordinate(lat: 48, lon: 2);
+
+            mut first = 0;
+            mut last = 0;
+            let arr: [i64; 3] = [10, 20, 30];
+            [first, .., last] = arr;
+
+            return x + y + first + last;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Struct and slice destructuring assignment should validate successfully: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_destructuring_assignment_slice_with_rest_var() {
+    let code = r#"
+        pub fn main() -> i64 {
+            mut first = 0;
+            mut middle: Slice<i64> = [];
+            mut last = 0;
+            let arr: [i64; 4] = [10, 20, 30, 40];
+            [first, ..middle, last] = arr;
+            return first + last;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Slice destructuring assignment with rest variable should succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_destructuring_assignment_immutable_error() {
+    let code = r#"
+        pub fn main() {
+            let a = 10;
+            mut b = 20;
+            (a, b) = (1, 2);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Reassigning immutable variable 'a' in tuple destructuring must produce E0014"
+    );
+    let has_e0014 = res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0014"));
+    assert!(
+        has_e0014,
+        "Expected E0014 error, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_destructuring_assignment_unknown_var_error() {
+    let code = r#"
+        pub fn main() {
+            mut a = 10;
+            (a, unknown_target) = (1, 2);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Assigning to unknown variable in pattern destructuring must fail"
+    );
+}
+
+#[test]
+fn test_destructuring_assignment_refutable_error() {
+    let code = r#"
+        enum Maybe {
+            Val(i64),
+            None,
+        }
+
+        pub fn main() {
+            mut a = 10;
+            let opt = Maybe::Val(42);
+            Maybe::Val(a) = opt;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Refutable pattern in unconditional destructuring assignment must emit E0047"
+    );
+    let has_e0047 = res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0047"));
+    assert!(
+        has_e0047,
+        "Expected E0047 error, got: {:?}",
+        res.diagnostics
+    );
+}

@@ -82,6 +82,31 @@ impl Parser {
         while self.match_token(&TokenKind::Semicolon) {}
     }
 
+    fn can_start_destructure_pattern(&self) -> bool {
+        match self.current().kind {
+            TokenKind::OpenParen | TokenKind::OpenBracket => true,
+            TokenKind::Ident(s) if s.as_str() == "_" => true,
+            TokenKind::Ident(_) => {
+                let mut lookahead = self.cursor + 1;
+                let has_colon_colon = lookahead + 1 < self.tokens.len()
+                    && self.tokens[lookahead].kind == TokenKind::ColonColon;
+                while lookahead + 1 < self.tokens.len()
+                    && self.tokens[lookahead].kind == TokenKind::ColonColon
+                    && matches!(self.tokens[lookahead + 1].kind, TokenKind::Ident(_))
+                {
+                    lookahead += 2;
+                }
+                if lookahead < self.tokens.len() {
+                    self.tokens[lookahead].kind == TokenKind::OpenBrace
+                        || (has_colon_colon && self.tokens[lookahead].kind == TokenKind::OpenParen)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     // --- Top-level Program Parsing ---
 
     pub fn parse_program(&mut self) -> (Program, Vec<Diagnostic>) {
@@ -1047,6 +1072,24 @@ impl Parser {
                 Ok(Stmt::Continue(tok.span))
             }
             _ => {
+                // Tenter une assignation par déstructuration de motif si le token indique un motif
+                // déstructurant (tuple, tranche, structure ou wildcard) :
+                // ex: (a, b) = expr; ou Point { x, y } = expr; ou [a, b] = expr; ou _ = expr;
+                if self.can_start_destructure_pattern() {
+                    let saved_cursor = self.cursor;
+                    let saved_diag_len = self.diagnostics.len();
+                    if let Ok(pattern) = self.parse_pattern() {
+                        if self.match_token(&TokenKind::Eq) {
+                            let val = self.parse_expr()?;
+                            self.match_token(&TokenKind::Semicolon);
+                            let span = Span::new(self.file_id, pattern.span().start, val.span.end);
+                            return Ok(Stmt::AssignPattern { pattern, val, span });
+                        }
+                    }
+                    self.cursor = saved_cursor;
+                    self.diagnostics.truncate(saved_diag_len);
+                }
+
                 // Expression or Assignment
                 let expr = self.parse_expr()?;
 

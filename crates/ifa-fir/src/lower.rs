@@ -913,6 +913,31 @@ impl<'a> FunctionLoweringContext<'a> {
                 }
             }
 
+            Stmt::AssignPattern { pattern, val, span } => {
+                let val_id = self.lower_expr(val);
+                let target_ty = self
+                    .infer_expr_fir_type(val)
+                    .unwrap_or(FirType::Int(IntType::I64));
+
+                let success_block = self.alloc_block();
+                let fail_block = self.alloc_block();
+
+                self.lower_pattern_match(
+                    val_id,
+                    &target_ty,
+                    pattern,
+                    success_block,
+                    fail_block,
+                    *span,
+                );
+
+                if let Some(b) = self.func.get_block_mut(fail_block) {
+                    b.terminator = Some(Terminator::Unreachable);
+                }
+
+                self.current_block = success_block;
+            }
+
             Stmt::Expr(expr) => {
                 let _ = self.lower_expr(expr);
             }

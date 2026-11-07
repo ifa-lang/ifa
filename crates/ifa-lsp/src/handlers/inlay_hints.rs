@@ -57,6 +57,9 @@ impl<'a, 'ast> Visitor<'ast> for InlayHintVisitor<'a> {
                 self.visit_expr(target);
                 self.visit_expr(val);
             }
+            Stmt::AssignPattern { val, .. } => {
+                self.visit_expr(val);
+            }
             Stmt::Expr(e) => self.visit_expr(e),
             Stmt::Defer(b, _) => self.visit_block(b),
             Stmt::Return(e, _) => {

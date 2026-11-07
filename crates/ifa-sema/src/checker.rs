@@ -1018,6 +1018,35 @@ impl<'a> SemanticAnalyzer<'a> {
                     }
                 }
             }
+            Stmt::AssignPattern {
+                pattern,
+                val,
+                span: _,
+            } => {
+                let val_ty = self.infer_expr(val);
+
+                // Validation obligatoire d'irréfutabilité en mode assignation par déstructuration
+                let is_irrefutable =
+                    crate::exhaustiveness::is_irrefutable_pattern_for_type(pattern, &val_ty);
+                if !is_irrefutable && val_ty != Type::Unknown {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "motif réfutable dans une assignation par déstructuration : le motif ne couvre pas toutes les valeurs possibles du type '{}'",
+                            val_ty
+                        ))
+                        .with_code("E0047")
+                        .with_primary_label(
+                            pattern.span(),
+                            "motif réfutable non autorisé dans une assignation sans condition",
+                        )
+                        .with_note(
+                            "les motifs réfutables ne sont autorisés que dans les instructions 'match' ou 'if let'",
+                        ),
+                    );
+                }
+
+                self.check_destructuring_assignment(pattern, &val_ty);
+            }
             Stmt::Expr(expr) => {
                 self.infer_expr(expr);
             }
@@ -2101,6 +2130,291 @@ impl<'a> SemanticAnalyzer<'a> {
 
     fn check_pattern(&mut self, pat: &Pattern, target_ty: &Type) {
         self.check_pattern_with_mut(pat, target_ty, false, true);
+    }
+
+    fn check_destructuring_assignment(&mut self, pat: &Pattern, target_ty: &Type) {
+        match pat {
+            Pattern::Wildcard(_) => {}
+            Pattern::Lit(lit, span) => {
+                let lit_ty = match lit {
+                    Lit::Int(_) => Type::Int(IntType::I64),
+                    Lit::Float(_) => Type::Float(crate::types::FloatType::F64),
+                    Lit::Bool(_) => Type::Bool,
+                    Lit::Char(_) => Type::Char,
+                    Lit::String(_) => Type::Str,
+                    Lit::Null => Type::Optional(Box::new(Type::Unknown)),
+                };
+                if !lit_ty.is_assignable_to(target_ty)
+                    && !target_ty.is_assignable_to(&lit_ty)
+                    && *target_ty != Type::Unknown
+                {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "le motif de type '{}' est incompatible avec le type '{}'",
+                            lit_ty, target_ty
+                        ))
+                        .with_code("E0036")
+                        .with_primary_label(*span, "type de motif incompatible"),
+                    );
+                }
+            }
+            Pattern::Ident(sym, span) => {
+                let var_name = INTERNER.resolve(sym);
+                if let Some(var) = self.symbols.lookup_variable(sym).cloned() {
+                    if !var.is_mut && var.is_initialized {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "impossible d'assigner à la variable immuable '{}'",
+                                var_name
+                            ))
+                            .with_code("E0014")
+                            .with_primary_label(
+                                *span,
+                                format!("tentative de réassignation de '{}'", var_name),
+                            )
+                            .with_secondary_label(
+                                var.span,
+                                format!(
+                                    "variable '{}' déclarée immuable avec 'let' (utilisez 'mut')",
+                                    var_name
+                                ),
+                            )
+                            .with_help(
+                                "Déclarez la variable avec 'mut' si vous devez la réassigner.",
+                            ),
+                        );
+                    }
+                    if !target_ty.is_assignable_to(&var.ty) && *target_ty != Type::Unknown {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "type incompatible lors de l'assignation : la cible est {}, mais la valeur est {}",
+                                var.ty, target_ty
+                            ))
+                            .with_code("E0001")
+                            .with_primary_label(*span, format!("cible de type {}", var.ty))
+                            .with_note(format!("valeur extraite du motif de type {}", target_ty)),
+                        );
+                    }
+                    self.moved_vars.remove(sym);
+                    if let Some(v_mut) = self.symbols.lookup_variable_mut(sym) {
+                        v_mut.is_initialized = true;
+                    }
+                } else {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!("variable inconnue '{}'", var_name))
+                            .with_code("E0001")
+                            .with_primary_label(*span, "variable non trouvée dans cette portée")
+                            .with_help("Déclarez la variable avec 'mut' avant de lui réassigner une valeur."),
+                    );
+                }
+            }
+            Pattern::Tuple(elems, span) => match target_ty {
+                Type::Tuple(expected_elems) => {
+                    if elems.len() != expected_elems.len() {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "le motif tuple contient {} élément(s), mais le type attendu '{}' en contient {}",
+                                elems.len(),
+                                target_ty,
+                                expected_elems.len()
+                            ))
+                            .with_code("E0036")
+                            .with_primary_label(*span, "arité de tuple incompatible"),
+                        );
+                    } else {
+                        for (elem_pat, elem_ty) in elems.iter().zip(expected_elems.iter()) {
+                            self.check_destructuring_assignment(elem_pat, elem_ty);
+                        }
+                    }
+                }
+                Type::Unit if elems.is_empty() => {}
+                Type::Unknown => {
+                    for elem_pat in elems {
+                        self.check_destructuring_assignment(elem_pat, &Type::Unknown);
+                    }
+                }
+                _ => {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "le motif tuple est incompatible avec le type non-tuple '{}'",
+                            target_ty
+                        ))
+                        .with_code("E0036")
+                        .with_primary_label(*span, "type de motif incompatible"),
+                    );
+                }
+            },
+            Pattern::Struct {
+                name,
+                fields,
+                has_rest,
+                span,
+            } => {
+                let st_name = match name.last() {
+                    Some(sym) => *sym,
+                    None => return,
+                };
+
+                let st_opt = self.symbols.lookup_struct(&st_name).cloned();
+                if st_opt.is_none() {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "structure inconnue '{}'",
+                            INTERNER.resolve(&st_name)
+                        ))
+                        .with_code("E0006")
+                        .with_primary_label(*span, "structure inconnue"),
+                    );
+                    return;
+                }
+                let st = st_opt.unwrap();
+
+                let is_compatible = match target_ty {
+                    Type::Struct { name: t_name, .. } => *t_name == st_name,
+                    Type::Generic { name: t_name, .. } => *t_name == st_name,
+                    Type::Unknown => true,
+                    _ => false,
+                };
+
+                if !is_compatible {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "le motif de structure '{}' est incompatible avec le type '{}'",
+                            INTERNER.resolve(&st_name),
+                            target_ty
+                        ))
+                        .with_code("E0036")
+                        .with_primary_label(*span, "structure incompatible"),
+                    );
+                }
+
+                if !has_rest && fields.len() < st.fields.len() {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "champs manquants dans le motif de déstructuration de '{}' (ajoutez '..' ou les champs manquants)",
+                            INTERNER.resolve(&st_name)
+                        ))
+                        .with_code("E0048")
+                        .with_primary_label(*span, "motif incomplet"),
+                    );
+                }
+
+                for f in fields {
+                    if let Some(struct_field) = st.get_field(&f.name) {
+                        self.check_destructuring_assignment(&f.pattern, &struct_field.ty);
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "le champ '{}' n'existe pas dans la structure '{}'",
+                                INTERNER.resolve(&f.name),
+                                INTERNER.resolve(&st_name)
+                            ))
+                            .with_code("E0007")
+                            .with_primary_label(f.span, "champ inconnu"),
+                        );
+                    }
+                }
+            }
+            Pattern::Slice {
+                prefix,
+                rest,
+                suffix,
+                span,
+            } => match target_ty {
+                Type::Array(elem_ty, len) => {
+                    let min_len = prefix.len() + suffix.len();
+                    if rest.is_none() && min_len != *len as usize {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "taille de motif de tranche incompatible : attendu {} élément(s), motif avec {}",
+                                len, min_len
+                            ))
+                            .with_code("E0036")
+                            .with_primary_label(*span, "taille de tableau incompatible"),
+                        );
+                    } else if rest.is_some() && min_len > *len as usize {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "le motif de tranche exige au moins {} élément(s), mais le tableau n'en contient que {}",
+                                min_len, len
+                            ))
+                            .with_code("E0036")
+                            .with_primary_label(*span, "trop d'éléments pour ce tableau"),
+                        );
+                    }
+                    for p in prefix {
+                        self.check_destructuring_assignment(p, elem_ty);
+                    }
+                    if let Some(Some(r)) = rest {
+                        let rest_ty = Type::Slice(elem_ty.clone());
+                        self.check_destructuring_assignment(r, &rest_ty);
+                    }
+                    for s in suffix {
+                        self.check_destructuring_assignment(s, elem_ty);
+                    }
+                }
+                Type::Slice(elem_ty) => {
+                    for p in prefix {
+                        self.check_destructuring_assignment(p, elem_ty);
+                    }
+                    if let Some(Some(r)) = rest {
+                        let rest_ty = Type::Slice(elem_ty.clone());
+                        self.check_destructuring_assignment(r, &rest_ty);
+                    }
+                    for s in suffix {
+                        self.check_destructuring_assignment(s, elem_ty);
+                    }
+                }
+                Type::Unknown => {
+                    for p in prefix {
+                        self.check_destructuring_assignment(p, &Type::Unknown);
+                    }
+                    if let Some(Some(r)) = rest {
+                        self.check_destructuring_assignment(r, &Type::Unknown);
+                    }
+                    for s in suffix {
+                        self.check_destructuring_assignment(s, &Type::Unknown);
+                    }
+                }
+                _ => {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "le motif de tranche est incompatible avec le type non-tranche '{}'",
+                            target_ty
+                        ))
+                        .with_code("E0036")
+                        .with_primary_label(*span, "type incompatible avec une tranche"),
+                    );
+                }
+            },
+            Pattern::Variant { span, .. } => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "les motifs de variant d'énumération ne sont pas autorisés dans une assignation par déstructuration inconditionnelle",
+                    )
+                    .with_code("E0047")
+                    .with_primary_label(*span, "motif de variant non autorisé ici"),
+                );
+            }
+            Pattern::Or(_, span) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "les motifs d'alternative 'or' ('|') ne sont pas autorisés dans une assignation par déstructuration",
+                    )
+                    .with_code("E0047")
+                    .with_primary_label(*span, "motif 'or' non autorisé ici"),
+                );
+            }
+            Pattern::Range { span, .. } => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "les motifs d'intervalle ne sont pas autorisés dans une assignation par déstructuration",
+                    )
+                    .with_code("E0047")
+                    .with_primary_label(*span, "motif d'intervalle non autorisé ici"),
+                );
+            }
+        }
     }
 
     fn check_pattern_with_mut(
