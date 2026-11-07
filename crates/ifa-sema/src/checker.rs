@@ -718,6 +718,7 @@ impl<'a> SemanticAnalyzer<'a> {
 
         for p in fn_params {
             let is_mut = matches!(p.mode, ParamMode::Mut | ParamMode::InOut);
+            self.expr_types.insert(p.span, p.ty.clone());
             if let Err(diag) =
                 self.symbols
                     .define_variable(p.name, p.ty, is_mut, true, Some(p.mode), p.span)
@@ -2898,6 +2899,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
             }
             Pattern::Ident(sym, span) => {
+                self.expr_types.insert(*span, target_ty.clone());
                 if let Err(diag) = self.symbols.define_variable(
                     *sym,
                     target_ty.clone(),
@@ -2922,6 +2924,7 @@ impl<'a> SemanticAnalyzer<'a> {
                     }
                     BindingMode::InOut => (target_ty.clone(), true, Some(ParamMode::InOut)),
                 };
+                self.expr_types.insert(*span, var_ty.clone());
                 if let Err(diag) = self.symbols.define_variable(
                     *name,
                     var_ty,

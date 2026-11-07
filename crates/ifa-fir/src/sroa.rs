@@ -301,14 +301,21 @@ impl SroaPass {
         let mut new_field_allocas = Vec::new();
         let mut struct_to_fields: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
 
-        // 1. Collect struct initializations
-        let mut struct_inits: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+        // 1. Collect aggregate initializations and constant integer values
+        let mut aggregate_inits: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+        let mut const_ints: HashMap<ValueId, usize> = HashMap::new();
         for block in &func.blocks {
             for inst in &block.instructions {
                 if let Some(res) = inst.result {
                     match &inst.expr {
                         ValueExpr::StructInit { fields, .. } | ValueExpr::TupleInit(fields) => {
-                            struct_inits.insert(res, fields.clone());
+                            aggregate_inits.insert(res, fields.clone());
+                        }
+                        ValueExpr::ArrayInit(elements) => {
+                            aggregate_inits.insert(res, elements.clone());
+                        }
+                        ValueExpr::Constant(ConstantValue::Int(v, _)) if *v >= 0 => {
+                            const_ints.insert(res, *v as usize);
                         }
                         _ => {}
                     }
@@ -319,9 +326,14 @@ impl SroaPass {
         // 2. Identify which non-escaping allocas are eligible aggregates for decomposition
         for &ptr in non_escaping {
             if let Some((ty, name, span, block_id)) = alloca_info.get(&ptr) {
-                let field_types: Vec<FirType> = match ty {
-                    FirType::Struct(_, fields) => fields.iter().map(|(_, t)| t.clone()).collect(),
-                    _ => Vec::new(),
+                let (is_array, field_types): (bool, Vec<FirType>) = match ty {
+                    FirType::Struct(_, fields) => {
+                        (false, fields.iter().map(|(_, t)| t.clone()).collect())
+                    }
+                    FirType::Array(elem_ty, count) if *count <= 16 => {
+                        (true, vec![(**elem_ty).clone(); *count as usize])
+                    }
+                    _ => (false, Vec::new()),
                 };
 
                 if field_types.is_empty() {
@@ -329,8 +341,8 @@ impl SroaPass {
                 }
 
                 // Check eligibility:
-                // A) All stores to `ptr` must store a known StructInit
-                // B) All loads from `ptr` must only be used by GetField
+                // A) All stores to `ptr` must store a known aggregate init of matching length
+                // B) All indexed operations on `ptr` or loaded values must use in-bounds constant indices
                 let mut is_eligible = true;
                 let mut loaded_values = HashSet::new();
 
@@ -338,9 +350,34 @@ impl SroaPass {
                     for inst in &block.instructions {
                         match &inst.expr {
                             ValueExpr::Store { ptr: p, val } if *p == ptr => {
-                                if !struct_inits.contains_key(val) {
+                                if let Some(inits) = aggregate_inits.get(val) {
+                                    if inits.len() != field_types.len() {
+                                        is_eligible = false;
+                                        break;
+                                    }
+                                } else {
                                     is_eligible = false;
                                     break;
+                                }
+                            }
+                            ValueExpr::SetElement { base: p, index, .. }
+                                if is_array && *p == ptr =>
+                            {
+                                match const_ints.get(index) {
+                                    Some(&k) if k < field_types.len() => {}
+                                    _ => {
+                                        is_eligible = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            ValueExpr::GetElement { base: p, index } if is_array && *p == ptr => {
+                                match const_ints.get(index) {
+                                    Some(&k) if k < field_types.len() => {}
+                                    _ => {
+                                        is_eligible = false;
+                                        break;
+                                    }
                                 }
                             }
                             ValueExpr::Load { ptr: p } if *p == ptr => {
@@ -360,16 +397,34 @@ impl SroaPass {
                     continue;
                 }
 
-                // Verify that loaded struct values are ONLY used as base in GetField
+                // Verify that loaded aggregate values are ONLY used as base in GetField (struct) or GetElement (array)
                 for block in &func.blocks {
                     for inst in &block.instructions {
                         for u in inst.expr.uses() {
                             if loaded_values.contains(&u) {
-                                match &inst.expr {
-                                    ValueExpr::GetField { base, .. } if *base == u => {}
-                                    _ => {
-                                        is_eligible = false;
-                                        break;
+                                if is_array {
+                                    match &inst.expr {
+                                        ValueExpr::GetElement { base, index } if *base == u => {
+                                            match const_ints.get(index) {
+                                                Some(&k) if k < field_types.len() => {}
+                                                _ => {
+                                                    is_eligible = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            is_eligible = false;
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    match &inst.expr {
+                                        ValueExpr::GetField { base, .. } if *base == u => {}
+                                        _ => {
+                                            is_eligible = false;
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -451,10 +506,10 @@ impl SroaPass {
                     }
                 }
 
-                // If storing into a decomposed aggregate struct
+                // If storing into a decomposed aggregate struct or array
                 if let ValueExpr::Store { ptr, val } = &inst.expr {
                     if let Some(fields) = struct_to_fields.get(ptr) {
-                        if let Some(init_fields) = struct_inits.get(val) {
+                        if let Some(init_fields) = aggregate_inits.get(val) {
                             for (f_ptr, f_val) in fields.iter().zip(init_fields) {
                                 rewritten_instructions.push(Instruction::new(
                                     None,
@@ -492,6 +547,25 @@ impl SroaPass {
                     }
                 }
 
+                // If setting an element of a decomposed aggregate array
+                if let ValueExpr::SetElement { base, index, val } = &inst.expr {
+                    if let Some(fields) = struct_to_fields.get(base) {
+                        if let Some(&k) = const_ints.get(index) {
+                            if let Some(&f_ptr) = fields.get(k) {
+                                rewritten_instructions.push(Instruction::new(
+                                    None,
+                                    ValueExpr::Store {
+                                        ptr: f_ptr,
+                                        val: *val,
+                                    },
+                                    inst.span,
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 // If getting a field from a loaded struct or directly from an alloca base
                 if let ValueExpr::GetField {
                     base, field_idx, ..
@@ -518,6 +592,38 @@ impl SroaPass {
                                     inst.span,
                                 ));
                                 continue;
+                            }
+                        }
+                    }
+                }
+
+                // If getting an element from a loaded array or directly from an alloca base
+                if let ValueExpr::GetElement { base, index } = &inst.expr {
+                    // Case A: GetElement directly on the aggregate pointer
+                    if let Some(fields) = struct_to_fields.get(base) {
+                        if let Some(&k) = const_ints.get(index) {
+                            if let Some(&f_ptr) = fields.get(k) {
+                                rewritten_instructions.push(Instruction::new(
+                                    inst.result,
+                                    ValueExpr::Load { ptr: f_ptr },
+                                    inst.span,
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                    // Case B: GetElement on a value loaded from the aggregate pointer
+                    if let Some(struct_ptr) = struct_loads.get(base) {
+                        if let Some(fields) = struct_to_fields.get(struct_ptr) {
+                            if let Some(&k) = const_ints.get(index) {
+                                if let Some(&f_ptr) = fields.get(k) {
+                                    rewritten_instructions.push(Instruction::new(
+                                        inst.result,
+                                        ValueExpr::Load { ptr: f_ptr },
+                                        inst.span,
+                                    ));
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -972,7 +1078,8 @@ impl SroaPass {
         }
     }
 
-    /// Directly folds field projections (`GetField`) on known SSA aggregates (`StructInit` / `TupleInit`).
+    /// Directly folds field projections (`GetField`), element lookups (`GetElement`), and length queries (`ArrayLen`)
+    /// on known SSA aggregates (`StructInit`, `TupleInit`, `ArrayInit`, and `SliceSub`).
     fn optimize_aggregate_projections(&mut self, func: &mut FirFunction) {
         let mut loop_count = 0;
         loop {
@@ -982,6 +1089,9 @@ impl SroaPass {
             }
 
             let mut aggregate_inits: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+            let mut array_inits: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+            let mut slice_subs: HashMap<ValueId, (ValueId, ValueId, ValueId)> = HashMap::new();
+            let mut const_ints: HashMap<ValueId, i128> = HashMap::new();
             let mut substitutions: HashMap<ValueId, ValueId> = HashMap::new();
 
             for block in &func.blocks {
@@ -991,13 +1101,22 @@ impl SroaPass {
                             ValueExpr::StructInit { fields, .. } | ValueExpr::TupleInit(fields) => {
                                 aggregate_inits.insert(res, fields.clone());
                             }
+                            ValueExpr::ArrayInit(elements) => {
+                                array_inits.insert(res, elements.clone());
+                            }
+                            ValueExpr::SliceSub { base, start, end } => {
+                                slice_subs.insert(res, (*base, *start, *end));
+                            }
+                            ValueExpr::Constant(ConstantValue::Int(v, _)) => {
+                                const_ints.insert(res, *v);
+                            }
                             _ => {}
                         }
                     }
                 }
             }
 
-            if aggregate_inits.is_empty() {
+            if aggregate_inits.is_empty() && array_inits.is_empty() && slice_subs.is_empty() {
                 break;
             }
 
@@ -1005,20 +1124,107 @@ impl SroaPass {
             for block in &mut func.blocks {
                 for inst in &mut block.instructions {
                     if let Some(res) = inst.result {
-                        if let ValueExpr::GetField {
-                            base, field_idx, ..
-                        } = &inst.expr
-                        {
-                            let actual_base = substitutions.get(base).copied().unwrap_or(*base);
-                            if let Some(fields) = aggregate_inits.get(&actual_base) {
-                                if let Some(&field_val) = fields.get(*field_idx) {
-                                    let actual_val =
-                                        substitutions.get(&field_val).copied().unwrap_or(field_val);
-                                    substitutions.insert(res, actual_val);
+                        match &mut inst.expr {
+                            ValueExpr::GetField {
+                                base, field_idx, ..
+                            } => {
+                                let actual_base = substitutions.get(base).copied().unwrap_or(*base);
+                                if let Some(fields) = aggregate_inits.get(&actual_base) {
+                                    if let Some(&field_val) = fields.get(*field_idx) {
+                                        let actual_val = substitutions
+                                            .get(&field_val)
+                                            .copied()
+                                            .unwrap_or(field_val);
+                                        substitutions.insert(res, actual_val);
+                                        self.stats.forwarded_payloads += 1;
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            ValueExpr::GetElement { base, index } => {
+                                let actual_base = substitutions.get(base).copied().unwrap_or(*base);
+                                let actual_idx =
+                                    substitutions.get(index).copied().unwrap_or(*index);
+                                if let Some(&idx_val) = const_ints.get(&actual_idx) {
+                                    // 1. Direct array indexing
+                                    if let Some(elements) = array_inits.get(&actual_base) {
+                                        if idx_val >= 0 && (idx_val as usize) < elements.len() {
+                                            let elem_val = elements[idx_val as usize];
+                                            let actual_val = substitutions
+                                                .get(&elem_val)
+                                                .copied()
+                                                .unwrap_or(elem_val);
+                                            substitutions.insert(res, actual_val);
+                                            self.stats.forwarded_payloads += 1;
+                                            changed = true;
+                                        }
+                                    } else {
+                                        // 2. Indexing through one or more SliceSub layers
+                                        let mut curr = actual_base;
+                                        let mut offset = idx_val;
+                                        let mut resolved = None;
+                                        while let Some(&(sub_base, start_v, _end_v)) =
+                                            slice_subs.get(&curr)
+                                        {
+                                            let actual_start = substitutions
+                                                .get(&start_v)
+                                                .copied()
+                                                .unwrap_or(start_v);
+                                            if let Some(&s_val) = const_ints.get(&actual_start) {
+                                                offset += s_val;
+                                                curr = substitutions
+                                                    .get(&sub_base)
+                                                    .copied()
+                                                    .unwrap_or(sub_base);
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        if let Some(elements) = array_inits.get(&curr) {
+                                            if offset >= 0 && (offset as usize) < elements.len() {
+                                                resolved = Some(elements[offset as usize]);
+                                            }
+                                        }
+                                        if let Some(elem_val) = resolved {
+                                            let actual_val = substitutions
+                                                .get(&elem_val)
+                                                .copied()
+                                                .unwrap_or(elem_val);
+                                            substitutions.insert(res, actual_val);
+                                            self.stats.forwarded_payloads += 1;
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            ValueExpr::ArrayLen { array } => {
+                                let actual_arr =
+                                    substitutions.get(array).copied().unwrap_or(*array);
+                                let mut resolved_len: Option<i128> = None;
+                                if let Some(elements) = array_inits.get(&actual_arr) {
+                                    resolved_len = Some(elements.len() as i128);
+                                } else if let Some(&(_base, start_v, end_v)) =
+                                    slice_subs.get(&actual_arr)
+                                {
+                                    let actual_start =
+                                        substitutions.get(&start_v).copied().unwrap_or(start_v);
+                                    let actual_end =
+                                        substitutions.get(&end_v).copied().unwrap_or(end_v);
+                                    if let (Some(&s_val), Some(&e_val)) =
+                                        (const_ints.get(&actual_start), const_ints.get(&actual_end))
+                                    {
+                                        resolved_len = Some((e_val - s_val).max(0));
+                                    }
+                                }
+                                if let Some(len) = resolved_len {
+                                    inst.expr =
+                                        ValueExpr::Constant(ConstantValue::Int(len, IntType::I64));
+                                    const_ints.insert(res, len);
                                     self.stats.forwarded_payloads += 1;
                                     changed = true;
                                 }
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -1081,7 +1287,10 @@ impl SroaPass {
                                 | ValueExpr::ArrayInit(_)
                                 | ValueExpr::GetField { .. }
                                 | ValueExpr::GetFieldPtr { .. }
+                                | ValueExpr::GetElement { .. }
                                 | ValueExpr::GetElementPtr { .. }
+                                | ValueExpr::ArrayLen { .. }
+                                | ValueExpr::SliceSub { .. }
                                 | ValueExpr::Alloca { .. }
                         );
 

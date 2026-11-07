@@ -247,3 +247,119 @@ fn test_sroa_mutated_struct_full_pipeline() {
     let res = interp.execute_function("compute", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(42));
 }
+
+#[test]
+fn test_sroa_array_decomposition_and_promotion() {
+    let src = r#"
+        pub fn compute_array() -> i64 {
+            mut arr: [i64; 3] = [10, 20, 30];
+            arr[1] = 42;
+            let val = arr[1];
+            return val;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("array_sroa.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module =
+        compile_to_fir_with_opts(&prog, &analysis.symbols, false, false, false, false).unwrap();
+    let mut sroa = SroaPass::new();
+    sroa.run_on_module(&mut module);
+
+    let stats = sroa.stats();
+    assert!(
+        stats.decomposed_aggregates >= 1,
+        "Expected array decomposition, got {:?}",
+        stats
+    );
+
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        !formatted.contains("alloca"),
+        "Expected 0 allocas after array decomposition and promotion:\n{}",
+        formatted
+    );
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("compute_array", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(42));
+}
+
+#[test]
+fn test_sroa_slice_projection_and_length_folding() {
+    let src = r#"
+        pub fn test_slicing() -> i64 {
+            let arr: [i64; 5] = [10, 20, 30, 40, 50];
+            let window = arr[1..4];
+            let x = window[1];
+            let len = window.len();
+            return x * 10 + len;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("slice_sroa.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("test_slicing", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(303));
+}
+
+#[test]
+fn test_sroa_nested_sub_slicing_projection() {
+    let src = r#"
+        pub fn test_nested() -> i64 {
+            let arr: [i64; 6] = [100, 200, 300, 400, 500, 600];
+            let s1 = arr[1..5];
+            let s2 = s1[1..3];
+            let first = s2[0];
+            let second = s2[1];
+            let n = s2.len();
+            return first + second + n;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("nested_slice_sroa.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("test_nested", vec![]).unwrap();
+    // s1 is arr[1..5] -> [200, 300, 400, 500]
+    // s2 is s1[1..3] -> [300, 400], len is 2
+    // first (300) + second (400) + n (2) = 702
+    assert_eq!(res, FirValue::Int(702));
+}

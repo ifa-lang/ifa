@@ -2,53 +2,53 @@
 
 use crate::document::Document;
 use crate::protocol::{InlayHint, InlayHintKind, Range};
-use ifa_ast::{Expr, ExprKind, Stmt, Visitor};
+use ifa_ast::{Expr, ExprKind, Pattern, Stmt, Visitor};
 
 struct InlayHintVisitor<'a> {
     doc: &'a Document,
     hints: Vec<InlayHint>,
 }
 
-impl<'a, 'ast> Visitor<'ast> for InlayHintVisitor<'a> {
-    fn visit_stmt(&mut self, stmt: &'ast Stmt) {
-        if let Stmt::Let {
-            pattern: ifa_ast::Pattern::Ident(name, _) | ifa_ast::Pattern::Binding { name, .. },
-            ty: None,
-            span,
-            ..
-        } = stmt
-        {
-            if let Some(analysis) = &self.doc.analysis {
-                // Find inferred type from semantic scopes
-                for scope in &analysis.symbols.scopes {
-                    if let Some(var) = scope.variables.get(name) {
-                        let ty_str = format!("{}", var.ty);
-                        if ty_str != "unknown" {
-                            let name_str = name.resolve();
-                            let start_offset = span.start.0 as usize;
-                            let end_offset = (span.end.0 as usize).min(self.doc.text.len());
-                            if let Some(rel_idx) =
-                                self.doc.text[start_offset..end_offset].find(&name_str)
-                            {
-                                let hint_offset = start_offset + rel_idx + name_str.len();
-                                let position = self.doc.offset_to_position(hint_offset);
-                                self.hints.push(InlayHint {
-                                    position,
-                                    label: format!(": {}", ty_str),
-                                    kind: Some(InlayHintKind::Type as u32),
-                                    padding_left: Some(false),
-                                    padding_right: Some(true),
-                                });
-                            }
+impl<'a> InlayHintVisitor<'a> {
+    fn emit_pattern_type_hints(&mut self, pattern: &Pattern) {
+        if let Some(analysis) = &self.doc.analysis {
+            for (sym, span) in pattern.bound_variables() {
+                let ty_opt = analysis.symbols.expr_types.get(&span).cloned().or_else(|| {
+                    for scope in &analysis.symbols.scopes {
+                        if let Some(var) = scope.variables.get(&sym) {
+                            return Some(var.ty.clone());
                         }
-                        break;
+                    }
+                    None
+                });
+
+                if let Some(ty) = ty_opt {
+                    let ty_str = format!("{}", ty);
+                    if ty_str != "unknown" {
+                        let position = self.doc.offset_to_position(span.end.0 as usize);
+                        self.hints.push(InlayHint {
+                            position,
+                            label: format!(": {}", ty_str),
+                            kind: Some(InlayHintKind::Type as u32),
+                            padding_left: Some(false),
+                            padding_right: Some(true),
+                        });
                     }
                 }
             }
         }
+    }
+}
 
+impl<'a, 'ast> Visitor<'ast> for InlayHintVisitor<'a> {
+    fn visit_stmt(&mut self, stmt: &'ast Stmt) {
         match stmt {
-            Stmt::Let { init, .. } => {
+            Stmt::Let {
+                pattern, ty, init, ..
+            } => {
+                if ty.is_none() {
+                    self.emit_pattern_type_hints(pattern);
+                }
                 if let Some(e) = init {
                     self.visit_expr(e);
                 }
@@ -73,15 +73,26 @@ impl<'a, 'ast> Visitor<'ast> for InlayHintVisitor<'a> {
                 self.visit_block(body);
             }
             Stmt::WhileLet {
-                expr, guard, body, ..
+                pattern,
+                expr,
+                guard,
+                body,
+                ..
             } => {
+                self.emit_pattern_type_hints(pattern);
                 self.visit_expr(expr);
                 if let Some(g) = guard {
                     self.visit_expr(g);
                 }
                 self.visit_block(body);
             }
-            Stmt::For { iterable, body, .. } => {
+            Stmt::For {
+                pattern,
+                iterable,
+                body,
+                ..
+            } => {
+                self.emit_pattern_type_hints(pattern);
                 self.visit_expr(iterable);
                 self.visit_block(body);
             }
@@ -168,12 +179,13 @@ impl<'a, 'ast> Visitor<'ast> for InlayHintVisitor<'a> {
                 }
             }
             ExprKind::IfLet {
+                pattern,
                 expr,
                 guard,
                 then_branch,
                 else_branch,
-                ..
             } => {
+                self.emit_pattern_type_hints(pattern);
                 self.visit_expr(expr);
                 if let Some(g) = guard {
                     self.visit_expr(g);
@@ -186,6 +198,7 @@ impl<'a, 'ast> Visitor<'ast> for InlayHintVisitor<'a> {
             ExprKind::Match { expr, arms } => {
                 self.visit_expr(expr);
                 for arm in arms {
+                    self.emit_pattern_type_hints(&arm.pattern);
                     if let Some(guard) = &arm.guard {
                         self.visit_expr(guard);
                     }

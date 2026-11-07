@@ -635,6 +635,79 @@ mod tests {
     }
 
     #[test]
+    fn test_lsp_inlay_hints_for_ranges_and_slices() {
+        let mut server = LanguageServer::new();
+        let code = r#"
+            pub fn process_data() -> i64 {
+                let ledger: [i64; 5] = [10, 20, 30, 40, 50];
+                let r = 1..4;
+                let sub = ledger[r];
+                mut total: i64 = 0;
+                for item in sub {
+                    total = total + item;
+                }
+                return total;
+            }
+        "#;
+
+        let open_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/ranges_slices_inlay.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": code
+                }
+            }
+        })
+        .to_string();
+
+        server.handle_message(&open_notif);
+
+        let hint_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "textDocument/inlayHint",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/ranges_slices_inlay.ifa"
+                },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 15, "character": 0 }
+                }
+            }
+        })
+        .to_string();
+
+        let (resp, _) = server.handle_message(&hint_req);
+        assert!(resp.is_some());
+        let resp_val: serde_json::Value = serde_json::from_str(&resp.unwrap()).unwrap();
+        let hints = resp_val["result"].as_array().unwrap();
+        assert!(!hints.is_empty(), "Hints must not be empty");
+        let labels: Vec<&str> = hints.iter().filter_map(|h| h["label"].as_str()).collect();
+
+        // Must contain inlay type hints for inferred range, slice, and loop variable
+        assert!(
+            labels.iter().any(|l| l.contains("Range")),
+            "Expected Range type hint in labels: {:?}",
+            labels
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("Slice")),
+            "Expected Slice type hint in labels: {:?}",
+            labels
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("i64")),
+            "Expected i64 type hint in labels: {:?}",
+            labels
+        );
+    }
+
+    #[test]
     fn test_lsp_signature_help() {
         let mut server = LanguageServer::new();
         let code = r#"

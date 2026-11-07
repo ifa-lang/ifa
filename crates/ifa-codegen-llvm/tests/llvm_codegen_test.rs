@@ -1809,3 +1809,118 @@ fn test_llvm_range_for_loop_and_sub_slicing_execution() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_slice_fat_pointer_inter_function_passing_and_execution() {
+    let src = r#"
+        fn sum_slice(s: Slice<i64>) -> i64 {
+            mut total: i64 = 0;
+            for x in s {
+                total = total + x;
+            }
+            return total;
+        }
+
+        fn inspect_slice_endpoints(s: Slice<i64>) -> i64 {
+            let n = s.len();
+            if n == 0 {
+                return 0;
+            }
+            let first = s[0];
+            let last = s[n - 1];
+            return first * 100 + last;
+        }
+
+        fn sub_slice_passthrough(s: Slice<i64>) -> i64 {
+            let sub = s[1..3];
+            return sum_slice(sub);
+        }
+
+        fn extract_sub_slice(s: Slice<i64>) -> Slice<i64> {
+            return s[1..3];
+        }
+
+        pub fn main() -> i64 {
+            let ledger: [i64; 6] = [10, 20, 30, 40, 50, 60];
+
+            // 1. Pass sub-slice ledger[1..4] (20, 30, 40) -> sum = 90
+            let window = ledger[1..4];
+            let sum1 = sum_slice(window);
+
+            // 2. Coerce entire array to Slice parameter -> sum = 210
+            let sum_all = sum_slice(ledger);
+
+            // 3. Inspect endpoints on window (len 3, first 20, last 40) -> 2040
+            let endpoints = inspect_slice_endpoints(window);
+
+            // 4. Nested sub-slicing on Slice parameter: ledger[1..5] -> sub[1..3] -> 70
+            let wider = ledger[1..5];
+            let sum_nested = sub_slice_passthrough(wider);
+
+            // 5. Returning a Slice<T> dynamically from a function
+            let extracted = extract_sub_slice(wider);
+            let sum_extracted = sum_slice(extracted);
+
+            let grand_total = sum1 + sum_all + endpoints + sum_nested + sum_extracted;
+
+            if grand_total == 2480 {
+                return 42;
+            }
+
+            return 1;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("slice_fat_ptr_test.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse diags: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let llvm_ir = emitter.emit_module(&fir_module).unwrap();
+
+    // Verify fat pointer { ptr, i64 } signatures and operations
+    assert!(
+        llvm_ir.contains("{ ptr, i64 }"),
+        "LLVM IR must define and pass {{ ptr, i64 }} fat pointers"
+    );
+    assert!(
+        llvm_ir.contains("@sum_slice({ ptr, i64 }"),
+        "Function must receive fat pointer {{ ptr, i64 }}: {}",
+        llvm_ir
+    );
+
+    let temp_dir = std::env::temp_dir().join(format!("ifa_llvm_slice_fat_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("slice_fat.o");
+    let bin_path = temp_dir.join("slice_fat_exec");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&fir_module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(output.status.code(), Some(42));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

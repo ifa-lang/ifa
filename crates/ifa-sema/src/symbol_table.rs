@@ -992,7 +992,7 @@ impl SymbolTable {
         let var_sym = VariableSymbol {
             id,
             name,
-            ty,
+            ty: ty.clone(),
             original_ty: None,
             is_mut,
             is_initialized,
@@ -1001,6 +1001,7 @@ impl SymbolTable {
             scope_depth: depth,
         };
 
+        self.expr_types.insert(span, ty);
         current_scope.variables.insert(name, var_sym);
         Ok(id)
     }
