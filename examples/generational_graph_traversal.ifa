@@ -1,0 +1,32 @@
+// IFA Systems Programming Language
+// Generational Safe References and Loop-Invariant Check Elimination (GCE)
+// Section 9.3: 100% sound cycle modeling without borrow checker or garbage collection
+
+struct Node {
+    id: i64,
+    weight: i64,
+    next: ?ref Node,
+}
+
+// Traverse and accumulate weights across safe references in a loop.
+// The IFA compiler statically hoists generational checks out of the loop header (LICM GCE).
+pub fn traverse_accumulator(start: ref Node, iterations: i64) -> i64 {
+    mut acc = 0;
+    mut count = 0;
+    mut current = start;
+
+    while count < iterations {
+        acc = acc + current.weight;
+        count = count + 1;
+    }
+
+    return acc;
+}
+
+pub fn main() {
+    mut tail = Node(id: 2, weight: 25, next: None);
+    mut head = Node(id: 1, weight: 15, next: ref tail);
+
+    let total = traverse_accumulator(ref head, 4);
+    println("Traversal accumulated total:", total);
+}

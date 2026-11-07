@@ -13,7 +13,7 @@ pub mod verify;
 pub use cfg::ControlFlowGraph;
 pub use cow::{CowPass, SharingState};
 pub use dominance::DominanceTree;
-pub use gen_opt::{GenOptStats, GenerationalOptPass};
+pub use gen_opt::{GenOptStats, GenerationalOptPass, NaturalLoop};
 pub use interp::{FirInterpreter, FirValue, GenHeader, GenHeap, InterpError};
 pub use ir::*;
 pub use lower::lower_program;

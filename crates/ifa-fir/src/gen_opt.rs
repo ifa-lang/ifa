@@ -1,13 +1,15 @@
 use crate::cfg::ControlFlowGraph;
 use crate::dominance::DominanceTree;
 use crate::ir::*;
-use std::collections::{HashMap, HashSet};
+use ifa_span::Span;
+use std::collections::{HashMap, HashSet, VecDeque};
 
-/// Statistics collected by the generational check elimination pass.
+/// Statistics collected by the generational check elimination (GCE) pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct GenOptStats {
     pub total_checks: usize,
     pub eliminated_checks: usize,
+    pub hoisted_checks: usize,
 }
 
 impl GenOptStats {
@@ -21,7 +23,16 @@ impl GenOptStats {
     }
 }
 
-/// Optimizes generational references by statically eliminating redundant `GenCheck` instructions.
+/// A natural loop representation in the Control Flow Graph.
+#[derive(Debug, Clone)]
+pub struct NaturalLoop {
+    pub header: BlockId,
+    pub blocks: HashSet<BlockId>,
+    pub preheader: Option<BlockId>,
+}
+
+/// Optimizes generational references by statically eliminating redundant `GenCheck` instructions
+/// and hoisting loop-invariant checks out of loops (Section 9.3).
 pub struct GenerationalOptPass {
     stats: GenOptStats,
 }
@@ -44,7 +55,7 @@ impl GenerationalOptPass {
         }
     }
 
-    /// Run the dominance-based elimination on a single function.
+    /// Run the full GCE pass (Loop-Invariant Hoisting + Dominance Elimination) on a function.
     pub fn run_on_function(&mut self, func: &mut FirFunction) {
         let cfg = ControlFlowGraph::build(func);
         let dom_tree = DominanceTree::build(&cfg);
@@ -70,62 +81,275 @@ impl GenerationalOptPass {
             }
         }
 
-        // 2. Map of verified references: ref_val -> Set of blocks that dominate and have verified it
-        let mut verified_in_block: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
+        // 2. Loop-Invariant Check Hoisting (LICM for Generational Checks - Section 9.3 Rule 2)
+        self.hoist_loop_invariant_checks(
+            func,
+            &cfg,
+            &dom_tree,
+            &freeing_blocks,
+            &ref_creation_block,
+        );
 
-        for block in &mut func.blocks {
-            let block_id = block.id;
-            let mut checked_in_this_block: HashSet<ValueId> = HashSet::new();
+        // 3. Dominance-based and Dataflow Elimination (Section 9.3 Rules 1 & 3)
+        self.run_dominance_elimination(func, &cfg, &dom_tree, &freeing_blocks, &ref_creation_block);
+    }
 
-            for inst in &mut block.instructions {
-                if let ValueExpr::GenCheck { ref_val, redundant } = &mut inst.expr {
-                    self.stats.total_checks += 1;
+    /// Identifies natural loops and hoists invariant `GenCheck` instructions into loop preheaders.
+    fn hoist_loop_invariant_checks(
+        &mut self,
+        func: &mut FirFunction,
+        cfg: &ControlFlowGraph,
+        dom_tree: &DominanceTree,
+        freeing_blocks: &HashSet<BlockId>,
+        ref_defs: &HashMap<ValueId, BlockId>,
+    ) {
+        let loops = Self::find_natural_loops(cfg, dom_tree);
+        let param_values: HashSet<ValueId> = func.params.iter().map(|p| p.val).collect();
 
-                    // Condition 1: Has this reference already been checked earlier in the same block without free?
-                    let already_checked_in_block = checked_in_this_block.contains(ref_val);
+        for loop_info in loops {
+            // Rule 2 condition: if any block in the loop frees memory, checks cannot be hoisted safely
+            let loop_has_free = loop_info.blocks.iter().any(|b| freeing_blocks.contains(b));
+            if loop_has_free {
+                continue;
+            }
 
-                    // Condition 2: Is the creation block dominating this block, and no frees intervene?
-                    let created_in_dominating =
-                        ref_creation_block.get(ref_val).is_some_and(|&def_block| {
-                            dom_tree.dominates(def_block, block_id)
-                                && !freeing_blocks.iter().any(|&fb| {
-                                    dom_tree.dominates(def_block, fb)
-                                        && dom_tree.dominates(fb, block_id)
-                                })
-                        });
+            let preheader_id = match loop_info.preheader {
+                Some(p) => p,
+                None => continue,
+            };
 
-                    // Condition 3: Has a dominating predecessor block already checked this reference?
-                    let checked_in_dominator =
-                        verified_in_block.iter().any(|(&dom_b, checked_refs)| {
-                            dom_tree.dominates(dom_b, block_id)
-                                && checked_refs.contains(ref_val)
-                                && !freeing_blocks.iter().any(|&fb| {
-                                    dom_tree.dominates(dom_b, fb)
-                                        && dom_tree.dominates(fb, block_id)
-                                })
-                        });
+            // Collect all invariant references checked inside the loop
+            let mut candidate_checks: Vec<(ValueId, Span)> = Vec::new();
 
-                    // Condition 4: Strict function guarantees zero generational dynamic checks
-                    let is_strict_func = func.is_strict;
+            for &b_id in &loop_info.blocks {
+                if let Some(block) = func.get_block(b_id) {
+                    for inst in &block.instructions {
+                        if let ValueExpr::GenCheck { ref_val, redundant } = &inst.expr {
+                            if !*redundant {
+                                let is_param = param_values.contains(ref_val);
+                                let is_defined_outside =
+                                    ref_defs.get(ref_val).is_some_and(|&def_b| {
+                                        !loop_info.blocks.contains(&def_b)
+                                            && dom_tree.dominates(def_b, preheader_id)
+                                    });
 
-                    if already_checked_in_block
-                        || created_in_dominating
-                        || checked_in_dominator
-                        || is_strict_func
-                    {
-                        *redundant = true;
-                        self.stats.eliminated_checks += 1;
-                    } else {
-                        // First dynamic check in this block: mark as verified for successors
-                        checked_in_this_block.insert(*ref_val);
+                                if (is_param || is_defined_outside)
+                                    && !candidate_checks.iter().any(|(v, _)| v == ref_val)
+                                {
+                                    candidate_checks.push((*ref_val, inst.span));
+                                }
+                            }
+                        }
                     }
                 }
             }
 
-            if !checked_in_this_block.is_empty() {
-                verified_in_block.insert(block_id, checked_in_this_block);
+            if candidate_checks.is_empty() {
+                continue;
+            }
+
+            // Hoist checks to preheader and mark inside-loop checks as redundant
+            for (ref_val, span) in candidate_checks {
+                let already_checked_in_preheader = func.get_block(preheader_id).is_some_and(|pb| {
+                    pb.instructions.iter().any(|inst| match &inst.expr {
+                        ValueExpr::GenCheck { ref_val: r, .. } => *r == ref_val,
+                        _ => false,
+                    })
+                });
+
+                if !already_checked_in_preheader {
+                    if let Some(pb) = func.get_block_mut(preheader_id) {
+                        pb.instructions.push(Instruction::new(
+                            None,
+                            ValueExpr::GenCheck {
+                                ref_val,
+                                redundant: false,
+                            },
+                            span,
+                        ));
+                        self.stats.hoisted_checks += 1;
+                    }
+                }
+
+                // Eliminate all instances of this check within loop blocks
+                for &b_id in &loop_info.blocks {
+                    if let Some(block) = func.get_block_mut(b_id) {
+                        for inst in &mut block.instructions {
+                            if let ValueExpr::GenCheck {
+                                ref_val: r,
+                                redundant,
+                            } = &mut inst.expr
+                            {
+                                if *r == ref_val && !*redundant {
+                                    *redundant = true;
+                                    self.stats.eliminated_checks += 1;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+
+    /// Performs dominance-based and dataflow elimination in Reverse Post-Order.
+    fn run_dominance_elimination(
+        &mut self,
+        func: &mut FirFunction,
+        _cfg: &ControlFlowGraph,
+        dom_tree: &DominanceTree,
+        freeing_blocks: &HashSet<BlockId>,
+        ref_defs: &HashMap<ValueId, BlockId>,
+    ) {
+        let is_strict = func.is_strict;
+        let mut verified_at_exit: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
+
+        for &block_id in &dom_tree.rpo_blocks {
+            let mut available: HashSet<ValueId> = HashSet::new();
+
+            if is_strict {
+                // In strict mode, function guarantees zero dynamic generational checks
+            } else if block_id != func.entry_block {
+                // 1. Inherit verified references from immediate dominator if no frees intervene
+                if let Some(idom) = dom_tree.immediate_dominator(block_id) {
+                    if let Some(dom_checks) = verified_at_exit.get(&idom) {
+                        let no_free = !freeing_blocks.iter().any(|&fb| {
+                            fb != idom
+                                && dom_tree.dominates(idom, fb)
+                                && dom_tree.dominates(fb, block_id)
+                        });
+                        if no_free {
+                            available.extend(dom_checks.iter().copied());
+                        }
+                    }
+                }
+
+                // 2. Direct lexical dominance: created in dominating block with no intervening frees
+                for (&ref_val, &def_block) in ref_defs {
+                    if dom_tree.dominates(def_block, block_id) {
+                        let no_free = !freeing_blocks.iter().any(|&fb| {
+                            dom_tree.dominates(def_block, fb) && dom_tree.dominates(fb, block_id)
+                        });
+                        if no_free {
+                            available.insert(ref_val);
+                        }
+                    }
+                }
+            }
+
+            if let Some(block) = func.get_block_mut(block_id) {
+                for inst in &mut block.instructions {
+                    match &mut inst.expr {
+                        ValueExpr::GenRef { .. } => {
+                            if let Some(res) = inst.result {
+                                available.insert(res);
+                            }
+                        }
+                        ValueExpr::GenFree { ptr } => {
+                            available.remove(ptr);
+                        }
+                        ValueExpr::GenCheck { ref_val, redundant } => {
+                            self.stats.total_checks += 1;
+
+                            if *redundant {
+                                // Already eliminated by LICM hoisting
+                                available.insert(*ref_val);
+                            } else if is_strict || available.contains(ref_val) {
+                                *redundant = true;
+                                self.stats.eliminated_checks += 1;
+                                available.insert(*ref_val);
+                            } else {
+                                // First dynamic check in path: available for following instructions
+                                available.insert(*ref_val);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            verified_at_exit.insert(block_id, available);
+        }
+    }
+
+    /// Finds all natural loops in the CFG using dominance back-edges.
+    pub fn find_natural_loops(
+        cfg: &ControlFlowGraph,
+        dom_tree: &DominanceTree,
+    ) -> Vec<NaturalLoop> {
+        let mut back_edges: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        for (&block_id, succs) in &cfg.successors {
+            for &succ in succs {
+                if dom_tree.dominates(succ, block_id) {
+                    back_edges.entry(succ).or_default().push(block_id);
+                }
+            }
+        }
+
+        let mut loops = Vec::new();
+        for (header, srcs) in back_edges {
+            let mut loop_blocks = HashSet::new();
+            loop_blocks.insert(header);
+            let mut worklist = VecDeque::new();
+
+            for &src in &srcs {
+                if loop_blocks.insert(src) {
+                    worklist.push_back(src);
+                }
+            }
+
+            while let Some(b) = worklist.pop_front() {
+                if let Some(preds) = cfg.predecessors.get(&b) {
+                    for &pred in preds {
+                        if loop_blocks.insert(pred) {
+                            worklist.push_back(pred);
+                        }
+                    }
+                }
+            }
+
+            let preheader = cfg.predecessors.get(&header).and_then(|preds| {
+                let outside: Vec<BlockId> = preds
+                    .iter()
+                    .copied()
+                    .filter(|p| !loop_blocks.contains(p))
+                    .collect();
+                if outside.len() == 1 {
+                    Some(outside[0])
+                } else {
+                    dom_tree
+                        .immediate_dominator(header)
+                        .filter(|idom| !loop_blocks.contains(idom))
+                }
+            });
+
+            loops.push(NaturalLoop {
+                header,
+                blocks: loop_blocks,
+                preheader,
+            });
+        }
+
+        loops
+    }
+
+    /// Physically removes all `GenCheck` instructions marked as redundant from the function.
+    pub fn strip_redundant_checks(func: &mut FirFunction) -> usize {
+        let mut stripped = 0;
+        for block in &mut func.blocks {
+            let before = block.instructions.len();
+            block.instructions.retain(|inst| {
+                !matches!(
+                    &inst.expr,
+                    ValueExpr::GenCheck {
+                        redundant: true,
+                        ..
+                    }
+                )
+            });
+            stripped += before - block.instructions.len();
+        }
+        stripped
     }
 }
 

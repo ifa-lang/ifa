@@ -382,6 +382,30 @@ impl<'a> FunctionLoweringContext<'a> {
         }
     }
 
+    fn is_generational_ref_expr(&self, expr: &Expr) -> bool {
+        if matches!(
+            &expr.kind,
+            ExprKind::Unary {
+                op: UnaryOp::Ref,
+                ..
+            }
+        ) {
+            return true;
+        }
+        if let Some(fir_ty) = self.infer_expr_fir_type(expr) {
+            match fir_ty {
+                FirType::GenerationalRef(_) => return true,
+                FirType::Optional(inner) => {
+                    if matches!(*inner, FirType::GenerationalRef(_)) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn eval_static_bool(&self, expr: &Expr) -> Option<bool> {
         if let Some(ifa_comptime::Value::Bool(b)) =
             self.symbols.comptime_expr_values.get(&expr.span)
@@ -1791,10 +1815,8 @@ impl<'a> FunctionLoweringContext<'a> {
 
                     // access_block: deref/getfield
                     self.current_block = access_block;
-                    let checked_base = if let ExprKind::Unary {
-                        op: UnaryOp::Ref, ..
-                    } = &receiver.kind
-                    {
+                    let is_gen_ref = self.is_generational_ref_expr(receiver);
+                    let checked_base = if is_gen_ref {
                         self.emit(
                             None,
                             ValueExpr::GenCheck {
@@ -1843,10 +1865,8 @@ impl<'a> FunctionLoweringContext<'a> {
 
                 let base_val = self.lower_expr(receiver);
                 // Si le récepteur est une référence ref, émettre GenCheck et GenDeref
-                let checked_base = if let ExprKind::Unary {
-                    op: UnaryOp::Ref, ..
-                } = &receiver.kind
-                {
+                let is_gen_ref = self.is_generational_ref_expr(receiver);
+                let checked_base = if is_gen_ref {
                     self.emit(
                         None,
                         ValueExpr::GenCheck {
