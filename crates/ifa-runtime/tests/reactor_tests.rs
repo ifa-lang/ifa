@@ -73,6 +73,10 @@ fn test_async_tcp_listener_and_stream_fiber_echo() {
     let n = client.read(&mut reply).expect("Client read");
     assert_eq!(&reply[..n], b"pong-ifa");
 
+    let start_wait = Instant::now();
+    while !done.load(Ordering::SeqCst) && start_wait.elapsed() < Duration::from_millis(500) {
+        std::thread::yield_now();
+    }
     assert!(done.load(Ordering::SeqCst));
 }
 
