@@ -513,6 +513,64 @@ impl<'a> LlvmIrEmitter<'a> {
                     res_id
                 ));
             }
+            ValueExpr::GetField {
+                base, field_idx, ..
+            } => {
+                out.push_str(&format!(
+                    "  %gep_{} = getelementptr inbounds i64, ptr %v{}, i32 {}\n",
+                    res_id, base.0, field_idx
+                ));
+                out.push_str(&format!("  %v{} = load i64, ptr %gep_{}\n", res_id, res_id));
+            }
+            ValueExpr::GetElement { base, index } => {
+                out.push_str(&format!(
+                    "  %gep_{} = getelementptr inbounds i64, ptr %v{}, i64 %v{}\n",
+                    res_id, base.0, index.0
+                ));
+                out.push_str(&format!("  %v{} = load i64, ptr %gep_{}\n", res_id, res_id));
+            }
+            ValueExpr::ArrayInit(elements) => {
+                let count = elements.len().max(1);
+                out.push_str(&format!(
+                    "  %arr_alloc_{} = alloca [{} x i64], align 8\n",
+                    res_id, count
+                ));
+                for (idx, elem) in elements.iter().enumerate() {
+                    out.push_str(&format!(
+                        "  %elem_ptr_{}_{} = getelementptr inbounds [{} x i64], ptr %arr_alloc_{}, i64 0, i64 {}\n",
+                        res_id, idx, count, res_id, idx
+                    ));
+                    out.push_str(&format!(
+                        "  store i64 %v{}, ptr %elem_ptr_{}_{}, align 8\n",
+                        elem.0, res_id, idx
+                    ));
+                }
+                out.push_str(&format!(
+                    "  %v{} = getelementptr inbounds [{} x i64], ptr %arr_alloc_{}, i64 0, i64 0\n",
+                    res_id, count, res_id
+                ));
+            }
+            ValueExpr::StructInit { name, fields } => {
+                let s_name = INTERNER.resolve(name);
+                out.push_str(&format!(
+                    "  %st_alloc_{} = alloca %struct.{}, align 8\n",
+                    res_id, s_name
+                ));
+                for (idx, field_val) in fields.iter().enumerate() {
+                    out.push_str(&format!(
+                        "  %field_ptr_{}_{} = getelementptr inbounds %struct.{}, ptr %st_alloc_{}, i32 0, i32 {}\n",
+                        res_id, idx, s_name, res_id, idx
+                    ));
+                    out.push_str(&format!(
+                        "  store i64 %v{}, ptr %field_ptr_{}_{}, align 8\n",
+                        field_val.0, res_id, idx
+                    ));
+                }
+                out.push_str(&format!(
+                    "  %v{} = load %struct.{}, ptr %st_alloc_{}\n",
+                    res_id, s_name, res_id
+                ));
+            }
             _ => {
                 // Default fallback for intermediate structures
                 out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
@@ -598,6 +656,32 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             ValueExpr::Yield => {
                 out.push_str("  call void @ifa_rt_fiber_yield()\n");
+            }
+            ValueExpr::SetField {
+                base,
+                field_idx,
+                val,
+            } => {
+                let _ = base;
+                out.push_str(&format!(
+                    "  %gep_set_{} = getelementptr inbounds i64, ptr %v{}, i32 {}\n",
+                    val.0, base.0, field_idx
+                ));
+                out.push_str(&format!(
+                    "  store i64 %v{}, ptr %gep_set_{}\n",
+                    val.0, val.0
+                ));
+            }
+            ValueExpr::SetElement { base, index, val } => {
+                let _ = base;
+                out.push_str(&format!(
+                    "  %gep_set_{} = getelementptr inbounds i64, ptr %v{}, i64 %v{}\n",
+                    val.0, base.0, index.0
+                ));
+                out.push_str(&format!(
+                    "  store i64 %v{}, ptr %gep_set_{}\n",
+                    val.0, val.0
+                ));
             }
             _ => {}
         }

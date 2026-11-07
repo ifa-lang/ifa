@@ -598,6 +598,15 @@ impl<'a> EscapeAnalyzer<'a> {
                 self.spawn_depth = prev_depth;
             }
             ExprKind::Comptime(inner) => self.check_expr(inner),
+            ExprKind::Match { expr: target, arms } => {
+                self.check_expr(target);
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        self.check_expr(guard);
+                    }
+                    self.check_expr(&arm.body);
+                }
+            }
             _ => {}
         }
     }

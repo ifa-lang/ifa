@@ -392,16 +392,74 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 None
             }
 
+            ValueExpr::GetElement { base, index } => {
+                let p = self.value_map[base];
+                let idx = self.value_map[index];
+                let offset = self.builder.ins().imul_imm_s(idx, 8);
+                let addr = self.builder.ins().iadd(p, offset);
+                Some(
+                    self.builder
+                        .ins()
+                        .load(types::I64, MemFlagsData::trusted(), addr, 0),
+                )
+            }
+
+            ValueExpr::SetElement { base, index, val } => {
+                let p = self.value_map[base];
+                let idx = self.value_map[index];
+                let v = self.value_map[val];
+                let offset = self.builder.ins().imul_imm_s(idx, 8);
+                let addr = self.builder.ins().iadd(p, offset);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), v, addr, 0);
+                None
+            }
+
+            ValueExpr::ArrayInit(elements) => {
+                let count = elements.len().max(1);
+                let byte_size = (count * 8) as u32;
+                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    byte_size,
+                    0,
+                ));
+                let base_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+                for (idx, elem_id) in elements.iter().enumerate() {
+                    let elem_val = self.value_map[elem_id];
+                    let offset = (idx * 8) as i32;
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), elem_val, base_addr, offset);
+                }
+                Some(base_addr)
+            }
+
+            ValueExpr::StructInit { fields, .. } => {
+                let count = fields.len().max(1);
+                let byte_size = (count * 8) as u32;
+                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    byte_size,
+                    0,
+                ));
+                let base_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+                for (idx, field_id) in fields.iter().enumerate() {
+                    let field_val = self.value_map[field_id];
+                    let offset = (idx * 8) as i32;
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), field_val, base_addr, offset);
+                }
+                Some(base_addr)
+            }
+
             ValueExpr::ArrayPush { .. }
             | ValueExpr::StructPushField { .. }
-            | ValueExpr::ArrayInit(_)
             | ValueExpr::TupleInit(_)
-            | ValueExpr::StructInit { .. }
             | ValueExpr::CoWCheckShared { .. }
             | ValueExpr::Spawn { .. }
-            | ValueExpr::Call { .. }
-            | ValueExpr::GetElement { .. }
-            | ValueExpr::SetElement { .. } => Some(self.builder.ins().iconst(types::I64, 0)),
+            | ValueExpr::Call { .. } => Some(self.builder.ins().iconst(types::I64, 0)),
 
             ValueExpr::ArrayLen { array } => {
                 let _ = array;

@@ -212,3 +212,45 @@ fn test_llvm_codegen_monomorphized_generic_functions() {
     assert!(llvm_ir.contains("@unbox__i64"));
     assert!(llvm_ir.contains("call i64 @unbox__i64"));
 }
+
+#[test]
+fn test_llvm_for_loop_and_match_codegen() {
+    let src = r#"
+        fn score(v: i64) -> i64 {
+            return match v {
+                10 => 1,
+                20 => 2,
+                _ => 0,
+            };
+        }
+
+        pub fn main() -> i64 {
+            let nums = [10, 20];
+            mut total = 0;
+            for n in nums {
+                total = total + score(n);
+            }
+            return total;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_for_match.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let llvm_ir = emitter.emit_module(&fir_module).unwrap();
+
+    assert!(llvm_ir.contains("define internal i64 @score(i64 %v0)"));
+    assert!(llvm_ir.contains("define dso_local i64 @main()"));
+    assert!(llvm_ir.contains("getelementptr inbounds [2 x i64]"));
+    assert!(llvm_ir.contains("call i64 @score"));
+}

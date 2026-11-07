@@ -6,8 +6,8 @@ use crate::symbol_table::{
 };
 use crate::types::{IntType, Type};
 use ifa_ast::{
-    Arg, BinOp, Block, Expr, ExprKind, Function, GenericParam, Impl, Item, Lit, ParamMode, Program,
-    Stmt, Struct, Trait, UnaryOp,
+    Arg, BinOp, Block, Expr, ExprKind, Function, GenericParam, Impl, Item, Lit, ParamMode, Pattern,
+    Program, Stmt, Struct, Trait, UnaryOp,
 };
 use ifa_diagnostics::Diagnostic;
 use ifa_span::{SourceMap, Span, Symbol, INTERNER};
@@ -1288,11 +1288,141 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
                 ty
             }
-            ExprKind::Match { expr: _, arms: _ } => Type::Unknown,
+            ExprKind::Match {
+                expr: target_expr,
+                arms,
+            } => {
+                let target_ty = self.infer_expr(target_expr);
+                if arms.is_empty() {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "l'expression 'match' doit comporter au moins une branche",
+                        )
+                        .with_code("E0033")
+                        .with_primary_label(expr.span, "branches manquantes"),
+                    );
+                    Type::Unknown
+                } else {
+                    let mut arm_types = Vec::new();
+                    for arm in arms {
+                        self.symbols.enter_scope(false, false);
+                        self.check_pattern(&arm.pattern, &target_ty);
+                        if let Some(guard) = &arm.guard {
+                            let guard_ty = self.infer_expr(guard);
+                            if !matches!(guard_ty, Type::Bool | Type::Unknown) {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "la condition de garde 'match' doit être un booléen, trouvé '{}'",
+                                        guard_ty
+                                    ))
+                                    .with_code("E0034")
+                                    .with_primary_label(guard.span, "condition de garde non booléenne"),
+                                );
+                            }
+                        }
+                        let arm_ty = self.check_expr(&arm.body, expected);
+                        self.symbols.exit_scope();
+                        arm_types.push(arm_ty);
+                    }
+
+                    let mut unified = arm_types[0].clone();
+                    for arm_ty in &arm_types[1..] {
+                        if !arm_ty.is_assignable_to(&unified)
+                            && !unified.is_assignable_to(arm_ty)
+                            && *arm_ty != Type::Unknown
+                            && unified != Type::Unknown
+                        {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "incompatibilité de type entre les branches du 'match' : attendu '{}', trouvé '{}'",
+                                    unified, arm_ty
+                                ))
+                                .with_code("E0035")
+                                .with_primary_label(expr.span, "types incompatibles entre les branches"),
+                            );
+                        } else if unified == Type::Unknown {
+                            unified = arm_ty.clone();
+                        }
+                    }
+                    unified
+                }
+            }
         };
 
         self.expr_types.insert(expr.span, ty.clone());
         ty
+    }
+
+    fn check_pattern(&mut self, pat: &Pattern, target_ty: &Type) {
+        match pat {
+            Pattern::Wildcard(_) => {}
+            Pattern::Lit(lit, span) => {
+                let lit_ty = match lit {
+                    Lit::Int(_) => Type::Int(IntType::I64),
+                    Lit::Float(_) => Type::Float(crate::types::FloatType::F64),
+                    Lit::Bool(_) => Type::Bool,
+                    Lit::Char(_) => Type::Char,
+                    Lit::String(_) => Type::Str,
+                };
+                if !lit_ty.is_assignable_to(target_ty)
+                    && !target_ty.is_assignable_to(&lit_ty)
+                    && *target_ty != Type::Unknown
+                {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "le motif de type '{}' est incompatible avec le type '{}'",
+                            lit_ty, target_ty
+                        ))
+                        .with_code("E0036")
+                        .with_primary_label(*span, "type de motif incompatible"),
+                    );
+                }
+            }
+            Pattern::Ident(sym, span) => {
+                let _ =
+                    self.symbols
+                        .define_variable(*sym, target_ty.clone(), false, true, None, *span);
+            }
+            Pattern::Variant {
+                enum_name,
+                variant,
+                inner,
+                span,
+            } => {
+                if let Type::Enum { name: e_sym, .. } = target_ty {
+                    if let Some(e_decl) = self.symbols.lookup_enum(e_sym) {
+                        if !e_decl.variants.iter().any(|(v, _)| v == variant) {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "le variant '{}' n'existe pas dans l'énumération '{}'",
+                                    INTERNER.resolve(variant),
+                                    INTERNER.resolve(e_sym)
+                                ))
+                                .with_code("E0037")
+                                .with_primary_label(*span, "variant inconnu"),
+                            );
+                        }
+                    }
+                } else if let Some(e_sym) = enum_name {
+                    if let Some(e_decl) = self.symbols.lookup_enum(e_sym) {
+                        if !e_decl.variants.iter().any(|(v, _)| v == variant) {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "le variant '{}' n'existe pas dans l'énumération '{}'",
+                                    INTERNER.resolve(variant),
+                                    INTERNER.resolve(e_sym)
+                                ))
+                                .with_code("E0037")
+                                .with_primary_label(*span, "variant inconnu"),
+                            );
+                        }
+                    }
+                }
+                if let Some(inner_pat) = inner {
+                    self.check_pattern(inner_pat, &Type::Unknown);
+                }
+            }
+        }
     }
 
     fn check_binary_expr(&mut self, op: BinOp, left: &Expr, right: &Expr, span: Span) -> Type {

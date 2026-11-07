@@ -290,3 +290,45 @@ fn test_cranelift_jit_monomorphized_generic_functions() {
     let result = jit.run_main().expect("Failed to execute native main");
     assert_eq!(result, 123);
 }
+
+#[test]
+fn test_jit_for_loop_and_match_execution() {
+    let src = r#"
+        fn score(v: i64) -> i64 {
+            return match v {
+                10 => 1,
+                20 => 2,
+                30 => 3,
+                _ => 0,
+            };
+        }
+
+        pub fn main() -> i64 {
+            let nums = [10, 20, 30];
+            mut total = 0;
+            for n in nums {
+                total = total + score(n);
+            }
+            return total;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("jit_for_match.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, _) = ifa_parser::parse(fid, tokens);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile for loop and match to Cranelift machine code");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 6); // 1 + 2 + 3 = 6
+}

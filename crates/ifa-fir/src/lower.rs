@@ -1,6 +1,6 @@
 use crate::ir::*;
 use crate::types::FirType;
-use ifa_ast::{BinOp, Expr, ExprKind, Item, Lit, Program, Stmt, UnaryOp};
+use ifa_ast::{BinOp, Block, Expr, ExprKind, Item, Lit, Pattern, Program, Stmt, UnaryOp};
 use ifa_sema::types::{FloatType, IntType};
 use ifa_sema::SymbolTable;
 use ifa_span::{Span, Symbol, INTERNER};
@@ -26,6 +26,8 @@ struct FunctionLoweringContext<'a> {
     loop_stack: Vec<LoopContext>,
     type_subst: HashMap<Symbol, ifa_sema::types::Type>,
     module_structs: &'a [FirStruct],
+    module_enums: &'a [FirEnum],
+    defer_stack: Vec<Block>,
 }
 
 impl<'a> FunctionLoweringContext<'a> {
@@ -36,6 +38,7 @@ impl<'a> FunctionLoweringContext<'a> {
         func_name_override: Option<Symbol>,
         type_subst: HashMap<Symbol, ifa_sema::types::Type>,
         module_structs: &'a [FirStruct],
+        module_enums: &'a [FirEnum],
     ) -> Self {
         let ret_ty = func_ast
             .ret_ty
@@ -103,7 +106,29 @@ impl<'a> FunctionLoweringContext<'a> {
             loop_stack: Vec::new(),
             type_subst,
             module_structs,
+            module_enums,
+            defer_stack: Vec::new(),
         }
+    }
+
+    fn emit_all_defers(&mut self) {
+        let defers = self.defer_stack.clone();
+        for block in defers.iter().rev() {
+            for s in &block.stmts {
+                self.lower_stmt(s);
+            }
+        }
+    }
+
+    fn lookup_variant_discriminant(&self, variant_name: Symbol) -> Option<usize> {
+        for e in self.module_enums {
+            for (idx, (v_name, _)) in e.variants.iter().enumerate() {
+                if *v_name == variant_name {
+                    return Some(idx);
+                }
+            }
+        }
+        None
     }
 
     fn alloc_value(&mut self) -> ValueId {
@@ -336,9 +361,11 @@ impl<'a> FunctionLoweringContext<'a> {
         // 3. Lower optional trailing expression as return
         if let Some(trailing_expr) = &body.expr {
             let ret_val = self.lower_expr(trailing_expr);
+            self.emit_all_defers();
             self.set_terminator(Terminator::Return(Some(ret_val)));
         } else if let Some(block) = self.func.get_block(self.current_block) {
             if !block.is_terminated() {
+                self.emit_all_defers();
                 self.set_terminator(Terminator::Return(None));
             }
         }
@@ -454,11 +481,13 @@ impl<'a> FunctionLoweringContext<'a> {
 
             Stmt::Return(opt_expr, _) => {
                 let ret_val = opt_expr.as_ref().map(|e| self.lower_expr(e));
+                self.emit_all_defers();
                 self.set_terminator(Terminator::Return(ret_val));
             }
 
             Stmt::Fail(expr, _) => {
                 let fail_val = self.lower_expr(expr);
+                self.emit_all_defers();
                 self.set_terminator(Terminator::Fail(fail_val));
             }
 
@@ -564,11 +593,189 @@ impl<'a> FunctionLoweringContext<'a> {
                 }
             }
 
-            Stmt::Defer(_, _) => {
-                // Defers are lowered at block exit in reverse order
+            Stmt::Defer(body, _) => {
+                self.defer_stack.push(body.clone());
             }
 
-            Stmt::For { .. } => {}
+            Stmt::For {
+                var,
+                iterable,
+                body,
+                span,
+            } => {
+                let iter_val = self.lower_expr(iterable);
+                let iter_ty = self.infer_expr_fir_type(iterable);
+
+                let limit_val = if let Some(FirType::Array(_, len)) = iter_ty {
+                    let lim = self.alloc_value();
+                    self.emit(
+                        Some(lim),
+                        ValueExpr::Constant(ConstantValue::Int(len as i128, IntType::I64)),
+                        *span,
+                    );
+                    lim
+                } else {
+                    let lim = self.alloc_value();
+                    self.emit(Some(lim), ValueExpr::ArrayLen { array: iter_val }, *span);
+                    lim
+                };
+
+                let elem_ty = match &iter_ty {
+                    Some(FirType::Array(inner, _)) => (**inner).clone(),
+                    Some(FirType::Slice(inner)) => (**inner).clone(),
+                    _ => FirType::Int(IntType::I64),
+                };
+
+                // Allocate loop index counter
+                let idx_ptr = self.alloc_value();
+                self.emit(
+                    Some(idx_ptr),
+                    ValueExpr::Alloca {
+                        ty: FirType::Int(IntType::I64),
+                        name: Some(
+                            INTERNER.intern(&format!("__for_idx_{}", self.func.next_value_id)),
+                        ),
+                    },
+                    *span,
+                );
+                let zero_val = self.alloc_value();
+                self.emit(
+                    Some(zero_val),
+                    ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                    *span,
+                );
+                self.emit(
+                    None,
+                    ValueExpr::Store {
+                        ptr: idx_ptr,
+                        val: zero_val,
+                    },
+                    *span,
+                );
+
+                // Allocate loop element variable
+                let var_ptr = self.alloc_value();
+                self.emit(
+                    Some(var_ptr),
+                    ValueExpr::Alloca {
+                        ty: elem_ty.clone(),
+                        name: Some(*var),
+                    },
+                    *span,
+                );
+                self.var_allocas.insert(*var, var_ptr);
+                self.var_types.insert(*var, elem_ty);
+
+                let cond_block = self.alloc_block();
+                let body_block = self.alloc_block();
+                let step_block = self.alloc_block();
+                let exit_block = self.alloc_block();
+
+                self.set_terminator(Terminator::Branch {
+                    target: cond_block,
+                    args: Vec::new(),
+                });
+
+                // Condition block
+                self.current_block = cond_block;
+                let cur_idx = self.alloc_value();
+                self.emit(Some(cur_idx), ValueExpr::Load { ptr: idx_ptr }, *span);
+                let cond_val = self.alloc_value();
+                self.emit(
+                    Some(cond_val),
+                    ValueExpr::Binary {
+                        op: BinaryOp::Lt,
+                        lhs: cur_idx,
+                        rhs: limit_val,
+                    },
+                    *span,
+                );
+                self.set_terminator(Terminator::BranchCond {
+                    cond: cond_val,
+                    then_block: body_block,
+                    then_args: Vec::new(),
+                    else_block: exit_block,
+                    else_args: Vec::new(),
+                });
+
+                // Body block
+                self.current_block = body_block;
+                self.loop_stack.push(LoopContext {
+                    continue_block: step_block,
+                    break_block: exit_block,
+                });
+
+                let elem_val = self.alloc_value();
+                self.emit(
+                    Some(elem_val),
+                    ValueExpr::GetElement {
+                        base: iter_val,
+                        index: cur_idx,
+                    },
+                    *span,
+                );
+                self.emit(
+                    None,
+                    ValueExpr::Store {
+                        ptr: var_ptr,
+                        val: elem_val,
+                    },
+                    *span,
+                );
+
+                for s in &body.stmts {
+                    self.lower_stmt(s);
+                }
+                if let Some(trailing) = &body.expr {
+                    let _ = self.lower_expr(trailing);
+                }
+
+                if let Some(b) = self.func.get_block(self.current_block) {
+                    if !b.is_terminated() {
+                        self.set_terminator(Terminator::Branch {
+                            target: step_block,
+                            args: Vec::new(),
+                        });
+                    }
+                }
+                self.loop_stack.pop();
+
+                // Step block
+                self.current_block = step_block;
+                let idx_before = self.alloc_value();
+                self.emit(Some(idx_before), ValueExpr::Load { ptr: idx_ptr }, *span);
+                let one_val = self.alloc_value();
+                self.emit(
+                    Some(one_val),
+                    ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+                    *span,
+                );
+                let idx_after = self.alloc_value();
+                self.emit(
+                    Some(idx_after),
+                    ValueExpr::Binary {
+                        op: BinaryOp::Add,
+                        lhs: idx_before,
+                        rhs: one_val,
+                    },
+                    *span,
+                );
+                self.emit(
+                    None,
+                    ValueExpr::Store {
+                        ptr: idx_ptr,
+                        val: idx_after,
+                    },
+                    *span,
+                );
+                self.set_terminator(Terminator::Branch {
+                    target: cond_block,
+                    args: Vec::new(),
+                });
+
+                // Exit block
+                self.current_block = exit_block;
+            }
         }
     }
 
@@ -601,6 +808,14 @@ impl<'a> FunctionLoweringContext<'a> {
                     res
                 } else if let Some(c_expr) = self.constants.get(sym) {
                     self.lower_expr(c_expr)
+                } else if let Some(disc) = self.lookup_variant_discriminant(*sym) {
+                    let res = self.alloc_value();
+                    self.emit(
+                        Some(res),
+                        ValueExpr::Constant(ConstantValue::Int(disc as i128, IntType::I64)),
+                        span,
+                    );
+                    res
                 } else {
                     let res = self.alloc_value();
                     self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), span);
@@ -1084,16 +1299,25 @@ impl<'a> FunctionLoweringContext<'a> {
             }
 
             ExprKind::Block(b) => {
+                let defer_checkpoint = self.defer_stack.len();
                 for s in &b.stmts {
                     self.lower_stmt(s);
                 }
-                if let Some(e) = &b.expr {
+                let res = if let Some(e) = &b.expr {
                     self.lower_expr(e)
                 } else {
                     let res = self.alloc_value();
                     self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), span);
                     res
+                };
+                while self.defer_stack.len() > defer_checkpoint {
+                    if let Some(def) = self.defer_stack.pop() {
+                        for s in &def.stmts {
+                            self.lower_stmt(s);
+                        }
+                    }
                 }
+                res
             }
 
             ExprKind::StructInit { name, fields } => {
@@ -1189,6 +1413,332 @@ impl<'a> FunctionLoweringContext<'a> {
             }
 
             ExprKind::Comptime(inner) => self.lower_expr(inner),
+
+            ExprKind::Catch {
+                expr: inner_expr,
+                err_var,
+                body,
+            } => {
+                let inner_val = self.lower_expr(inner_expr);
+                let inner_fir_ty = self.infer_expr_fir_type(inner_expr);
+                let is_fallible = matches!(inner_fir_ty, Some(FirType::ErrorUnion { .. }));
+
+                if !is_fallible {
+                    return inner_val;
+                }
+
+                let res_ptr = self.alloc_value();
+                let res_ty = inner_fir_ty
+                    .as_ref()
+                    .map(|t| match t {
+                        FirType::ErrorUnion { ok, .. } => (**ok).clone(),
+                        other => other.clone(),
+                    })
+                    .unwrap_or(FirType::Int(IntType::I64));
+
+                self.emit(
+                    Some(res_ptr),
+                    ValueExpr::Alloca {
+                        ty: res_ty.clone(),
+                        name: Some(
+                            INTERNER.intern(&format!("__catch_res_{}", self.func.next_value_id)),
+                        ),
+                    },
+                    span,
+                );
+
+                let ok_block = self.alloc_block();
+                let err_block = self.alloc_block();
+                let exit_block = self.alloc_block();
+
+                // Extract error status (field 0)
+                let err_status = self.alloc_value();
+                self.emit(
+                    Some(err_status),
+                    ValueExpr::GetField {
+                        base: inner_val,
+                        field_idx: 0,
+                        field_name: INTERNER.intern("status"),
+                    },
+                    span,
+                );
+                let zero_const = self.alloc_value();
+                self.emit(
+                    Some(zero_const),
+                    ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                    span,
+                );
+                let is_err_val = self.alloc_value();
+                self.emit(
+                    Some(is_err_val),
+                    ValueExpr::Binary {
+                        op: BinaryOp::Ne,
+                        lhs: err_status,
+                        rhs: zero_const,
+                    },
+                    span,
+                );
+                self.set_terminator(Terminator::BranchCond {
+                    cond: is_err_val,
+                    then_block: err_block,
+                    then_args: Vec::new(),
+                    else_block: ok_block,
+                    else_args: Vec::new(),
+                });
+
+                // ok_block: unpack success value (field 1)
+                self.current_block = ok_block;
+                let ok_val = self.alloc_value();
+                self.emit(
+                    Some(ok_val),
+                    ValueExpr::GetField {
+                        base: inner_val,
+                        field_idx: 1,
+                        field_name: INTERNER.intern("value"),
+                    },
+                    span,
+                );
+                self.emit(
+                    None,
+                    ValueExpr::Store {
+                        ptr: res_ptr,
+                        val: ok_val,
+                    },
+                    span,
+                );
+                self.set_terminator(Terminator::Branch {
+                    target: exit_block,
+                    args: Vec::new(),
+                });
+
+                // err_block: catch fallback branch
+                self.current_block = err_block;
+                if let Some(err_name) = err_var {
+                    let err_ptr = self.alloc_value();
+                    self.emit(
+                        Some(err_ptr),
+                        ValueExpr::Alloca {
+                            ty: FirType::Int(IntType::I64),
+                            name: Some(*err_name),
+                        },
+                        span,
+                    );
+                    self.emit(
+                        None,
+                        ValueExpr::Store {
+                            ptr: err_ptr,
+                            val: inner_val,
+                        },
+                        span,
+                    );
+                    self.var_allocas.insert(*err_name, err_ptr);
+                    self.var_types.insert(*err_name, FirType::Int(IntType::I64));
+                }
+
+                for s in &body.stmts {
+                    self.lower_stmt(s);
+                }
+                let body_res = if let Some(e) = &body.expr {
+                    self.lower_expr(e)
+                } else {
+                    let u = self.alloc_value();
+                    self.emit(Some(u), ValueExpr::Constant(ConstantValue::Unit), span);
+                    u
+                };
+                self.emit(
+                    None,
+                    ValueExpr::Store {
+                        ptr: res_ptr,
+                        val: body_res,
+                    },
+                    span,
+                );
+                if let Some(b) = self.func.get_block(self.current_block) {
+                    if !b.is_terminated() {
+                        self.set_terminator(Terminator::Branch {
+                            target: exit_block,
+                            args: Vec::new(),
+                        });
+                    }
+                }
+
+                // exit_block
+                self.current_block = exit_block;
+                let final_res = self.alloc_value();
+                self.emit(Some(final_res), ValueExpr::Load { ptr: res_ptr }, span);
+                final_res
+            }
+
+            ExprKind::Match {
+                expr: target_expr,
+                arms,
+            } => {
+                let target_val = self.lower_expr(target_expr);
+                let exit_block = self.alloc_block();
+
+                let res_ptr = self.alloc_value();
+                let res_ty = self
+                    .infer_expr_fir_type(expr)
+                    .unwrap_or(FirType::Int(IntType::I64));
+                self.emit(
+                    Some(res_ptr),
+                    ValueExpr::Alloca {
+                        ty: res_ty.clone(),
+                        name: Some(
+                            INTERNER.intern(&format!("__match_res_{}", self.func.next_value_id)),
+                        ),
+                    },
+                    span,
+                );
+
+                let mut next_arm_block = self.alloc_block();
+                let total_arms = arms.len();
+
+                for (arm_idx, arm) in arms.iter().enumerate() {
+                    let is_last = arm_idx + 1 == total_arms;
+                    let arm_check_block = next_arm_block;
+                    let arm_body_block = self.alloc_block();
+                    next_arm_block = if is_last {
+                        exit_block
+                    } else {
+                        self.alloc_block()
+                    };
+
+                    self.set_terminator(Terminator::Branch {
+                        target: arm_check_block,
+                        args: Vec::new(),
+                    });
+
+                    self.current_block = arm_check_block;
+
+                    match &arm.pattern {
+                        Pattern::Wildcard(_) => {
+                            self.set_terminator(Terminator::Branch {
+                                target: arm_body_block,
+                                args: Vec::new(),
+                            });
+                        }
+                        Pattern::Lit(lit, _) => {
+                            let lit_const = match lit {
+                                Lit::Int(s) => {
+                                    let v: i128 = s.as_str().replace('_', "").parse().unwrap_or(0);
+                                    ConstantValue::Int(v, IntType::I64)
+                                }
+                                Lit::Float(s) => {
+                                    let v: f64 = s.as_str().parse().unwrap_or(0.0);
+                                    ConstantValue::Float(v, FloatType::F64)
+                                }
+                                Lit::Bool(b) => ConstantValue::Bool(*b),
+                                Lit::Char(c) => ConstantValue::Char(*c),
+                                Lit::String(s) => ConstantValue::String(*s),
+                            };
+                            let lit_val = self.alloc_value();
+                            self.emit(Some(lit_val), ValueExpr::Constant(lit_const), arm.span);
+                            let matches_cond = self.alloc_value();
+                            self.emit(
+                                Some(matches_cond),
+                                ValueExpr::Binary {
+                                    op: BinaryOp::Eq,
+                                    lhs: target_val,
+                                    rhs: lit_val,
+                                },
+                                arm.span,
+                            );
+                            self.set_terminator(Terminator::BranchCond {
+                                cond: matches_cond,
+                                then_block: arm_body_block,
+                                then_args: Vec::new(),
+                                else_block: next_arm_block,
+                                else_args: Vec::new(),
+                            });
+                        }
+                        Pattern::Ident(sym, p_span) => {
+                            let var_ptr = self.alloc_value();
+                            let var_ty = self
+                                .infer_expr_fir_type(target_expr)
+                                .unwrap_or(FirType::Int(IntType::I64));
+                            self.emit(
+                                Some(var_ptr),
+                                ValueExpr::Alloca {
+                                    ty: var_ty.clone(),
+                                    name: Some(*sym),
+                                },
+                                *p_span,
+                            );
+                            self.emit(
+                                None,
+                                ValueExpr::Store {
+                                    ptr: var_ptr,
+                                    val: target_val,
+                                },
+                                *p_span,
+                            );
+                            self.var_allocas.insert(*sym, var_ptr);
+                            self.var_types.insert(*sym, var_ty);
+
+                            self.set_terminator(Terminator::Branch {
+                                target: arm_body_block,
+                                args: Vec::new(),
+                            });
+                        }
+                        Pattern::Variant {
+                            variant,
+                            span: v_span,
+                            ..
+                        } => {
+                            let disc = self.lookup_variant_discriminant(*variant).unwrap_or(0);
+                            let disc_val = self.alloc_value();
+                            self.emit(
+                                Some(disc_val),
+                                ValueExpr::Constant(ConstantValue::Int(disc as i128, IntType::I64)),
+                                *v_span,
+                            );
+                            let matches_cond = self.alloc_value();
+                            self.emit(
+                                Some(matches_cond),
+                                ValueExpr::Binary {
+                                    op: BinaryOp::Eq,
+                                    lhs: target_val,
+                                    rhs: disc_val,
+                                },
+                                *v_span,
+                            );
+                            self.set_terminator(Terminator::BranchCond {
+                                cond: matches_cond,
+                                then_block: arm_body_block,
+                                then_args: Vec::new(),
+                                else_block: next_arm_block,
+                                else_args: Vec::new(),
+                            });
+                        }
+                    }
+
+                    // Arm Body
+                    self.current_block = arm_body_block;
+                    let arm_res = self.lower_expr(&arm.body);
+                    self.emit(
+                        None,
+                        ValueExpr::Store {
+                            ptr: res_ptr,
+                            val: arm_res,
+                        },
+                        arm.span,
+                    );
+                    if let Some(b) = self.func.get_block(self.current_block) {
+                        if !b.is_terminated() {
+                            self.set_terminator(Terminator::Branch {
+                                target: exit_block,
+                                args: Vec::new(),
+                            });
+                        }
+                    }
+                }
+
+                self.current_block = exit_block;
+                let final_res = self.alloc_value();
+                self.emit(Some(final_res), ValueExpr::Load { ptr: res_ptr }, span);
+                final_res
+            }
 
             ExprKind::Unit => {
                 let res = self.alloc_value();
@@ -1317,6 +1867,7 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
                     None,
                     HashMap::new(),
                     &module.structs,
+                    &module.enums,
                 );
                 let fir_func = ctx.lower(body);
                 module.functions.push(fir_func);
@@ -1353,6 +1904,7 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
                     Some(mangled_name),
                     type_subst,
                     &module.structs,
+                    &module.enums,
                 );
                 let fir_func = ctx.lower(body);
                 module.functions.push(fir_func);
