@@ -1,5 +1,8 @@
 use crate::escape::EscapeAnalyzer;
-use crate::exclusivity::{check_assignment_target, check_call_exclusivity};
+use crate::exclusivity::{
+    check_assignment_target_with_active, check_call_exclusivity_with_active, extract_access_path,
+    BorrowKind, BorrowRecord,
+};
 use crate::symbol_table::{
     CapturedVariable, ConstSymbol, EnumSymbol, FieldSymbol, FunctionSymbol, ParamSymbol,
     StructSymbol, SymbolTable, TraitMethodSymbol, TraitSymbol,
@@ -105,6 +108,7 @@ pub struct SemanticAnalyzer<'a> {
     pub current_func_generics: Vec<GenericParam>,
     pub expr_types: HashMap<Span, Type>,
     pub moved_vars: HashMap<Symbol, Span>,
+    pub active_borrows: Vec<BorrowRecord>,
     pub comptime_vm: ifa_comptime::ComptimeVM,
 }
 
@@ -123,6 +127,7 @@ impl<'a> SemanticAnalyzer<'a> {
             current_func_generics: Vec::new(),
             expr_types: HashMap::new(),
             moved_vars: HashMap::new(),
+            active_borrows: Vec::new(),
             comptime_vm: ifa_comptime::ComptimeVM::new(),
         }
     }
@@ -1079,7 +1084,12 @@ impl<'a> SemanticAnalyzer<'a> {
                 span: _,
             } => {
                 // Verify exclusivity & mutability of target
-                check_assignment_target(target, &self.symbols, &mut self.diagnostics);
+                check_assignment_target_with_active(
+                    target,
+                    &self.active_borrows,
+                    &self.symbols,
+                    &mut self.diagnostics,
+                );
 
                 if let Some((root_sym, _)) = crate::exclusivity::extract_root_variable(target) {
                     self.moved_vars.remove(&root_sym);
@@ -1360,7 +1370,22 @@ impl<'a> SemanticAnalyzer<'a> {
                 self.check_pattern_binding_duplicates(pattern);
                 self.symbols.enter_scope(true, false);
                 self.check_pattern(pattern, &elem_ty);
+
+                let iter_borrow = extract_access_path(iterable).map(|path| BorrowRecord {
+                    path,
+                    kind: BorrowKind::In,
+                    span: iterable.span,
+                });
+                if let Some(b) = &iter_borrow {
+                    self.active_borrows.push(b.clone());
+                }
+
                 self.check_block(body, None);
+
+                if iter_borrow.is_some() {
+                    self.active_borrows.pop();
+                }
+
                 self.symbols.exit_scope();
             }
             Stmt::Loop(body, _) => {
@@ -3894,7 +3919,13 @@ impl<'a> SemanticAnalyzer<'a> {
 
             if let Some((sig_params, sig_ret)) = fn_sig {
                 let param_modes: Vec<ParamMode> = sig_params.iter().map(|(m, _)| *m).collect();
-                check_call_exclusivity(args, &param_modes, &self.symbols, &mut self.diagnostics);
+                check_call_exclusivity_with_active(
+                    args,
+                    &param_modes,
+                    &self.active_borrows,
+                    &self.symbols,
+                    &mut self.diagnostics,
+                );
 
                 if args.len() != sig_params.len() {
                     self.diagnostics.push(
@@ -3951,7 +3982,13 @@ impl<'a> SemanticAnalyzer<'a> {
         } else {
             // Function or standard library function not yet in symbol table (e.g. io::println, http::Server::new)
             let param_modes = vec![ParamMode::In; args.len()];
-            check_call_exclusivity(args, &param_modes, &self.symbols, &mut self.diagnostics);
+            check_call_exclusivity_with_active(
+                args,
+                &param_modes,
+                &self.active_borrows,
+                &self.symbols,
+                &mut self.diagnostics,
+            );
 
             for arg in args {
                 self.infer_expr(&arg.value);
@@ -4157,7 +4194,13 @@ impl<'a> SemanticAnalyzer<'a> {
         let param_modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
 
         // Check Law of Exclusivity on arguments!
-        check_call_exclusivity(args, &param_modes, &self.symbols, &mut self.diagnostics);
+        check_call_exclusivity_with_active(
+            args,
+            &param_modes,
+            &self.active_borrows,
+            &self.symbols,
+            &mut self.diagnostics,
+        );
 
         // Enforce strict fn constraints: a strict fn can only call other strict functions or pure intrinsics
         if self.current_func_is_strict && !f.is_strict && !f.is_comptime {

@@ -11,7 +11,7 @@ pub fn extract_root_variable(expr: &Expr) -> Option<(Symbol, Span)> {
         ExprKind::FieldAccess { receiver, .. } => extract_root_variable(receiver),
         ExprKind::Index { receiver, .. } => extract_root_variable(receiver),
         ExprKind::Unary {
-            op: UnaryOp::InOut | UnaryOp::Sink,
+            op: UnaryOp::InOut | UnaryOp::Sink | UnaryOp::Ref,
             expr: inner,
         } => extract_root_variable(inner),
         _ => None,
@@ -98,7 +98,7 @@ pub fn extract_access_path(expr: &Expr) -> Option<AccessPath> {
             Some(parent)
         }
         ExprKind::Unary {
-            op: UnaryOp::InOut | UnaryOp::Sink,
+            op: UnaryOp::InOut | UnaryOp::Sink | UnaryOp::Ref,
             expr: inner,
         } => extract_access_path(inner),
         _ => None,
@@ -113,7 +113,7 @@ pub fn is_lvalue(expr: &Expr) -> bool {
             | ExprKind::FieldAccess { .. }
             | ExprKind::Index { .. }
             | ExprKind::Unary {
-                op: UnaryOp::InOut | UnaryOp::Sink,
+                op: UnaryOp::InOut | UnaryOp::Sink | UnaryOp::Ref,
                 ..
             }
     )
@@ -144,7 +144,19 @@ pub fn check_call_exclusivity(
     symbols: &SymbolTable,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let mut borrows: Vec<BorrowRecord> = Vec::new();
+    check_call_exclusivity_with_active(args, param_modes, &[], symbols, diagnostics);
+}
+
+/// Verifies the Law of Exclusivity across arguments of a function or method call,
+/// taking into account enclosing CFG active borrows (e.g. outer iteration loops).
+pub fn check_call_exclusivity_with_active(
+    args: &[Arg],
+    param_modes: &[ParamMode],
+    active_borrows: &[BorrowRecord],
+    symbols: &SymbolTable,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut borrows: Vec<BorrowRecord> = active_borrows.to_vec();
 
     for (idx, arg) in args.iter().enumerate() {
         let is_explicit_inout = matches!(
@@ -392,12 +404,52 @@ pub fn check_call_exclusivity(
     }
 }
 
-/// Checks that an assignment target is mutable and assignable.
+/// Checks that an assignment target is mutable, assignable, and does not conflict with active borrows.
 pub fn check_assignment_target(
     target: &Expr,
     symbols: &SymbolTable,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    check_assignment_target_with_active(target, &[], symbols, diagnostics);
+}
+
+/// Checks that an assignment target is mutable, assignable, and does not violate exclusivity against CFG active borrows.
+pub fn check_assignment_target_with_active(
+    target: &Expr,
+    active_borrows: &[BorrowRecord],
+    symbols: &SymbolTable,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if let Some(target_path) = extract_access_path(target) {
+        if let Some(conflict) = active_borrows
+            .iter()
+            .find(|b| b.path.overlaps(&target_path))
+        {
+            let mode = match conflict.kind {
+                BorrowKind::In => "en lecture ('in')",
+                BorrowKind::InOut => "en écriture exclusive ('inout')",
+                BorrowKind::Sink => "transférée ('sink')",
+            };
+            diagnostics.push(
+                Diagnostic::error(format!(
+                    "loi d'exclusivité violée : la variable '{}' ne peut pas être modifiée car elle fait l'objet d'un emprunt actif {}",
+                    target_path.display, mode
+                ))
+                .with_code("E0012")
+                .with_primary_label(
+                    target.span,
+                    format!("mutation interdite sur '{}' pendant un emprunt actif", target_path.display),
+                )
+                .with_secondary_label(
+                    conflict.span,
+                    format!("emprunt actif {} ici", mode),
+                )
+                .with_help("Terminez la portée de l'emprunt actif (ex: boucle d'itération) avant de modifier la variable."),
+            );
+            return;
+        }
+    }
+
     if let Some((root_sym, _)) = extract_root_variable(target) {
         let var_name = INTERNER.resolve(&root_sym);
         if let Some(var) = symbols.lookup_variable(&root_sym) {

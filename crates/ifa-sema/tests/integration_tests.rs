@@ -3025,3 +3025,162 @@ fn test_refutable_destructuring_assignment_non_divergent_rejected() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_law_of_exclusivity_for_loop_mutation_rejected() {
+    let code = r#"
+        pub fn main() {
+            mut items: [i64; 3] = [1, 2, 3];
+            for x in items {
+                items[0] = 99;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Mutating iterable array inside for loop must violate exclusivity"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0012")),
+        "Expected E0012 diagnostic code for loop mutation, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_law_of_exclusivity_for_loop_disjoint_field_allowed() {
+    let code = r#"
+        struct State {
+            items: [i64; 3],
+            counter: i64,
+        }
+
+        pub fn main() {
+            mut s = State { items: [10, 20, 30], counter: 0 };
+            for x in s.items {
+                s.counter = s.counter + 1;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Mutating provably disjoint struct field during for-loop must be allowed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_law_of_exclusivity_for_loop_inout_call_rejected() {
+    let code = r#"
+        fn modify_slice(inout target: [i64; 3]) {
+            target[0] = 42;
+        }
+
+        pub fn main() {
+            mut items: [i64; 3] = [1, 2, 3];
+            for x in items {
+                modify_slice(inout items);
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Passing iterable inout during for-loop must violate exclusivity"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0012")),
+        "Expected E0012 for inout call on active iterable borrow, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_law_of_exclusivity_ref_and_inout_conflict() {
+    let code = r#"
+        fn compare_and_mutate(r: ref i64, inout target: i64) {
+            target = target + 1;
+        }
+
+        pub fn main() {
+            mut x: i64 = 10;
+            compare_and_mutate(ref x, inout x);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Concurrent ref and inout on same variable must violate exclusivity"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0012")),
+        "Expected E0012 for ref and inout conflict, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_law_of_exclusivity_ref_disjoint_fields_allowed() {
+    let code = r#"
+        struct Pair {
+            a: i64,
+            b: i64,
+        }
+
+        fn update_with_ref(r: ref i64, inout target: i64) {
+            target = target + 1;
+        }
+
+        pub fn main() {
+            mut p = Pair { a: 10, b: 20 };
+            update_with_ref(ref p.a, inout p.b);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Concurrent ref and inout on provably disjoint fields must be permitted: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_law_of_exclusivity_ref_overlapping_fields_rejected() {
+    let code = r#"
+        struct Sub {
+            val: i64,
+        }
+        struct Wrapper {
+            child: Sub,
+        }
+
+        fn inspect_and_mod(r: ref Wrapper, inout target: i64) {
+            target = target + 1;
+        }
+
+        pub fn main() {
+            mut w = Wrapper { child: Sub { val: 42 } };
+            inspect_and_mod(ref w, inout w.child.val);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Overlapping ref and inout paths must violate exclusivity"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0012")),
+        "Expected E0012 for overlapping ref and child inout, got: {:?}",
+        res.diagnostics
+    );
+}
