@@ -319,3 +319,116 @@ fn test_fir_dynamic_function_pointer_reassignment() {
     let result = interp.execute_function("main", vec![]).unwrap();
     assert_eq!(result, FirValue::Int(40));
 }
+
+#[test]
+fn test_fir_monomorphic_loop_specialization_and_thunk_inlining() {
+    let src = r#"
+        pub fn square(x: i64) -> i64 {
+            return x * x;
+        }
+
+        pub fn apply_sum(f: fn(i64) -> i64, n: i64) -> i64 {
+            mut sum = 0;
+            mut i = 1;
+            while i <= n {
+                sum = sum + f(i);
+                i = i + 1;
+            }
+            return sum;
+        }
+
+        pub fn main() -> i64 {
+            return apply_sum(square, 4); // 1 + 4 + 9 + 16 = 30
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("mono_spec.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    // Verify specialized function was generated
+    let has_spec = fir_module
+        .functions
+        .iter()
+        .any(|f| f.name.as_str().contains("apply_sum$spec_square"));
+    assert!(
+        has_spec,
+        "Expected specialized function apply_sum$spec_square to exist in FIR module"
+    );
+
+    // Verify main calls the specialized function directly
+    let main_fn = fir_module
+        .functions
+        .iter()
+        .find(|f| f.name.as_str() == "main")
+        .expect("main function must exist");
+    let calls_spec = main_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .any(|inst| {
+            if let ifa_fir::ValueExpr::CallDirect { name, .. } = &inst.expr {
+                name.as_str().contains("apply_sum$spec_square")
+            } else {
+                false
+            }
+        });
+    assert!(calls_spec, "main must call apply_sum$spec_square directly");
+
+    // Execute via FIR interpreter
+    let mut interp = FirInterpreter::new(&fir_module);
+    let result = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(result, FirValue::Int(30));
+}
+
+#[test]
+fn test_fir_closure_opt_stats_and_thunk_elimination() {
+    let src = r#"
+        pub fn cube(x: i64) -> i64 {
+            return x * x * x;
+        }
+
+        pub fn transform(f: fn(i64) -> i64, val: i64) -> i64 {
+            return f(val);
+        }
+
+        pub fn main() -> i64 {
+            return transform(cube, 5); // 125
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("stats_test.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+
+    let mut module = ifa_fir::lower_program(&prog, &analysis.symbols);
+    let mut closure_pass = ifa_fir::ClosureOptPass::new();
+    closure_pass.run_on_module(&mut module);
+
+    let stats = closure_pass.stats();
+    assert!(
+        stats.inlined_thunk_adapters > 0,
+        "Expected inlined_thunk_adapters > 0, got {}",
+        stats.inlined_thunk_adapters
+    );
+
+    let mut interp = FirInterpreter::new(&module);
+    let result = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(result, FirValue::Int(125));
+}

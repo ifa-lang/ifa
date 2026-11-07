@@ -129,3 +129,119 @@ pub extern "C" strict fn fib(n: i64) -> i64 {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_end_to_end_higher_order_wasm_execution() {
+    let temp_dir = std::env::temp_dir().join(format!("ifa_wasm_hof_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let src = r#"
+pub extern "C" strict fn square(x: i64) -> i64 {
+    return x * x
+}
+
+pub extern "C" strict fn double_val(x: i64) -> i64 {
+    return x * 2
+}
+
+pub extern "C" strict fn apply(f: fn(i64) -> i64, val: i64) -> i64 {
+    return f(val)
+}
+
+pub extern "C" strict fn run_square(n: i64) -> i64 {
+    return apply(square, n)
+}
+
+pub extern "C" strict fn run_double(n: i64) -> i64 {
+    return apply(double_val, n)
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("wasm_hof.ifa".to_string(), src);
+    let tokens = tokenize(fid, src);
+    let (prog, parse_diags) = parse(fid, tokens);
+    assert!(parse_diags.is_empty(), "Parse error: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors(), "Sema error");
+
+    let fir_module =
+        compile_to_fir(&prog, &analysis.symbols, true, true).expect("FIR lowering failed");
+
+    let wasm_path = temp_dir.join("hof_module.wasm");
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::wasm32_wasi());
+    compiler
+        .compile_to_wasm(&fir_module, &wasm_path)
+        .expect("Compilation of higher-order module to WebAssembly failed");
+
+    assert!(wasm_path.exists());
+    let wasm_bytes = fs::read(&wasm_path).unwrap();
+
+    // 1. Inspect WebAssembly binary exports and sections
+    let inspector = WasmModuleInspector::new(&wasm_bytes);
+    let sections = inspector.inspect().expect("Wasm inspection failed");
+    assert!(!sections.is_empty());
+
+    let exports = inspector
+        .extract_exports()
+        .expect("Failed to extract exports");
+    let export_names: Vec<String> = exports.into_iter().map(|e| e.name).collect();
+    assert!(export_names.iter().any(|name| name == "run_square"));
+    assert!(export_names.iter().any(|name| name == "run_double"));
+
+    // 2. Execute within Wasmtime if available
+    if WasmEngineRunner::is_available(WasmEngine::Wasmtime) {
+        let res_sq = WasmEngineRunner::run(
+            WasmEngine::Wasmtime,
+            &wasm_path,
+            Some("run_square"),
+            &["9".to_string()],
+        )
+        .expect("Wasmtime execution of `run_square` failed");
+        assert_eq!(res_sq.exit_code, 0);
+        assert_eq!(res_sq.return_value, Some(81));
+
+        let res_dbl = WasmEngineRunner::run(
+            WasmEngine::Wasmtime,
+            &wasm_path,
+            Some("run_double"),
+            &["21".to_string()],
+        )
+        .expect("Wasmtime execution of `run_double` failed");
+        assert_eq!(res_dbl.exit_code, 0);
+        assert_eq!(res_dbl.return_value, Some(42));
+    }
+
+    // 3. Execute within Wasmer if available
+    if WasmEngineRunner::is_available(WasmEngine::Wasmer) {
+        let res_sq = WasmEngineRunner::run(
+            WasmEngine::Wasmer,
+            &wasm_path,
+            Some("run_square"),
+            &["9".to_string()],
+        )
+        .expect("Wasmer execution of `run_square` failed");
+        assert_eq!(res_sq.exit_code, 0);
+        assert_eq!(res_sq.return_value, Some(81));
+
+        let res_dbl = WasmEngineRunner::run(
+            WasmEngine::Wasmer,
+            &wasm_path,
+            Some("run_double"),
+            &["21".to_string()],
+        )
+        .expect("Wasmer execution of `run_double` failed");
+        assert_eq!(res_dbl.exit_code, 0);
+        assert_eq!(res_dbl.return_value, Some(42));
+    }
+
+    // 4. Test internal WASI emulator
+    let res_internal = WasmEngineRunner::run(WasmEngine::Internal, &wasm_path, None, &[])
+        .expect("Internal WASI validator failed");
+    assert_eq!(res_internal.exit_code, 0);
+    assert!(res_internal.stdout.contains("Internal WASI VM"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

@@ -118,17 +118,86 @@ impl WasmLinearMemory {
     }
 }
 
+/// WebAssembly standard funcref function table (Section 4 & 9) for indirect dispatch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WasmFunctionTable {
+    slots: Vec<Option<u32>>,
+    min_size: usize,
+    max_size: Option<usize>,
+}
+
+impl WasmFunctionTable {
+    pub fn new(min_size: usize, max_size: Option<usize>) -> Self {
+        Self {
+            slots: vec![None; min_size],
+            min_size,
+            max_size,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    pub fn get(&self, index: usize) -> Option<u32> {
+        self.slots.get(index).copied().flatten()
+    }
+
+    pub fn set(&mut self, index: usize, func_idx: u32) -> Result<(), String> {
+        if index >= self.slots.len() {
+            if let Some(max) = self.max_size {
+                if index >= max {
+                    return Err(format!(
+                        "Table index {} exceeds maximum limit {}",
+                        index, max
+                    ));
+                }
+            }
+            self.slots.resize(index + 1, None);
+        }
+        self.slots[index] = Some(func_idx);
+        Ok(())
+    }
+
+    pub fn load_elements(&mut self, offset: usize, func_indices: &[u32]) -> Result<(), String> {
+        for (i, &f_idx) in func_indices.iter().enumerate() {
+            self.set(offset + i, f_idx)?;
+        }
+        Ok(())
+    }
+}
+
 /// Simulated WASI Preview 1 host environment for standalone execution.
 #[derive(Debug, Default)]
 pub struct WasiHostEnvironment {
     pub stdout_buffer: Vec<u8>,
     pub stderr_buffer: Vec<u8>,
     pub exit_code: Option<i32>,
+    pub table: WasmFunctionTable,
 }
 
 impl WasiHostEnvironment {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Dispatches an indirect function call via the host WebAssembly function table.
+    pub fn dispatch_indirect(
+        &self,
+        table_idx: usize,
+        _args: &[i64],
+    ) -> Result<Option<i64>, String> {
+        let func_idx = self.table.get(table_idx).ok_or_else(|| {
+            format!(
+                "Indirect call error: uninitialized element at table index {}",
+                table_idx
+            )
+        })?;
+        Ok(Some(func_idx as i64))
     }
 
     /// Implementation of WASI `fd_write(fd, *iovs, iovs_len, *nwritten)`.

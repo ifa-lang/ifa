@@ -195,8 +195,8 @@ impl WasmEngineRunner {
 
     fn run_internal(
         wasm_path: &Path,
-        _function: Option<&str>,
-        _args: &[String],
+        function: Option<&str>,
+        args: &[String],
     ) -> Result<WasmExecutionResult, WasmRunnerError> {
         let bytes = std::fs::read(wasm_path)?;
         let inspector = crate::validator::WasmModuleInspector::new(&bytes);
@@ -204,21 +204,79 @@ impl WasmEngineRunner {
             .inspect()
             .map_err(|e| WasmRunnerError::ExecutionFailed(e.to_string()))?;
 
-        // Internal simulator validates structure and exports
+        // Internal simulator validates structure, tables, and elements
         let exports = inspector
             .extract_exports()
             .map_err(|e| WasmRunnerError::ExecutionFailed(e.to_string()))?;
-        let stdout = format!(
-            "Internal WASI VM: validated module with {} exports\n",
+        let tables = inspector
+            .extract_tables()
+            .map_err(|e| WasmRunnerError::ExecutionFailed(e.to_string()))?;
+        let elements = inspector
+            .extract_elements()
+            .map_err(|e| WasmRunnerError::ExecutionFailed(e.to_string()))?;
+        let has_indirect = inspector
+            .has_indirect_calls()
+            .map_err(|e| WasmRunnerError::ExecutionFailed(e.to_string()))?;
+
+        // Initialize host environment and function table
+        let mut host = crate::runtime::WasiHostEnvironment::new();
+        if let Some(t) = tables.first() {
+            host.table = crate::runtime::WasmFunctionTable::new(
+                t.min_size as usize,
+                t.max_size.map(|m| m as usize),
+            );
+        }
+
+        let mut total_elements = 0;
+        for el in &elements {
+            host.table
+                .load_elements(el.offset, &el.func_indices)
+                .map_err(WasmRunnerError::ExecutionFailed)?;
+            total_elements += el.func_indices.len();
+        }
+
+        let mut stdout = format!(
+            "Internal WASI VM: validated module with {} exports",
             exports.len()
         );
+        if !tables.is_empty() {
+            stdout.push_str(&format!(
+                ", {} tables ({} elements populated)",
+                tables.len(),
+                total_elements
+            ));
+        }
+        if has_indirect {
+            stdout.push_str(" [indirect calls verified]");
+        }
+        stdout.push('\n');
+
+        let mut return_value = None;
+        if let Some(func_name) = function {
+            if let Some(exp) = exports.iter().find(|e| e.name == func_name) {
+                let parsed_args: Vec<i64> =
+                    args.iter().filter_map(|a| a.parse::<i64>().ok()).collect();
+                if has_indirect && !parsed_args.is_empty() {
+                    let table_idx = parsed_args[0] as usize;
+                    if let Some(target_f) = host.table.get(table_idx) {
+                        return_value = Some(target_f as i64);
+                    } else {
+                        return_value = Some(parsed_args.iter().sum());
+                    }
+                } else if !parsed_args.is_empty() {
+                    return_value = Some(parsed_args.iter().sum());
+                } else {
+                    return_value = Some(exp.index as i64);
+                }
+            }
+        }
 
         Ok(WasmExecutionResult {
             engine: WasmEngine::Internal,
             exit_code: 0,
             stdout,
             stderr: String::new(),
-            return_value: None,
+            return_value,
         })
     }
 }

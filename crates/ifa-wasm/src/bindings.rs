@@ -10,16 +10,26 @@ pub enum WasmType {
     Bool,
     String,
     Void,
+    Function(Vec<WasmType>, Box<WasmType>),
 }
 
 impl WasmType {
-    pub fn to_typescript(&self) -> &'static str {
+    pub fn to_typescript(&self) -> String {
         match self {
-            WasmType::I32 | WasmType::F32 | WasmType::F64 => "number",
-            WasmType::I64 => "bigint",
-            WasmType::Bool => "boolean",
-            WasmType::String => "string",
-            WasmType::Void => "void",
+            WasmType::I32 | WasmType::F32 | WasmType::F64 => "number".to_string(),
+            WasmType::I64 => "bigint".to_string(),
+            WasmType::Bool => "boolean".to_string(),
+            WasmType::String => "string".to_string(),
+            WasmType::Void => "void".to_string(),
+            WasmType::Function(params, ret) => {
+                let p_str = params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| format!("arg{}: {}", i, p.to_typescript()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({}) => {}", p_str, ret.to_typescript())
+            }
         }
     }
 }

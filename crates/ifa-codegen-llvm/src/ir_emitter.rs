@@ -424,14 +424,46 @@ impl<'a> LlvmIrEmitter<'a> {
         }
 
         // 3.5. Emit structure type definitions
+        let mut declared_structs = std::collections::HashSet::new();
         if !module.structs.is_empty() {
             out.push_str("; Structure Type Definitions\n");
             for st in &module.structs {
                 let st_name = INTERNER.resolve(&st.name);
+                declared_structs.insert(st_name.to_string());
                 let mut field_types = Vec::new();
                 for (_, f_ty) in &st.fields {
                     field_types.push(fir_to_llvm_type(f_ty)?);
                 }
+                out.push_str(&format!(
+                    "%struct.{} = type {{ {} }}\n",
+                    st_name,
+                    field_types.join(", ")
+                ));
+            }
+            out.push('\n');
+        }
+
+        // Also emit synthesized structure definitions (e.g. closures, environment records)
+        let mut synthesized_structs: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for func in &module.functions {
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let ValueExpr::StructInit { name, fields } = &inst.expr {
+                        let st_name = INTERNER.resolve(name);
+                        if !declared_structs.contains(&st_name)
+                            && !synthesized_structs.contains_key(&st_name)
+                        {
+                            synthesized_structs.insert(st_name, fields.len());
+                        }
+                    }
+                }
+            }
+        }
+        if !synthesized_structs.is_empty() {
+            out.push_str("; Synthesized Closure & Environment Structure Definitions\n");
+            for (st_name, field_count) in synthesized_structs {
+                let field_types = vec!["i64"; field_count.max(1)];
                 out.push_str(&format!(
                     "%struct.{} = type {{ {} }}\n",
                     st_name,

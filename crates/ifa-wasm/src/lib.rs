@@ -7,8 +7,11 @@ pub mod validator;
 pub use bindings::{TypeScriptBindingsGenerator, WasmExportFunction, WasmType};
 pub use bundler::{WasmBundleResult, WasmBundler};
 pub use runner::{WasmEngine, WasmEngineRunner, WasmExecutionResult, WasmRunnerError};
-pub use runtime::{WasiHostEnvironment, WasmLinearMemory, WASM_PAGE_SIZE};
-pub use validator::{WasmExport, WasmModuleInspector, WasmSection, WasmValidationError};
+pub use runtime::{WasiHostEnvironment, WasmFunctionTable, WasmLinearMemory, WASM_PAGE_SIZE};
+pub use validator::{
+    WasmElementSegment, WasmExport, WasmFuncType, WasmModuleInspector, WasmSection, WasmTableDef,
+    WasmValidationError,
+};
 
 #[cfg(test)]
 mod tests {
@@ -148,5 +151,100 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_wasm_function_table_and_indirect_dispatch() {
+        let mut table = WasmFunctionTable::new(4, Some(16));
+        assert_eq!(table.len(), 4);
+        assert_eq!(table.get(0), None);
+
+        // Load elements into table slots
+        table.load_elements(1, &[101, 102, 103]).unwrap();
+        assert_eq!(table.get(0), None);
+        assert_eq!(table.get(1), Some(101));
+        assert_eq!(table.get(2), Some(102));
+        assert_eq!(table.get(3), Some(103));
+
+        // Grow table dynamically
+        table.set(5, 105).unwrap();
+        assert_eq!(table.len(), 6);
+        assert_eq!(table.get(5), Some(105));
+
+        // Host environment indirect dispatch
+        let mut host = WasiHostEnvironment::new();
+        host.table = table;
+        let dispatched = host.dispatch_indirect(2, &[]).unwrap();
+        assert_eq!(dispatched, Some(102));
+
+        // Uninitialized slot returns error
+        let err = host.dispatch_indirect(0, &[]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_wasm_table_and_element_inspection() {
+        // Construct minimal WebAssembly binary with Table (ID 4) and Element (ID 9)
+        let mut wasm_bytes = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+
+        // 1. Table section (ID 4): 1 table, funcref (0x70), min=5, max=10
+        // Payload: 1 table, 0x70, flag=1 (min and max), min=5, max=10
+        let table_payload = vec![0x01, 0x70, 0x01, 0x05, 0x0A];
+        wasm_bytes.push(0x04);
+        wasm_bytes.push(table_payload.len() as u8);
+        wasm_bytes.extend_from_slice(&table_payload);
+
+        // 2. Element section (ID 9): 1 active segment on table 0 at offset 2, 2 func indices [7, 8]
+        // Payload: 1 segment, kind=0 (table 0 active), 0x41, 0x02, 0x0B (offset expr), 2 funcs, 7, 8
+        let elem_payload = vec![0x01, 0x00, 0x41, 0x02, 0x0B, 0x02, 0x07, 0x08];
+        wasm_bytes.push(0x09);
+        wasm_bytes.push(elem_payload.len() as u8);
+        wasm_bytes.extend_from_slice(&elem_payload);
+
+        // 3. Code section (ID 10): containing call_indirect (0x11)
+        let code_payload = vec![0x01, 0x04, 0x00, 0x11, 0x00, 0x0B];
+        wasm_bytes.push(0x0A);
+        wasm_bytes.push(code_payload.len() as u8);
+        wasm_bytes.extend_from_slice(&code_payload);
+
+        let inspector = WasmModuleInspector::new(&wasm_bytes);
+        let tables = inspector.extract_tables().unwrap();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].elem_type, 0x70);
+        assert_eq!(tables[0].min_size, 5);
+        assert_eq!(tables[0].max_size, Some(10));
+
+        let elements = inspector.extract_elements().unwrap();
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].table_index, 0);
+        assert_eq!(elements[0].offset, 2);
+        assert_eq!(elements[0].func_indices, vec![7, 8]);
+
+        let has_indirect = inspector.has_indirect_calls().unwrap();
+        assert!(
+            has_indirect,
+            "Expected call_indirect opcode 0x11 to be detected"
+        );
+    }
+
+    #[test]
+    fn test_typescript_bindings_higher_order_callback() {
+        let mut gen = TypeScriptBindingsGenerator::new("hof_engine");
+        gen.add_function(WasmExportFunction {
+            name: "apply".to_string(),
+            params: vec![
+                (
+                    "callback".to_string(),
+                    WasmType::Function(vec![WasmType::I64], Box::new(WasmType::I64)),
+                ),
+                ("val".to_string(), WasmType::I64),
+            ],
+            ret_ty: WasmType::I64,
+            doc: Some("Higher-order function applying callback to value.".to_string()),
+        });
+
+        let dts = gen.generate_dts();
+        assert!(dts.contains("callback: (arg0: bigint) => bigint"));
+        assert!(dts.contains("val: bigint"));
     }
 }

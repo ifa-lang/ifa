@@ -48,6 +48,10 @@ pub struct ClosureEscapeStats {
     pub inlined_higher_order_calls: usize,
     /// Intermediate closure/environment allocations eliminated.
     pub eliminated_allocations: usize,
+    /// Thunk adapters inlined directly to underlying top-level functions.
+    pub inlined_thunk_adapters: usize,
+    /// Monomorphic higher-order function calls specialized for static callees.
+    pub specialized_higher_order_calls: usize,
 }
 
 /// Interprocedural closure escape analysis and capture optimizer.
@@ -91,13 +95,23 @@ impl ClosureOptPass {
         // Step 3: Inline small higher-order helper functions at known closure call sites
         self.inline_higher_order_call_sites(module, &closures);
 
-        // Step 4: Devirtualize closure calls and forward captured fields in all functions
+        // Step 4: Specialize monomorphic higher-order calls (multi-block or loops)
+        self.specialize_higher_order_calls(module, &mut closures);
+
+        // Step 5: Devirtualize closure calls and forward captured fields in all functions
+        let thunk_adapters = self.collect_thunk_adapters(module);
         for func in &mut module.functions {
-            self.optimize_function(func, &closures);
+            self.optimize_function(func, &closures, &thunk_adapters);
         }
 
-        // Step 5: Clean up dead aggregate instructions resulting from capture forwarding
+        // Step 6: Inline remaining direct thunk adapter calls
+        self.inline_thunk_adapter_calls(module, &thunk_adapters);
+
+        // Step 7: Clean up dead aggregate instructions resulting from capture forwarding
         self.eliminate_dead_closure_instructions(module);
+
+        // Step 8: Prune unreferenced thunk adapter functions completely inlined
+        self.prune_unused_thunk_adapters(module, &thunk_adapters);
     }
 
     /// Collects all closure aggregate initializations across all functions.
@@ -369,6 +383,30 @@ impl ClosureOptPass {
             let mut func_subst: HashMap<ValueId, ValueId> = HashMap::new();
             let mut inlined_anything = false;
 
+            // Track local single-store alloca loads to resolve closure argument values
+            let mut local_aliases: HashMap<ValueId, ValueId> = HashMap::new();
+            let mut store_counts: HashMap<ValueId, usize> = HashMap::new();
+            let mut store_map: HashMap<ValueId, ValueId> = HashMap::new();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let ValueExpr::Store { ptr, val } = &inst.expr {
+                        *store_counts.entry(*ptr).or_insert(0) += 1;
+                        store_map.insert(*ptr, *val);
+                    }
+                }
+            }
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let (Some(res), ValueExpr::Load { ptr }) = (inst.result, &inst.expr) {
+                        if store_counts.get(ptr) == Some(&1) {
+                            if let Some(&val) = store_map.get(ptr) {
+                                local_aliases.insert(res, val);
+                            }
+                        }
+                    }
+                }
+            }
+
             for block in &mut func.blocks {
                 let mut new_instructions = Vec::with_capacity(block.instructions.len());
 
@@ -377,15 +415,21 @@ impl ClosureOptPass {
                         (inst.result, &inst.expr)
                     {
                         if let Some(target_func) = candidates.get(name) {
-                            let has_known_closure_arg =
-                                args.iter().any(|a| closure_val_to_lambda.contains_key(a));
+                            let has_known_closure_arg = args.iter().any(|a| {
+                                let resolved = local_aliases.get(a).copied().unwrap_or(*a);
+                                closure_val_to_lambda.contains_key(&resolved)
+                            });
 
                             if has_known_closure_arg && target_func.blocks.len() == 1 {
                                 let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
                                 for (p_idx, param) in target_func.params.iter().enumerate() {
                                     if let Some(&arg_val) = args.get(p_idx) {
                                         let resolved_arg =
-                                            func_subst.get(&arg_val).copied().unwrap_or(arg_val);
+                                            local_aliases.get(&arg_val).copied().unwrap_or(arg_val);
+                                        let resolved_arg = func_subst
+                                            .get(&resolved_arg)
+                                            .copied()
+                                            .unwrap_or(resolved_arg);
                                         subst.insert(param.val, resolved_arg);
                                     }
                                 }
@@ -442,8 +486,334 @@ impl ClosureOptPass {
         }
     }
 
+    /// Collects all thunk adapter functions that adapt a direct function to the uniform closure ABI.
+    fn collect_thunk_adapters(&self, module: &FirModule) -> HashMap<Symbol, Symbol> {
+        let mut map = HashMap::new();
+        for func in &module.functions {
+            let name_str = INTERNER.resolve(&func.name);
+            if name_str.starts_with("__ifa_thunk_") && func.blocks.len() == 1 {
+                let block = &func.blocks[0];
+                for inst in &block.instructions {
+                    if let ValueExpr::CallDirect { name: target, args } = &inst.expr {
+                        if func.params.len() == args.len() + 1 {
+                            let matches = args
+                                .iter()
+                                .enumerate()
+                                .all(|(idx, &arg_val)| func.params[idx + 1].val == arg_val);
+                            if matches {
+                                map.insert(func.name, *target);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        map
+    }
+
+    /// Resolves an SSA argument value to its static closure or function pointer identity if known.
+    fn resolve_closure_arg(
+        func: &FirFunction,
+        arg_val: ValueId,
+        closures: &[ClosureInstance],
+    ) -> Option<(Symbol, ValueId)> {
+        // 1. Direct match in closure instances for this function
+        if let Some(c) = closures
+            .iter()
+            .find(|c| c.func_name == func.name && c.closure_val == arg_val)
+        {
+            return Some((c.lambda_sym, c.env_val));
+        }
+
+        // 2. Track alloca aliases if arg was loaded from an alloca
+        let mut load_source: Option<ValueId> = None;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if inst.result == Some(arg_val) {
+                    if let ValueExpr::Load { ptr } = &inst.expr {
+                        load_source = Some(*ptr);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(alloca_ptr) = load_source {
+            let mut store_count = 0;
+            let mut single_store_val = None;
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let ValueExpr::Store { ptr, val } = &inst.expr {
+                        if *ptr == alloca_ptr {
+                            store_count += 1;
+                            single_store_val = Some(*val);
+                        }
+                    }
+                }
+            }
+
+            if store_count == 1 {
+                if let Some(val) = single_store_val {
+                    if val != arg_val {
+                        if let Some(res) = Self::resolve_closure_arg(func, val, closures) {
+                            return Some(res);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Check if arg_val was defined directly by Constant(Function) or StructInit
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if inst.result == Some(arg_val) {
+                    match &inst.expr {
+                        ValueExpr::Constant(ConstantValue::Function(sym)) => {
+                            return Some((*sym, ValueId(0)));
+                        }
+                        ValueExpr::StructInit { fields, .. } if !fields.is_empty() => {
+                            let fn_vid = fields[0];
+                            let env_vid = if fields.len() > 1 {
+                                fields[1]
+                            } else {
+                                ValueId(0)
+                            };
+                            for b2 in &func.blocks {
+                                for i2 in &b2.instructions {
+                                    if i2.result == Some(fn_vid) {
+                                        if let ValueExpr::Constant(ConstantValue::Function(sym)) =
+                                            &i2.expr
+                                        {
+                                            return Some((*sym, env_vid));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Specializes higher-order functions for statically monomorphic closure or function pointer call sites.
+    fn specialize_higher_order_calls(
+        &mut self,
+        module: &mut FirModule,
+        closures: &mut Vec<ClosureInstance>,
+    ) {
+        let mut specialized_cache: HashMap<(Symbol, usize, Symbol), Symbol> = HashMap::new();
+
+        // Perform specialization up to 4 iterations (handles pipelines and transitive higher-order calls)
+        for _iteration in 0..4 {
+            let mut specializations_to_apply = Vec::new();
+
+            // Collect function parameter signatures
+            let func_signatures: HashMap<Symbol, Vec<FirType>> = module
+                .functions
+                .iter()
+                .map(|f| (f.name, f.params.iter().map(|p| p.ty.clone()).collect()))
+                .collect();
+
+            for func in &module.functions {
+                let func_name_str = INTERNER.resolve(&func.name);
+                if func_name_str.starts_with("__ifa_thunk_")
+                    || func_name_str.starts_with("__ifa_lambda_")
+                {
+                    continue;
+                }
+
+                for (b_idx, block) in func.blocks.iter().enumerate() {
+                    for (i_idx, inst) in block.instructions.iter().enumerate() {
+                        if let ValueExpr::CallDirect {
+                            name: callee_name,
+                            args,
+                        } = &inst.expr
+                        {
+                            let callee_name_str = INTERNER.resolve(callee_name);
+                            if callee_name_str.starts_with("__ifa_thunk_")
+                                || callee_name_str.starts_with("__ifa_lambda_")
+                            {
+                                continue;
+                            }
+
+                            if let Some(param_tys) = func_signatures.get(callee_name) {
+                                for (p_idx, p_ty) in param_tys.iter().enumerate() {
+                                    let is_hof_param = matches!(p_ty, FirType::Function { .. })
+                                        || matches!(
+                                            p_ty,
+                                            FirType::Struct(name, _)
+                                                if INTERNER.resolve(name).starts_with("__ifa_closure_")
+                                        );
+
+                                    if is_hof_param {
+                                        if let Some(&arg_val) = args.get(p_idx) {
+                                            if let Some((target_sym, env_val)) =
+                                                Self::resolve_closure_arg(func, arg_val, closures)
+                                            {
+                                                specializations_to_apply.push((
+                                                    func.name,
+                                                    b_idx,
+                                                    i_idx,
+                                                    *callee_name,
+                                                    p_idx,
+                                                    target_sym,
+                                                    env_val,
+                                                ));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if specializations_to_apply.is_empty() {
+                break;
+            }
+
+            let mut new_specialized_funcs = Vec::new();
+
+            for (caller_name, b_idx, i_idx, callee_name, p_idx, target_sym, env_val) in
+                specializations_to_apply
+            {
+                let spec_name = *specialized_cache
+                    .entry((callee_name, p_idx, target_sym))
+                    .or_insert_with(|| {
+                        let base_callee = INTERNER.resolve(&callee_name);
+                        let target_clean = INTERNER.resolve(&target_sym);
+                        let clean_suffix = target_clean
+                            .trim_start_matches("__ifa_thunk_")
+                            .trim_start_matches("__ifa_lambda_");
+                        let new_sym =
+                            INTERNER.intern(&format!("{}$spec_{}", base_callee, clean_suffix));
+
+                        if let Some(orig_func) =
+                            module.functions.iter().find(|f| f.name == callee_name)
+                        {
+                            let mut spec_func = orig_func.clone();
+                            spec_func.name = new_sym;
+                            let param_val = spec_func.params[p_idx].val;
+
+                            // Register closure instance in the new specialized function
+                            closures.push(ClosureInstance {
+                                func_name: new_sym,
+                                closure_val: param_val,
+                                lambda_sym: target_sym,
+                                env_val,
+                                allocation: ClosureAllocationKind::Stack,
+                            });
+
+                            new_specialized_funcs.push(spec_func);
+                            self.stats.specialized_higher_order_calls += 1;
+                        }
+
+                        new_sym
+                    });
+
+                // Update call site in caller
+                if let Some(caller_func) =
+                    module.functions.iter_mut().find(|f| f.name == caller_name)
+                {
+                    if let Some(inst) = caller_func
+                        .blocks
+                        .get_mut(b_idx)
+                        .and_then(|b| b.instructions.get_mut(i_idx))
+                    {
+                        if let ValueExpr::CallDirect { name, .. } = &mut inst.expr {
+                            *name = spec_name;
+                        }
+                    }
+                }
+            }
+
+            module.functions.extend(new_specialized_funcs);
+        }
+    }
+
+    /// Inlines calls to thunk adapters directly to the underlying function, dropping dummy env arg.
+    fn inline_thunk_adapter_calls(
+        &mut self,
+        module: &mut FirModule,
+        thunk_adapters: &HashMap<Symbol, Symbol>,
+    ) {
+        if thunk_adapters.is_empty() {
+            return;
+        }
+
+        for func in &mut module.functions {
+            if thunk_adapters.contains_key(&func.name) {
+                continue;
+            }
+
+            for block in &mut func.blocks {
+                for inst in &mut block.instructions {
+                    if let ValueExpr::CallDirect { name, args } = &mut inst.expr {
+                        if let Some(&underlying_fn) = thunk_adapters.get(name) {
+                            *name = underlying_fn;
+                            if !args.is_empty() {
+                                args.remove(0);
+                            }
+                            self.stats.inlined_thunk_adapters += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prune unreferenced thunk adapter functions that were completely inlined.
+    fn prune_unused_thunk_adapters(
+        &mut self,
+        module: &mut FirModule,
+        thunk_adapters: &HashMap<Symbol, Symbol>,
+    ) {
+        if thunk_adapters.is_empty() {
+            return;
+        }
+
+        let mut referenced = HashSet::new();
+        for func in &module.functions {
+            if thunk_adapters.contains_key(&func.name) {
+                continue;
+            }
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    match &inst.expr {
+                        ValueExpr::CallDirect { name, .. } => {
+                            referenced.insert(*name);
+                        }
+                        ValueExpr::Constant(ConstantValue::Function(sym)) => {
+                            referenced.insert(*sym);
+                        }
+                        ValueExpr::Constant(ConstantValue::String(sym)) => {
+                            referenced.insert(*sym);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        module
+            .functions
+            .retain(|f| !thunk_adapters.contains_key(&f.name) || referenced.contains(&f.name));
+    }
+
     /// Optimizes a single FIR function: devirtualizes calls and forwards capture projections.
-    fn optimize_function(&mut self, func: &mut FirFunction, closures: &[ClosureInstance]) {
+    fn optimize_function(
+        &mut self,
+        func: &mut FirFunction,
+        closures: &[ClosureInstance],
+        thunk_adapters: &HashMap<Symbol, Symbol>,
+    ) {
         // Build map of closure SSA values to their lambda symbol and env SSA value
         let mut closure_map: HashMap<ValueId, (Symbol, ValueId)> = HashMap::new();
         for c in closures {
@@ -457,6 +827,31 @@ impl ClosureOptPass {
         let mut env_inst_values: HashMap<ValueId, ValueId> = HashMap::new();
         let mut env_struct_inits: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
         let mut substitutions: HashMap<ValueId, ValueId> = HashMap::new();
+
+        // Track local single-store alloca loads for closures so un-promoted closures and parameters are resolved
+        let mut store_counts: HashMap<ValueId, usize> = HashMap::new();
+        let mut store_map: HashMap<ValueId, ValueId> = HashMap::new();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let ValueExpr::Store { ptr, val } = &inst.expr {
+                    *store_counts.entry(*ptr).or_insert(0) += 1;
+                    store_map.insert(*ptr, *val);
+                }
+            }
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let (Some(res), ValueExpr::Load { ptr }) = (inst.result, &inst.expr) {
+                    if store_counts.get(ptr) == Some(&1) {
+                        if let Some(&val) = store_map.get(ptr) {
+                            if closure_map.contains_key(&val) {
+                                substitutions.insert(res, val);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         for block in &func.blocks {
             for inst in &block.instructions {
@@ -488,7 +883,7 @@ impl ClosureOptPass {
             }
         }
 
-        // Devirtualize indirect Call to CallDirect when callee resolves to a known lambda
+        // Devirtualize indirect Call to CallDirect when callee resolves to a known lambda or thunk
         for block in &mut func.blocks {
             for inst in &mut block.instructions {
                 if let ValueExpr::Call { callee, args } = &inst.expr {
@@ -499,11 +894,26 @@ impl ClosureOptPass {
                             let sub_a = substitutions.get(a).copied().unwrap_or(*a);
                             rewritten_args.push(sub_a);
                         }
-                        inst.expr = ValueExpr::CallDirect {
-                            name: lambda_sym,
-                            args: rewritten_args,
-                        };
-                        self.stats.devirtualized_calls += 1;
+
+                        if let Some(&underlying_fn) = thunk_adapters.get(&lambda_sym) {
+                            let actual_args = if rewritten_args.is_empty() {
+                                Vec::new()
+                            } else {
+                                rewritten_args[1..].to_vec()
+                            };
+                            inst.expr = ValueExpr::CallDirect {
+                                name: underlying_fn,
+                                args: actual_args,
+                            };
+                            self.stats.devirtualized_calls += 1;
+                            self.stats.inlined_thunk_adapters += 1;
+                        } else {
+                            inst.expr = ValueExpr::CallDirect {
+                                name: lambda_sym,
+                                args: rewritten_args,
+                            };
+                            self.stats.devirtualized_calls += 1;
+                        }
                     }
                 }
             }
