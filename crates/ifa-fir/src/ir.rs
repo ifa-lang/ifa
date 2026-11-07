@@ -442,12 +442,46 @@ impl Terminator {
     }
 }
 
-/// Optimization hint for loop vectorization (SIMD lane width, interleave, and unroll directives).
+/// Classification of scalar reductions detected in loop vectorization candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReductionKind {
+    /// Scalar sum or difference reduction (e.g., acc = acc + x, acc = acc - x).
+    Sum,
+    /// Scalar product reduction (e.g., prod = prod * x).
+    Product,
+    /// Scalar minimum reduction (e.g., if x < min_val { min_val = x }, or min(a, b)).
+    Min,
+    /// Scalar maximum reduction (e.g., if x > max_val { max_val = x }, or max(a, b)).
+    Max,
+    /// Scalar bitwise reduction (e.g., acc = acc & x, acc = acc | x, acc = acc ^ x).
+    Bitwise,
+}
+
+/// Optimization hint for loop vectorization (SIMD lane width, interleave, unroll directives, and reduction kind).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LoopVectorHint {
     pub vector_width: u32,
     pub interleave_count: u32,
     pub unroll_enable: bool,
+    pub reduction_kind: Option<ReductionKind>,
+}
+
+impl LoopVectorHint {
+    /// Construct a basic loop vectorization hint without attached reduction classification.
+    pub fn new(vector_width: u32, interleave_count: u32, unroll_enable: bool) -> Self {
+        Self {
+            vector_width,
+            interleave_count,
+            unroll_enable,
+            reduction_kind: None,
+        }
+    }
+
+    /// Attach an identified scalar reduction classification to this vectorization hint.
+    pub fn with_reduction(mut self, kind: ReductionKind) -> Self {
+        self.reduction_kind = Some(kind);
+        self
+    }
 }
 
 /// Basic block containing sequential instructions and ending with a terminator.

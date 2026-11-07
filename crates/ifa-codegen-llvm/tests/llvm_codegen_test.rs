@@ -349,6 +349,27 @@ fn test_llvm_simd_slice_vectorization() {
     assert!(ir.contains("@ifa_simd_slice_sum_i64"));
     assert!(ir.contains("@ifa_simd_slice_add_u8"));
     assert!(ir.contains("@ifa_simd_slice_xor_u8"));
+
+    // Verify Advanced SIMD Scalar Reductions (prod, min, max)
+    assert!(ir.contains("declare float @llvm.vector.reduce.fmul.v8f32"));
+    assert!(ir.contains("declare float @llvm.vector.reduce.fmin.v8f32"));
+    assert!(ir.contains("declare float @llvm.vector.reduce.fmax.v8f32"));
+    assert!(ir.contains("declare i32 @llvm.vector.reduce.mul.v8i32"));
+    assert!(ir.contains("declare i32 @llvm.vector.reduce.smin.v8i32"));
+    assert!(ir.contains("declare i32 @llvm.vector.reduce.smax.v8i32"));
+    assert!(ir.contains("@ifa_simd_slice_prod_f32"));
+    assert!(ir.contains("@ifa_simd_slice_min_f32"));
+    assert!(ir.contains("@ifa_simd_slice_max_f32"));
+    assert!(ir.contains("@ifa_simd_slice_prod_i32"));
+    assert!(ir.contains("@ifa_simd_slice_min_i32"));
+    assert!(ir.contains("@ifa_simd_slice_max_i32"));
+    assert!(ir.contains("@ifa_simd_slice_prod_f64"));
+    assert!(ir.contains("@ifa_simd_slice_min_f64"));
+    assert!(ir.contains("@ifa_simd_slice_max_f64"));
+    assert!(ir.contains("@ifa_simd_slice_prod_i64"));
+    assert!(ir.contains("@ifa_simd_slice_min_i64"));
+    assert!(ir.contains("@ifa_simd_slice_max_i64"));
+
     assert!(ir.contains("<8 x float>"));
     assert!(ir.contains("<4 x double>"));
     assert!(ir.contains("<8 x i32>"));
@@ -360,7 +381,57 @@ fn test_llvm_simd_slice_vectorization() {
     assert!(ir.contains("!\"llvm.loop.vectorize.width\", i32 8"));
     assert!(ir.contains("!\"llvm.loop.vectorize.width\", i32 4"));
     assert!(ir.contains("!\"llvm.loop.vectorize.width\", i32 16"));
+    assert!(ir.contains("!\"llvm.loop.vectorize.width\", i32 2"));
     assert!(ir.contains("\"no-trapping-math\"=\"true\""));
+}
+
+#[test]
+fn test_llvm_aarch64_neon_horizontal_reduction_intrinsics() {
+    let src = r#"
+        pub fn neon_test() -> () {
+            let x: i64 = 42;
+            return ();
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("neon_test.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let target = LlvmTargetConfig::aarch64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&module).unwrap();
+
+    // Verify AArch64 target triple and datalayout
+    assert!(ir.contains(
+        "target datalayout = \"e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32\""
+    ));
+    assert!(ir.contains("target triple = \"aarch64-unknown-linux-gnu\""));
+
+    // Verify AArch64 Neon native horizontal reduction intrinsics
+    assert!(ir.contains("declare float @llvm.aarch64.neon.fmaxv.f32.v4f32(<4 x float>)"));
+    assert!(ir.contains("declare float @llvm.aarch64.neon.fminv.f32.v4f32(<4 x float>)"));
+    assert!(ir.contains("declare float @llvm.aarch64.neon.fmaxnmv.f32.v4f32(<4 x float>)"));
+    assert!(ir.contains("declare float @llvm.aarch64.neon.fminnmv.f32.v4f32(<4 x float>)"));
+    assert!(ir.contains("declare double @llvm.aarch64.neon.fmaxv.f64.v2f64(<2 x double>)"));
+    assert!(ir.contains("declare double @llvm.aarch64.neon.fminv.f64.v2f64(<2 x double>)"));
+    assert!(ir.contains("declare i32 @llvm.aarch64.neon.smaxv.i32.v4i32(<4 x i32>)"));
+    assert!(ir.contains("declare i32 @llvm.aarch64.neon.sminv.i32.v4i32(<4 x i32>)"));
+    assert!(ir.contains("declare i32 @llvm.aarch64.neon.umaxv.i32.v4i32(<4 x i32>)"));
+    assert!(ir.contains("declare i32 @llvm.aarch64.neon.uminv.i32.v4i32(<4 x i32>)"));
+    assert!(ir.contains("declare i32 @llvm.aarch64.neon.uaddv.i32.v4i32(<4 x i32>)"));
+    assert!(ir.contains("declare i64 @llvm.aarch64.neon.smaxv.i64.v2i64(<2 x i64>)"));
+    assert!(ir.contains("declare i64 @llvm.aarch64.neon.sminv.i64.v2i64(<2 x i64>)"));
+
+    // Verify AArch64 Neon hardware-accelerated slice vectorizers
+    assert!(ir.contains("@ifa_neon_slice_sum_f32"));
+    assert!(ir.contains("@ifa_neon_slice_min_f32"));
+    assert!(ir.contains("@ifa_neon_slice_max_f32"));
+    assert!(ir.contains("@ifa_neon_slice_min_i32"));
+    assert!(ir.contains("@ifa_neon_slice_max_i32"));
 }
 
 #[test]
@@ -2054,11 +2125,7 @@ fn test_llvm_vector_branchcond_and_arena_genalloc() {
     func.blocks.push(bb0);
 
     let mut bb1 = BasicBlock::new(BlockId(1));
-    bb1.set_vector_hint(LoopVectorHint {
-        vector_width: 8,
-        interleave_count: 4,
-        unroll_enable: true,
-    });
+    bb1.set_vector_hint(LoopVectorHint::new(8, 4, true));
     bb1.instructions.push(Instruction::new(
         Some(ValueId(2)),
         ValueExpr::Constant(ConstantValue::Bool(true)),

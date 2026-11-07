@@ -314,3 +314,243 @@ fn test_vectorize_pass_slice_mutation_map_i32() {
     assert!(stats.slices_vectorized >= 1);
     assert!(stats.maps_vectorized >= 1);
 }
+
+#[test]
+fn test_vectorize_pass_slice_product_f32() {
+    let src = r#"
+        pub fn prod_slice_f32(s: Slice<f32>) -> f32 {
+            let mut acc: f32 = 1.0;
+            for x in s {
+                acc = acc * x;
+            }
+            return acc;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("prod_f32.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(formatted.contains("// [vector_hint: width=8, interleave=4]"));
+    assert!(formatted.contains("// [reduction: product]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_analyzed, 1);
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.product_reductions_vectorized, 1);
+}
+
+#[test]
+fn test_vectorize_pass_array_product_i64() {
+    let src = r#"
+        pub fn prod_arr_i64(arr: [i64; 32]) -> i64 {
+            let mut acc: i64 = 1;
+            for x in arr {
+                acc = acc * x;
+            }
+            return acc;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("prod_i64.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(formatted.contains("// [vector_hint: width=4, interleave=4]"));
+    assert!(formatted.contains("// [reduction: product]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.product_reductions_vectorized, 1);
+}
+
+#[test]
+fn test_vectorize_pass_slice_min_reduction_f32() {
+    let src = r#"
+        pub fn min_slice_f32(s: Slice<f32>) -> f32 {
+            let mut m: f32 = 1000.0;
+            for x in s {
+                if x < m {
+                    m = x;
+                }
+            }
+            return m;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("min_f32.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(formatted.contains("// [vector_hint: width=8, interleave=4]"));
+    assert!(formatted.contains("// [reduction: min]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.min_reductions_vectorized, 1);
+}
+
+#[test]
+fn test_vectorize_pass_intrinsic_min_reduction() {
+    let src = r#"
+        pub fn intrinsic_min(arr: [f32; 64]) -> f32 {
+            let mut m: f32 = arr[0];
+            for x in arr {
+                m = min(m, x);
+            }
+            return m;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("intrinsic_min.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(formatted.contains("// [vector_hint: width=8, interleave=4]"));
+    assert!(formatted.contains("// [reduction: min]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.min_reductions_vectorized, 1);
+}
+
+#[test]
+fn test_vectorize_pass_slice_max_reduction_i32() {
+    let src = r#"
+        pub fn max_slice_i32(s: Slice<i32>) -> i32 {
+            let mut m: i32 = -1000;
+            for x in s {
+                if x > m {
+                    m = x;
+                }
+            }
+            return m;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("max_i32.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(formatted.contains("// [vector_hint: width=8, interleave=4]"));
+    assert!(formatted.contains("// [reduction: max]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.max_reductions_vectorized, 1);
+}
+
+#[test]
+fn test_vectorize_pass_while_min_reduction_f64() {
+    let src = r#"
+        pub fn while_min_f64(arr: [f64; 64]) -> f64 {
+            let mut m: f64 = 99999.0;
+            let mut i: i64 = 0;
+            while i < 64 {
+                if arr[i] < m {
+                    m = arr[i];
+                }
+                i = i + 1;
+            }
+            return m;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("while_min.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(formatted.contains("// [vector_hint: width=4, interleave=4]"));
+    assert!(formatted.contains("// [reduction: min]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.min_reductions_vectorized, 1);
+}
+
+#[test]
+fn test_vectorize_pass_intrinsic_max_reduction() {
+    let src = r#"
+        pub fn intrinsic_max(arr: [f32; 64]) -> f32 {
+            let mut m: f32 = arr[0];
+            for x in arr {
+                m = max(m, x);
+            }
+            return m;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("intrinsic_max.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(formatted.contains("// [vector_hint: width=8, interleave=4]"));
+    assert!(formatted.contains("// [reduction: max]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.max_reductions_vectorized, 1);
+}

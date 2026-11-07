@@ -98,6 +98,17 @@ impl<'a> FirPrinter<'a> {
                 "// [vector_hint: width={}, interleave={}]",
                 hint.vector_width, hint.interleave_count
             )?;
+            if let Some(reduction) = hint.reduction_kind {
+                self.indent();
+                let red_name = match reduction {
+                    crate::ir::ReductionKind::Sum => "sum",
+                    crate::ir::ReductionKind::Product => "product",
+                    crate::ir::ReductionKind::Min => "min",
+                    crate::ir::ReductionKind::Max => "max",
+                    crate::ir::ReductionKind::Bitwise => "bitwise",
+                };
+                writeln!(self.output, "// [reduction: {}]", red_name)?;
+            }
         }
         for inst in &block.instructions {
             self.indent();

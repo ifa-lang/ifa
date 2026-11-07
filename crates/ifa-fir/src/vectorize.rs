@@ -28,6 +28,12 @@ pub struct VectorizeStats {
     pub pure_calls_allowed: usize,
     /// Number of loops vectorized containing IPO-verified pure function calls.
     pub ipo_vectorized_loops: usize,
+    /// Number of scalar product reduction loops identified and accelerated.
+    pub product_reductions_vectorized: usize,
+    /// Number of scalar minimum reduction loops identified and accelerated.
+    pub min_reductions_vectorized: usize,
+    /// Number of scalar maximum reduction loops identified and accelerated.
+    pub max_reductions_vectorized: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -88,6 +94,26 @@ impl VectorizePass {
                 continue;
             }
 
+            // Identify condition values used for loop boundary / termination checks
+            let mut loop_exit_conds: HashSet<ValueId> = HashSet::new();
+            for &b_id in &loop_info.blocks {
+                if let Some(b) = func.get_block(b_id) {
+                    if let Some(Terminator::BranchCond {
+                        cond,
+                        then_block,
+                        else_block,
+                        ..
+                    }) = &b.terminator
+                    {
+                        if !loop_info.blocks.contains(then_block)
+                            || !loop_info.blocks.contains(else_block)
+                        {
+                            loop_exit_conds.insert(*cond);
+                        }
+                    }
+                }
+            }
+
             // 2. Scan for primitive array or slice operations within the loop
             let mut detected_elem_types: Vec<FirType> = Vec::new();
             let mut read_elements = 0;
@@ -95,6 +121,7 @@ impl VectorizePass {
             let mut array_elements = 0;
             let mut slice_elements = 0;
             let mut has_reduction_op = false;
+            let mut detected_reduction: Option<crate::ir::ReductionKind> = None;
             let mut had_eliminated_bounds = false;
 
             for &b_id in &loop_info.blocks {
@@ -153,17 +180,82 @@ impl VectorizePass {
                             } => {
                                 had_eliminated_bounds = true;
                             }
-                            ValueExpr::Binary { op, .. } => {
-                                if matches!(
-                                    op,
-                                    BinaryOp::Add
-                                        | BinaryOp::Sub
-                                        | BinaryOp::Mul
-                                        | BinaryOp::BitAnd
-                                        | BinaryOp::BitOr
-                                        | BinaryOp::BitXor
-                                ) {
+                            ValueExpr::Binary { op, .. } => match op {
+                                BinaryOp::Mul => {
                                     has_reduction_op = true;
+                                    Self::update_reduction_kind(
+                                        &mut detected_reduction,
+                                        crate::ir::ReductionKind::Product,
+                                    );
+                                }
+                                BinaryOp::Lt | BinaryOp::Le => {
+                                    if !inst.result.is_some_and(|r| loop_exit_conds.contains(&r)) {
+                                        has_reduction_op = true;
+                                        Self::update_reduction_kind(
+                                            &mut detected_reduction,
+                                            crate::ir::ReductionKind::Min,
+                                        );
+                                    }
+                                }
+                                BinaryOp::Gt | BinaryOp::Ge => {
+                                    if !inst.result.is_some_and(|r| loop_exit_conds.contains(&r)) {
+                                        has_reduction_op = true;
+                                        Self::update_reduction_kind(
+                                            &mut detected_reduction,
+                                            crate::ir::ReductionKind::Max,
+                                        );
+                                    }
+                                }
+                                BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
+                                    has_reduction_op = true;
+                                    Self::update_reduction_kind(
+                                        &mut detected_reduction,
+                                        crate::ir::ReductionKind::Bitwise,
+                                    );
+                                }
+                                BinaryOp::Add | BinaryOp::Sub => {
+                                    has_reduction_op = true;
+                                    Self::update_reduction_kind(
+                                        &mut detected_reduction,
+                                        crate::ir::ReductionKind::Sum,
+                                    );
+                                }
+                                _ => {}
+                            },
+                            ValueExpr::CallDirect { name, .. } => {
+                                let callee = INTERNER.resolve(name);
+                                if callee == "min"
+                                    || callee == "fmin"
+                                    || callee.contains("slice_min")
+                                {
+                                    has_reduction_op = true;
+                                    Self::update_reduction_kind(
+                                        &mut detected_reduction,
+                                        crate::ir::ReductionKind::Min,
+                                    );
+                                } else if callee == "max"
+                                    || callee == "fmax"
+                                    || callee.contains("slice_max")
+                                {
+                                    has_reduction_op = true;
+                                    Self::update_reduction_kind(
+                                        &mut detected_reduction,
+                                        crate::ir::ReductionKind::Max,
+                                    );
+                                } else if callee.contains("slice_prod") {
+                                    has_reduction_op = true;
+                                    Self::update_reduction_kind(
+                                        &mut detected_reduction,
+                                        crate::ir::ReductionKind::Product,
+                                    );
+                                } else if callee.contains("slice_sum")
+                                    || callee.contains("slice_dot")
+                                {
+                                    has_reduction_op = true;
+                                    Self::update_reduction_kind(
+                                        &mut detected_reduction,
+                                        crate::ir::ReductionKind::Sum,
+                                    );
                                 }
                             }
                             _ => {}
@@ -181,6 +273,11 @@ impl VectorizePass {
                     vector_width,
                     interleave_count: 4,
                     unroll_enable: true,
+                    reduction_kind: if write_elements == 0 && read_elements > 0 {
+                        detected_reduction
+                    } else {
+                        None
+                    },
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)
@@ -228,9 +325,44 @@ impl VectorizePass {
                         self.stats.maps_vectorized += 1;
                     } else if read_elements > 0 && has_reduction_op {
                         self.stats.reductions_vectorized += 1;
+                        match detected_reduction {
+                            Some(crate::ir::ReductionKind::Product) => {
+                                self.stats.product_reductions_vectorized += 1;
+                            }
+                            Some(crate::ir::ReductionKind::Min) => {
+                                self.stats.min_reductions_vectorized += 1;
+                            }
+                            Some(crate::ir::ReductionKind::Max) => {
+                                self.stats.max_reductions_vectorized += 1;
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// Update current reduction candidate with a newly encountered operator using priority rules.
+    fn update_reduction_kind(
+        current: &mut Option<crate::ir::ReductionKind>,
+        candidate: crate::ir::ReductionKind,
+    ) {
+        match (*current, candidate) {
+            (None, cand) => *current = Some(cand),
+            (Some(crate::ir::ReductionKind::Sum), crate::ir::ReductionKind::Product) => {
+                *current = Some(crate::ir::ReductionKind::Product)
+            }
+            (Some(crate::ir::ReductionKind::Sum), crate::ir::ReductionKind::Bitwise) => {
+                *current = Some(crate::ir::ReductionKind::Bitwise)
+            }
+            (Some(_), crate::ir::ReductionKind::Min) => {
+                *current = Some(crate::ir::ReductionKind::Min)
+            }
+            (Some(_), crate::ir::ReductionKind::Max) => {
+                *current = Some(crate::ir::ReductionKind::Max)
+            }
+            _ => {}
         }
     }
 

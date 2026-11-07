@@ -243,7 +243,43 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("declare double @llvm.vector.reduce.fadd.v4f64(double, <4 x double>)\n");
         out.push_str("declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)\n");
         out.push_str("declare i32 @llvm.vector.reduce.add.v8i32(<8 x i32>)\n");
-        out.push_str("declare i64 @llvm.vector.reduce.add.v4i64(<4 x i64>)\n\n");
+        out.push_str("declare i64 @llvm.vector.reduce.add.v4i64(<4 x i64>)\n");
+        out.push_str("declare float @llvm.vector.reduce.fmul.v4f32(float, <4 x float>)\n");
+        out.push_str("declare float @llvm.vector.reduce.fmul.v8f32(float, <8 x float>)\n");
+        out.push_str("declare double @llvm.vector.reduce.fmul.v4f64(double, <4 x double>)\n");
+        out.push_str("declare i32 @llvm.vector.reduce.mul.v4i32(<4 x i32>)\n");
+        out.push_str("declare i32 @llvm.vector.reduce.mul.v8i32(<8 x i32>)\n");
+        out.push_str("declare i64 @llvm.vector.reduce.mul.v4i64(<4 x i64>)\n");
+        out.push_str("declare float @llvm.vector.reduce.fmin.v4f32(<4 x float>)\n");
+        out.push_str("declare float @llvm.vector.reduce.fmin.v8f32(<8 x float>)\n");
+        out.push_str("declare double @llvm.vector.reduce.fmin.v4f64(<4 x double>)\n");
+        out.push_str("declare i32 @llvm.vector.reduce.smin.v4i32(<4 x i32>)\n");
+        out.push_str("declare i32 @llvm.vector.reduce.smin.v8i32(<8 x i32>)\n");
+        out.push_str("declare i64 @llvm.vector.reduce.smin.v4i64(<4 x i64>)\n");
+        out.push_str("declare float @llvm.vector.reduce.fmax.v4f32(<4 x float>)\n");
+        out.push_str("declare float @llvm.vector.reduce.fmax.v8f32(<8 x float>)\n");
+        out.push_str("declare double @llvm.vector.reduce.fmax.v4f64(<4 x double>)\n");
+        out.push_str("declare i32 @llvm.vector.reduce.smax.v4i32(<4 x i32>)\n");
+        out.push_str("declare i32 @llvm.vector.reduce.smax.v8i32(<8 x i32>)\n");
+        out.push_str("declare i64 @llvm.vector.reduce.smax.v4i64(<4 x i64>)\n\n");
+
+        if self.target.arch == TargetArch::AArch64 {
+            out.push_str("; AArch64 Advanced SIMD (NEON) Horizontal Reduction Intrinsics\n");
+            out.push_str("declare float @llvm.aarch64.neon.fmaxv.f32.v4f32(<4 x float>)\n");
+            out.push_str("declare float @llvm.aarch64.neon.fminv.f32.v4f32(<4 x float>)\n");
+            out.push_str("declare float @llvm.aarch64.neon.fmaxnmv.f32.v4f32(<4 x float>)\n");
+            out.push_str("declare float @llvm.aarch64.neon.fminnmv.f32.v4f32(<4 x float>)\n");
+            out.push_str("declare double @llvm.aarch64.neon.fmaxv.f64.v2f64(<2 x double>)\n");
+            out.push_str("declare double @llvm.aarch64.neon.fminv.f64.v2f64(<2 x double>)\n");
+            out.push_str("declare i32 @llvm.aarch64.neon.smaxv.i32.v4i32(<4 x i32>)\n");
+            out.push_str("declare i32 @llvm.aarch64.neon.sminv.i32.v4i32(<4 x i32>)\n");
+            out.push_str("declare i32 @llvm.aarch64.neon.umaxv.i32.v4i32(<4 x i32>)\n");
+            out.push_str("declare i32 @llvm.aarch64.neon.uminv.i32.v4i32(<4 x i32>)\n");
+            out.push_str("declare i32 @llvm.aarch64.neon.uaddv.i32.v4i32(<4 x i32>)\n");
+            out.push_str("declare i32 @llvm.aarch64.neon.saddv.i32.v4i32(<4 x i32>)\n");
+            out.push_str("declare i64 @llvm.aarch64.neon.smaxv.i64.v2i64(<2 x i64>)\n");
+            out.push_str("declare i64 @llvm.aarch64.neon.sminv.i64.v2i64(<2 x i64>)\n\n");
+        }
 
         // Linkonce SIMD Vectorized Slice Operations
         out.push_str("; IFA Standard Library SIMD Slice Vectorizers\n");
@@ -442,6 +478,176 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
         out.push_str("done:\n  ret void\n}\n\n");
 
+        // Advanced SIMD Scalar Reductions: Product, Min, Max (32-bit & 64-bit)
+        out.push_str("; IFA Standard Library SIMD Advanced Scalar Reductions\n");
+        out.push_str("define linkonce_odr float @ifa_simd_slice_prod_f32(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x float> [ <float 1.0, float 1.0, float 1.0, float 1.0, float 1.0, float 1.0, float 1.0, float 1.0>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds float, ptr %src, i64 %i\n  %v = load <8 x float>, ptr %p, align 4\n  %next_acc = fmul <8 x float> %acc, %v\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !1\n");
+        out.push_str("reduce:\n  %vec_prod = call float @llvm.vector.reduce.fmul.v8f32(float 1.0, <8 x float> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi float [ %vec_prod, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds float, ptr %src, i64 %ti\n  %tv = load float, ptr %tp, align 4\n  %next_s_acc = fmul float %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret float %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr float @ifa_simd_slice_min_f32(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x float> [ <float 0x7FF0000000000000, float 0x7FF0000000000000, float 0x7FF0000000000000, float 0x7FF0000000000000, float 0x7FF0000000000000, float 0x7FF0000000000000, float 0x7FF0000000000000, float 0x7FF0000000000000>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds float, ptr %src, i64 %i\n  %v = load <8 x float>, ptr %p, align 4\n  %cmp = fcmp olt <8 x float> %v, %acc\n  %next_acc = select <8 x i1> %cmp, <8 x float> %v, <8 x float> %acc\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !1\n");
+        out.push_str("reduce:\n  %vec_min = call float @llvm.vector.reduce.fmin.v8f32(<8 x float> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi float [ %vec_min, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds float, ptr %src, i64 %ti\n  %tv = load float, ptr %tp, align 4\n  %tcmp = fcmp olt float %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, float %tv, float %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret float %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr float @ifa_simd_slice_max_f32(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x float> [ <float 0xFFF0000000000000, float 0xFFF0000000000000, float 0xFFF0000000000000, float 0xFFF0000000000000, float 0xFFF0000000000000, float 0xFFF0000000000000, float 0xFFF0000000000000, float 0xFFF0000000000000>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds float, ptr %src, i64 %i\n  %v = load <8 x float>, ptr %p, align 4\n  %cmp = fcmp ogt <8 x float> %v, %acc\n  %next_acc = select <8 x i1> %cmp, <8 x float> %v, <8 x float> %acc\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !1\n");
+        out.push_str("reduce:\n  %vec_max = call float @llvm.vector.reduce.fmax.v8f32(<8 x float> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi float [ %vec_max, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds float, ptr %src, i64 %ti\n  %tv = load float, ptr %tp, align 4\n  %tcmp = fcmp ogt float %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, float %tv, float %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret float %s_acc\n}\n\n");
+
+        out.push_str(
+            "define linkonce_odr i32 @ifa_simd_slice_prod_i32(ptr %src, i64 %len) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x i32> [ <i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i32, ptr %src, i64 %i\n  %v = load <8 x i32>, ptr %p, align 4\n  %next_acc = mul <8 x i32> %acc, %v\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !1\n");
+        out.push_str("reduce:\n  %vec_prod = call i32 @llvm.vector.reduce.mul.v8i32(<8 x i32> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i32 [ %vec_prod, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i32, ptr %src, i64 %ti\n  %tv = load i32, ptr %tp, align 4\n  %next_s_acc = mul i32 %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i32 %s_acc\n}\n\n");
+
+        out.push_str(
+            "define linkonce_odr i32 @ifa_simd_slice_min_i32(ptr %src, i64 %len) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x i32> [ <i32 2147483647, i32 2147483647, i32 2147483647, i32 2147483647, i32 2147483647, i32 2147483647, i32 2147483647, i32 2147483647>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i32, ptr %src, i64 %i\n  %v = load <8 x i32>, ptr %p, align 4\n  %cmp = icmp slt <8 x i32> %v, %acc\n  %next_acc = select <8 x i1> %cmp, <8 x i32> %v, <8 x i32> %acc\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !1\n");
+        out.push_str("reduce:\n  %vec_min = call i32 @llvm.vector.reduce.smin.v8i32(<8 x i32> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i32 [ %vec_min, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i32, ptr %src, i64 %ti\n  %tv = load i32, ptr %tp, align 4\n  %tcmp = icmp slt i32 %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, i32 %tv, i32 %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i32 %s_acc\n}\n\n");
+
+        out.push_str(
+            "define linkonce_odr i32 @ifa_simd_slice_max_i32(ptr %src, i64 %len) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x i32> [ <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i32, ptr %src, i64 %i\n  %v = load <8 x i32>, ptr %p, align 4\n  %cmp = icmp sgt <8 x i32> %v, %acc\n  %next_acc = select <8 x i1> %cmp, <8 x i32> %v, <8 x i32> %acc\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !1\n");
+        out.push_str("reduce:\n  %vec_max = call i32 @llvm.vector.reduce.smax.v8i32(<8 x i32> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i32 [ %vec_max, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i32, ptr %src, i64 %ti\n  %tv = load i32, ptr %tp, align 4\n  %tcmp = icmp sgt i32 %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, i32 %tv, i32 %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i32 %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr double @ifa_simd_slice_prod_f64(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x double> [ <double 1.0, double 1.0, double 1.0, double 1.0>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds double, ptr %src, i64 %i\n  %v = load <4 x double>, ptr %p, align 8\n  %next_acc = fmul <4 x double> %acc, %v\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+        out.push_str("reduce:\n  %vec_prod = call double @llvm.vector.reduce.fmul.v4f64(double 1.0, <4 x double> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi double [ %vec_prod, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds double, ptr %src, i64 %ti\n  %tv = load double, ptr %tp, align 8\n  %next_s_acc = fmul double %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret double %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr double @ifa_simd_slice_min_f64(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x double> [ <double 0x7FF0000000000000, double 0x7FF0000000000000, double 0x7FF0000000000000, double 0x7FF0000000000000>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds double, ptr %src, i64 %i\n  %v = load <4 x double>, ptr %p, align 8\n  %cmp = fcmp olt <4 x double> %v, %acc\n  %next_acc = select <4 x i1> %cmp, <4 x double> %v, <4 x double> %acc\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+        out.push_str("reduce:\n  %vec_min = call double @llvm.vector.reduce.fmin.v4f64(<4 x double> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi double [ %vec_min, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds double, ptr %src, i64 %ti\n  %tv = load double, ptr %tp, align 8\n  %tcmp = fcmp olt double %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, double %tv, double %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret double %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr double @ifa_simd_slice_max_f64(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x double> [ <double 0xFFF0000000000000, double 0xFFF0000000000000, double 0xFFF0000000000000, double 0xFFF0000000000000>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds double, ptr %src, i64 %i\n  %v = load <4 x double>, ptr %p, align 8\n  %cmp = fcmp ogt <4 x double> %v, %acc\n  %next_acc = select <4 x i1> %cmp, <4 x double> %v, <4 x double> %acc\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+        out.push_str("reduce:\n  %vec_max = call double @llvm.vector.reduce.fmax.v4f64(<4 x double> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi double [ %vec_max, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds double, ptr %src, i64 %ti\n  %tv = load double, ptr %tp, align 8\n  %tcmp = fcmp ogt double %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, double %tv, double %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret double %s_acc\n}\n\n");
+
+        out.push_str(
+            "define linkonce_odr i64 @ifa_simd_slice_prod_i64(ptr %src, i64 %len) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x i64> [ <i64 1, i64 1, i64 1, i64 1>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i64, ptr %src, i64 %i\n  %v = load <4 x i64>, ptr %p, align 8\n  %next_acc = mul <4 x i64> %acc, %v\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+        out.push_str("reduce:\n  %vec_prod = call i64 @llvm.vector.reduce.mul.v4i64(<4 x i64> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i64 [ %vec_prod, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i64, ptr %src, i64 %ti\n  %tv = load i64, ptr %tp, align 8\n  %next_s_acc = mul i64 %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i64 %s_acc\n}\n\n");
+
+        out.push_str(
+            "define linkonce_odr i64 @ifa_simd_slice_min_i64(ptr %src, i64 %len) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x i64> [ <i64 9223372036854775807, i64 9223372036854775807, i64 9223372036854775807, i64 9223372036854775807>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i64, ptr %src, i64 %i\n  %v = load <4 x i64>, ptr %p, align 8\n  %cmp = icmp slt <4 x i64> %v, %acc\n  %next_acc = select <4 x i1> %cmp, <4 x i64> %v, <4 x i64> %acc\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+        out.push_str("reduce:\n  %vec_min = call i64 @llvm.vector.reduce.smin.v4i64(<4 x i64> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i64 [ %vec_min, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i64, ptr %src, i64 %ti\n  %tv = load i64, ptr %tp, align 8\n  %tcmp = icmp slt i64 %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, i64 %tv, i64 %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i64 %s_acc\n}\n\n");
+
+        out.push_str(
+            "define linkonce_odr i64 @ifa_simd_slice_max_i64(ptr %src, i64 %len) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x i64> [ <i64 -9223372036854775808, i64 -9223372036854775808, i64 -9223372036854775808, i64 -9223372036854775808>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i64, ptr %src, i64 %i\n  %v = load <4 x i64>, ptr %p, align 8\n  %cmp = icmp sgt <4 x i64> %v, %acc\n  %next_acc = select <4 x i1> %cmp, <4 x i64> %v, <4 x i64> %acc\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+        out.push_str("reduce:\n  %vec_max = call i64 @llvm.vector.reduce.smax.v4i64(<4 x i64> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i64 [ %vec_max, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i64, ptr %src, i64 %ti\n  %tv = load i64, ptr %tp, align 8\n  %tcmp = icmp sgt i64 %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, i64 %tv, i64 %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i64 %s_acc\n}\n\n");
+
+        if self.target.arch == TargetArch::AArch64 {
+            out.push_str("; AArch64 Advanced SIMD (NEON) Hardware-Accelerated Vectorizers\n");
+            out.push_str("define linkonce_odr float @ifa_neon_slice_sum_f32(ptr %src, i64 %len) alwaysinline {\n");
+            out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+            out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x float> [ zeroinitializer, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+            out.push_str("vec_step:\n  %p = getelementptr inbounds float, ptr %src, i64 %i\n  %v = load <4 x float>, ptr %p, align 4\n  %next_acc = fadd <4 x float> %acc, %v\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+            out.push_str("reduce:\n  %vec_sum = call float @llvm.vector.reduce.fadd.v4f32(float 0.0, <4 x float> %acc)\n  br label %tail_loop\n");
+            out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi float [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+            out.push_str("tail_step:\n  %tp = getelementptr inbounds float, ptr %src, i64 %ti\n  %tv = load float, ptr %tp, align 4\n  %next_s_acc = fadd float %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+            out.push_str("done:\n  ret float %s_acc\n}\n\n");
+
+            out.push_str("define linkonce_odr float @ifa_neon_slice_min_f32(ptr %src, i64 %len) alwaysinline {\n");
+            out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+            out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x float> [ <float 0x7FF0000000000000, float 0x7FF0000000000000, float 0x7FF0000000000000, float 0x7FF0000000000000>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+            out.push_str("vec_step:\n  %p = getelementptr inbounds float, ptr %src, i64 %i\n  %v = load <4 x float>, ptr %p, align 4\n  %cmp = fcmp olt <4 x float> %v, %acc\n  %next_acc = select <4 x i1> %cmp, <4 x float> %v, <4 x float> %acc\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+            out.push_str("reduce:\n  %vec_min = call float @llvm.aarch64.neon.fminnmv.f32.v4f32(<4 x float> %acc)\n  br label %tail_loop\n");
+            out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi float [ %vec_min, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+            out.push_str("tail_step:\n  %tp = getelementptr inbounds float, ptr %src, i64 %ti\n  %tv = load float, ptr %tp, align 4\n  %tcmp = fcmp olt float %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, float %tv, float %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+            out.push_str("done:\n  ret float %s_acc\n}\n\n");
+
+            out.push_str("define linkonce_odr float @ifa_neon_slice_max_f32(ptr %src, i64 %len) alwaysinline {\n");
+            out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+            out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x float> [ <float 0xFFF0000000000000, float 0xFFF0000000000000, float 0xFFF0000000000000, float 0xFFF0000000000000>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+            out.push_str("vec_step:\n  %p = getelementptr inbounds float, ptr %src, i64 %i\n  %v = load <4 x float>, ptr %p, align 4\n  %cmp = fcmp ogt <4 x float> %v, %acc\n  %next_acc = select <4 x i1> %cmp, <4 x float> %v, <4 x float> %acc\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+            out.push_str("reduce:\n  %vec_max = call float @llvm.aarch64.neon.fmaxnmv.f32.v4f32(<4 x float> %acc)\n  br label %tail_loop\n");
+            out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi float [ %vec_max, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+            out.push_str("tail_step:\n  %tp = getelementptr inbounds float, ptr %src, i64 %ti\n  %tv = load float, ptr %tp, align 4\n  %tcmp = fcmp ogt float %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, float %tv, float %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+            out.push_str("done:\n  ret float %s_acc\n}\n\n");
+
+            out.push_str("define linkonce_odr i32 @ifa_neon_slice_min_i32(ptr %src, i64 %len) alwaysinline {\n");
+            out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+            out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x i32> [ <i32 2147483647, i32 2147483647, i32 2147483647, i32 2147483647>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+            out.push_str("vec_step:\n  %p = getelementptr inbounds i32, ptr %src, i64 %i\n  %v = load <4 x i32>, ptr %p, align 4\n  %cmp = icmp slt <4 x i32> %v, %acc\n  %next_acc = select <4 x i1> %cmp, <4 x i32> %v, <4 x i32> %acc\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+            out.push_str("reduce:\n  %vec_min = call i32 @llvm.aarch64.neon.sminv.i32.v4i32(<4 x i32> %acc)\n  br label %tail_loop\n");
+            out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i32 [ %vec_min, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+            out.push_str("tail_step:\n  %tp = getelementptr inbounds i32, ptr %src, i64 %ti\n  %tv = load i32, ptr %tp, align 4\n  %tcmp = icmp slt i32 %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, i32 %tv, i32 %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+            out.push_str("done:\n  ret i32 %s_acc\n}\n\n");
+
+            out.push_str("define linkonce_odr i32 @ifa_neon_slice_max_i32(ptr %src, i64 %len) alwaysinline {\n");
+            out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+            out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x i32> [ <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+            out.push_str("vec_step:\n  %p = getelementptr inbounds i32, ptr %src, i64 %i\n  %v = load <4 x i32>, ptr %p, align 4\n  %cmp = icmp sgt <4 x i32> %v, %acc\n  %next_acc = select <4 x i1> %cmp, <4 x i32> %v, <4 x i32> %acc\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+            out.push_str("reduce:\n  %vec_max = call i32 @llvm.aarch64.neon.smaxv.i32.v4i32(<4 x i32> %acc)\n  br label %tail_loop\n");
+            out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i32 [ %vec_max, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+            out.push_str("tail_step:\n  %tp = getelementptr inbounds i32, ptr %src, i64 %ti\n  %tv = load i32, ptr %tp, align 4\n  %tcmp = icmp sgt i32 %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, i32 %tv, i32 %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+            out.push_str("done:\n  ret i32 %s_acc\n}\n\n");
+        }
+
         // Fast-path 1-cycle CPU inlined generation check (alwaysinline with branch weights)
         out.push_str("; Inlined 1-cycle CPU generation check\n");
         out.push_str("define linkonce_odr void @ifa_rt_gen_check(ptr %ptr, i32 %remembered_gen) alwaysinline {\n");
@@ -607,6 +813,9 @@ impl<'a> LlvmIrEmitter<'a> {
         // 16-lane SIMD vectorization hint (u8, i8 bytes, crypto)
         out.push_str("!8 = distinct !{!8, !2, !9, !4, !5}\n");
         out.push_str("!9 = !{!\"llvm.loop.vectorize.width\", i32 16}\n");
+        // 2-lane SIMD vectorization hint (AArch64 Neon f64, i64)
+        out.push_str("!10 = distinct !{!10, !2, !11, !4, !5}\n");
+        out.push_str("!11 = !{!\"llvm.loop.vectorize.width\", i32 2}\n");
 
         Ok(out)
     }
@@ -2754,6 +2963,7 @@ impl<'a> LlvmIrEmitter<'a> {
             Terminator::Branch { target, .. } => {
                 if let Some(hint) = vector_hint {
                     let meta_id = match hint.vector_width {
+                        2 => 10,
                         4 => 6,
                         16 | 32 => 8,
                         _ => 1,
@@ -2774,6 +2984,7 @@ impl<'a> LlvmIrEmitter<'a> {
             } => {
                 if let Some(hint) = vector_hint {
                     let meta_id = match hint.vector_width {
+                        2 => 10,
                         4 => 6,
                         16 | 32 => 8,
                         _ => 1,
