@@ -876,7 +876,7 @@ impl<'a> SemanticAnalyzer<'a> {
         match stmt {
             Stmt::Let {
                 is_mut,
-                name,
+                pattern,
                 ty: annotated_ty,
                 init,
                 span,
@@ -904,11 +904,15 @@ impl<'a> SemanticAnalyzer<'a> {
                     let inferred = self.check_expr(init_expr, declared_ty.as_ref());
                     if let Some(expected) = &declared_ty {
                         if !inferred.is_assignable_to(expected) {
-                            let var_name = INTERNER.resolve(name);
+                            let pat_desc = if let Pattern::Ident(name, _) = pattern {
+                                format!(" pour '{}'", INTERNER.resolve(name))
+                            } else {
+                                String::new()
+                            };
                             self.diagnostics.push(
                                 Diagnostic::error(format!(
-                                    "type incompatible pour '{}' : attendu {}, trouvé {}",
-                                    var_name, expected, inferred
+                                    "type incompatible{} : attendu {}, trouvé {}",
+                                    pat_desc, expected, inferred
                                 ))
                                 .with_code("E0001")
                                 .with_primary_label(
@@ -928,19 +932,45 @@ impl<'a> SemanticAnalyzer<'a> {
                     declared_ty.unwrap_or(Type::Unknown)
                 };
 
+                if init.is_none() && !matches!(pattern, Pattern::Ident(_, _)) {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "la déstructuration requiert une expression d'initialisation",
+                        )
+                        .with_code("E0047")
+                        .with_primary_label(
+                            pattern.span(),
+                            "motif déstructurant sans initialisation",
+                        ),
+                    );
+                }
+
                 self.symbols.register_type_if_generic_instance(&actual_ty);
 
-                if let Err(diag) = self.symbols.define_variable(
-                    *name,
-                    actual_ty,
-                    *is_mut,
-                    init.is_some(),
-                    None,
-                    *span,
-                ) {
-                    self.diagnostics.push(diag);
+                // Validation obligatoire d'irréfutabilité en mode déclaration locale
+                let is_irrefutable =
+                    crate::exhaustiveness::is_irrefutable_pattern_for_type(pattern, &actual_ty);
+                if !is_irrefutable && actual_ty != Type::Unknown {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "motif réfutable dans une déclaration de variable : le motif ne couvre pas toutes les valeurs possibles du type '{}'",
+                            actual_ty
+                        ))
+                        .with_code("E0047")
+                        .with_primary_label(
+                            pattern.span(),
+                            "motif réfutable non autorisé dans une déclaration 'let' ou 'mut'",
+                        )
+                        .with_note(
+                            "les motifs réfutables ne sont autorisés que dans les instructions 'match' ou 'if let'",
+                        ),
+                    );
                 }
-                self.moved_vars.remove(name);
+
+                self.check_pattern_with_mut(pattern, &actual_ty, *is_mut, init.is_some());
+                for (sym, _) in pattern.bound_variables() {
+                    self.moved_vars.remove(&sym);
+                }
             }
             Stmt::Assign {
                 target,
@@ -1954,6 +1984,16 @@ impl<'a> SemanticAnalyzer<'a> {
     }
 
     fn check_pattern(&mut self, pat: &Pattern, target_ty: &Type) {
+        self.check_pattern_with_mut(pat, target_ty, false, true);
+    }
+
+    fn check_pattern_with_mut(
+        &mut self,
+        pat: &Pattern,
+        target_ty: &Type,
+        is_mut: bool,
+        is_initialized: bool,
+    ) {
         match pat {
             Pattern::Wildcard(_) => {}
             Pattern::Lit(lit, span) => {
@@ -1980,9 +2020,16 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
             }
             Pattern::Ident(sym, span) => {
-                let _ =
-                    self.symbols
-                        .define_variable(*sym, target_ty.clone(), false, true, None, *span);
+                if let Err(diag) = self.symbols.define_variable(
+                    *sym,
+                    target_ty.clone(),
+                    is_mut,
+                    is_initialized,
+                    None,
+                    *span,
+                ) {
+                    self.diagnostics.push(diag);
+                }
             }
             Pattern::Variant {
                 enum_name,
@@ -2045,7 +2092,12 @@ impl<'a> SemanticAnalyzer<'a> {
                 if valid_variant {
                     match (inner, found_payload_ty) {
                         (Some(inner_pat), Some(payload_ty)) => {
-                            self.check_pattern(inner_pat, &payload_ty);
+                            self.check_pattern_with_mut(
+                                inner_pat,
+                                &payload_ty,
+                                is_mut,
+                                is_initialized,
+                            );
                         }
                         (Some(inner_pat), None) => {
                             self.diagnostics.push(
@@ -2090,14 +2142,19 @@ impl<'a> SemanticAnalyzer<'a> {
                             );
                     } else {
                         for (elem_pat, elem_ty) in elems.iter().zip(expected_elems.iter()) {
-                            self.check_pattern(elem_pat, elem_ty);
+                            self.check_pattern_with_mut(elem_pat, elem_ty, is_mut, is_initialized);
                         }
                     }
                 }
                 Type::Unit if elems.is_empty() => {}
                 Type::Unknown => {
                     for elem_pat in elems {
-                        self.check_pattern(elem_pat, &Type::Unknown);
+                        self.check_pattern_with_mut(
+                            elem_pat,
+                            &Type::Unknown,
+                            is_mut,
+                            is_initialized,
+                        );
                     }
                 }
                 _ => {
@@ -2173,7 +2230,12 @@ impl<'a> SemanticAnalyzer<'a> {
                         } else {
                             f_sym.ty.substitute(&type_subst)
                         };
-                        self.check_pattern(&f.pattern, &expected_field_ty);
+                        self.check_pattern_with_mut(
+                            &f.pattern,
+                            &expected_field_ty,
+                            is_mut,
+                            is_initialized,
+                        );
                     } else {
                         self.diagnostics.push(
                             Diagnostic::error(format!(
@@ -2217,7 +2279,7 @@ impl<'a> SemanticAnalyzer<'a> {
 
                 for sub_pat in patterns {
                     self.symbols.enter_scope(false, false);
-                    self.check_pattern(sub_pat, target_ty);
+                    self.check_pattern_with_mut(sub_pat, target_ty, is_mut, is_initialized);
 
                     let mut sub_bindings = HashMap::new();
                     if let Some(scope) = self.symbols.scopes.last() {
@@ -2293,8 +2355,8 @@ impl<'a> SemanticAnalyzer<'a> {
                     let _ = self.symbols.define_variable(
                         *var_name,
                         var_ty.clone(),
-                        false,
-                        true,
+                        is_mut,
+                        is_initialized,
                         None,
                         *var_span,
                     );
@@ -2323,10 +2385,10 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
 
                 if let Some(s) = start {
-                    self.check_pattern(s, target_ty);
+                    self.check_pattern_with_mut(s, target_ty, is_mut, is_initialized);
                 }
                 if let Some(e) = end {
-                    self.check_pattern(e, target_ty);
+                    self.check_pattern_with_mut(e, target_ty, is_mut, is_initialized);
                 }
             }
             Pattern::Slice {
@@ -2377,16 +2439,16 @@ impl<'a> SemanticAnalyzer<'a> {
                 };
 
                 for p in prefix {
-                    self.check_pattern(p, &elem_ty);
+                    self.check_pattern_with_mut(p, &elem_ty, is_mut, is_initialized);
                 }
 
                 if let Some(Some(rest_pat)) = rest {
                     let slice_ty = Type::Slice(Box::new(elem_ty.clone()));
-                    self.check_pattern(rest_pat, &slice_ty);
+                    self.check_pattern_with_mut(rest_pat, &slice_ty, is_mut, is_initialized);
                 }
 
                 for s in suffix {
-                    self.check_pattern(s, &elem_ty);
+                    self.check_pattern_with_mut(s, &elem_ty, is_mut, is_initialized);
                 }
             }
         }

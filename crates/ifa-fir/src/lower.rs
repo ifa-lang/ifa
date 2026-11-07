@@ -1,7 +1,7 @@
 use crate::ir::*;
 use crate::types::FirType;
 use ifa_ast::{
-    BinOp, Block, Expr, ExprKind, Item, Lit, Pattern, Program, SelectArm, Stmt, UnaryOp,
+    AssignOp, BinOp, Block, Expr, ExprKind, Item, Lit, Pattern, Program, SelectArm, Stmt, UnaryOp,
 };
 use ifa_sema::types::{FloatType, IntType};
 use ifa_sema::SymbolTable;
@@ -712,59 +712,124 @@ impl<'a> FunctionLoweringContext<'a> {
 
         match stmt {
             Stmt::Let {
-                name, init, span, ..
+                pattern,
+                init,
+                span,
+                ..
             } => {
                 let init_val = init.as_ref().map(|e| self.lower_expr(e));
-                let ty = if let Some(init_expr) = init {
-                    if let Some(inferred) = self.infer_expr_fir_type(init_expr) {
-                        inferred
-                    } else if let Some(var_sym) = self.symbols.lookup_variable(name) {
-                        let substituted = var_sym.ty.substitute(&self.type_subst);
-                        FirType::from_sema_type(&substituted)
-                    } else {
-                        init_val
-                            .map(|_| FirType::Int(IntType::I64))
-                            .unwrap_or(FirType::Unit)
+
+                match pattern {
+                    Pattern::Ident(name, p_span) => {
+                        let ty = if let Some(init_expr) = init {
+                            if let Some(inferred) = self.infer_expr_fir_type(init_expr) {
+                                inferred
+                            } else if let Some(var_sym) = self.symbols.lookup_variable(name) {
+                                let substituted = var_sym.ty.substitute(&self.type_subst);
+                                FirType::from_sema_type(&substituted)
+                            } else {
+                                init_val
+                                    .map(|_| FirType::Int(IntType::I64))
+                                    .unwrap_or(FirType::Unit)
+                            }
+                        } else if let Some(var_sym) = self.symbols.lookup_variable(name) {
+                            let substituted = var_sym.ty.substitute(&self.type_subst);
+                            FirType::from_sema_type(&substituted)
+                        } else {
+                            FirType::Unit
+                        };
+
+                        let ptr = self.alloc_value();
+                        self.emit(
+                            Some(ptr),
+                            ValueExpr::Alloca {
+                                ty: ty.clone(),
+                                name: Some(*name),
+                            },
+                            *p_span,
+                        );
+
+                        if let Some(val) = init_val {
+                            self.emit(None, ValueExpr::Store { ptr, val }, *p_span);
+                        }
+
+                        if let Some(init_expr) = init {
+                            if self.is_expr_null(init_expr) {
+                                self.known_null_vars.insert(*name);
+                                self.known_non_null_vars.remove(name);
+                            } else if self.is_expr_non_null(init_expr) {
+                                self.known_non_null_vars.insert(*name);
+                                self.known_null_vars.remove(name);
+                            }
+                        }
+
+                        self.var_allocas.insert(*name, ptr);
+                        self.var_types.insert(*name, ty);
                     }
-                } else if let Some(var_sym) = self.symbols.lookup_variable(name) {
-                    let substituted = var_sym.ty.substitute(&self.type_subst);
-                    FirType::from_sema_type(&substituted)
-                } else {
-                    FirType::Unit
-                };
+                    _ => {
+                        if let Some(val) = init_val {
+                            let init_expr = init.as_ref().unwrap();
+                            let target_ty = self
+                                .infer_expr_fir_type(init_expr)
+                                .unwrap_or(FirType::Int(IntType::I64));
 
-                let ptr = self.alloc_value();
-                self.emit(
-                    Some(ptr),
-                    ValueExpr::Alloca {
-                        ty: ty.clone(),
-                        name: Some(*name),
-                    },
-                    *span,
-                );
+                            let success_block = self.alloc_block();
+                            let fail_block = self.alloc_block();
 
-                if let Some(val) = init_val {
-                    self.emit(None, ValueExpr::Store { ptr, val }, *span);
-                }
+                            self.lower_pattern_match(
+                                val,
+                                &target_ty,
+                                pattern,
+                                success_block,
+                                fail_block,
+                                *span,
+                            );
 
-                if let Some(init_expr) = init {
-                    if self.is_expr_null(init_expr) {
-                        self.known_null_vars.insert(*name);
-                        self.known_non_null_vars.remove(name);
-                    } else if self.is_expr_non_null(init_expr) {
-                        self.known_non_null_vars.insert(*name);
-                        self.known_null_vars.remove(name);
+                            if let Some(b) = self.func.get_block_mut(fail_block) {
+                                b.terminator = Some(Terminator::Unreachable);
+                            }
+
+                            self.current_block = success_block;
+                        }
                     }
                 }
-
-                self.var_allocas.insert(*name, ptr);
-                self.var_types.insert(*name, ty);
             }
 
             Stmt::Assign {
-                target, val, span, ..
+                target,
+                op,
+                val,
+                span,
             } => {
-                let val_id = self.lower_expr(val);
+                let rhs_id = self.lower_expr(val);
+                let val_id = if let Some(assign_op) = op {
+                    let lhs_id = self.lower_expr(target);
+                    let fir_op = match assign_op {
+                        AssignOp::Add => BinaryOp::Add,
+                        AssignOp::Sub => BinaryOp::Sub,
+                        AssignOp::Mul => BinaryOp::Mul,
+                        AssignOp::Div => BinaryOp::Div,
+                        AssignOp::Rem => BinaryOp::Rem,
+                        AssignOp::BitXor => BinaryOp::BitXor,
+                        AssignOp::BitAnd => BinaryOp::BitAnd,
+                        AssignOp::BitOr => BinaryOp::BitOr,
+                        AssignOp::Shl => BinaryOp::Shl,
+                        AssignOp::Shr => BinaryOp::Shr,
+                    };
+                    let computed = self.alloc_value();
+                    self.emit(
+                        Some(computed),
+                        ValueExpr::Binary {
+                            op: fir_op,
+                            lhs: lhs_id,
+                            rhs: rhs_id,
+                        },
+                        *span,
+                    );
+                    computed
+                } else {
+                    rhs_id
+                };
 
                 if let ExprKind::Ident(target_sym) = &target.kind {
                     if self.is_expr_null(val) {

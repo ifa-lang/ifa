@@ -49,7 +49,7 @@ fn is_irrefutable_pattern(pat: &Pattern) -> bool {
 }
 
 /// Helper returning whether a pattern unconditionally matches any value of the target type.
-fn is_irrefutable_pattern_for_type(pat: &Pattern, target_ty: &Type) -> bool {
+pub(crate) fn is_irrefutable_pattern_for_type(pat: &Pattern, target_ty: &Type) -> bool {
     match pat {
         Pattern::Wildcard(_) | Pattern::Ident(_, _) => true,
         Pattern::Tuple(elems, _) => match target_ty {
@@ -59,7 +59,19 @@ fn is_irrefutable_pattern_for_type(pat: &Pattern, target_ty: &Type) -> bool {
                 .all(|(p, t)| is_irrefutable_pattern_for_type(p, t)),
             _ => elems.iter().all(is_irrefutable_pattern),
         },
-        Pattern::Struct { fields, .. } => fields.iter().all(|f| is_irrefutable_pattern(&f.pattern)),
+        Pattern::Struct { fields, .. } => fields.iter().all(|f| match target_ty {
+            Type::Struct {
+                fields: expected_fields,
+                ..
+            } => {
+                if let Some((_, f_ty)) = expected_fields.iter().find(|(name, _)| *name == f.name) {
+                    is_irrefutable_pattern_for_type(&f.pattern, f_ty)
+                } else {
+                    is_irrefutable_pattern(&f.pattern)
+                }
+            }
+            _ => is_irrefutable_pattern(&f.pattern),
+        }),
         Pattern::Or(pats, _) => pats
             .iter()
             .any(|p| is_irrefutable_pattern_for_type(p, target_ty)),

@@ -900,21 +900,12 @@ impl Parser {
         let cur = self.current();
         match cur.kind {
             TokenKind::Let | TokenKind::Mut => {
-                let is_mut = cur.kind == TokenKind::Mut;
+                let mut is_mut = cur.kind == TokenKind::Mut;
                 self.advance();
-                let name = match self.current().kind {
-                    TokenKind::Ident(s) => {
-                        self.advance();
-                        s
-                    }
-                    _ => {
-                        let c = self.current();
-                        let diag = Diagnostic::error("nom de variable attendu")
-                            .with_primary_label(c.span, "identifiant attendu");
-                        self.diagnostics.push(diag.clone());
-                        return Err(diag);
-                    }
-                };
+                if !is_mut && self.match_token(&TokenKind::Mut) {
+                    is_mut = true;
+                }
+                let pattern = self.parse_pattern()?;
 
                 let ty = if self.match_token(&TokenKind::Colon) {
                     Some(self.parse_type()?)
@@ -929,13 +920,14 @@ impl Parser {
                 };
 
                 self.match_token(&TokenKind::Semicolon);
-                let end = init
-                    .as_ref()
-                    .map(|e| e.span.end)
-                    .unwrap_or(self.current().span.end);
+                let end = init.as_ref().map(|e| e.span.end).unwrap_or_else(|| {
+                    ty.as_ref()
+                        .map(|t| t.span.end)
+                        .unwrap_or(pattern.span().end)
+                });
                 Ok(Stmt::Let {
                     is_mut,
-                    name,
+                    pattern,
                     ty,
                     init,
                     span: Span::new(self.file_id, cur.span.start, end),
@@ -2273,6 +2265,79 @@ mod tests {
                 ));
             } else {
                 panic!("expected let with safe MethodCall");
+            }
+        }
+    }
+
+    #[test]
+    fn test_destructuring_let_and_mut_statements() {
+        let src = r#"
+        fn test() {
+            let (a, b) = pair;
+            mut (x, y): (i32, i32) = point;
+            let mut [first, ..rest] = slice;
+            let Point { x: px, y: py, .. } = pt;
+        }
+        "#;
+        let fid = FileId(0);
+        let tokens = tokenize(fid, src);
+        let (prog, diags) = parse(fid, tokens);
+        assert!(diags.is_empty(), "Parser diags: {:?}", diags);
+
+        if let Item::Function(f) = &prog.items[0] {
+            let body = f.body.as_ref().unwrap();
+            assert_eq!(body.stmts.len(), 4);
+
+            // 1. let (a, b) = pair;
+            if let Stmt::Let {
+                is_mut, pattern, ..
+            } = &body.stmts[0]
+            {
+                assert!(!is_mut);
+                assert!(matches!(pattern, Pattern::Tuple(elems, _) if elems.len() == 2));
+            } else {
+                panic!("expected tuple let");
+            }
+
+            // 2. mut (x, y): (i32, i32) = point;
+            if let Stmt::Let {
+                is_mut,
+                pattern,
+                ty,
+                ..
+            } = &body.stmts[1]
+            {
+                assert!(is_mut);
+                assert!(matches!(pattern, Pattern::Tuple(elems, _) if elems.len() == 2));
+                assert!(ty.is_some());
+            } else {
+                panic!("expected mut tuple let with type annotation");
+            }
+
+            // 3. let mut [first, ..rest] = slice;
+            if let Stmt::Let {
+                is_mut, pattern, ..
+            } = &body.stmts[2]
+            {
+                assert!(is_mut);
+                assert!(
+                    matches!(pattern, Pattern::Slice { prefix, rest: Some(Some(_)), .. } if prefix.len() == 1)
+                );
+            } else {
+                panic!("expected let mut slice");
+            }
+
+            // 4. let Point { x: px, y: py, .. } = pt;
+            if let Stmt::Let {
+                is_mut, pattern, ..
+            } = &body.stmts[3]
+            {
+                assert!(!is_mut);
+                assert!(
+                    matches!(pattern, Pattern::Struct { fields, has_rest: true, .. } if fields.len() == 2)
+                );
+            } else {
+                panic!("expected struct let");
             }
         }
     }

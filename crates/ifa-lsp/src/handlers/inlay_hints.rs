@@ -12,7 +12,7 @@ struct InlayHintVisitor<'a> {
 impl<'a, 'ast> Visitor<'ast> for InlayHintVisitor<'a> {
     fn visit_stmt(&mut self, stmt: &'ast Stmt) {
         if let Stmt::Let {
-            name,
+            pattern: ifa_ast::Pattern::Ident(name, _),
             ty: None,
             span,
             ..

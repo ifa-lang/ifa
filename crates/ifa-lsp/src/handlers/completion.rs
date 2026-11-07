@@ -60,7 +60,12 @@ pub fn handle_completion(doc: &Document, position: Position) -> CompletionList {
                             }
                             if let Some(body) = &f.body {
                                 for stmt in &body.stmts {
-                                    if let ifa_ast::Stmt::Let { name, ty, .. } = stmt {
+                                    if let ifa_ast::Stmt::Let {
+                                        pattern: ifa_ast::Pattern::Ident(name, _),
+                                        ty,
+                                        ..
+                                    } = stmt
+                                    {
                                         if *name == receiver_sym {
                                             if let Some(t) = ty {
                                                 if let Some(sn) = extract_struct_from_ast_type(t) {

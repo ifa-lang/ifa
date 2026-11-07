@@ -140,13 +140,15 @@ pub fn lint_program(prog: &Program, _sm: &SourceMap) -> Vec<String> {
 fn lint_statements(stmts: &[Stmt], warnings: &mut Vec<String>) {
     for stmt in stmts {
         match stmt {
-            Stmt::Let { name, .. } => {
-                let var_name = INTERNER.resolve(name);
-                if !is_snake_case(&var_name) && !var_name.starts_with('_') {
-                    warnings.push(format!(
-                        "style warning: variable `{}` should follow snake_case convention",
-                        var_name
-                    ));
+            Stmt::Let { pattern, .. } => {
+                for (sym, _) in pattern.bound_variables() {
+                    let var_name = INTERNER.resolve(&sym);
+                    if !is_snake_case(&var_name) && !var_name.starts_with('_') {
+                        warnings.push(format!(
+                            "style warning: variable `{}` should follow snake_case convention",
+                            var_name
+                        ));
+                    }
                 }
             }
             Stmt::Expr(expr) => match &expr.kind {

@@ -287,21 +287,24 @@ impl<'a> EscapeAnalyzer<'a> {
 
     fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let {
-                name, init, span, ..
-            } => {
-                self.record_local_var(*name, *span);
+            Stmt::Let { pattern, init, .. } => {
+                let bound = pattern.bound_variables();
+                for (sym, p_span) in &bound {
+                    self.record_local_var(*sym, *p_span);
+                }
                 if let Some(expr) = init {
                     let refs = self.collect_contained_refs(expr);
                     if !refs.is_empty() {
-                        for r in &refs {
-                            self.ref_dependencies
-                                .entry(*name)
-                                .or_default()
-                                .push(r.target_var);
-                        }
-                        if let Some(info) = self.var_info.get_mut(name) {
-                            info.contained_refs.extend(refs);
+                        for (sym, _) in &bound {
+                            for r in &refs {
+                                self.ref_dependencies
+                                    .entry(*sym)
+                                    .or_default()
+                                    .push(r.target_var);
+                            }
+                            if let Some(info) = self.var_info.get_mut(sym) {
+                                info.contained_refs.extend(refs.clone());
+                            }
                         }
                         self.detect_and_handle_cycles();
                     }

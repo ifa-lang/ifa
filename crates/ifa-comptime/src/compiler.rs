@@ -1,7 +1,7 @@
 use crate::error::{ComptimeError, ComptimeErrorKind};
 use crate::op::{Chunk, OpCode};
 use crate::value::Value;
-use ifa_ast::{BinOp, Block, Expr, ExprKind, Function, Lit, Stmt, UnaryOp};
+use ifa_ast::{BinOp, Block, Expr, ExprKind, Function, Lit, Pattern, Stmt, UnaryOp};
 use ifa_span::{sym, Span, Symbol, INTERNER};
 
 /// Compiled bytecode function ready for execution by `ComptimeVM`.
@@ -130,15 +130,25 @@ impl Compiler {
     pub fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), ComptimeError> {
         match stmt {
             Stmt::Let {
-                name, init, span, ..
+                pattern,
+                init,
+                span,
+                ..
             } => {
                 if let Some(val_expr) = init {
                     self.compile_expr(val_expr)?;
                 } else {
                     self.chunk.emit(OpCode::Unit, *span);
                 }
-                let slot = self.define_local(*name);
-                self.chunk.emit(OpCode::StoreLocal(slot), *span);
+                if let Pattern::Ident(name, _) = pattern {
+                    let slot = self.define_local(*name);
+                    self.chunk.emit(OpCode::StoreLocal(slot), *span);
+                } else {
+                    for (sym, _) in pattern.bound_variables() {
+                        let slot = self.define_local(sym);
+                        self.chunk.emit(OpCode::StoreLocal(slot), *span);
+                    }
+                }
             }
             Stmt::Assign {
                 target, val, span, ..

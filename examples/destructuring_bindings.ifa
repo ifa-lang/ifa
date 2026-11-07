@@ -1,0 +1,48 @@
+// Exemples idiomatiques de déstructuration de motifs dans les déclarations locales `let` et `mut`.
+// Illustre la déstructuration irréfutable de tuples, structures et tranches/tableaux avec reste.
+
+struct GeoCoordinate {
+    latitude: i64,
+    longitude: i64,
+    altitude: i64,
+}
+
+fn process_pair(pair: (i64, i64)) -> i64 {
+    let (first, second) = pair;
+    return first * 10 + second;
+}
+
+fn compute_offset(point: (i64, i64)) -> i64 {
+    mut (dx, dy) = point;
+    dx += 5;
+    dy += 15;
+    return dx + dy;
+}
+
+fn extract_geography(coord: GeoCoordinate) -> i64 {
+    let GeoCoordinate { latitude, longitude, altitude } = coord;
+    return latitude + longitude + altitude;
+}
+
+fn extract_array_slice(dataset: [i64; 4]) -> i64 {
+    let [head, ..middle, tail] = dataset;
+    return head * 1000 + tail;
+}
+
+pub fn main() -> i64 {
+    let r1 = process_pair((3, 7));
+    let r2 = compute_offset((10, 20));
+
+    let loc = GeoCoordinate(latitude: 45, longitude: 12, altitude: 300);
+    let r3 = extract_geography(loc);
+
+    let data: [i64; 4] = [2, 10, 20, 5];
+    let r4 = extract_array_slice(data);
+
+    // r1: 37
+    // r2: (10 + 5) + (20 + 15) = 15 + 35 = 50
+    // r3: 45 + 12 + 300 = 357
+    // r4: 2005
+    // Total = 37 + 50 + 357 + 2005 = 2449
+    return r1 + r2 + r3 + r4;
+}

@@ -697,3 +697,52 @@ fn test_nested_slice_pattern_matching_interp() {
     // 10 + 20 + 30 + 40 = 100
     assert_eq!(res, FirValue::Int(100));
 }
+
+#[test]
+fn test_destructuring_let_and_mut_interp() {
+    let src = r#"
+        struct Coordinate {
+            x: i64,
+            y: i64,
+        }
+
+        pub fn main() -> i64 {
+            // 1. Tuple destructuring
+            let (a, b) = (10, 20);
+
+            // 2. Mutable tuple destructuring with mutation
+            mut (u, v) = (5, 15);
+            u += 10; // u = 15
+            v += 20; // v = 35
+
+            // 3. Struct destructuring
+            let c = Coordinate(x: 100, y: 200);
+            let Coordinate { x: cx, y: cy } = c;
+
+            // 4. Fixed array slice destructuring
+            let arr: [i64; 3] = [30, 40, 50];
+            let [first, ..rest] = arr;
+
+            return a + b + u + v + cx + cy + first + rest[0] + rest[1];
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("destructuring_let.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(500));
+}

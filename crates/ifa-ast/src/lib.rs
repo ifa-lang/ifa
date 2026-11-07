@@ -185,7 +185,7 @@ pub struct Block {
 pub enum Stmt {
     Let {
         is_mut: bool,
-        name: Symbol,
+        pattern: Pattern,
         ty: Option<Type>,
         init: Option<Expr>,
         span: Span,
@@ -230,6 +230,19 @@ impl Stmt {
             Stmt::Loop(_, span) => *span,
             Stmt::Break(span) => *span,
             Stmt::Continue(span) => *span,
+        }
+    }
+
+    /// If this statement is a simple identifier `let` declaration, return the bound symbol.
+    pub fn let_name(&self) -> Option<Symbol> {
+        if let Stmt::Let {
+            pattern: Pattern::Ident(sym, _),
+            ..
+        } = self
+        {
+            Some(*sym)
+        } else {
+            None
         }
     }
 }
@@ -361,6 +374,52 @@ impl Pattern {
             Pattern::Or(_, sp) => *sp,
             Pattern::Range { span, .. } => *span,
             Pattern::Slice { span, .. } => *span,
+        }
+    }
+
+    /// Extract all variable symbols bound by this pattern with their respective spans.
+    pub fn bound_variables(&self) -> Vec<(Symbol, Span)> {
+        let mut vars = Vec::new();
+        self.collect_bound_variables(&mut vars);
+        vars
+    }
+
+    fn collect_bound_variables(&self, vars: &mut Vec<(Symbol, Span)>) {
+        match self {
+            Pattern::Ident(sym, span) => vars.push((*sym, *span)),
+            Pattern::Tuple(elems, _) | Pattern::Or(elems, _) => {
+                for e in elems {
+                    e.collect_bound_variables(vars);
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                for f in fields {
+                    f.pattern.collect_bound_variables(vars);
+                }
+            }
+            Pattern::Slice {
+                prefix,
+                rest,
+                suffix,
+                ..
+            } => {
+                for p in prefix {
+                    p.collect_bound_variables(vars);
+                }
+                if let Some(Some(r)) = rest {
+                    r.collect_bound_variables(vars);
+                }
+                for s in suffix {
+                    s.collect_bound_variables(vars);
+                }
+            }
+            Pattern::Variant { inner: Some(p), .. } => {
+                p.collect_bound_variables(vars);
+            }
+            Pattern::Variant { inner: None, .. }
+            | Pattern::Wildcard(_)
+            | Pattern::Lit(_, _)
+            | Pattern::Range { .. } => {}
         }
     }
 }

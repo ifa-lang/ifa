@@ -1961,3 +1961,172 @@ fn test_slice_pattern_non_indexable_rejected() {
         .iter()
         .any(|d| d.code.as_deref() == Some("E0036")));
 }
+
+#[test]
+fn test_destructuring_let_tuple_valid() {
+    let code = r#"
+        fn test_tuple() -> i64 {
+            let (a, b) = (10, 20);
+            return a + b;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Valid tuple destructuring in let must succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_destructuring_mut_tuple_and_immutability() {
+    let code_mut = r#"
+        fn test_mut() -> i64 {
+            mut (a, b) = (10, 20);
+            a += 5;
+            b += 10;
+            return a + b;
+        }
+    "#;
+    let res_mut = run_analysis(code_mut);
+    assert!(
+        !res_mut.has_errors(),
+        "Mut tuple destructuring allows reassignment: {:?}",
+        res_mut.diagnostics
+    );
+
+    let code_immutable = r#"
+        fn test_immut() -> i64 {
+            let (a, b) = (10, 20);
+            a = 99;
+            return a + b;
+        }
+    "#;
+    let res_immut = run_analysis(code_immutable);
+    assert!(
+        res_immut.has_errors(),
+        "Immutable tuple let must reject reassignment"
+    );
+}
+
+#[test]
+fn test_destructuring_let_struct_valid() {
+    let code = r#"
+        struct Vector2 {
+            x: i64,
+            y: i64,
+        }
+
+        fn get_sum(v: Vector2) -> i64 {
+            let Vector2 { x, y } = v;
+            return x + y;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Valid struct destructuring in let must succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_destructuring_let_slice_array_valid() {
+    let code = r#"
+        fn first_and_tail(arr: [i64; 4]) -> i64 {
+            let [first, ..rest] = arr;
+            return first;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Valid array slice destructuring in let must succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_destructuring_let_refutable_rejected() {
+    let code_variant = r#"
+        enum Status {
+            Active(i64),
+            Inactive,
+        }
+
+        fn test_refutable(s: Status) -> i64 {
+            let Status::Active(val) = s;
+            return val;
+        }
+    "#;
+    let res_variant = run_analysis(code_variant);
+    assert!(
+        res_variant.has_errors(),
+        "Refutable enum variant pattern in let must be rejected"
+    );
+    assert!(
+        res_variant
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0047")),
+        "Expected E0047 for refutable pattern in let"
+    );
+
+    let code_lit = r#"
+        fn test_lit(x: i64) -> i64 {
+            let 42 = x;
+            return x;
+        }
+    "#;
+    let res_lit = run_analysis(code_lit);
+    assert!(
+        res_lit.has_errors(),
+        "Literal pattern in let must be rejected with E0047"
+    );
+    assert!(
+        res_lit
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0047")),
+        "Expected E0047 for literal pattern in let"
+    );
+
+    let code_dynamic_slice = r#"
+        fn test_dyn_slice(s: [i64]) -> i64 {
+            let [a, b] = s;
+            return a + b;
+        }
+    "#;
+    let res_dyn = run_analysis(code_dynamic_slice);
+    assert!(
+        res_dyn.has_errors(),
+        "Dynamic slice pattern without catch-all in let must be rejected with E0047"
+    );
+    assert!(
+        res_dyn
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0047")),
+        "Expected E0047 for dynamic slice pattern in let"
+    );
+}
+
+#[test]
+fn test_destructuring_let_without_init_rejected() {
+    let code = r#"
+        fn test_no_init() {
+            let (a, b);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Destructuring let without init must be rejected with E0047"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0047")),
+        "Expected E0047 for destructuring let without initializer"
+    );
+}
