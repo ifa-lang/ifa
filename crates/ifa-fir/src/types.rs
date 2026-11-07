@@ -1,5 +1,5 @@
 use ifa_sema::types::{FloatType, IntType, Type as SemaType};
-use ifa_span::Symbol;
+use ifa_span::{Symbol, INTERNER};
 use std::fmt;
 
 /// Intermediate representation types for FIR SSA.
@@ -84,7 +84,15 @@ impl FirType {
                 let tuple_sym = ifa_span::INTERNER.intern("Tuple");
                 FirType::Struct(tuple_sym, fir_fields)
             }
-            SemaType::Generic { name, args: _ } => FirType::Struct(*name, Vec::new()),
+            SemaType::Generic { name, args } => {
+                if args.is_empty() {
+                    FirType::Struct(*name, Vec::new())
+                } else {
+                    let mangled_sym =
+                        mangle_instantiation_symbol(&ifa_span::INTERNER.resolve(name), args);
+                    FirType::Struct(mangled_sym, Vec::new())
+                }
+            }
             SemaType::TypeParam(_) => FirType::Int(IntType::I64),
             SemaType::IntegerLiteral(_) => FirType::Int(IntType::I64),
             SemaType::FloatLiteral => FirType::Float(FloatType::F64),
@@ -136,4 +144,56 @@ impl fmt::Display for FirType {
             }
         }
     }
+}
+
+/// Mangles a semantic type into a deterministic, valid identifier token for monomorphization.
+pub fn mangle_sema_type(ty: &SemaType) -> String {
+    match ty {
+        SemaType::Unit => "unit".to_string(),
+        SemaType::Bool => "bool".to_string(),
+        SemaType::Int(int_ty) => match int_ty {
+            IntType::I8 => "i8".to_string(),
+            IntType::I16 => "i16".to_string(),
+            IntType::I32 => "i32".to_string(),
+            IntType::I64 => "i64".to_string(),
+            IntType::U8 => "u8".to_string(),
+            IntType::U16 => "u16".to_string(),
+            IntType::U32 => "u32".to_string(),
+            IntType::U64 => "u64".to_string(),
+            IntType::ISize => "isize".to_string(),
+            IntType::USize => "usize".to_string(),
+        },
+        SemaType::Float(float_ty) => match float_ty {
+            FloatType::F32 => "f32".to_string(),
+            FloatType::F64 => "f64".to_string(),
+        },
+        SemaType::Char => "char".to_string(),
+        SemaType::Str => "str".to_string(),
+        SemaType::String => "string".to_string(),
+        SemaType::Ref(inner) => format!("ref_{}", mangle_sema_type(inner)),
+        SemaType::Array(inner, n) => format!("arr{}_{}", n, mangle_sema_type(inner)),
+        SemaType::Slice(inner) => format!("slice_{}", mangle_sema_type(inner)),
+        SemaType::Optional(inner) => format!("opt_{}", mangle_sema_type(inner)),
+        SemaType::ErrorUnion { err, ok } => {
+            format!("err_{}_{}", mangle_sema_type(err), mangle_sema_type(ok))
+        }
+        SemaType::Struct { name, .. } | SemaType::Enum { name, .. } => INTERNER.resolve(name),
+        SemaType::Generic { name, args } => {
+            let base = INTERNER.resolve(name);
+            let args_str: Vec<String> = args.iter().map(mangle_sema_type).collect();
+            format!("{}_{}", base, args_str.join("_"))
+        }
+        SemaType::TypeParam(sym) => INTERNER.resolve(sym),
+        _ => "val".to_string(),
+    }
+}
+
+/// Computes the specialized symbol name for a monomorphized function or struct.
+pub fn mangle_instantiation_symbol(base: &str, type_args: &[SemaType]) -> Symbol {
+    if type_args.is_empty() {
+        return INTERNER.intern(base);
+    }
+    let mangled_args: Vec<String> = type_args.iter().map(mangle_sema_type).collect();
+    let full = format!("{}__{}", base, mangled_args.join("_"));
+    INTERNER.intern(&full)
 }

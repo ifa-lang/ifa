@@ -142,6 +142,10 @@ pub struct SymbolTable {
     pub consts: HashMap<Symbol, ConstSymbol>,
     pub traits: HashMap<Symbol, TraitSymbol>,
     pub trait_impls: HashMap<Symbol, Vec<Type>>,
+    pub expr_types: HashMap<Span, Type>,
+    pub generic_function_instances: HashMap<Symbol, Vec<Vec<Type>>>,
+    pub generic_struct_instances: HashMap<Symbol, Vec<Vec<Type>>>,
+    pub call_instantiations: HashMap<Span, Vec<Type>>,
     next_var_id: u32,
 }
 
@@ -155,10 +159,64 @@ impl SymbolTable {
             consts: HashMap::new(),
             traits: HashMap::new(),
             trait_impls: HashMap::new(),
+            expr_types: HashMap::new(),
+            generic_function_instances: HashMap::new(),
+            generic_struct_instances: HashMap::new(),
+            call_instantiations: HashMap::new(),
             next_var_id: 1,
         };
         table.init_builtins();
         table
+    }
+
+    /// Records a concrete generic function instantiation for monomorphization.
+    pub fn record_generic_function_instance(&mut self, name: Symbol, type_args: Vec<Type>) {
+        let instances = self.generic_function_instances.entry(name).or_default();
+        if !instances.iter().any(|existing| existing == &type_args) {
+            instances.push(type_args);
+        }
+    }
+
+    /// Records a concrete generic struct instantiation for monomorphization.
+    pub fn record_generic_struct_instance(&mut self, name: Symbol, type_args: Vec<Type>) {
+        let instances = self.generic_struct_instances.entry(name).or_default();
+        if !instances.iter().any(|existing| existing == &type_args) {
+            instances.push(type_args);
+        }
+    }
+
+    /// Traverses a semantic type and records any concrete generic struct instantiations.
+    pub fn register_type_if_generic_instance(&mut self, ty: &Type) {
+        match ty {
+            Type::Generic { name, args } => {
+                if !args.is_empty()
+                    && args
+                        .iter()
+                        .all(|a| !matches!(a, Type::Unknown | Type::TypeParam(_)))
+                {
+                    self.record_generic_struct_instance(*name, args.clone());
+                }
+                for a in args {
+                    self.register_type_if_generic_instance(a);
+                }
+            }
+            Type::Ref(inner)
+            | Type::Array(inner, _)
+            | Type::Slice(inner)
+            | Type::Optional(inner) => {
+                self.register_type_if_generic_instance(inner);
+            }
+            Type::ErrorUnion { err, ok } => {
+                self.register_type_if_generic_instance(err);
+                self.register_type_if_generic_instance(ok);
+            }
+            Type::Tuple(elems) => {
+                for e in elems {
+                    self.register_type_if_generic_instance(e);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn init_builtins(&mut self) {

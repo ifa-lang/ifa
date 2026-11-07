@@ -24,6 +24,8 @@ struct FunctionLoweringContext<'a> {
     symbols: &'a SymbolTable,
     constants: &'a HashMap<Symbol, &'a Expr>,
     loop_stack: Vec<LoopContext>,
+    type_subst: HashMap<Symbol, ifa_sema::types::Type>,
+    module_structs: &'a [FirStruct],
 }
 
 impl<'a> FunctionLoweringContext<'a> {
@@ -31,13 +33,17 @@ impl<'a> FunctionLoweringContext<'a> {
         func_ast: &ifa_ast::Function,
         symbols: &'a SymbolTable,
         constants: &'a HashMap<Symbol, &'a Expr>,
+        func_name_override: Option<Symbol>,
+        type_subst: HashMap<Symbol, ifa_sema::types::Type>,
+        module_structs: &'a [FirStruct],
     ) -> Self {
         let ret_ty = func_ast
             .ret_ty
             .as_ref()
             .map(|_t| {
                 if let Some(sema_ty) = symbols.lookup_function(&func_ast.name) {
-                    FirType::from_sema_type(&sema_ty.ret_ty)
+                    let substituted = sema_ty.ret_ty.substitute(&type_subst);
+                    FirType::from_sema_type(&substituted)
                 } else {
                     FirType::Unit
                 }
@@ -55,7 +61,10 @@ impl<'a> FunctionLoweringContext<'a> {
                     .params
                     .iter()
                     .find(|ps| ps.name == p.name)
-                    .map(|ps| FirType::from_sema_type(&ps.ty))
+                    .map(|ps| {
+                        let substituted = ps.ty.substitute(&type_subst);
+                        FirType::from_sema_type(&substituted)
+                    })
                     .unwrap_or(FirType::Unit)
             } else {
                 FirType::Unit
@@ -68,8 +77,10 @@ impl<'a> FunctionLoweringContext<'a> {
             });
         }
 
+        let name = func_name_override.unwrap_or(func_ast.name);
+
         let mut func = FirFunction::new(
-            func_ast.name,
+            name,
             params,
             ret_ty,
             func_ast.is_strict,
@@ -90,6 +101,8 @@ impl<'a> FunctionLoweringContext<'a> {
             symbols,
             constants,
             loop_stack: Vec::new(),
+            type_subst,
+            module_structs,
         }
     }
 
@@ -122,6 +135,8 @@ impl<'a> FunctionLoweringContext<'a> {
             FirType::Struct(name, fields) => {
                 if let Some(pos) = fields.iter().position(|(f_name, _)| *f_name == field) {
                     Some(pos)
+                } else if let Some(st) = self.module_structs.iter().find(|s| s.name == *name) {
+                    st.fields.iter().position(|(f_name, _)| *f_name == field)
                 } else if let Some(st) = self.symbols.lookup_struct(name) {
                     st.field_indices.get(&field).copied()
                 } else {
@@ -136,13 +151,21 @@ impl<'a> FunctionLoweringContext<'a> {
     }
 
     fn infer_expr_fir_type(&self, expr: &Expr) -> Option<FirType> {
+        if let Some(sema_ty) = self.symbols.expr_types.get(&expr.span) {
+            let substituted = sema_ty.substitute(&self.type_subst);
+            if !matches!(substituted, ifa_sema::types::Type::Unknown) {
+                return Some(FirType::from_sema_type(&substituted));
+            }
+        }
+
         match &expr.kind {
             ExprKind::Ident(sym) => {
                 if let Some(ty) = self.var_types.get(sym) {
                     return Some(ty.clone());
                 }
                 if let Some(var) = self.symbols.lookup_variable(sym) {
-                    return Some(FirType::from_sema_type(&var.ty));
+                    let substituted = var.ty.substitute(&self.type_subst);
+                    return Some(FirType::from_sema_type(&substituted));
                 }
                 None
             }
@@ -252,13 +275,20 @@ impl<'a> FunctionLoweringContext<'a> {
                 }
             }
             if let Some(var_sym) = self.symbols.lookup_variable(rec_sym) {
-                let fir_ty = FirType::from_sema_type(&var_sym.ty);
+                let substituted = var_sym.ty.substitute(&self.type_subst);
+                let fir_ty = FirType::from_sema_type(&substituted);
                 if let Some(idx) = self.extract_field_index_from_fir_type(&fir_ty, field) {
                     return idx;
                 }
             }
         }
-        // 3. Fallback: Lookup in struct definitions in symbol table
+        // 3. Fallback: Lookup in module structs
+        for st in self.module_structs {
+            if let Some(pos) = st.fields.iter().position(|(f_name, _)| *f_name == field) {
+                return pos;
+            }
+        }
+        // 4. Fallback: Lookup in struct definitions in symbol table
         for st in self.symbols.structs.values() {
             if let Some(&idx) = st.field_indices.get(&field) {
                 return idx;
@@ -332,14 +362,16 @@ impl<'a> FunctionLoweringContext<'a> {
                     if let Some(inferred) = self.infer_expr_fir_type(init_expr) {
                         inferred
                     } else if let Some(var_sym) = self.symbols.lookup_variable(name) {
-                        FirType::from_sema_type(&var_sym.ty)
+                        let substituted = var_sym.ty.substitute(&self.type_subst);
+                        FirType::from_sema_type(&substituted)
                     } else {
                         init_val
                             .map(|_| FirType::Int(IntType::I64))
                             .unwrap_or(FirType::Unit)
                     }
                 } else if let Some(var_sym) = self.symbols.lookup_variable(name) {
-                    FirType::from_sema_type(&var_sym.ty)
+                    let substituted = var_sym.ty.substitute(&self.type_subst);
+                    FirType::from_sema_type(&substituted)
                 } else {
                     FirType::Unit
                 };
@@ -694,6 +726,23 @@ impl<'a> FunctionLoweringContext<'a> {
                 // Check if calling a Struct constructor directly (e.g. WindowNode(id: ..., parent: ...))
                 if let Some(struct_name) = direct_name {
                     if let Some(st) = self.symbols.lookup_struct(&struct_name) {
+                        let target_struct_name = if !st.generics.is_empty() {
+                            if let Some(call_args) = self.symbols.call_instantiations.get(&span) {
+                                let concrete_args: Vec<_> = call_args
+                                    .iter()
+                                    .map(|t| t.substitute(&self.type_subst))
+                                    .collect();
+                                crate::types::mangle_instantiation_symbol(
+                                    &INTERNER.resolve(&struct_name),
+                                    &concrete_args,
+                                )
+                            } else {
+                                struct_name
+                            }
+                        } else {
+                            struct_name
+                        };
+
                         let mut ordered_fields = Vec::new();
                         for field_sym in &st.fields {
                             if let Some(arg) = args.iter().find(|a| a.name == Some(field_sym.name))
@@ -725,7 +774,7 @@ impl<'a> FunctionLoweringContext<'a> {
                         self.emit(
                             Some(res),
                             ValueExpr::StructInit {
-                                name: struct_name,
+                                name: target_struct_name,
                                 fields: ordered_fields,
                             },
                             span,
@@ -740,11 +789,34 @@ impl<'a> FunctionLoweringContext<'a> {
                 }
 
                 if let Some(fn_name) = direct_name {
+                    let target_fn_name = if let Some(fn_sym) =
+                        self.symbols.lookup_function(&fn_name)
+                    {
+                        if !fn_sym.generics.is_empty() {
+                            if let Some(call_args) = self.symbols.call_instantiations.get(&span) {
+                                let concrete_args: Vec<_> = call_args
+                                    .iter()
+                                    .map(|t| t.substitute(&self.type_subst))
+                                    .collect();
+                                crate::types::mangle_instantiation_symbol(
+                                    &INTERNER.resolve(&fn_name),
+                                    &concrete_args,
+                                )
+                            } else {
+                                fn_name
+                            }
+                        } else {
+                            fn_name
+                        }
+                    } else {
+                        fn_name
+                    };
+
                     let res = self.alloc_value();
                     self.emit(
                         Some(res),
                         ValueExpr::CallDirect {
-                            name: fn_name,
+                            name: target_fn_name,
                             args: arg_vals,
                         },
                         span,
@@ -837,11 +909,33 @@ impl<'a> FunctionLoweringContext<'a> {
                     for a in args {
                         arg_vals.push(self.lower_expr(&a.value));
                     }
+                    let target_fn_name = if let Some(fn_sym) = self.symbols.lookup_function(method)
+                    {
+                        if !fn_sym.generics.is_empty() {
+                            if let Some(call_args) = self.symbols.call_instantiations.get(&span) {
+                                let concrete_args: Vec<_> = call_args
+                                    .iter()
+                                    .map(|t| t.substitute(&self.type_subst))
+                                    .collect();
+                                crate::types::mangle_instantiation_symbol(
+                                    &INTERNER.resolve(method),
+                                    &concrete_args,
+                                )
+                            } else {
+                                *method
+                            }
+                        } else {
+                            *method
+                        }
+                    } else {
+                        *method
+                    };
+
                     let res = self.alloc_value();
                     self.emit(
                         Some(res),
                         ValueExpr::CallDirect {
-                            name: *method,
+                            name: target_fn_name,
                             args: arg_vals,
                         },
                         span,
@@ -1011,11 +1105,32 @@ impl<'a> FunctionLoweringContext<'a> {
                     .last()
                     .copied()
                     .unwrap_or_else(|| INTERNER.intern("Struct"));
+                let target_struct_name = if let Some(st) = self.symbols.lookup_struct(&sym_name) {
+                    if !st.generics.is_empty() {
+                        if let Some(call_args) = self.symbols.call_instantiations.get(&span) {
+                            let concrete_args: Vec<_> = call_args
+                                .iter()
+                                .map(|t| t.substitute(&self.type_subst))
+                                .collect();
+                            crate::types::mangle_instantiation_symbol(
+                                &INTERNER.resolve(&sym_name),
+                                &concrete_args,
+                            )
+                        } else {
+                            sym_name
+                        }
+                    } else {
+                        sym_name
+                    }
+                } else {
+                    sym_name
+                };
+
                 let res = self.alloc_value();
                 self.emit(
                     Some(res),
                     ValueExpr::StructInit {
-                        name: sym_name,
+                        name: target_struct_name,
                         fields: field_vals,
                     },
                     span,
@@ -1102,16 +1217,23 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
         }
     }
 
+    // 1. Lower all enums
     for item in &program.items {
-        match item {
-            Item::Function(func_ast) => {
-                if let Some(body) = &func_ast.body {
-                    let ctx = FunctionLoweringContext::new(func_ast, symbols, &constants);
-                    let fir_func = ctx.lower(body);
-                    module.functions.push(fir_func);
-                }
-            }
-            Item::Struct(s_ast) => {
+        if let Item::Enum(e_ast) = item {
+            let variants = e_ast.variants.iter().map(|v| (v.name, None)).collect();
+            module.enums.push(FirEnum {
+                name: e_ast.name,
+                variants,
+                is_pub: e_ast.is_pub,
+                span: e_ast.span,
+            });
+        }
+    }
+
+    // 2. Lower non-generic structs and monomorphize generic structs
+    for item in &program.items {
+        if let Item::Struct(s_ast) = item {
+            if s_ast.generics.is_empty() {
                 let struct_sym = symbols.lookup_struct(&s_ast.name);
                 let fields = if let Some(st) = struct_sym {
                     st.fields
@@ -1131,26 +1253,110 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
                     is_pub: s_ast.is_pub,
                     span: s_ast.span,
                 });
+            } else if let Some(instances) = symbols.generic_struct_instances.get(&s_ast.name) {
+                for type_args in instances {
+                    let mut type_subst = HashMap::new();
+                    for (g, concrete) in s_ast.generics.iter().zip(type_args.iter()) {
+                        type_subst.insert(g.name, concrete.clone());
+                    }
+                    let mangled_name = crate::types::mangle_instantiation_symbol(
+                        &INTERNER.resolve(&s_ast.name),
+                        type_args,
+                    );
+                    let struct_sym = symbols.lookup_struct(&s_ast.name);
+                    let fields = if let Some(st) = struct_sym {
+                        st.fields
+                            .iter()
+                            .map(|f| {
+                                let sub = f.ty.substitute(&type_subst);
+                                (f.name, FirType::from_sema_type(&sub))
+                            })
+                            .collect()
+                    } else {
+                        s_ast
+                            .fields
+                            .iter()
+                            .map(|f| (f.name, FirType::Int(IntType::I64)))
+                            .collect()
+                    };
+                    module.structs.push(FirStruct {
+                        name: mangled_name,
+                        fields,
+                        is_pub: s_ast.is_pub,
+                        span: s_ast.span,
+                    });
+                }
             }
-            Item::Enum(e_ast) => {
-                let variants = e_ast.variants.iter().map(|v| (v.name, None)).collect();
-                module.enums.push(FirEnum {
-                    name: e_ast.name,
-                    variants,
-                    is_pub: e_ast.is_pub,
-                    span: e_ast.span,
-                });
+        }
+    }
+
+    // 3. Collect all functions (free functions and methods in impl blocks)
+    let mut all_functions: HashMap<Symbol, &ifa_ast::Function> = HashMap::new();
+    for item in &program.items {
+        match item {
+            Item::Function(f) => {
+                all_functions.insert(f.name, f);
             }
             Item::Impl(im) => {
-                for func_ast in &im.methods {
-                    if let Some(body) = &func_ast.body {
-                        let ctx = FunctionLoweringContext::new(func_ast, symbols, &constants);
-                        let fir_func = ctx.lower(body);
-                        module.functions.push(fir_func);
-                    }
+                for f in &im.methods {
+                    all_functions.insert(f.name, f);
                 }
             }
             _ => {}
+        }
+    }
+
+    // 4. Lower non-generic functions
+    for func_ast in all_functions.values() {
+        if func_ast.generics.is_empty() {
+            if let Some(body) = &func_ast.body {
+                let ctx = FunctionLoweringContext::new(
+                    func_ast,
+                    symbols,
+                    &constants,
+                    None,
+                    HashMap::new(),
+                    &module.structs,
+                );
+                let fir_func = ctx.lower(body);
+                module.functions.push(fir_func);
+            }
+        }
+    }
+
+    // 5. Monomorphize all generic function instances
+    let mut worklist: Vec<(Symbol, Vec<ifa_sema::types::Type>)> = Vec::new();
+    for (fn_name, instances) in &symbols.generic_function_instances {
+        for type_args in instances {
+            worklist.push((*fn_name, type_args.clone()));
+        }
+    }
+
+    let mut generated_instances = std::collections::HashSet::new();
+    while let Some((orig_name, type_args)) = worklist.pop() {
+        let mangled_name =
+            crate::types::mangle_instantiation_symbol(&INTERNER.resolve(&orig_name), &type_args);
+        if !generated_instances.insert(mangled_name) {
+            continue;
+        }
+
+        if let Some(func_ast) = all_functions.get(&orig_name) {
+            if let Some(body) = &func_ast.body {
+                let mut type_subst = HashMap::new();
+                for (g, concrete) in func_ast.generics.iter().zip(type_args.iter()) {
+                    type_subst.insert(g.name, concrete.clone());
+                }
+                let ctx = FunctionLoweringContext::new(
+                    func_ast,
+                    symbols,
+                    &constants,
+                    Some(mangled_name),
+                    type_subst,
+                    &module.structs,
+                );
+                let fir_func = ctx.lower(body);
+                module.functions.push(fir_func);
+            }
         }
     }
 

@@ -19,7 +19,7 @@ pub use ir::*;
 pub use lower::lower_program;
 pub use printer::{format_function, format_module, FirPrinter};
 pub use sroa::{SroaPass, SroaStats};
-pub use types::FirType;
+pub use types::{mangle_instantiation_symbol, mangle_sema_type, FirType};
 pub use verify::{FirVerifier, FirVerifyError};
 
 use ifa_ast::Program;

@@ -1,6 +1,6 @@
 use crate::error::CodegenError;
 use crate::types::fir_type_to_cranelift;
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     types, Block as ClBlock, BlockArg, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind,
     TrapCode, Value as ClValue,
@@ -200,40 +200,64 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let mut r = self.value_map[rhs];
                 let ty_l = self.builder.func.dfg.value_type(l);
                 let ty_r = self.builder.func.dfg.value_type(r);
-                if ty_l != ty_r {
-                    if ty_l.bits() > ty_r.bits() {
-                        r = self.builder.ins().sextend(ty_l, r);
-                    } else {
-                        l = self.builder.ins().sextend(ty_r, l);
+                if ty_l == types::F32 || ty_l == types::F64 {
+                    Some(match op {
+                        BinaryOp::Add => self.builder.ins().fadd(l, r),
+                        BinaryOp::Sub => self.builder.ins().fsub(l, r),
+                        BinaryOp::Mul => self.builder.ins().fmul(l, r),
+                        BinaryOp::Div => self.builder.ins().fdiv(l, r),
+                        BinaryOp::Eq => self.builder.ins().fcmp(FloatCC::Equal, l, r),
+                        BinaryOp::Ne => self.builder.ins().fcmp(FloatCC::NotEqual, l, r),
+                        BinaryOp::Lt => self.builder.ins().fcmp(FloatCC::LessThan, l, r),
+                        BinaryOp::Le => self.builder.ins().fcmp(FloatCC::LessThanOrEqual, l, r),
+                        BinaryOp::Gt => self.builder.ins().fcmp(FloatCC::GreaterThan, l, r),
+                        BinaryOp::Ge => self.builder.ins().fcmp(FloatCC::GreaterThanOrEqual, l, r),
+                        _ => self.builder.ins().fadd(l, r),
+                    })
+                } else {
+                    if ty_l != ty_r {
+                        if ty_l.bits() > ty_r.bits() {
+                            r = self.builder.ins().sextend(ty_l, r);
+                        } else {
+                            l = self.builder.ins().sextend(ty_r, l);
+                        }
                     }
+                    Some(match op {
+                        BinaryOp::Add => self.builder.ins().iadd(l, r),
+                        BinaryOp::Sub => self.builder.ins().isub(l, r),
+                        BinaryOp::Mul => self.builder.ins().imul(l, r),
+                        BinaryOp::Div => self.builder.ins().sdiv(l, r),
+                        BinaryOp::Rem => self.builder.ins().srem(l, r),
+                        BinaryOp::BitAnd | BinaryOp::And => self.builder.ins().band(l, r),
+                        BinaryOp::BitOr | BinaryOp::Or => self.builder.ins().bor(l, r),
+                        BinaryOp::BitXor => self.builder.ins().bxor(l, r),
+                        BinaryOp::Shl => self.builder.ins().ishl(l, r),
+                        BinaryOp::Shr => self.builder.ins().sshr(l, r),
+                        BinaryOp::Eq => self.builder.ins().icmp(IntCC::Equal, l, r),
+                        BinaryOp::Ne => self.builder.ins().icmp(IntCC::NotEqual, l, r),
+                        BinaryOp::Lt => self.builder.ins().icmp(IntCC::SignedLessThan, l, r),
+                        BinaryOp::Le => self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, l, r),
+                        BinaryOp::Gt => self.builder.ins().icmp(IntCC::SignedGreaterThan, l, r),
+                        BinaryOp::Ge => {
+                            self.builder
+                                .ins()
+                                .icmp(IntCC::SignedGreaterThanOrEqual, l, r)
+                        }
+                    })
                 }
-                Some(match op {
-                    BinaryOp::Add => self.builder.ins().iadd(l, r),
-                    BinaryOp::Sub => self.builder.ins().isub(l, r),
-                    BinaryOp::Mul => self.builder.ins().imul(l, r),
-                    BinaryOp::Div => self.builder.ins().sdiv(l, r),
-                    BinaryOp::Rem => self.builder.ins().srem(l, r),
-                    BinaryOp::BitAnd | BinaryOp::And => self.builder.ins().band(l, r),
-                    BinaryOp::BitOr | BinaryOp::Or => self.builder.ins().bor(l, r),
-                    BinaryOp::BitXor => self.builder.ins().bxor(l, r),
-                    BinaryOp::Shl => self.builder.ins().ishl(l, r),
-                    BinaryOp::Shr => self.builder.ins().sshr(l, r),
-                    BinaryOp::Eq => self.builder.ins().icmp(IntCC::Equal, l, r),
-                    BinaryOp::Ne => self.builder.ins().icmp(IntCC::NotEqual, l, r),
-                    BinaryOp::Lt => self.builder.ins().icmp(IntCC::SignedLessThan, l, r),
-                    BinaryOp::Le => self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, l, r),
-                    BinaryOp::Gt => self.builder.ins().icmp(IntCC::SignedGreaterThan, l, r),
-                    BinaryOp::Ge => self
-                        .builder
-                        .ins()
-                        .icmp(IntCC::SignedGreaterThanOrEqual, l, r),
-                })
             }
 
             ValueExpr::Unary { op, val } => {
                 let v = self.value_map[val];
+                let ty_v = self.builder.func.dfg.value_type(v);
                 Some(match op {
-                    UnaryOp::Neg => self.builder.ins().ineg(v),
+                    UnaryOp::Neg => {
+                        if ty_v == types::F32 || ty_v == types::F64 {
+                            self.builder.ins().fneg(v)
+                        } else {
+                            self.builder.ins().ineg(v)
+                        }
+                    }
                     UnaryOp::Not => self.builder.ins().bnot(v),
                 })
             }

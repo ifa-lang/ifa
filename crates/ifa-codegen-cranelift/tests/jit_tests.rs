@@ -251,3 +251,42 @@ fn test_cranelift_generational_native_execution() {
     let result = jit.run_main().expect("Failed to execute native main");
     assert_eq!(result, 99);
 }
+
+#[test]
+fn test_cranelift_jit_monomorphized_generic_functions() {
+    let src = r#"
+        fn identity<T>(x: T) -> T {
+            return x;
+        }
+
+        fn add_vals<T>(a: T, b: T) -> T {
+            return a + b;
+        }
+
+        pub fn main() -> i64 {
+            let a = identity(100);
+            let b = identity(23);
+            let sum = add_vals(a, b);
+            return sum;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("jit_generic.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, _) = ifa_parser::parse(fid, tokens);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile monomorphized generic functions to Cranelift machine code");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 123);
+}

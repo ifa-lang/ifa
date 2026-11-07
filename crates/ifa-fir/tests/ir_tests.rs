@@ -331,3 +331,76 @@ fn test_cyclic_graph_references_and_safety() {
     assert!(res.is_ok());
     assert_eq!(interp.captured_output[0], "Cycle completed successfully");
 }
+
+#[test]
+fn test_generic_function_monomorphization_execution() {
+    let src = r#"
+        struct Box<T> {
+            val: T,
+        }
+
+        fn unbox<T>(b: Box<T>) -> T {
+            return b.val;
+        }
+
+        pub fn main() -> i64 {
+            let b1 = Box(val: 42);
+            let v1: i64 = unbox(b1);
+            let v2: i64 = b1.unbox();
+            return v1 + v2;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("generic_unbox.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse diags: {:?}", diags);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema diagnostics: {:?}",
+        analysis.diagnostics
+    );
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let formatted = format_module(&module);
+    assert!(formatted.contains("fir.func @unbox__i64"));
+    assert!(formatted.contains("struct @Box__i64"));
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(84));
+}
+
+#[test]
+fn test_generic_multi_param_swap_monomorphization() {
+    let src = r#"
+        struct Pair<T, U> {
+            first: T,
+            second: U,
+        }
+
+        fn swap<T, U>(p: Pair<T, U>) -> Pair<U, T> {
+            return Pair(first: p.second, second: p.first);
+        }
+
+        pub fn main() -> i64 {
+            let p = Pair(first: 10, second: 20);
+            let swapped = p.swap();
+            return swapped.first + swapped.second;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("generic_swap.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, _) = ifa_parser::parse(fid, tokens);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(30));
+}

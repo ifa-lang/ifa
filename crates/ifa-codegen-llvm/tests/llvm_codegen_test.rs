@@ -174,3 +174,41 @@ pub fn main() -> () {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_codegen_monomorphized_generic_functions() {
+    let src = r#"
+        struct Box<T> {
+            val: T,
+        }
+
+        fn unbox<T>(b: Box<T>) -> T {
+            return b.val;
+        }
+
+        pub fn main() -> i64 {
+            let b = Box(val: 42);
+            let v = unbox(b);
+            return v;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_generic.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let llvm_ir = emitter.emit_module(&fir_module).unwrap();
+
+    assert!(llvm_ir.contains("%struct.Box__i64 = type { i64 }"));
+    assert!(llvm_ir.contains("@unbox__i64"));
+    assert!(llvm_ir.contains("call i64 @unbox__i64"));
+}

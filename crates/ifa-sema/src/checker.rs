@@ -50,6 +50,8 @@ impl<'a> SemanticAnalyzer<'a> {
         // Phase 3: Check bodies and expressions
         self.check_program_bodies(program);
 
+        self.symbols.expr_types = self.expr_types;
+
         (self.symbols, self.diagnostics)
     }
 
@@ -92,6 +94,12 @@ impl<'a> SemanticAnalyzer<'a> {
                 ty,
                 span: f.span,
             });
+        }
+
+        if st.generics.is_empty() {
+            for f in &fields {
+                self.symbols.register_type_if_generic_instance(&f.ty);
+            }
         }
 
         let struct_sym =
@@ -260,6 +268,13 @@ impl<'a> SemanticAnalyzer<'a> {
                         Type::Unit
                     };
 
+                    if f.generics.is_empty() {
+                        for p in &params {
+                            self.symbols.register_type_if_generic_instance(&p.ty);
+                        }
+                        self.symbols.register_type_if_generic_instance(&ret_ty);
+                    }
+
                     let fn_sym = FunctionSymbol {
                         name: f.name,
                         is_pub: f.is_pub,
@@ -352,6 +367,13 @@ impl<'a> SemanticAnalyzer<'a> {
             } else {
                 Type::Unit
             };
+
+            if f.generics.is_empty() {
+                for p in &params {
+                    self.symbols.register_type_if_generic_instance(&p.ty);
+                }
+                self.symbols.register_type_if_generic_instance(&ret_ty);
+            }
 
             let fn_sym = FunctionSymbol {
                 name: f.name,
@@ -551,6 +573,8 @@ impl<'a> SemanticAnalyzer<'a> {
                 } else {
                     declared_ty.unwrap_or(Type::Unknown)
                 };
+
+                self.symbols.register_type_if_generic_instance(&actual_ty);
 
                 if let Err(diag) = self.symbols.define_variable(
                     *name,
@@ -1169,6 +1193,20 @@ impl<'a> SemanticAnalyzer<'a> {
                                         .unwrap_or(Type::Unknown)
                                 })
                                 .collect();
+                            if concrete_args.iter().all(|t| !matches!(t, Type::Unknown)) {
+                                self.symbols
+                                    .call_instantiations
+                                    .insert(expr.span, concrete_args.clone());
+                                if concrete_args
+                                    .iter()
+                                    .all(|t| !matches!(t, Type::TypeParam(_)))
+                                {
+                                    self.symbols.record_generic_struct_instance(
+                                        *struct_name,
+                                        concrete_args.clone(),
+                                    );
+                                }
+                            }
                             Type::Generic {
                                 name: *struct_name,
                                 args: concrete_args,
@@ -1268,6 +1306,8 @@ impl<'a> SemanticAnalyzer<'a> {
                     && matches!(r_ty, Type::String | Type::Str)
                 {
                     Type::String
+                } else if matches!(l_ty, Type::TypeParam(_)) && l_ty == r_ty {
+                    l_ty.clone()
                 } else {
                     self.diagnostics.push(
                         Diagnostic::error(format!(
@@ -1285,6 +1325,8 @@ impl<'a> SemanticAnalyzer<'a> {
                 let r_ty = self.check_expr(right, Some(&l_ty));
                 if l_ty.is_integer() && r_ty.is_integer() {
                     l_ty.resolve_defaults()
+                } else if matches!(l_ty, Type::TypeParam(_)) && l_ty == r_ty {
+                    l_ty.clone()
                 } else {
                     self.diagnostics.push(
                         Diagnostic::error(format!(
@@ -1581,6 +1623,18 @@ impl<'a> SemanticAnalyzer<'a> {
                         .unwrap_or(Type::Unknown)
                 })
                 .collect();
+            if concrete_args.iter().all(|t| !matches!(t, Type::Unknown)) {
+                self.symbols
+                    .call_instantiations
+                    .insert(span, concrete_args.clone());
+                if concrete_args
+                    .iter()
+                    .all(|t| !matches!(t, Type::TypeParam(_)))
+                {
+                    self.symbols
+                        .record_generic_struct_instance(st.name, concrete_args.clone());
+                }
+            }
             Type::Generic {
                 name: st.name,
                 args: concrete_args,
@@ -1745,6 +1799,29 @@ impl<'a> SemanticAnalyzer<'a> {
                             );
                         }
                     }
+                }
+            }
+
+            let concrete_args: Vec<Type> = f
+                .generics
+                .iter()
+                .map(|g| {
+                    type_param_map
+                        .get(&g.name)
+                        .cloned()
+                        .unwrap_or(Type::Unknown)
+                })
+                .collect();
+            if concrete_args.iter().all(|t| !matches!(t, Type::Unknown)) {
+                self.symbols
+                    .call_instantiations
+                    .insert(span, concrete_args.clone());
+                if concrete_args
+                    .iter()
+                    .all(|t| !matches!(t, Type::TypeParam(_)))
+                {
+                    self.symbols
+                        .record_generic_function_instance(f.name, concrete_args);
                 }
             }
         }

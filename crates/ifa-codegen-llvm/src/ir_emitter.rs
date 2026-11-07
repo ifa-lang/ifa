@@ -151,9 +151,27 @@ impl<'a> LlvmIrEmitter<'a> {
             }
         }
 
+        // 3.5. Emit structure type definitions
+        if !module.structs.is_empty() {
+            out.push_str("; Structure Type Definitions\n");
+            for st in &module.structs {
+                let st_name = INTERNER.resolve(&st.name);
+                let mut field_types = Vec::new();
+                for (_, f_ty) in &st.fields {
+                    field_types.push(fir_to_llvm_type(f_ty)?);
+                }
+                out.push_str(&format!(
+                    "%struct.{} = type {{ {} }}\n",
+                    st_name,
+                    field_types.join(", ")
+                ));
+            }
+            out.push('\n');
+        }
+
         // 4. Emit function definitions
         for func in &module.functions {
-            self.emit_function(func, &mut out)?;
+            self.emit_function(func, module, &mut out)?;
             out.push('\n');
         }
 
@@ -179,7 +197,12 @@ impl<'a> LlvmIrEmitter<'a> {
         Ok(out)
     }
 
-    fn emit_function(&self, func: &FirFunction, out: &mut String) -> Result<(), LlvmCodegenError> {
+    fn emit_function(
+        &self,
+        func: &FirFunction,
+        module: &FirModule,
+        out: &mut String,
+    ) -> Result<(), LlvmCodegenError> {
         let fn_name = INTERNER.resolve(&func.name);
         let ret_ty = fir_to_llvm_type(&func.ret_ty)?;
 
@@ -209,6 +232,71 @@ impl<'a> LlvmIrEmitter<'a> {
             attr_group
         ));
 
+        // Precompute SSA value types within this function
+        let mut value_types: HashMap<ifa_fir::ValueId, ifa_fir::FirType> = HashMap::new();
+        for p in &func.params {
+            value_types.insert(p.val, p.ty.clone());
+        }
+        for block in &func.blocks {
+            for (p_id, p_ty) in &block.params {
+                value_types.insert(*p_id, p_ty.clone());
+            }
+            for inst in &block.instructions {
+                if let Some(res) = inst.result {
+                    let ty = match &inst.expr {
+                        ValueExpr::Constant(ConstantValue::Float(_, f_ty)) => {
+                            ifa_fir::FirType::Float(*f_ty)
+                        }
+                        ValueExpr::Constant(ConstantValue::Int(_, i_ty)) => {
+                            ifa_fir::FirType::Int(*i_ty)
+                        }
+                        ValueExpr::Constant(ConstantValue::Bool(_)) => ifa_fir::FirType::Bool,
+                        ValueExpr::Constant(ConstantValue::Char(_)) => ifa_fir::FirType::Char,
+                        ValueExpr::Constant(ConstantValue::String(_)) => ifa_fir::FirType::Str,
+                        ValueExpr::Binary { op, lhs, .. } => match op {
+                            BinaryOp::Eq
+                            | BinaryOp::Ne
+                            | BinaryOp::Lt
+                            | BinaryOp::Le
+                            | BinaryOp::Gt
+                            | BinaryOp::Ge
+                            | BinaryOp::And
+                            | BinaryOp::Or => ifa_fir::FirType::Bool,
+                            _ => value_types
+                                .get(lhs)
+                                .cloned()
+                                .unwrap_or(ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)),
+                        },
+                        ValueExpr::Unary { op, val } => match op {
+                            UnaryOp::Not => ifa_fir::FirType::Bool,
+                            UnaryOp::Neg => value_types
+                                .get(val)
+                                .cloned()
+                                .unwrap_or(ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)),
+                        },
+                        ValueExpr::Alloca { ty, .. } => {
+                            ifa_fir::FirType::Pointer(Box::new(ty.clone()))
+                        }
+                        ValueExpr::Load { ptr } => match value_types.get(ptr) {
+                            Some(ifa_fir::FirType::Pointer(inner)) => (**inner).clone(),
+                            _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
+                        },
+                        ValueExpr::CallDirect { name, .. } => {
+                            if let Some(target_fn) =
+                                module.functions.iter().find(|f| f.name == *name)
+                            {
+                                target_fn.ret_ty.clone()
+                            } else {
+                                ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                            }
+                        }
+                        _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
+                    };
+                    value_types.insert(res, ty);
+                }
+            }
+        }
+
         // Basic blocks
         for (b_idx, block) in func.blocks.iter().enumerate() {
             let label = if b_idx == 0 {
@@ -221,9 +309,9 @@ impl<'a> LlvmIrEmitter<'a> {
             // SSA Instructions
             for inst in &block.instructions {
                 if let Some(res) = inst.result {
-                    self.emit_instruction(res.0, &inst.expr, out)?;
+                    self.emit_instruction(res.0, &inst.expr, module, &value_types, out)?;
                 } else {
-                    self.emit_effectful_instruction(&inst.expr, out)?;
+                    self.emit_effectful_instruction(&inst.expr, module, &value_types, out)?;
                 }
             }
 
@@ -243,6 +331,8 @@ impl<'a> LlvmIrEmitter<'a> {
         &self,
         res_id: u32,
         expr: &ValueExpr,
+        module: &FirModule,
+        value_types: &HashMap<ifa_fir::ValueId, ifa_fir::FirType>,
         out: &mut String,
     ) -> Result<(), LlvmCodegenError> {
         match expr {
@@ -278,34 +368,60 @@ impl<'a> LlvmIrEmitter<'a> {
                 }
             },
             ValueExpr::Binary { op, lhs, rhs } => {
-                let op_str = match op {
-                    BinaryOp::Add => "add nsw i64",
-                    BinaryOp::Sub => "sub nsw i64",
-                    BinaryOp::Mul => "mul nsw i64",
-                    BinaryOp::Div => "sdiv i64",
-                    BinaryOp::Rem => "srem i64",
-                    BinaryOp::Eq => "icmp eq i64",
-                    BinaryOp::Ne => "icmp ne i64",
-                    BinaryOp::Lt => "icmp slt i64",
-                    BinaryOp::Le => "icmp sle i64",
-                    BinaryOp::Gt => "icmp sgt i64",
-                    BinaryOp::Ge => "icmp sge i64",
-                    BinaryOp::And => "and i1",
-                    BinaryOp::Or => "or i1",
-                    BinaryOp::BitAnd => "and i64",
-                    BinaryOp::BitOr => "or i64",
-                    BinaryOp::BitXor => "xor i64",
-                    BinaryOp::Shl => "shl i64",
-                    BinaryOp::Shr => "ashr i64",
-                };
-                out.push_str(&format!(
-                    "  %v{} = {} %v{}, %v{}\n",
-                    res_id, op_str, lhs.0, rhs.0
-                ));
+                let is_float = matches!(value_types.get(lhs), Some(ifa_fir::FirType::Float(_)));
+                if is_float {
+                    let (op_str, ty_str) = match op {
+                        BinaryOp::Add => ("fadd", "double"),
+                        BinaryOp::Sub => ("fsub", "double"),
+                        BinaryOp::Mul => ("fmul", "double"),
+                        BinaryOp::Div => ("fdiv", "double"),
+                        BinaryOp::Eq => ("fcmp oeq", "double"),
+                        BinaryOp::Ne => ("fcmp one", "double"),
+                        BinaryOp::Lt => ("fcmp olt", "double"),
+                        BinaryOp::Le => ("fcmp ole", "double"),
+                        BinaryOp::Gt => ("fcmp ogt", "double"),
+                        BinaryOp::Ge => ("fcmp oge", "double"),
+                        _ => ("fadd", "double"),
+                    };
+                    out.push_str(&format!(
+                        "  %v{} = {} {} %v{}, %v{}\n",
+                        res_id, op_str, ty_str, lhs.0, rhs.0
+                    ));
+                } else {
+                    let op_str = match op {
+                        BinaryOp::Add => "add nsw i64",
+                        BinaryOp::Sub => "sub nsw i64",
+                        BinaryOp::Mul => "mul nsw i64",
+                        BinaryOp::Div => "sdiv i64",
+                        BinaryOp::Rem => "srem i64",
+                        BinaryOp::Eq => "icmp eq i64",
+                        BinaryOp::Ne => "icmp ne i64",
+                        BinaryOp::Lt => "icmp slt i64",
+                        BinaryOp::Le => "icmp sle i64",
+                        BinaryOp::Gt => "icmp sgt i64",
+                        BinaryOp::Ge => "icmp sge i64",
+                        BinaryOp::And => "and i1",
+                        BinaryOp::Or => "or i1",
+                        BinaryOp::BitAnd => "and i64",
+                        BinaryOp::BitOr => "or i64",
+                        BinaryOp::BitXor => "xor i64",
+                        BinaryOp::Shl => "shl i64",
+                        BinaryOp::Shr => "ashr i64",
+                    };
+                    out.push_str(&format!(
+                        "  %v{} = {} %v{}, %v{}\n",
+                        res_id, op_str, lhs.0, rhs.0
+                    ));
+                }
             }
             ValueExpr::Unary { op, val } => match op {
                 UnaryOp::Neg => {
-                    out.push_str(&format!("  %v{} = sub nsw i64 0, %v{}\n", res_id, val.0));
+                    let is_float = matches!(value_types.get(val), Some(ifa_fir::FirType::Float(_)));
+                    if is_float {
+                        out.push_str(&format!("  %v{} = fneg double %v{}\n", res_id, val.0));
+                    } else {
+                        out.push_str(&format!("  %v{} = sub nsw i64 0, %v{}\n", res_id, val.0));
+                    }
                 }
                 UnaryOp::Not => {
                     out.push_str(&format!("  %v{} = xor i1 %v{}, true\n", res_id, val.0));
@@ -350,14 +466,45 @@ impl<'a> LlvmIrEmitter<'a> {
                     }
                     out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
                 } else {
-                    let args_str: Vec<String> =
-                        args.iter().map(|a| format!("i64 %v{}", a.0)).collect();
-                    out.push_str(&format!(
-                        "  %v{} = call i64 @{}({})\n",
-                        res_id,
-                        callee_name,
-                        args_str.join(", ")
-                    ));
+                    let (ret_ty_str, param_types) = if let Some(target_fn) =
+                        module.functions.iter().find(|f| f.name == *name)
+                    {
+                        let ret_ty = fir_to_llvm_type(&target_fn.ret_ty)?;
+                        let params: Vec<String> = target_fn
+                            .params
+                            .iter()
+                            .map(|p| fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()))
+                            .collect();
+                        (ret_ty, params)
+                    } else {
+                        ("i64".to_string(), vec!["i64".to_string(); args.len()])
+                    };
+
+                    let args_str: Vec<String> = args
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| {
+                            let p_ty = param_types.get(i).map(|s| s.as_str()).unwrap_or("i64");
+                            format!("{} %v{}", p_ty, a.0)
+                        })
+                        .collect();
+
+                    if ret_ty_str == "void" {
+                        out.push_str(&format!(
+                            "  call void @{}({})\n",
+                            callee_name,
+                            args_str.join(", ")
+                        ));
+                        out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
+                    } else {
+                        out.push_str(&format!(
+                            "  %v{} = call {} @{}({})\n",
+                            res_id,
+                            ret_ty_str,
+                            callee_name,
+                            args_str.join(", ")
+                        ));
+                    }
                 }
             }
             ValueExpr::GenAlloc { .. } => {
@@ -377,8 +524,11 @@ impl<'a> LlvmIrEmitter<'a> {
     fn emit_effectful_instruction(
         &self,
         expr: &ValueExpr,
+        module: &FirModule,
+        value_types: &HashMap<ifa_fir::ValueId, ifa_fir::FirType>,
         out: &mut String,
     ) -> Result<(), LlvmCodegenError> {
+        let _ = value_types;
         match expr {
             ValueExpr::Store { ptr, val } => {
                 out.push_str(&format!(
@@ -406,10 +556,30 @@ impl<'a> LlvmIrEmitter<'a> {
                         ));
                     }
                 } else {
-                    let args_str: Vec<String> =
-                        args.iter().map(|a| format!("i64 %v{}", a.0)).collect();
+                    let (ret_ty_str, param_types) = if let Some(target_fn) =
+                        module.functions.iter().find(|f| f.name == *name)
+                    {
+                        let ret_ty = fir_to_llvm_type(&target_fn.ret_ty)?;
+                        let params: Vec<String> = target_fn
+                            .params
+                            .iter()
+                            .map(|p| fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()))
+                            .collect();
+                        (ret_ty, params)
+                    } else {
+                        ("i64".to_string(), vec!["i64".to_string(); args.len()])
+                    };
+                    let args_str: Vec<String> = args
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| {
+                            let p_ty = param_types.get(i).map(|s| s.as_str()).unwrap_or("i64");
+                            format!("{} %v{}", p_ty, a.0)
+                        })
+                        .collect();
                     out.push_str(&format!(
-                        "  call void @{}({})\n",
+                        "  call {} @{}({})\n",
+                        ret_ty_str,
                         callee,
                         args_str.join(", ")
                     ));
