@@ -706,6 +706,17 @@ impl<'a> SemanticAnalyzer<'a> {
         self.current_func_ret_ty = Some(ret_ty.clone());
         self.current_func_is_strict = f.is_strict;
 
+        if f.is_strict && matches!(ret_ty, Type::String) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "violation du mode strict : type de retour 'String' alloué sur le tas interdit dans une fonction 'strict fn'",
+                )
+                .with_code("E0020")
+                .with_primary_label(f.span, "type de retour dynamique sur le tas interdit en mode strict")
+                .with_note("Le mode strict garantit l'absence totale d'allocation sur le tas. Utilisez des tranches 'Slice<u8>', 'str' ou des tableaux fixes '[u8; N]'."),
+            );
+        }
+
         // Enter function root scope
         self.symbols.enter_scope(false, true);
 
@@ -1531,6 +1542,16 @@ impl<'a> SemanticAnalyzer<'a> {
                 let joined = full_path.join("::");
 
                 if joined == "List::new" {
+                    if self.current_func_is_strict {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "violation du mode strict : instanciation de 'List::new' allouant sur le tas interdite dans une fonction 'strict fn'",
+                            )
+                            .with_code("E0020")
+                            .with_primary_label(expr.span, "allocation de liste dynamique sur le tas interdite en mode strict")
+                            .with_note("Le mode strict impose une exécution zéro-heap déterministe. Utilisez des tableaux à taille fixe '[T; N]', des tranches 'Slice<T>' ou des arènes pré-allouées."),
+                        );
+                    }
                     if let Some(Type::Generic { name, args }) = expected {
                         if INTERNER.resolve(name) == "List" {
                             Type::Generic {
@@ -2294,6 +2315,16 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
             }
             ExprKind::Spawn(inner) => {
+                if self.current_func_is_strict {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "violation du mode strict : l'instanciation de fibre concurrente ('spawn') est interdite dans une fonction 'strict fn'",
+                        )
+                        .with_code("E0020")
+                        .with_primary_label(expr.span, "'spawn' concurrent interdit en mode strict")
+                        .with_note("Le mode strict requiert une exécution synchrone et déterministe sur la pile d'appel locale sans allocation de frame d'ordonnanceur."),
+                    );
+                }
                 self.infer_expr(inner);
                 Type::Unit
             }
@@ -2310,6 +2341,16 @@ impl<'a> SemanticAnalyzer<'a> {
                 ty
             }
             ExprKind::InterpolatedString(parts) => {
+                if self.current_func_is_strict {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "violation du mode strict : l'interpolation de chaîne allouée sur le tas est interdite dans une fonction 'strict fn'",
+                        )
+                        .with_code("E0020")
+                        .with_primary_label(expr.span, "interpolation dynamique sur le tas interdite en mode strict")
+                        .with_note("Le mode strict garantit l'absence totale d'allocation implicite sur le tas. Utilisez des tranches de chaîne 'str' ou des tampons de pile."),
+                    );
+                }
                 for part in parts {
                     let _ = self.infer_expr(part);
                 }
@@ -3589,6 +3630,16 @@ impl<'a> SemanticAnalyzer<'a> {
                 } else if matches!(eff_l, Type::String | Type::Str)
                     && matches!(eff_r, Type::String | Type::Str)
                 {
+                    if self.current_func_is_strict {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "violation du mode strict : la concaténation de chaînes avec '+' est interdite dans une fonction 'strict fn'",
+                            )
+                            .with_code("E0020")
+                            .with_primary_label(span, "concaténation allouant sur le tas interdite en mode strict")
+                            .with_note("Le mode strict impose un déterminisme zéro-heap. Utilisez des tranches de chaîne fixes ou des tampons de pile pré-alloués."),
+                        );
+                    }
                     Type::String
                 } else if matches!(eff_l, Type::TypeParam(_)) && eff_l == eff_r {
                     eff_l.clone()
@@ -3751,6 +3802,27 @@ impl<'a> SemanticAnalyzer<'a> {
     }
 
     fn check_call_expr(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Type {
+        if let ExprKind::Path(path) = &callee.kind {
+            let full_path: Vec<String> = path.iter().map(|s| INTERNER.resolve(s)).collect();
+            let joined = full_path.join("::");
+            if joined == "List::new" {
+                if self.current_func_is_strict {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "violation du mode strict : l'instanciation de 'List::new' allouant sur le tas est interdite dans une fonction 'strict fn'",
+                        )
+                        .with_code("E0020")
+                        .with_primary_label(span, "allocation de liste dynamique sur le tas interdite en mode strict")
+                        .with_note("Le mode strict impose une exécution zéro-heap déterministe. Utilisez des tableaux à taille fixe '[T; N]', des tranches 'Slice<T>' ou des arènes pré-allouées."),
+                    );
+                }
+                return Type::Generic {
+                    name: path[0],
+                    args: vec![Type::Unknown],
+                };
+            }
+        }
+
         // First check if callee is a qualified module member or struct constructor
         if let ExprKind::Path(path) = &callee.kind {
             if path.len() >= 2 {
@@ -3987,6 +4059,38 @@ impl<'a> SemanticAnalyzer<'a> {
         if let Some(f) = fn_match {
             self.check_function_call(&f, args, false, span)
         } else {
+            if self.current_func_is_strict {
+                let callee_name = match &callee.kind {
+                    ExprKind::Ident(s) => INTERNER.resolve(s),
+                    ExprKind::Path(p) => {
+                        let names: Vec<String> = p.iter().map(|s| INTERNER.resolve(s)).collect();
+                        names.join("::")
+                    }
+                    _ => "<expression>".to_string(),
+                };
+                let is_allowed_intrinsic = callee_name == "assert"
+                    || callee_name == "assert_eq"
+                    || callee_name == "assert_ne"
+                    || callee_name == "sizeof"
+                    || callee_name == "alignof"
+                    || callee_name == "ifa_rt_println"
+                    || callee_name == "ifa_rt_print"
+                    || callee_name == "ifa_rt_println_i64"
+                    || callee_name == "ifa_rt_print_i64";
+                if !is_allowed_intrinsic {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "violation du mode strict : appel de la fonction non-stricte '{}' interdit dans une fonction 'strict fn'",
+                            callee_name
+                        ))
+                        .with_code("E0020")
+                        .with_primary_label(span, format!("appel à '{}' non garanti zéro-heap", callee_name))
+                        .with_note("Le mode strict garantit l'absence totale d'allocation sur le tas et le déterminisme temporel.")
+                        .with_help("Annotez la fonction appelée avec 'strict fn' ou effectuez l'appel hors du mode strict."),
+                    );
+                }
+            }
+
             // Function or standard library function not yet in symbol table (e.g. io::println, http::Server::new)
             let param_modes = vec![ParamMode::In; args.len()];
             check_call_exclusivity_interproc(
@@ -4530,6 +4634,16 @@ impl<'a> SemanticAnalyzer<'a> {
                 name,
                 args: gen_args,
             } if INTERNER.resolve(name) == "List" && m_name == "push" && !gen_args.is_empty() => {
+                if self.current_func_is_strict {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "violation du mode strict : la méthode 'push' sur 'List' avec redimensionnement sur le tas est interdite dans une fonction 'strict fn'",
+                        )
+                        .with_code("E0020")
+                        .with_primary_label(span, "redimensionnement dynamique sur le tas interdit en mode strict")
+                        .with_note("Le mode strict requiert des tableaux à taille fixe '[T; N]', des tranches 'Slice<T>' ou des arènes pré-allouées."),
+                    );
+                }
                 if let Some(arg) = args.first() {
                     self.check_expr(&arg.value, Some(&gen_args[0]));
                 }

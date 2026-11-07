@@ -568,3 +568,130 @@ pub fn spawn_pattern_ref() -> () {
         analysis.diagnostics
     );
 }
+
+#[test]
+fn test_strict_fn_string_interp_rejected() {
+    let src = r#"
+pub strict fn format_error_code(code: i64) -> () {
+    let msg = "Erreur: {code}"
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_interp.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0020")),
+        "Expected E0020 for heap-allocated string interpolation in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_strict_fn_string_concat_rejected() {
+    let src = r#"
+pub strict fn concat_strings() -> () {
+    let s = "cle_" + "valeur"
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_concat.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0020")),
+        "Expected E0020 for heap-allocated string concatenation in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_strict_fn_spawn_rejected() {
+    let src = r#"
+pub strict fn run_concurrent_task() -> () {
+    spawn {
+        let x = 100
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_spawn.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0020")),
+        "Expected E0020 for spawn in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_strict_fn_list_allocation_rejected() {
+    let src = r#"
+pub strict fn run_dynamic_list() -> () {
+    let l = List::new()
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_list.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0020")),
+        "Expected E0020 for List::new in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_strict_fn_string_return_rejected() {
+    let src = r#"
+pub strict fn get_dynamic_name() -> String {
+    return "alpha"
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_ret_string.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0020")),
+        "Expected E0020 for String return type in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}

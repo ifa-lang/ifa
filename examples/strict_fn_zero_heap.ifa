@@ -1,0 +1,48 @@
+// Exemple d'ingénierie système IFA : Déterminisme absolu et Zéro-Heap en mode `strict fn`.
+//
+// Le mot-clé `strict fn` garantit statiquement à la compilation :
+// 1. Zéro allocation implicite ou explicite sur le tas (interdiction de String dynamique, List, etc.).
+// 2. Zéro Copy-on-Write (CoW) caché : toutes les mutations s'exécutent strictement sur place (in-place).
+// 3. Exécution déterministe sur la pile d'appel locale et dans les tranches de mémoire contiguës.
+// 4. Appel transitif exclusif de fonctions également certifiées `strict fn`.
+
+struct DigestState {
+    h0: i64,
+    h1: i64,
+    h2: i64,
+    h3: i64,
+}
+
+// Fonction certifiée strict fn : transformation déterministe sur place
+pub strict fn mix_state(inout st: DigestState, round_constant: i64) {
+    st.h0 = (st.h0 ^ st.h1) + round_constant;
+    st.h1 = (st.h1 ^ st.h2) + round_constant;
+    st.h2 = (st.h2 ^ st.h3) + round_constant;
+    st.h3 = (st.h3 ^ st.h0) + round_constant;
+}
+
+// Calcule un résumé d'intégrité en mode strict fn sur la pile locale
+pub strict fn compute_deterministic_digest(seed: i64, rounds: i64) -> i64 {
+    mut state = DigestState {
+        h0: seed,
+        h1: seed ^ 1518500249,
+        h2: seed ^ 1859775393,
+        h3: seed ^ 2400959708,
+    };
+
+    mut r: i64 = 0;
+    while r < rounds {
+        let round_key = (r * 1103515245 + 12345) % 2147483647;
+        mix_state(inout state, round_key);
+        r = r + 1;
+    }
+
+    return state.h0 ^ state.h1 ^ state.h2 ^ state.h3;
+}
+
+pub fn main() {
+    let seed: i64 = 305419896;
+    let digest = compute_deterministic_digest(seed, 64);
+
+    println("Calcul cryptographique zéro-heap exécuté avec succès en mode strict.");
+}
