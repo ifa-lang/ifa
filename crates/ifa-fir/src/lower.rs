@@ -360,7 +360,29 @@ impl<'a> FunctionLoweringContext<'a> {
 
         // 3. Lower optional trailing expression as return
         if let Some(trailing_expr) = &body.expr {
-            let ret_val = self.lower_expr(trailing_expr);
+            let val = self.lower_expr(trailing_expr);
+            let ret_val = if matches!(self.func.ret_ty, FirType::ErrorUnion { .. }) {
+                let e_ty = self.infer_expr_fir_type(trailing_expr);
+                if !matches!(e_ty, Some(FirType::ErrorUnion { .. })) {
+                    let zero = self.alloc_value();
+                    self.emit(
+                        Some(zero),
+                        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                        trailing_expr.span,
+                    );
+                    let union_val = self.alloc_value();
+                    self.emit(
+                        Some(union_val),
+                        ValueExpr::TupleInit(vec![zero, val]),
+                        trailing_expr.span,
+                    );
+                    union_val
+                } else {
+                    val
+                }
+            } else {
+                val
+            };
             self.emit_all_defers();
             self.set_terminator(Terminator::Return(Some(ret_val)));
         } else if let Some(block) = self.func.get_block(self.current_block) {
@@ -479,16 +501,79 @@ impl<'a> FunctionLoweringContext<'a> {
                 let _ = self.lower_expr(expr);
             }
 
-            Stmt::Return(opt_expr, _) => {
-                let ret_val = opt_expr.as_ref().map(|e| self.lower_expr(e));
+            Stmt::Return(opt_expr, span) => {
+                let ret_val = if let Some(e) = opt_expr {
+                    let val = self.lower_expr(e);
+                    if matches!(self.func.ret_ty, FirType::ErrorUnion { .. }) {
+                        let e_ty = self.infer_expr_fir_type(e);
+                        if !matches!(e_ty, Some(FirType::ErrorUnion { .. })) {
+                            let zero = self.alloc_value();
+                            self.emit(
+                                Some(zero),
+                                ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                                *span,
+                            );
+                            let union_val = self.alloc_value();
+                            self.emit(
+                                Some(union_val),
+                                ValueExpr::TupleInit(vec![zero, val]),
+                                *span,
+                            );
+                            Some(union_val)
+                        } else {
+                            Some(val)
+                        }
+                    } else {
+                        Some(val)
+                    }
+                } else if matches!(self.func.ret_ty, FirType::ErrorUnion { .. }) {
+                    let zero = self.alloc_value();
+                    self.emit(
+                        Some(zero),
+                        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                        *span,
+                    );
+                    let unit_val = self.alloc_value();
+                    self.emit(
+                        Some(unit_val),
+                        ValueExpr::Constant(ConstantValue::Unit),
+                        *span,
+                    );
+                    let union_val = self.alloc_value();
+                    self.emit(
+                        Some(union_val),
+                        ValueExpr::TupleInit(vec![zero, unit_val]),
+                        *span,
+                    );
+                    Some(union_val)
+                } else {
+                    None
+                };
                 self.emit_all_defers();
                 self.set_terminator(Terminator::Return(ret_val));
             }
 
-            Stmt::Fail(expr, _) => {
+            Stmt::Fail(expr, span) => {
                 let fail_val = self.lower_expr(expr);
+                let err_union_val = if matches!(self.func.ret_ty, FirType::ErrorUnion { .. }) {
+                    let status_one = self.alloc_value();
+                    self.emit(
+                        Some(status_one),
+                        ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+                        *span,
+                    );
+                    let union_val = self.alloc_value();
+                    self.emit(
+                        Some(union_val),
+                        ValueExpr::TupleInit(vec![status_one, fail_val]),
+                        *span,
+                    );
+                    union_val
+                } else {
+                    fail_val
+                };
                 self.emit_all_defers();
-                self.set_terminator(Terminator::Fail(fail_val));
+                self.set_terminator(Terminator::Return(Some(err_union_val)));
             }
 
             Stmt::While {
@@ -914,7 +999,78 @@ impl<'a> FunctionLoweringContext<'a> {
                         }
                     }
                     UnaryOp::Sink => self.lower_expr(expr),
-                    UnaryOp::Try => self.lower_expr(expr),
+                    UnaryOp::Try => {
+                        let inner_val = self.lower_expr(expr);
+                        let inner_fir_ty = self.infer_expr_fir_type(expr);
+                        let is_fallible = inner_fir_ty
+                            .as_ref()
+                            .is_none_or(|t| matches!(t, FirType::ErrorUnion { .. }));
+
+                        if !is_fallible {
+                            inner_val
+                        } else {
+                            let err_status = self.alloc_value();
+                            self.emit(
+                                Some(err_status),
+                                ValueExpr::GetField {
+                                    base: inner_val,
+                                    field_idx: 0,
+                                    field_name: INTERNER.intern("status"),
+                                },
+                                span,
+                            );
+                            let zero_const = self.alloc_value();
+                            self.emit(
+                                Some(zero_const),
+                                ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                                span,
+                            );
+                            let is_err_val = self.alloc_value();
+                            self.emit(
+                                Some(is_err_val),
+                                ValueExpr::Binary {
+                                    op: BinaryOp::Ne,
+                                    lhs: err_status,
+                                    rhs: zero_const,
+                                },
+                                span,
+                            );
+
+                            let ok_block = self.alloc_block();
+                            let err_block = self.alloc_block();
+
+                            self.set_terminator(Terminator::BranchCond {
+                                cond: is_err_val,
+                                then_block: err_block,
+                                then_args: Vec::new(),
+                                else_block: ok_block,
+                                else_args: Vec::new(),
+                            });
+
+                            // err_block: propagate error immediately to caller
+                            self.current_block = err_block;
+                            self.emit_all_defers();
+                            if matches!(self.func.ret_ty, FirType::ErrorUnion { .. }) {
+                                self.set_terminator(Terminator::Return(Some(inner_val)));
+                            } else {
+                                self.set_terminator(Terminator::Fail(inner_val));
+                            }
+
+                            // ok_block: unpack success value
+                            self.current_block = ok_block;
+                            let ok_val = self.alloc_value();
+                            self.emit(
+                                Some(ok_val),
+                                ValueExpr::GetField {
+                                    base: inner_val,
+                                    field_idx: 1,
+                                    field_name: INTERNER.intern("value"),
+                                },
+                                span,
+                            );
+                            ok_val
+                        }
+                    }
                 }
             }
 
@@ -1514,6 +1670,16 @@ impl<'a> FunctionLoweringContext<'a> {
                 // err_block: catch fallback branch
                 self.current_block = err_block;
                 if let Some(err_name) = err_var {
+                    let err_payload = self.alloc_value();
+                    self.emit(
+                        Some(err_payload),
+                        ValueExpr::GetField {
+                            base: inner_val,
+                            field_idx: 1,
+                            field_name: INTERNER.intern("error"),
+                        },
+                        span,
+                    );
                     let err_ptr = self.alloc_value();
                     self.emit(
                         Some(err_ptr),
@@ -1527,7 +1693,7 @@ impl<'a> FunctionLoweringContext<'a> {
                         None,
                         ValueExpr::Store {
                             ptr: err_ptr,
-                            val: inner_val,
+                            val: err_payload,
                         },
                         span,
                     );

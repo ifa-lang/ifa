@@ -571,6 +571,27 @@ impl<'a> LlvmIrEmitter<'a> {
                     res_id, s_name, res_id
                 ));
             }
+            ValueExpr::TupleInit(fields) => {
+                let count = fields.len().max(1);
+                out.push_str(&format!(
+                    "  %tup_alloc_{} = alloca [{} x i64], align 8\n",
+                    res_id, count
+                ));
+                for (idx, field_val) in fields.iter().enumerate() {
+                    out.push_str(&format!(
+                        "  %tup_elem_{}_{} = getelementptr inbounds [{} x i64], ptr %tup_alloc_{}, i64 0, i64 {}\n",
+                        res_id, idx, count, res_id, idx
+                    ));
+                    out.push_str(&format!(
+                        "  store i64 %v{}, ptr %tup_elem_{}_{}, align 8\n",
+                        field_val.0, res_id, idx
+                    ));
+                }
+                out.push_str(&format!(
+                    "  %v{} = getelementptr inbounds [{} x i64], ptr %tup_alloc_{}, i64 0, i64 0\n",
+                    res_id, count, res_id
+                ));
+            }
             _ => {
                 // Default fallback for intermediate structures
                 out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
@@ -719,7 +740,15 @@ impl<'a> LlvmIrEmitter<'a> {
                     cond.0, then_block.0, else_block.0
                 ));
             }
-            Terminator::Unreachable | Terminator::Fail(_) => {
+            Terminator::Fail(val) => {
+                let llvm_ty = fir_to_llvm_type(ret_ty)?;
+                if llvm_ty != "void" {
+                    out.push_str(&format!("  ret {} %v{}\n", llvm_ty, val.0));
+                } else {
+                    out.push_str("  unreachable\n");
+                }
+            }
+            Terminator::Unreachable => {
                 out.push_str("  unreachable\n");
             }
             Terminator::Switch { .. } => {

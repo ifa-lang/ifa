@@ -254,3 +254,54 @@ fn test_llvm_for_loop_and_match_codegen() {
     assert!(llvm_ir.contains("getelementptr inbounds [2 x i64]"));
     assert!(llvm_ir.contains("call i64 @score"));
 }
+
+#[test]
+fn test_llvm_error_union_try_question_catch_codegen() {
+    let src = r#"
+        struct IoError {
+            code: i64
+        }
+
+        fn step_success() -> IoError!i64 {
+            return 10;
+        }
+
+        fn step_fail() -> IoError!i64 {
+            fail IoError(code: 404);
+        }
+
+        fn chain_work() -> IoError!i64 {
+            let a = try step_success();
+            let b = step_fail()?;
+            return a + b;
+        }
+
+        pub fn main() -> i64 {
+            let res = chain_work() catch err {
+                return 999;
+            };
+            return res;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_error.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let llvm_ir = emitter.emit_module(&fir_module).unwrap();
+
+    assert!(llvm_ir.contains("define internal ptr @step_success()"));
+    assert!(llvm_ir.contains("define internal ptr @step_fail()"));
+    assert!(llvm_ir.contains("define internal ptr @chain_work()"));
+    assert!(llvm_ir.contains("define dso_local i64 @main()"));
+    assert!(llvm_ir.contains("call ptr @chain_work()"));
+}

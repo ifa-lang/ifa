@@ -134,3 +134,35 @@ pub extern "C" fn ifa_rt_print_i64(n: i64) {
 pub extern "C" fn ifa_rt_println_i64(n: i64) {
     crate::io::rt_println_i64(n);
 }
+
+/// Binary C-ABI representation of an IFA Error Union result (`Error!T`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IfaErrorUnion {
+    pub status: i64,
+    pub value: *mut u8,
+}
+
+impl IfaErrorUnion {
+    pub fn ok(payload: *mut u8) -> Self {
+        Self {
+            status: 0,
+            value: payload,
+        }
+    }
+
+    pub fn err(code: i64, payload: *mut u8) -> Self {
+        Self {
+            status: if code == 0 { 1 } else { code },
+            value: payload,
+        }
+    }
+
+    pub fn is_ok(&self) -> bool {
+        self.status == 0
+    }
+
+    pub fn is_err(&self) -> bool {
+        self.status != 0
+    }
+}

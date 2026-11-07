@@ -44,6 +44,15 @@ typedef struct {
     uint16_t _reserved;      /**< Reserved padding */
 } ifa_gen_ref_t;
 
+/**
+ * Binary representation of an IFA Error Union result (`Error!T`).
+ * Status 0 indicates success, non-zero indicates an error code or tag.
+ */
+typedef struct {
+    int64_t status; /**< 0 = OK, non-zero = error code / tag */
+    void*   value;  /**< Pointer or scalar payload */
+} ifa_error_union_t;
+
 /* --- Generational Memory Allocator API --- */
 
 /**

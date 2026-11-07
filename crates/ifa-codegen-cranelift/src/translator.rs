@@ -435,7 +435,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 Some(base_addr)
             }
 
-            ValueExpr::StructInit { fields, .. } => {
+            ValueExpr::StructInit { fields, .. } | ValueExpr::TupleInit(fields) => {
                 let count = fields.len().max(1);
                 let byte_size = (count * 8) as u32;
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
@@ -456,7 +456,6 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
 
             ValueExpr::ArrayPush { .. }
             | ValueExpr::StructPushField { .. }
-            | ValueExpr::TupleInit(_)
             | ValueExpr::CoWCheckShared { .. }
             | ValueExpr::Spawn { .. }
             | ValueExpr::Call { .. } => Some(self.builder.ins().iconst(types::I64, 0)),
@@ -576,7 +575,21 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
 
                 self.builder.ins().jump(default_cl_block, &default_cl_args);
             }
-            Terminator::Fail(_) | Terminator::Unreachable => {
+            Terminator::Fail(fail_val) => {
+                let returns = self.builder.func.signature.returns.clone();
+                if !returns.is_empty() {
+                    let expected_ret_ty = returns[0].value_type;
+                    let ret_val = self
+                        .value_map
+                        .get(fail_val)
+                        .copied()
+                        .unwrap_or_else(|| self.builder.ins().iconst(expected_ret_ty, 0));
+                    self.builder.ins().return_(&[ret_val]);
+                } else {
+                    self.builder.ins().trap(TrapCode::unwrap_user(1));
+                }
+            }
+            Terminator::Unreachable => {
                 self.builder.ins().trap(TrapCode::unwrap_user(1));
             }
         }

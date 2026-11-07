@@ -28,7 +28,7 @@ pub fn fir_type_to_cranelift(ty: &FirType, ptr_type: types::Type) -> Option<type
         | FirType::Array(_, _)
         | FirType::Slice(_) => Some(ptr_type),
         FirType::Optional(inner) => fir_type_to_cranelift(inner, ptr_type),
-        FirType::ErrorUnion { ok, .. } => fir_type_to_cranelift(ok, ptr_type),
+        FirType::ErrorUnion { .. } => Some(ptr_type),
         FirType::Function { .. } => Some(ptr_type),
         FirType::Enum(_, _) => Some(types::I32),
     }

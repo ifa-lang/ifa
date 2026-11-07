@@ -273,6 +273,24 @@ fn test_ffi_c_header_and_php_bridge_generation() {
             }],
             return_type: FirType::Bool,
         },
+        ExportedFunction {
+            name: "process_transfer".to_string(),
+            is_strict: true,
+            params: vec![
+                ExportedParam {
+                    name: "account_id".to_string(),
+                    ty: FirType::Int(IntType::I64),
+                },
+                ExportedParam {
+                    name: "amount".to_string(),
+                    ty: FirType::Int(IntType::I64),
+                },
+            ],
+            return_type: FirType::ErrorUnion {
+                err: Box::new(FirType::Int(IntType::I64)),
+                ok: Box::new(FirType::Int(IntType::I64)),
+            },
+        },
     ];
 
     let c_header = gen.generate_c_header(&exported_fns);
@@ -280,6 +298,8 @@ fn test_ffi_c_header_and_php_bridge_generation() {
     assert!(c_header.contains("#define CRYPTO_ENGINE_H"));
     assert!(c_header.contains("int64_t hash_transaction(int64_t amount, int32_t currency_code);"));
     assert!(c_header.contains("bool validate_signature(const char* signature);"));
+    assert!(c_header
+        .contains("ifa_error_union_t* process_transfer(int64_t account_id, int64_t amount);"));
 
     let php_class = gen.generate_php_class(
         "NativeCryptoService",
@@ -294,6 +314,12 @@ fn test_ffi_c_header_and_php_bridge_generation() {
         .contains("public function hash_transaction(int $amount, int $currency_code): int"));
     assert!(php_class.contains("return $this->ffi->hash_transaction($amount, $currency_code);"));
     assert!(php_class.contains("public function validate_signature(string $signature): bool"));
+    assert!(
+        php_class.contains("public function process_transfer(int $account_id, int $amount): int")
+    );
+    assert!(php_class.contains("if ($res->status !== 0)"));
+    assert!(php_class.contains("throw new \\RuntimeException"));
+    assert!(php_class.contains("return $res->value;"));
     assert!(php_class.contains("public static function setPreloadedInstance(FFI $ffi): void"));
 }
 

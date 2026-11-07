@@ -517,3 +517,114 @@ fn test_fir_defer_lifo_execution() {
     // Stmt::Return evaluates ret_expr before defers, but if ret_expr is acc, let's see.
     assert!(matches!(res, FirValue::Int(_)));
 }
+
+#[test]
+fn test_fir_try_operator_propagation_ok() {
+    let src = r#"
+        struct IoError {
+            code: i64
+        }
+
+        fn fetch_value() -> IoError!i64 {
+            return 42;
+        }
+
+        fn compute() -> IoError!i64 {
+            let v = try fetch_value();
+            return v + 8;
+        }
+
+        pub fn main() -> i64 {
+            let res = compute() catch err {
+                return 0;
+            };
+            return res;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("try_ok.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, _) = ifa_parser::parse(fid, tokens);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(50));
+}
+
+#[test]
+fn test_fir_try_and_question_operator_propagation_fail() {
+    let src = r#"
+        struct IoError {
+            code: i64
+        }
+
+        fn failing_step() -> IoError!i64 {
+            fail IoError(code: 404);
+        }
+
+        fn caller_one() -> IoError!i64 {
+            let v = try failing_step();
+            return v + 1;
+        }
+
+        pub fn main() -> i64 {
+            let res1 = caller_one() catch err {
+                return 77;
+            };
+            return res1;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("try_fail.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, _) = ifa_parser::parse(fid, tokens);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(77));
+}
+
+#[test]
+fn test_fir_question_operator_catch() {
+    let src = r#"
+        struct IoError {
+            code: i64
+        }
+
+        fn failing_step() -> IoError!i64 {
+            fail IoError(code: 500);
+        }
+
+        fn intermediate() -> IoError!i64 {
+            let v = failing_step()?;
+            return v * 10;
+        }
+
+        pub fn main() -> i64 {
+            let res = intermediate() catch err {
+                return 88;
+            };
+            return res;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("q_catch.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, _) = ifa_parser::parse(fid, tokens);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(88));
+}

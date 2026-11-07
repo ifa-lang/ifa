@@ -1,4 +1,5 @@
 use crate::ir::*;
+use crate::types::FirType;
 use ifa_span::{Symbol, INTERNER};
 use std::collections::HashMap;
 use std::fmt;
@@ -326,6 +327,9 @@ impl<'a> FirInterpreter<'a> {
                         .get(fail_val)
                         .cloned()
                         .ok_or(InterpError::UndefinedValue(*fail_val))?;
+                    if matches!(func.ret_ty, FirType::ErrorUnion { .. }) {
+                        return Ok(FirValue::Tuple(vec![FirValue::Int(1), val]));
+                    }
                     return Err(InterpError::ExplicitFail(val.to_string()));
                 }
                 Terminator::Branch { target, args } => {

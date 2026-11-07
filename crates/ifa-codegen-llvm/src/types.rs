@@ -35,10 +35,7 @@ pub fn fir_to_llvm_type(ty: &FirType) -> Result<String, LlvmCodegenError> {
             let inner = fir_to_llvm_type(elem)?;
             Ok(format!("{{ i1, {} }}", inner))
         }
-        FirType::ErrorUnion { ok, .. } => {
-            let ok_llvm = fir_to_llvm_type(ok)?;
-            Ok(format!("{{ i64, {} }}", ok_llvm))
-        }
+        FirType::ErrorUnion { .. } => Ok("ptr".to_string()),
         FirType::Enum(sym, _) => {
             let name = INTERNER.resolve(sym);
             Ok(format!("%enum.{}", name))

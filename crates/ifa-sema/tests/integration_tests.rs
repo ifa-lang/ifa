@@ -184,6 +184,7 @@ fn test_try_operator_propagation() {
 
         fn step_two() -> CustomError!u64 {
             let val = try step_one();
+            let val2 = step_one()?;
             return 100;
         }
     "#;

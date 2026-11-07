@@ -332,3 +332,52 @@ fn test_jit_for_loop_and_match_execution() {
     let result = jit.run_main().expect("Failed to execute native main");
     assert_eq!(result, 6); // 1 + 2 + 3 = 6
 }
+
+#[test]
+fn test_jit_error_union_try_question_catch() {
+    let src = r#"
+        struct IoError {
+            code: i64
+        }
+
+        fn step_success() -> IoError!i64 {
+            return 10;
+        }
+
+        fn step_fail() -> IoError!i64 {
+            fail IoError(code: 404);
+        }
+
+        fn chain_work() -> IoError!i64 {
+            let a = try step_success();
+            let b = step_fail()?;
+            return a + b;
+        }
+
+        pub fn main() -> i64 {
+            let res = chain_work() catch err {
+                return 999;
+            };
+            return res;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("jit_error.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, _) = ifa_parser::parse(fid, tokens);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile error union propagation to Cranelift machine code");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 999);
+}

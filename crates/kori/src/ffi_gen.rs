@@ -230,7 +230,20 @@ impl FfiBridgeGenerator {
                 php_ret
             ));
             out.push_str("    {\n");
-            if func.return_type == FirType::Unit {
+            if matches!(func.return_type, FirType::ErrorUnion { .. }) {
+                out.push_str(&format!(
+                    "        $res = $this->ffi->{}({});\n",
+                    func.name,
+                    args_call.join(", ")
+                ));
+                out.push_str("        if ($res->status !== 0) {\n");
+                out.push_str(&format!(
+                    "            throw new \\RuntimeException(sprintf('IFA native execution error code %d in %s', $res->status, '{}'));\n",
+                    func.name
+                ));
+                out.push_str("        }\n");
+                out.push_str("        return $res->value;\n");
+            } else if func.return_type == FirType::Unit {
                 out.push_str(&format!(
                     "        $this->ffi->{}({});\n",
                     func.name,
@@ -305,6 +318,7 @@ pub fn fir_type_to_c(ty: &FirType) -> &'static str {
         FirType::Pointer(_) => "void*",
         FirType::GenerationalRef(_) => "ifa_gen_ref_t",
         FirType::Struct(..) => "void*",
+        FirType::ErrorUnion { .. } => "ifa_error_union_t*",
         _ => "void*",
     }
 }
@@ -320,6 +334,7 @@ pub fn fir_type_to_php(ty: &FirType) -> &'static str {
         FirType::Pointer(_) => "\\FFI\\CData",
         FirType::GenerationalRef(_) => "\\FFI\\CData",
         FirType::Struct(..) => "\\FFI\\CData",
+        FirType::ErrorUnion { ok, .. } => fir_type_to_php(ok),
         _ => "mixed",
     }
 }

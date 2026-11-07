@@ -1067,7 +1067,10 @@ impl Parser {
             let cur = self.current();
             let prec = match cur.kind {
                 // Suffixes (100)
-                TokenKind::Dot | TokenKind::OpenParen | TokenKind::OpenBracket => 100,
+                TokenKind::Dot
+                | TokenKind::OpenParen
+                | TokenKind::OpenBracket
+                | TokenKind::Question => 100,
 
                 // Multiplicative (80)
                 TokenKind::Star | TokenKind::Slash | TokenKind::Percent => 80,
@@ -1524,6 +1527,18 @@ impl Parser {
                     span,
                 ))
             }
+            // Postfix Try / Error Propagation Operator: expr?
+            TokenKind::Question => {
+                let q_tok = self.advance();
+                let span = Span::new(self.file_id, left.span.start, q_tok.span.end);
+                Ok(Expr::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::Try,
+                        expr: Box::new(left),
+                    },
+                    span,
+                ))
+            }
             // Catch Operator: expr catch err { ... }
             TokenKind::Catch => {
                 self.advance();
@@ -1652,6 +1667,23 @@ mod tests {
                     fail "Invalid payload";
                 };
                 return payload;
+            }
+        "#;
+        let fid = FileId(0);
+        let tokens = tokenize(fid, src);
+        let (prog, diags) = parse(fid, tokens);
+
+        assert!(diags.is_empty(), "Diagnostics: {:?}", diags);
+        assert_eq!(prog.items.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_try_and_question_operator() {
+        let src = r#"
+            fn process() -> IoError!String {
+                let a = try read_file("a.txt");
+                let b = read_file("b.txt")?;
+                return a + b;
             }
         "#;
         let fid = FileId(0);
