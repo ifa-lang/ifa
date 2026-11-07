@@ -622,6 +622,18 @@ impl<'a> FunctionLoweringContext<'a> {
         false
     }
 
+    /// Automatically dereferences generational reference expressions when a scalar value is required.
+    fn deref_if_ref(&mut self, val: ValueId, expr: &Expr, span: Span) -> ValueId {
+        if let Some(FirType::GenerationalRef(inner)) = self.infer_expr_fir_type(expr) {
+            if !matches!(*inner, FirType::Struct(..) | FirType::Array(..)) {
+                let deref = self.alloc_value();
+                self.emit(Some(deref), ValueExpr::Load { ptr: val }, span);
+                return deref;
+            }
+        }
+        val
+    }
+
     fn eval_static_bool(&self, expr: &Expr) -> Option<bool> {
         if let Some(ifa_comptime::Value::Bool(b)) =
             self.symbols.comptime_expr_values.get(&expr.span)
@@ -714,6 +726,11 @@ impl<'a> FunctionLoweringContext<'a> {
         // 3. Lower optional trailing expression as return
         if let Some(trailing_expr) = &body.expr {
             let val = self.lower_expr(trailing_expr);
+            let val = if !matches!(self.func.ret_ty, FirType::GenerationalRef(_)) {
+                self.deref_if_ref(val, trailing_expr, trailing_expr.span)
+            } else {
+                val
+            };
             let ret_val = if matches!(self.func.ret_ty, FirType::ErrorUnion { .. }) {
                 let e_ty = self.infer_expr_fir_type(trailing_expr);
                 if !matches!(e_ty, Some(FirType::ErrorUnion { .. })) {
@@ -870,27 +887,43 @@ impl<'a> FunctionLoweringContext<'a> {
                         name,
                         span: p_span,
                     } => {
-                        let inner_ty = if let Some(init_expr) = init {
-                            if let Some(inferred) = self.infer_expr_fir_type(init_expr) {
-                                inferred
+                        let (ref_ty, ptr_to_ref) = if let Some(FirType::GenerationalRef(inner)) =
+                            init.as_ref().and_then(|e| self.infer_expr_fir_type(e))
+                        {
+                            let init_v = init_val.unwrap_or_else(|| {
+                                let zero = self.alloc_value();
+                                self.emit(
+                                    Some(zero),
+                                    ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                                    *p_span,
+                                );
+                                zero
+                            });
+                            (FirType::GenerationalRef(inner), init_v)
+                        } else {
+                            let inner_ty = if let Some(init_expr) = init {
+                                if let Some(inferred) = self.infer_expr_fir_type(init_expr) {
+                                    inferred
+                                } else {
+                                    FirType::Int(IntType::I64)
+                                }
                             } else {
                                 FirType::Int(IntType::I64)
-                            }
-                        } else {
-                            FirType::Int(IntType::I64)
-                        };
-                        let ref_ty = FirType::GenerationalRef(Box::new(inner_ty));
+                            };
+                            let ref_ty = FirType::GenerationalRef(Box::new(inner_ty));
 
-                        let ptr_to_ref = if let Some(val) = init_val {
-                            self.val_ptrs.get(&val).copied().unwrap_or(val)
-                        } else {
-                            let zero = self.alloc_value();
-                            self.emit(
-                                Some(zero),
-                                ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
-                                *p_span,
-                            );
-                            zero
+                            let ptr_to_ref = if let Some(val) = init_val {
+                                self.val_ptrs.get(&val).copied().unwrap_or(val)
+                            } else {
+                                let zero = self.alloc_value();
+                                self.emit(
+                                    Some(zero),
+                                    ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                                    *p_span,
+                                );
+                                zero
+                            };
+                            (ref_ty, ptr_to_ref)
                         };
 
                         let gen_ref = self.alloc_value();
@@ -1081,6 +1114,11 @@ impl<'a> FunctionLoweringContext<'a> {
             Stmt::Return(opt_expr, span) => {
                 let ret_val = if let Some(e) = opt_expr {
                     let val = self.lower_expr(e);
+                    let val = if !matches!(self.func.ret_ty, FirType::GenerationalRef(_)) {
+                        self.deref_if_ref(val, e, *span)
+                    } else {
+                        val
+                    };
                     if matches!(self.func.ret_ty, FirType::ErrorUnion { .. }) {
                         let e_ty = self.infer_expr_fir_type(e);
                         if !matches!(e_ty, Some(FirType::ErrorUnion { .. })) {
@@ -1689,8 +1727,10 @@ impl<'a> FunctionLoweringContext<'a> {
                     self.emit(Some(res), ValueExpr::Constant(ConstantValue::Bool(b)), span);
                     return res;
                 }
-                let lhs = self.lower_expr(left);
-                let rhs = self.lower_expr(right);
+                let raw_lhs = self.lower_expr(left);
+                let raw_rhs = self.lower_expr(right);
+                let lhs = self.deref_if_ref(raw_lhs, left, left.span);
+                let rhs = self.deref_if_ref(raw_rhs, right, right.span);
                 let fir_op = match op {
                     BinOp::Add => BinaryOp::Add,
                     BinOp::Sub => BinaryOp::Sub,
@@ -1728,7 +1768,8 @@ impl<'a> FunctionLoweringContext<'a> {
             ExprKind::Unary { op, expr } => {
                 match op {
                     UnaryOp::Neg => {
-                        let val = self.lower_expr(expr);
+                        let raw_val = self.lower_expr(expr);
+                        let val = self.deref_if_ref(raw_val, expr, expr.span);
                         let res = self.alloc_value();
                         self.emit(
                             Some(res),
@@ -1741,7 +1782,8 @@ impl<'a> FunctionLoweringContext<'a> {
                         res
                     }
                     UnaryOp::Not => {
-                        let val = self.lower_expr(expr);
+                        let raw_val = self.lower_expr(expr);
+                        let val = self.deref_if_ref(raw_val, expr, expr.span);
                         let res = self.alloc_value();
                         self.emit(
                             Some(res),
@@ -3039,7 +3081,12 @@ impl<'a> FunctionLoweringContext<'a> {
 
                     // Arm Body
                     self.current_block = arm_body_block;
-                    let arm_res = self.lower_expr(&arm.body);
+                    let raw_arm_res = self.lower_expr(&arm.body);
+                    let arm_res = if !matches!(res_ty, FirType::GenerationalRef(_)) {
+                        self.deref_if_ref(raw_arm_res, &arm.body, arm.span)
+                    } else {
+                        raw_arm_res
+                    };
                     self.emit(
                         None,
                         ValueExpr::Store {
@@ -3467,7 +3514,18 @@ impl<'a> FunctionLoweringContext<'a> {
                     });
                 }
                 BindingMode::Ref => {
-                    let ref_ty = FirType::GenerationalRef(Box::new(target_ty.clone()));
+                    let (ref_ty, ptr_to_ref) = if let FirType::GenerationalRef(inner) = target_ty {
+                        let _ = inner;
+                        (target_ty.clone(), target_val)
+                    } else {
+                        let ref_ty = FirType::GenerationalRef(Box::new(target_ty.clone()));
+                        let ptr = self
+                            .val_ptrs
+                            .get(&target_val)
+                            .copied()
+                            .unwrap_or(target_val);
+                        (ref_ty, ptr)
+                    };
                     let var_ptr = if let Some(existing_ptr) = self.var_allocas.get(sym).copied() {
                         existing_ptr
                     } else {
@@ -3488,11 +3546,6 @@ impl<'a> FunctionLoweringContext<'a> {
                         self.var_types.insert(*sym, ref_ty);
                         ptr
                     };
-                    let ptr_to_ref = self
-                        .val_ptrs
-                        .get(&target_val)
-                        .copied()
-                        .unwrap_or(target_val);
                     let gen_ref = self.alloc_value();
                     self.emit(
                         Some(gen_ref),

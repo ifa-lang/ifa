@@ -9,10 +9,10 @@ use cranelift_frontend::FunctionBuilder;
 use cranelift_module::{FuncId, Module};
 use ifa_ast::ParamMode;
 use ifa_fir::{
-    BinaryOp, BlockId, ConstantValue, FirFunction, Terminator, UnaryOp, ValueExpr, ValueId,
+    BinaryOp, BlockId, ConstantValue, FirFunction, FirType, Terminator, UnaryOp, ValueExpr, ValueId,
 };
 use ifa_sema::types::IntType;
-use ifa_span::INTERNER;
+use ifa_span::{Symbol, INTERNER};
 use std::collections::HashMap;
 
 /// Translates a single FIR function into Cranelift IR using FunctionBuilder.
@@ -21,9 +21,11 @@ pub struct FunctionTranslator<'a, M: Module> {
     module: &'a mut M,
     func_ids: &'a HashMap<String, FuncId>,
     ptr_type: types::Type,
+    struct_defs: &'a HashMap<Symbol, Vec<(Symbol, FirType)>>,
     block_map: HashMap<BlockId, ClBlock>,
     value_map: HashMap<ValueId, ClValue>,
     pointer_types: HashMap<ValueId, types::Type>,
+    pointer_fir_types: HashMap<ValueId, FirType>,
 }
 
 impl<'a, M: Module> FunctionTranslator<'a, M> {
@@ -32,15 +34,18 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         module: &'a mut M,
         func_ids: &'a HashMap<String, FuncId>,
         ptr_type: types::Type,
+        struct_defs: &'a HashMap<Symbol, Vec<(Symbol, FirType)>>,
     ) -> Self {
         Self {
             builder,
             module,
             func_ids,
             ptr_type,
+            struct_defs,
             block_map: HashMap::new(),
             value_map: HashMap::new(),
             pointer_types: HashMap::new(),
+            pointer_fir_types: HashMap::new(),
         }
     }
 
@@ -69,6 +74,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let elem_ty =
                     fir_type_to_cranelift(&param.ty, self.ptr_type).unwrap_or(self.ptr_type);
                 self.pointer_types.insert(param.val, elem_ty);
+                self.pointer_fir_types.insert(param.val, param.ty.clone());
             }
         }
 
@@ -175,15 +181,42 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
 
             ValueExpr::Alloca { ty, .. } => {
                 let elem_cl_ty = fir_type_to_cranelift(ty, self.ptr_type).unwrap_or(self.ptr_type);
-                let size = elem_cl_ty.bytes().max(1);
+                let byte_size = match ty {
+                    FirType::Struct(name, fields) if fields.is_empty() => {
+                        if let Some(def_fields) = self.struct_defs.get(name) {
+                            def_fields
+                                .iter()
+                                .map(|(_, f_ty)| crate::types::fir_type_byte_size(f_ty).max(8))
+                                .sum::<usize>()
+                                .max(8) as u32
+                        } else {
+                            crate::types::fir_type_byte_size(ty)
+                                .max(elem_cl_ty.bytes().max(1) as usize)
+                                as u32
+                        }
+                    }
+                    _ => crate::types::fir_type_byte_size(ty)
+                        .max(elem_cl_ty.bytes().max(1) as usize) as u32,
+                };
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
-                    size,
+                    byte_size,
                     0,
                 ));
                 let addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
                 if let Some(res_id) = result {
                     self.pointer_types.insert(res_id, elem_cl_ty);
+                    let populated_ty = match ty {
+                        FirType::Struct(name, fields) if fields.is_empty() => {
+                            if let Some(def_fields) = self.struct_defs.get(name) {
+                                FirType::Struct(*name, def_fields.clone())
+                            } else {
+                                ty.clone()
+                            }
+                        }
+                        _ => ty.clone(),
+                    };
+                    self.pointer_fir_types.insert(res_id, populated_ty);
                 }
                 Some(addr)
             }
@@ -191,6 +224,43 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             ValueExpr::Store { ptr, val } => {
                 let p = self.value_map[ptr];
                 let mut v = self.value_map[val];
+                if let Some(fir_ty) = self.pointer_fir_types.get(ptr) {
+                    if matches!(fir_ty, FirType::Struct(..) | FirType::Array(..)) {
+                        let total_bytes = match fir_ty {
+                            FirType::Struct(name, fields) if fields.is_empty() => {
+                                if let Some(def_fields) = self.struct_defs.get(name) {
+                                    def_fields
+                                        .iter()
+                                        .map(|(_, f_ty)| {
+                                            crate::types::fir_type_byte_size(f_ty).max(8)
+                                        })
+                                        .sum::<usize>()
+                                        .max(8)
+                                } else {
+                                    crate::types::fir_type_byte_size(fir_ty).max(8)
+                                }
+                            }
+                            _ => crate::types::fir_type_byte_size(fir_ty).max(8),
+                        };
+                        if total_bytes > 0 {
+                            for offset in (0..total_bytes).step_by(8) {
+                                let word = self.builder.ins().load(
+                                    types::I64,
+                                    MemFlagsData::trusted(),
+                                    v,
+                                    offset as i32,
+                                );
+                                self.builder.ins().store(
+                                    MemFlagsData::trusted(),
+                                    word,
+                                    p,
+                                    offset as i32,
+                                );
+                            }
+                            return Ok(None);
+                        }
+                    }
+                }
                 if let Some(&target_ty) = self.pointer_types.get(ptr) {
                     let cur_ty = self.builder.func.dfg.value_type(v);
                     if cur_ty != target_ty {
@@ -207,6 +277,24 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
 
             ValueExpr::Load { ptr } => {
                 let p = self.value_map[ptr];
+                if let Some(fir_ty) = self.pointer_fir_types.get(ptr).cloned() {
+                    if matches!(fir_ty, FirType::Struct(..) | FirType::Array(..)) {
+                        if let Some(res_id) = result {
+                            let populated = match &fir_ty {
+                                FirType::Struct(name, fields) if fields.is_empty() => {
+                                    if let Some(def_fields) = self.struct_defs.get(name) {
+                                        FirType::Struct(*name, def_fields.clone())
+                                    } else {
+                                        fir_ty.clone()
+                                    }
+                                }
+                                _ => fir_ty.clone(),
+                            };
+                            self.pointer_fir_types.insert(res_id, populated);
+                        }
+                        return Ok(Some(p));
+                    }
+                }
                 let load_ty = self.pointer_types.get(ptr).copied().unwrap_or(types::I64);
                 Some(
                     self.builder
@@ -317,12 +405,62 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             ValueExpr::CoWMakeUnique { val }
             | ValueExpr::CoWClone { val }
             | ValueExpr::GenRef { ptr: val }
-            | ValueExpr::GenDeref { ref_val: val } => Some(self.value_map[val]),
+            | ValueExpr::GenDeref { ref_val: val } => {
+                if let Some(ty) = self.pointer_fir_types.get(val).cloned() {
+                    if let Some(res_id) = result {
+                        self.pointer_fir_types.insert(res_id, ty);
+                    }
+                }
+                Some(self.value_map[val])
+            }
 
             ValueExpr::GetField {
-                base, field_idx, ..
+                base,
+                field_idx,
+                field_name: _,
             } => {
                 let p = self.value_map[base];
+                if let Some(fir_ty) = self.pointer_fir_types.get(base).cloned() {
+                    let fields = match &fir_ty {
+                        FirType::Struct(name, fields) => {
+                            if fields.is_empty() {
+                                self.struct_defs.get(name).cloned().unwrap_or_default()
+                            } else {
+                                fields.clone()
+                            }
+                        }
+                        _ => Vec::new(),
+                    };
+
+                    if !fields.is_empty() && *field_idx < fields.len() {
+                        let (_, f_ty) = &fields[*field_idx];
+                        let offset: usize = fields[0..*field_idx]
+                            .iter()
+                            .map(|(_, ty)| crate::types::fir_type_byte_size(ty).max(8))
+                            .sum();
+
+                        if matches!(f_ty, FirType::Struct(..) | FirType::Array(..)) {
+                            let f_addr = self.builder.ins().iadd_imm_s(p, offset as i64);
+                            if let Some(res_id) = result {
+                                self.pointer_fir_types.insert(res_id, f_ty.clone());
+                            }
+                            return Ok(Some(f_addr));
+                        } else {
+                            let cl_ty =
+                                fir_type_to_cranelift(f_ty, self.ptr_type).unwrap_or(types::I64);
+                            let loaded = self.builder.ins().load(
+                                cl_ty,
+                                MemFlagsData::trusted(),
+                                p,
+                                offset as i32,
+                            );
+                            if let Some(res_id) = result {
+                                self.pointer_fir_types.insert(res_id, f_ty.clone());
+                            }
+                            return Ok(Some(loaded));
+                        }
+                    }
+                }
                 let offset = (*field_idx * 8) as i32;
                 Some(
                     self.builder
@@ -332,10 +470,34 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             }
 
             ValueExpr::GetFieldPtr {
-                base, field_idx, ..
+                base,
+                field_idx,
+                field_name: _,
             } => {
                 let p = self.value_map[base];
-                let offset = (*field_idx * 8) as i64;
+                let mut offset = (*field_idx * 8) as i64;
+                if let Some(fir_ty) = self.pointer_fir_types.get(base).cloned() {
+                    let fields = match &fir_ty {
+                        FirType::Struct(name, fields) => {
+                            if fields.is_empty() {
+                                self.struct_defs.get(name).cloned().unwrap_or_default()
+                            } else {
+                                fields.clone()
+                            }
+                        }
+                        _ => Vec::new(),
+                    };
+                    if !fields.is_empty() && *field_idx < fields.len() {
+                        let f_ty = &fields[*field_idx].1;
+                        offset = fields[0..*field_idx]
+                            .iter()
+                            .map(|(_, ty)| crate::types::fir_type_byte_size(ty).max(8))
+                            .sum::<usize>() as i64;
+                        if let Some(res_id) = result {
+                            self.pointer_fir_types.insert(res_id, f_ty.clone());
+                        }
+                    }
+                }
                 Some(self.builder.ins().iadd_imm_s(p, offset))
             }
 
@@ -353,7 +515,44 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             } => {
                 let p = self.value_map[base];
                 let v = self.value_map[val];
-                let offset = (*field_idx * 8) as i32;
+                let mut offset = (*field_idx * 8) as i32;
+                if let Some(fir_ty) = self.pointer_fir_types.get(base).cloned() {
+                    let fields = match &fir_ty {
+                        FirType::Struct(name, fields) => {
+                            if fields.is_empty() {
+                                self.struct_defs.get(name).cloned().unwrap_or_default()
+                            } else {
+                                fields.clone()
+                            }
+                        }
+                        _ => Vec::new(),
+                    };
+                    if !fields.is_empty() && *field_idx < fields.len() {
+                        let f_ty = &fields[*field_idx].1;
+                        let f_size = crate::types::fir_type_byte_size(f_ty).max(8);
+                        offset = fields[0..*field_idx]
+                            .iter()
+                            .map(|(_, ty)| crate::types::fir_type_byte_size(ty).max(8))
+                            .sum::<usize>() as i32;
+                        if matches!(f_ty, FirType::Struct(..) | FirType::Array(..)) {
+                            for byte_off in (0..f_size).step_by(8) {
+                                let word = self.builder.ins().load(
+                                    types::I64,
+                                    MemFlagsData::trusted(),
+                                    v,
+                                    byte_off as i32,
+                                );
+                                self.builder.ins().store(
+                                    MemFlagsData::trusted(),
+                                    word,
+                                    p,
+                                    offset + byte_off as i32,
+                                );
+                            }
+                            return Ok(None);
+                        }
+                    }
+                }
                 self.builder
                     .ins()
                     .store(MemFlagsData::trusted(), v, p, offset);
@@ -470,7 +669,79 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 Some(base_addr)
             }
 
-            ValueExpr::StructInit { fields, .. } | ValueExpr::TupleInit(fields) => {
+            ValueExpr::StructInit { name, fields } => {
+                let st_fields = self.struct_defs.get(name);
+                let total_size = if let Some(s_fields) = st_fields {
+                    s_fields
+                        .iter()
+                        .map(|(_, ty)| crate::types::fir_type_byte_size(ty).max(8))
+                        .sum::<usize>()
+                        .max(8) as u32
+                } else {
+                    (fields.len().max(1) * 8) as u32
+                };
+
+                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    total_size,
+                    0,
+                ));
+                let base_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+
+                let mut current_offset = 0i32;
+                for (idx, field_id) in fields.iter().enumerate() {
+                    let field_val = self.value_map[field_id];
+                    let (f_ty, f_size) = if let Some(s_fields) = st_fields {
+                        if let Some((_, ty)) = s_fields.get(idx) {
+                            (Some(ty), crate::types::fir_type_byte_size(ty).max(8))
+                        } else {
+                            (None, 8)
+                        }
+                    } else {
+                        (None, 8)
+                    };
+
+                    if let Some(ty) = f_ty {
+                        if matches!(ty, FirType::Struct(..) | FirType::Array(..)) {
+                            for byte_off in (0..f_size).step_by(8) {
+                                let word = self.builder.ins().load(
+                                    types::I64,
+                                    MemFlagsData::trusted(),
+                                    field_val,
+                                    byte_off as i32,
+                                );
+                                self.builder.ins().store(
+                                    MemFlagsData::trusted(),
+                                    word,
+                                    base_addr,
+                                    current_offset + byte_off as i32,
+                                );
+                            }
+                            current_offset += f_size as i32;
+                            continue;
+                        }
+                    }
+
+                    self.builder.ins().store(
+                        MemFlagsData::trusted(),
+                        field_val,
+                        base_addr,
+                        current_offset,
+                    );
+                    current_offset += f_size as i32;
+                }
+
+                if let Some(res_id) = result {
+                    if let Some(s_fields) = st_fields {
+                        self.pointer_fir_types
+                            .insert(res_id, FirType::Struct(*name, s_fields.clone()));
+                    }
+                }
+
+                Some(base_addr)
+            }
+
+            ValueExpr::TupleInit(fields) => {
                 let count = fields.len().max(1);
                 let byte_size = (count * 8) as u32;
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(

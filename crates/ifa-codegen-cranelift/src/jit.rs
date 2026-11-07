@@ -207,6 +207,13 @@ impl JitEngine {
             self.func_ids.insert(fn_name, func_id);
         }
 
+        let struct_defs: HashMap<ifa_span::Symbol, Vec<(ifa_span::Symbol, ifa_fir::FirType)>> =
+            fir_module
+                .structs
+                .iter()
+                .map(|s| (s.name, s.fields.clone()))
+                .collect();
+
         // 2. Translate and define each function
         for fir_func in &fir_module.functions {
             let fn_name = INTERNER.resolve(&fir_func.name);
@@ -220,8 +227,13 @@ impl JitEngine {
                     &mut self.ctx.func,
                     &mut self.builder_context,
                 );
-                let translator =
-                    FunctionTranslator::new(builder, &mut self.module, &self.func_ids, ptr_type);
+                let translator = FunctionTranslator::new(
+                    builder,
+                    &mut self.module,
+                    &self.func_ids,
+                    ptr_type,
+                    &struct_defs,
+                );
                 translator.translate(fir_func)?;
             }
 

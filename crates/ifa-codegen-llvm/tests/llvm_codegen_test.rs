@@ -926,3 +926,373 @@ pub fn main() -> i64 {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_inout_and_struct_pattern_destructuring() {
+    let src = r#"
+struct Coord {
+    x: i64,
+    y: i64,
+}
+
+pub fn main() -> i64 {
+    mut c = Coord(x: 10, y: 32);
+    let Coord { inout x, inout y } = c;
+    x = x + 5;
+    y = y + 10;
+    return c.x + c.y;
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_inout_pat.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("llvm_inout_pattern_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("inout_pattern.o");
+    let bin_path = temp_dir.join("inout_pattern_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(57),
+        "Native binary output exit code must be 57 (15 + 42)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_tuple_inout_pattern_destructuring() {
+    let src = r#"
+pub fn main() -> i64 {
+    mut pair = (10, 20);
+    let (inout a, inout b) = pair;
+    a = a + 1;
+    b = b + 2;
+    let (final_a, final_b) = pair;
+    return final_a + final_b;
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_tup_inout_pat.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "llvm_tuple_inout_pattern_test_{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("tuple_inout_pattern.o");
+    let bin_path = temp_dir.join("tuple_inout_pattern_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_ref_pattern_destructuring() {
+    let src = r#"
+struct Coord {
+    x: i64,
+    y: i64,
+}
+
+pub fn main() -> i64 {
+    let c = Coord(x: 10, y: 32);
+    let Coord { ref x, ref y } = c;
+    return x + y;
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_ref_pat.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("llvm_ref_pattern_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("ref_pattern.o");
+    let bin_path = temp_dir.join("ref_pattern_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "Native binary output exit code must be 42 (10 + 32)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_tuple_ref_pattern_destructuring() {
+    let src = r#"
+pub fn main() -> i64 {
+    let pair = (40, 2);
+    let (ref a, ref b) = pair;
+    return a + b;
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_tup_ref_pat.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "llvm_tuple_ref_pattern_test_{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("tuple_ref_pattern.o");
+    let bin_path = temp_dir.join("tuple_ref_pattern_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "Native binary output exit code must be 42 (40 + 2)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_match_ref_pattern_destructuring() {
+    let src = r#"
+struct Coord {
+    x: i64,
+    y: i64,
+}
+
+pub fn main() -> i64 {
+    let c = Coord(x: 100, y: 250);
+    return match c {
+        Coord { ref x, ref y } => x + y,
+    };
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_match_ref_pat.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "llvm_match_ref_pattern_test_{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("match_ref_pattern.o");
+    let bin_path = temp_dir.join("match_ref_pattern_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(94), // 350 % 256 = 94 car exit status est sur 8 bits (0-255)
+        "Native binary output exit code must be 94 (350 % 256)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_nested_graph_destructuring_ref_bindings() {
+    let src = r#"
+struct TargetNode {
+    value: i64,
+}
+
+struct Edge {
+    weight: i64,
+    target: ref TargetNode,
+}
+
+struct GraphNode {
+    id: i64,
+    edge: Edge,
+}
+
+pub fn main() -> i64 {
+    let t = TargetNode(value: 50);
+    let ref target_ref = t;
+    let g = GraphNode(id: 3, edge: Edge(weight: 12, target: target_ref));
+    let GraphNode { id, edge: Edge { weight, ref target } } = g;
+    return id + weight + target.value;
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_nested_graph.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("llvm_nested_graph_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("nested_graph.o");
+    let bin_path = temp_dir.join("nested_graph_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(65),
+        "Native binary output exit code must be 65 (3 + 12 + 50)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

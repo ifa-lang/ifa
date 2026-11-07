@@ -804,3 +804,162 @@ fn test_cranelift_slice_pattern_matching_jit() {
     // a = 0, b = 57, c = 60 => 117
     assert_eq!(result, 117);
 }
+
+#[test]
+fn test_cranelift_inout_pattern_destructuring() {
+    let src = r#"
+        struct Coord {
+            x: i64,
+            y: i64,
+        }
+
+        pub fn main() -> i64 {
+            mut c = Coord(x: 10, y: 32);
+            let Coord { inout x, inout y } = c;
+            x = x + 5;
+            y = y + 10;
+            return c.x + c.y;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("jit_inout_pat.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 57);
+}
+
+#[test]
+fn test_cranelift_ref_pattern_destructuring() {
+    let src = r#"
+        struct Coord {
+            x: i64,
+            y: i64,
+        }
+
+        pub fn main() -> i64 {
+            let c = Coord(x: 10, y: 32);
+            let Coord { ref x, ref y } = c;
+            return x + y;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("jit_ref_pat.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 42);
+}
+
+#[test]
+fn test_cranelift_match_ref_pattern_destructuring() {
+    let src = r#"
+        struct Coord {
+            x: i64,
+            y: i64,
+        }
+
+        pub fn main() -> i64 {
+            let c = Coord(x: 100, y: 250);
+            return match c {
+                Coord { ref x, ref y } => x + y,
+            };
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("jit_match_ref_pat.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 350);
+}
+
+#[test]
+fn test_cranelift_nested_graph_destructuring_ref_bindings() {
+    let src = r#"
+        struct TargetNode {
+            value: i64,
+        }
+
+        struct Edge {
+            weight: i64,
+            target: ref TargetNode,
+        }
+
+        struct GraphNode {
+            id: i64,
+            edge: Edge,
+        }
+
+        pub fn main() -> i64 {
+            let t = TargetNode(value: 50);
+            let ref target_ref = t;
+            let g = GraphNode(id: 3, edge: Edge(weight: 12, target: target_ref));
+            let GraphNode { id, edge: Edge { weight, ref target } } = g;
+            return id + weight + target.value;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("nested_graph_jit.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    // 3 + 12 + 50 = 65
+    assert_eq!(result, 65);
+}

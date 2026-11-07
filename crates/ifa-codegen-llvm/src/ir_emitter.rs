@@ -694,6 +694,44 @@ impl<'a> LlvmIrEmitter<'a> {
                             ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                         }
                         ValueExpr::EnumGetPayload { payload_ty, .. } => payload_ty.clone(),
+                        ValueExpr::GenRef { ptr } => match value_types.get(ptr) {
+                            Some(inner) => {
+                                ifa_fir::FirType::GenerationalRef(Box::new(inner.clone()))
+                            }
+                            None => ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Int(
+                                ifa_sema::types::IntType::I64,
+                            ))),
+                        },
+                        ValueExpr::GenDeref { ref_val } => match value_types.get(ref_val) {
+                            Some(ifa_fir::FirType::GenerationalRef(inner)) => (**inner).clone(),
+                            _ => ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Int(
+                                ifa_sema::types::IntType::I64,
+                            ))),
+                        },
+                        ValueExpr::GetFieldPtr {
+                            base, field_idx, ..
+                        } => match value_types.get(base) {
+                            Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
+                                ifa_fir::FirType::Struct(_, fields)
+                                    if *field_idx < fields.len() =>
+                                {
+                                    ifa_fir::FirType::Pointer(Box::new(
+                                        fields[*field_idx].1.clone(),
+                                    ))
+                                }
+                                _ => ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Int(
+                                    ifa_sema::types::IntType::I64,
+                                ))),
+                            },
+                            Some(ifa_fir::FirType::Struct(_, fields))
+                                if *field_idx < fields.len() =>
+                            {
+                                ifa_fir::FirType::Pointer(Box::new(fields[*field_idx].1.clone()))
+                            }
+                            _ => ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Int(
+                                ifa_sema::types::IntType::I64,
+                            ))),
+                        },
                         _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
                     };
                     value_types.insert(res, ty);
@@ -1199,6 +1237,12 @@ impl<'a> LlvmIrEmitter<'a> {
                 out.push_str(&format!(
                     "  %v{} = getelementptr inbounds i64, ptr %v{}, i64 %v{}\n",
                     res_id, base.0, index.0
+                ));
+            }
+            ValueExpr::GenRef { ptr } | ValueExpr::GenDeref { ref_val: ptr } => {
+                out.push_str(&format!(
+                    "  %v{} = getelementptr i8, ptr %v{}, i64 0\n",
+                    res_id, ptr.0
                 ));
             }
             ValueExpr::GetElement { base, index } => {
