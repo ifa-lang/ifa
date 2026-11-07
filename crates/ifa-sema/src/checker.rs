@@ -11,7 +11,7 @@ use ifa_ast::{
 };
 use ifa_diagnostics::Diagnostic;
 use ifa_span::{SourceMap, Span, Symbol, INTERNER};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Control-flow sensitive type narrowing facts deduced from conditional expressions.
 #[derive(Debug, Clone, Default)]
@@ -2072,6 +2072,138 @@ impl<'a> SemanticAnalyzer<'a> {
                             );
                         }
                         (None, None) => {}
+                    }
+                }
+            }
+            Pattern::Tuple(elems, span) => match target_ty {
+                Type::Tuple(expected_elems) => {
+                    if elems.len() != expected_elems.len() {
+                        self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "le motif tuple contient {} élément(s), mais le type attendu '{}' en contient {}",
+                                    elems.len(),
+                                    target_ty,
+                                    expected_elems.len()
+                                ))
+                                .with_code("E0036")
+                                .with_primary_label(*span, "arité de tuple incompatible"),
+                            );
+                    } else {
+                        for (elem_pat, elem_ty) in elems.iter().zip(expected_elems.iter()) {
+                            self.check_pattern(elem_pat, elem_ty);
+                        }
+                    }
+                }
+                Type::Unit if elems.is_empty() => {}
+                Type::Unknown => {
+                    for elem_pat in elems {
+                        self.check_pattern(elem_pat, &Type::Unknown);
+                    }
+                }
+                _ => {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "le motif tuple est incompatible avec le type non-tuple '{}'",
+                            target_ty
+                        ))
+                        .with_code("E0036")
+                        .with_primary_label(*span, "type de motif incompatible"),
+                    );
+                }
+            },
+            Pattern::Struct {
+                name,
+                fields,
+                has_rest,
+                span,
+            } => {
+                let st_name = match name.last() {
+                    Some(sym) => *sym,
+                    None => return,
+                };
+
+                let st_opt = self.symbols.lookup_struct(&st_name).cloned();
+                if st_opt.is_none() {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "structure inconnue '{}'",
+                            INTERNER.resolve(&st_name)
+                        ))
+                        .with_code("E0006")
+                        .with_primary_label(*span, "structure inconnue"),
+                    );
+                    return;
+                }
+                let st = st_opt.unwrap();
+
+                // Check type compatibility
+                let is_compatible = match target_ty {
+                    Type::Struct { name: t_name, .. } => *t_name == st_name,
+                    Type::Generic { name: t_name, .. } => *t_name == st_name,
+                    Type::Unknown => true,
+                    _ => false,
+                };
+
+                if !is_compatible {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "le motif de structure '{}' ne correspond pas au type '{}'",
+                            INTERNER.resolve(&st_name),
+                            target_ty
+                        ))
+                        .with_code("E0036")
+                        .with_primary_label(*span, "type de motif incompatible"),
+                    );
+                    return;
+                }
+
+                let mut type_subst: HashMap<Symbol, Type> = HashMap::new();
+                if let Type::Generic { args, .. } = target_ty {
+                    for (g, a) in st.generics.iter().zip(args.iter()) {
+                        type_subst.insert(g.name, a.clone());
+                    }
+                }
+
+                let mut bound_fields = HashSet::new();
+                for f in fields {
+                    bound_fields.insert(f.name);
+                    if let Some(f_sym) = st.get_field(&f.name) {
+                        let expected_field_ty = if type_subst.is_empty() {
+                            f_sym.ty.clone()
+                        } else {
+                            f_sym.ty.substitute(&type_subst)
+                        };
+                        self.check_pattern(&f.pattern, &expected_field_ty);
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "le champ '{}' n'existe pas dans la structure '{}'",
+                                INTERNER.resolve(&f.name),
+                                INTERNER.resolve(&st_name)
+                            ))
+                            .with_code("E0037")
+                            .with_primary_label(f.span, "champ inconnu"),
+                        );
+                    }
+                }
+
+                if !has_rest && bound_fields.len() < st.fields.len() {
+                    let missing_fields: Vec<String> = st
+                        .fields
+                        .iter()
+                        .filter(|f| !bound_fields.contains(&f.name))
+                        .map(|f| INTERNER.resolve(&f.name).to_string())
+                        .collect();
+                    if !missing_fields.is_empty() {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "motif incomplet pour la structure '{}' : champs manquants : {}. Utilisez '..' pour ignorer les champs restants",
+                                INTERNER.resolve(&st_name),
+                                missing_fields.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", ")
+                            ))
+                            .with_code("E0043")
+                            .with_primary_label(*span, "champs omis non ignorés"),
+                        );
                     }
                 }
             }

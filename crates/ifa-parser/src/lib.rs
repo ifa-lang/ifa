@@ -1517,6 +1517,35 @@ impl Parser {
         let cur = self.current();
         let pat_start = cur.span.start;
         match cur.kind {
+            TokenKind::OpenParen => {
+                self.advance();
+                if self.match_token(&TokenKind::CloseParen) {
+                    let span = Span::new(
+                        self.file_id,
+                        pat_start,
+                        self.tokens[self.cursor - 1].span.end,
+                    );
+                    Ok(Pattern::Tuple(Vec::new(), span))
+                } else {
+                    let mut elems = Vec::new();
+                    elems.push(self.parse_pattern()?);
+                    let mut has_trailing_comma = false;
+                    while self.match_token(&TokenKind::Comma) {
+                        has_trailing_comma = true;
+                        if self.check(&TokenKind::CloseParen) {
+                            break;
+                        }
+                        elems.push(self.parse_pattern()?);
+                    }
+                    let close = self.expect(TokenKind::CloseParen)?;
+                    let span = Span::new(self.file_id, pat_start, close.span.end);
+                    if elems.len() == 1 && !has_trailing_comma {
+                        Ok(elems.into_iter().next().unwrap())
+                    } else {
+                        Ok(Pattern::Tuple(elems, span))
+                    }
+                }
+            }
             TokenKind::Ident(s) => {
                 self.advance();
                 if s.as_str() == "_" {
@@ -1525,47 +1554,105 @@ impl Parser {
                         pat_start,
                         cur.span.end,
                     )))
-                } else if self.match_token(&TokenKind::ColonColon) {
-                    let variant_tok = self.current();
-                    let variant_sym = match variant_tok.kind {
-                        TokenKind::Ident(v) => {
-                            self.advance();
-                            v
+                } else {
+                    let mut path = vec![s];
+                    while self.match_token(&TokenKind::ColonColon) {
+                        let next_tok = self.current();
+                        match next_tok.kind {
+                            TokenKind::Ident(next_sym) => {
+                                self.advance();
+                                path.push(next_sym);
+                            }
+                            _ => {
+                                let diag = Diagnostic::error(
+                                    "nom de variant ou de structure attendu après '::'",
+                                )
+                                .with_primary_label(next_tok.span, "identifiant attendu");
+                                self.diagnostics.push(diag.clone());
+                                return Err(diag);
+                            }
                         }
-                        _ => {
-                            let diag = Diagnostic::error("nom de variant attendu après '::'")
-                                .with_primary_label(variant_tok.span, "identifiant attendu");
-                            self.diagnostics.push(diag.clone());
-                            return Err(diag);
+                    }
+
+                    if self.match_token(&TokenKind::OpenBrace) {
+                        let mut fields = Vec::new();
+                        let mut has_rest = false;
+                        while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
+                            if self.match_token(&TokenKind::DotDot) {
+                                has_rest = true;
+                                let _ = self.match_token(&TokenKind::Comma);
+                                break;
+                            }
+                            let f_tok = self.current();
+                            let f_name = match f_tok.kind {
+                                TokenKind::Ident(name) => {
+                                    self.advance();
+                                    name
+                                }
+                                _ => {
+                                    let diag = Diagnostic::error(
+                                        "nom de champ ou '..' attendu dans le motif de structure",
+                                    )
+                                    .with_primary_label(f_tok.span, "nom de champ attendu");
+                                    self.diagnostics.push(diag.clone());
+                                    return Err(diag);
+                                }
+                            };
+                            let (f_pat, f_end) = if self.match_token(&TokenKind::Colon) {
+                                let pat = self.parse_pattern()?;
+                                let end = pat.span().end;
+                                (pat, end)
+                            } else {
+                                (Pattern::Ident(f_name, f_tok.span), f_tok.span.end)
+                            };
+                            fields.push(StructPatternField {
+                                name: f_name,
+                                pattern: f_pat,
+                                span: Span::new(self.file_id, f_tok.span.start, f_end),
+                            });
+                            if !self.match_token(&TokenKind::Comma) {
+                                break;
+                            }
                         }
-                    };
-                    let (inner, end_pos) = if self.match_token(&TokenKind::OpenParen) {
+                        let close = self.expect(TokenKind::CloseBrace)?;
+                        Ok(Pattern::Struct {
+                            name: path,
+                            fields,
+                            has_rest,
+                            span: Span::new(self.file_id, pat_start, close.span.end),
+                        })
+                    } else if self.match_token(&TokenKind::OpenParen) {
                         let inner_pat = self.parse_pattern()?;
                         let close = self.expect(TokenKind::CloseParen)?;
-                        (Some(Box::new(inner_pat)), close.span.end)
+                        let (enum_name, variant) = if path.len() > 1 {
+                            let v = path.pop().unwrap();
+                            let e = path.pop();
+                            (e, v)
+                        } else {
+                            (None, path[0])
+                        };
+                        Ok(Pattern::Variant {
+                            enum_name,
+                            variant,
+                            inner: Some(Box::new(inner_pat)),
+                            span: Span::new(self.file_id, pat_start, close.span.end),
+                        })
+                    } else if path.len() > 1 {
+                        let v = path.pop().unwrap();
+                        let e = path.pop();
+                        let last_end = self.tokens[self.cursor - 1].span.end;
+                        Ok(Pattern::Variant {
+                            enum_name: e,
+                            variant: v,
+                            inner: None,
+                            span: Span::new(self.file_id, pat_start, last_end),
+                        })
                     } else {
-                        (None, variant_tok.span.end)
-                    };
-                    Ok(Pattern::Variant {
-                        enum_name: Some(s),
-                        variant: variant_sym,
-                        inner,
-                        span: Span::new(self.file_id, pat_start, end_pos),
-                    })
-                } else if self.match_token(&TokenKind::OpenParen) {
-                    let inner_pat = self.parse_pattern()?;
-                    let close = self.expect(TokenKind::CloseParen)?;
-                    Ok(Pattern::Variant {
-                        enum_name: None,
-                        variant: s,
-                        inner: Some(Box::new(inner_pat)),
-                        span: Span::new(self.file_id, pat_start, close.span.end),
-                    })
-                } else {
-                    Ok(Pattern::Ident(
-                        s,
-                        Span::new(self.file_id, pat_start, cur.span.end),
-                    ))
+                        Ok(Pattern::Ident(
+                            s,
+                            Span::new(self.file_id, pat_start, cur.span.end),
+                        ))
+                    }
                 }
             }
             TokenKind::IntLiteral(s) => {

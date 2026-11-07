@@ -708,3 +708,83 @@ pub fn main() -> i64 {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_tuple_and_struct_pattern_matching_native() {
+    let src = r#"
+struct Coord {
+    x: i64,
+    y: i64,
+}
+
+fn eval_coord(c: Coord) -> i64 {
+    return match c {
+        Coord { x: 0, y: 0 } => 10,
+        Coord { x: 0, y } => y,
+        Coord { x, y } => x + y,
+    }
+}
+
+fn eval_pair(p: (i64, i64)) -> i64 {
+    return match p {
+        (0, 0) => 20,
+        (0, b) => b * 2,
+        (a, b) => a + b,
+    }
+}
+
+pub fn main() -> i64 {
+    let c1 = eval_coord(Coord(x: 0, y: 0));
+    let c2 = eval_coord(Coord(x: 10, y: 30));
+    let p1 = eval_pair((0, 0));
+    let p2 = eval_pair((0, 15));
+    let p3 = eval_pair((7, 8));
+
+    return c1 + c2 + p1 + p2 + p3;
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_struct_tup.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir = std::env::temp_dir().join(format!("llvm_agg_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("agg.o");
+    let bin_path = temp_dir.join("agg_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(115),
+        "Native binary output exit code must be 115 (10 + 40 + 20 + 30 + 15)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

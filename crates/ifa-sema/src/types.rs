@@ -270,6 +270,16 @@ impl Type {
             }
         }
 
+        // Tuple to Tuple compatibility
+        if let (Type::Tuple(src_elems), Type::Tuple(target_elems)) = (self, target) {
+            if src_elems.len() == target_elems.len() {
+                return src_elems
+                    .iter()
+                    .zip(target_elems.iter())
+                    .all(|(s, t)| s.is_assignable_to(t));
+            }
+        }
+
         // Ref(T) assignable to Ref(T)
         if let (Type::Ref(src_inner), Type::Ref(target_inner)) = (self, target) {
             return src_inner.is_assignable_to(target_inner);

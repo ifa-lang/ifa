@@ -310,6 +310,13 @@ pub struct SelectArm {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct StructPatternField {
+    pub name: Symbol,
+    pub pattern: Pattern,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     Wildcard(Span),
     Lit(Lit, Span),
@@ -318,6 +325,13 @@ pub enum Pattern {
         enum_name: Option<Symbol>,
         variant: Symbol,
         inner: Option<Box<Pattern>>,
+        span: Span,
+    },
+    Tuple(Vec<Pattern>, Span),
+    Struct {
+        name: Vec<Symbol>,
+        fields: Vec<StructPatternField>,
+        has_rest: bool,
         span: Span,
     },
 }
@@ -329,6 +343,8 @@ impl Pattern {
             Pattern::Lit(_, sp) => *sp,
             Pattern::Ident(_, sp) => *sp,
             Pattern::Variant { span, .. } => *span,
+            Pattern::Tuple(_, sp) => *sp,
+            Pattern::Struct { span, .. } => *span,
         }
     }
 }

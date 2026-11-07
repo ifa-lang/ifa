@@ -100,6 +100,7 @@ impl SroaPass {
 
         // Step 5: Optimize tagged unions (fold discriminants, forward payloads, fold branch conds)
         self.optimize_tagged_unions(func);
+        self.optimize_aggregate_projections(func);
 
         // Step 6: Clean up dead pure instructions
         self.eliminate_dead_instructions(func);
@@ -935,6 +936,62 @@ impl SroaPass {
         }
 
         // Apply payload substitutions across instructions and terminators
+        if !substitutions.is_empty() {
+            Self::resolve_substitution_chains(&mut substitutions);
+            for block in &mut func.blocks {
+                for inst in &mut block.instructions {
+                    Self::substitute_instruction_operands(inst, &substitutions);
+                }
+                if let Some(term) = &mut block.terminator {
+                    Self::substitute_terminator_operands(term, &substitutions);
+                }
+            }
+        }
+    }
+
+    /// Directly folds field projections (`GetField`) on known SSA aggregates (`StructInit` / `TupleInit`).
+    fn optimize_aggregate_projections(&mut self, func: &mut FirFunction) {
+        let mut aggregate_inits: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+        let mut substitutions: HashMap<ValueId, ValueId> = HashMap::new();
+
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Some(res) = inst.result {
+                    match &inst.expr {
+                        ValueExpr::StructInit { fields, .. } | ValueExpr::TupleInit(fields) => {
+                            aggregate_inits.insert(res, fields.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if aggregate_inits.is_empty() {
+            return;
+        }
+
+        for block in &mut func.blocks {
+            for inst in &mut block.instructions {
+                if let Some(res) = inst.result {
+                    if let ValueExpr::GetField {
+                        base, field_idx, ..
+                    } = &inst.expr
+                    {
+                        let actual_base = substitutions.get(base).copied().unwrap_or(*base);
+                        if let Some(fields) = aggregate_inits.get(&actual_base) {
+                            if let Some(&field_val) = fields.get(*field_idx) {
+                                let actual_val =
+                                    substitutions.get(&field_val).copied().unwrap_or(field_val);
+                                substitutions.insert(res, actual_val);
+                                self.stats.forwarded_payloads += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if !substitutions.is_empty() {
             Self::resolve_substitution_chains(&mut substitutions);
             for block in &mut func.blocks {

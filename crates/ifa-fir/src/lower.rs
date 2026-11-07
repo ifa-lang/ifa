@@ -2999,6 +2999,149 @@ impl<'a> FunctionLoweringContext<'a> {
                     });
                 }
             }
+            Pattern::Tuple(sub_patterns, t_span) => {
+                if sub_patterns.is_empty() {
+                    self.set_terminator(Terminator::Branch {
+                        target: success_target,
+                        args: Vec::new(),
+                    });
+                    return;
+                }
+
+                let total_sub = sub_patterns.len();
+                let mut intermediate_blocks = Vec::with_capacity(total_sub);
+                intermediate_blocks.push(self.current_block);
+                for _ in 0..total_sub - 1 {
+                    intermediate_blocks.push(self.alloc_block());
+                }
+
+                for (idx, sub_pat) in sub_patterns.iter().enumerate() {
+                    let block_for_this = intermediate_blocks[idx];
+                    let next_success = if idx + 1 < total_sub {
+                        intermediate_blocks[idx + 1]
+                    } else {
+                        success_target
+                    };
+
+                    self.current_block = block_for_this;
+
+                    let elem_fir_ty = match target_ty {
+                        FirType::Struct(_, fields) if idx < fields.len() => fields[idx].1.clone(),
+                        _ => FirType::Int(IntType::I64),
+                    };
+
+                    let elem_val = self.alloc_value();
+                    let field_name = INTERNER.intern(&format!("_{}", idx));
+                    self.emit(
+                        Some(elem_val),
+                        ValueExpr::GetField {
+                            base: target_val,
+                            field_idx: idx,
+                            field_name,
+                        },
+                        *t_span,
+                    );
+
+                    self.lower_pattern_match(
+                        elem_val,
+                        &elem_fir_ty,
+                        sub_pat,
+                        next_success,
+                        fail_target,
+                        *t_span,
+                    );
+                }
+            }
+            Pattern::Struct {
+                name,
+                fields,
+                span: s_span,
+                ..
+            } => {
+                if fields.is_empty() {
+                    self.set_terminator(Terminator::Branch {
+                        target: success_target,
+                        args: Vec::new(),
+                    });
+                    return;
+                }
+
+                let total_fields = fields.len();
+                let mut intermediate_blocks = Vec::with_capacity(total_fields);
+                intermediate_blocks.push(self.current_block);
+                for _ in 0..total_fields - 1 {
+                    intermediate_blocks.push(self.alloc_block());
+                }
+
+                let st_name = name.last().copied();
+
+                for (idx, f) in fields.iter().enumerate() {
+                    let block_for_this = intermediate_blocks[idx];
+                    let next_success = if idx + 1 < total_fields {
+                        intermediate_blocks[idx + 1]
+                    } else {
+                        success_target
+                    };
+
+                    self.current_block = block_for_this;
+
+                    let (field_idx, field_ty) = match target_ty {
+                        FirType::Struct(s_sym, struct_fields) => {
+                            if let Some(pos) = struct_fields
+                                .iter()
+                                .position(|(f_name, _)| *f_name == f.name)
+                            {
+                                (pos, struct_fields[pos].1.clone())
+                            } else if let Some(st) = self.symbols.lookup_struct(s_sym) {
+                                let pos = st.field_indices.get(&f.name).copied().unwrap_or(idx);
+                                let ty = st
+                                    .get_field(&f.name)
+                                    .map(|fl| FirType::from_sema_type(&fl.ty))
+                                    .unwrap_or(FirType::Int(IntType::I64));
+                                (pos, ty)
+                            } else {
+                                (idx, FirType::Int(IntType::I64))
+                            }
+                        }
+                        _ => {
+                            if let Some(ref s_sym) = st_name {
+                                if let Some(st) = self.symbols.lookup_struct(s_sym) {
+                                    let pos = st.field_indices.get(&f.name).copied().unwrap_or(idx);
+                                    let ty = st
+                                        .get_field(&f.name)
+                                        .map(|fl| FirType::from_sema_type(&fl.ty))
+                                        .unwrap_or(FirType::Int(IntType::I64));
+                                    (pos, ty)
+                                } else {
+                                    (idx, FirType::Int(IntType::I64))
+                                }
+                            } else {
+                                (idx, FirType::Int(IntType::I64))
+                            }
+                        }
+                    };
+
+                    let field_val = self.alloc_value();
+                    self.emit(
+                        Some(field_val),
+                        ValueExpr::GetField {
+                            base: target_val,
+                            field_idx,
+                            field_name: f.name,
+                        },
+                        f.span,
+                    );
+
+                    self.lower_pattern_match(
+                        field_val,
+                        &field_ty,
+                        &f.pattern,
+                        next_success,
+                        fail_target,
+                        *s_span,
+                    );
+                }
+            }
         }
     }
 }

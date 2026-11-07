@@ -660,3 +660,60 @@ fn test_cranelift_jit_adt_and_match_guards() {
     let result = jit.run_main().expect("Failed to execute native main");
     assert_eq!(result, 375);
 }
+
+#[test]
+fn test_cranelift_jit_tuple_and_struct_match_destructuring() {
+    let src = r#"
+        struct Coord {
+            x: i64,
+            y: i64
+        }
+
+        fn eval_coord(c: Coord) -> i64 {
+            return match c {
+                Coord { x: 0, y: 0 } => 10,
+                Coord { x: 0, y } => y,
+                Coord { x, y } => x + y,
+            }
+        }
+
+        fn eval_pair(p: (i64, i64)) -> i64 {
+            return match p {
+                (0, 0) => 20,
+                (0, b) => b * 2,
+                (a, b) => a + b,
+            }
+        }
+
+        pub fn main() -> i64 {
+            let c1 = eval_coord(Coord(x: 0, y: 0));
+            let c2 = eval_coord(Coord(x: 10, y: 30));
+            let p1 = eval_pair((0, 0));
+            let p2 = eval_pair((0, 15));
+            let p3 = eval_pair((7, 8));
+
+            return c1 + c2 + p1 + p2 + p3;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("cranelift_struct_tup.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    // c1: 10, c2: 40, p1: 20, p2: 30, p3: 15 => 10 + 40 + 20 + 30 + 15 = 115
+    assert_eq!(result, 115);
+}

@@ -1538,3 +1538,153 @@ fn test_match_exhaustive_enum_and_bool_succeeds() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_tuple_pattern_matching_valid() {
+    let code = r#"
+        fn classify_pair(pair: (i64, i64)) -> i64 {
+            return match pair {
+                (0, 0) => 0,
+                (0, y) => y,
+                (x, 0) => x,
+                (x, y) => x + y,
+            }
+        }
+
+        pub fn main() {
+            let res = classify_pair((10, 20));
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Tuple pattern matching must succeed without semantic errors: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_tuple_pattern_arite_mismatch_reported() {
+    let code = r#"
+        fn bad_tuple_match(pair: (i64, i64)) -> i64 {
+            return match pair {
+                (x, y, z) => x + y + z,
+                _ => 0,
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Mismatched tuple pattern arity must emit diagnostic"
+    );
+    assert!(res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0036")));
+}
+
+#[test]
+fn test_struct_pattern_matching_valid() {
+    let code = r#"
+        struct Point {
+            x: i64,
+            y: i64
+        }
+
+        fn check_origin(p: Point) -> i64 {
+            return match p {
+                Point { x: 0, y: 0 } => 0,
+                Point { x: 0, y } => y,
+                Point { x, y } => x + y,
+            }
+        }
+
+        pub fn main() {
+            let p = Point(x: 10, y: 20);
+            let c = check_origin(p);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Struct pattern matching must succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_struct_pattern_with_rest_pattern_valid() {
+    let code = r#"
+        struct User {
+            id: i64,
+            name: String,
+            active: bool
+        }
+
+        fn get_id(u: User) -> i64 {
+            return match u {
+                User { id, .. } => id,
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Struct pattern with '..' rest pattern must succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_struct_pattern_missing_field_without_rest_reported() {
+    let code = r#"
+        struct Point {
+            x: i64,
+            y: i64
+        }
+
+        fn partial(p: Point) -> i64 {
+            return match p {
+                Point { x } => x,
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Omitted fields without '..' must report non-exhaustive / incomplete pattern"
+    );
+    assert!(res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0043")));
+}
+
+#[test]
+fn test_nested_recursive_tuple_and_struct_patterns() {
+    let code = r#"
+        struct Vector {
+            coords: (i64, i64),
+            scale: i64
+        }
+
+        fn process_vec(v: Vector) -> i64 {
+            return match v {
+                Vector { coords: (0, 0), scale } => scale,
+                Vector { coords: (x, y), scale } => (x + y) * scale,
+            }
+        }
+
+        pub fn main() {
+            let v = Vector(coords: (3, 4), scale: 2);
+            let res = process_vec(v);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Nested recursive tuple and struct patterns must succeed: {:?}",
+        res.diagnostics
+    );
+}

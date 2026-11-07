@@ -26,6 +26,16 @@ fn format_missing_list(items: &[String]) -> String {
         .join(", ")
 }
 
+/// Helper returning whether a pattern unconditionally matches any value of its type.
+fn is_irrefutable_pattern(pat: &Pattern) -> bool {
+    match pat {
+        Pattern::Wildcard(_) | Pattern::Ident(_, _) => true,
+        Pattern::Tuple(elems, _) => elems.iter().all(is_irrefutable_pattern),
+        Pattern::Struct { fields, .. } => fields.iter().all(|f| is_irrefutable_pattern(&f.pattern)),
+        Pattern::Variant { .. } | Pattern::Lit(_, _) => false,
+    }
+}
+
 /// Checks pattern exhaustiveness and dead arm / unreachable pattern usefulness in a `match` expression.
 ///
 /// Emits:
@@ -171,22 +181,30 @@ pub fn check_match_exhaustiveness(
 
         // 2. Accumulate Coverage (ONLY for unguarded arms)
         if !is_guarded {
-            match &arm.pattern {
-                Pattern::Wildcard(_) | Pattern::Ident(_, _) => {
-                    has_universal_catch_all = true;
-                    if let Some(ref all_variants) = enum_variants_info {
-                        for (v, _) in all_variants {
-                            fully_covered_variants.insert(*v);
-                        }
-                    }
-                    if *target_ty == Type::Bool {
-                        covered_true = true;
-                        covered_false = true;
+            if is_irrefutable_pattern(&arm.pattern) {
+                has_universal_catch_all = true;
+                if let Some(ref all_variants) = enum_variants_info {
+                    for (v, _) in all_variants {
+                        fully_covered_variants.insert(*v);
                     }
                 }
+                if *target_ty == Type::Bool {
+                    covered_true = true;
+                    covered_false = true;
+                }
+            }
+
+            match &arm.pattern {
+                Pattern::Wildcard(_)
+                | Pattern::Ident(_, _)
+                | Pattern::Tuple(_, _)
+                | Pattern::Struct { .. } => {}
                 Pattern::Variant { variant, inner, .. } => {
                     match inner.as_deref() {
                         None | Some(Pattern::Wildcard(_)) | Some(Pattern::Ident(_, _)) => {
+                            fully_covered_variants.insert(*variant);
+                        }
+                        Some(p) if is_irrefutable_pattern(p) => {
                             fully_covered_variants.insert(*variant);
                         }
                         Some(Pattern::Lit(lit, _)) => {
@@ -196,8 +214,10 @@ pub fn check_match_exhaustiveness(
                                 .or_default()
                                 .insert(lit_key);
                         }
-                        Some(Pattern::Variant { .. }) => {
-                            // Sub-variant: does not fully cover unless it covers all sub-cases
+                        Some(Pattern::Variant { .. })
+                        | Some(Pattern::Tuple(_, _))
+                        | Some(Pattern::Struct { .. }) => {
+                            // Sub-pattern does not fully cover unless irrefutable
                         }
                     }
                 }
@@ -267,10 +287,10 @@ pub fn check_match_exhaustiveness(
             );
         }
     } else {
-        // Scalar types (int, float, string, char, etc.) have infinite or open domains
+        // Scalar types (int, float, string, char, etc.) and aggregates without universal catch-all
         diagnostics.push(
             Diagnostic::error(format!(
-                "le filtrage par motif n'est pas exhaustif : un motif générique '_' ou une variable de repli est requis pour le type '{}'",
+                "le filtrage par motif n'est pas exhaustif : un motif universel ou une variable de repli '_' est requis pour le type '{}'",
                 target_ty
             ))
             .with_code("E0043")
