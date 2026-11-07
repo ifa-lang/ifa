@@ -996,6 +996,36 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let sub_addr = self.builder.ins().iadd(base_addr, offset);
                 Some(sub_addr)
             }
+
+            ValueExpr::FormatString(parts) => {
+                if parts.is_empty() {
+                    let zero = self.builder.ins().iconst(self.ptr_type, 0);
+                    if let Some(func_id) = self.func_ids.get("ifa_rt_string_concat") {
+                        let local_func = self
+                            .module
+                            .declare_func_in_func(*func_id, self.builder.func);
+                        let call = self.builder.ins().call(local_func, &[zero, zero]);
+                        let results = self.builder.inst_results(call);
+                        Some(results.first().copied().unwrap_or(zero))
+                    } else {
+                        Some(zero)
+                    }
+                } else {
+                    let mut curr = self.translate_part_to_str_ptr(parts[0]);
+                    for &part in &parts[1..] {
+                        let part_val = self.translate_part_to_str_ptr(part);
+                        if let Some(func_id) = self.func_ids.get("ifa_rt_string_concat") {
+                            let local_func = self
+                                .module
+                                .declare_func_in_func(*func_id, self.builder.func);
+                            let call = self.builder.ins().call(local_func, &[curr, part_val]);
+                            let results = self.builder.inst_results(call);
+                            curr = results.first().copied().unwrap_or(curr);
+                        }
+                    }
+                    Some(curr)
+                }
+            }
         };
 
         Ok(val)
@@ -1162,5 +1192,56 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             }
         }
         Ok(())
+    }
+
+    fn translate_part_to_str_ptr(&mut self, part: ValueId) -> ClValue {
+        let val = self.value_map[&part];
+        let val_ty = self.builder.func.dfg.value_type(val);
+        if val_ty == types::I64 || val_ty == types::I32 {
+            let i64_val = if val_ty == types::I32 {
+                self.builder.ins().sextend(types::I64, val)
+            } else {
+                val
+            };
+            if let Some(func_id) = self.func_ids.get("ifa_rt_string_from_i64") {
+                let local_func = self
+                    .module
+                    .declare_func_in_func(*func_id, self.builder.func);
+                let call = self.builder.ins().call(local_func, &[i64_val]);
+                let results = self.builder.inst_results(call);
+                results.first().copied().unwrap_or(val)
+            } else {
+                val
+            }
+        } else if val_ty == types::F64 || val_ty == types::F32 {
+            let f64_val = if val_ty == types::F32 {
+                self.builder.ins().fpromote(types::F64, val)
+            } else {
+                val
+            };
+            if let Some(func_id) = self.func_ids.get("ifa_rt_string_from_f64") {
+                let local_func = self
+                    .module
+                    .declare_func_in_func(*func_id, self.builder.func);
+                let call = self.builder.ins().call(local_func, &[f64_val]);
+                let results = self.builder.inst_results(call);
+                results.first().copied().unwrap_or(val)
+            } else {
+                val
+            }
+        } else if val_ty == types::I8 {
+            if let Some(func_id) = self.func_ids.get("ifa_rt_string_from_bool") {
+                let local_func = self
+                    .module
+                    .declare_func_in_func(*func_id, self.builder.func);
+                let call = self.builder.ins().call(local_func, &[val]);
+                let results = self.builder.inst_results(call);
+                results.first().copied().unwrap_or(val)
+            } else {
+                val
+            }
+        } else {
+            val
+        }
     }
 }

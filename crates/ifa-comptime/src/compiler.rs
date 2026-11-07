@@ -590,6 +590,14 @@ impl Compiler {
             ExprKind::Spawn(inner) => {
                 self.compile_expr(inner)?;
             }
+            ExprKind::InterpolatedString(parts) => {
+                let idx = self.chunk.add_constant(Value::String(String::new()));
+                self.chunk.emit(OpCode::Const(idx), expr.span);
+                for part in parts {
+                    self.compile_expr(part)?;
+                    self.chunk.emit(OpCode::Add, expr.span);
+                }
+            }
             _ => {
                 return Err(ComptimeError::new(
                     ComptimeErrorKind::CompileError(format!(

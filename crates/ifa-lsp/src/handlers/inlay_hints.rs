@@ -219,6 +219,11 @@ impl<'a, 'ast> Visitor<'ast> for InlayHintVisitor<'a> {
                 self.visit_block(body);
             }
             ExprKind::Comptime(e) => self.visit_expr(e),
+            ExprKind::InterpolatedString(parts) => {
+                for part in parts {
+                    self.visit_expr(part);
+                }
+            }
         }
     }
 }

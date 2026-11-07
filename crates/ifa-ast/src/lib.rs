@@ -617,6 +617,7 @@ pub enum ExprKind {
         body: Block,
     },
     Comptime(Box<Expr>),
+    InterpolatedString(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -836,6 +837,11 @@ pub trait Visitor<'ast>: Sized {
                 self.visit_block(body);
             }
             ExprKind::Comptime(e) => self.visit_expr(e),
+            ExprKind::InterpolatedString(parts) => {
+                for part in parts {
+                    self.visit_expr(part);
+                }
+            }
         }
     }
 }

@@ -3,6 +3,7 @@ use crate::target::{LlvmTargetConfig, TargetArch};
 use crate::types::fir_to_llvm_type;
 use ifa_fir::{
     BinaryOp, BlockId, ConstantValue, FirFunction, FirModule, Terminator, UnaryOp, ValueExpr,
+    ValueId,
 };
 use ifa_span::INTERNER;
 use std::collections::{HashMap, HashSet};
@@ -124,7 +125,11 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i32 @ifa_rt_channel_recv(ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_channel_close(ptr)\n");
             out.push_str("declare i64 @ifa_rt_channel_select(ptr, i64, i32)\n");
-            out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n\n");
+            out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n");
+            out.push_str("declare ptr @ifa_rt_string_concat(ptr, ptr)\n");
+            out.push_str("declare ptr @ifa_rt_string_from_i64(i64)\n");
+            out.push_str("declare ptr @ifa_rt_string_from_f64(double)\n");
+            out.push_str("declare ptr @ifa_rt_string_from_bool(i1)\n\n");
         } else {
             out.push_str("; IFA Runtime Intrinsic Declarations\n");
             out.push_str("declare void @ifa_rt_println(ptr)\n");
@@ -149,7 +154,11 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i32 @ifa_rt_channel_recv(ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_channel_close(ptr)\n");
             out.push_str("declare i64 @ifa_rt_channel_select(ptr, i64, i32)\n");
-            out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n\n");
+            out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n");
+            out.push_str("declare ptr @ifa_rt_string_concat(ptr, ptr)\n");
+            out.push_str("declare ptr @ifa_rt_string_from_i64(i64)\n");
+            out.push_str("declare ptr @ifa_rt_string_from_f64(double)\n");
+            out.push_str("declare ptr @ifa_rt_string_from_bool(i1)\n\n");
         }
 
         // LLVM Standard Coroutine Intrinsics
@@ -616,6 +625,7 @@ impl<'a> LlvmIrEmitter<'a> {
                         ValueExpr::Constant(ConstantValue::Bool(_)) => ifa_fir::FirType::Bool,
                         ValueExpr::Constant(ConstantValue::Char(_)) => ifa_fir::FirType::Char,
                         ValueExpr::Constant(ConstantValue::String(_)) => ifa_fir::FirType::Str,
+                        ValueExpr::FormatString(_) => ifa_fir::FirType::String,
                         ValueExpr::Constant(ConstantValue::Function(_)) => {
                             ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Unit))
                         }
@@ -1627,6 +1637,37 @@ impl<'a> LlvmIrEmitter<'a> {
                     res_id, elem_ty_str, base.0, start.0
                 ));
             }
+            ValueExpr::FormatString(parts) => {
+                if parts.is_empty() {
+                    out.push_str(&format!(
+                        "  %v{} = call ptr @ifa_rt_string_concat(ptr null, ptr null)\n",
+                        res_id
+                    ));
+                } else {
+                    Self::emit_llvm_part_to_str_ptr(res_id, 0, parts[0], value_types, out);
+                    let mut curr_ptr = format!("%fmt_{}_0", res_id);
+                    for (idx, &part) in parts.iter().enumerate().skip(1) {
+                        Self::emit_llvm_part_to_str_ptr(res_id, idx, part, value_types, out);
+                        let part_ptr = format!("%fmt_{}_{}", res_id, idx);
+                        let next_ptr = if idx == parts.len() - 1 {
+                            format!("%v{}", res_id)
+                        } else {
+                            format!("%fmt_acc_{}_{}", res_id, idx)
+                        };
+                        out.push_str(&format!(
+                            "  {} = call ptr @ifa_rt_string_concat(ptr {}, ptr {})\n",
+                            next_ptr, curr_ptr, part_ptr
+                        ));
+                        curr_ptr = next_ptr;
+                    }
+                    if parts.len() == 1 {
+                        out.push_str(&format!(
+                            "  %v{} = call ptr @ifa_rt_string_concat(ptr %fmt_{}_0, ptr null)\n",
+                            res_id, res_id
+                        ));
+                    }
+                }
+            }
             _ => {
                 // Default fallback for intermediate structures
                 out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
@@ -1891,6 +1932,74 @@ impl<'a> LlvmIrEmitter<'a> {
             _ => {}
         }
         Ok(())
+    }
+
+    fn emit_llvm_part_to_str_ptr(
+        res_id: u32,
+        step: usize,
+        part: ValueId,
+        value_types: &HashMap<ValueId, ifa_fir::FirType>,
+        out: &mut String,
+    ) {
+        let ty = value_types.get(&part);
+        match ty {
+            Some(ifa_fir::FirType::Int(ity)) => {
+                let int_ty_str = match ity {
+                    ifa_sema::types::IntType::I8 | ifa_sema::types::IntType::U8 => "i8",
+                    ifa_sema::types::IntType::I16 | ifa_sema::types::IntType::U16 => "i16",
+                    ifa_sema::types::IntType::I32 | ifa_sema::types::IntType::U32 => "i32",
+                    _ => "i64",
+                };
+                if int_ty_str != "i64" {
+                    out.push_str(&format!(
+                        "  %fmt_ext_{}_{} = sext {} %v{} to i64\n",
+                        res_id, step, int_ty_str, part.0
+                    ));
+                    out.push_str(&format!(
+                        "  %fmt_{}_{} = call ptr @ifa_rt_string_from_i64(i64 %fmt_ext_{}_{})\n",
+                        res_id, step, res_id, step
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  %fmt_{}_{} = call ptr @ifa_rt_string_from_i64(i64 %v{})\n",
+                        res_id, step, part.0
+                    ));
+                }
+            }
+            Some(ifa_fir::FirType::Float(fty)) => {
+                let f_str = match fty {
+                    ifa_sema::types::FloatType::F32 => "float",
+                    ifa_sema::types::FloatType::F64 => "double",
+                };
+                if f_str == "float" {
+                    out.push_str(&format!(
+                        "  %fmt_fpext_{}_{} = fpext float %v{} to double\n",
+                        res_id, step, part.0
+                    ));
+                    out.push_str(&format!(
+                        "  %fmt_{}_{} = call ptr @ifa_rt_string_from_f64(double %fmt_fpext_{}_{})\n",
+                        res_id, step, res_id, step
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  %fmt_{}_{} = call ptr @ifa_rt_string_from_f64(double %v{})\n",
+                        res_id, step, part.0
+                    ));
+                }
+            }
+            Some(ifa_fir::FirType::Bool) => {
+                out.push_str(&format!(
+                    "  %fmt_{}_{} = call ptr @ifa_rt_string_from_bool(i1 %v{})\n",
+                    res_id, step, part.0
+                ));
+            }
+            _ => {
+                out.push_str(&format!(
+                    "  %fmt_{}_{} = bitcast ptr %v{} to ptr\n",
+                    res_id, step, part.0
+                ));
+            }
+        }
     }
 
     fn emit_terminator(

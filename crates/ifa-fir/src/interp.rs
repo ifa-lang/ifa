@@ -2038,6 +2038,20 @@ impl<'a> FirInterpreter<'a> {
                 }) => Ok((**p).clone()),
                 _ => Ok(FirValue::Unit),
             },
+            ValueExpr::FormatString(parts) => {
+                let mut out = String::new();
+                for part in parts {
+                    let v = env.get(part).ok_or(InterpError::UndefinedValue(*part))?;
+                    match v {
+                        FirValue::String(s) => out.push_str(s),
+                        FirValue::Int(i) => out.push_str(&i.to_string()),
+                        FirValue::Float(f) => out.push_str(&f.to_string()),
+                        FirValue::Bool(b) => out.push_str(&b.to_string()),
+                        other => out.push_str(&other.to_string()),
+                    }
+                }
+                Ok(FirValue::String(out))
+            }
         }
     }
 

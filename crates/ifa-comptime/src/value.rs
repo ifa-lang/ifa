@@ -212,6 +212,7 @@ impl Value {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
             (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
             (Value::String(a), other) => Ok(Value::String(format!("{}{}", a, other))),
+            (other, Value::String(b)) => Ok(Value::String(format!("{}{}", other, b))),
             (Value::Array(a), Value::Array(b)) => {
                 let mut concat = a.clone();
                 concat.extend(b.clone());

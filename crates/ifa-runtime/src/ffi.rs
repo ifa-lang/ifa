@@ -328,6 +328,92 @@ pub extern "C" fn ifa_rt_println_i64(n: i64) {
     crate::io::rt_println_i64(n);
 }
 
+/// Concatenate two null-terminated UTF-8 C strings and return a new heap-allocated null-terminated C string.
+#[no_mangle]
+pub extern "C" fn ifa_rt_string_concat(a: *const u8, b: *const u8) -> *mut u8 {
+    let s_a = if a.is_null() {
+        ""
+    } else {
+        unsafe {
+            std::ffi::CStr::from_ptr(a as *const std::os::raw::c_char)
+                .to_str()
+                .unwrap_or("")
+        }
+    };
+    let s_b = if b.is_null() {
+        ""
+    } else {
+        unsafe {
+            std::ffi::CStr::from_ptr(b as *const std::os::raw::c_char)
+                .to_str()
+                .unwrap_or("")
+        }
+    };
+    let combined = format!("{}{}\0", s_a, s_b);
+    let bytes = combined.into_bytes();
+    let len = bytes.len();
+    let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, len);
+        mem
+    }
+}
+
+/// Convert a 64-bit integer to a heap-allocated null-terminated C string.
+#[no_mangle]
+pub extern "C" fn ifa_rt_string_from_i64(val: i64) -> *mut u8 {
+    let s = format!("{}\0", val);
+    let bytes = s.into_bytes();
+    let len = bytes.len();
+    let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, len);
+        mem
+    }
+}
+
+/// Convert a 64-bit float to a heap-allocated null-terminated C string.
+#[no_mangle]
+pub extern "C" fn ifa_rt_string_from_f64(val: f64) -> *mut u8 {
+    let s = format!("{}\0", val);
+    let bytes = s.into_bytes();
+    let len = bytes.len();
+    let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, len);
+        mem
+    }
+}
+
+/// Convert a boolean to a heap-allocated null-terminated C string.
+#[no_mangle]
+pub extern "C" fn ifa_rt_string_from_bool(val: bool) -> *mut u8 {
+    let s = if val { "true\0" } else { "false\0" };
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, len);
+        mem
+    }
+}
+
 /// Binary C-ABI representation of an IFA Error Union result (`Error!T`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

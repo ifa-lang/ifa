@@ -52,6 +52,19 @@ impl JitEngine {
         );
         builder.symbol("ifa_rt_channel_close", ifa_rt_channel_close as *const u8);
         builder.symbol("ifa_rt_channel_select", ifa_rt_channel_select as *const u8);
+        builder.symbol("ifa_rt_string_concat", ifa_rt_string_concat as *const u8);
+        builder.symbol(
+            "ifa_rt_string_from_i64",
+            ifa_rt_string_from_i64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_string_from_f64",
+            ifa_rt_string_from_f64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_string_from_bool",
+            ifa_rt_string_from_bool as *const u8,
+        );
 
         let module = JITModule::new(builder);
 
@@ -190,6 +203,47 @@ impl JitEngine {
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids
             .insert("ifa_rt_channel_select".into(), chan_select_id);
+
+        let mut str_concat_sig = Signature::new(call_conv);
+        str_concat_sig.params.push(AbiParam::new(ptr_type));
+        str_concat_sig.params.push(AbiParam::new(ptr_type));
+        str_concat_sig.returns.push(AbiParam::new(ptr_type));
+        let str_concat_id = self
+            .module
+            .declare_function("ifa_rt_string_concat", Linkage::Import, &str_concat_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_string_concat".into(), str_concat_id);
+
+        let mut str_i64_sig = Signature::new(call_conv);
+        str_i64_sig.params.push(AbiParam::new(types::I64));
+        str_i64_sig.returns.push(AbiParam::new(ptr_type));
+        let str_i64_id = self
+            .module
+            .declare_function("ifa_rt_string_from_i64", Linkage::Import, &str_i64_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_string_from_i64".into(), str_i64_id);
+
+        let mut str_f64_sig = Signature::new(call_conv);
+        str_f64_sig.params.push(AbiParam::new(types::F64));
+        str_f64_sig.returns.push(AbiParam::new(ptr_type));
+        let str_f64_id = self
+            .module
+            .declare_function("ifa_rt_string_from_f64", Linkage::Import, &str_f64_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_string_from_f64".into(), str_f64_id);
+
+        let mut str_bool_sig = Signature::new(call_conv);
+        str_bool_sig.params.push(AbiParam::new(types::I8));
+        str_bool_sig.returns.push(AbiParam::new(ptr_type));
+        let str_bool_id = self
+            .module
+            .declare_function("ifa_rt_string_from_bool", Linkage::Import, &str_bool_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_string_from_bool".into(), str_bool_id);
 
         // 1. Declare all functions first to enable mutual recursion and forward calls
         for fir_func in &fir_module.functions {

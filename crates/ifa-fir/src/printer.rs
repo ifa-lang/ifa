@@ -330,6 +330,16 @@ impl<'a> FirPrinter<'a> {
             ValueExpr::EnumGetPayload { base, payload_ty } => {
                 write!(self.output, "enum.get_payload {} as {}", base, payload_ty)
             }
+            ValueExpr::FormatString(parts) => {
+                write!(self.output, "format.string(")?;
+                for (i, p) in parts.iter().enumerate() {
+                    if i > 0 {
+                        write!(self.output, ", ")?;
+                    }
+                    write!(self.output, "{}", p)?;
+                }
+                write!(self.output, ")")
+            }
         }
     }
 

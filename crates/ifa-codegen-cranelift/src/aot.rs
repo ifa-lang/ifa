@@ -17,6 +17,7 @@ pub const RUNTIME_STUB_C: &str = r#"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 
 void println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } }
 void ifa_rt_println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } }
@@ -167,6 +168,44 @@ void ifa_rt_slice_free(ifa_mut_slice_t slice) {
     if (slice.ptr) {
         ifa_rt_gen_free((void*)slice.ptr);
     }
+}
+
+char* ifa_rt_string_concat(const char* a, const char* b) {
+    size_t len_a = a ? strlen(a) : 0;
+    size_t len_b = b ? strlen(b) : 0;
+    char* res = (char*)malloc(len_a + len_b + 1);
+    if (!res) abort();
+    if (len_a > 0) memcpy(res, a, len_a);
+    if (len_b > 0) memcpy(res + len_a, b, len_b);
+    res[len_a + len_b] = '\0';
+    return res;
+}
+
+char* ifa_rt_string_from_i64(int64_t val) {
+    char buf[64];
+    int len = snprintf(buf, sizeof(buf), "%ld", (long)val);
+    char* res = (char*)malloc(len + 1);
+    if (!res) abort();
+    memcpy(res, buf, len + 1);
+    return res;
+}
+
+char* ifa_rt_string_from_f64(double val) {
+    char buf[64];
+    int len = snprintf(buf, sizeof(buf), "%g", val);
+    char* res = (char*)malloc(len + 1);
+    if (!res) abort();
+    memcpy(res, buf, len + 1);
+    return res;
+}
+
+char* ifa_rt_string_from_bool(int8_t val) {
+    const char* s = val ? "true" : "false";
+    size_t len = strlen(s);
+    char* res = (char*)malloc(len + 1);
+    if (!res) abort();
+    memcpy(res, s, len + 1);
+    return res;
 }
 
 const char* ifa_rt_version_string(void) {
@@ -402,6 +441,71 @@ impl AotCompiler {
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids
             .insert("ifa_rt_channel_select".into(), chan_select_id);
+
+        let mut str_concat_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        str_concat_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        str_concat_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        str_concat_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        let str_concat_id = self
+            .module
+            .declare_function("ifa_rt_string_concat", Linkage::Import, &str_concat_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_string_concat".into(), str_concat_id);
+
+        let mut str_i64_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        str_i64_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        str_i64_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        let str_i64_id = self
+            .module
+            .declare_function("ifa_rt_string_from_i64", Linkage::Import, &str_i64_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_string_from_i64".into(), str_i64_id);
+
+        let mut str_f64_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        str_f64_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::F64,
+            ));
+        str_f64_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        let str_f64_id = self
+            .module
+            .declare_function("ifa_rt_string_from_f64", Linkage::Import, &str_f64_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_string_from_f64".into(), str_f64_id);
+
+        let mut str_bool_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        str_bool_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I8,
+            ));
+        str_bool_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        let str_bool_id = self
+            .module
+            .declare_function("ifa_rt_string_from_bool", Linkage::Import, &str_bool_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_string_from_bool".into(), str_bool_id);
 
         // 1. Declare functions
         for fir_func in &fir_module.functions {

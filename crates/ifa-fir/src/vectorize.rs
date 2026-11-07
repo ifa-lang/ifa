@@ -260,6 +260,7 @@ impl VectorizePass {
                         ValueExpr::Constant(ConstantValue::Bool(_)) => FirType::Bool,
                         ValueExpr::Constant(ConstantValue::Char(_)) => FirType::Char,
                         ValueExpr::Constant(ConstantValue::String(_)) => FirType::Str,
+                        ValueExpr::FormatString(_) => FirType::String,
                         ValueExpr::Constant(ConstantValue::Function(_)) => {
                             FirType::Pointer(Box::new(FirType::Unit))
                         }

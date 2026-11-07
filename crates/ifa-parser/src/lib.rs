@@ -3,7 +3,7 @@
 use ifa_ast::*;
 use ifa_diagnostics::Diagnostic;
 use ifa_lexer::token::{Token, TokenKind};
-use ifa_span::{sym, BytePos, FileId, Span, INTERNER};
+use ifa_span::{sym, BytePos, FileId, Span, Symbol, INTERNER};
 
 pub struct Parser {
     file_id: FileId,
@@ -1249,6 +1249,125 @@ impl Parser {
         Ok(left)
     }
 
+    fn parse_string_literal(&mut self, sym_val: Symbol, span: Span) -> Result<Expr, Diagnostic> {
+        let raw = INTERNER.resolve(&sym_val);
+        if !raw.contains('{') && !raw.contains('}') {
+            return Ok(Expr::new(ExprKind::Lit(Lit::String(sym_val)), span));
+        }
+
+        let mut parts: Vec<Expr> = Vec::new();
+        let mut text_buf = String::new();
+        let chars: Vec<char> = raw.chars().collect();
+        let len = chars.len();
+        let mut i = 0;
+        let mut has_interpolation = false;
+
+        while i < len {
+            if chars[i] == '{' {
+                if i + 1 < len && chars[i + 1] == '{' {
+                    // Escaped {{ -> {
+                    text_buf.push('{');
+                    i += 2;
+                } else {
+                    // Try to see if this is an interpolation {expr}
+                    let mut look = i + 1;
+                    let mut depth = 1;
+                    let mut in_str = false;
+                    let mut str_quote = '"';
+
+                    while look < len && depth > 0 {
+                        let c = chars[look];
+                        if in_str {
+                            if c == '\\' && look + 1 < len {
+                                look += 2;
+                                continue;
+                            } else if c == str_quote {
+                                in_str = false;
+                            }
+                        } else if c == '"' || c == '\'' {
+                            in_str = true;
+                            str_quote = c;
+                        } else if c == '{' {
+                            depth += 1;
+                        } else if c == '}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        look += 1;
+                    }
+
+                    if depth == 0 {
+                        let expr_str: String = chars[i + 1..look].iter().collect();
+                        let trimmed = expr_str.trim();
+                        if !trimmed.is_empty() {
+                            let sub_tokens = ifa_lexer::tokenize(self.file_id, trimmed);
+                            let mut sub_parser = Parser::new(self.file_id, sub_tokens);
+                            if let Ok(parsed_expr) = sub_parser.parse_expr() {
+                                if sub_parser.diagnostics.is_empty()
+                                    && sub_parser.current().kind == TokenKind::Eof
+                                {
+                                    has_interpolation = true;
+                                    if !text_buf.is_empty() {
+                                        let text_sym = INTERNER.intern(&text_buf);
+                                        parts.push(Expr::new(
+                                            ExprKind::Lit(Lit::String(text_sym)),
+                                            span,
+                                        ));
+                                        text_buf.clear();
+                                    }
+                                    parts.push(parsed_expr);
+                                    i = look + 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback: not a valid interpolated expression, treat '{' as literal
+                    text_buf.push('{');
+                    i += 1;
+                }
+            } else if chars[i] == '}' {
+                if i + 1 < len && chars[i + 1] == '}' {
+                    // Escaped }} -> }
+                    text_buf.push('}');
+                    i += 2;
+                } else {
+                    // Unmatched '}' treated as literal '}'
+                    text_buf.push('}');
+                    i += 1;
+                }
+            } else {
+                text_buf.push(chars[i]);
+                i += 1;
+            }
+        }
+
+        if !text_buf.is_empty() {
+            let text_sym = INTERNER.intern(&text_buf);
+            parts.push(Expr::new(ExprKind::Lit(Lit::String(text_sym)), span));
+        }
+
+        if !has_interpolation {
+            let final_sym = if parts.len() == 1 {
+                if let ExprKind::Lit(Lit::String(s)) = &parts[0].kind {
+                    *s
+                } else {
+                    sym_val
+                }
+            } else {
+                sym_val
+            };
+            Ok(Expr::new(ExprKind::Lit(Lit::String(final_sym)), span))
+        } else if parts.is_empty() {
+            Ok(Expr::new(ExprKind::Lit(Lit::String(sym_val)), span))
+        } else {
+            Ok(Expr::new(ExprKind::InterpolatedString(parts), span))
+        }
+    }
+
     fn parse_prefix(&mut self) -> Result<Expr, Diagnostic> {
         let cur = self.current();
         match cur.kind {
@@ -1262,7 +1381,7 @@ impl Parser {
             }
             TokenKind::StringLiteral(s) => {
                 self.advance();
-                Ok(Expr::new(ExprKind::Lit(Lit::String(s)), cur.span))
+                self.parse_string_literal(s, cur.span)
             }
             TokenKind::CharLiteral(c) => {
                 self.advance();

@@ -840,6 +840,11 @@ impl SroaPass {
                 replace(start);
                 replace(end);
             }
+            ValueExpr::FormatString(parts) => {
+                for p in parts {
+                    replace(p);
+                }
+            }
         }
     }
 

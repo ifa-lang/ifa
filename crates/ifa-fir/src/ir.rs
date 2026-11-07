@@ -272,6 +272,7 @@ pub enum ValueExpr {
         base: ValueId,
         payload_ty: FirType,
     },
+    FormatString(Vec<ValueId>),
 }
 
 impl ValueExpr {
@@ -322,6 +323,7 @@ impl ValueExpr {
             ValueExpr::EnumInit { payload, .. } => payload.iter().copied().collect(),
             ValueExpr::EnumGetDiscriminant { base } => vec![*base],
             ValueExpr::EnumGetPayload { base, .. } => vec![*base],
+            ValueExpr::FormatString(parts) => parts.clone(),
         }
     }
 }

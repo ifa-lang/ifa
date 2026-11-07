@@ -2242,6 +2242,16 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
                 ty
             }
+            ExprKind::InterpolatedString(parts) => {
+                for part in parts {
+                    let _ = self.infer_expr(part);
+                }
+                if let Some(Type::Str) = expected {
+                    Type::Str
+                } else {
+                    Type::String
+                }
+            }
             ExprKind::Match {
                 expr: target_expr,
                 arms,
@@ -4724,6 +4734,11 @@ fn collect_captures_in_expr(
         }
         ExprKind::Spawn(e) | ExprKind::Comptime(e) => {
             collect_captures_in_expr(e, parent_depth, symbols, local_vars, seen, captured);
+        }
+        ExprKind::InterpolatedString(parts) => {
+            for part in parts {
+                collect_captures_in_expr(part, parent_depth, symbols, local_vars, seen, captured);
+            }
         }
         ExprKind::Catch {
             expr: inner,

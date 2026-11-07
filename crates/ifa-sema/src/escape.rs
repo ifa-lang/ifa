@@ -733,6 +733,11 @@ impl<'a> EscapeAnalyzer<'a> {
                 self.spawn_depth = prev_depth;
             }
             ExprKind::Comptime(inner) => self.check_expr(inner),
+            ExprKind::InterpolatedString(parts) => {
+                for part in parts {
+                    self.check_expr(part);
+                }
+            }
             ExprKind::Match { expr: target, arms } => {
                 self.check_expr(target);
                 for arm in arms {

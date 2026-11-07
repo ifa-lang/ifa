@@ -2016,6 +2016,21 @@ impl<'a> FunctionLoweringContext<'a> {
                 let raw_rhs = self.lower_expr(right);
                 let lhs = self.deref_if_ref(raw_lhs, left, left.span);
                 let rhs = self.deref_if_ref(raw_rhs, right, right.span);
+
+                if matches!(op, BinOp::Add) {
+                    let is_string_add = self
+                        .infer_expr_fir_type(left)
+                        .is_some_and(|t| matches!(t, FirType::String | FirType::Str))
+                        || self
+                            .infer_expr_fir_type(right)
+                            .is_some_and(|t| matches!(t, FirType::String | FirType::Str));
+                    if is_string_add {
+                        let res = self.alloc_value();
+                        self.emit(Some(res), ValueExpr::FormatString(vec![lhs, rhs]), span);
+                        return res;
+                    }
+                }
+
                 let fir_op = match op {
                     BinOp::Add => BinaryOp::Add,
                     BinOp::Sub => BinaryOp::Sub,
@@ -3955,6 +3970,18 @@ impl<'a> FunctionLoweringContext<'a> {
             ExprKind::Unit => {
                 let res = self.alloc_value();
                 self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), span);
+                res
+            }
+
+            ExprKind::InterpolatedString(parts) => {
+                let mut part_vals = Vec::with_capacity(parts.len());
+                for part in parts {
+                    let v = self.lower_expr(part);
+                    let deref_v = self.deref_if_ref(v, part, part.span);
+                    part_vals.push(deref_v);
+                }
+                let res = self.alloc_value();
+                self.emit(Some(res), ValueExpr::FormatString(part_vals), span);
                 res
             }
 

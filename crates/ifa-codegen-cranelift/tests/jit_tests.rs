@@ -1292,3 +1292,37 @@ fn test_cranelift_jit_dynamic_function_pointer_dispatch() {
     let result = jit.run_main().expect("Failed to execute native main");
     assert_eq!(result, 40);
 }
+
+#[test]
+fn test_cranelift_jit_string_interpolation_and_concatenation() {
+    let src = r#"
+        pub fn main() -> i64 {
+            let user = "System";
+            let version: i64 = 1;
+            let msg = "Hello {user} v{version}!";
+            let extra = " Ok.";
+            let full = msg + extra;
+            return 88;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("jit_interp.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 88);
+}
