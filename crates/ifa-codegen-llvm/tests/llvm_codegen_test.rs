@@ -497,7 +497,7 @@ fn test_llvm_coroutine_state_machine_lowering() {
     let ir = emitter.emit_module(&module).expect("Emission failed");
 
     // 1. Assert that generator was lowered with presplitcoroutine attribute and coro intrinsics
-    assert!(ir.contains("define dso_local presplitcoroutine ptr @stream_generator()"));
+    assert!(ir.contains("define dso_local ptr @stream_generator() presplitcoroutine"));
     assert!(ir.contains("call token @llvm.coro.id("));
     assert!(ir.contains("call ptr @llvm.coro.begin("));
     assert!(ir.contains("call i8 @llvm.coro.suspend("));
@@ -2100,4 +2100,227 @@ fn test_llvm_vector_branchcond_and_arena_genalloc() {
         "LLVM IR BranchCond must emit !llvm.loop !1: {}",
         ir
     );
+}
+
+#[test]
+fn test_llvm_coroutine_channel_untyped_and_select_multiplexing() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+    use std::fs;
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let fn_name = INTERNER.intern("coro_channel_worker");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+
+    // Create two untyped channels
+    let ch1 = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(ch1),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+
+    let ch2 = ValueId(2);
+    bb0.instructions.push(Instruction::new(
+        Some(ch2),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: Some(ValueId(3)),
+        },
+        Span::DUMMY,
+    ));
+
+    // Send untyped integer value over ch1
+    let val_to_send = ValueId(4);
+    bb0.instructions.push(Instruction::new(
+        Some(val_to_send),
+        ValueExpr::Constant(ConstantValue::Int(1337, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::ChanSend {
+            chan: ch1,
+            val: val_to_send,
+        },
+        Span::DUMMY,
+    ));
+
+    // Direct multi-channel select multiplexing in coroutine without default clause
+    let sel_res = ValueId(5);
+    bb0.instructions.push(Instruction::new(
+        Some(sel_res),
+        ValueExpr::ChanSelect {
+            channels: vec![ch1, ch2],
+            has_default: false,
+        },
+        Span::DUMMY,
+    ));
+
+    // Untyped channel receive with coroutine suspension
+    let recv_res = ValueId(6);
+    bb0.instructions.push(Instruction::new(
+        Some(recv_res),
+        ValueExpr::ChanRecv { chan: ch1 },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(None));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("coro_chan_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    // 1. Verify coroutine LLVM attributes and intrinsics
+    assert!(ir.contains("define dso_local ptr @coro_channel_worker() presplitcoroutine"));
+    assert!(ir.contains("call token @llvm.coro.id("));
+    assert!(ir.contains("call ptr @llvm.coro.begin("));
+
+    // 2. Verify untyped send cast and intrinsic
+    assert!(ir.contains("%chan_val_cast_4 = inttoptr i64 %v4 to ptr"));
+    assert!(ir.contains("call i32 @ifa_rt_channel_send(ptr %v1, ptr %chan_val_cast_4)"));
+
+    // 3. Verify multi-channel select multiplexing with stackless suspension
+    assert!(ir.contains("br label %coro.sel_poll_"));
+    assert!(ir.contains(
+        "%sel_poll_res_5_0 = call i64 @ifa_rt_channel_select(ptr %select_arr_5, i64 2, i32 1)"
+    ));
+    assert!(ir.contains("%sel_is_waiting_5_0 = icmp eq i64 %sel_poll_res_5_0, 2"));
+    assert!(ir.contains("call i8 @llvm.coro.suspend(token none, i1 false)"));
+    assert!(ir.contains("%v5 = phi i64 [ %sel_poll_res_5_0, %coro.sel_poll_0 ]"));
+
+    // 4. Verify channel receive with stackless suspension
+    assert!(ir.contains("br label %coro.recv_poll_"));
+    assert!(ir.contains("call i32 @ifa_rt_channel_try_recv(ptr %v1, ptr %chan_out_slot_6)"));
+    assert!(ir.contains("%v6 = ptrtoint ptr %chan_raw_6 to i64"));
+
+    // 5. Compile to native object using Clang to guarantee valid LLVM IR
+    let temp_dir = std::env::temp_dir().join(format!("llvm_chan_coro_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("chan_coro.o");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation of channel coroutine module failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_wasm32_coroutine_stackless_suspension() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+    use std::fs;
+
+    let wasm_target = LlvmTargetConfig::wasm32_wasi();
+    let mut emitter = LlvmIrEmitter::new(&wasm_target);
+
+    let fn_name = INTERNER.intern("wasm_generator");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    bb0.instructions
+        .push(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    let val_id = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(val_id),
+        ValueExpr::Constant(ConstantValue::Int(42, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions
+        .push(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    bb0.terminator = Some(Terminator::Return(None));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("wasm_coro_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    // 1. Verify wasm32-unknown-wasi target configuration
+    assert!(ir.contains("target triple = \"wasm32-unknown-wasi\""));
+    assert!(ir.contains("declare i32 @llvm.coro.size.i32()"));
+    assert!(ir.contains("%coro.size.32 = call i32 @llvm.coro.size.i32()"));
+    assert!(ir.contains("%coro.size = zext i32 %coro.size.32 to i64"));
+    assert!(ir.contains("call ptr @ifa_rt_gen_alloc(i64 %coro.size, i64 8, i16 0)"));
+    assert!(ir.contains("call i8 @llvm.coro.suspend(token none, i1 false)"));
+
+    // 2. Compile to standalone WebAssembly module (.wasm) with wasm-ld
+    let temp_dir = std::env::temp_dir().join(format!("llvm_wasm_coro_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let wasm_path = temp_dir.join("wasm_coro.wasm");
+
+    let compiler = LlvmCompiler::new(wasm_target);
+    let compile_res = compiler.compile_to_wasm(&module, &wasm_path);
+    assert!(
+        compile_res.is_ok(),
+        "WebAssembly compilation of coroutine module failed: {:?}",
+        compile_res.err()
+    );
+    assert!(wasm_path.exists());
+
+    // 3. Verify valid WebAssembly binary header (\0asm)
+    let wasm_bytes = fs::read(&wasm_path).unwrap();
+    assert!(wasm_bytes.len() >= 8);
+    assert_eq!(&wasm_bytes[0..4], b"\0asm");
+    assert_eq!(&wasm_bytes[4..8], &[1, 0, 0, 0]);
+
+    let _ = fs::remove_dir_all(&temp_dir);
 }

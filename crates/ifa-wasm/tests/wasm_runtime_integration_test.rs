@@ -245,3 +245,101 @@ pub extern "C" strict fn run_double(n: i64) -> i64 {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_end_to_end_wasm_coroutine_inspection_and_validation() {
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let temp_dir = std::env::temp_dir().join(format!("ifa_wasm_coro_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let fn_name = INTERNER.intern("wasm_stream_coro");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    let ch = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(ch),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+
+    let val = ValueId(2);
+    bb0.instructions.push(Instruction::new(
+        Some(val),
+        ValueExpr::Constant(ConstantValue::Int(999, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::ChanSend { chan: ch, val },
+        Span::DUMMY,
+    ));
+
+    bb0.instructions
+        .push(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+
+    bb0.terminator = Some(Terminator::Return(None));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("wasm_coro_pkg"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let wasm_path = temp_dir.join("coro_stream.wasm");
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::wasm32_wasi());
+    compiler
+        .compile_to_wasm(&module, &wasm_path)
+        .expect("WebAssembly compilation of coroutine stream failed");
+
+    assert!(wasm_path.exists());
+    let wasm_bytes = fs::read(&wasm_path).unwrap();
+
+    // 1. Inspect WebAssembly binary format
+    let inspector = WasmModuleInspector::new(&wasm_bytes);
+    let sections = inspector
+        .inspect()
+        .expect("Inspection of wasm coroutine module failed");
+    assert!(!sections.is_empty());
+
+    let exports = inspector
+        .extract_exports()
+        .expect("Extraction of exports failed");
+    let export_names: Vec<String> = exports.into_iter().map(|e| e.name).collect();
+    assert!(
+        export_names.iter().any(|name| name == "wasm_stream_coro"),
+        "Export `wasm_stream_coro` not found in WebAssembly binary: {:?}",
+        export_names
+    );
+
+    // 2. Validate through internal WASI engine
+    let res = WasmEngineRunner::run(WasmEngine::Internal, &wasm_path, None, &[])
+        .expect("Internal WASI execution of coroutine module failed");
+    assert_eq!(res.exit_code, 0);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

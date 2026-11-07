@@ -124,7 +124,10 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare void @ifa_rt_channel_destroy(ptr)\n");
             out.push_str("declare i32 @ifa_rt_channel_send(ptr, ptr)\n");
             out.push_str("declare i32 @ifa_rt_channel_recv(ptr, ptr)\n");
+            out.push_str("declare i32 @ifa_rt_channel_try_send(ptr, ptr)\n");
+            out.push_str("declare i32 @ifa_rt_channel_try_recv(ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_channel_close(ptr)\n");
+            out.push_str("declare i32 @ifa_rt_channel_is_closed(ptr)\n");
             out.push_str("declare i64 @ifa_rt_channel_select(ptr, i64, i32)\n");
             out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n");
             out.push_str("declare ptr @ifa_rt_string_concat(ptr, ptr)\n");
@@ -156,7 +159,10 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare void @ifa_rt_channel_destroy(ptr)\n");
             out.push_str("declare i32 @ifa_rt_channel_send(ptr, ptr)\n");
             out.push_str("declare i32 @ifa_rt_channel_recv(ptr, ptr)\n");
+            out.push_str("declare i32 @ifa_rt_channel_try_send(ptr, ptr)\n");
+            out.push_str("declare i32 @ifa_rt_channel_try_recv(ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_channel_close(ptr)\n");
+            out.push_str("declare i32 @ifa_rt_channel_is_closed(ptr)\n");
             out.push_str("declare i64 @ifa_rt_channel_select(ptr, i64, i32)\n");
             out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n");
             out.push_str("declare ptr @ifa_rt_string_concat(ptr, ptr)\n");
@@ -170,7 +176,11 @@ impl<'a> LlvmIrEmitter<'a> {
         // LLVM Standard Coroutine Intrinsics
         out.push_str("; LLVM Standard Coroutine Intrinsics\n");
         out.push_str("declare token @llvm.coro.id(i32, ptr, ptr, ptr)\n");
-        out.push_str("declare i64 @llvm.coro.size.i64()\n");
+        if self.target.arch == TargetArch::Wasm32Wasi {
+            out.push_str("declare i32 @llvm.coro.size.i32()\n");
+        } else {
+            out.push_str("declare i64 @llvm.coro.size.i64()\n");
+        }
         out.push_str("declare ptr @llvm.coro.begin(token, ptr)\n");
         out.push_str("declare i8 @llvm.coro.suspend(token, i1)\n");
         out.push_str("declare i1 @llvm.coro.end(ptr, i1, token)\n");
@@ -635,12 +645,12 @@ impl<'a> LlvmIrEmitter<'a> {
             .collect();
 
         out.push_str(&format!(
-            "define {}{}{} @{}({}) {} {{\n",
+            "define {}{} @{}({}) {}{} {{\n",
             linkage,
-            coro_attr,
             ret_ty,
             fn_name,
             params_str.join(", "),
+            coro_attr,
             attr_group
         ));
 
@@ -902,7 +912,12 @@ impl<'a> LlvmIrEmitter<'a> {
                 out.push_str(
                     "  %coro.id = call token @llvm.coro.id(i32 0, ptr null, ptr null, ptr null)\n",
                 );
-                out.push_str("  %coro.size = call i64 @llvm.coro.size.i64()\n");
+                if self.target.arch == TargetArch::Wasm32Wasi {
+                    out.push_str("  %coro.size.32 = call i32 @llvm.coro.size.i32()\n");
+                    out.push_str("  %coro.size = zext i32 %coro.size.32 to i64\n");
+                } else {
+                    out.push_str("  %coro.size = call i64 @llvm.coro.size.i64()\n");
+                }
                 out.push_str(
                     "  %coro.alloc = call ptr @ifa_rt_gen_alloc(i64 %coro.size, i64 8, i16 0)\n",
                 );
@@ -953,6 +968,8 @@ impl<'a> LlvmIrEmitter<'a> {
                         module,
                         &value_types,
                         &array_allocas,
+                        is_coro,
+                        &mut coro_yield_idx,
                         out,
                     )?;
                 } else {
@@ -1072,6 +1089,7 @@ impl<'a> LlvmIrEmitter<'a> {
         args_str
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_instruction(
         &self,
         res_id: u32,
@@ -1079,6 +1097,8 @@ impl<'a> LlvmIrEmitter<'a> {
         module: &FirModule,
         value_types: &HashMap<ifa_fir::ValueId, ifa_fir::FirType>,
         array_allocas: &HashMap<ifa_fir::ValueId, ifa_fir::ValueId>,
+        is_coro: bool,
+        coro_yield_idx: &mut usize,
         out: &mut String,
     ) -> Result<(), LlvmCodegenError> {
         match expr {
@@ -1670,14 +1690,123 @@ impl<'a> LlvmIrEmitter<'a> {
                     "  %chan_out_slot_{} = alloca ptr, align 8\n",
                     res_id
                 ));
+                if is_coro {
+                    let y_id = *coro_yield_idx;
+                    *coro_yield_idx += 1;
+                    out.push_str(&format!("  br label %coro.recv_poll_{}\n", y_id));
+                    out.push_str(&format!("coro.recv_poll_{}:\n", y_id));
+                    out.push_str(&format!(
+                        "  %recv_st_{}_{} = call i32 @ifa_rt_channel_try_recv(ptr %v{}, ptr %chan_out_slot_{})\n",
+                        res_id, y_id, chan.0, res_id
+                    ));
+                    out.push_str(&format!(
+                        "  %recv_empty_{}_{} = icmp eq i32 %recv_st_{}_{}, 1\n",
+                        res_id, y_id, res_id, y_id
+                    ));
+                    out.push_str(&format!(
+                        "  br i1 %recv_empty_{}_{}, label %coro.recv_susp_{}, label %coro.recv_done_{}\n",
+                        res_id, y_id, y_id, y_id
+                    ));
+                    out.push_str(&format!("coro.recv_susp_{}:\n", y_id));
+                    out.push_str(&format!(
+                        "  %coro.recv_tok_{} = call i8 @llvm.coro.suspend(token none, i1 false)\n",
+                        y_id
+                    ));
+                    out.push_str(&format!(
+                        "  switch i8 %coro.recv_tok_{}, label %coro.susp_ret [ i8 0, label %coro.recv_poll_{} i8 1, label %coro.cleanup ]\n",
+                        y_id, y_id
+                    ));
+                    out.push_str(&format!("coro.recv_done_{}:\n", y_id));
+                } else {
+                    out.push_str(&format!(
+                        "  call i32 @ifa_rt_channel_recv(ptr %v{}, ptr %chan_out_slot_{})\n",
+                        chan.0, res_id
+                    ));
+                }
                 out.push_str(&format!(
-                    "  call i32 @ifa_rt_channel_recv(ptr %v{}, ptr %chan_out_slot_{})\n",
-                    chan.0, res_id
-                ));
-                out.push_str(&format!(
-                    "  %v{} = load ptr, ptr %chan_out_slot_{}, align 8\n",
+                    "  %chan_raw_{} = load ptr, ptr %chan_out_slot_{}, align 8\n",
                     res_id, res_id
                 ));
+                let dest_ty = value_types.get(&ifa_fir::ValueId(res_id));
+                match dest_ty {
+                    Some(ifa_fir::FirType::Pointer(_))
+                    | Some(ifa_fir::FirType::GenerationalRef(_))
+                    | Some(ifa_fir::FirType::Str)
+                    | Some(ifa_fir::FirType::String)
+                    | Some(ifa_fir::FirType::Struct(..))
+                    | Some(ifa_fir::FirType::Enum(..))
+                    | Some(ifa_fir::FirType::Array(..))
+                    | Some(ifa_fir::FirType::Slice(..))
+                    | Some(ifa_fir::FirType::Channel(_))
+                    | Some(ifa_fir::FirType::Unit) => {
+                        out.push_str(&format!(
+                            "  %v{} = bitcast ptr %chan_raw_{} to ptr\n",
+                            res_id, res_id
+                        ));
+                    }
+                    Some(ifa_fir::FirType::Int(
+                        ifa_sema::types::IntType::I32 | ifa_sema::types::IntType::U32,
+                    )) => {
+                        out.push_str(&format!(
+                            "  %chan_i64_{} = ptrtoint ptr %chan_raw_{} to i64\n",
+                            res_id, res_id
+                        ));
+                        out.push_str(&format!(
+                            "  %v{} = trunc i64 %chan_i64_{} to i32\n",
+                            res_id, res_id
+                        ));
+                    }
+                    Some(ifa_fir::FirType::Int(
+                        ifa_sema::types::IntType::I8 | ifa_sema::types::IntType::U8,
+                    )) => {
+                        out.push_str(&format!(
+                            "  %chan_i64_{} = ptrtoint ptr %chan_raw_{} to i64\n",
+                            res_id, res_id
+                        ));
+                        out.push_str(&format!(
+                            "  %v{} = trunc i64 %chan_i64_{} to i8\n",
+                            res_id, res_id
+                        ));
+                    }
+                    Some(ifa_fir::FirType::Int(
+                        ifa_sema::types::IntType::I16 | ifa_sema::types::IntType::U16,
+                    )) => {
+                        out.push_str(&format!(
+                            "  %chan_i64_{} = ptrtoint ptr %chan_raw_{} to i64\n",
+                            res_id, res_id
+                        ));
+                        out.push_str(&format!(
+                            "  %v{} = trunc i64 %chan_i64_{} to i16\n",
+                            res_id, res_id
+                        ));
+                    }
+                    Some(ifa_fir::FirType::Bool) => {
+                        out.push_str(&format!(
+                            "  %chan_i64_{} = ptrtoint ptr %chan_raw_{} to i64\n",
+                            res_id, res_id
+                        ));
+                        out.push_str(&format!(
+                            "  %v{} = trunc i64 %chan_i64_{} to i1\n",
+                            res_id, res_id
+                        ));
+                    }
+                    Some(ifa_fir::FirType::Float(_)) => {
+                        out.push_str(&format!(
+                            "  %chan_i64_{} = ptrtoint ptr %chan_raw_{} to i64\n",
+                            res_id, res_id
+                        ));
+                        out.push_str(&format!(
+                            "  %v{} = bitcast i64 %chan_i64_{} to double\n",
+                            res_id, res_id
+                        ));
+                    }
+                    _ => {
+                        out.push_str(&format!(
+                            "  %v{} = ptrtoint ptr %chan_raw_{} to i64\n",
+                            res_id, res_id
+                        ));
+                    }
+                }
             }
             ValueExpr::ChanSelect {
                 channels,
@@ -1699,13 +1828,46 @@ impl<'a> LlvmIrEmitter<'a> {
                         chan_id.0, res_id, i
                     ));
                 }
-                out.push_str(&format!(
-                    "  %v{} = call i64 @ifa_rt_channel_select(ptr %select_arr_{}, i64 {}, i32 {})\n",
-                    res_id,
-                    res_id,
-                    n,
-                    if *has_default { 1 } else { 0 }
-                ));
+                if is_coro && !has_default {
+                    let y_id = *coro_yield_idx;
+                    *coro_yield_idx += 1;
+                    out.push_str(&format!("  br label %coro.sel_poll_{}\n", y_id));
+                    out.push_str(&format!("coro.sel_poll_{}:\n", y_id));
+                    out.push_str(&format!(
+                        "  %sel_poll_res_{}_{} = call i64 @ifa_rt_channel_select(ptr %select_arr_{}, i64 {}, i32 1)\n",
+                        res_id, y_id, res_id, n
+                    ));
+                    out.push_str(&format!(
+                        "  %sel_is_waiting_{}_{} = icmp eq i64 %sel_poll_res_{}_{}, {}\n",
+                        res_id, y_id, res_id, y_id, n
+                    ));
+                    out.push_str(&format!(
+                        "  br i1 %sel_is_waiting_{}_{}, label %coro.sel_susp_{}, label %coro.sel_done_{}\n",
+                        res_id, y_id, y_id, y_id
+                    ));
+                    out.push_str(&format!("coro.sel_susp_{}:\n", y_id));
+                    out.push_str(&format!(
+                        "  %coro.sel_tok_{} = call i8 @llvm.coro.suspend(token none, i1 false)\n",
+                        y_id
+                    ));
+                    out.push_str(&format!(
+                        "  switch i8 %coro.sel_tok_{}, label %coro.susp_ret [ i8 0, label %coro.sel_poll_{} i8 1, label %coro.cleanup ]\n",
+                        y_id, y_id
+                    ));
+                    out.push_str(&format!("coro.sel_done_{}:\n", y_id));
+                    out.push_str(&format!(
+                        "  %v{} = phi i64 [ %sel_poll_res_{}_{}, %coro.sel_poll_{} ]\n",
+                        res_id, res_id, y_id, y_id
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  %v{} = call i64 @ifa_rt_channel_select(ptr %select_arr_{}, i64 {}, i32 {})\n",
+                        res_id,
+                        res_id,
+                        n,
+                        if *has_default { 1 } else { 0 }
+                    ));
+                }
             }
             ValueExpr::Spawn { target, args } => {
                 let callee = INTERNER.resolve(target);
@@ -2190,13 +2352,32 @@ impl<'a> LlvmIrEmitter<'a> {
                 }
             }
             ValueExpr::ChanSend { chan, val } => {
+                let is_val_ptr = matches!(
+                    value_types.get(val),
+                    Some(ifa_fir::FirType::Pointer(_))
+                        | Some(ifa_fir::FirType::GenerationalRef(_))
+                        | Some(ifa_fir::FirType::Str)
+                        | Some(ifa_fir::FirType::String)
+                        | Some(ifa_fir::FirType::Struct(..))
+                        | Some(ifa_fir::FirType::Enum(..))
+                        | Some(ifa_fir::FirType::Array(..))
+                        | Some(ifa_fir::FirType::Slice(..))
+                        | Some(ifa_fir::FirType::Channel(_))
+                        | Some(ifa_fir::FirType::Unit)
+                );
+                let val_ptr_expr = if is_val_ptr {
+                    format!("%v{}", val.0)
+                } else {
+                    let cast_val = format!("%chan_val_cast_{}", val.0);
+                    out.push_str(&format!(
+                        "  {} = inttoptr i64 %v{} to ptr\n",
+                        cast_val, val.0
+                    ));
+                    cast_val
+                };
                 out.push_str(&format!(
-                    "  %chan_val_cast_{} = inttoptr i64 %v{} to ptr\n",
-                    val.0, val.0
-                ));
-                out.push_str(&format!(
-                    "  call i32 @ifa_rt_channel_send(ptr %v{}, ptr %chan_val_cast_{})\n",
-                    chan.0, val.0
+                    "  call i32 @ifa_rt_channel_send(ptr %v{}, ptr {})\n",
+                    chan.0, val_ptr_expr
                 ));
             }
             ValueExpr::ChanClose { chan } => {
