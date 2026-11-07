@@ -212,6 +212,7 @@ impl<'a> FunctionLoweringContext<'a> {
             is_strict: false,
             is_pub: false,
             is_comptime: false,
+            is_coroutine: false,
             is_extern: None,
             span,
             next_value_id,

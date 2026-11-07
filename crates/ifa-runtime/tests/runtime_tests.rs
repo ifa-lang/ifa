@@ -507,6 +507,47 @@ fn test_stackless_native_coroutine_spawn_scheduler() {
 }
 
 #[test]
+fn test_stackless_custom_frame_coroutine_creation_and_lifecycle() {
+    use ifa_runtime::ffi::{
+        ifa_rt_coro_create_custom, ifa_rt_coro_destroy, ifa_rt_coro_frame, ifa_rt_coro_is_done,
+        ifa_rt_coro_resume,
+    };
+
+    static DESTROY_CALLED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    extern "C" fn custom_destroy(ptr: *mut u8) {
+        DESTROY_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+        unsafe {
+            let _ = Box::from_raw(ptr as *mut MockCoroFrame);
+        }
+    }
+
+    let raw_frame = Box::into_raw(Box::new(MockCoroFrame {
+        accumulator: 0,
+        stage: 0,
+    })) as *mut u8;
+
+    let coro = ifa_rt_coro_create_custom(raw_frame, mock_coro_resume, Some(custom_destroy));
+    assert_eq!(ifa_rt_coro_is_done(coro), 0);
+
+    let res1 = ifa_rt_coro_resume(coro);
+    assert_eq!(res1, 0); // Suspended
+    let res2 = ifa_rt_coro_resume(coro);
+    assert_eq!(res2, 0); // Suspended
+    let res3 = ifa_rt_coro_resume(coro);
+    assert_eq!(res3, 1); // Completed
+    assert_eq!(ifa_rt_coro_is_done(coro), 1);
+
+    let frame = unsafe { &*(ifa_rt_coro_frame(coro) as *const MockCoroFrame) };
+    assert_eq!(frame.accumulator, 60);
+    assert_eq!(frame.stage, 3);
+
+    ifa_rt_coro_destroy(coro);
+    assert!(DESTROY_CALLED.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
 fn test_zero_copy_slice_ffi() {
     use ifa_runtime::ffi::{
         ifa_rt_slice_alloc, ifa_rt_slice_free, ifa_rt_slice_from_raw, ifa_rt_version_string,

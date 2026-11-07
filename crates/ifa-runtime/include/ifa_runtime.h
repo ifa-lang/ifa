@@ -165,6 +165,11 @@ typedef struct ifa_coroutine ifa_coroutine_t;
 ifa_coroutine_t* ifa_rt_coro_create(size_t frame_size, ifa_coro_resume_fn resume_fn, ifa_coro_destroy_fn destroy_fn);
 
 /**
+ * Initialize a stackless coroutine from an externally managed handle or LLVM coroutine frame.
+ */
+ifa_coroutine_t* ifa_rt_coro_create_custom(void* handle, ifa_coro_resume_fn resume_fn, ifa_coro_destroy_fn destroy_fn);
+
+/**
  * Resume execution of a stackless coroutine for one cooperative step.
  */
 int32_t ifa_rt_coro_resume(ifa_coroutine_t* coro);

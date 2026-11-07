@@ -496,6 +496,7 @@ pub struct FirFunction {
     pub is_strict: bool,
     pub is_pub: bool,
     pub is_comptime: bool,
+    pub is_coroutine: bool,
     pub is_extern: Option<String>,
     pub span: Span,
     pub next_value_id: u32,
@@ -525,11 +526,22 @@ impl FirFunction {
             is_strict,
             is_pub,
             is_comptime,
+            is_coroutine: false,
             is_extern,
             span,
             next_value_id: 0,
             next_block_id: 1,
         }
+    }
+
+    /// Returns true if this function is a coroutine or contains yield suspension points.
+    pub fn is_coroutine(&self) -> bool {
+        self.is_coroutine
+            || self.blocks.iter().any(|b| {
+                b.instructions
+                    .iter()
+                    .any(|inst| matches!(inst.expr, ValueExpr::Yield))
+            })
     }
 
     pub fn alloc_value(&mut self) -> ValueId {

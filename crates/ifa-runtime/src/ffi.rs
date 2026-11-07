@@ -181,6 +181,7 @@ pub struct IfaCoroutine {
     pub destroy_fn: Option<CoroDestroyFn>,
     pub status: CoroStatus,
     pub fiber_id: Option<FiberId>,
+    pub owns_frame: bool,
 }
 
 unsafe impl Send for IfaCoroutine {}
@@ -204,6 +205,25 @@ pub extern "C" fn ifa_rt_coro_create(
         destroy_fn,
         status: CoroStatus::Suspended,
         fiber_id: None,
+        owns_frame: true,
+    });
+    Box::into_raw(coro)
+}
+
+/// Create a stackless native coroutine from an externally allocated handle or LLVM coroutine frame.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_create_custom(
+    handle: *mut u8,
+    resume_fn: extern "C" fn(*mut u8) -> i32,
+    destroy_fn: Option<extern "C" fn(*mut u8)>,
+) -> *mut IfaCoroutine {
+    let coro = Box::new(IfaCoroutine {
+        frame: handle,
+        resume_fn,
+        destroy_fn,
+        status: CoroStatus::Suspended,
+        fiber_id: None,
+        owns_frame: false,
     });
     Box::into_raw(coro)
 }
@@ -263,9 +283,10 @@ pub extern "C" fn ifa_rt_coro_destroy(coro: *mut IfaCoroutine) {
             if let Some(destroy) = c.destroy_fn {
                 if !c.frame.is_null() {
                     destroy(c.frame);
+                    c.frame = std::ptr::null_mut();
                 }
             }
-            if !c.frame.is_null() {
+            if c.owns_frame && !c.frame.is_null() {
                 GLOBAL_ALLOCATOR.free(c.frame);
                 c.frame = std::ptr::null_mut();
             }
