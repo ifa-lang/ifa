@@ -246,7 +246,7 @@ fn test_ffi_c_header_and_php_bridge_generation() {
         php_class_name: Some("NativeCryptoService".to_string()),
         output_dir: None,
         generate_preload_script: true,
-        generate_symfony_config: true,
+        generate_service_config: true,
     };
 
     let gen = FfiBridgeGenerator::new("crypto-engine", ffi_config);
@@ -334,7 +334,7 @@ fn test_ffi_c_header_and_php_bridge_generation() {
         .contains("public function allocateBuffer(int $size, ?int $arenaId = null): \\FFI\\CData"));
     assert!(php_class.contains("public function freeBuffer(\\FFI\\CData $slice): void"));
 
-    // Verify Symfony request-scoped arena lifecycle hooks
+    // Verify request-scoped arena lifecycle hooks
     assert!(php_class.contains("public function createArena(int $capacity = 65536): int"));
     assert!(php_class.contains("public function resetArena(int $arenaId): void"));
     assert!(php_class.contains("public function destroyArena(int $arenaId): void"));
@@ -346,23 +346,23 @@ fn test_ffi_c_header_and_php_bridge_generation() {
         "crypto_engine.h",
         "libcrypto_engine.so",
     );
-    assert!(preload_script.contains("OPcache Preload Script for Symfony 8.1 / PHP 8.4+"));
+    assert!(preload_script.contains("OPcache Preload Script for PHP 8.4+"));
     assert!(preload_script
         .contains("\\App\\Bridge\\NativeBridge\\NativeCryptoService::setPreloadedInstance($ffi);"));
 
-    // Verify Symfony 8.1 Dependency Injection configuration
-    let symfony_yaml = gen.generate_symfony_service_config(
+    // Verify Dependency Injection configuration
+    let service_yaml = gen.generate_service_config(
         "NativeCryptoService",
         "crypto_engine.h",
         "libcrypto_engine.so",
     );
-    assert!(symfony_yaml.contains("App\\Bridge\\NativeBridge\\NativeCryptoService:"));
-    assert!(symfony_yaml.contains("$autoArena: true"));
-    assert!(symfony_yaml.contains("- { name: 'kernel.reset', method: 'reset' }"));
+    assert!(service_yaml.contains("App\\Bridge\\NativeBridge\\NativeCryptoService:"));
+    assert!(service_yaml.contains("$autoArena: true"));
+    assert!(service_yaml.contains("- { name: 'kernel.reset', method: 'reset' }"));
 }
 
 #[test]
-fn test_zero_copy_php_ffi_symfony_service_integration() {
+fn test_zero_copy_php_ffi_service_integration() {
     let temp_dir = std::env::temp_dir().join(format!("kori_ffi_zc_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(temp_dir.join("src")).unwrap();
@@ -427,12 +427,12 @@ pub extern "C" strict fn process_payload_checksum(value: i64) -> i64 {
         .expect("Preload script missing");
     assert!(preload_art.path.exists());
 
-    let symfony_art = report
+    let service_art = report
         .artifacts
         .iter()
-        .find(|a| a.kind == kori::ArtifactKind::SymfonyService)
-        .expect("Symfony service config missing");
-    assert!(symfony_art.path.exists());
+        .find(|a| a.kind == kori::ArtifactKind::ServiceConfig)
+        .expect("Service config missing");
+    assert!(service_art.path.exists());
 
     let php_content = fs::read_to_string(&php_art.path).unwrap();
     assert!(php_content.contains("namespace App\\Bridge\\DataGateway;"));
@@ -460,7 +460,7 @@ if ($arenaId === null || $arenaId === 0) {{
 }}
 
 // 2. Verify Zero-Copy Slice Creation and String Reading
-$testString = "High-Throughput Zero-Copy Payload for Symfony 8.1";
+$testString = "High-Throughput Zero-Copy Payload for Native PHP 8.4+ FFI";
 $slice = $gateway->createSlice($testString);
 if ($slice->len !== strlen($testString)) {{
     fwrite(STDERR, "Slice length mismatch\n");
@@ -480,7 +480,7 @@ if ($buffer->cap < 256) {{
 }}
 $gateway->freeBuffer($buffer);
 
-// 4. Verify Symfony reset hook
+// 4. Verify request reset hook
 $gateway->reset();
 if ($gateway->getCurrentArenaId() !== $arenaId) {{
     fwrite(STDERR, "Arena ID changed after reset\n");
@@ -596,7 +596,7 @@ pub extern "C" strict fn compute_hash(seed: i64, multiplier: i64) -> i64 {
     let header_content = fs::read_to_string(&header_art.path).unwrap();
     assert!(header_content.contains("int64_t compute_hash(int64_t seed, int64_t multiplier);"));
 
-    // Verify PHP 8.4+ / Symfony 8.1 FFI bridge artifact was created
+    // Verify PHP 8.4+ FFI bridge artifact was created
     let php_art = report
         .artifacts
         .iter()
@@ -608,7 +608,7 @@ pub extern "C" strict fn compute_hash(seed: i64, multiplier: i64) -> i64 {
     assert!(php_content.contains("final class MathBridge"));
     assert!(php_content.contains("public function compute_hash(int $seed, int $multiplier): int"));
 
-    // Verify OPcache preload script and Symfony 8.1 services.yaml were created
+    // Verify OPcache preload script and services.yaml were created
     let preload_art = report
         .artifacts
         .iter()
@@ -616,17 +616,17 @@ pub extern "C" strict fn compute_hash(seed: i64, multiplier: i64) -> i64 {
         .expect("Preload script artifact missing");
     assert!(preload_art.path.exists());
     let preload_content = fs::read_to_string(&preload_art.path).unwrap();
-    assert!(preload_content.contains("OPcache Preload Script for Symfony 8.1 / PHP 8.4+"));
+    assert!(preload_content.contains("OPcache Preload Script for PHP 8.4+"));
 
-    let symfony_art = report
+    let service_art = report
         .artifacts
         .iter()
-        .find(|a| a.kind == kori::ArtifactKind::SymfonyService)
-        .expect("Symfony service artifact missing");
-    assert!(symfony_art.path.exists());
-    let symfony_content = fs::read_to_string(&symfony_art.path).unwrap();
-    assert!(symfony_content.contains("App\\Service\\Native\\MathBridge:"));
-    assert!(symfony_content.contains("- { name: 'kernel.reset', method: 'reset' }"));
+        .find(|a| a.kind == kori::ArtifactKind::ServiceConfig)
+        .expect("Service artifact missing");
+    assert!(service_art.path.exists());
+    let service_content = fs::read_to_string(&service_art.path).unwrap();
+    assert!(service_content.contains("App\\Service\\Native\\MathBridge:"));
+    assert!(service_content.contains("- { name: 'kernel.reset', method: 'reset' }"));
 
     // If PHP is available on the host system, verify end-to-end execution via PHP FFI
     if let Ok(php_check) = std::process::Command::new("php").arg("-v").output() {

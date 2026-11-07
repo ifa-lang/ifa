@@ -523,7 +523,7 @@ fn test_zero_copy_slice_ffi() {
     assert!(mut_slice.cap >= 64);
     assert!(!mut_slice.ptr.is_null());
 
-    let payload = b"Hello from Symfony 8.1 FFI";
+    let payload = b"Hello from Native C-ABI FFI";
     mut_slice.as_capacity_bytes_mut()[..payload.len()].copy_from_slice(payload);
     mut_slice.len = payload.len();
     assert_eq!(&mut_slice.as_bytes()[..payload.len()], payload);

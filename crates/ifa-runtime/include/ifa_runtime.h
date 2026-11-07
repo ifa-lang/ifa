@@ -4,7 +4,7 @@
  *
  * Provides deterministic zero-GC generational memory allocation,
  * fiber concurrency primitives, and stream I/O for native execution
- * and PHP 8.4+ / Symfony 8.1 FFI integration.
+ * and high-performance cross-language C-ABI FFI integration.
  */
 
 #ifndef IFA_RUNTIME_H

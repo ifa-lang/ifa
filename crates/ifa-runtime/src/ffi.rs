@@ -1,4 +1,4 @@
-//! C-ABI Foreign Function Interface exports for native execution and PHP 8.4+ / Symfony 8.1 FFI.
+//! C-ABI Foreign Function Interface exports for native execution and cross-language FFI.
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 

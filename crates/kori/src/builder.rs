@@ -28,7 +28,7 @@ pub enum ArtifactKind {
     CHeader,
     PhpBridge,
     PreloadScript,
-    SymfonyService,
+    ServiceConfig,
     IfaArchive,
 }
 
@@ -306,7 +306,7 @@ impl BuildOrchestrator {
                         });
                     }
 
-                    // Automatic FFI generation for PHP 8.4+ / Symfony 8.1 and C header
+                    // Automatic FFI generation for PHP 8.4+ and C header
                     let ffi_config = pkg.manifest.ffi.clone().unwrap_or_default();
                     let ffi_gen = FfiBridgeGenerator::new(&pkg.name, ffi_config);
                     let exported_fns = FfiBridgeGenerator::extract_exported_functions(&fir_module);
@@ -337,11 +337,11 @@ impl BuildOrchestrator {
                         });
                     }
 
-                    if let Some(symfony_path) = ffi_artifacts.symfony_config_path {
+                    if let Some(service_path) = ffi_artifacts.service_config_path {
                         artifacts.push(BuiltArtifact {
                             name: "services.yaml".to_string(),
-                            path: symfony_path,
-                            kind: ArtifactKind::SymfonyService,
+                            path: service_path,
+                            kind: ArtifactKind::ServiceConfig,
                             cached: false,
                         });
                     }

@@ -131,7 +131,7 @@ Le processeur exécute le chemin nominal en **1 seul cycle CPU** (branchement co
 
 ---
 
-## 5. Gestionnaire de Paquets `kori` et Pont FFI PHP 8.4+ / Symfony 8.1
+## 5. Gestionnaire de Paquets `kori` et Pont FFI PHP 8.4+ / C-ABI
 
 ### 5.1. Manifeste Déterministe `kori.toml`
 
@@ -156,7 +156,7 @@ cdylib = true
 wasi = true
 ```
 
-### 5.2. Intégration FFI PHP 8.4+ / Symfony 8.1
+### 5.2. Intégration FFI PHP 8.4+ / C-ABI
 
 Le générateur FFI intégré à `kori` génère automatiquement les classes PHP 8.4+ typées avec chargement natif OPcache (`opcache.preload`) :
 
@@ -213,7 +213,7 @@ Le moteur d'orchestration `kori` supporte la génération simultanée et déterm
 
 | Type de Cible (`crate_types`) | Extension d'Artefact | Rôle Technique & Cas d'Usage | Outils Associés |
 | :--- | :--- | :--- | :--- |
-| `cdylib` | `lib{name}.so` / `.dll` | Bibliothèque dynamique C-ABI avec en-têtes C `.h` et ponts typés PHP 8.4+ / Symfony 8.1 | GCC, Clang, FFI |
+| `cdylib` | `lib{name}.so` / `.dll` | Bibliothèque dynamique C-ABI avec en-têtes C `.h` et ponts typés PHP 8.4+ | GCC, Clang, FFI |
 | `staticlib` | `lib{name}.a` | Archive statique C-ABI pour édition de liens embarquée ou standalone | `ar`, `llvm-ar` |
 | `wasm` | `{name}.wasm` | Binaire WebAssembly WASI standardisé bare-metal sans Garbage Collector | Clang wasm32, Wasmtime |
 | `ifalib` | `{name}.ifalib` | Module canonique FIR SSA pour distribution et réutilisation directe dans l'écosystème IFA | `kori pack`, `kori resolver` |

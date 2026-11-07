@@ -12,7 +12,7 @@
 Le langage de programmation IFA est conçu pour une intégration native de premier ordre avec l'écosystème C et Rust. Grâce à son absence de Garbage Collector et à sa disposition mémoire conforme à la norme C-ABI standard (System V AMD64 ABI sous Linux/macOS, MSVC ABI sous Windows), IFA peut :
 
 1. **Consommer directement des bibliothèques C et Rust** (statiques `.a` ou dynamiques `.so`, `.dll`, `.dylib`) sans coût de conversion ou de marshalling.
-2. **Exporter des fonctions haute performance et des bibliothèques partagées** utilisables directement par d'autres environnements de production (PHP 8.4+ / Symfony 8.1, Node.js, Python, Go, Rust).
+2. **Exporter des fonctions haute performance et des bibliothèques partagées** utilisables directement par d'autres environnements de production (PHP 8.4+, Node.js, Python, Go, Rust, C++).
 
 ---
 
@@ -94,7 +94,7 @@ pub extern "C" strict fn ifa_compute_payment_checksum(
 
 ## 5. Configuration du Manifeste `kori.toml`
 
-Le fichier `kori.toml` pilote le packaging, la compilation et la génération automatique des en-têtes C et bindings PHP Symfony.
+Le fichier `kori.toml` pilote le packaging, la compilation et la génération automatique des en-têtes C et bindings PHP FFI.
 
 ```toml
 [package]
@@ -192,18 +192,18 @@ pub fn main() {
 
 ---
 
-## 7. Pont FFI PHP 8.4+ / Symfony 8.1 Automatisé
+## 7. Pont FFI PHP 8.4+ Automatisé
 
 La commande `kori ffi-gen` analyse les déclarations `pub extern "C"` et produit automatiquement :
 1. L'en-tête C standard (`.h`).
-2. La classe de service PHP 8.4+ typée compatible avec l'injection de dépendances de Symfony 8.1.
+2. La classe de service PHP 8.4+ typée pour l'intégration FFI.
 
 ### Génération automatique :
 ```bash
 kori ffi-gen --target php
 ```
 
-### Exemple de Service Symfony Généré (`FintechCoreService.php`) :
+### Exemple de Classe PHP FFI Générée (`FintechCoreService.php`) :
 
 ```php
 <?php

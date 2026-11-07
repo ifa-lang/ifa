@@ -217,7 +217,7 @@ pub struct FfiConfig {
     #[serde(default = "default_true")]
     pub generate_preload_script: bool,
     #[serde(default = "default_true")]
-    pub generate_symfony_config: bool,
+    pub generate_service_config: bool,
 }
 
 fn default_true() -> bool {
@@ -237,7 +237,7 @@ impl Default for FfiConfig {
             php_class_name: None,
             output_dir: None,
             generate_preload_script: true,
-            generate_symfony_config: true,
+            generate_service_config: true,
         }
     }
 }

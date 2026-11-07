@@ -176,7 +176,7 @@ Pour garantir une vélocité maximale dès la phase d'amorçage (*bootstrapping*
 
 1. **Modules WebAssembly Haute Performance (Systèmes & Web OS) :** Compilation de moteurs de rendu, systèmes de fichiers virtuels et utilitaires système en binaires `.wasm` de quelques kilo-octets (sans runtime GC) pour propulser des environnements web modernes tels que des Web OS ou des applications **React / TypeScript**.  
 2. **Passerelles Fintech & Microservices Critique :** Création de proxys API, moteurs de réconciliation financière et passerelles de paiement (Mobile Money, agrégateurs bancaires, conversion de devises) capables de traiter des dizaines de milliers de requêtes par seconde avec une latence constante (aucun *Stop-The-World* de Garbage Collector).  
-3. **Extensions Natives pour Backends Existants (FFI C-ABI) :** Exportation transparente de fonctions IFA selon l'ABI C standard (`extern "C"`), permettant d'appeler des librairies IFA ultra-rapides directement depuis **PHP 8.4+ (via FFI dans des architectures Symfony)** ou **Node.js (via N-API)**.
+3. **Extensions Natives pour Backends Existants (FFI C-ABI) :** Exportation transparente de fonctions IFA selon l'ABI C standard (`extern "C"`), permettant d'appeler des librairies IFA ultra-rapides directement depuis **PHP 8.4+ (via FFI)** ou **Node.js (via N-API)**.
 
 # **7\. Feuille de Route (Roadmap d'Implémentation)**
 
@@ -290,7 +290,7 @@ Pour accélérer le développement initial (bootstrapping), le compilateur ifac 
 | `crates/ifa-runtime` | Bibliothèque d'exécution minimale (no\_std) contenant l'allocateur générationnel et l'ordonnanceur de fibres I/O. | rustix, io-uring (Linux), windows-sys |
 | `crates/kori` | Gestionnaire de paquets, lecture de kori.toml, résolution de versions et orchestration du cache de build. | serde, toml, clap, blake3 |
 
-# **12\. Spécification du Manifeste kori.toml et Pont FFI PHP 8.4+ / Symfony 8.1**
+# **12\. Spécification du Manifeste kori.toml et Pont FFI PHP 8.4+ / C-ABI**
 
 ## **12.1. Configuration Standard d'un Projet (kori.toml)**
 
@@ -301,12 +301,12 @@ Chaque projet IFA est piloté par un fichier kori.toml à sa racine qui unifie l
 * **Section \[profiles.dev\] :** Active par défaut le backend cranelift pour une compilation en moins de 500 millisecondes avec vérifications générationnelles complètes.  
 * **Section \[profiles.release\] :** Active le backend llvm avec optimisation maximale (opt\_level \= 3, lto \= "thin", strip\_symbols \= true).
 
-## **12.2. Intégration Native dans une Architecture PHP 8.4+ et Symfony 8.1 (Dernière Version de Symfony)**
+## **12.2. Intégration Native dans une Architecture PHP 8.4+ / C-ABI**
 
-Grâce à l'absence de Garbage Collector dans IFA, toute fonction annotée pub extern "C" strict fn produit un symbole binaire C-ABI pur, sans surcharge de runtime. Cela permet de déporter les traitements lourds d'une application **Symfony 8.1 (dernière version de Symfony)** tournant sous **PHP 8.4+** directement vers une bibliothèque compilée en IFA :
+Grâce à l'absence de Garbage Collector dans IFA, toute fonction annotée pub extern "C" strict fn produit un symbole binaire C-ABI pur, sans surcharge de runtime. Cela permet de déporter les traitements lourds d'une application tournant sous **PHP 8.4+** directement vers une bibliothèque compilée en IFA :
 
 * **1\. Côté IFA :** La fonction reçoit des pointeurs constants ou des tranches d'octets, exécute le calcul intensif (hachage cryptographique, agrégation financière massive, validation de lot JSON/CSV, signature de transaction) sur la pile en mode strict, et retourne le résultat.  
-* **2\. Côté Symfony 8.1 / PHP 8.4+ :** Un service dédié charge la bibliothèque .so en préchargement (opcache.preload) via FFI::cdef(), offrant des appels de fonctions natives en quelques nanosecondes depuis les contrôleurs ou les workers Messenger de Symfony 8.1.
+* **2\. Côté PHP 8.4+ :** Un service dédié charge la bibliothèque .so en préchargement (opcache.preload) via FFI::cdef(), offrant des appels de fonctions natives en quelques nanosecondes depuis les contrôleurs ou les workers.
 
 # **13\. Plan d'Exécution Développeur — Checklist Granulaire des 4 Premiers Sprints**
 
@@ -327,5 +327,5 @@ Pour lancer le développement immédiatement et valider chaque brique de manièr
 * **Sprint 4 (Semaines 10 à 12\) — Allocateur Générationnel, Mot-clé ref et Pont C-ABI :**  
   * Implémenter l'allocateur par dalles avec en-tête GenHeader de 64 bits dans ifa-runtime.  
   * Activer la génération des instructions gen\_alloc, gen\_ref et gen\_check ainsi que la passe d'élimination statique par dominance.  
-  * Générer la première bibliothèque partagée .so / .dll via pub extern "C" strict fn et tester son appel depuis un script PHP 8.4+ / Symfony 8.1.
+  * Générer la première bibliothèque partagée .so / .dll via pub extern "C" strict fn et tester son appel depuis un script PHP 8.4+ C-ABI.
 

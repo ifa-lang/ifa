@@ -285,14 +285,14 @@ strip_symbols = true
 
 L'intégration d'un serveur de langage LSP 3.17 (`ifa-lsp`) dès la conception garantit le support immédiat de l'autocomplétion, des jetons sémantiques et du refactoring dans les éditeurs (VS Code, Cursor, Neovim).
 
-### 4.2. Cas d'usage cibles et intégration FFI (PHP 8.4+ / Symfony 8.1 & WASM)
+### 4.2. Cas d'usage cibles et intégration FFI (C-ABI universel, PHP 8.4+ & WASM)
 
-Grâce à l'absence de Garbage Collector, toute fonction IFA annotée avec `pub extern "C" strict fn` émet des symboles C-ABI purs, sans aucune surcharge de runtime. Cette propriété permet de déporter les traitements intensifs d'applications Web professionnelles (ex. Symfony 8.1 sous PHP 8.4+) vers une bibliothèque IFA hautement performante.
+Grâce à l'absence de Garbage Collector, toute fonction IFA annotée avec `pub extern "C" strict fn` émet des symboles C-ABI purs, sans aucune surcharge de runtime. Cette propriété permet de déporter les traitements intensifs d'applications professionnelles (services backend PHP 8.4+, daemons C/Rust/Go, Node.js) vers une bibliothèque IFA hautement performante.
 
 ```text
-[ Application Symfony 8.1 / PHP 8.4+ ]
+[ Application Hôte (PHP 8.4+, Go, Rust, C) ]
        │
-       ▼ (Chargement unique via opcache.preload) FFI::cdef()
+       ▼ (Chargement dynamique C-ABI) FFI::cdef() / dlopen()
        │
        ▼ (Appel natif direct C-ABI sans GC)
 [ Bibliothèque partagée .so (IFA strict fn) ]
@@ -312,7 +312,7 @@ pub extern "C" strict fn compute_hmac_sha256(
 }
 ```
 
-Côté PHP 8.4+ dans un service Symfony 8.1, l'intégration s'effectue directement via FFI :
+Côté PHP 8.4+, l'intégration s'effectue directement via FFI :
 
 ```php
 final class CryptographyBridge
