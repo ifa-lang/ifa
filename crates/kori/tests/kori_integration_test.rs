@@ -363,65 +363,92 @@ fn test_ffi_c_header_and_php_bridge_generation() {
 
 #[test]
 fn test_zero_copy_php_ffi_symfony_service_integration() {
-    let ffi_config = kori::manifest::FfiConfig {
-        generate_c_headers: true,
-        generate_php_binding: true,
-        php_namespace: "App\\Bridge\\DataGateway".to_string(),
-        php_class_name: Some("ZeroCopyGateway".to_string()),
-        output_dir: None,
-        generate_preload_script: true,
-        generate_symfony_config: true,
-    };
+    let temp_dir = std::env::temp_dir().join(format!("kori_ffi_zc_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(temp_dir.join("src")).unwrap();
 
-    let gen = FfiBridgeGenerator::new("data-gateway", ffi_config);
+    let manifest = r#"
+[package]
+name = "data_gateway"
+version = "0.1.0"
+edition = "2026"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
 
-    let exported_fns = vec![ExportedFunction {
-        name: "ifa_rt_version_string".to_string(),
-        is_strict: true,
-        params: vec![],
-        return_type: FirType::Str,
-    }];
+[targets.lib]
+name = "data_gateway"
+path = "src/lib.ifa"
+crate_types = ["cdylib"]
 
-    let c_header = gen.generate_c_header(&exported_fns);
-    assert!(c_header.contains("const char* ifa_rt_version_string(void);"));
+[ffi]
+generate_c_headers = true
+generate_php_binding = true
+php_namespace = "App\\Bridge\\DataGateway"
+php_class_name = "ZeroCopyGateway"
+"#;
 
-    let php_class = gen.generate_php_class(
-        "ZeroCopyGateway",
-        &exported_fns,
-        "data_gateway.h",
-        "libdata_gateway.so",
-    );
+    let lib_ifa = r#"
+pub extern "C" strict fn process_payload_checksum(value: i64) -> i64 {
+    return value * 3 + 1
+}
+"#;
 
-    assert!(php_class.contains("namespace App\\Bridge\\DataGateway;"));
-    assert!(php_class.contains("public function ifa_rt_version_string(): string"));
-    assert!(php_class.contains("return (string) $this->ffi->ifa_rt_version_string();"));
+    fs::write(temp_dir.join("kori.toml"), manifest).unwrap();
+    fs::write(temp_dir.join("src").join("lib.ifa"), lib_ifa).unwrap();
+
+    let orchestrator =
+        BuildOrchestrator::new(temp_dir.clone()).expect("Failed to initialize orchestrator");
+    let report = orchestrator.build(false, None, true).expect("Build failed");
+
+    let so_art = report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::SharedLibrary)
+        .expect("Shared library artifact missing");
+    assert!(so_art.path.exists());
+
+    let php_art = report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::PhpBridge)
+        .expect("PHP Bridge artifact missing");
+    assert!(php_art.path.exists());
+
+    let header_art = report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::CHeader)
+        .expect("C Header artifact missing");
+    assert!(header_art.path.exists());
+
+    let preload_art = report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::PreloadScript)
+        .expect("Preload script missing");
+    assert!(preload_art.path.exists());
+
+    let symfony_art = report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::SymfonyService)
+        .expect("Symfony service config missing");
+    assert!(symfony_art.path.exists());
+
+    let php_content = fs::read_to_string(&php_art.path).unwrap();
+    assert!(php_content.contains("namespace App\\Bridge\\DataGateway;"));
+    assert!(php_content.contains("final class ZeroCopyGateway"));
+    assert!(php_content.contains("public function process_payload_checksum(int $value): int"));
 
     // If PHP is available on the host system, verify end-to-end execution of zero-copy slice and buffer primitives
     if let Ok(php_check) = std::process::Command::new("php").arg("-v").output() {
         if php_check.status.success() {
-            let temp_dir = std::env::temp_dir().join(format!("kori_ffi_zc_{}", std::process::id()));
-            let _ = fs::remove_dir_all(&temp_dir);
-            fs::create_dir_all(&temp_dir).unwrap();
-
-            let artifacts = gen
-                .emit_bindings(
-                    &exported_fns,
-                    &temp_dir,
-                    "/root/ifa/target/debug/libifa_runtime.so",
-                )
-                .expect("Failed to emit bindings");
-
-            assert!(artifacts.header_path.exists());
-            assert!(artifacts.php_path.exists());
-            assert!(artifacts.preload_path.unwrap().exists());
-            assert!(artifacts.symfony_config_path.unwrap().exists());
-
             let php_test = format!(
                 r#"
 require_once '{php_file}';
 
 $gateway = new App\Bridge\DataGateway\ZeroCopyGateway(
-    libraryPath: '/root/ifa/target/debug/libifa_runtime.so',
+    libraryPath: '{so_file}',
+    headerPath: '{hdr_file}',
     autoArena: true
 );
 
@@ -460,14 +487,16 @@ if ($gateway->getCurrentArenaId() !== $arenaId) {{
     exit(5);
 }}
 
-// 5. Verify C-ABI function call returning string
-$ver = $gateway->ifa_rt_version_string();
-if (!str_contains($ver, "IFA Runtime")) {{
-    fwrite(STDERR, "Runtime version string mismatch: " . $ver . "\n");
+// 5. Verify C-ABI function call execution
+$checksum = $gateway->process_payload_checksum(10);
+if ($checksum !== 31) {{
+    fwrite(STDERR, "Checksum mismatch: " . $checksum . "\n");
     exit(6);
 }}
 "#,
-                php_file = artifacts.php_path.display()
+                php_file = php_art.path.display(),
+                so_file = so_art.path.display(),
+                hdr_file = header_art.path.display()
             );
 
             let test_output = std::process::Command::new("php")
@@ -481,10 +510,10 @@ if (!str_contains($ver, "IFA Runtime")) {{
                 "PHP Zero-Copy FFI validation failed: {}",
                 String::from_utf8_lossy(&test_output.stderr)
             );
-
-            let _ = fs::remove_dir_all(&temp_dir);
         }
     }
+
+    let _ = fs::remove_dir_all(&temp_dir);
 }
 
 #[test]
