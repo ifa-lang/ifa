@@ -7,7 +7,10 @@ pub mod symbol_table;
 pub mod types;
 
 pub use checker::SemanticAnalyzer;
-pub use escape::{AllocKind, EscapeAnalyzer, EscapeStatus};
+pub use escape::{
+    extract_escape_root, format_projection_expr, AllocKind, ContainedRef, EscapeAnalyzer,
+    EscapeStatus, VarEscapeInfo, VarOrigin,
+};
 pub use exclusivity::check_call_exclusivity;
 pub use symbol_table::{FunctionSymbol, StructSymbol, SymbolTable, VariableSymbol};
 pub use types::{FloatType, IntType, Type};

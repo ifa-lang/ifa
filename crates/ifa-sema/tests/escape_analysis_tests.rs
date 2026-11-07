@@ -179,3 +179,296 @@ pub fn make_transitive_cycle() -> () {
     let analysis = analyze(&sm, &prog);
     assert!(!analysis.has_errors());
 }
+
+#[test]
+fn test_generic_container_scalar_projection_ref_escape() {
+    let src = r#"
+struct Container<T> {
+    item: T,
+    id: i64,
+}
+
+pub fn leak_field() -> ref i64 {
+    let c = Container(item: 42, id: 1)
+    return ref c.item
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("leak_field.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(analysis
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0021")));
+}
+
+#[test]
+fn test_generic_container_holding_local_ref_escapes() {
+    let src = r#"
+struct Container<T> {
+    item: T,
+    id: i64,
+}
+
+pub fn leak_container() -> Container<ref i64> {
+    let x = 42
+    let c = Container(item: ref x, id: 1)
+    return c
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("leak_container.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(analysis
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0021")));
+}
+
+#[test]
+fn test_generic_container_projection_resolving_to_local_ref_escapes() {
+    let src = r#"
+struct Container<T> {
+    item: T,
+    id: i64,
+}
+
+pub fn leak_projection_val() -> ref i64 {
+    let x = 42
+    let c = Container(item: ref x, id: 1)
+    return c.item
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("leak_proj_val.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(analysis
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0021")));
+}
+
+#[test]
+fn test_stack_array_scalar_projection_ref_escape() {
+    let src = r#"
+pub fn leak_array_elem() -> ref i64 {
+    let arr = [10, 20, 30]
+    return ref arr[1]
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("leak_arr.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(analysis
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0021")));
+}
+
+#[test]
+fn test_strict_fn_generic_container_ref_disallowed() {
+    let src = r#"
+struct Box<T> {
+    val: T,
+}
+
+pub strict fn strict_container() -> () {
+    let b = Box(val: 42)
+    let r = ref b.val
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_box.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(analysis
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0020")));
+}
+
+#[test]
+fn test_strict_fn_generic_container_stack_projection_allowed() {
+    let src = r#"
+struct Box<T> {
+    val: T,
+}
+
+pub strict fn compute_box() -> i64 {
+    let b = Box(val: 42)
+    return b.val
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("compute_box.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+}
+
+#[test]
+fn test_spawn_concurrent_scalar_projection_mutation() {
+    let src = r#"
+struct Container<T> {
+    item: T,
+    id: i64,
+}
+
+pub fn spawn_field_race() -> () {
+    mut c = Container(item: 10, id: 1)
+    spawn {
+        c.item = 20
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("spawn_field_race.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(analysis
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0025")));
+}
+
+#[test]
+fn test_spawn_concurrent_array_index_mutation() {
+    let src = r#"
+pub fn spawn_arr_race() -> () {
+    mut arr = [1, 2, 3]
+    spawn {
+        arr[0] = 99
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("spawn_arr_race.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(analysis
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0025")));
+}
+
+#[test]
+fn test_in_param_generic_container_ref_escape_disallowed() {
+    let src = r#"
+struct Container<T> {
+    item: T,
+}
+
+pub fn return_param_ref(in c: Container<i64>) -> ref i64 {
+    return ref c.item
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("return_param_ref.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(analysis
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0021")));
+}
+
+#[test]
+fn test_nested_generic_container_ref_propagation() {
+    let src = r#"
+struct Box<T> {
+    val: T,
+}
+
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+
+pub fn leak_nested() -> Pair<Box<ref i64>, i64> {
+    let x = 100
+    let b = Box(val: ref x)
+    let p = Pair(first: b, second: 200)
+    return p
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("leak_nested.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(analysis
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0021")));
+}
+
+#[test]
+fn test_generic_container_cyclic_graph_strict_disallowed() {
+    let src = r#"
+struct Node<T> {
+    data: T,
+    link: ?ref Node<T>,
+}
+
+pub strict fn make_generic_cycle() -> () {
+    mut a = Node(data: 1, link: nil)
+    mut b = Node(data: 2, link: nil)
+    a.link = ref b
+    b.link = ref a
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("generic_cycle_strict.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(analysis
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0020")));
+}
