@@ -330,19 +330,36 @@ fn test_llvm_simd_slice_vectorization() {
 
     // Verify SIMD Vector Reduction Intrinsics and Vectorizers are generated
     assert!(ir.contains("declare float @llvm.vector.reduce.fadd.v8f32"));
+    assert!(ir.contains("declare double @llvm.vector.reduce.fadd.v4f64"));
     assert!(ir.contains("declare i32 @llvm.vector.reduce.add.v8i32"));
+    assert!(ir.contains("declare i64 @llvm.vector.reduce.add.v4i64"));
     assert!(ir.contains("@ifa_simd_slice_add_f32"));
     assert!(ir.contains("@ifa_simd_slice_mul_f32"));
     assert!(ir.contains("@ifa_simd_slice_dot_f32"));
     assert!(ir.contains("@ifa_simd_slice_sum_f32"));
     assert!(ir.contains("@ifa_simd_slice_add_i32"));
+    assert!(ir.contains("@ifa_simd_slice_mul_i32"));
     assert!(ir.contains("@ifa_simd_slice_sum_i32"));
+    assert!(ir.contains("@ifa_simd_slice_add_f64"));
+    assert!(ir.contains("@ifa_simd_slice_mul_f64"));
+    assert!(ir.contains("@ifa_simd_slice_dot_f64"));
+    assert!(ir.contains("@ifa_simd_slice_sum_f64"));
+    assert!(ir.contains("@ifa_simd_slice_add_i64"));
+    assert!(ir.contains("@ifa_simd_slice_mul_i64"));
+    assert!(ir.contains("@ifa_simd_slice_sum_i64"));
+    assert!(ir.contains("@ifa_simd_slice_add_u8"));
+    assert!(ir.contains("@ifa_simd_slice_xor_u8"));
     assert!(ir.contains("<8 x float>"));
+    assert!(ir.contains("<4 x double>"));
     assert!(ir.contains("<8 x i32>"));
+    assert!(ir.contains("<4 x i64>"));
+    assert!(ir.contains("<16 x i8>"));
 
     // Verify loop vectorization metadata
     assert!(ir.contains("!\"llvm.loop.vectorize.enable\", i1 1"));
     assert!(ir.contains("!\"llvm.loop.vectorize.width\", i32 8"));
+    assert!(ir.contains("!\"llvm.loop.vectorize.width\", i32 4"));
+    assert!(ir.contains("!\"llvm.loop.vectorize.width\", i32 16"));
     assert!(ir.contains("\"no-trapping-math\"=\"true\""));
 }
 
@@ -411,6 +428,71 @@ fn test_llvm_stackless_fibers_and_coroutine_intrinsics() {
     assert!(
         compile_res.is_ok(),
         "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_auto_vectorization_loop_codegen() {
+    let src = r#"
+        pub fn sum_f32_vec(arr: [f32; 64]) -> f32 {
+            let mut acc: f32 = 0.0;
+            for x in arr {
+                acc = acc + x;
+            }
+            return acc;
+        }
+
+        pub fn xor_u8_crypto(buf: [u8; 16]) -> u8 {
+            let mut acc: u8 = 0;
+            for b in buf {
+                acc = acc ^ b;
+            }
+            return acc;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("simd_loop_test.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).expect("FIR lowering failed");
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&module).expect("Emission failed");
+
+    // 1. Verify loop branch attaches the SIMD vectorize metadata hints
+    assert!(
+        ir.contains("!llvm.loop !1"),
+        "IR must attach 8-lane SIMD hint for f32: {}",
+        ir
+    );
+    assert!(
+        ir.contains("!llvm.loop !8"),
+        "IR must attach 16-lane SIMD hint for u8: {}",
+        ir
+    );
+
+    // 2. Verify compilation to native object file succeeds with LLVM optimizer
+    let temp_dir = std::env::temp_dir().join(format!("llvm_simd_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("simd_loop.o");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation with SIMD vectorization failed: {:?}",
         compile_res.err()
     );
     assert!(obj_path.exists());

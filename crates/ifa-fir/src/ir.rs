@@ -385,6 +385,14 @@ impl Terminator {
     }
 }
 
+/// Optimization hint for loop vectorization (SIMD lane width, interleave, and unroll directives).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LoopVectorHint {
+    pub vector_width: u32,
+    pub interleave_count: u32,
+    pub unroll_enable: bool,
+}
+
 /// Basic block containing sequential instructions and ending with a terminator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BasicBlock {
@@ -392,6 +400,7 @@ pub struct BasicBlock {
     pub params: Vec<(ValueId, FirType)>,
     pub instructions: Vec<Instruction>,
     pub terminator: Option<Terminator>,
+    pub vector_hint: Option<LoopVectorHint>,
 }
 
 impl BasicBlock {
@@ -401,7 +410,12 @@ impl BasicBlock {
             params: Vec::new(),
             instructions: Vec::new(),
             terminator: None,
+            vector_hint: None,
         }
+    }
+
+    pub fn set_vector_hint(&mut self, hint: LoopVectorHint) {
+        self.vector_hint = Some(hint);
     }
 
     pub fn push_param(&mut self, val: ValueId, ty: FirType) {

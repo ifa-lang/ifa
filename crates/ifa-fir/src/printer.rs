@@ -91,6 +91,14 @@ impl<'a> FirPrinter<'a> {
         writeln!(self.output, "):")?;
 
         self.indent_level += 1;
+        if let Some(hint) = &block.vector_hint {
+            self.indent();
+            writeln!(
+                self.output,
+                "// [vector_hint: width={}, interleave={}]",
+                hint.vector_width, hint.interleave_count
+            )?;
+        }
         for inst in &block.instructions {
             self.indent();
             self.print_instruction(inst)?;

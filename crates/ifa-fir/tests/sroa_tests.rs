@@ -28,7 +28,7 @@ fn test_scalar_variable_mem2reg_promotion() {
 
     // 1. Without SROA: contains alloca, store, load
     let unopt_module =
-        compile_to_fir_with_opts(&prog, &analysis.symbols, false, false, false).unwrap();
+        compile_to_fir_with_opts(&prog, &analysis.symbols, false, false, false, false).unwrap();
     let unopt_func = &unopt_module.functions[0];
     let unopt_formatted = format_function(unopt_func);
     assert!(unopt_formatted.contains("alloca"));
@@ -37,7 +37,7 @@ fn test_scalar_variable_mem2reg_promotion() {
 
     // 2. With SROA / Mem2Reg: non-escaping allocas, stores, loads promoted into pure SSA
     let opt_module =
-        compile_to_fir_with_opts(&prog, &analysis.symbols, false, false, true).unwrap();
+        compile_to_fir_with_opts(&prog, &analysis.symbols, false, false, true, false).unwrap();
     let opt_func = &opt_module.functions[0];
     let opt_formatted = format_function(opt_func);
 
@@ -97,7 +97,7 @@ fn test_sroa_aggregate_decomposition_and_promotion() {
     );
 
     let mut module =
-        compile_to_fir_with_opts(&prog, &analysis.symbols, false, false, false).unwrap();
+        compile_to_fir_with_opts(&prog, &analysis.symbols, false, false, false, false).unwrap();
     let mut sroa = SroaPass::new();
     sroa.run_on_module(&mut module);
 

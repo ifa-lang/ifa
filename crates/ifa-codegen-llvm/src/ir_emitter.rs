@@ -182,8 +182,10 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("; LLVM Vector Reduction Intrinsics\n");
         out.push_str("declare float @llvm.vector.reduce.fadd.v4f32(float, <4 x float>)\n");
         out.push_str("declare float @llvm.vector.reduce.fadd.v8f32(float, <8 x float>)\n");
+        out.push_str("declare double @llvm.vector.reduce.fadd.v4f64(double, <4 x double>)\n");
         out.push_str("declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)\n");
-        out.push_str("declare i32 @llvm.vector.reduce.add.v8i32(<8 x i32>)\n\n");
+        out.push_str("declare i32 @llvm.vector.reduce.add.v8i32(<8 x i32>)\n");
+        out.push_str("declare i64 @llvm.vector.reduce.add.v4i64(<4 x i64>)\n\n");
 
         // Linkonce SIMD Vectorized Slice Operations
         out.push_str("; IFA Standard Library SIMD Slice Vectorizers\n");
@@ -246,6 +248,19 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
         out.push_str("done:\n  ret void\n}\n\n");
 
+        out.push_str("define linkonce_odr void @ifa_simd_slice_mul_i32(ptr %dst, ptr %src1, ptr %src2, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %tail_entry\n");
+        out.push_str("vec_step:\n  %p1 = getelementptr inbounds i32, ptr %src1, i64 %i\n  %p2 = getelementptr inbounds i32, ptr %src2, i64 %i\n  %pd = getelementptr inbounds i32, ptr %dst, i64 %i\n");
+        out.push_str("  %v1 = load <8 x i32>, ptr %p1, align 4\n  %v2 = load <8 x i32>, ptr %p2, align 4\n  %vr = mul <8 x i32> %v1, %v2\n  store <8 x i32> %vr, ptr %pd, align 4\n");
+        out.push_str("  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !1\n");
+        out.push_str("tail_entry:\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %tail_entry ], [ %next_ti, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp1 = getelementptr inbounds i32, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds i32, ptr %src2, i64 %ti\n  %tpd = getelementptr inbounds i32, ptr %dst, i64 %ti\n");
+        out.push_str("  %tv1 = load i32, ptr %tp1, align 4\n  %tv2 = load i32, ptr %tp2, align 4\n  %tvr = mul i32 %tv1, %tv2\n  store i32 %tvr, ptr %tpd, align 4\n");
+        out.push_str("  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
         out.push_str(
             "define linkonce_odr i32 @ifa_simd_slice_sum_i32(ptr %src, i64 %len) alwaysinline {\n",
         );
@@ -256,6 +271,118 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i32 [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
         out.push_str("tail_step:\n  %tp = getelementptr inbounds i32, ptr %src, i64 %ti\n  %tv = load i32, ptr %tp, align 4\n  %next_s_acc = add i32 %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
         out.push_str("done:\n  ret i32 %s_acc\n}\n\n");
+
+        // 64-bit Floating-Point SIMD Operations (AVX/NEON 4-lane)
+        out.push_str("define linkonce_odr void @ifa_simd_slice_add_f64(ptr %dst, ptr %src1, ptr %src2, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %tail_entry\n");
+        out.push_str("vec_step:\n  %p1 = getelementptr inbounds double, ptr %src1, i64 %i\n  %p2 = getelementptr inbounds double, ptr %src2, i64 %i\n  %pd = getelementptr inbounds double, ptr %dst, i64 %i\n");
+        out.push_str("  %v1 = load <4 x double>, ptr %p1, align 8\n  %v2 = load <4 x double>, ptr %p2, align 8\n  %vr = fadd <4 x double> %v1, %v2\n  store <4 x double> %vr, ptr %pd, align 8\n");
+        out.push_str("  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+        out.push_str("tail_entry:\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %tail_entry ], [ %next_ti, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp1 = getelementptr inbounds double, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds double, ptr %src2, i64 %ti\n  %tpd = getelementptr inbounds double, ptr %dst, i64 %ti\n");
+        out.push_str("  %tv1 = load double, ptr %tp1, align 8\n  %tv2 = load double, ptr %tp2, align 8\n  %tvr = fadd double %tv1, %tv2\n  store double %tvr, ptr %tpd, align 8\n");
+        out.push_str("  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_slice_mul_f64(ptr %dst, ptr %src1, ptr %src2, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %tail_entry\n");
+        out.push_str("vec_step:\n  %p1 = getelementptr inbounds double, ptr %src1, i64 %i\n  %p2 = getelementptr inbounds double, ptr %src2, i64 %i\n  %pd = getelementptr inbounds double, ptr %dst, i64 %i\n");
+        out.push_str("  %v1 = load <4 x double>, ptr %p1, align 8\n  %v2 = load <4 x double>, ptr %p2, align 8\n  %vr = fmul <4 x double> %v1, %v2\n  store <4 x double> %vr, ptr %pd, align 8\n");
+        out.push_str("  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+        out.push_str("tail_entry:\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %tail_entry ], [ %next_ti, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp1 = getelementptr inbounds double, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds double, ptr %src2, i64 %ti\n  %tpd = getelementptr inbounds double, ptr %dst, i64 %ti\n");
+        out.push_str("  %tv1 = load double, ptr %tp1, align 8\n  %tv2 = load double, ptr %tp2, align 8\n  %tvr = fmul double %tv1, %tv2\n  store double %tvr, ptr %tpd, align 8\n");
+        out.push_str("  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr double @ifa_simd_slice_dot_f64(ptr %src1, ptr %src2, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x double> [ zeroinitializer, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p1 = getelementptr inbounds double, ptr %src1, i64 %i\n  %p2 = getelementptr inbounds double, ptr %src2, i64 %i\n  %v1 = load <4 x double>, ptr %p1, align 8\n  %v2 = load <4 x double>, ptr %p2, align 8\n");
+        out.push_str("  %prod = fmul <4 x double> %v1, %v2\n  %next_acc = fadd <4 x double> %acc, %prod\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+        out.push_str("reduce:\n  %vec_sum = call double @llvm.vector.reduce.fadd.v4f64(double 0.0, <4 x double> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi double [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp1 = getelementptr inbounds double, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds double, ptr %src2, i64 %ti\n  %tv1 = load double, ptr %tp1, align 8\n  %tv2 = load double, ptr %tp2, align 8\n");
+        out.push_str("  %tprod = fmul double %tv1, %tv2\n  %next_s_acc = fadd double %s_acc, %tprod\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret double %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr double @ifa_simd_slice_sum_f64(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x double> [ zeroinitializer, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds double, ptr %src, i64 %i\n  %v = load <4 x double>, ptr %p, align 8\n  %next_acc = fadd <4 x double> %acc, %v\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+        out.push_str("reduce:\n  %vec_sum = call double @llvm.vector.reduce.fadd.v4f64(double 0.0, <4 x double> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi double [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds double, ptr %src, i64 %ti\n  %tv = load double, ptr %tp, align 8\n  %next_s_acc = fadd double %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret double %s_acc\n}\n\n");
+
+        // 64-bit Integer SIMD Operations
+        out.push_str("define linkonce_odr void @ifa_simd_slice_add_i64(ptr %dst, ptr %src1, ptr %src2, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %tail_entry\n");
+        out.push_str("vec_step:\n  %p1 = getelementptr inbounds i64, ptr %src1, i64 %i\n  %p2 = getelementptr inbounds i64, ptr %src2, i64 %i\n  %pd = getelementptr inbounds i64, ptr %dst, i64 %i\n");
+        out.push_str("  %v1 = load <4 x i64>, ptr %p1, align 8\n  %v2 = load <4 x i64>, ptr %p2, align 8\n  %vr = add <4 x i64> %v1, %v2\n  store <4 x i64> %vr, ptr %pd, align 8\n");
+        out.push_str("  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+        out.push_str("tail_entry:\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %tail_entry ], [ %next_ti, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp1 = getelementptr inbounds i64, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds i64, ptr %src2, i64 %ti\n  %tpd = getelementptr inbounds i64, ptr %dst, i64 %ti\n");
+        out.push_str("  %tv1 = load i64, ptr %tp1, align 8\n  %tv2 = load i64, ptr %tp2, align 8\n  %tvr = add i64 %tv1, %tv2\n  store i64 %tvr, ptr %tpd, align 8\n");
+        out.push_str("  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_slice_mul_i64(ptr %dst, ptr %src1, ptr %src2, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %tail_entry\n");
+        out.push_str("vec_step:\n  %p1 = getelementptr inbounds i64, ptr %src1, i64 %i\n  %p2 = getelementptr inbounds i64, ptr %src2, i64 %i\n  %pd = getelementptr inbounds i64, ptr %dst, i64 %i\n");
+        out.push_str("  %v1 = load <4 x i64>, ptr %p1, align 8\n  %v2 = load <4 x i64>, ptr %p2, align 8\n  %vr = mul <4 x i64> %v1, %v2\n  store <4 x i64> %vr, ptr %pd, align 8\n");
+        out.push_str("  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+        out.push_str("tail_entry:\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %tail_entry ], [ %next_ti, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp1 = getelementptr inbounds i64, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds i64, ptr %src2, i64 %ti\n  %tpd = getelementptr inbounds i64, ptr %dst, i64 %ti\n");
+        out.push_str("  %tv1 = load i64, ptr %tp1, align 8\n  %tv2 = load i64, ptr %tp2, align 8\n  %tvr = mul i64 %tv1, %tv2\n  store i64 %tvr, ptr %tpd, align 8\n");
+        out.push_str("  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str(
+            "define linkonce_odr i64 @ifa_simd_slice_sum_i64(ptr %src, i64 %len) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x i64> [ zeroinitializer, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i64, ptr %src, i64 %i\n  %v = load <4 x i64>, ptr %p, align 8\n  %next_acc = add <4 x i64> %acc, %v\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !6\n");
+        out.push_str("reduce:\n  %vec_sum = call i64 @llvm.vector.reduce.add.v4i64(<4 x i64> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i64 [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i64, ptr %src, i64 %ti\n  %tv = load i64, ptr %tp, align 8\n  %next_s_acc = add i64 %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i64 %s_acc\n}\n\n");
+
+        // 8-bit Byte SIMD Operations (16-lane SSE/AVX/NEON/WASM - for cryptographic hashes and memory blocks)
+        out.push_str("define linkonce_odr void @ifa_simd_slice_add_u8(ptr %dst, ptr %src1, ptr %src2, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -16\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %tail_entry\n");
+        out.push_str("vec_step:\n  %p1 = getelementptr inbounds i8, ptr %src1, i64 %i\n  %p2 = getelementptr inbounds i8, ptr %src2, i64 %i\n  %pd = getelementptr inbounds i8, ptr %dst, i64 %i\n");
+        out.push_str("  %v1 = load <16 x i8>, ptr %p1, align 1\n  %v2 = load <16 x i8>, ptr %p2, align 1\n  %vr = add <16 x i8> %v1, %v2\n  store <16 x i8> %vr, ptr %pd, align 1\n");
+        out.push_str("  %next_i = add i64 %i, 16\n  br label %vec_loop, !llvm.loop !8\n");
+        out.push_str("tail_entry:\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %tail_entry ], [ %next_ti, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp1 = getelementptr inbounds i8, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds i8, ptr %src2, i64 %ti\n  %tpd = getelementptr inbounds i8, ptr %dst, i64 %ti\n");
+        out.push_str("  %tv1 = load i8, ptr %tp1, align 1\n  %tv2 = load i8, ptr %tp2, align 1\n  %tvr = add i8 %tv1, %tv2\n  store i8 %tvr, ptr %tpd, align 1\n");
+        out.push_str("  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_slice_xor_u8(ptr %dst, ptr %src1, ptr %src2, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -16\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %tail_entry\n");
+        out.push_str("vec_step:\n  %p1 = getelementptr inbounds i8, ptr %src1, i64 %i\n  %p2 = getelementptr inbounds i8, ptr %src2, i64 %i\n  %pd = getelementptr inbounds i8, ptr %dst, i64 %i\n");
+        out.push_str("  %v1 = load <16 x i8>, ptr %p1, align 1\n  %v2 = load <16 x i8>, ptr %p2, align 1\n  %vr = xor <16 x i8> %v1, %v2\n  store <16 x i8> %vr, ptr %pd, align 1\n");
+        out.push_str("  %next_i = add i64 %i, 16\n  br label %vec_loop, !llvm.loop !8\n");
+        out.push_str("tail_entry:\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %tail_entry ], [ %next_ti, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp1 = getelementptr inbounds i8, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds i8, ptr %src2, i64 %ti\n  %tpd = getelementptr inbounds i8, ptr %dst, i64 %ti\n");
+        out.push_str("  %tv1 = load i8, ptr %tp1, align 1\n  %tv2 = load i8, ptr %tp2, align 1\n  %tvr = xor i8 %tv1, %tv2\n  store i8 %tvr, ptr %tpd, align 1\n");
+        out.push_str("  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
 
         // Fast-path 1-cycle CPU inlined generation check (alwaysinline with branch weights)
         out.push_str("; Inlined 1-cycle CPU generation check\n");
@@ -338,11 +465,18 @@ impl<'a> LlvmIrEmitter<'a> {
 
         // 6. Metadata for branch weights and loop vectorization hints
         out.push_str("\n!0 = !{!\"branch_weights\", i32 1048576, i32 1}\n");
+        // 8-lane SIMD vectorization hint (f32, i32)
         out.push_str("!1 = distinct !{!1, !2, !3, !4, !5}\n");
         out.push_str("!2 = !{!\"llvm.loop.vectorize.enable\", i1 1}\n");
         out.push_str("!3 = !{!\"llvm.loop.vectorize.width\", i32 8}\n");
         out.push_str("!4 = !{!\"llvm.loop.interleave.count\", i32 4}\n");
         out.push_str("!5 = !{!\"llvm.loop.unroll.enable\", i1 1}\n");
+        // 4-lane SIMD vectorization hint (f64, i64)
+        out.push_str("!6 = distinct !{!6, !2, !7, !4, !5}\n");
+        out.push_str("!7 = !{!\"llvm.loop.vectorize.width\", i32 4}\n");
+        // 16-lane SIMD vectorization hint (u8, i8 bytes, crypto)
+        out.push_str("!8 = distinct !{!8, !2, !9, !4, !5}\n");
+        out.push_str("!9 = !{!\"llvm.loop.vectorize.width\", i32 16}\n");
 
         Ok(out)
     }
@@ -370,7 +504,10 @@ impl<'a> LlvmIrEmitter<'a> {
             .params
             .iter()
             .map(|p| {
-                let ty = fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "ptr".to_string());
+                let ty = match &p.ty {
+                    ifa_fir::FirType::Array(..) | ifa_fir::FirType::Slice(..) => "ptr".to_string(),
+                    _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "ptr".to_string()),
+                };
                 format!("{} %v{}", ty, p.val.0)
             })
             .collect();
@@ -436,6 +573,27 @@ impl<'a> LlvmIrEmitter<'a> {
                             Some(ifa_fir::FirType::Pointer(inner)) => (**inner).clone(),
                             _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
                         },
+                        ValueExpr::GetElement { base, .. } => match value_types.get(base) {
+                            Some(ifa_fir::FirType::Array(inner, _))
+                            | Some(ifa_fir::FirType::Slice(inner)) => (**inner).clone(),
+                            Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
+                                ifa_fir::FirType::Array(elem, _)
+                                | ifa_fir::FirType::Slice(elem) => (**elem).clone(),
+                                _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
+                            },
+                            _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
+                        },
+                        ValueExpr::ArrayInit(elements) => {
+                            let elem_ty = elements
+                                .first()
+                                .and_then(|e| value_types.get(e))
+                                .cloned()
+                                .unwrap_or(ifa_fir::FirType::Int(ifa_sema::types::IntType::I64));
+                            ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Array(
+                                Box::new(elem_ty),
+                                elements.len() as u32,
+                            )))
+                        }
                         ValueExpr::CallDirect { name, .. } => {
                             let callee = INTERNER.resolve(name);
                             if callee.starts_with("ifa_simd_") {
@@ -443,10 +601,17 @@ impl<'a> LlvmIrEmitter<'a> {
                                     && (callee.contains("dot") || callee.contains("sum"))
                                 {
                                     ifa_fir::FirType::Float(ifa_sema::types::FloatType::F32)
+                                } else if callee.ends_with("_f64")
+                                    && (callee.contains("dot") || callee.contains("sum"))
+                                {
+                                    ifa_fir::FirType::Float(ifa_sema::types::FloatType::F64)
                                 } else if callee.ends_with("_i32") && callee.contains("sum") {
                                     ifa_fir::FirType::Int(ifa_sema::types::IntType::I32)
+                                } else if callee.ends_with("_i64") && callee.contains("sum") {
+                                    ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                                 } else if callee.contains("slice_add")
                                     || callee.contains("slice_mul")
+                                    || callee.contains("slice_xor")
                                 {
                                     ifa_fir::FirType::Unit
                                 } else {
@@ -570,7 +735,13 @@ impl<'a> LlvmIrEmitter<'a> {
 
             // Terminator
             if let Some(ref term) = block.terminator {
-                self.emit_terminator(term, &func.ret_ty, is_main_unit, out)?;
+                self.emit_terminator(
+                    term,
+                    &func.ret_ty,
+                    is_main_unit,
+                    block.vector_hint.as_ref(),
+                    out,
+                )?;
             } else {
                 out.push_str("  unreachable\n");
             }
@@ -600,11 +771,25 @@ impl<'a> LlvmIrEmitter<'a> {
                         if *b { 1 } else { 0 }
                     ));
                 }
-                ConstantValue::Int(val, _) => {
-                    out.push_str(&format!("  %v{} = add i64 {}, 0\n", res_id, val));
+                ConstantValue::Int(val, i_ty) => {
+                    let ty_str = match i_ty {
+                        ifa_sema::types::IntType::I8 | ifa_sema::types::IntType::U8 => "i8",
+                        ifa_sema::types::IntType::I16 | ifa_sema::types::IntType::U16 => "i16",
+                        ifa_sema::types::IntType::I32 | ifa_sema::types::IntType::U32 => "i32",
+                        _ => "i64",
+                    };
+                    out.push_str(&format!("  %v{} = add {} {}, 0\n", res_id, ty_str, val));
                 }
-                ConstantValue::Float(val, _) => {
-                    out.push_str(&format!("  %v{} = fadd double {:e}, 0.0\n", res_id, val));
+                ConstantValue::Float(val, f_ty) => {
+                    let ty_str = match f_ty {
+                        ifa_sema::types::FloatType::F32 => "float",
+                        ifa_sema::types::FloatType::F64 => "double",
+                    };
+                    let formatted_val = format_llvm_float(*val);
+                    out.push_str(&format!(
+                        "  %v{} = fadd {} {}, 0.0\n",
+                        res_id, ty_str, formatted_val
+                    ));
                 }
                 ConstantValue::Char(c) => {
                     out.push_str(&format!("  %v{} = add i8 {}, 0\n", res_id, *c as u8));
@@ -624,45 +809,62 @@ impl<'a> LlvmIrEmitter<'a> {
                 }
             },
             ValueExpr::Binary { op, lhs, rhs } => {
-                let is_float = matches!(value_types.get(lhs), Some(ifa_fir::FirType::Float(_)));
-                if is_float {
-                    let (op_str, ty_str) = match op {
-                        BinaryOp::Add => ("fadd", "double"),
-                        BinaryOp::Sub => ("fsub", "double"),
-                        BinaryOp::Mul => ("fmul", "double"),
-                        BinaryOp::Div => ("fdiv", "double"),
-                        BinaryOp::Eq => ("fcmp oeq", "double"),
-                        BinaryOp::Ne => ("fcmp one", "double"),
-                        BinaryOp::Lt => ("fcmp olt", "double"),
-                        BinaryOp::Le => ("fcmp ole", "double"),
-                        BinaryOp::Gt => ("fcmp ogt", "double"),
-                        BinaryOp::Ge => ("fcmp oge", "double"),
-                        _ => ("fadd", "double"),
+                let float_ty = match value_types.get(lhs) {
+                    Some(ifa_fir::FirType::Float(f)) => Some(match f {
+                        ifa_sema::types::FloatType::F32 => "float",
+                        ifa_sema::types::FloatType::F64 => "double",
+                    }),
+                    _ => None,
+                };
+                if let Some(ty_str) = float_ty {
+                    let op_str = match op {
+                        BinaryOp::Add => "fadd",
+                        BinaryOp::Sub => "fsub",
+                        BinaryOp::Mul => "fmul",
+                        BinaryOp::Div => "fdiv",
+                        BinaryOp::Eq => "fcmp oeq",
+                        BinaryOp::Ne => "fcmp one",
+                        BinaryOp::Lt => "fcmp olt",
+                        BinaryOp::Le => "fcmp ole",
+                        BinaryOp::Gt => "fcmp ogt",
+                        BinaryOp::Ge => "fcmp oge",
+                        _ => "fadd",
                     };
                     out.push_str(&format!(
                         "  %v{} = {} {} %v{}, %v{}\n",
                         res_id, op_str, ty_str, lhs.0, rhs.0
                     ));
                 } else {
+                    let int_ty_str = match value_types.get(lhs) {
+                        Some(ifa_fir::FirType::Int(i)) => match i {
+                            ifa_sema::types::IntType::I8 | ifa_sema::types::IntType::U8 => "i8",
+                            ifa_sema::types::IntType::I16 | ifa_sema::types::IntType::U16 => "i16",
+                            ifa_sema::types::IntType::I32 | ifa_sema::types::IntType::U32 => "i32",
+                            _ => "i64",
+                        },
+                        Some(ifa_fir::FirType::Bool) => "i1",
+                        Some(ifa_fir::FirType::Char) => "i8",
+                        _ => "i64",
+                    };
                     let op_str = match op {
-                        BinaryOp::Add => "add nsw i64",
-                        BinaryOp::Sub => "sub nsw i64",
-                        BinaryOp::Mul => "mul nsw i64",
-                        BinaryOp::Div => "sdiv i64",
-                        BinaryOp::Rem => "srem i64",
-                        BinaryOp::Eq => "icmp eq i64",
-                        BinaryOp::Ne => "icmp ne i64",
-                        BinaryOp::Lt => "icmp slt i64",
-                        BinaryOp::Le => "icmp sle i64",
-                        BinaryOp::Gt => "icmp sgt i64",
-                        BinaryOp::Ge => "icmp sge i64",
-                        BinaryOp::And => "and i1",
-                        BinaryOp::Or => "or i1",
-                        BinaryOp::BitAnd => "and i64",
-                        BinaryOp::BitOr => "or i64",
-                        BinaryOp::BitXor => "xor i64",
-                        BinaryOp::Shl => "shl i64",
-                        BinaryOp::Shr => "ashr i64",
+                        BinaryOp::Add => format!("add nsw {}", int_ty_str),
+                        BinaryOp::Sub => format!("sub nsw {}", int_ty_str),
+                        BinaryOp::Mul => format!("mul nsw {}", int_ty_str),
+                        BinaryOp::Div => format!("sdiv {}", int_ty_str),
+                        BinaryOp::Rem => format!("srem {}", int_ty_str),
+                        BinaryOp::Eq => format!("icmp eq {}", int_ty_str),
+                        BinaryOp::Ne => format!("icmp ne {}", int_ty_str),
+                        BinaryOp::Lt => format!("icmp slt {}", int_ty_str),
+                        BinaryOp::Le => format!("icmp sle {}", int_ty_str),
+                        BinaryOp::Gt => format!("icmp sgt {}", int_ty_str),
+                        BinaryOp::Ge => format!("icmp sge {}", int_ty_str),
+                        BinaryOp::And => "and i1".to_string(),
+                        BinaryOp::Or => "or i1".to_string(),
+                        BinaryOp::BitAnd => format!("and {}", int_ty_str),
+                        BinaryOp::BitOr => format!("or {}", int_ty_str),
+                        BinaryOp::BitXor => format!("xor {}", int_ty_str),
+                        BinaryOp::Shl => format!("shl {}", int_ty_str),
+                        BinaryOp::Shr => format!("ashr {}", int_ty_str),
                     };
                     out.push_str(&format!(
                         "  %v{} = {} %v{}, %v{}\n",
@@ -672,11 +874,33 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             ValueExpr::Unary { op, val } => match op {
                 UnaryOp::Neg => {
-                    let is_float = matches!(value_types.get(val), Some(ifa_fir::FirType::Float(_)));
-                    if is_float {
-                        out.push_str(&format!("  %v{} = fneg double %v{}\n", res_id, val.0));
+                    let float_ty = match value_types.get(val) {
+                        Some(ifa_fir::FirType::Float(f)) => Some(match f {
+                            ifa_sema::types::FloatType::F32 => "float",
+                            ifa_sema::types::FloatType::F64 => "double",
+                        }),
+                        _ => None,
+                    };
+                    if let Some(ty_str) = float_ty {
+                        out.push_str(&format!("  %v{} = fneg {} %v{}\n", res_id, ty_str, val.0));
                     } else {
-                        out.push_str(&format!("  %v{} = sub nsw i64 0, %v{}\n", res_id, val.0));
+                        let int_ty_str = match value_types.get(val) {
+                            Some(ifa_fir::FirType::Int(i)) => match i {
+                                ifa_sema::types::IntType::I8 | ifa_sema::types::IntType::U8 => "i8",
+                                ifa_sema::types::IntType::I16 | ifa_sema::types::IntType::U16 => {
+                                    "i16"
+                                }
+                                ifa_sema::types::IntType::I32 | ifa_sema::types::IntType::U32 => {
+                                    "i32"
+                                }
+                                _ => "i64",
+                            },
+                            _ => "i64",
+                        };
+                        out.push_str(&format!(
+                            "  %v{} = sub nsw {} 0, %v{}\n",
+                            res_id, int_ty_str, val.0
+                        ));
                     }
                 }
                 UnaryOp::Not => {
@@ -685,18 +909,42 @@ impl<'a> LlvmIrEmitter<'a> {
             },
             ValueExpr::Alloca { ty, .. } => {
                 let llvm_ty = fir_to_llvm_type(ty)?;
-                out.push_str(&format!("  %v{} = alloca {}, align 8\n", res_id, llvm_ty));
+                let align = llvm_align_for_type(ty);
+                out.push_str(&format!(
+                    "  %v{} = alloca {}, align {}\n",
+                    res_id, llvm_ty, align
+                ));
             }
             ValueExpr::Load { ptr } => {
+                let (ty_str, align) = match value_types.get(ptr) {
+                    Some(ifa_fir::FirType::Pointer(inner)) => (
+                        fir_to_llvm_type(inner).unwrap_or_else(|_| "i64".to_string()),
+                        llvm_align_for_type(inner),
+                    ),
+                    _ => ("i64".to_string(), 8),
+                };
                 out.push_str(&format!(
-                    "  %v{} = load i64, ptr %v{}, align 8\n",
-                    res_id, ptr.0
+                    "  %v{} = load {}, ptr %v{}, align {}\n",
+                    res_id, ty_str, ptr.0, align
                 ));
             }
             ValueExpr::Store { ptr, val } => {
+                let (ty_str, align) = match value_types.get(val) {
+                    Some(ty) => (
+                        fir_to_llvm_type(ty).unwrap_or_else(|_| "i64".to_string()),
+                        llvm_align_for_type(ty),
+                    ),
+                    _ => match value_types.get(ptr) {
+                        Some(ifa_fir::FirType::Pointer(inner)) => (
+                            fir_to_llvm_type(inner).unwrap_or_else(|_| "i64".to_string()),
+                            llvm_align_for_type(inner),
+                        ),
+                        _ => ("i64".to_string(), 8),
+                    },
+                };
                 out.push_str(&format!(
-                    "  store i64 %v{}, ptr %v{}, align 8\n",
-                    val.0, ptr.0
+                    "  store {} %v{}, ptr %v{}, align {}\n",
+                    ty_str, val.0, ptr.0, align
                 ));
             }
             ValueExpr::CallDirect { name, args } => {
@@ -730,7 +978,12 @@ impl<'a> LlvmIrEmitter<'a> {
                         let params: Vec<String> = target_fn
                             .params
                             .iter()
-                            .map(|p| fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()))
+                            .map(|p| match &p.ty {
+                                ifa_fir::FirType::Array(..) | ifa_fir::FirType::Slice(..) => {
+                                    "ptr".to_string()
+                                }
+                                _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()),
+                            })
                             .collect();
                         (ret_ty, params)
                     } else if callee.starts_with("ifa_simd_") {
@@ -743,12 +996,29 @@ impl<'a> LlvmIrEmitter<'a> {
                                 vec!["ptr".to_string(), "i64".to_string()]
                             };
                             ("float".to_string(), p_types)
+                        } else if callee.ends_with("_f64")
+                            && (callee.contains("dot") || callee.contains("sum"))
+                        {
+                            let p_types = if callee.contains("dot") {
+                                vec!["ptr".to_string(), "ptr".to_string(), "i64".to_string()]
+                            } else {
+                                vec!["ptr".to_string(), "i64".to_string()]
+                            };
+                            ("double".to_string(), p_types)
                         } else if callee.ends_with("_i32") && callee.contains("sum") {
                             (
                                 "i32".to_string(),
                                 vec!["ptr".to_string(), "i64".to_string()],
                             )
-                        } else if callee.contains("slice_add") || callee.contains("slice_mul") {
+                        } else if callee.ends_with("_i64") && callee.contains("sum") {
+                            (
+                                "i64".to_string(),
+                                vec!["ptr".to_string(), "i64".to_string()],
+                            )
+                        } else if callee.contains("slice_add")
+                            || callee.contains("slice_mul")
+                            || callee.contains("slice_xor")
+                        {
                             (
                                 "void".to_string(),
                                 vec![
@@ -817,31 +1087,63 @@ impl<'a> LlvmIrEmitter<'a> {
                 }
             }
             ValueExpr::GetElement { base, index } => {
+                let (elem_ty_str, align) = match value_types.get(base) {
+                    Some(ifa_fir::FirType::Array(inner, _))
+                    | Some(ifa_fir::FirType::Slice(inner)) => (
+                        fir_to_llvm_type(inner).unwrap_or_else(|_| "i64".to_string()),
+                        llvm_align_for_type(inner),
+                    ),
+                    Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
+                        ifa_fir::FirType::Array(elem, _) | ifa_fir::FirType::Slice(elem) => (
+                            fir_to_llvm_type(elem).unwrap_or_else(|_| "i64".to_string()),
+                            llvm_align_for_type(elem),
+                        ),
+                        _ => ("i64".to_string(), 8),
+                    },
+                    _ => ("i64".to_string(), 8),
+                };
                 out.push_str(&format!(
-                    "  %gep_{} = getelementptr inbounds i64, ptr %v{}, i64 %v{}\n",
-                    res_id, base.0, index.0
+                    "  %gep_{} = getelementptr inbounds {}, ptr %v{}, i64 %v{}\n",
+                    res_id, elem_ty_str, base.0, index.0
                 ));
-                out.push_str(&format!("  %v{} = load i64, ptr %gep_{}\n", res_id, res_id));
+                out.push_str(&format!(
+                    "  %v{} = load {}, ptr %gep_{}, align {}\n",
+                    res_id, elem_ty_str, res_id, align
+                ));
             }
             ValueExpr::ArrayInit(elements) => {
                 let count = elements.len().max(1);
+                let (elem_ty_str, align) = elements
+                    .first()
+                    .and_then(|e| value_types.get(e))
+                    .map(|ty| {
+                        (
+                            fir_to_llvm_type(ty).unwrap_or_else(|_| "i64".to_string()),
+                            llvm_align_for_type(ty),
+                        )
+                    })
+                    .unwrap_or_else(|| ("i64".to_string(), 8));
+
                 out.push_str(&format!(
-                    "  %arr_alloc_{} = alloca [{} x i64], align 8\n",
-                    res_id, count
+                    "  %arr_alloc_{} = alloca [{} x {}], align {}\n",
+                    res_id,
+                    count,
+                    elem_ty_str,
+                    align.max(8)
                 ));
                 for (idx, elem) in elements.iter().enumerate() {
                     out.push_str(&format!(
-                        "  %elem_ptr_{}_{} = getelementptr inbounds [{} x i64], ptr %arr_alloc_{}, i64 0, i64 {}\n",
-                        res_id, idx, count, res_id, idx
+                        "  %elem_ptr_{}_{} = getelementptr inbounds [{} x {}], ptr %arr_alloc_{}, i64 0, i64 {}\n",
+                        res_id, idx, count, elem_ty_str, res_id, idx
                     ));
                     out.push_str(&format!(
-                        "  store i64 %v{}, ptr %elem_ptr_{}_{}, align 8\n",
-                        elem.0, res_id, idx
+                        "  store {} %v{}, ptr %elem_ptr_{}_{}, align {}\n",
+                        elem_ty_str, elem.0, res_id, idx, align
                     ));
                 }
                 out.push_str(&format!(
-                    "  %v{} = getelementptr inbounds [{} x i64], ptr %arr_alloc_{}, i64 0, i64 0\n",
-                    res_id, count, res_id
+                    "  %v{} = getelementptr inbounds [{} x {}], ptr %arr_alloc_{}, i64 0, i64 0\n",
+                    res_id, count, elem_ty_str, res_id
                 ));
             }
             ValueExpr::StructInit { name, fields } => {
@@ -995,12 +1297,24 @@ impl<'a> LlvmIrEmitter<'a> {
         value_types: &HashMap<ifa_fir::ValueId, ifa_fir::FirType>,
         out: &mut String,
     ) -> Result<(), LlvmCodegenError> {
-        let _ = value_types;
         match expr {
             ValueExpr::Store { ptr, val } => {
+                let (ty_str, align) = match value_types.get(val) {
+                    Some(ty) => (
+                        fir_to_llvm_type(ty).unwrap_or_else(|_| "i64".to_string()),
+                        llvm_align_for_type(ty),
+                    ),
+                    _ => match value_types.get(ptr) {
+                        Some(ifa_fir::FirType::Pointer(inner)) => (
+                            fir_to_llvm_type(inner).unwrap_or_else(|_| "i64".to_string()),
+                            llvm_align_for_type(inner),
+                        ),
+                        _ => ("i64".to_string(), 8),
+                    },
+                };
                 out.push_str(&format!(
-                    "  store i64 %v{}, ptr %v{}, align 8\n",
-                    val.0, ptr.0
+                    "  store {} %v{}, ptr %v{}, align {}\n",
+                    ty_str, val.0, ptr.0, align
                 ));
             }
             ValueExpr::CallDirect { name, args } => {
@@ -1030,7 +1344,12 @@ impl<'a> LlvmIrEmitter<'a> {
                         let params: Vec<String> = target_fn
                             .params
                             .iter()
-                            .map(|p| fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()))
+                            .map(|p| match &p.ty {
+                                ifa_fir::FirType::Array(..) | ifa_fir::FirType::Slice(..) => {
+                                    "ptr".to_string()
+                                }
+                                _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()),
+                            })
                             .collect();
                         (ret_ty, params)
                     } else if callee.starts_with("ifa_simd_") {
@@ -1043,12 +1362,29 @@ impl<'a> LlvmIrEmitter<'a> {
                                 vec!["ptr".to_string(), "i64".to_string()]
                             };
                             ("float".to_string(), p_types)
+                        } else if callee.ends_with("_f64")
+                            && (callee.contains("dot") || callee.contains("sum"))
+                        {
+                            let p_types = if callee.contains("dot") {
+                                vec!["ptr".to_string(), "ptr".to_string(), "i64".to_string()]
+                            } else {
+                                vec!["ptr".to_string(), "i64".to_string()]
+                            };
+                            ("double".to_string(), p_types)
                         } else if callee.ends_with("_i32") && callee.contains("sum") {
                             (
                                 "i32".to_string(),
                                 vec!["ptr".to_string(), "i64".to_string()],
                             )
-                        } else if callee.contains("slice_add") || callee.contains("slice_mul") {
+                        } else if callee.ends_with("_i64") && callee.contains("sum") {
+                            (
+                                "i64".to_string(),
+                                vec!["ptr".to_string(), "i64".to_string()],
+                            )
+                        } else if callee.contains("slice_add")
+                            || callee.contains("slice_mul")
+                            || callee.contains("slice_xor")
+                        {
                             (
                                 "void".to_string(),
                                 vec![
@@ -1126,14 +1462,28 @@ impl<'a> LlvmIrEmitter<'a> {
                 ));
             }
             ValueExpr::SetElement { base, index, val } => {
-                let _ = base;
+                let (elem_ty_str, align) = match value_types.get(base) {
+                    Some(ifa_fir::FirType::Array(inner, _))
+                    | Some(ifa_fir::FirType::Slice(inner)) => (
+                        fir_to_llvm_type(inner).unwrap_or_else(|_| "i64".to_string()),
+                        llvm_align_for_type(inner),
+                    ),
+                    Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
+                        ifa_fir::FirType::Array(elem, _) | ifa_fir::FirType::Slice(elem) => (
+                            fir_to_llvm_type(elem).unwrap_or_else(|_| "i64".to_string()),
+                            llvm_align_for_type(elem),
+                        ),
+                        _ => ("i64".to_string(), 8),
+                    },
+                    _ => ("i64".to_string(), 8),
+                };
                 out.push_str(&format!(
-                    "  %gep_set_{} = getelementptr inbounds i64, ptr %v{}, i64 %v{}\n",
-                    val.0, base.0, index.0
+                    "  %gep_set_{} = getelementptr inbounds {}, ptr %v{}, i64 %v{}\n",
+                    val.0, elem_ty_str, base.0, index.0
                 ));
                 out.push_str(&format!(
-                    "  store i64 %v{}, ptr %gep_set_{}\n",
-                    val.0, val.0
+                    "  store {} %v{}, ptr %gep_set_{}, align {}\n",
+                    elem_ty_str, val.0, val.0, align
                 ));
             }
             ValueExpr::Spawn { target, args } => {
@@ -1186,6 +1536,7 @@ impl<'a> LlvmIrEmitter<'a> {
         term: &Terminator,
         ret_ty: &ifa_fir::FirType,
         is_main_unit: bool,
+        vector_hint: Option<&ifa_fir::LoopVectorHint>,
         out: &mut String,
     ) -> Result<(), LlvmCodegenError> {
         match term {
@@ -1204,7 +1555,19 @@ impl<'a> LlvmIrEmitter<'a> {
                 }
             }
             Terminator::Branch { target, .. } => {
-                out.push_str(&format!("  br label %bb{}\n", target.0));
+                if let Some(hint) = vector_hint {
+                    let meta_id = match hint.vector_width {
+                        4 => 6,
+                        16 | 32 => 8,
+                        _ => 1,
+                    };
+                    out.push_str(&format!(
+                        "  br label %bb{}, !llvm.loop !{}\n",
+                        target.0, meta_id
+                    ));
+                } else {
+                    out.push_str(&format!("  br label %bb{}\n", target.0));
+                }
             }
             Terminator::BranchCond {
                 cond,
@@ -1246,4 +1609,34 @@ fn escape_llvm_string(s: &str) -> String {
         }
     }
     escaped
+}
+
+fn llvm_align_for_type(ty: &ifa_fir::FirType) -> u32 {
+    match ty {
+        ifa_fir::FirType::Int(i) => match i {
+            ifa_sema::types::IntType::I8 | ifa_sema::types::IntType::U8 => 1,
+            ifa_sema::types::IntType::I16 | ifa_sema::types::IntType::U16 => 2,
+            ifa_sema::types::IntType::I32 | ifa_sema::types::IntType::U32 => 4,
+            _ => 8,
+        },
+        ifa_fir::FirType::Float(f) => match f {
+            ifa_sema::types::FloatType::F32 => 4,
+            ifa_sema::types::FloatType::F64 => 8,
+        },
+        ifa_fir::FirType::Bool | ifa_fir::FirType::Char => 1,
+        _ => 8,
+    }
+}
+
+fn format_llvm_float(val: f64) -> String {
+    let s = format!("{:e}", val);
+    if !s.contains('.') {
+        if let Some(pos) = s.find('e') {
+            format!("{}.0{}", &s[..pos], &s[pos..])
+        } else {
+            format!("{}.0", s)
+        }
+    } else {
+        s
+    }
 }
