@@ -271,6 +271,13 @@ impl Type {
             }
         }
 
+        // Array [T; N] to Array [U; N] compatibility
+        if let (Type::Array(src_elem, src_n), Type::Array(target_elem, target_n)) = (self, target) {
+            if src_n == target_n && src_elem.is_assignable_to(target_elem) {
+                return true;
+            }
+        }
+
         // Array [T; N] can coerce to Slice<T>
         if let (Type::Array(src_elem, _), Type::Slice(target_elem)) = (self, target) {
             if src_elem.is_assignable_to(target_elem) {

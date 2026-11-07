@@ -4,7 +4,7 @@ use crate::gen_opt::GenerationalOptPass;
 use crate::ir::*;
 use crate::types::FirType;
 use ifa_sema::types::{FloatType, IntType};
-use ifa_span::INTERNER;
+use ifa_span::{Symbol, INTERNER};
 use std::collections::{HashMap, HashSet};
 
 /// Statistics collected by the SIMD auto-vectorization pipeline.
@@ -24,6 +24,10 @@ pub struct VectorizeStats {
     pub slices_vectorized: usize,
     /// Number of loops vectorized specifically leveraging statically eliminated bounds checks.
     pub eliminated_bounds_loops: usize,
+    /// Number of function calls inside loops verified pure via IPO analysis.
+    pub pure_calls_allowed: usize,
+    /// Number of loops vectorized containing IPO-verified pure function calls.
+    pub ipo_vectorized_loops: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -34,6 +38,7 @@ pub struct VectorizeStats {
 /// platform-native vector hardware (AVX2, AVX-512, NEON, WASM SIMD128).
 pub struct VectorizePass {
     stats: VectorizeStats,
+    pure_functions: HashSet<Symbol>,
 }
 
 impl VectorizePass {
@@ -41,7 +46,14 @@ impl VectorizePass {
     pub fn new() -> Self {
         Self {
             stats: VectorizeStats::default(),
+            pure_functions: HashSet::new(),
         }
+    }
+
+    /// Attach a precomputed set of pure function symbols to the pass.
+    pub fn with_pure_functions(mut self, pure_funcs: HashSet<Symbol>) -> Self {
+        self.pure_functions = pure_funcs;
+        self
     }
 
     /// Return current pass statistics.
@@ -51,6 +63,7 @@ impl VectorizePass {
 
     /// Run the vectorization pass across all functions in a FIR module.
     pub fn run_on_module(&mut self, module: &mut FirModule) {
+        self.pure_functions = crate::ipo::IpoPass::compute_pure_functions(module);
         for func in &mut module.functions {
             self.run_on_function(func);
         }
@@ -70,7 +83,8 @@ impl VectorizePass {
             self.stats.loops_analyzed += 1;
 
             // 1. Verify loop purity (no blocking I/O, fibers, yields, or invalidating calls)
-            if !Self::is_loop_side_effect_free(func, &loop_info.blocks) {
+            let (is_free, has_pure_calls) = self.is_loop_side_effect_free(func, &loop_info.blocks);
+            if !is_free {
                 continue;
             }
 
@@ -207,6 +221,9 @@ impl VectorizePass {
                     if had_eliminated_bounds {
                         self.stats.eliminated_bounds_loops += 1;
                     }
+                    if has_pure_calls {
+                        self.stats.ipo_vectorized_loops += 1;
+                    }
                     if write_elements > 0 {
                         self.stats.maps_vectorized += 1;
                     } else if read_elements > 0 && has_reduction_op {
@@ -264,8 +281,14 @@ impl VectorizePass {
         }
     }
 
-    /// Verify whether all blocks in a loop are free of side effects (I/O, concurrency, deallocation).
-    fn is_loop_side_effect_free(func: &FirFunction, loop_blocks: &HashSet<BlockId>) -> bool {
+    /// Verify whether all blocks in a loop are free of side effects (I/O, concurrency, deallocation)
+    /// leveraging whole-module inter-procedural purity analysis.
+    fn is_loop_side_effect_free(
+        &mut self,
+        func: &FirFunction,
+        loop_blocks: &HashSet<BlockId>,
+    ) -> (bool, bool) {
+        let mut has_pure_calls = false;
         for &b_id in loop_blocks {
             if let Some(block) = func.get_block(b_id) {
                 for inst in &block.instructions {
@@ -278,27 +301,25 @@ impl VectorizePass {
                         | ValueExpr::ChanTryRecv { .. }
                         | ValueExpr::ChanClose { .. }
                         | ValueExpr::ChanSelect { .. }
-                        | ValueExpr::GenFree { .. } => return false,
+                        | ValueExpr::GenFree { .. }
+                        | ValueExpr::CoWClone { .. } => return (false, false),
                         ValueExpr::BoundsCheck { redundant, .. }
                         | ValueExpr::SliceBoundsCheck { redundant, .. } => {
                             // If a bounds check is not statically eliminated, it can trigger
                             // a dynamic panic or branching, inhibiting safe auto-vectorization
                             if !*redundant {
-                                return false;
+                                return (false, false);
                             }
                         }
                         ValueExpr::CallDirect { name, .. } => {
                             let callee = INTERNER.resolve(name);
-                            if callee == "println"
-                                || callee == "print"
-                                || callee == "ifa_rt_println"
-                                || callee == "ifa_rt_print"
-                                || callee == "ifa_rt_println_i64"
-                                || callee == "ifa_rt_panic_uaf"
-                                || callee == "ifa_rt_bounds_check"
-                                || callee == "ifa_rt_panic_bounds"
+                            if self.pure_functions.contains(name)
+                                || crate::ipo::IpoPass::is_known_pure_intrinsic(&callee)
                             {
-                                return false;
+                                self.stats.pure_calls_allowed += 1;
+                                has_pure_calls = true;
+                            } else {
+                                return (false, false);
                             }
                         }
                         _ => {}
@@ -306,7 +327,7 @@ impl VectorizePass {
                 }
             }
         }
-        true
+        (true, has_pure_calls)
     }
 
     /// Collect and infer intermediate types for all SSA values within the function.

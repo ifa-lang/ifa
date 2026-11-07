@@ -313,6 +313,57 @@ impl<'a> FunctionLoweringContext<'a> {
         res
     }
 
+    /// Lowers an arbitrary compile-time value (scalars, static array tables, tuples, structs)
+    /// into direct SSA instructions.
+    fn lower_comptime_val(&mut self, val: &ifa_comptime::Value, span: Span) -> Option<ValueId> {
+        if let Some(c) = comptime_val_to_constant(val) {
+            let res = self.alloc_value();
+            self.emit(Some(res), ValueExpr::Constant(c), span);
+            Some(res)
+        } else {
+            match val {
+                ifa_comptime::Value::Array(elems) => {
+                    let mut elem_ids = Vec::with_capacity(elems.len());
+                    for elem in elems {
+                        let elem_id = self.lower_comptime_val(elem, span)?;
+                        elem_ids.push(elem_id);
+                    }
+                    let res = self.alloc_value();
+                    self.emit(Some(res), ValueExpr::ArrayInit(elem_ids), span);
+                    Some(res)
+                }
+                ifa_comptime::Value::Tuple(items) => {
+                    let mut item_ids = Vec::with_capacity(items.len());
+                    for item in items {
+                        let item_id = self.lower_comptime_val(item, span)?;
+                        item_ids.push(item_id);
+                    }
+                    let res = self.alloc_value();
+                    self.emit(Some(res), ValueExpr::TupleInit(item_ids), span);
+                    Some(res)
+                }
+                ifa_comptime::Value::Struct { name, fields } => {
+                    let mut field_ids = Vec::with_capacity(fields.len());
+                    for (_fname, fval) in fields {
+                        let fid = self.lower_comptime_val(fval, span)?;
+                        field_ids.push(fid);
+                    }
+                    let res = self.alloc_value();
+                    self.emit(
+                        Some(res),
+                        ValueExpr::StructInit {
+                            name: *name,
+                            fields: field_ids,
+                        },
+                        span,
+                    );
+                    Some(res)
+                }
+                _ => None,
+            }
+        }
+    }
+
     fn extract_constant_string_repr(&self, vid: ValueId) -> Option<String> {
         match self.emitted_exprs.get(&vid)? {
             ValueExpr::Constant(c) => match c {
@@ -2213,9 +2264,7 @@ impl<'a> FunctionLoweringContext<'a> {
                     self.val_ptrs.insert(res, ptr);
                     res
                 } else if let Some(val) = self.symbols.comptime_values.get(sym) {
-                    if let Some(c) = comptime_val_to_constant(val) {
-                        let res = self.alloc_value();
-                        self.emit(Some(res), ValueExpr::Constant(c), span);
+                    if let Some(res) = self.lower_comptime_val(val, span) {
                         res
                     } else if let Some(c_expr) = self.constants.get(sym) {
                         self.lower_expr(c_expr)
@@ -3863,9 +3912,7 @@ impl<'a> FunctionLoweringContext<'a> {
 
             ExprKind::Comptime(inner) => {
                 if let Some(val) = self.symbols.comptime_expr_values.get(&expr.span) {
-                    if let Some(c) = comptime_val_to_constant(val) {
-                        let res = self.alloc_value();
-                        self.emit(Some(res), ValueExpr::Constant(c), span);
+                    if let Some(res) = self.lower_comptime_val(val, span) {
                         return res;
                     }
                 }
@@ -4307,9 +4354,7 @@ impl<'a> FunctionLoweringContext<'a> {
 
             ExprKind::Path(path) => {
                 if let Some(val) = self.symbols.comptime_expr_values.get(&expr.span) {
-                    if let Some(c) = comptime_val_to_constant(val) {
-                        let res = self.alloc_value();
-                        self.emit(Some(res), ValueExpr::Constant(c), span);
+                    if let Some(res) = self.lower_comptime_val(val, span) {
                         return res;
                     }
                 }
@@ -4317,9 +4362,7 @@ impl<'a> FunctionLoweringContext<'a> {
                     if let Some(m) = self.symbols.lookup_module(&path[0]) {
                         if let Some(c) = m.consts.get(&path[1]) {
                             if let Some(val) = &c.value {
-                                if let Some(cv) = comptime_val_to_constant(val) {
-                                    let res = self.alloc_value();
-                                    self.emit(Some(res), ValueExpr::Constant(cv), span);
+                                if let Some(res) = self.lower_comptime_val(val, span) {
                                     return res;
                                 }
                             }

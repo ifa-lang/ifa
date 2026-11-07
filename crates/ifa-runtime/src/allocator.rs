@@ -307,7 +307,7 @@ impl GenArena {
 pub struct GlobalGenAllocatorInner {
     pools: Vec<SizeClassPool>,
     arenas: HashMap<u16, GenArena>,
-    large_allocations: HashMap<usize, (Layout, u32)>,
+    large_allocations: HashMap<usize, (usize, Layout, u32)>,
 }
 
 impl GlobalGenAllocatorInner {
@@ -324,8 +324,29 @@ impl GlobalGenAllocatorInner {
         }
     }
 
-    /// Allocate a generational memory slot for a specific payload size.
-    pub fn alloc(&mut self, size: usize, _align: usize, arena_id: u16) -> *mut u8 {
+    /// Allocate a generational memory slot for a specific payload size and alignment.
+    ///
+    /// For SIMD vectors requiring strict alignment (16-byte for ARM Neon, 32-byte for AVX2,
+    /// 64-byte for AVX-512), direct large allocation with power-of-two alignment guarantees
+    /// cacheline boundary compliance.
+    pub fn alloc(&mut self, size: usize, align: usize, arena_id: u16) -> *mut u8 {
+        let actual_align = align.max(8);
+
+        // Vector alignments > 8 bytes (AVX-512, AVX2, Neon) bypass size-class slabs to guarantee alignment
+        if actual_align > 8 {
+            let ptr = self.alloc_large(size, actual_align, arena_id);
+            if arena_id > 0 {
+                if let Some(arena) = self.arenas.get_mut(&arena_id) {
+                    unsafe {
+                        let header = (ptr as *mut GenHeader).sub(1);
+                        (*header).allocation_flags |= FLAG_ARENA_SCOPED;
+                    }
+                    arena.allocated_ptrs.push(ptr);
+                }
+            }
+            return ptr;
+        }
+
         // Find best-matching size class
         let class_idx = SIZE_CLASSES.iter().position(|&s| s >= size);
 
@@ -333,7 +354,7 @@ impl GlobalGenAllocatorInner {
             self.pools[idx].allocate(arena_id, idx)
         } else {
             // Direct large allocation
-            self.alloc_large(size, arena_id)
+            self.alloc_large(size, 8, arena_id)
         };
 
         if arena_id > 0 {
@@ -362,7 +383,7 @@ impl GlobalGenAllocatorInner {
         } else {
             let mut list = Vec::with_capacity(count);
             for _ in 0..count {
-                list.push(self.alloc_large(size, arena_id));
+                list.push(self.alloc_large(size, 8, arena_id));
             }
             (list, usize::MAX)
         }
@@ -408,9 +429,8 @@ impl GlobalGenAllocatorInner {
 
         // Locate size class or large allocation
         let addr = ptr as usize;
-        if let Some((layout, _)) = self.large_allocations.remove(&addr) {
-            let raw_ptr = header as *mut u8;
-            dealloc(raw_ptr, layout);
+        if let Some((raw_addr, layout, _)) = self.large_allocations.remove(&addr) {
+            dealloc(raw_addr as *mut u8, layout);
         } else {
             let class_code = (*header).size_class_id();
             if class_code >= 1 && class_code <= self.pools.len() {
@@ -431,16 +451,25 @@ impl GlobalGenAllocatorInner {
         }
     }
 
-    fn alloc_large(&mut self, size: usize, arena_id: u16) -> *mut u8 {
-        let header_size = std::mem::size_of::<GenHeader>();
-        let total_size = header_size + size;
-        let layout = Layout::from_size_align(total_size, 8).expect("Invalid large layout");
+    /// Allocates memory directly with strict vector alignment (AVX-512 64B, AVX2 32B, NEON 16B).
+    ///
+    /// The returned payload pointer is strictly aligned to `align.max(8)`, and its generational
+    /// header is placed immediately before it at `payload.sub(8)`.
+    fn alloc_large(&mut self, size: usize, align: usize, arena_id: u16) -> *mut u8 {
+        let actual_align = align.max(8);
+        // The payload is placed at offset `actual_align` from raw_mem.
+        // Since actual_align >= 8, the GenHeader (8 bytes) safely resides at `offset - 8`.
+        let offset = actual_align;
+        let total_size = offset + size;
+        let layout =
+            Layout::from_size_align(total_size, actual_align).expect("Invalid large layout");
         unsafe {
             let raw_mem = alloc(layout);
             if raw_mem.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
-            let header = raw_mem as *mut GenHeader;
+            let payload = raw_mem.add(offset);
+            let header = (payload as *mut GenHeader).sub(1);
             std::ptr::write(
                 header,
                 GenHeader {
@@ -449,8 +478,8 @@ impl GlobalGenAllocatorInner {
                     arena_id,
                 },
             );
-            let payload = raw_mem.add(header_size);
-            self.large_allocations.insert(payload as usize, (layout, 1));
+            self.large_allocations
+                .insert(payload as usize, (raw_mem as usize, layout, 1));
             payload
         }
     }
@@ -507,8 +536,9 @@ impl GlobalGenAllocator {
     pub fn alloc(&self, size: usize, align: usize, arena_id: u16) -> *mut u8 {
         self.allocated_bytes.fetch_add(size, Ordering::Relaxed);
 
-        // Fast-path for non-arena standard slab size classes via thread-local cache
-        if arena_id == 0 {
+        // Fast-path for non-arena standard slab size classes via thread-local cache.
+        // Vector alignments > 8 bytes (AVX-512, AVX2, NEON) bypass the 8-byte slab cache.
+        if arena_id == 0 && align <= 8 {
             if let Some(idx) = SIZE_CLASSES.iter().position(|&s| s >= size) {
                 let cached_ptr = LOCAL_CACHE.with(|cache| {
                     let mut c = cache.borrow_mut();

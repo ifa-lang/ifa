@@ -179,6 +179,256 @@ pub fn call_intrinsic(name: Symbol, args: &[Value], span: Span) -> Result<Value,
             let is_valid = validate_json_syntax(text);
             Ok(Value::Bool(is_valid))
         }
+        "abs" => {
+            if args.len() != 1 {
+                return Err(ComptimeError::new(
+                    ComptimeErrorKind::ArityMismatch {
+                        expected: 1,
+                        found: args.len(),
+                    },
+                    span,
+                ));
+            }
+            match &args[0] {
+                Value::Int(i) => Ok(Value::Int(i.abs())),
+                Value::UInt(u) => Ok(Value::UInt(*u)),
+                Value::Float(f) => Ok(Value::Float(f.abs())),
+                other => Err(ComptimeError::new(
+                    ComptimeErrorKind::TypeMismatch {
+                        expected: "numérique".to_string(),
+                        found: other.type_name().to_string(),
+                    },
+                    span,
+                )),
+            }
+        }
+        "sqrt" => {
+            if args.len() != 1 {
+                return Err(ComptimeError::new(
+                    ComptimeErrorKind::ArityMismatch {
+                        expected: 1,
+                        found: args.len(),
+                    },
+                    span,
+                ));
+            }
+            let f = match &args[0] {
+                Value::Float(f) => *f,
+                Value::Int(i) => *i as f64,
+                Value::UInt(u) => *u as f64,
+                other => {
+                    return Err(ComptimeError::new(
+                        ComptimeErrorKind::TypeMismatch {
+                            expected: "float".to_string(),
+                            found: other.type_name().to_string(),
+                        },
+                        span,
+                    ));
+                }
+            };
+            if f < 0.0 {
+                return Err(ComptimeError::new(
+                    ComptimeErrorKind::InvalidUnaryOp {
+                        op: "sqrt".to_string(),
+                        operand: format!("{}", f),
+                    },
+                    span,
+                ));
+            }
+            Ok(Value::Float(f.sqrt()))
+        }
+        "sin" => {
+            if args.len() != 1 {
+                return Err(ComptimeError::new(
+                    ComptimeErrorKind::ArityMismatch {
+                        expected: 1,
+                        found: args.len(),
+                    },
+                    span,
+                ));
+            }
+            let f = match &args[0] {
+                Value::Float(f) => *f,
+                Value::Int(i) => *i as f64,
+                Value::UInt(u) => *u as f64,
+                other => {
+                    return Err(ComptimeError::new(
+                        ComptimeErrorKind::TypeMismatch {
+                            expected: "float".to_string(),
+                            found: other.type_name().to_string(),
+                        },
+                        span,
+                    ));
+                }
+            };
+            Ok(Value::Float(f.sin()))
+        }
+        "cos" => {
+            if args.len() != 1 {
+                return Err(ComptimeError::new(
+                    ComptimeErrorKind::ArityMismatch {
+                        expected: 1,
+                        found: args.len(),
+                    },
+                    span,
+                ));
+            }
+            let f = match &args[0] {
+                Value::Float(f) => *f,
+                Value::Int(i) => *i as f64,
+                Value::UInt(u) => *u as f64,
+                other => {
+                    return Err(ComptimeError::new(
+                        ComptimeErrorKind::TypeMismatch {
+                            expected: "float".to_string(),
+                            found: other.type_name().to_string(),
+                        },
+                        span,
+                    ));
+                }
+            };
+            Ok(Value::Float(f.cos()))
+        }
+        "floor" => {
+            if args.len() != 1 {
+                return Err(ComptimeError::new(
+                    ComptimeErrorKind::ArityMismatch {
+                        expected: 1,
+                        found: args.len(),
+                    },
+                    span,
+                ));
+            }
+            let f = match &args[0] {
+                Value::Float(f) => *f,
+                Value::Int(i) => *i as f64,
+                Value::UInt(u) => *u as f64,
+                other => {
+                    return Err(ComptimeError::new(
+                        ComptimeErrorKind::TypeMismatch {
+                            expected: "float".to_string(),
+                            found: other.type_name().to_string(),
+                        },
+                        span,
+                    ));
+                }
+            };
+            Ok(Value::Float(f.floor()))
+        }
+        "ceil" => {
+            if args.len() != 1 {
+                return Err(ComptimeError::new(
+                    ComptimeErrorKind::ArityMismatch {
+                        expected: 1,
+                        found: args.len(),
+                    },
+                    span,
+                ));
+            }
+            let f = match &args[0] {
+                Value::Float(f) => *f,
+                Value::Int(i) => *i as f64,
+                Value::UInt(u) => *u as f64,
+                other => {
+                    return Err(ComptimeError::new(
+                        ComptimeErrorKind::TypeMismatch {
+                            expected: "float".to_string(),
+                            found: other.type_name().to_string(),
+                        },
+                        span,
+                    ));
+                }
+            };
+            Ok(Value::Float(f.ceil()))
+        }
+        "min" => {
+            if args.len() != 2 {
+                return Err(ComptimeError::new(
+                    ComptimeErrorKind::ArityMismatch {
+                        expected: 2,
+                        found: args.len(),
+                    },
+                    span,
+                ));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.min(b))),
+                (Value::UInt(a), Value::UInt(b)) => Ok(Value::UInt(*a.min(b))),
+                (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.min(*b))),
+                (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).min(*b))),
+                (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.min(*b as f64))),
+                (other1, other2) => Err(ComptimeError::new(
+                    ComptimeErrorKind::InvalidBinaryOp {
+                        op: "min".to_string(),
+                        left: other1.type_name().to_string(),
+                        right: other2.type_name().to_string(),
+                    },
+                    span,
+                )),
+            }
+        }
+        "max" => {
+            if args.len() != 2 {
+                return Err(ComptimeError::new(
+                    ComptimeErrorKind::ArityMismatch {
+                        expected: 2,
+                        found: args.len(),
+                    },
+                    span,
+                ));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.max(b))),
+                (Value::UInt(a), Value::UInt(b)) => Ok(Value::UInt(*a.max(b))),
+                (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.max(*b))),
+                (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).max(*b))),
+                (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.max(*b as f64))),
+                (other1, other2) => Err(ComptimeError::new(
+                    ComptimeErrorKind::InvalidBinaryOp {
+                        op: "max".to_string(),
+                        left: other1.type_name().to_string(),
+                        right: other2.type_name().to_string(),
+                    },
+                    span,
+                )),
+            }
+        }
+        "pow" => {
+            if args.len() != 2 {
+                return Err(ComptimeError::new(
+                    ComptimeErrorKind::ArityMismatch {
+                        expected: 2,
+                        found: args.len(),
+                    },
+                    span,
+                ));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Int(base), Value::Int(exp)) if *exp >= 0 && *exp <= u32::MAX as i64 => {
+                    match base.checked_pow(*exp as u32) {
+                        Some(res) => Ok(Value::Int(res)),
+                        None => {
+                            let base_f = *base as f64;
+                            let exp_f = *exp as f64;
+                            Ok(Value::Float(base_f.powf(exp_f)))
+                        }
+                    }
+                }
+                (Value::Float(base), Value::Float(exp)) => Ok(Value::Float(base.powf(*exp))),
+                (Value::Int(base), Value::Float(exp)) => {
+                    Ok(Value::Float((*base as f64).powf(*exp)))
+                }
+                (Value::Float(base), Value::Int(exp)) => Ok(Value::Float(base.powf(*exp as f64))),
+                (other1, other2) => Err(ComptimeError::new(
+                    ComptimeErrorKind::InvalidBinaryOp {
+                        op: "pow".to_string(),
+                        left: other1.type_name().to_string(),
+                        right: other2.type_name().to_string(),
+                    },
+                    span,
+                )),
+            }
+        }
         _ => Err(ComptimeError::new(
             ComptimeErrorKind::UndefinedFunction(name_str),
             span,

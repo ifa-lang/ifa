@@ -64,6 +64,21 @@ impl ComptimeVM {
         self
     }
 
+    /// Dynamically sets the instruction gas limit for the VM.
+    pub fn set_gas_limit(&mut self, limit: u64) {
+        self.gas_limit = limit;
+    }
+
+    /// Dynamically sets the memory quota for the VM.
+    pub fn set_max_memory(&mut self, limit_bytes: usize) {
+        self.max_memory_bytes = limit_bytes;
+    }
+
+    /// Resets the gas counter to zero.
+    pub fn reset_gas(&mut self) {
+        self.gas_used = 0;
+    }
+
     /// Checks if allocating `bytes` exceeds the memory sandbox quota.
     #[inline]
     pub fn check_memory_quota(&mut self, bytes: usize, span: Span) -> Result<(), ComptimeError> {

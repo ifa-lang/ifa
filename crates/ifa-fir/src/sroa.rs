@@ -60,43 +60,40 @@ impl SroaPass {
             }
         }
 
-        if alloca_info.is_empty() {
-            return;
+        if !alloca_info.is_empty() {
+            // Step 2: Escape analysis across all instructions and terminators
+            let escaping = Self::analyze_escapes(func, &alloca_info);
+            let non_escaping: HashSet<ValueId> = alloca_info
+                .keys()
+                .copied()
+                .filter(|ptr| !escaping.contains(ptr))
+                .collect();
+
+            if !non_escaping.is_empty() {
+                // Step 3: Decompose non-escaping aggregate structures (SROA)
+                let decomposed_fields =
+                    self.decompose_aggregates(func, &non_escaping, &alloca_info);
+
+                // Update alloca info with newly created field allocas
+                for (field_id, field_ty, field_name, field_span, block_id) in &decomposed_fields {
+                    alloca_info.insert(
+                        *field_id,
+                        (field_ty.clone(), *field_name, *field_span, *block_id),
+                    );
+                }
+
+                // Re-analyze non-escaping allocas now that aggregates are decomposed
+                let escaping_after_sroa = Self::analyze_escapes(func, &alloca_info);
+                let candidates: HashSet<ValueId> = alloca_info
+                    .keys()
+                    .copied()
+                    .filter(|ptr| !escaping_after_sroa.contains(ptr))
+                    .collect();
+
+                // Step 4: Promote non-escaping allocations to SSA values (Store-to-Load forwarding)
+                self.promote_allocations_to_registers(func, &candidates);
+            }
         }
-
-        // Step 2: Escape analysis across all instructions and terminators
-        let escaping = Self::analyze_escapes(func, &alloca_info);
-        let non_escaping: HashSet<ValueId> = alloca_info
-            .keys()
-            .copied()
-            .filter(|ptr| !escaping.contains(ptr))
-            .collect();
-
-        if non_escaping.is_empty() {
-            return;
-        }
-
-        // Step 3: Decompose non-escaping aggregate structures (SROA)
-        let decomposed_fields = self.decompose_aggregates(func, &non_escaping, &alloca_info);
-
-        // Update alloca info with newly created field allocas
-        for (field_id, field_ty, field_name, field_span, block_id) in &decomposed_fields {
-            alloca_info.insert(
-                *field_id,
-                (field_ty.clone(), *field_name, *field_span, *block_id),
-            );
-        }
-
-        // Re-analyze non-escaping allocas now that aggregates are decomposed
-        let escaping_after_sroa = Self::analyze_escapes(func, &alloca_info);
-        let candidates: HashSet<ValueId> = alloca_info
-            .keys()
-            .copied()
-            .filter(|ptr| !escaping_after_sroa.contains(ptr))
-            .collect();
-
-        // Step 4: Promote non-escaping allocations to SSA values (Store-to-Load forwarding)
-        self.promote_allocations_to_registers(func, &candidates);
 
         // Step 5: Optimize tagged unions (fold discriminants, forward payloads, fold branch conds)
         self.optimize_tagged_unions(func);

@@ -1367,3 +1367,47 @@ fn test_cranelift_jit_range_for_loop_and_sub_slicing() {
     let result = jit.run_main().expect("Failed to execute native main");
     assert_eq!(result, 60);
 }
+
+#[test]
+fn test_cranelift_vector_array_execution_and_alignment() {
+    let src = r#"
+        pub fn main() -> i64 {
+            // 16-element float array (16 * 8 = 128 bytes -> 16-byte Neon/SSE stack slot alignment)
+            mut vec: [i64; 16] = [0; 16];
+            mut i = 0;
+            while i < 16 {
+                vec[i] = i * 2;
+                i = i + 1;
+            }
+
+            mut total: i64 = 0;
+            mut j = 0;
+            while j < 16 {
+                total = total + vec[j];
+                j = j + 1;
+            }
+            return total;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("jit_vec_align.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile vector FIR module to Cranelift JIT");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    // sum_{i=0}^{15} 2*i = 2 * (15 * 16 / 2) = 240
+    assert_eq!(result, 240);
+}

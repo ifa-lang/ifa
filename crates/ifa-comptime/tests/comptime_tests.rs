@@ -149,3 +149,83 @@ fn test_comptime_for_loop_destructuring() {
     let res = eval_function(&func, vec![]).expect("comptime sum_pairs failed");
     assert_eq!(res, Value::Int(140));
 }
+
+#[test]
+fn test_comptime_math_intrinsics() {
+    let expr = parse_first_expr("const X = abs(-42);");
+    assert_eq!(eval_expr(&expr).unwrap(), Value::Int(42));
+
+    let expr = parse_first_expr("const X = min(15, 30);");
+    assert_eq!(eval_expr(&expr).unwrap(), Value::Int(15));
+
+    let expr = parse_first_expr("const X = max(15, 30);");
+    assert_eq!(eval_expr(&expr).unwrap(), Value::Int(30));
+
+    let expr = parse_first_expr("const X = pow(2, 8);");
+    assert_eq!(eval_expr(&expr).unwrap(), Value::Int(256));
+
+    let expr = parse_first_expr("const X = sqrt(16.0);");
+    assert_eq!(eval_expr(&expr).unwrap(), Value::Float(4.0));
+
+    let expr = parse_first_expr("const X = floor(3.7);");
+    assert_eq!(eval_expr(&expr).unwrap(), Value::Float(3.0));
+
+    let expr = parse_first_expr("const X = ceil(3.2);");
+    assert_eq!(eval_expr(&expr).unwrap(), Value::Float(4.0));
+}
+
+#[test]
+fn test_comptime_static_table_generator() {
+    let func = parse_first_fn(
+        r#"
+        comptime fn generate_square_table() -> [i64; 8] {
+            mut table = [0; 8];
+            mut i = 0;
+            while i < 8 {
+                table[i] = (i + 1) * (i + 1);
+                i = i + 1;
+            }
+            return table;
+        }
+    "#,
+    );
+    let res = eval_function(&func, vec![]).expect("generate_square_table failed");
+    if let Value::Array(elems) = res {
+        assert_eq!(elems.len(), 8);
+        assert_eq!(elems[0], Value::Int(1));
+        assert_eq!(elems[1], Value::Int(4));
+        assert_eq!(elems[2], Value::Int(9));
+        assert_eq!(elems[7], Value::Int(64));
+    } else {
+        panic!("Expected array value, got {:?}", res);
+    }
+}
+
+#[test]
+fn test_comptime_sandboxed_table_generation_fuel() {
+    let mut vm = ifa_comptime::ComptimeVM::new().with_gas_limit(50);
+    let func = parse_first_fn(
+        r#"
+        comptime fn generate_large_table() -> [i64; 100] {
+            mut table = [0; 100];
+            mut i = 0;
+            while i < 100 {
+                table[i] = i * 2;
+                i = i + 1;
+            }
+            return table;
+        }
+    "#,
+    );
+    let bc = ifa_comptime::Compiler::compile_function(&func).unwrap();
+    let name = bc.name;
+    let span = bc.span;
+    vm.register_function(bc);
+    let err = vm
+        .call_function(name, vec![], span)
+        .expect_err("Fuel limit of 50 steps must be reached");
+    assert!(matches!(
+        err.kind,
+        ComptimeErrorKind::GasLimitExceeded { limit: 50 }
+    ));
+}

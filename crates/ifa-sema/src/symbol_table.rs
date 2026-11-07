@@ -850,6 +850,94 @@ impl SymbolTable {
             ret_ty: f64_ty.clone(),
             span: dummy,
         });
+        math_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("sin"),
+            is_pub: true,
+            is_strict: true,
+            is_comptime: true,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: x_sym,
+                ty: f64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: f64_ty.clone(),
+            span: dummy,
+        });
+        math_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("cos"),
+            is_pub: true,
+            is_strict: true,
+            is_comptime: true,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: x_sym,
+                ty: f64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: f64_ty.clone(),
+            span: dummy,
+        });
+        math_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("floor"),
+            is_pub: true,
+            is_strict: true,
+            is_comptime: true,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: x_sym,
+                ty: f64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: f64_ty.clone(),
+            span: dummy,
+        });
+        math_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("ceil"),
+            is_pub: true,
+            is_strict: true,
+            is_comptime: true,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: x_sym,
+                ty: f64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: f64_ty.clone(),
+            span: dummy,
+        });
+        math_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("pow"),
+            is_pub: true,
+            is_strict: true,
+            is_comptime: true,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: a_sym,
+                    ty: f64_ty.clone(),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: b_sym,
+                    ty: f64_ty.clone(),
+                    span: dummy,
+                },
+            ],
+            ret_ty: f64_ty.clone(),
+            span: dummy,
+        });
         math_mod.add_const(ConstSymbol {
             name: INTERNER.intern("PI"),
             is_pub: true,

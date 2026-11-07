@@ -909,3 +909,48 @@ fn test_slab_allocator_epoch_preservation_and_quarantine() {
     assert_eq!(quarantined_after, quarantined_before + 1);
     assert_eq!(ifa_rt_epoch_quarantined_count(), quarantined_after);
 }
+
+#[test]
+fn test_simd_vector_cacheline_alignments() {
+    // 1. 16-byte alignment (ARM Neon / SSE)
+    let ptr_neon = ifa_rt_gen_alloc(128, 16, 0);
+    assert_eq!(
+        ptr_neon as usize % 16,
+        0,
+        "NEON buffer must be 16-byte aligned"
+    );
+    unsafe {
+        let header = (ptr_neon as *const GenHeader).sub(1);
+        assert!((*header).is_active());
+        assert_eq!((*header).generation_counter, 1);
+    }
+    ifa_rt_gen_free(ptr_neon);
+
+    // 2. 32-byte alignment (AVX2 / 256-bit vector lanes)
+    let ptr_avx2 = ifa_rt_gen_alloc(256, 32, 0);
+    assert_eq!(
+        ptr_avx2 as usize % 32,
+        0,
+        "AVX2 buffer must be 32-byte aligned"
+    );
+    unsafe {
+        let header = (ptr_avx2 as *const GenHeader).sub(1);
+        assert!((*header).is_active());
+        assert_eq!((*header).generation_counter, 1);
+    }
+    ifa_rt_gen_free(ptr_avx2);
+
+    // 3. 64-byte alignment (AVX-512 / 512-bit vector lanes / L1 Cache Line)
+    let ptr_avx512 = ifa_rt_gen_alloc(512, 64, 0);
+    assert_eq!(
+        ptr_avx512 as usize % 64,
+        0,
+        "AVX-512 buffer must be 64-byte cacheline aligned"
+    );
+    unsafe {
+        let header = (ptr_avx512 as *const GenHeader).sub(1);
+        assert!((*header).is_active());
+        assert_eq!((*header).generation_counter, 1);
+    }
+    ifa_rt_gen_free(ptr_avx512);
+}

@@ -209,10 +209,11 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     _ => crate::types::fir_type_byte_size(ty)
                         .max(elem_cl_ty.bytes().max(1) as usize) as u32,
                 };
+                let align_shift = crate::types::fir_type_align_shift(ty);
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     byte_size,
-                    0,
+                    align_shift,
                 ));
                 let addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
                 if let Some(res_id) = result {
@@ -669,10 +670,12 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             ValueExpr::ArrayInit(elements) => {
                 let count = elements.len().max(1);
                 let byte_size = (count * 8) as u32;
+                // Maximum stack slot alignment supported by Cranelift stack frames is 16 bytes (ARM Neon / SSE)
+                let align_shift = if byte_size >= 16 { 4 } else { 3 };
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     byte_size,
-                    0,
+                    align_shift,
                 ));
                 let base_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
                 for (idx, elem_id) in elements.iter().enumerate() {
@@ -700,7 +703,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     total_size,
-                    0,
+                    3,
                 ));
                 let base_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
 
@@ -763,7 +766,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     byte_size,
-                    0,
+                    3,
                 ));
                 let base_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
                 for (idx, field_id) in fields.iter().enumerate() {
@@ -814,7 +817,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     8,
-                    0,
+                    3,
                 ));
                 let slot_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
                 if let Some(func_id) = self.func_ids.get("ifa_rt_channel_recv") {
@@ -839,7 +842,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     8,
-                    0,
+                    3,
                 ));
                 let slot_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
                 if let Some(func_id) = self.func_ids.get("ifa_rt_channel_try_recv") {
@@ -879,7 +882,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     total_size,
-                    0,
+                    3,
                 ));
                 let arr_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
                 for (idx, ch_id) in channels.iter().enumerate() {
@@ -950,7 +953,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     16,
-                    0,
+                    3,
                 ));
                 let base_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
                 let disc_val = self.builder.ins().iconst(types::I64, *discriminant as i64);

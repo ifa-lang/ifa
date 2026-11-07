@@ -552,7 +552,8 @@ impl Compiler {
                 let name_str = INTERNER.resolve(&func_name);
                 match name_str.as_str() {
                     "assert" | "compile_error" | "len" | "type_of" | "crc32" | "hex_encode"
-                    | "json_validate" => {
+                    | "json_validate" | "abs" | "sqrt" | "sin" | "cos" | "floor" | "ceil"
+                    | "min" | "max" | "pow" => {
                         self.chunk.emit(
                             OpCode::CallIntrinsic {
                                 name: func_name,

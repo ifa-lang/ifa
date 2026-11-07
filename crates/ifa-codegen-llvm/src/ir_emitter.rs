@@ -1630,12 +1630,20 @@ impl<'a> LlvmIrEmitter<'a> {
                     })
                     .unwrap_or_else(|| ("i64".to_string(), 8));
 
+                let total_bytes = count * align as usize;
+                let arr_align = if total_bytes >= 64 {
+                    64
+                } else if total_bytes >= 32 {
+                    32
+                } else if total_bytes >= 16 {
+                    16
+                } else {
+                    align.max(8)
+                };
+
                 out.push_str(&format!(
                     "  %arr_alloc_{} = alloca [{} x {}], align {}\n",
-                    res_id,
-                    count,
-                    elem_ty_str,
-                    align.max(8)
+                    res_id, count, elem_ty_str, arr_align
                 ));
                 for (idx, elem) in elements.iter().enumerate() {
                     out.push_str(&format!(
@@ -2825,6 +2833,19 @@ fn llvm_align_for_type(ty: &ifa_fir::FirType) -> u32 {
             ifa_sema::types::FloatType::F64 => 8,
         },
         ifa_fir::FirType::Bool | ifa_fir::FirType::Char => 1,
+        ifa_fir::FirType::Array(elem, len) => {
+            let elem_align = llvm_align_for_type(elem);
+            let total_bytes = (*len as usize) * (elem_align as usize);
+            if total_bytes >= 64 {
+                64
+            } else if total_bytes >= 32 {
+                32
+            } else if total_bytes >= 16 {
+                16
+            } else {
+                elem_align.max(8)
+            }
+        }
         _ => 8,
     }
 }

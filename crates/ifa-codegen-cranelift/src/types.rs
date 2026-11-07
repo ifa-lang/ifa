@@ -110,3 +110,64 @@ pub fn fir_type_byte_size(ty: &FirType) -> usize {
         FirType::ErrorUnion { ok, .. } => fir_type_byte_size(ok) + 8,
     }
 }
+
+/// Calculate the required alignment in bytes for a FIR type.
+pub fn fir_type_alignment(ty: &FirType) -> u32 {
+    match ty {
+        FirType::Unit | FirType::Bool | FirType::Int(IntType::I8 | IntType::U8) => 1,
+        FirType::Int(IntType::I16 | IntType::U16) => 2,
+        FirType::Int(IntType::I32 | IntType::U32)
+        | FirType::Float(FloatType::F32)
+        | FirType::Char => 4,
+        FirType::Int(IntType::I64 | IntType::U64 | IntType::ISize | IntType::USize)
+        | FirType::Float(FloatType::F64)
+        | FirType::Str
+        | FirType::String
+        | FirType::Pointer(_)
+        | FirType::GenerationalRef(_)
+        | FirType::Channel(_)
+        | FirType::Function { .. } => 8,
+        FirType::Enum(_, vars) => {
+            let has_payload = vars.iter().any(|(_, opt)| opt.is_some());
+            if has_payload {
+                16
+            } else {
+                8
+            }
+        }
+        FirType::Slice(_) => 8,
+        FirType::Range { elem, .. } => fir_type_alignment(elem).max(8),
+        FirType::Array(elem_ty, len) => {
+            let elem_align = fir_type_alignment(elem_ty);
+            let total_bytes = fir_type_byte_size(elem_ty) * (*len as usize);
+            if total_bytes >= 64 {
+                64
+            } else if total_bytes >= 32 {
+                32
+            } else if total_bytes >= 16 {
+                16
+            } else {
+                elem_align.max(8)
+            }
+        }
+        FirType::Struct(_, fields) => {
+            let max_field_align = fields
+                .iter()
+                .map(|(_, f)| fir_type_alignment(f))
+                .max()
+                .unwrap_or(8);
+            max_field_align.max(8)
+        }
+        FirType::Optional(inner) => fir_type_alignment(inner),
+        FirType::ErrorUnion { ok, .. } => fir_type_alignment(ok).max(8),
+    }
+}
+
+/// Calculate base-2 logarithm (alignment shift) for Cranelift StackSlotData.
+///
+/// Cranelift stack frames enforce a maximum stack slot alignment of 16 bytes (shift 4),
+/// matching the System V ABI and ARM Neon 128-bit vector register boundaries.
+pub fn fir_type_align_shift(ty: &FirType) -> u8 {
+    let align = fir_type_alignment(ty);
+    align.trailing_zeros().min(4) as u8
+}

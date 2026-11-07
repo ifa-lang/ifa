@@ -2324,3 +2324,63 @@ fn test_llvm_wasm32_coroutine_stackless_suspension() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_vector_memory_alignment_avx512_and_neon() {
+    let src = r#"
+        pub fn make_avx512() -> [f64; 64] {
+            // AVX-512 vector array (64 * 8 = 512 bytes -> align 64)
+            mut big_vec = [0.0; 64];
+            return big_vec;
+        }
+
+        pub fn make_avx2() -> [f64; 4] {
+            // AVX2 vector array (4 * 8 = 32 bytes -> align 32)
+            mut avx2_vec = [0.0; 4];
+            return avx2_vec;
+        }
+
+        pub fn make_neon() -> [f64; 2] {
+            // ARM Neon / SSE vector array (2 * 8 = 16 bytes -> align 16)
+            mut neon_vec = [0.0; 2];
+            return neon_vec;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("vec_align.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let ir = emitter
+        .emit_module(&module)
+        .expect("LLVM IR emission failed");
+
+    // Verify AVX-512 64-byte cacheline alignment
+    assert!(
+        ir.contains("alloca [64 x double], align 64"),
+        "Expected AVX-512 64-byte alignment for 64-element double array:\n{}",
+        ir
+    );
+    // Verify AVX2 32-byte alignment
+    assert!(
+        ir.contains("alloca [4 x double], align 32"),
+        "Expected AVX2 32-byte alignment for 4-element double array:\n{}",
+        ir
+    );
+    // Verify ARM Neon 16-byte alignment
+    assert!(
+        ir.contains("alloca [2 x double], align 16"),
+        "Expected ARM Neon 16-byte alignment for 2-element double array:\n{}",
+        ir
+    );
+}

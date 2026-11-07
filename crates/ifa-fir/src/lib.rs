@@ -5,6 +5,7 @@ pub mod cow;
 pub mod dominance;
 pub mod gen_opt;
 pub mod interp;
+pub mod ipo;
 pub mod ir;
 pub mod layout_opt;
 pub mod lower;
@@ -22,6 +23,7 @@ pub use cow::{CowPass, SharingState};
 pub use dominance::DominanceTree;
 pub use gen_opt::{GenOptStats, GenerationalOptPass, NaturalLoop};
 pub use interp::{FirInterpreter, FirValue, GenHeader, GenHeap, InterpError};
+pub use ipo::{IpoPass, IpoStats};
 pub use ir::*;
 pub use layout_opt::{CacheLayoutPass, CacheLayoutStats, CACHE_LINE_SIZE};
 pub use lower::lower_program;
@@ -90,6 +92,15 @@ pub fn compile_to_fir_with_opts(
     bce_pass.run_on_module(&mut module);
 
     if opt_vectorize {
+        let mut ipo_pass = IpoPass::new();
+        ipo_pass.run_on_module(&mut module);
+
+        let mut sroa_pass3 = SroaPass::new();
+        sroa_pass3.run_on_module(&mut module);
+
+        let mut bce_pass2 = BcePass::new();
+        bce_pass2.run_on_module(&mut module);
+
         let mut vec_pass = VectorizePass::new();
         vec_pass.run_on_module(&mut module);
     }
