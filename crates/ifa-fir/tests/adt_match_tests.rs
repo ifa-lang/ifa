@@ -1223,3 +1223,149 @@ fn test_pattern_binding_match_inout_interp() {
     let res = interp.execute_function("main", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(60));
 }
+
+#[test]
+fn test_ref_destructuring_on_generational_ref_interp() {
+    let src = r#"
+        struct Node {
+            id: i64,
+            val: i64,
+        }
+
+        pub fn main() -> i64 {
+            let n = Node(id: 10, val: 32);
+            let ref r = n;
+            let Node { ref id, ref val } = r;
+            return id + val;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("ref_destruct_gen.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(42));
+}
+
+#[test]
+fn test_nested_graph_destructuring_ref_bindings_interp() {
+    let src = r#"
+        struct TargetNode {
+            value: i64,
+        }
+
+        struct Edge {
+            weight: i64,
+            target: ref TargetNode,
+        }
+
+        struct GraphNode {
+            id: i64,
+            edge: Edge,
+        }
+
+        pub fn main() -> i64 {
+            let t = TargetNode(value: 50);
+            let ref target_ref = t;
+            let g = GraphNode(id: 3, edge: Edge(weight: 12, target: target_ref));
+            let GraphNode { id, edge: Edge { weight, ref target } } = g;
+            return id + weight + target.value;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("nested_graph_ref.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(65));
+}
+
+#[test]
+fn test_match_destructuring_through_generational_ref_interp() {
+    let src = r#"
+        struct Coordinate {
+            x: i64,
+            y: i64,
+        }
+
+        pub fn main() -> i64 {
+            let c = Coordinate(x: 100, y: 250);
+            let ref c_ref = c;
+            return match c_ref {
+                Coordinate { ref x, ref y } => x + y,
+            };
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("match_gen_ref.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(350));
+}
+
+#[test]
+fn test_tuple_ref_destructuring_interp() {
+    let src = r#"
+        pub fn main() -> i64 {
+            let pair = (40, 2);
+            let ref pair_ref = pair;
+            let (ref a, ref b) = pair_ref;
+            return a + b;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("tuple_ref_destruct.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(42));
+}

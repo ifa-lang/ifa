@@ -2665,3 +2665,102 @@ fn test_inout_and_mut_binding_patterns_valid() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_ref_binding_destructuring_on_generational_ref() {
+    let code = r#"
+        struct Node {
+            id: i64,
+            value: i64,
+        }
+
+        pub fn main() {
+            let n = Node(id: 1, value: 42);
+            let ref node_ref = n;
+            let Node { ref id, value } = node_ref;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Destructuring on generational ref should succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_inout_binding_on_generational_ref_rejected() {
+    let code = r#"
+        struct Node {
+            id: i64,
+            value: i64,
+        }
+
+        pub fn main() {
+            let n = Node(id: 1, value: 42);
+            let ref node_ref = n;
+            let Node { inout id, .. } = node_ref;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "inout binding on generational ref must be rejected"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0010")),
+        "Expected E0010 for inout on ref target: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_nested_graph_struct_ref_bindings_valid() {
+    let code = r#"
+        struct TargetNode {
+            key: i64,
+        }
+
+        struct Edge {
+            weight: i64,
+            target: ref TargetNode,
+        }
+
+        struct GraphNode {
+            id: i64,
+            edge: Edge,
+        }
+
+        pub fn main() {
+            let t = TargetNode(key: 99);
+            let ref target_ref = t;
+            let g = GraphNode(id: 7, edge: Edge(weight: 100, target: target_ref));
+            let GraphNode { id, edge: Edge { weight, ref target } } = g;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Nested graph struct with ref binding should succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_tuple_ref_destructuring_valid() {
+    let code = r#"
+        pub fn main() {
+            let pair = (10, 20);
+            let ref pair_ref = pair;
+            let (ref a, b) = pair_ref;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Tuple ref destructuring should succeed: {:?}",
+        res.diagnostics
+    );
+}

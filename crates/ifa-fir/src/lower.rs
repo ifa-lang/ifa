@@ -879,7 +879,7 @@ impl<'a> FunctionLoweringContext<'a> {
                         } else {
                             FirType::Int(IntType::I64)
                         };
-                        let ref_ty = FirType::Pointer(Box::new(inner_ty));
+                        let ref_ty = FirType::GenerationalRef(Box::new(inner_ty));
 
                         let ptr_to_ref = if let Some(val) = init_val {
                             self.val_ptrs.get(&val).copied().unwrap_or(val)
@@ -3308,6 +3308,45 @@ impl<'a> FunctionLoweringContext<'a> {
         fail_target: BlockId,
         _span: Span,
     ) {
+        if let FirType::GenerationalRef(inner_ty) = target_ty {
+            if matches!(
+                pat,
+                Pattern::Struct { .. }
+                    | Pattern::Tuple(..)
+                    | Pattern::Variant { .. }
+                    | Pattern::Slice { .. }
+            ) {
+                // Inlined 1-cycle CPU generation check
+                self.emit(
+                    None,
+                    ValueExpr::GenCheck {
+                        ref_val: target_val,
+                        redundant: false,
+                    },
+                    _span,
+                );
+                let deref_val = self.alloc_value();
+                self.emit(
+                    Some(deref_val),
+                    ValueExpr::GenDeref {
+                        ref_val: target_val,
+                    },
+                    _span,
+                );
+                self.val_ptrs.insert(deref_val, target_val);
+
+                self.lower_pattern_match(
+                    deref_val,
+                    inner_ty,
+                    pat,
+                    success_target,
+                    fail_target,
+                    _span,
+                );
+                return;
+            }
+        }
+
         match pat {
             Pattern::Wildcard(_) => {
                 self.set_terminator(Terminator::Branch {
@@ -3428,7 +3467,7 @@ impl<'a> FunctionLoweringContext<'a> {
                     });
                 }
                 BindingMode::Ref => {
-                    let ref_ty = FirType::Pointer(Box::new(target_ty.clone()));
+                    let ref_ty = FirType::GenerationalRef(Box::new(target_ty.clone()));
                     let var_ptr = if let Some(existing_ptr) = self.var_allocas.get(sym).copied() {
                         existing_ptr
                     } else {

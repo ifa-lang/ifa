@@ -1,6 +1,6 @@
 use crate::symbol_table::SymbolTable;
 use crate::types::Type;
-use ifa_ast::{Expr, ExprKind, Function, ParamMode, Stmt, UnaryOp};
+use ifa_ast::{Expr, ExprKind, Function, ParamMode, Pattern, Stmt, UnaryOp};
 use ifa_diagnostics::Diagnostic;
 use ifa_span::{Span, Symbol, INTERNER};
 use std::collections::HashMap;
@@ -310,11 +310,17 @@ impl<'a> EscapeAnalyzer<'a> {
 
     fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { pattern, init, .. } => {
+            Stmt::Let {
+                pattern,
+                init,
+                span,
+                ..
+            } => {
                 let bound = pattern.bound_variables();
                 for (sym, p_span) in &bound {
                     self.record_local_var(*sym, *p_span);
                 }
+                self.check_pattern_ref_bindings(pattern, init.as_ref(), *span);
                 if let Some(expr) = init {
                     let refs = self.collect_contained_refs(expr);
                     if !refs.is_empty() {
@@ -410,6 +416,7 @@ impl<'a> EscapeAnalyzer<'a> {
                 }
             }
             Stmt::AssignPattern { pattern, val, span } => {
+                self.check_pattern_ref_bindings(pattern, Some(val), *span);
                 if self.spawn_depth > 0 {
                     for (root_sym, root_span) in pattern.bound_variables() {
                         if self.var_info.contains_key(&root_sym) {
@@ -450,8 +457,17 @@ impl<'a> EscapeAnalyzer<'a> {
                 }
             }
             Stmt::WhileLet {
-                expr, guard, body, ..
+                pattern,
+                expr,
+                guard,
+                body,
+                span,
             } => {
+                let bound = pattern.bound_variables();
+                for (sym, p_span) in &bound {
+                    self.record_local_var(*sym, *p_span);
+                }
+                self.check_pattern_ref_bindings(pattern, Some(expr), *span);
                 self.check_expr(expr);
                 if let Some(g) = guard {
                     self.check_expr(g);
@@ -635,12 +651,18 @@ impl<'a> EscapeAnalyzer<'a> {
                 }
             }
             ExprKind::IfLet {
+                pattern,
                 expr,
                 guard,
                 then_branch,
                 else_branch,
                 ..
             } => {
+                let bound = pattern.bound_variables();
+                for (sym, p_span) in &bound {
+                    self.record_local_var(*sym, *p_span);
+                }
+                self.check_pattern_ref_bindings(pattern, Some(expr), expr.span);
                 self.check_expr(expr);
                 if let Some(g) = guard {
                     self.check_expr(g);
@@ -692,6 +714,11 @@ impl<'a> EscapeAnalyzer<'a> {
             ExprKind::Match { expr: target, arms } => {
                 self.check_expr(target);
                 for arm in arms {
+                    let bound = arm.pattern.bound_variables();
+                    for (sym, p_span) in &bound {
+                        self.record_local_var(*sym, *p_span);
+                    }
+                    self.check_pattern_ref_bindings(&arm.pattern, Some(target), arm.span);
                     if let Some(guard) = &arm.guard {
                         self.check_expr(guard);
                     }
@@ -708,6 +735,70 @@ impl<'a> EscapeAnalyzer<'a> {
             }
             _ => {}
         }
+    }
+
+    fn check_pattern_ref_bindings(
+        &mut self,
+        pattern: &Pattern,
+        source_expr: Option<&Expr>,
+        _pat_span: Span,
+    ) {
+        let refs = pattern.ref_bindings();
+        if refs.is_empty() {
+            return;
+        }
+
+        for (bound_sym, b_span) in refs {
+            if self.current_func_is_strict {
+                self.diagnostics.push(
+                    Diagnostic::error("violation du mode strict : les références générationnelles ('ref') dans les motifs sont interdites dans une fonction 'strict fn'")
+                        .with_code("E0020")
+                        .with_primary_label(b_span, "emprunt 'ref' dans un motif interdit en mode strict")
+                        .with_secondary_label(self.current_func_span, "cette fonction est annotée 'strict fn'")
+                        .with_note("Le mode strict garantit l'absence totale d'allocation sur le tas et de références indirectes.")
+                        .with_help("Utilisez des liaisons par valeur directe ou des projections 'inout'."),
+                );
+            }
+
+            if let Some(src) = source_expr {
+                if let Some((root_sym, root_span)) = extract_escape_root(src) {
+                    if self.spawn_depth > 0 {
+                        if let Some(root_info) = self.var_info.get(&root_sym) {
+                            if root_info.origin == VarOrigin::Local {
+                                let var_name = INTERNER.resolve(&root_sym);
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "course aux données concurrente : emprunt générationnel 'ref' sur la variable locale '{}' interdit au sein d'une fibre 'spawn'",
+                                        var_name
+                                    ))
+                                    .with_code("E0025")
+                                    .with_primary_label(b_span, format!("emprunt 'ref' sur '{}' dans spawn", var_name))
+                                    .with_secondary_label(root_span, format!("'{}' appartient au cadre de pile parent", var_name))
+                                    .with_note("Les fibres partagent la mémoire de manière non-bloquante et interdisent les courses aux données statiques.")
+                                    .with_help("Utilisez un canal 'Channel', un type atomique ou transférez la variable avec 'sink'."),
+                                );
+                            }
+                        }
+                    }
+
+                    self.ref_dependencies
+                        .entry(bound_sym)
+                        .or_default()
+                        .push(root_sym);
+                    if let Some(info) = self.var_info.get_mut(&bound_sym) {
+                        info.contained_refs.push(ContainedRef {
+                            target_var: root_sym,
+                            ref_span: b_span,
+                            is_projection: true,
+                        });
+                    }
+                    if let Some(root_info) = self.var_info.get_mut(&root_sym) {
+                        root_info.alloc_kind = AllocKind::HeapGenerational;
+                    }
+                }
+            }
+        }
+        self.detect_and_handle_cycles();
     }
 
     fn handle_ref_creation(&mut self, target: &Expr, span: Span) {

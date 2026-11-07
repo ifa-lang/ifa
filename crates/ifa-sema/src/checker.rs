@@ -2509,7 +2509,13 @@ impl<'a> SemanticAnalyzer<'a> {
                 let (var_ty, var_mut, param_mode) = match mode {
                     BindingMode::Value => (target_ty.clone(), is_mut, None),
                     BindingMode::Mut => (target_ty.clone(), true, Some(ParamMode::Mut)),
-                    BindingMode::Ref => (Type::Ref(Box::new(target_ty.clone())), false, None),
+                    BindingMode::Ref => {
+                        let inner_ref = match target_ty {
+                            Type::Ref(inner) => inner.clone(),
+                            other => Box::new(other.clone()),
+                        };
+                        (Type::Ref(inner_ref), false, None)
+                    }
                     BindingMode::InOut => (target_ty.clone(), true, Some(ParamMode::InOut)),
                 };
                 if let Err(diag) = self.symbols.define_variable(
@@ -2529,13 +2535,39 @@ impl<'a> SemanticAnalyzer<'a> {
                 inner,
                 span,
             } => {
+                let mut cur_ty = target_ty;
+                let mut is_ref_target = false;
+                while let Type::Ref(inner_ref) = cur_ty {
+                    cur_ty = inner_ref;
+                    is_ref_target = true;
+                }
+
+                if is_ref_target {
+                    if let Some(inner_pat) = inner {
+                        if pattern_has_inout(inner_pat) {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "impossible de créer un emprunt mutable exclusif 'inout' à travers une référence générationnelle immuable ('{}')",
+                                    target_ty
+                                ))
+                                .with_code("E0010")
+                                .with_primary_label(
+                                    inner_pat.span(),
+                                    "liaison exclusive 'inout' interdite sur une cible 'ref'",
+                                )
+                                .with_help("Les références 'ref' sont des emprunts immuables. Utilisez 'ref' ou une copie par valeur."),
+                            );
+                        }
+                    }
+                }
+
                 let mut found_payload_ty: Option<Type> = None;
                 let mut valid_variant = false;
 
                 if let Type::Enum {
                     name: e_sym,
                     variants,
-                } = target_ty
+                } = cur_ty
                 {
                     if let Some((_, opt_ty)) = variants.iter().find(|(v, _)| v == variant) {
                         valid_variant = true;
@@ -2569,7 +2601,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 } else if let Some((_, _, opt_ty)) = self.symbols.lookup_enum_by_variant(variant) {
                     valid_variant = true;
                     found_payload_ty = opt_ty.cloned();
-                } else if *target_ty != Type::Unknown {
+                } else if *cur_ty != Type::Unknown {
                     self.diagnostics.push(
                         Diagnostic::error(format!(
                             "le motif variant '{}' ne correspond pas au type '{}'",
@@ -2619,47 +2651,80 @@ impl<'a> SemanticAnalyzer<'a> {
                     }
                 }
             }
-            Pattern::Tuple(elems, span) => match target_ty {
-                Type::Tuple(expected_elems) => {
-                    if elems.len() != expected_elems.len() {
-                        self.diagnostics.push(
+            Pattern::Tuple(elems, span) => {
+                let mut cur_ty = target_ty;
+                let mut is_ref_target = false;
+                while let Type::Ref(inner_ref) = cur_ty {
+                    cur_ty = inner_ref;
+                    is_ref_target = true;
+                }
+
+                if is_ref_target {
+                    for elem in elems {
+                        if pattern_has_inout(elem) {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "impossible de créer un emprunt mutable exclusif 'inout' à travers une référence générationnelle immuable ('{}')",
+                                    target_ty
+                                ))
+                                .with_code("E0010")
+                                .with_primary_label(
+                                    elem.span(),
+                                    "liaison exclusive 'inout' interdite sur une cible 'ref'",
+                                )
+                                .with_help("Les références 'ref' sont des emprunts immuables. Utilisez 'ref' ou une copie par valeur."),
+                            );
+                        }
+                    }
+                }
+
+                match cur_ty {
+                    Type::Tuple(expected_elems) => {
+                        if elems.len() != expected_elems.len() {
+                            self.diagnostics.push(
                                 Diagnostic::error(format!(
                                     "le motif tuple contient {} élément(s), mais le type attendu '{}' en contient {}",
                                     elems.len(),
-                                    target_ty,
+                                    cur_ty,
                                     expected_elems.len()
                                 ))
                                 .with_code("E0036")
                                 .with_primary_label(*span, "arité de tuple incompatible"),
                             );
-                    } else {
-                        for (elem_pat, elem_ty) in elems.iter().zip(expected_elems.iter()) {
-                            self.check_pattern_with_mut(elem_pat, elem_ty, is_mut, is_initialized);
+                        } else {
+                            for (elem_pat, elem_ty) in elems.iter().zip(expected_elems.iter()) {
+                                self.check_pattern_with_mut(
+                                    elem_pat,
+                                    elem_ty,
+                                    is_mut,
+                                    is_initialized,
+                                );
+                            }
                         }
                     }
-                }
-                Type::Unit if elems.is_empty() => {}
-                Type::Unknown => {
-                    for elem_pat in elems {
-                        self.check_pattern_with_mut(
-                            elem_pat,
-                            &Type::Unknown,
-                            is_mut,
-                            is_initialized,
+                    Type::Unit if elems.is_empty() => {}
+                    Type::Unknown => {
+                        for elem_pat in elems {
+                            self.check_pattern_with_mut(
+                                elem_pat,
+                                &Type::Unknown,
+                                is_mut,
+                                is_initialized,
+                            );
+                        }
+                    }
+                    _ => {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "le motif tuple est incompatible avec le type non-tuple '{}'",
+                                cur_ty
+                            ))
+                            .with_code("E0036")
+                            .with_primary_label(*span, "type de motif incompatible"),
                         );
                     }
                 }
-                _ => {
-                    self.diagnostics.push(
-                        Diagnostic::error(format!(
-                            "le motif tuple est incompatible avec le type non-tuple '{}'",
-                            target_ty
-                        ))
-                        .with_code("E0036")
-                        .with_primary_label(*span, "type de motif incompatible"),
-                    );
-                }
-            },
+            }
             Pattern::Struct {
                 name,
                 fields,
@@ -2685,8 +2750,34 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
                 let st = st_opt.unwrap();
 
+                let mut cur_ty = target_ty;
+                let mut is_ref_target = false;
+                while let Type::Ref(inner_ref) = cur_ty {
+                    cur_ty = inner_ref;
+                    is_ref_target = true;
+                }
+
+                if is_ref_target {
+                    for f in fields {
+                        if pattern_has_inout(&f.pattern) {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "impossible de créer un emprunt mutable exclusif 'inout' à travers une référence générationnelle immuable ('{}')",
+                                    target_ty
+                                ))
+                                .with_code("E0010")
+                                .with_primary_label(
+                                    f.pattern.span(),
+                                    "liaison exclusive 'inout' interdite sur une cible 'ref'",
+                                )
+                                .with_help("Les références 'ref' sont des emprunts immuables. Utilisez 'ref' ou une copie par valeur."),
+                            );
+                        }
+                    }
+                }
+
                 // Check type compatibility
-                let is_compatible = match target_ty {
+                let is_compatible = match cur_ty {
                     Type::Struct { name: t_name, .. } => *t_name == st_name,
                     Type::Generic { name: t_name, .. } => *t_name == st_name,
                     Type::Unknown => true,
@@ -2707,7 +2798,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
 
                 let mut type_subst: HashMap<Symbol, Type> = HashMap::new();
-                if let Type::Generic { args, .. } = target_ty {
+                if let Type::Generic { args, .. } = cur_ty {
                     for (g, a) in st.generics.iter().zip(args.iter()) {
                         type_subst.insert(g.name, a.clone());
                     }
@@ -3048,14 +3139,22 @@ impl<'a> SemanticAnalyzer<'a> {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                 let l_ty = self.infer_expr(left);
                 let r_ty = self.check_expr(right, Some(&l_ty));
-                if l_ty.is_numeric() && r_ty.is_numeric() {
-                    l_ty.resolve_defaults()
-                } else if matches!(l_ty, Type::String | Type::Str)
-                    && matches!(r_ty, Type::String | Type::Str)
+                let mut eff_l = &l_ty;
+                while let Type::Ref(inner) = eff_l {
+                    eff_l = inner;
+                }
+                let mut eff_r = &r_ty;
+                while let Type::Ref(inner) = eff_r {
+                    eff_r = inner;
+                }
+                if eff_l.is_numeric() && eff_r.is_numeric() {
+                    eff_l.resolve_defaults()
+                } else if matches!(eff_l, Type::String | Type::Str)
+                    && matches!(eff_r, Type::String | Type::Str)
                 {
                     Type::String
-                } else if matches!(l_ty, Type::TypeParam(_)) && l_ty == r_ty {
-                    l_ty.clone()
+                } else if matches!(eff_l, Type::TypeParam(_)) && eff_l == eff_r {
+                    eff_l.clone()
                 } else {
                     self.diagnostics.push(
                         Diagnostic::error(format!(
@@ -3071,10 +3170,18 @@ impl<'a> SemanticAnalyzer<'a> {
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
                 let l_ty = self.infer_expr(left);
                 let r_ty = self.check_expr(right, Some(&l_ty));
-                if l_ty.is_integer() && r_ty.is_integer() {
-                    l_ty.resolve_defaults()
-                } else if matches!(l_ty, Type::TypeParam(_)) && l_ty == r_ty {
-                    l_ty.clone()
+                let mut eff_l = &l_ty;
+                while let Type::Ref(inner) = eff_l {
+                    eff_l = inner;
+                }
+                let mut eff_r = &r_ty;
+                while let Type::Ref(inner) = eff_r {
+                    eff_r = inner;
+                }
+                if eff_l.is_integer() && eff_r.is_integer() {
+                    eff_l.resolve_defaults()
+                } else if matches!(eff_l, Type::TypeParam(_)) && eff_l == eff_r {
+                    eff_l.clone()
                 } else {
                     self.diagnostics.push(
                         Diagnostic::error(format!(

@@ -472,3 +472,99 @@ pub strict fn make_generic_cycle() -> () {
         .iter()
         .any(|d| d.code.as_deref() == Some("E0020")));
 }
+
+#[test]
+fn test_strict_fn_ref_in_pattern_rejected() {
+    let src = r#"
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+pub strict fn process_strict() -> () {
+    let p = Point(x: 10, y: 20)
+    let Point { ref x, y } = p
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_pattern_ref.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0020")),
+        "Expected E0020 for ref in pattern under strict mode: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_return_ref_bound_from_local_stack_rejected() {
+    let src = r#"
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+pub fn leak_pattern_ref() -> ref i64 {
+    let p = Point(x: 10, y: 20)
+    let Point { ref x, y } = p
+    return x
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("leak_pattern_ref.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0021")),
+        "Expected E0021 for returning ref bound from local stack: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_spawn_ref_bound_from_parent_local_stack_rejected() {
+    let src = r#"
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+pub fn spawn_pattern_ref() -> () {
+    let p = Point(x: 10, y: 20)
+    spawn {
+        let Point { ref x, y } = p
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("spawn_pattern_ref.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(analysis.has_errors());
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0025")),
+        "Expected E0025 for borrowing parent stack in spawn pattern: {:?}",
+        analysis.diagnostics
+    );
+}

@@ -15,11 +15,16 @@ pub enum FirValue {
     Pointer(usize),
     FieldPointer {
         base_addr: usize,
-        field_idx: usize,
+        path: Vec<usize>,
     },
     ElementPointer {
         base_addr: usize,
         index: usize,
+    },
+    HeapFieldPointer {
+        slot: usize,
+        generation: u32,
+        path: Vec<usize>,
     },
     GenRef {
         slot: usize,
@@ -70,10 +75,26 @@ impl fmt::Display for FirValue {
             FirValue::Float(fl) => write!(f, "{}", fl),
             FirValue::String(s) => write!(f, "{}", s),
             FirValue::Pointer(addr) => write!(f, "ptr(0x{:x})", addr),
-            FirValue::FieldPointer {
-                base_addr,
-                field_idx,
-            } => write!(f, "field_ptr(0x{:x}.#{})", base_addr, field_idx),
+            FirValue::FieldPointer { base_addr, path } => {
+                let p = path
+                    .iter()
+                    .map(|i| format!("#{}", i))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                write!(f, "field_ptr(0x{:x}.{})", base_addr, p)
+            }
+            FirValue::HeapFieldPointer {
+                slot,
+                generation,
+                path,
+            } => {
+                let p = path
+                    .iter()
+                    .map(|i| format!("#{}", i))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                write!(f, "heap_field_ptr({}#{}@{})", slot, generation, p)
+            }
             FirValue::ElementPointer { base_addr, index } => {
                 write!(f, "elem_ptr(0x{:x}[{}])", base_addr, index)
             }
@@ -263,6 +284,59 @@ pub enum InterpError {
     Panic(String),
 }
 
+fn navigate_value<'b>(root: &'b FirValue, path: &[usize]) -> Result<&'b FirValue, InterpError> {
+    let mut cur = root;
+    for (step, &idx) in path.iter().enumerate() {
+        match cur {
+            FirValue::Struct { fields, .. } | FirValue::Tuple(fields) => {
+                if let Some(next) = fields.get(idx) {
+                    cur = next;
+                } else {
+                    return Err(InterpError::Panic(format!(
+                        "Field index {} out of bounds at path step {}",
+                        idx, step
+                    )));
+                }
+            }
+            other => {
+                return Err(InterpError::TypeMismatch(format!(
+                    "Cannot traverse field {} on non-composite value {}",
+                    idx, other
+                )));
+            }
+        }
+    }
+    Ok(cur)
+}
+
+fn navigate_value_mut<'b>(
+    root: &'b mut FirValue,
+    path: &[usize],
+) -> Result<&'b mut FirValue, InterpError> {
+    let mut cur = root;
+    for (step, &idx) in path.iter().enumerate() {
+        match cur {
+            FirValue::Struct { fields, .. } | FirValue::Tuple(fields) => {
+                if let Some(next) = fields.get_mut(idx) {
+                    cur = next;
+                } else {
+                    return Err(InterpError::Panic(format!(
+                        "Field index {} out of bounds at path step {}",
+                        idx, step
+                    )));
+                }
+            }
+            other => {
+                return Err(InterpError::TypeMismatch(format!(
+                    "Cannot traverse field {} on non-composite value {}",
+                    idx, other
+                )));
+            }
+        }
+    }
+    Ok(cur)
+}
+
 /// SSA FIR Interpreter executing functions deterministically.
 pub struct FirInterpreter<'a> {
     module: &'a FirModule,
@@ -374,7 +448,16 @@ impl<'a> FirInterpreter<'a> {
                     } else {
                         FirValue::Unit
                     };
-                    return Ok(val);
+                    let final_val = match val {
+                        FirValue::GenRef { slot, generation }
+                            if !matches!(func.ret_ty, FirType::GenerationalRef(_)) =>
+                        {
+                            self.heap.check(slot, generation)?;
+                            self.heap.deref(slot)?.clone()
+                        }
+                        other => other,
+                    };
+                    return Ok(final_val);
                 }
                 Terminator::Fail(fail_val) => {
                     let val = env
@@ -532,31 +615,25 @@ impl<'a> FirInterpreter<'a> {
                         self.stack_memory.insert(*addr, val_to_store);
                         Ok(FirValue::Unit)
                     }
-                    FirValue::FieldPointer {
-                        base_addr,
-                        field_idx,
-                    } => {
+                    FirValue::FieldPointer { base_addr, path } => {
                         let target = self
                             .stack_memory
                             .get_mut(base_addr)
                             .ok_or(InterpError::InvalidPointer(*base_addr))?;
-                        match target {
-                            FirValue::Struct { fields, .. } | FirValue::Tuple(fields) => {
-                                if let Some(slot) = fields.get_mut(*field_idx) {
-                                    *slot = val_to_store;
-                                    Ok(FirValue::Unit)
-                                } else {
-                                    Err(InterpError::Panic(format!(
-                                        "Field index {} out of bounds",
-                                        field_idx
-                                    )))
-                                }
-                            }
-                            other => Err(InterpError::TypeMismatch(format!(
-                                "FieldPointer target must be struct or tuple, got {}",
-                                other
-                            ))),
-                        }
+                        let leaf = navigate_value_mut(target, path)?;
+                        *leaf = val_to_store;
+                        Ok(FirValue::Unit)
+                    }
+                    FirValue::HeapFieldPointer {
+                        slot,
+                        generation,
+                        path,
+                    } => {
+                        self.heap.check(*slot, *generation)?;
+                        let target = self.heap.deref_mut(*slot)?;
+                        let leaf = navigate_value_mut(target, path)?;
+                        *leaf = val_to_store;
+                        Ok(FirValue::Unit)
                     }
                     FirValue::ElementPointer { base_addr, index } => {
                         let target = self
@@ -605,30 +682,23 @@ impl<'a> FirInterpreter<'a> {
                             .unwrap_or(FirValue::Unit);
                         Ok(val)
                     }
-                    FirValue::FieldPointer {
-                        base_addr,
-                        field_idx,
-                    } => {
+                    FirValue::FieldPointer { base_addr, path } => {
                         let target = self
                             .stack_memory
                             .get(base_addr)
                             .ok_or(InterpError::InvalidPointer(*base_addr))?;
-                        match target {
-                            FirValue::Struct { fields, .. } | FirValue::Tuple(fields) => {
-                                if let Some(f) = fields.get(*field_idx) {
-                                    Ok(f.clone())
-                                } else {
-                                    Err(InterpError::Panic(format!(
-                                        "Field index {} out of bounds",
-                                        field_idx
-                                    )))
-                                }
-                            }
-                            other => Err(InterpError::TypeMismatch(format!(
-                                "FieldPointer target must be struct or tuple, got {}",
-                                other
-                            ))),
-                        }
+                        let leaf = navigate_value(target, path)?;
+                        Ok(leaf.clone())
+                    }
+                    FirValue::HeapFieldPointer {
+                        slot,
+                        generation,
+                        path,
+                    } => {
+                        self.heap.check(*slot, *generation)?;
+                        let target = self.heap.deref(*slot)?;
+                        let leaf = navigate_value(target, path)?;
+                        Ok(leaf.clone())
                     }
                     FirValue::ElementPointer { base_addr, index } => {
                         let target = self
@@ -781,6 +851,124 @@ impl<'a> FirInterpreter<'a> {
                             ))
                         }
                     }
+                    FirValue::FieldPointer { base_addr, path } => {
+                        let target = self
+                            .stack_memory
+                            .get(base_addr)
+                            .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                        let sub = navigate_value(target, path)?;
+                        match sub {
+                            FirValue::Struct { name, fields } => {
+                                let actual_idx =
+                                    self.resolve_struct_field_index(*name, *field_idx, *field_name);
+                                if let Some(f) = fields.get(actual_idx) {
+                                    Ok(f.clone())
+                                } else {
+                                    Err(InterpError::Panic(format!(
+                                        "Field index {} out of bounds",
+                                        actual_idx
+                                    )))
+                                }
+                            }
+                            FirValue::Tuple(fields) => {
+                                if let Some(f) = fields.get(*field_idx) {
+                                    Ok(f.clone())
+                                } else {
+                                    Err(InterpError::Panic(format!(
+                                        "Tuple index {} out of bounds",
+                                        field_idx
+                                    )))
+                                }
+                            }
+                            FirValue::GenRef { slot, generation } => {
+                                self.heap.check(*slot, *generation)?;
+                                let heap_val = self.heap.deref(*slot)?;
+                                if let FirValue::Struct { name, fields } = heap_val {
+                                    let actual_idx = self.resolve_struct_field_index(
+                                        *name,
+                                        *field_idx,
+                                        *field_name,
+                                    );
+                                    if let Some(f) = fields.get(actual_idx) {
+                                        Ok(f.clone())
+                                    } else {
+                                        Err(InterpError::Panic(format!(
+                                            "Field index {} out of bounds",
+                                            actual_idx
+                                        )))
+                                    }
+                                } else {
+                                    Err(InterpError::TypeMismatch(
+                                        "Heap target is not a struct".into(),
+                                    ))
+                                }
+                            }
+                            other => Err(InterpError::TypeMismatch(format!(
+                                "Cannot access field of {}",
+                                other
+                            ))),
+                        }
+                    }
+                    FirValue::HeapFieldPointer {
+                        slot,
+                        generation,
+                        path,
+                    } => {
+                        self.heap.check(*slot, *generation)?;
+                        let target = self.heap.deref(*slot)?;
+                        let sub = navigate_value(target, path)?;
+                        match sub {
+                            FirValue::Struct { name, fields } => {
+                                let actual_idx =
+                                    self.resolve_struct_field_index(*name, *field_idx, *field_name);
+                                if let Some(f) = fields.get(actual_idx) {
+                                    Ok(f.clone())
+                                } else {
+                                    Err(InterpError::Panic(format!(
+                                        "Field index {} out of bounds",
+                                        actual_idx
+                                    )))
+                                }
+                            }
+                            FirValue::Tuple(fields) => {
+                                if let Some(f) = fields.get(*field_idx) {
+                                    Ok(f.clone())
+                                } else {
+                                    Err(InterpError::Panic(format!(
+                                        "Tuple index {} out of bounds",
+                                        field_idx
+                                    )))
+                                }
+                            }
+                            FirValue::GenRef { slot, generation } => {
+                                self.heap.check(*slot, *generation)?;
+                                let heap_val = self.heap.deref(*slot)?;
+                                if let FirValue::Struct { name, fields } = heap_val {
+                                    let actual_idx = self.resolve_struct_field_index(
+                                        *name,
+                                        *field_idx,
+                                        *field_name,
+                                    );
+                                    if let Some(f) = fields.get(actual_idx) {
+                                        Ok(f.clone())
+                                    } else {
+                                        Err(InterpError::Panic(format!(
+                                            "Field index {} out of bounds",
+                                            actual_idx
+                                        )))
+                                    }
+                                } else {
+                                    Err(InterpError::TypeMismatch(
+                                        "Heap target is not a struct".into(),
+                                    ))
+                                }
+                            }
+                            other => Err(InterpError::TypeMismatch(format!(
+                                "Cannot access field of {}",
+                                other
+                            ))),
+                        }
+                    }
                     other => Err(InterpError::TypeMismatch(format!(
                         "Cannot access field of {}",
                         other
@@ -805,16 +993,65 @@ impl<'a> FirInterpreter<'a> {
                         };
                         Ok(FirValue::FieldPointer {
                             base_addr: *addr,
-                            field_idx: actual_idx,
+                            path: vec![actual_idx],
                         })
                     }
-                    FirValue::FieldPointer {
-                        base_addr,
-                        field_idx: _,
-                    } => Ok(FirValue::FieldPointer {
-                        base_addr: *base_addr,
-                        field_idx: *field_idx,
-                    }),
+                    FirValue::FieldPointer { base_addr, path } => {
+                        let actual_idx = if let Some(target) = self.stack_memory.get(base_addr) {
+                            if let Ok(FirValue::Struct { name, .. }) = navigate_value(target, path)
+                            {
+                                self.resolve_struct_field_index(*name, *field_idx, *field_name)
+                            } else {
+                                *field_idx
+                            }
+                        } else {
+                            *field_idx
+                        };
+                        let mut new_path = path.clone();
+                        new_path.push(actual_idx);
+                        Ok(FirValue::FieldPointer {
+                            base_addr: *base_addr,
+                            path: new_path,
+                        })
+                    }
+                    FirValue::GenRef { slot, generation } => {
+                        self.heap.check(*slot, *generation)?;
+                        let actual_idx =
+                            if let Ok(FirValue::Struct { name, .. }) = self.heap.deref(*slot) {
+                                self.resolve_struct_field_index(*name, *field_idx, *field_name)
+                            } else {
+                                *field_idx
+                            };
+                        Ok(FirValue::HeapFieldPointer {
+                            slot: *slot,
+                            generation: *generation,
+                            path: vec![actual_idx],
+                        })
+                    }
+                    FirValue::HeapFieldPointer {
+                        slot,
+                        generation,
+                        path,
+                    } => {
+                        self.heap.check(*slot, *generation)?;
+                        let actual_idx = if let Ok(target) = self.heap.deref(*slot) {
+                            if let Ok(FirValue::Struct { name, .. }) = navigate_value(target, path)
+                            {
+                                self.resolve_struct_field_index(*name, *field_idx, *field_name)
+                            } else {
+                                *field_idx
+                            }
+                        } else {
+                            *field_idx
+                        };
+                        let mut new_path = path.clone();
+                        new_path.push(actual_idx);
+                        Ok(FirValue::HeapFieldPointer {
+                            slot: *slot,
+                            generation: *generation,
+                            path: new_path,
+                        })
+                    }
                     other => Err(InterpError::TypeMismatch(format!(
                         "GetFieldPtr requires pointer base, got {}",
                         other
@@ -1564,6 +1801,51 @@ impl<'a> FirInterpreter<'a> {
                         slot: *slot,
                         generation: *generation,
                     }),
+                    FirValue::FieldPointer { base_addr, path } => {
+                        let target = self
+                            .stack_memory
+                            .get(base_addr)
+                            .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                        let leaf = navigate_value(target, path)?;
+                        match leaf {
+                            FirValue::GenRef { slot, generation } => Ok(FirValue::GenRef {
+                                slot: *slot,
+                                generation: *generation,
+                            }),
+                            other => {
+                                let (new_slot, new_gen) = self.heap.alloc(other.clone());
+                                Ok(FirValue::GenRef {
+                                    slot: new_slot,
+                                    generation: new_gen,
+                                })
+                            }
+                        }
+                    }
+                    FirValue::HeapFieldPointer {
+                        slot,
+                        generation,
+                        path,
+                    } => {
+                        self.heap.check(*slot, *generation)?;
+                        let target = self.heap.deref(*slot)?;
+                        let leaf = navigate_value(target, path)?;
+                        match leaf {
+                            FirValue::GenRef {
+                                slot: inner_slot,
+                                generation: inner_gen,
+                            } => Ok(FirValue::GenRef {
+                                slot: *inner_slot,
+                                generation: *inner_gen,
+                            }),
+                            other => {
+                                let (new_slot, new_gen) = self.heap.alloc(other.clone());
+                                Ok(FirValue::GenRef {
+                                    slot: new_slot,
+                                    generation: new_gen,
+                                })
+                            }
+                        }
+                    }
                     _ => {
                         let (slot, generation) = self.heap.alloc(v.clone());
                         Ok(FirValue::GenRef { slot, generation })
@@ -1576,7 +1858,10 @@ impl<'a> FirInterpreter<'a> {
                         .get(ref_val)
                         .ok_or(InterpError::UndefinedValue(*ref_val))?;
                     match v {
-                        FirValue::GenRef { slot, generation } => {
+                        FirValue::GenRef { slot, generation }
+                        | FirValue::HeapFieldPointer {
+                            slot, generation, ..
+                        } => {
                             self.heap.check(*slot, *generation)?;
                         }
                         FirValue::Pointer(addr) => {
@@ -1600,6 +1885,24 @@ impl<'a> FirInterpreter<'a> {
                         self.heap.check(*slot, *generation)?;
                         let val = self.heap.deref(*slot)?.clone();
                         Ok(val)
+                    }
+                    FirValue::HeapFieldPointer {
+                        slot,
+                        generation,
+                        path,
+                    } => {
+                        self.heap.check(*slot, *generation)?;
+                        let target = self.heap.deref(*slot)?;
+                        let leaf = navigate_value(target, path)?;
+                        Ok(leaf.clone())
+                    }
+                    FirValue::FieldPointer { base_addr, path } => {
+                        let target = self
+                            .stack_memory
+                            .get(base_addr)
+                            .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                        let leaf = navigate_value(target, path)?;
+                        Ok(leaf.clone())
                     }
                     FirValue::Pointer(addr) => {
                         if let Some(target) = self.stack_memory.get(addr) {
@@ -1719,7 +2022,31 @@ impl<'a> FirInterpreter<'a> {
         lhs: &FirValue,
         rhs: &FirValue,
     ) -> Result<FirValue, InterpError> {
-        match (lhs, rhs) {
+        let deref_lhs = if let FirValue::GenRef { slot, generation } = lhs {
+            if !matches!(rhs, FirValue::Null) {
+                self.heap.check(*slot, *generation)?;
+                Some(self.heap.deref(*slot)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let effective_lhs = deref_lhs.unwrap_or(lhs);
+
+        let deref_rhs = if let FirValue::GenRef { slot, generation } = rhs {
+            if !matches!(effective_lhs, FirValue::Null) {
+                self.heap.check(*slot, *generation)?;
+                Some(self.heap.deref(*slot)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let effective_rhs = deref_rhs.unwrap_or(rhs);
+
+        match (effective_lhs, effective_rhs) {
             (FirValue::Int(a), FirValue::Int(b)) => match op {
                 BinaryOp::Add => Ok(FirValue::Int(a.wrapping_add(*b))),
                 BinaryOp::Sub => Ok(FirValue::Int(a.wrapping_sub(*b))),

@@ -423,6 +423,53 @@ impl Pattern {
         vars
     }
 
+    /// Extract all variables bound specifically with `ref` mode in this pattern.
+    pub fn ref_bindings(&self) -> Vec<(Symbol, Span)> {
+        let mut refs = Vec::new();
+        self.collect_ref_bindings(&mut refs);
+        refs
+    }
+
+    fn collect_ref_bindings(&self, refs: &mut Vec<(Symbol, Span)>) {
+        match self {
+            Pattern::Binding {
+                mode: BindingMode::Ref,
+                name,
+                span,
+            } => refs.push((*name, *span)),
+            Pattern::Tuple(elems, _) | Pattern::Or(elems, _) => {
+                for e in elems {
+                    e.collect_ref_bindings(refs);
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                for f in fields {
+                    f.pattern.collect_ref_bindings(refs);
+                }
+            }
+            Pattern::Slice {
+                prefix,
+                rest,
+                suffix,
+                ..
+            } => {
+                for p in prefix {
+                    p.collect_ref_bindings(refs);
+                }
+                if let Some(Some(r)) = rest {
+                    r.collect_ref_bindings(refs);
+                }
+                for s in suffix {
+                    s.collect_ref_bindings(refs);
+                }
+            }
+            Pattern::Variant { inner: Some(p), .. } => {
+                p.collect_ref_bindings(refs);
+            }
+            _ => {}
+        }
+    }
+
     fn collect_bound_variables(&self, vars: &mut Vec<(Symbol, Span)>) {
         match self {
             Pattern::Ident(sym, span) => vars.push((*sym, *span)),
