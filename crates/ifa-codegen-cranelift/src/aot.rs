@@ -131,6 +131,116 @@ impl AotCompiler {
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids.insert("ifa_rt_fiber_yield".into(), yield_id);
 
+        let mut chan_create_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        chan_create_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_create_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        let chan_create_id = self
+            .module
+            .declare_function("ifa_rt_channel_create", Linkage::Import, &chan_create_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_create".into(), chan_create_id);
+
+        let mut chan_send_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        chan_send_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_send_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_send_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+        let chan_send_id = self
+            .module
+            .declare_function("ifa_rt_channel_send", Linkage::Import, &chan_send_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_send".into(), chan_send_id);
+
+        let mut chan_recv_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        chan_recv_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_recv_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_recv_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+        let chan_recv_id = self
+            .module
+            .declare_function("ifa_rt_channel_recv", Linkage::Import, &chan_recv_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_recv".into(), chan_recv_id);
+
+        let mut chan_try_recv_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        chan_try_recv_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_try_recv_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_try_recv_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+        let chan_try_recv_id = self
+            .module
+            .declare_function(
+                "ifa_rt_channel_try_recv",
+                Linkage::Import,
+                &chan_try_recv_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_try_recv".into(), chan_try_recv_id);
+
+        let mut chan_close_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        chan_close_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        let chan_close_id = self
+            .module
+            .declare_function("ifa_rt_channel_close", Linkage::Import, &chan_close_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_close".into(), chan_close_id);
+
+        let mut chan_select_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        chan_select_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_select_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_select_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+        chan_select_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        let chan_select_id = self
+            .module
+            .declare_function("ifa_rt_channel_select", Linkage::Import, &chan_select_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_select".into(), chan_select_id);
+
         // 1. Declare functions
         for fir_func in &fir_module.functions {
             let fn_name = INTERNER.resolve(&fir_func.name);
@@ -243,6 +353,64 @@ void ifa_rt_gen_check(const void* ptr, uint32_t remembered_gen) {
 }
 
 void ifa_rt_fiber_yield(void) {}
+
+typedef struct ifa_channel_stub {
+    void* val;
+    int has_val;
+    int closed;
+} ifa_channel_stub_t;
+
+void* ifa_rt_channel_create(size_t capacity) {
+    (void)capacity;
+    ifa_channel_stub_t* c = (ifa_channel_stub_t*)calloc(1, sizeof(ifa_channel_stub_t));
+    return c;
+}
+
+void ifa_rt_channel_destroy(void* chan) {
+    if (chan) free(chan);
+}
+
+int32_t ifa_rt_channel_send(void* chan, void* val) {
+    if (!chan) return -1;
+    ifa_channel_stub_t* c = (ifa_channel_stub_t*)chan;
+    if (c->closed) return -2;
+    c->val = val;
+    c->has_val = 1;
+    return 0;
+}
+
+int32_t ifa_rt_channel_recv(void* chan, void** out_val) {
+    if (!chan || !out_val) return -1;
+    ifa_channel_stub_t* c = (ifa_channel_stub_t*)chan;
+    if (c->has_val) {
+        *out_val = c->val;
+        c->has_val = 0;
+        return 0;
+    }
+    if (c->closed) return -2;
+    *out_val = NULL;
+    return 0;
+}
+
+int32_t ifa_rt_channel_try_recv(void* chan, void** out_val) {
+    return ifa_rt_channel_recv(chan, out_val);
+}
+
+void ifa_rt_channel_close(void* chan) {
+    if (!chan) return;
+    ifa_channel_stub_t* c = (ifa_channel_stub_t*)chan;
+    c->closed = 1;
+}
+
+int64_t ifa_rt_channel_select(void** channels, size_t num_channels, int32_t has_default) {
+    if (!channels || num_channels == 0) return has_default ? 0 : -2;
+    for (size_t i = 0; i < num_channels; i++) {
+        ifa_channel_stub_t* c = (ifa_channel_stub_t*)channels[i];
+        if (c && c->has_val) return (int64_t)i;
+    }
+    if (has_default) return (int64_t)num_channels;
+    return 0;
+}
 "#;
         let rt_path =
             std::env::temp_dir().join(format!("ifa_runtime_stub_{}.c", std::process::id()));

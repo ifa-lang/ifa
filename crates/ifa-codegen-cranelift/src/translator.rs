@@ -454,16 +454,143 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 Some(base_addr)
             }
 
+            ValueExpr::ChanCreate { capacity, .. } => {
+                let cap_val = if let Some(cap) = capacity {
+                    self.value_map[cap]
+                } else {
+                    self.builder.ins().iconst(self.ptr_type, 0)
+                };
+                if let Some(func_id) = self.func_ids.get("ifa_rt_channel_create") {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    let call = self.builder.ins().call(local_func, &[cap_val]);
+                    let results = self.builder.inst_results(call);
+                    results.first().copied()
+                } else {
+                    Some(self.builder.ins().iconst(self.ptr_type, 0))
+                }
+            }
+
+            ValueExpr::ChanSend { chan, val } => {
+                let ch = self.value_map[chan];
+                let v = self.value_map[val];
+                if let Some(func_id) = self.func_ids.get("ifa_rt_channel_send") {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    let call = self.builder.ins().call(local_func, &[ch, v]);
+                    let results = self.builder.inst_results(call);
+                    results.first().copied()
+                } else {
+                    None
+                }
+            }
+
+            ValueExpr::ChanRecv { chan } => {
+                let ch = self.value_map[chan];
+                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    8,
+                    0,
+                ));
+                let slot_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+                if let Some(func_id) = self.func_ids.get("ifa_rt_channel_recv") {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    self.builder.ins().call(local_func, &[ch, slot_addr]);
+                    let loaded_val = self.builder.ins().load(
+                        self.ptr_type,
+                        MemFlagsData::trusted(),
+                        slot_addr,
+                        0,
+                    );
+                    Some(loaded_val)
+                } else {
+                    Some(self.builder.ins().iconst(self.ptr_type, 0))
+                }
+            }
+
+            ValueExpr::ChanTryRecv { chan } => {
+                let ch = self.value_map[chan];
+                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    8,
+                    0,
+                ));
+                let slot_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+                if let Some(func_id) = self.func_ids.get("ifa_rt_channel_try_recv") {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    self.builder.ins().call(local_func, &[ch, slot_addr]);
+                    let loaded_val = self.builder.ins().load(
+                        self.ptr_type,
+                        MemFlagsData::trusted(),
+                        slot_addr,
+                        0,
+                    );
+                    Some(loaded_val)
+                } else {
+                    Some(self.builder.ins().iconst(self.ptr_type, 0))
+                }
+            }
+
+            ValueExpr::ChanClose { chan } => {
+                let ch = self.value_map[chan];
+                if let Some(func_id) = self.func_ids.get("ifa_rt_channel_close") {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    self.builder.ins().call(local_func, &[ch]);
+                }
+                None
+            }
+
+            ValueExpr::ChanSelect {
+                channels,
+                has_default,
+            } => {
+                let n = channels.len();
+                let total_size = (n.max(1) * 8) as u32;
+                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    total_size,
+                    0,
+                ));
+                let arr_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+                for (idx, ch_id) in channels.iter().enumerate() {
+                    let ch_val = self.value_map[ch_id];
+                    let offset = (idx * 8) as i32;
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), ch_val, arr_addr, offset);
+                }
+                let n_val = self.builder.ins().iconst(self.ptr_type, n as i64);
+                let def_val = self
+                    .builder
+                    .ins()
+                    .iconst(types::I32, if *has_default { 1 } else { 0 });
+                if let Some(func_id) = self.func_ids.get("ifa_rt_channel_select") {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    let call = self
+                        .builder
+                        .ins()
+                        .call(local_func, &[arr_addr, n_val, def_val]);
+                    let results = self.builder.inst_results(call);
+                    results.first().copied()
+                } else {
+                    Some(self.builder.ins().iconst(types::I64, 0))
+                }
+            }
+
             ValueExpr::ArrayPush { .. }
             | ValueExpr::StructPushField { .. }
             | ValueExpr::CoWCheckShared { .. }
             | ValueExpr::Spawn { .. }
-            | ValueExpr::ChanCreate { .. }
-            | ValueExpr::ChanSend { .. }
-            | ValueExpr::ChanRecv { .. }
-            | ValueExpr::ChanTryRecv { .. }
-            | ValueExpr::ChanClose { .. }
-            | ValueExpr::ChanSelect { .. }
             | ValueExpr::Call { .. } => Some(self.builder.ins().iconst(types::I64, 0)),
 
             ValueExpr::ArrayLen { array } => {

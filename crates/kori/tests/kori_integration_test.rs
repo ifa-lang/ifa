@@ -313,14 +313,16 @@ fn test_ffi_c_header_and_php_bridge_generation() {
     assert!(php_class.contains("final class NativeCryptoService"));
     assert!(php_class
         .contains("public function hash_transaction(int $amount, int $currency_code): int"));
-    assert!(php_class.contains("return $this->ffi->hash_transaction($amount, $currency_code);"));
+    assert!(
+        php_class.contains("return (int) $this->ffi->hash_transaction($amount, $currency_code);")
+    );
     assert!(php_class.contains("public function validate_signature(string $signature): bool"));
     assert!(
         php_class.contains("public function process_transfer(int $account_id, int $amount): int")
     );
     assert!(php_class.contains("if ($res->status !== 0)"));
     assert!(php_class.contains("throw new \\RuntimeException"));
-    assert!(php_class.contains("return $res->value;"));
+    assert!(php_class.contains("return (int) $res->value;"));
     assert!(php_class.contains("public static function setPreloadedInstance(FFI $ffi): void"));
 }
 
@@ -415,6 +417,28 @@ pub extern "C" strict fn compute_hash(seed: i64, multiplier: i64) -> i64 {
     assert!(php_content.contains("namespace App\\Service\\Native;"));
     assert!(php_content.contains("final class MathBridge"));
     assert!(php_content.contains("public function compute_hash(int $seed, int $multiplier): int"));
+
+    // If PHP is available on the host system, verify end-to-end execution via PHP FFI
+    if let Ok(php_check) = std::process::Command::new("php").arg("-v").output() {
+        if php_check.status.success() {
+            let php_script = format!(
+                "require_once '{}';\n$bridge = new App\\Service\\Native\\MathBridge('{}', '{}');\n$res = $bridge->compute_hash(10, 3);\nif ($res !== 37) {{ exit(1); }}\n",
+                php_art.path.display(),
+                so_art.path.display(),
+                header_art.path.display()
+            );
+            let test_output = std::process::Command::new("php")
+                .arg("-r")
+                .arg(&php_script)
+                .output()
+                .expect("Failed to invoke PHP CLI");
+            assert!(
+                test_output.status.success(),
+                "PHP FFI test execution failed: {}",
+                String::from_utf8_lossy(&test_output.stderr)
+            );
+        }
+    }
 
     // Verify lockfile was generated
     let lock_file = temp_dir.join("kori.lock");

@@ -164,6 +164,35 @@ impl FfiBridgeGenerator {
         out.push_str("    private FFI $ffi;\n");
         out.push_str("    private static ?FFI $preloadedFfi = null;\n\n");
 
+        // Embedded C declarations for direct FFI::cdef initialization without external header dependencies
+        out.push_str("    private const CDEF = <<< 'CDEF_BLOCK'\n");
+        out.push_str("typedef long int64_t;\n");
+        out.push_str("typedef unsigned long uint64_t;\n");
+        out.push_str("typedef int int32_t;\n");
+        out.push_str("typedef unsigned int uint32_t;\n");
+        out.push_str("typedef short int16_t;\n");
+        out.push_str("typedef unsigned short uint16_t;\n");
+        out.push_str("typedef signed char int8_t;\n");
+        out.push_str("typedef unsigned char uint8_t;\n");
+        out.push_str("typedef _Bool bool;\n\n");
+
+        for func in functions {
+            let ret_str = fir_type_to_c(&func.return_type);
+            out.push_str(&format!("{} {}(", ret_str, func.name));
+            if func.params.is_empty() {
+                out.push_str("void");
+            } else {
+                let params_str: Vec<String> = func
+                    .params
+                    .iter()
+                    .map(|p| format!("{} {}", fir_type_to_c(&p.ty), p.name))
+                    .collect();
+                out.push_str(&params_str.join(", "));
+            }
+            out.push_str(");\n");
+        }
+        out.push_str("CDEF_BLOCK;\n\n");
+
         // Constructor
         out.push_str("    public function __construct(?string $libraryPath = null, ?string $headerPath = null)\n");
         out.push_str("    {\n");
@@ -172,18 +201,38 @@ impl FfiBridgeGenerator {
         out.push_str("            return;\n");
         out.push_str("        }\n\n");
         out.push_str("        $lib = $libraryPath ?? self::defaultLibraryPath();\n");
-        out.push_str("        $hdr = $headerPath ?? self::defaultHeaderPath();\n\n");
         out.push_str("        if (!file_exists($lib)) {\n");
         out.push_str("            throw new RuntimeException(sprintf('IFA native shared library not found at: %s', $lib));\n");
-        out.push_str("        }\n");
-        out.push_str("        if (!file_exists($hdr)) {\n");
-        out.push_str("            throw new RuntimeException(sprintf('IFA C-ABI header definition not found at: %s', $hdr));\n");
         out.push_str("        }\n\n");
-        out.push_str("        $headerContent = file_get_contents($hdr);\n");
-        out.push_str("        if ($headerContent === false) {\n");
-        out.push_str("            throw new RuntimeException(sprintf('Failed to read IFA C-ABI header at: %s', $hdr));\n");
+        out.push_str("        $cdef = self::CDEF;\n");
+        out.push_str("        if ($headerPath !== null) {\n");
+        out.push_str("            if (!file_exists($headerPath)) {\n");
+        out.push_str("                throw new RuntimeException(sprintf('IFA C-ABI header definition not found at: %s', $headerPath));\n");
+        out.push_str("            }\n");
+        out.push_str("            $rawHeader = file_get_contents($headerPath);\n");
+        out.push_str("            if ($rawHeader === false) {\n");
+        out.push_str("                throw new RuntimeException(sprintf('Failed to read IFA C-ABI header at: %s', $headerPath));\n");
+        out.push_str("            }\n");
+        out.push_str("            $cdef = self::sanitizeCdef($rawHeader);\n");
         out.push_str("        }\n\n");
-        out.push_str("        $this->ffi = FFI::cdef($headerContent, $lib);\n");
+        out.push_str("        $this->ffi = FFI::cdef($cdef, $lib);\n");
+        out.push_str("    }\n\n");
+
+        // Sanitize helper
+        out.push_str("    /**\n");
+        out.push_str(
+            "     * Sanitize a C header for PHP FFI parser by stripping preprocessor directives\n",
+        );
+        out.push_str("     * and C++ linkage declarations.\n");
+        out.push_str("     */\n");
+        out.push_str("    public static function sanitizeCdef(string $header): string\n");
+        out.push_str("    {\n");
+        out.push_str("        $clean = preg_replace('/^\\s*#.*$/m', '', $header) ?? $header;\n");
+        out.push_str(
+            "        $clean = str_replace(['extern \"C\" {', 'extern \"C\"'], '', $clean);\n",
+        );
+        out.push_str("        $clean = preg_replace('/^\\s*\\}\\s*$/m', '', $clean) ?? $clean;\n");
+        out.push_str("        return \"typedef long int64_t;\\ntypedef unsigned long uint64_t;\\ntypedef int int32_t;\\ntypedef unsigned int uint32_t;\\ntypedef short int16_t;\\ntypedef unsigned short uint16_t;\\ntypedef signed char int8_t;\\ntypedef unsigned char uint8_t;\\ntypedef _Bool bool;\\n\" . $clean;\n");
         out.push_str("    }\n\n");
 
         // Preload support
@@ -242,7 +291,19 @@ impl FfiBridgeGenerator {
                     func.name
                 ));
                 out.push_str("        }\n");
-                out.push_str("        return $res->value;\n");
+                if php_ret == "bool" {
+                    out.push_str("        return (bool) $res->value;\n");
+                } else if php_ret == "int" {
+                    out.push_str("        return (int) $res->value;\n");
+                } else if php_ret == "float" {
+                    out.push_str("        return (float) $res->value;\n");
+                } else if php_ret == "string" {
+                    out.push_str("        return (string) $res->value;\n");
+                } else if php_ret == "void" {
+                    // void return
+                } else {
+                    out.push_str("        return $res->value;\n");
+                }
             } else if func.return_type == FirType::Unit {
                 out.push_str(&format!(
                     "        $this->ffi->{}({});\n",
@@ -250,8 +311,16 @@ impl FfiBridgeGenerator {
                     args_call.join(", ")
                 ));
             } else {
+                let cast_prefix = match php_ret {
+                    "bool" => "(bool) ",
+                    "int" => "(int) ",
+                    "float" => "(float) ",
+                    "string" => "(string) ",
+                    _ => "",
+                };
                 out.push_str(&format!(
-                    "        return $this->ffi->{}({});\n",
+                    "        return {}$this->ffi->{}({});\n",
+                    cast_prefix,
                     func.name,
                     args_call.join(", ")
                 ));

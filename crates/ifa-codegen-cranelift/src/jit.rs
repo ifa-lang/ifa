@@ -39,6 +39,19 @@ impl JitEngine {
         builder.symbol("ifa_rt_gen_free", ifa_rt_gen_free as *const u8);
         builder.symbol("ifa_rt_gen_check", ifa_rt_gen_check as *const u8);
         builder.symbol("ifa_rt_fiber_yield", ifa_rt_fiber_yield as *const u8);
+        builder.symbol("ifa_rt_channel_create", ifa_rt_channel_create as *const u8);
+        builder.symbol(
+            "ifa_rt_channel_destroy",
+            ifa_rt_channel_destroy as *const u8,
+        );
+        builder.symbol("ifa_rt_channel_send", ifa_rt_channel_send as *const u8);
+        builder.symbol("ifa_rt_channel_recv", ifa_rt_channel_recv as *const u8);
+        builder.symbol(
+            "ifa_rt_channel_try_recv",
+            ifa_rt_channel_try_recv as *const u8,
+        );
+        builder.symbol("ifa_rt_channel_close", ifa_rt_channel_close as *const u8);
+        builder.symbol("ifa_rt_channel_select", ifa_rt_channel_select as *const u8);
 
         let module = JITModule::new(builder);
 
@@ -109,6 +122,74 @@ impl JitEngine {
             .declare_function("ifa_rt_fiber_yield", Linkage::Import, &yield_sig)
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids.insert("ifa_rt_fiber_yield".into(), yield_id);
+
+        let mut chan_create_sig = Signature::new(call_conv);
+        chan_create_sig.params.push(AbiParam::new(ptr_type));
+        chan_create_sig.returns.push(AbiParam::new(ptr_type));
+        let chan_create_id = self
+            .module
+            .declare_function("ifa_rt_channel_create", Linkage::Import, &chan_create_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_create".into(), chan_create_id);
+
+        let mut chan_send_sig = Signature::new(call_conv);
+        chan_send_sig.params.push(AbiParam::new(ptr_type));
+        chan_send_sig.params.push(AbiParam::new(ptr_type));
+        chan_send_sig.returns.push(AbiParam::new(types::I32));
+        let chan_send_id = self
+            .module
+            .declare_function("ifa_rt_channel_send", Linkage::Import, &chan_send_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_send".into(), chan_send_id);
+
+        let mut chan_recv_sig = Signature::new(call_conv);
+        chan_recv_sig.params.push(AbiParam::new(ptr_type));
+        chan_recv_sig.params.push(AbiParam::new(ptr_type));
+        chan_recv_sig.returns.push(AbiParam::new(types::I32));
+        let chan_recv_id = self
+            .module
+            .declare_function("ifa_rt_channel_recv", Linkage::Import, &chan_recv_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_recv".into(), chan_recv_id);
+
+        let mut chan_try_recv_sig = Signature::new(call_conv);
+        chan_try_recv_sig.params.push(AbiParam::new(ptr_type));
+        chan_try_recv_sig.params.push(AbiParam::new(ptr_type));
+        chan_try_recv_sig.returns.push(AbiParam::new(types::I32));
+        let chan_try_recv_id = self
+            .module
+            .declare_function(
+                "ifa_rt_channel_try_recv",
+                Linkage::Import,
+                &chan_try_recv_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_try_recv".into(), chan_try_recv_id);
+
+        let mut chan_close_sig = Signature::new(call_conv);
+        chan_close_sig.params.push(AbiParam::new(ptr_type));
+        let chan_close_id = self
+            .module
+            .declare_function("ifa_rt_channel_close", Linkage::Import, &chan_close_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_close".into(), chan_close_id);
+
+        let mut chan_select_sig = Signature::new(call_conv);
+        chan_select_sig.params.push(AbiParam::new(ptr_type));
+        chan_select_sig.params.push(AbiParam::new(ptr_type));
+        chan_select_sig.params.push(AbiParam::new(types::I32));
+        chan_select_sig.returns.push(AbiParam::new(types::I64));
+        let chan_select_id = self
+            .module
+            .declare_function("ifa_rt_channel_select", Linkage::Import, &chan_select_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_select".into(), chan_select_id);
 
         // 1. Declare all functions first to enable mutual recursion and forward calls
         for fir_func in &fir_module.functions {

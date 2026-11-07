@@ -1,12 +1,23 @@
 pub mod crypto;
 pub mod csv;
+pub mod fs;
 pub mod http;
+pub mod io;
 pub mod json;
 pub mod sync;
 
 pub use crypto::{blake3, blake3_hex, sha256, sha256_hex};
 pub use csv::{decode as decode_csv, encode as encode_csv, CsvTable};
+pub use fs::{
+    append as fs_append, copy as fs_copy, create_dir as fs_create_dir,
+    create_dir_all as fs_create_dir_all, exists as fs_exists, file_size as fs_file_size,
+    is_dir as fs_is_dir, is_file as fs_is_file, list_dir as fs_list_dir, metadata as fs_metadata,
+    read as fs_read, read_to_string as fs_read_to_string, remove_dir as fs_remove_dir,
+    remove_dir_all as fs_remove_dir_all, remove_file as fs_remove_file, rename as fs_rename,
+    write as fs_write, write_string as fs_write_string, FileMetadata,
+};
 pub use http::{HttpHeaders, HttpMethod, HttpRequest, HttpResponse, HttpStatus};
+pub use io::{BufferedReader, BufferedWriter, MemoryStream};
 pub use json::{
     decode as decode_json, encode as encode_json, encode_pretty as encode_json_pretty, JsonValue,
 };
@@ -154,5 +165,70 @@ mod tests {
         assert!(!flag.load());
         assert!(!flag.swap(true));
         assert!(flag.load());
+    }
+
+    #[test]
+    fn test_fs_operations() {
+        let temp_dir = std::env::temp_dir().join(format!("ifa_fs_test_{}", std::process::id()));
+        fs_create_dir_all(&temp_dir).unwrap();
+        assert!(fs_is_dir(&temp_dir));
+
+        let file_path = temp_dir.join("test.txt");
+        fs_write_string(&file_path, "Hello IFA File System!\n").unwrap();
+        assert!(fs_exists(&file_path));
+        assert!(fs_is_file(&file_path));
+
+        fs_append(&file_path, b"Second line appended.\n").unwrap();
+        let content = fs_read_to_string(&file_path).unwrap();
+        assert_eq!(content, "Hello IFA File System!\nSecond line appended.\n");
+
+        let copy_path = temp_dir.join("copy.txt");
+        fs_copy(&file_path, &copy_path).unwrap();
+        assert_eq!(
+            fs_file_size(&file_path).unwrap(),
+            fs_file_size(&copy_path).unwrap()
+        );
+
+        let entries = fs_list_dir(&temp_dir).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        let meta = fs_metadata(&file_path).unwrap();
+        assert!(meta.is_file);
+        assert!(!meta.is_dir);
+
+        fs_remove_file(&file_path).unwrap();
+        assert!(!fs_exists(&file_path));
+
+        fs_remove_dir_all(&temp_dir).unwrap();
+        assert!(!fs_exists(&temp_dir));
+    }
+
+    #[test]
+    fn test_io_buffered_and_memory_stream() {
+        // Test memory stream
+        let mut mem = MemoryStream::new();
+        assert!(mem.is_empty());
+        mem.write_bytes(b"IFA Memory Stream Data");
+        assert_eq!(mem.len(), 22);
+
+        mem.seek(4);
+        let read_slice = mem.read_bytes(6);
+        assert_eq!(read_slice, b"Memory");
+
+        // Test buffered reader
+        let cursor = std::io::Cursor::new(b"line 1\nline 2\r\nline 3");
+        let reader = BufferedReader::new(cursor);
+        let lines = reader.lines().unwrap();
+        assert_eq!(lines, vec!["line 1", "line 2", "line 3"]);
+
+        // Test buffered writer
+        let mut sink = Vec::new();
+        {
+            let mut writer = BufferedWriter::new(&mut sink);
+            writer.write_line("Alpha").unwrap();
+            writer.write_line("Beta").unwrap();
+            writer.flush().unwrap();
+        }
+        assert_eq!(sink, b"Alpha\nBeta\n");
     }
 }

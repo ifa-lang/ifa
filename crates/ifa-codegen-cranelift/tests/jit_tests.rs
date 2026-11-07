@@ -381,3 +381,168 @@ fn test_jit_error_union_try_question_catch() {
     let result = jit.run_main().expect("Failed to execute native main");
     assert_eq!(result, 999);
 }
+
+#[test]
+fn test_cranelift_jit_channel_operations() {
+    use ifa_fir::{
+        ConstantValue, FirFunction, FirModule, FirType, Instruction, Terminator, ValueExpr,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let v_chan = func.alloc_value();
+    let v_send_val = func.alloc_value();
+    let v_recv_val = func.alloc_value();
+
+    let entry = func.get_block_mut(func.entry_block).unwrap();
+
+    // 1. Create channel
+    entry.push_instruction(Instruction::new(
+        Some(v_chan),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+
+    // 2. Prepare value 123
+    entry.push_instruction(Instruction::new(
+        Some(v_send_val),
+        ValueExpr::Constant(ConstantValue::Int(123, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    // 3. Send 123 into channel
+    entry.push_instruction(Instruction::new(
+        None,
+        ValueExpr::ChanSend {
+            chan: v_chan,
+            val: v_send_val,
+        },
+        Span::DUMMY,
+    ));
+
+    // 4. Receive from channel
+    entry.push_instruction(Instruction::new(
+        Some(v_recv_val),
+        ValueExpr::ChanRecv { chan: v_chan },
+        Span::DUMMY,
+    ));
+
+    // 5. Close channel
+    entry.push_instruction(Instruction::new(
+        None,
+        ValueExpr::ChanClose { chan: v_chan },
+        Span::DUMMY,
+    ));
+
+    // 6. Return received value
+    entry.set_terminator(Terminator::Return(Some(v_recv_val)));
+
+    let mut module = FirModule::new(INTERNER.intern("test_chan_mod"));
+    module.functions.push(func);
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile channel operations to Cranelift");
+
+    let result = jit.run_main().expect("Failed to run channel JIT");
+    assert_eq!(result, 123);
+}
+
+#[test]
+fn test_cranelift_jit_channel_select_operations() {
+    use ifa_fir::{
+        ConstantValue, FirFunction, FirModule, FirType, Instruction, Terminator, ValueExpr,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let v_chan1 = func.alloc_value();
+    let v_chan2 = func.alloc_value();
+    let v_val = func.alloc_value();
+    let v_selected_idx = func.alloc_value();
+
+    let entry = func.get_block_mut(func.entry_block).unwrap();
+
+    // 1. Create chan1 and chan2
+    entry.push_instruction(Instruction::new(
+        Some(v_chan1),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+    entry.push_instruction(Instruction::new(
+        Some(v_chan2),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+
+    // 2. Send data into chan2 (index 1)
+    entry.push_instruction(Instruction::new(
+        Some(v_val),
+        ValueExpr::Constant(ConstantValue::Int(888, IntType::I64)),
+        Span::DUMMY,
+    ));
+    entry.push_instruction(Instruction::new(
+        None,
+        ValueExpr::ChanSend {
+            chan: v_chan2,
+            val: v_val,
+        },
+        Span::DUMMY,
+    ));
+
+    // 3. Select over [chan1, chan2]
+    entry.push_instruction(Instruction::new(
+        Some(v_selected_idx),
+        ValueExpr::ChanSelect {
+            channels: vec![v_chan1, v_chan2],
+            has_default: false,
+        },
+        Span::DUMMY,
+    ));
+
+    // 4. Return selected index (should be 1)
+    entry.set_terminator(Terminator::Return(Some(v_selected_idx)));
+
+    let mut module = FirModule::new(INTERNER.intern("test_select_mod"));
+    module.functions.push(func);
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile select operations to Cranelift");
+
+    let result = jit.run_main().expect("Failed to run select JIT");
+    assert_eq!(result, 1);
+}
