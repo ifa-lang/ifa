@@ -7,6 +7,17 @@ struct TransactionEvent {
     success: bool
 }
 
+struct CurrencyInfo {
+    code: String,
+    symbol: String
+}
+
+impl CurrencyInfo {
+    pub fn to_string(c: CurrencyInfo) -> String {
+        return c.code + " (" + c.symbol + ")";
+    }
+}
+
 comptime fn generate_header(service: String, version: i64) -> String {
     return "{service} v{version} - Initialized";
 }
@@ -30,14 +41,19 @@ pub fn main() -> i64 {
     );
     let audit_log = "Transaction {tx.id} - Montant : {tx.amount_xof} XOF (succès : {tx.success})";
 
-    // 4. Échappement des accolades avec doubles accolades {{ et }}
+    // 4. Interpolation directe de structure via la méthode to_string / Display
+    let dev = CurrencyInfo(code: "XOF", symbol: "CFA");
+    let dev_msg = "Devise opérationnelle : {dev}";
+
+    // 5. Échappement des accolades avec doubles accolades {{ et }}
     let config_json = "Format {{'tx_id': {tx.id}, 'valid': {tx.success}}}";
 
-    // 5. Concaténation de chaînes avec l'opérateur +
+    // 6. Concaténation de chaînes avec l'opérateur + et fusion de constantes statiques
     let prefix = "Statut : ";
     let status_line = prefix + audit_log;
+    let folded_banner = "Serveur : " + "IFA-Cluster-Alpha" + " (En ligne)";
 
-    // 6. Évaluation au comptime
+    // 7. Évaluation au comptime
     let header = comptime generate_header("IFA-Gateway", 1);
 
     if tx.success && node_id == 7 {

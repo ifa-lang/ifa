@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod csv;
+pub mod fmt;
 pub mod fs;
 pub mod http;
 pub mod io;
@@ -9,6 +10,10 @@ pub mod sync;
 
 pub use crypto::{blake3, blake3_hex, sha256, sha256_hex};
 pub use csv::{decode as decode_csv, encode as encode_csv, CsvTable};
+pub use fmt::{
+    format_binary, format_float, format_hex, format_octal, pad_center, pad_left, pad_right,
+    Alignment, FormatSpecifier,
+};
 pub use fs::{
     append as fs_append, copy as fs_copy, create_dir as fs_create_dir,
     create_dir_all as fs_create_dir_all, exists as fs_exists, file_size as fs_file_size,

@@ -75,6 +75,7 @@ struct FunctionLoweringContext<'a> {
     lifted_structs: Vec<FirStruct>,
     var_lambda_names: HashMap<Symbol, Symbol>,
     captures_to_unpack: Vec<(usize, Symbol, FirType)>,
+    emitted_exprs: HashMap<ValueId, ValueExpr>,
 }
 
 impl<'a> FunctionLoweringContext<'a> {
@@ -178,6 +179,7 @@ impl<'a> FunctionLoweringContext<'a> {
             lifted_structs: Vec::new(),
             var_lambda_names: HashMap::new(),
             captures_to_unpack: Vec::new(),
+            emitted_exprs: HashMap::new(),
         }
     }
 
@@ -230,6 +232,7 @@ impl<'a> FunctionLoweringContext<'a> {
             lifted_structs: Vec::new(),
             var_lambda_names: HashMap::new(),
             captures_to_unpack,
+            emitted_exprs: HashMap::new(),
         }
     }
 
@@ -293,11 +296,149 @@ impl<'a> FunctionLoweringContext<'a> {
     }
 
     fn emit(&mut self, res: Option<ValueId>, expr: ValueExpr, span: Span) -> Option<ValueId> {
+        if let Some(r) = res {
+            self.emitted_exprs.insert(r, expr.clone());
+        }
         let inst = Instruction::new(res, expr, span);
         if let Some(block) = self.func.get_block_mut(self.current_block) {
             block.push_instruction(inst);
         }
         res
+    }
+
+    fn extract_constant_string_repr(&self, vid: ValueId) -> Option<String> {
+        match self.emitted_exprs.get(&vid)? {
+            ValueExpr::Constant(c) => match c {
+                ConstantValue::String(sym) => Some(INTERNER.resolve(sym)),
+                ConstantValue::Int(i, _) => Some(i.to_string()),
+                ConstantValue::Float(f, _) => Some(f.to_string()),
+                ConstantValue::Bool(b) => Some(b.to_string()),
+                ConstantValue::Char(c) => Some(c.to_string()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn flatten_format_parts(&self, parts: &[ValueId], out: &mut Vec<ValueId>) {
+        for &p in parts {
+            if let Some(ValueExpr::FormatString(sub_parts)) = self.emitted_exprs.get(&p) {
+                self.flatten_format_parts(sub_parts, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+
+    fn emit_format_string(&mut self, raw_parts: Vec<ValueId>, span: Span) -> ValueId {
+        let mut flat_parts = Vec::with_capacity(raw_parts.len());
+        self.flatten_format_parts(&raw_parts, &mut flat_parts);
+
+        let mut merged_parts = Vec::new();
+        let mut current_literal = String::new();
+
+        for &part in &flat_parts {
+            if let Some(str_val) = self.extract_constant_string_repr(part) {
+                current_literal.push_str(&str_val);
+            } else {
+                if !current_literal.is_empty() {
+                    let lit_val = self.alloc_value();
+                    let sym = INTERNER.intern(&current_literal);
+                    self.emit(
+                        Some(lit_val),
+                        ValueExpr::Constant(ConstantValue::String(sym)),
+                        span,
+                    );
+                    merged_parts.push(lit_val);
+                    current_literal.clear();
+                }
+                merged_parts.push(part);
+            }
+        }
+
+        if !current_literal.is_empty() {
+            let lit_val = self.alloc_value();
+            let sym = INTERNER.intern(&current_literal);
+            self.emit(
+                Some(lit_val),
+                ValueExpr::Constant(ConstantValue::String(sym)),
+                span,
+            );
+            merged_parts.push(lit_val);
+            current_literal.clear();
+        }
+
+        if merged_parts.is_empty() {
+            let res = self.alloc_value();
+            let empty_sym = INTERNER.intern("");
+            self.emit(
+                Some(res),
+                ValueExpr::Constant(ConstantValue::String(empty_sym)),
+                span,
+            );
+            res
+        } else if merged_parts.len() == 1 {
+            let single = merged_parts[0];
+            if let Some(ValueExpr::Constant(_)) = self.emitted_exprs.get(&single) {
+                single
+            } else {
+                let res = self.alloc_value();
+                self.emit(Some(res), ValueExpr::FormatString(vec![single]), span);
+                res
+            }
+        } else {
+            let res = self.alloc_value();
+            self.emit(Some(res), ValueExpr::FormatString(merged_parts), span);
+            res
+        }
+    }
+
+    fn convert_to_string_if_needed(&mut self, val: ValueId, expr: &Expr) -> ValueId {
+        let fir_ty = self.infer_expr_fir_type(expr);
+        let mut struct_name = None;
+        if let Some(mut cur) = fir_ty.as_ref() {
+            while let FirType::GenerationalRef(inner)
+            | FirType::Pointer(inner)
+            | FirType::Optional(inner) = cur
+            {
+                cur = inner;
+            }
+            if let FirType::Struct(name, _) = cur {
+                struct_name = Some(*name);
+            }
+        }
+
+        if let Some(st_name) = struct_name {
+            let to_string_sym = INTERNER.intern("to_string");
+            let specialized =
+                INTERNER.intern(&format!("{}__{}", INTERNER.resolve(&st_name), "to_string"));
+
+            let found_fn = if self.symbols.lookup_function(&specialized).is_some()
+                || self
+                    .symbols
+                    .lookup_type_method(&st_name, &to_string_sym)
+                    .is_some()
+            {
+                Some(specialized)
+            } else {
+                None
+            };
+
+            if let Some(fn_name) = found_fn {
+                let res = self.alloc_value();
+                self.emit(
+                    Some(res),
+                    ValueExpr::CallDirect {
+                        name: fn_name,
+                        args: vec![val],
+                    },
+                    expr.span,
+                );
+                return res;
+            }
+        }
+
+        val
     }
 
     fn set_terminator(&mut self, term: Terminator) {
@@ -2025,9 +2166,9 @@ impl<'a> FunctionLoweringContext<'a> {
                             .infer_expr_fir_type(right)
                             .is_some_and(|t| matches!(t, FirType::String | FirType::Str));
                     if is_string_add {
-                        let res = self.alloc_value();
-                        self.emit(Some(res), ValueExpr::FormatString(vec![lhs, rhs]), span);
-                        return res;
+                        let lhs_str = self.convert_to_string_if_needed(lhs, left);
+                        let rhs_str = self.convert_to_string_if_needed(rhs, right);
+                        return self.emit_format_string(vec![lhs_str, rhs_str], span);
                     }
                 }
 
@@ -3978,11 +4119,10 @@ impl<'a> FunctionLoweringContext<'a> {
                 for part in parts {
                     let v = self.lower_expr(part);
                     let deref_v = self.deref_if_ref(v, part, part.span);
-                    part_vals.push(deref_v);
+                    let formatted_v = self.convert_to_string_if_needed(deref_v, part);
+                    part_vals.push(formatted_v);
                 }
-                let res = self.alloc_value();
-                self.emit(Some(res), ValueExpr::FormatString(part_vals), span);
-                res
+                self.emit_format_string(part_vals, span)
             }
 
             _ => {

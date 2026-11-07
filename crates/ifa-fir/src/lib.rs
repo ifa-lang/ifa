@@ -8,6 +8,7 @@ pub mod ir;
 pub mod lower;
 pub mod printer;
 pub mod sroa;
+pub mod string_fold;
 pub mod types;
 pub mod vectorize;
 pub mod verify;
@@ -22,6 +23,7 @@ pub use ir::*;
 pub use lower::lower_program;
 pub use printer::{format_function, format_module, FirPrinter};
 pub use sroa::{SroaPass, SroaStats};
+pub use string_fold::{StringFoldPass, StringFoldStats};
 pub use types::{mangle_instantiation_symbol, mangle_sema_type, FirType};
 pub use vectorize::{VectorizePass, VectorizeStats};
 pub use verify::{FirVerifier, FirVerifyError};
@@ -62,6 +64,9 @@ pub fn compile_to_fir_with_opts(
 
         let mut sroa_pass2 = SroaPass::new();
         sroa_pass2.run_on_module(&mut module);
+
+        let mut string_fold_pass = StringFoldPass::new();
+        string_fold_pass.run_on_module(&mut module);
     }
 
     if opt_cow {

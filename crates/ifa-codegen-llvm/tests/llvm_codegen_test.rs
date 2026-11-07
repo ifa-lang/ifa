@@ -1687,12 +1687,14 @@ fn test_llvm_aot_dynamic_function_pointer_dispatch() {
 #[test]
 fn test_llvm_string_interpolation_and_concatenation() {
     let src = r#"
-        pub fn main() -> i64 {
-            let user = "System";
-            let version: i64 = 1;
+        pub fn format_dynamic_user(user: String, version: i64) -> String {
             let msg = "Welcome to {user} v{version}!";
             let extra = " Ready.";
-            let full = msg + extra;
+            return msg + extra;
+        }
+
+        pub fn main() -> i64 {
+            let full = format_dynamic_user("System", 1);
             return 77;
         }
     "#;
