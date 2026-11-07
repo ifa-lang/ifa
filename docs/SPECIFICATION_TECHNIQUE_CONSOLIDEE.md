@@ -197,9 +197,25 @@ Le compilateur unifié `ifa` regroupe l'ensemble des commandes nécessaires au c
 - `ifa run [source]` : Compile et exécute instantanément via le JIT Cranelift.
 - `ifa build [source] [--release]` : Compile vers un binaire exécutable ou un fichier objet AOT via LLVM (LTO Thin/Fat).
 - `ifa test [source]` : Découvre et exécute automatiquement les fonctions de test (`test_*`).
-- `ifa bench [--iterations N]` : Exécute la suite de benchmarks automatisés mesurant le surcoût de la vérification générationnelle (1 cycle CPU cible) par rapport au C brut et à Rust.
+- `ifa bench [--iterations N] [--multithread] [--threads T]` : Exécute la suite de benchmarks automatisés mesurant le surcoût de la vérification générationnelle (1 cycle CPU cible) par rapport au C brut et à Rust, ainsi que la résistance aux contentions multithread face à mimalloc et jemalloc.
 - `ifa fmt [--check]` : Formatage canonique des sources.
 - `ifa lint [source]` : Analyse statique de conformité stylistique et de sûreté.
 - `ifa lsp` : Lance le démon Language Server Protocol (LSP 3.17) sur stdio.
 - `ifa wasm inspect <file.wasm>` : Inspection des sections, exports et conformité binaire WebAssembly.
 - `ifa wasm bundle <module> <file.wasm> [--out-dir dir]` : Génère un paquet npm/browser avec wrappers JavaScript et définitions TypeScript `.d.ts`.
+- `ifa wasm run <file.wasm> [-f function] [-- args]` : Exécute directement un module WebAssembly WASI ou une fonction exportée via Wasmtime/Wasmer.
+
+---
+
+## 7. Matrice des Cibles de Compilation et Sorties d'Artefacts
+
+Le moteur d'orchestration `kori` supporte la génération simultanée et déterministe de multiples types d'artefacts déclarés dans la section `[targets.lib]` du fichier `kori.toml` :
+
+| Type de Cible (`crate_types`) | Extension d'Artefact | Rôle Technique & Cas d'Usage | Outils Associés |
+| :--- | :--- | :--- | :--- |
+| `cdylib` | `lib{name}.so` / `.dll` | Bibliothèque dynamique C-ABI avec en-têtes C `.h` et ponts typés PHP 8.4+ / Symfony 8.1 | GCC, Clang, FFI |
+| `staticlib` | `lib{name}.a` | Archive statique C-ABI pour édition de liens embarquée ou standalone | `ar`, `llvm-ar` |
+| `wasm` | `{name}.wasm` | Binaire WebAssembly WASI standardisé bare-metal sans Garbage Collector | Clang wasm32, Wasmtime |
+| `ifalib` | `{name}.ifalib` | Module canonique FIR SSA pour distribution et réutilisation directe dans l'écosystème IFA | `kori pack`, `kori resolver` |
+| `wasm_bundle` | `{name}_wasm_bundle/` | Paquetage npm complet avec `package.json`, définitions TypeScript `.d.ts` et wrappers React / Web OS | `ifa wasm bundle` |
+

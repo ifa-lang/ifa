@@ -19,6 +19,7 @@ ifa-fir.workspace = true
 ifa-runtime.workspace = true
 ifa-codegen-cranelift.workspace = true
 ifa-codegen-llvm.workspace = true
+ifa-wasm.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true

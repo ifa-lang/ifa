@@ -70,9 +70,12 @@ impl LlvmCompiler {
         self.emit_llvm_ir(module, &ll_path)?;
 
         // Try compiling via clang or llc if available
-        let clang_status = Command::new("clang")
-            .arg(format!("-O{}", self.opt_level))
-            .arg(format!("-flto={}", self.lto))
+        let mut clang_cmd = Command::new("clang");
+        clang_cmd.arg(format!("-O{}", self.opt_level));
+        if self.lto != "none" {
+            clang_cmd.arg(format!("-flto={}", self.lto));
+        }
+        let clang_status = clang_cmd
             .arg("-c")
             .arg(&ll_path)
             .arg("-o")
@@ -116,9 +119,12 @@ impl LlvmCompiler {
             let ll_path = parent.join(format!("{}_mod{}.ll", base_stem, i));
             let obj_part = parent.join(format!("{}_part{}.o", base_stem, i));
             self.emit_llvm_ir(module, &ll_path)?;
-            let part_status = Command::new("clang")
-                .arg(format!("-O{}", self.opt_level))
-                .arg(format!("-flto={}", self.lto))
+            let mut part_cmd = Command::new("clang");
+            part_cmd.arg(format!("-O{}", self.opt_level));
+            if self.lto != "none" {
+                part_cmd.arg(format!("-flto={}", self.lto));
+            }
+            let part_status = part_cmd
                 .arg("-c")
                 .arg(&ll_path)
                 .arg("-o")
@@ -132,8 +138,10 @@ impl LlvmCompiler {
 
         if obj_paths.len() == modules.len() {
             let mut link_cmd = Command::new("clang");
+            if self.lto != "none" {
+                link_cmd.arg(format!("-flto={}", self.lto));
+            }
             link_cmd
-                .arg(format!("-flto={}", self.lto))
                 .arg(format!("-O{}", self.opt_level))
                 .arg("-r")
                 .arg("-nostdlib");
@@ -182,11 +190,15 @@ impl LlvmCompiler {
         }
         fs::write(&ll_path, &ir)?;
 
-        let clang_status = Command::new("clang")
+        let mut clang_cmd = Command::new("clang");
+        clang_cmd
             .arg("--target=wasm32-unknown-wasi")
             .arg("-nostdlib")
-            .arg(format!("-O{}", self.opt_level))
-            .arg(format!("-flto={}", self.lto))
+            .arg(format!("-O{}", self.opt_level));
+        if self.lto != "none" {
+            clang_cmd.arg(format!("-flto={}", self.lto));
+        }
+        let clang_status = clang_cmd
             .arg("-Wl,--no-entry")
             .arg("-Wl,--export-all")
             .arg("-Wl,--allow-undefined")

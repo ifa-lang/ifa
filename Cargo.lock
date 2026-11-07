@@ -731,6 +731,7 @@ dependencies = [
  "ifa-runtime",
  "ifa-sema",
  "ifa-span",
+ "ifa-wasm",
  "petgraph",
  "semver",
  "serde",

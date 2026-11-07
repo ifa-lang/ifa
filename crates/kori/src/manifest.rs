@@ -161,6 +161,7 @@ pub enum BackendKind {
 
 /// Granular compilation flags and optimization profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProfileConfig {
     pub backend: BackendKind,
     pub opt_level: u8,
@@ -168,6 +169,12 @@ pub struct ProfileConfig {
     pub lto: String,
     pub strip_symbols: bool,
     pub gen_checks: bool,
+}
+
+impl Default for ProfileConfig {
+    fn default() -> Self {
+        Self::default_dev()
+    }
 }
 
 impl ProfileConfig {

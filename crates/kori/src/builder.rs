@@ -22,8 +22,11 @@ pub enum ArtifactKind {
     Executable,
     SharedLibrary,
     StaticLibrary,
+    WebAssemblyModule,
+    WebAssemblyBundle,
     CHeader,
     PhpBridge,
+    IfaArchive,
 }
 
 /// Metadata for a single compiled artifact.
@@ -321,8 +324,150 @@ impl BuildOrchestrator {
                         cached: false,
                     });
                 }
-                CrateType::IfaLib | CrateType::Staticlib | CrateType::Wasm => {
-                    // Supported artifact representations
+                CrateType::Staticlib => {
+                    let a_filename = format!("lib{}.a", lib.name);
+                    let a_path = out_dir.join(&a_filename);
+                    let target_key = format!("{}:staticlib:{}", pkg.name, lib.name);
+                    let fingerprint = cache.compute_target_fingerprint(pkg, profile, &[]);
+
+                    if !force && cache.is_up_to_date(&target_key, &fingerprint, &[&a_path]) {
+                        artifacts.push(BuiltArtifact {
+                            name: lib.name.clone(),
+                            path: a_path.clone(),
+                            kind: ArtifactKind::StaticLibrary,
+                            cached: true,
+                        });
+                    } else {
+                        let obj_path = out_dir.join(format!("{}_static.o", lib.name));
+
+                        match profile.backend {
+                            BackendKind::Llvm => {
+                                let mut llvm_comp = LlvmCompiler::new(LlvmTargetConfig::host());
+                                llvm_comp
+                                    .opt_level(profile.opt_level)
+                                    .lto(&profile.lto)
+                                    .strip_symbols(profile.strip_symbols);
+                                llvm_comp
+                                    .compile_to_object(&fir_module, &obj_path)
+                                    .map_err(|e| {
+                                        KoriError::Codegen(format!(
+                                            "LLVM compile static object failed: {}",
+                                            e
+                                        ))
+                                    })?;
+                            }
+                            BackendKind::Cranelift => {
+                                let compiler = AotCompiler::new().map_err(|e| {
+                                    KoriError::Codegen(format!(
+                                        "AOT compiler initialization failed: {}",
+                                        e
+                                    ))
+                                })?;
+
+                                compiler.compile_to_object(&fir_module, &obj_path).map_err(
+                                    |e| {
+                                        KoriError::Codegen(format!(
+                                            "Failed to compile static object: {}",
+                                            e
+                                        ))
+                                    },
+                                )?;
+                            }
+                        }
+
+                        Self::create_static_library(&obj_path, &a_path)?;
+
+                        cache.record_success(&target_key, fingerprint, vec![a_path.clone()])?;
+
+                        artifacts.push(BuiltArtifact {
+                            name: lib.name.clone(),
+                            path: a_path.clone(),
+                            kind: ArtifactKind::StaticLibrary,
+                            cached: false,
+                        });
+                    }
+                }
+                CrateType::Wasm => {
+                    let wasm_filename = format!("{}.wasm", lib.name);
+                    let wasm_path = out_dir.join(&wasm_filename);
+                    let target_key = format!("{}:wasm:{}", pkg.name, lib.name);
+                    let fingerprint = cache.compute_target_fingerprint(pkg, profile, &[]);
+
+                    if !force && cache.is_up_to_date(&target_key, &fingerprint, &[&wasm_path]) {
+                        artifacts.push(BuiltArtifact {
+                            name: lib.name.clone(),
+                            path: wasm_path.clone(),
+                            kind: ArtifactKind::WebAssemblyModule,
+                            cached: true,
+                        });
+                    } else {
+                        let mut llvm_comp = LlvmCompiler::new(LlvmTargetConfig::wasm32_wasi());
+                        llvm_comp
+                            .opt_level(profile.opt_level)
+                            .lto(&profile.lto)
+                            .strip_symbols(profile.strip_symbols);
+                        llvm_comp
+                            .compile_to_wasm(&fir_module, &wasm_path)
+                            .map_err(|e| {
+                                KoriError::Codegen(format!(
+                                    "LLVM compile WebAssembly failed: {}",
+                                    e
+                                ))
+                            })?;
+
+                        cache.record_success(&target_key, fingerprint, vec![wasm_path.clone()])?;
+
+                        artifacts.push(BuiltArtifact {
+                            name: lib.name.clone(),
+                            path: wasm_path.clone(),
+                            kind: ArtifactKind::WebAssemblyModule,
+                            cached: false,
+                        });
+
+                        // Bundle WebAssembly package with TypeScript and JavaScript glue
+                        if let Ok(wasm_bytes) = fs::read(&wasm_path) {
+                            let bundle_dir = out_dir.join(format!("{}_wasm_bundle", lib.name));
+                            let bundler = ifa_wasm::WasmBundler::new(&lib.name, wasm_bytes);
+                            if bundler.bundle(&bundle_dir).is_ok() {
+                                artifacts.push(BuiltArtifact {
+                                    name: format!("{}_wasm_bundle", lib.name),
+                                    path: bundle_dir,
+                                    kind: ArtifactKind::WebAssemblyBundle,
+                                    cached: false,
+                                });
+                            }
+                        }
+                    }
+                }
+                CrateType::IfaLib => {
+                    let ifalib_filename = format!("{}.ifalib", lib.name);
+                    let ifalib_path = out_dir.join(&ifalib_filename);
+                    let target_key = format!("{}:ifalib:{}", pkg.name, lib.name);
+                    let fingerprint = cache.compute_target_fingerprint(pkg, profile, &[]);
+
+                    if !force && cache.is_up_to_date(&target_key, &fingerprint, &[&ifalib_path]) {
+                        artifacts.push(BuiltArtifact {
+                            name: lib.name.clone(),
+                            path: ifalib_path,
+                            kind: ArtifactKind::IfaArchive,
+                            cached: true,
+                        });
+                    } else {
+                        let fir_str = ifa_fir::format_module(&fir_module);
+                        let _ = fs::write(&ifalib_path, fir_str);
+                        cache.record_success(
+                            &target_key,
+                            fingerprint,
+                            vec![ifalib_path.clone()],
+                        )?;
+
+                        artifacts.push(BuiltArtifact {
+                            name: lib.name.clone(),
+                            path: ifalib_path,
+                            kind: ArtifactKind::IfaArchive,
+                            cached: false,
+                        });
+                    }
                 }
             }
         }
@@ -475,6 +620,36 @@ void ifa_rt_fiber_yield(void) {}
         Err(KoriError::Codegen(format!(
             "Failed to link shared library `{}`: {}",
             output_so.display(),
+            last_err
+        )))
+    }
+
+    /// Create a static library (.a) from an object file using the host archiver (`ar` or `llvm-ar`).
+    pub fn create_static_library(object_path: &Path, output_a: &Path) -> Result<(), KoriError> {
+        let archivers = ["ar", "llvm-ar"];
+        let mut last_err = String::new();
+
+        for archiver in &archivers {
+            let status = Command::new(archiver)
+                .arg("crs")
+                .arg(output_a)
+                .arg(object_path)
+                .status();
+
+            match status {
+                Ok(s) if s.success() => return Ok(()),
+                Ok(s) => {
+                    last_err = format!("Archiver `{}` failed with exit status {}", archiver, s);
+                }
+                Err(e) => {
+                    last_err = format!("Failed to execute `{}`: {}", archiver, e);
+                }
+            }
+        }
+
+        Err(KoriError::Codegen(format!(
+            "Failed to create static library `{}`: {}",
+            output_a.display(),
             last_err
         )))
     }

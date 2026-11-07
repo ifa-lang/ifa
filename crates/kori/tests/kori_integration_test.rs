@@ -675,3 +675,99 @@ remote-math = "0.1.0"
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_build_orchestrator_multi_target_staticlib_wasm_ifalib() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kori_multi_target_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(temp_dir.join("src")).unwrap();
+
+    let manifest_content = r#"
+[package]
+name = "multitarget-core"
+version = "0.1.0"
+edition = "2026"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
+
+[targets.lib]
+name = "multitarget_native"
+path = "src/lib.ifa"
+crate_types = ["cdylib", "staticlib", "wasm", "ifalib"]
+
+[profiles.dev]
+backend = "llvm"
+opt_level = 0
+"#;
+    fs::write(temp_dir.join("kori.toml"), manifest_content).unwrap();
+
+    let lib_ifa = r#"
+pub fn double_val(x: i64) -> i64 {
+    return x * 2;
+}
+"#;
+    fs::write(temp_dir.join("src/lib.ifa"), lib_ifa).unwrap();
+
+    let orchestrator =
+        BuildOrchestrator::new(temp_dir.clone()).expect("Failed to initialize orchestrator");
+    let report = orchestrator
+        .build(false, None, false)
+        .expect("Build failed");
+
+    let cdylib = report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::SharedLibrary);
+    assert!(cdylib.is_some(), "Shared library (.so) must be produced");
+    assert!(cdylib.unwrap().path.exists());
+
+    let staticlib = report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::StaticLibrary);
+    assert!(staticlib.is_some(), "Static library (.a) must be produced");
+    assert!(staticlib.unwrap().path.exists());
+    let a_bytes = fs::read(&staticlib.unwrap().path).unwrap();
+    assert!(
+        a_bytes.starts_with(b"!<arch>\n"),
+        "Static library must have valid archive header"
+    );
+
+    let wasm = report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::WebAssemblyModule);
+    assert!(
+        wasm.is_some(),
+        "WebAssembly module (.wasm) must be produced"
+    );
+    assert!(wasm.unwrap().path.exists());
+    let wasm_bytes = fs::read(&wasm.unwrap().path).unwrap();
+    assert!(
+        wasm_bytes.starts_with(b"\0asm"),
+        "WebAssembly module must have valid header"
+    );
+
+    let ifalib = report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::IfaArchive);
+    assert!(
+        ifalib.is_some(),
+        "IFA library archive (.ifalib) must be produced"
+    );
+    assert!(ifalib.unwrap().path.exists());
+
+    let wasm_bundle = report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::WebAssemblyBundle);
+    assert!(
+        wasm_bundle.is_some(),
+        "WebAssembly bundle directory must be produced"
+    );
+    assert!(wasm_bundle.unwrap().path.join("package.json").exists());
+    assert!(wasm_bundle.unwrap().path.join("index.d.ts").exists());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
