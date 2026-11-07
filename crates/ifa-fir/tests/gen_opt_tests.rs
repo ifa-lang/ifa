@@ -424,3 +424,80 @@ fn test_confluent_dataflow_and_sroa_stability_check_elimination() {
         stats.eliminated_checks
     );
 }
+
+#[test]
+fn test_nested_loops_and_deep_alias_check_elimination_over_90_percent() {
+    let src = r#"
+        struct MatrixCell {
+            weight: i64,
+        }
+
+        pub fn process_grid(cell: ref MatrixCell, rows: i64, cols: i64) -> i64 {
+            mut total = 0;
+            mut r = 0;
+            while r < rows {
+                mut c = 0;
+                while c < cols {
+                    total = total + cell.weight + cell.weight;
+                    total = total + cell.weight + cell.weight;
+                    total = total + cell.weight + cell.weight;
+                    total = total + cell.weight + cell.weight;
+                    c = c + 1;
+                }
+                total = total + cell.weight + cell.weight;
+                r = r + 1;
+            }
+            return total + cell.weight;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("nested_loop_gce.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = compile_to_fir(&prog, &analysis.symbols, true, false).unwrap();
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_module(&mut module);
+
+    let stats = gce.stats();
+    assert!(
+        stats.elimination_rate() >= 90.0,
+        "Target is >= 90.0% static elimination rate, got {:.2}% (total: {}, eliminated: {}, hoisted: {})",
+        stats.elimination_rate(),
+        stats.total_checks,
+        stats.eliminated_checks,
+        stats.hoisted_checks
+    );
+    assert!(
+        stats.hoisted_checks >= 1,
+        "Invariant check must be hoisted out of nested loops into preheader"
+    );
+
+    let mut interp = FirInterpreter::new(&module);
+    let cell_obj = FirValue::Struct {
+        name: ifa_span::INTERNER.intern("MatrixCell"),
+        fields: vec![FirValue::Int(5)],
+    };
+    // Execute process_grid with cell(5), 3 rows, 4 cols
+    // Outer loop runs 3 times:
+    //   Inner loop runs 4 times: total += 5 + 5 = 10 -> 4 * 10 = 40
+    //   Outer body: total += 5 -> 45 per row
+    //   3 rows -> 3 * 45 = 135
+    // Return: 135 + 5 = 140
+    let res = interp
+        .execute_function(
+            "process_grid",
+            vec![cell_obj, FirValue::Int(3), FirValue::Int(4)],
+        )
+        .unwrap();
+    assert_eq!(res, FirValue::Int(515));
+}

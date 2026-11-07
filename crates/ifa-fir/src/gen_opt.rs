@@ -31,6 +31,18 @@ pub struct NaturalLoop {
     pub preheader: Option<BlockId>,
 }
 
+/// Helper resolving canonical root value through alias chains.
+fn canonical_ref(mut val: ValueId, aliases: &HashMap<ValueId, ValueId>) -> ValueId {
+    let mut visited = HashSet::new();
+    while let Some(&target) = aliases.get(&val) {
+        if !visited.insert(val) {
+            break;
+        }
+        val = target;
+    }
+    val
+}
+
 /// Optimizes generational references by statically eliminating redundant `GenCheck` instructions
 /// and hoisting loop-invariant checks out of loops (Section 9.3).
 pub struct GenerationalOptPass {
@@ -62,36 +74,85 @@ impl GenerationalOptPass {
 
         // 1. Identify which blocks contain freeing or invalidating operations
         let mut freeing_blocks: HashSet<BlockId> = HashSet::new();
-        // Track where each reference was created: ref_val -> creating BlockId
+        // Track where each value was created/defined: val -> creating BlockId
         let mut ref_creation_block: HashMap<ValueId, BlockId> = HashMap::new();
+        // Specifically track where GenRef/GenAlloc occurred
+        let mut gen_ref_creations: HashMap<ValueId, BlockId> = HashMap::new();
 
+        for p in &func.params {
+            ref_creation_block.insert(p.val, func.entry_block);
+        }
+        for block in &func.blocks {
+            for (p_val, _) in &block.params {
+                ref_creation_block.insert(*p_val, block.id);
+            }
+            for inst in &block.instructions {
+                if matches!(&inst.expr, ValueExpr::GenFree { .. }) {
+                    freeing_blocks.insert(block.id);
+                }
+                if let Some(res) = inst.result {
+                    ref_creation_block.insert(res, block.id);
+                    if matches!(
+                        &inst.expr,
+                        ValueExpr::GenRef { .. } | ValueExpr::GenAlloc { .. }
+                    ) {
+                        gen_ref_creations.insert(res, block.id);
+                    }
+                }
+            }
+        }
+
+        // Build global alias mappings (e.g. single-store allocas where Loads produce known values)
+        let mut store_counts: HashMap<ValueId, usize> = HashMap::new();
+        let mut single_store_val: HashMap<ValueId, ValueId> = HashMap::new();
         for block in &func.blocks {
             for inst in &block.instructions {
-                match &inst.expr {
-                    ValueExpr::GenFree { .. } => {
-                        freeing_blocks.insert(block.id);
+                if let ValueExpr::Store { ptr, val } = &inst.expr {
+                    *store_counts.entry(*ptr).or_default() += 1;
+                    single_store_val.insert(*ptr, *val);
+                }
+            }
+        }
+        single_store_val.retain(|ptr, _| store_counts.get(ptr) == Some(&1));
+
+        let mut global_aliases: HashMap<ValueId, ValueId> = HashMap::new();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let ValueExpr::Load { ptr } = &inst.expr {
+                    if let (Some(res), Some(&stored_val)) = (inst.result, single_store_val.get(ptr))
+                    {
+                        global_aliases.insert(res, stored_val);
                     }
-                    ValueExpr::GenRef { .. } => {
-                        if let Some(res) = inst.result {
-                            ref_creation_block.insert(res, block.id);
-                        }
-                    }
-                    _ => {}
                 }
             }
         }
 
         // 2. Loop-Invariant Check Hoisting (LICM for Generational Checks - Section 9.3 Rule 2)
-        self.hoist_loop_invariant_checks(
+        // Repeat until fixed point (up to 5 passes) for nested loops
+        for _ in 0..5 {
+            let before_hoisted = self.stats.hoisted_checks;
+            self.hoist_loop_invariant_checks(
+                func,
+                &cfg,
+                &dom_tree,
+                &freeing_blocks,
+                &ref_creation_block,
+                &global_aliases,
+            );
+            if self.stats.hoisted_checks == before_hoisted {
+                break;
+            }
+        }
+
+        // 3. Dominance-based and Dataflow Elimination (Section 9.3 Rules 1 & 3)
+        self.run_dominance_elimination(
             func,
             &cfg,
             &dom_tree,
             &freeing_blocks,
-            &ref_creation_block,
+            &gen_ref_creations,
+            &global_aliases,
         );
-
-        // 3. Dominance-based and Dataflow Elimination (Section 9.3 Rules 1 & 3)
-        self.run_dominance_elimination(func, &cfg, &dom_tree, &freeing_blocks, &ref_creation_block);
     }
 
     /// Identifies natural loops and hoists invariant `GenCheck` instructions into loop preheaders.
@@ -102,6 +163,7 @@ impl GenerationalOptPass {
         dom_tree: &DominanceTree,
         freeing_blocks: &HashSet<BlockId>,
         ref_defs: &HashMap<ValueId, BlockId>,
+        aliases: &HashMap<ValueId, ValueId>,
     ) {
         let loops = Self::find_natural_loops(cfg, dom_tree);
         let param_values: HashSet<ValueId> = func.params.iter().map(|p| p.val).collect();
@@ -119,24 +181,31 @@ impl GenerationalOptPass {
             };
 
             // Collect all invariant references checked inside the loop
-            let mut candidate_checks: Vec<(ValueId, Span)> = Vec::new();
+            let mut candidate_checks: Vec<(ValueId, ValueId, Span)> = Vec::new();
 
             for &b_id in &loop_info.blocks {
                 if let Some(block) = func.get_block(b_id) {
                     for inst in &block.instructions {
                         if let ValueExpr::GenCheck { ref_val, redundant } = &inst.expr {
                             if !*redundant {
-                                let is_param = param_values.contains(ref_val);
+                                let canon = canonical_ref(*ref_val, aliases);
+                                let is_param =
+                                    param_values.contains(ref_val) || param_values.contains(&canon);
                                 let is_defined_outside =
                                     ref_defs.get(ref_val).is_some_and(|&def_b| {
+                                        !loop_info.blocks.contains(&def_b)
+                                            && dom_tree.dominates(def_b, preheader_id)
+                                    }) || ref_defs.get(&canon).is_some_and(|&def_b| {
                                         !loop_info.blocks.contains(&def_b)
                                             && dom_tree.dominates(def_b, preheader_id)
                                     });
 
                                 if (is_param || is_defined_outside)
-                                    && !candidate_checks.iter().any(|(v, _)| v == ref_val)
+                                    && !candidate_checks
+                                        .iter()
+                                        .any(|(v, c, _)| *v == *ref_val || *c == canon)
                                 {
-                                    candidate_checks.push((*ref_val, inst.span));
+                                    candidate_checks.push((*ref_val, canon, inst.span));
                                 }
                             }
                         }
@@ -149,20 +218,31 @@ impl GenerationalOptPass {
             }
 
             // Hoist checks to preheader and mark inside-loop checks as redundant
-            for (ref_val, span) in candidate_checks {
+            for (ref_val, canon, span) in candidate_checks {
                 let already_checked_in_preheader = func.get_block(preheader_id).is_some_and(|pb| {
                     pb.instructions.iter().any(|inst| match &inst.expr {
-                        ValueExpr::GenCheck { ref_val: r, .. } => *r == ref_val,
+                        ValueExpr::GenCheck { ref_val: r, .. } => {
+                            *r == ref_val || *r == canon || canonical_ref(*r, aliases) == canon
+                        }
                         _ => false,
                     })
                 });
 
                 if !already_checked_in_preheader {
                     if let Some(pb) = func.get_block_mut(preheader_id) {
+                        let hoist_val = if param_values.contains(&canon)
+                            || ref_defs
+                                .get(&canon)
+                                .is_some_and(|&d| dom_tree.dominates(d, preheader_id))
+                        {
+                            canon
+                        } else {
+                            ref_val
+                        };
                         pb.instructions.push(Instruction::new(
                             None,
                             ValueExpr::GenCheck {
-                                ref_val,
+                                ref_val: hoist_val,
                                 redundant: false,
                             },
                             span,
@@ -180,7 +260,11 @@ impl GenerationalOptPass {
                                 redundant,
                             } = &mut inst.expr
                             {
-                                if *r == ref_val && !*redundant {
+                                if (*r == ref_val
+                                    || *r == canon
+                                    || canonical_ref(*r, aliases) == canon)
+                                    && !*redundant
+                                {
                                     *redundant = true;
                                     self.stats.eliminated_checks += 1;
                                 }
@@ -200,6 +284,7 @@ impl GenerationalOptPass {
         dom_tree: &DominanceTree,
         freeing_blocks: &HashSet<BlockId>,
         ref_defs: &HashMap<ValueId, BlockId>,
+        aliases: &HashMap<ValueId, ValueId>,
     ) {
         let is_strict = func.is_strict;
         let mut verified_at_exit: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
@@ -342,6 +427,7 @@ impl GenerationalOptPass {
                         });
                         if no_free {
                             available.insert(ref_val);
+                            available.insert(canonical_ref(ref_val, aliases));
                         }
                     }
                 }
@@ -357,34 +443,52 @@ impl GenerationalOptPass {
                             ptr_aliases.insert(*ptr, *val);
                         }
                         ValueExpr::Load { ptr } => {
-                            if let (Some(res), Some(&val)) = (inst.result, ptr_aliases.get(ptr)) {
-                                if available.contains(&val) {
-                                    available.insert(res);
+                            if let Some(res) = inst.result {
+                                let stored = ptr_aliases
+                                    .get(ptr)
+                                    .copied()
+                                    .or_else(|| aliases.get(&res).copied());
+                                if let Some(val) = stored {
+                                    let canon = canonical_ref(val, aliases);
+                                    if available.contains(&val) || available.contains(&canon) {
+                                        available.insert(res);
+                                        available.insert(canonical_ref(res, aliases));
+                                    }
                                 }
                             }
                         }
-                        ValueExpr::GenRef { .. } => {
+                        ValueExpr::GenRef { .. } | ValueExpr::GenAlloc { .. } => {
                             if let Some(res) = inst.result {
                                 available.insert(res);
+                                available.insert(canonical_ref(res, aliases));
                             }
                         }
                         ValueExpr::GenFree { ptr } => {
+                            let canon = canonical_ref(*ptr, aliases);
                             available.remove(ptr);
+                            available.remove(&canon);
                             ptr_aliases.remove(ptr);
                         }
                         ValueExpr::GenCheck { ref_val, redundant } => {
                             self.stats.total_checks += 1;
+                            let canon = canonical_ref(*ref_val, aliases);
 
                             if *redundant {
                                 // Already eliminated by LICM hoisting
                                 available.insert(*ref_val);
-                            } else if is_strict || available.contains(ref_val) {
+                                available.insert(canon);
+                            } else if is_strict
+                                || available.contains(ref_val)
+                                || available.contains(&canon)
+                            {
                                 *redundant = true;
                                 self.stats.eliminated_checks += 1;
                                 available.insert(*ref_val);
+                                available.insert(canon);
                             } else {
                                 // First dynamic check in path: available for following instructions
                                 available.insert(*ref_val);
+                                available.insert(canon);
                             }
                         }
                         _ => {}

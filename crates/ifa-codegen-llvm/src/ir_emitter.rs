@@ -113,6 +113,7 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_fiber_spawn(ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_fiber_join(i64)\n");
             out.push_str("declare ptr @ifa_rt_coro_create(i64, ptr, ptr)\n");
+            out.push_str("declare ptr @ifa_rt_coro_create_custom(ptr, ptr, ptr)\n");
             out.push_str("declare i32 @ifa_rt_coro_resume(ptr)\n");
             out.push_str("declare i64 @ifa_rt_coro_spawn(ptr)\n");
             out.push_str("declare void @ifa_rt_coro_destroy(ptr)\n");
@@ -144,6 +145,7 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_fiber_spawn(ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_fiber_join(i64)\n");
             out.push_str("declare ptr @ifa_rt_coro_create(i64, ptr, ptr)\n");
+            out.push_str("declare ptr @ifa_rt_coro_create_custom(ptr, ptr, ptr)\n");
             out.push_str("declare i32 @ifa_rt_coro_resume(ptr)\n");
             out.push_str("declare i64 @ifa_rt_coro_spawn(ptr)\n");
             out.push_str("declare void @ifa_rt_coro_destroy(ptr)\n");
@@ -174,7 +176,9 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("declare i1 @llvm.coro.end(ptr, i1, token)\n");
         out.push_str("declare void @llvm.coro.resume(ptr)\n");
         out.push_str("declare void @llvm.coro.destroy(ptr)\n");
-        out.push_str("declare i1 @llvm.coro.done(ptr)\n\n");
+        out.push_str("declare i1 @llvm.coro.done(ptr)\n");
+        out.push_str("declare ptr @llvm.coro.free(token, ptr)\n");
+        out.push_str("declare ptr @llvm.coro.frame()\n\n");
 
         // IFA Stackless Fiber Continuous Execution Helpers
         out.push_str("; IFA Stackless Fiber Continuous Execution Helpers\n");
@@ -190,6 +194,29 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str(
             "entry:\n  %res = call i32 @ifa_rt_coro_resume(ptr %coro)\n  ret i32 %res\n}\n\n",
         );
+
+        out.push_str(
+            "define linkonce_odr i32 @ifa_coro_llvm_resume_adapter(ptr %hdl) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  %is_done = call i1 @llvm.coro.done(ptr %hdl)\n  br i1 %is_done, label %done, label %do_resume\n");
+        out.push_str("do_resume:\n  call void @llvm.coro.resume(ptr %hdl)\n  %after_done = call i1 @llvm.coro.done(ptr %hdl)\n  %res = select i1 %after_done, i32 1, i32 0\n  ret i32 %res\n");
+        out.push_str("done:\n  ret i32 1\n}\n\n");
+
+        out.push_str(
+            "define linkonce_odr void @ifa_coro_llvm_destroy_adapter(ptr %hdl) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  call void @llvm.coro.destroy(ptr %hdl)\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr i64 @ifa_coro_llvm_spawn(ptr %hdl) alwaysinline {\n");
+        out.push_str("entry:\n  %coro = call ptr @ifa_rt_coro_create_custom(ptr %hdl, ptr @ifa_coro_llvm_resume_adapter, ptr @ifa_coro_llvm_destroy_adapter)\n");
+        out.push_str("  %fid = call i64 @ifa_rt_coro_spawn(ptr %coro)\n  ret i64 %fid\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_coro_llvm_run(ptr %hdl) alwaysinline {\n");
+        out.push_str("entry:\n  br label %step_loop\n");
+        out.push_str("step_loop:\n  %done = call i1 @llvm.coro.done(ptr %hdl)\n  br i1 %done, label %cleanup, label %resume_step\n");
+        out.push_str("resume_step:\n  call void @llvm.coro.resume(ptr %hdl)\n  %done_after = call i1 @llvm.coro.done(ptr %hdl)\n  br i1 %done_after, label %cleanup, label %yield_step\n");
+        out.push_str("yield_step:\n  call void @ifa_rt_fiber_yield()\n  br label %step_loop\n");
+        out.push_str("cleanup:\n  call void @llvm.coro.destroy(ptr %hdl)\n  ret void\n}\n\n");
 
         // SIMD Vector Reduction Intrinsics
         out.push_str("; LLVM Vector Reduction Intrinsics\n");
