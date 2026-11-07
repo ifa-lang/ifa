@@ -976,11 +976,17 @@ impl Parser {
                     let pattern = self.parse_pattern()?;
                     self.expect(TokenKind::Eq)?;
                     let expr = self.parse_expr()?;
+                    let guard = if self.match_token(&TokenKind::If) {
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
                     let body = self.parse_block()?;
                     let end = body.span.end;
                     Ok(Stmt::WhileLet {
                         pattern,
                         expr,
+                        guard,
                         body,
                         span: Span::new(self.file_id, while_tok.span.start, end),
                     })
@@ -1277,6 +1283,11 @@ impl Parser {
                     let pattern = self.parse_pattern()?;
                     self.expect(TokenKind::Eq)?;
                     let expr = self.parse_expr()?;
+                    let guard = if self.match_token(&TokenKind::If) {
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
+                    };
                     let then_branch = self.parse_block()?;
                     let mut else_branch = None;
                     let mut end_pos = then_branch.span.end;
@@ -1300,6 +1311,7 @@ impl Parser {
                         ExprKind::IfLet {
                             pattern,
                             expr: Box::new(expr),
+                            guard,
                             then_branch,
                             else_branch,
                         },
@@ -2439,6 +2451,63 @@ mod tests {
             // 2. while let
             if let Stmt::WhileLet { pattern, .. } = &body.stmts[1] {
                 assert!(matches!(pattern, Pattern::Variant { .. }));
+            } else {
+                panic!("expected WhileLet statement");
+            }
+        }
+    }
+
+    #[test]
+    fn test_if_let_and_while_let_guards_parsing() {
+        let src = r#"
+            fn test_guards(opt: Option<i64>) {
+                if let Some(x) = opt if x > 10 {
+                    println("greater");
+                } else if let Some(y) = opt if y > 0 {
+                    println("positive");
+                } else {
+                    println("other");
+                }
+
+                while let Some(z) = opt if z != 0 {
+                    break;
+                }
+            }
+        "#;
+        let fid = FileId(0);
+        let tokens = tokenize(fid, src);
+        let (prog, diags) = parse(fid, tokens);
+        assert!(diags.is_empty(), "Parser diags: {:?}", diags);
+
+        if let Item::Function(f) = &prog.items[0] {
+            let body = f.body.as_ref().unwrap();
+            assert_eq!(body.stmts.len(), 2);
+
+            // 1. if let with guard
+            if let Stmt::Expr(expr) = &body.stmts[0] {
+                if let ExprKind::IfLet {
+                    guard, else_branch, ..
+                } = &expr.kind
+                {
+                    assert!(guard.is_some(), "guard must be parsed");
+                    if let Some(else_expr) = else_branch {
+                        if let ExprKind::IfLet {
+                            guard: else_guard, ..
+                        } = &else_expr.kind
+                        {
+                            assert!(else_guard.is_some(), "else if let guard must be parsed");
+                        } else {
+                            panic!("expected else if let");
+                        }
+                    }
+                } else {
+                    panic!("expected IfLet expression");
+                }
+            }
+
+            // 2. while let with guard
+            if let Stmt::WhileLet { guard, .. } = &body.stmts[1] {
+                assert!(guard.is_some(), "while let guard must be parsed");
             } else {
                 panic!("expected WhileLet statement");
             }

@@ -899,5 +899,151 @@ fn test_example_if_let_while_let_execution() {
     let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
     let mut interp = FirInterpreter::new(&fir_module);
     let res = interp.execute_function("main", vec![]).unwrap();
-    assert_eq!(res, FirValue::Int(538));
+    assert_eq!(res, FirValue::Int(3659));
+}
+
+#[test]
+fn test_if_let_with_guard_execution() {
+    let src = r#"
+        enum NumOpt {
+            Some(i64),
+            None,
+        }
+
+        fn classify(opt: NumOpt) -> i64 {
+            if let NumOpt::Some(x) = opt if x > 100 {
+                return x * 2;
+            } else if let NumOpt::Some(y) = opt if y > 0 {
+                return y + 10;
+            } else if let NumOpt::Some(z) = opt {
+                return z - 1;
+            } else {
+                return -999;
+            }
+        }
+
+        fn main() -> i64 {
+            let a = classify(NumOpt::Some(150)); // 300
+            let b = classify(NumOpt::Some(50));  // 60
+            let c = classify(NumOpt::Some(-5));  // -6
+            let d = classify(NumOpt::None);      // -999
+
+            return a + b + c + d; // 300 + 60 - 6 - 999 = -645
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("if_let_guard_exec.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(-645));
+}
+
+#[test]
+fn test_while_let_with_guard_execution() {
+    let src = r#"
+        enum Stream {
+            Next(i64),
+            End,
+        }
+
+        fn step(x: i64) -> Stream {
+            return Stream::Next(x + 1);
+        }
+
+        fn main() -> i64 {
+            mut s = Stream::Next(1);
+            mut sum = 0;
+
+            // Loop continues while s is Stream::Next(n) AND n is less than or equal to 5
+            while let Stream::Next(n) = s if n <= 5 {
+                sum += n;
+                s = step(n);
+            }
+
+            return sum; // 1 + 2 + 3 + 4 + 5 = 15
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("while_let_guard_exec.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(15));
+}
+
+#[test]
+fn test_if_let_nested_patterns_and_guard_execution() {
+    let src = r#"
+        struct Coord {
+            x: i64,
+            y: i64,
+        }
+
+        enum Position {
+            Point(Coord),
+            Origin,
+        }
+
+        fn evaluate(pos: Position) -> i64 {
+            if let Position::Point(Coord { x, y }) = pos if x > 0 && y > 0 {
+                return x * y;
+            } else if let Position::Point(Coord { x, y }) = pos if x < 0 || y < 0 {
+                return -(x * y);
+            } else {
+                return 0;
+            }
+        }
+
+        fn main() -> i64 {
+            let p1 = Position::Point(Coord(x: 4, y: 5));   // 20
+            let p2 = Position::Point(Coord(x: -3, y: 7));  // -(-21) = 21
+            let p3 = Position::Point(Coord(x: 0, y: 10));  // 0
+            let p4 = Position::Origin;                     // 0
+
+            return evaluate(p1) + evaluate(p2) + evaluate(p3) + evaluate(p4); // 20 + 21 + 0 + 0 = 41
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("if_let_nested_guard_exec.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(41));
 }

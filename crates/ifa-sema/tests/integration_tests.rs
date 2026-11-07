@@ -2323,3 +2323,139 @@ fn test_while_let_irrefutable_warning() {
         "Expected W0001 warning for irrefutable pattern in while let"
     );
 }
+
+#[test]
+fn test_if_let_and_while_let_with_guard_valid() {
+    let code = r#"
+        enum ResultVal {
+            Ok(i64),
+            Err(i64),
+        }
+
+        fn process_positive(res: ResultVal) -> i64 {
+            if let ResultVal::Ok(val) = res if val > 0 {
+                return val * 10;
+            } else if let ResultVal::Ok(zero) = res if zero == 0 {
+                return 0;
+            } else {
+                return -1;
+            }
+        }
+
+        fn drain_positive() -> i64 {
+            mut current = ResultVal::Ok(5);
+            mut sum = 0;
+            while let ResultVal::Ok(v) = current if v > 0 {
+                sum = sum + v;
+                current = ResultVal::Ok(v - 1);
+            }
+            return sum;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Guarded if let and while let must validate successfully: {:?}",
+        res.diagnostics
+    );
+    assert_eq!(res.warning_count(), 0);
+}
+
+#[test]
+fn test_if_let_irrefutable_with_guard_no_warning() {
+    let code = r#"
+        fn test_guarded_irrefutable(x: i64) -> i64 {
+            if let val = x if val > 100 {
+                return val;
+            } else {
+                return 0;
+            }
+        }
+
+        fn test_guarded_while_irrefutable(n: i64) {
+            while let val = n if val < 10 {
+                break;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Guarded irrefutable pattern must pass semantic analysis: {:?}",
+        res.diagnostics
+    );
+    assert_eq!(
+        res.warning_count(),
+        0,
+        "No W0001 warning must be emitted when an irrefutable pattern has a conditional guard"
+    );
+}
+
+#[test]
+fn test_if_let_guard_non_bool_error() {
+    let code = r#"
+        enum Opt {
+            Some(i64),
+            None,
+        }
+
+        fn bad_guard(o: Opt) -> i64 {
+            if let Opt::Some(x) = o if x + 1 {
+                return x;
+            } else {
+                return 0;
+            }
+        }
+
+        fn bad_while_guard(o: Opt) {
+            while let Opt::Some(y) = o if y * 2 {
+                break;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Non-boolean guard expressions must produce semantic errors"
+    );
+    let guard_errors: Vec<_> = res
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.as_deref() == Some("E0034"))
+        .collect();
+    assert_eq!(
+        guard_errors.len(),
+        2,
+        "Expected 2 E0034 guard errors, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_if_let_nested_patterns_with_guard() {
+    let code = r#"
+        struct Point {
+            x: i64,
+            y: i64,
+        }
+
+        enum Shape {
+            Circle((Point, i64)),
+            None,
+        }
+
+        fn test_nested(s: Shape) -> i64 {
+            if let Shape::Circle((Point { x, y }, radius)) = s if x > 0 && y > 0 && radius > 10 {
+                return x + y + radius;
+            } else {
+                return 0;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Nested pattern destructuring with guard in if let must validate successfully: {:?}",
+        res.diagnostics
+    );
+}

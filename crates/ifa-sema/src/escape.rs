@@ -273,11 +273,15 @@ impl<'a> EscapeAnalyzer<'a> {
             }
             ExprKind::IfLet {
                 expr,
+                guard,
                 then_branch,
                 else_branch,
                 ..
             } => {
                 self.collect_contained_refs_rec(expr, out);
+                if let Some(g) = guard {
+                    self.collect_contained_refs_rec(g, out);
+                }
                 for s in &then_branch.stmts {
                     if let Stmt::Expr(e) = s {
                         self.collect_contained_refs_rec(e, out);
@@ -421,8 +425,13 @@ impl<'a> EscapeAnalyzer<'a> {
                     self.check_expr(e);
                 }
             }
-            Stmt::WhileLet { expr, body, .. } => {
+            Stmt::WhileLet {
+                expr, guard, body, ..
+            } => {
                 self.check_expr(expr);
+                if let Some(g) = guard {
+                    self.check_expr(g);
+                }
                 for s in &body.stmts {
                     self.check_stmt(s);
                 }
@@ -603,11 +612,15 @@ impl<'a> EscapeAnalyzer<'a> {
             }
             ExprKind::IfLet {
                 expr,
+                guard,
                 then_branch,
                 else_branch,
                 ..
             } => {
                 self.check_expr(expr);
+                if let Some(g) = guard {
+                    self.check_expr(g);
+                }
                 for s in &then_branch.stmts {
                     self.check_stmt(s);
                 }

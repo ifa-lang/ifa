@@ -1113,13 +1113,14 @@ impl<'a> SemanticAnalyzer<'a> {
             Stmt::WhileLet {
                 pattern,
                 expr,
+                guard,
                 body,
                 span: _,
             } => {
                 let cond_ty = self.infer_expr(expr);
                 let is_irrefutable =
                     crate::exhaustiveness::is_irrefutable_pattern_for_type(pattern, &cond_ty);
-                if is_irrefutable && cond_ty != Type::Unknown {
+                if guard.is_none() && is_irrefutable && cond_ty != Type::Unknown {
                     self.diagnostics.push(
                         Diagnostic::warning(format!(
                             "motif irréfutable dans une boucle 'while let' : le motif couvre toutes les valeurs possibles du type '{}'",
@@ -1135,6 +1136,19 @@ impl<'a> SemanticAnalyzer<'a> {
 
                 self.symbols.enter_scope(true, false);
                 self.check_pattern(pattern, &cond_ty);
+                if let Some(g) = guard {
+                    let guard_ty = self.infer_expr(g);
+                    if !matches!(guard_ty, Type::Bool | Type::Unknown) {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "la condition de garde 'while let' doit être un booléen, trouvé '{}'",
+                                guard_ty
+                            ))
+                            .with_code("E0034")
+                            .with_primary_label(g.span, "condition de garde non booléenne"),
+                        );
+                    }
+                }
                 self.check_block(body, None);
                 self.symbols.exit_scope();
             }
@@ -1662,13 +1676,14 @@ impl<'a> SemanticAnalyzer<'a> {
             ExprKind::IfLet {
                 pattern,
                 expr: cond_expr,
+                guard,
                 then_branch,
                 else_branch,
             } => {
                 let cond_ty = self.infer_expr(cond_expr);
                 let is_irrefutable =
                     crate::exhaustiveness::is_irrefutable_pattern_for_type(pattern, &cond_ty);
-                if is_irrefutable && cond_ty != Type::Unknown {
+                if guard.is_none() && is_irrefutable && cond_ty != Type::Unknown {
                     self.diagnostics.push(
                         Diagnostic::warning(format!(
                             "motif irréfutable dans une expression 'if let' : le motif couvre toutes les valeurs possibles du type '{}'",
@@ -1682,6 +1697,19 @@ impl<'a> SemanticAnalyzer<'a> {
 
                 self.symbols.enter_scope(false, false);
                 self.check_pattern(pattern, &cond_ty);
+                if let Some(g) = guard {
+                    let guard_ty = self.infer_expr(g);
+                    if !matches!(guard_ty, Type::Bool | Type::Unknown) {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "la condition de garde 'if let' doit être un booléen, trouvé '{}'",
+                                guard_ty
+                            ))
+                            .with_code("E0034")
+                            .with_primary_label(g.span, "condition de garde non booléenne"),
+                        );
+                    }
+                }
                 let then_ty = self.check_block(then_branch, expected);
                 self.symbols.exit_scope();
 

@@ -208,6 +208,7 @@ pub enum Stmt {
     WhileLet {
         pattern: Pattern,
         expr: Expr,
+        guard: Option<Expr>,
         body: Block,
         span: Span,
     },
@@ -502,6 +503,7 @@ pub enum ExprKind {
     IfLet {
         pattern: Pattern,
         expr: Box<Expr>,
+        guard: Option<Box<Expr>>,
         then_branch: Block,
         else_branch: Option<Box<Expr>>,
     },
@@ -613,8 +615,13 @@ pub trait Visitor<'ast>: Sized {
                 self.visit_expr(cond);
                 self.visit_block(body);
             }
-            Stmt::WhileLet { expr, body, .. } => {
+            Stmt::WhileLet {
+                expr, guard, body, ..
+            } => {
                 self.visit_expr(expr);
+                if let Some(g) = guard {
+                    self.visit_expr(g);
+                }
                 self.visit_block(body);
             }
             Stmt::For { iterable, body, .. } => {
@@ -679,11 +686,15 @@ pub trait Visitor<'ast>: Sized {
             }
             ExprKind::IfLet {
                 expr,
+                guard,
                 then_branch,
                 else_branch,
                 ..
             } => {
                 self.visit_expr(expr);
+                if let Some(g) = guard {
+                    self.visit_expr(g);
+                }
                 self.visit_block(then_branch);
                 if let Some(els) = else_branch {
                     self.visit_expr(els);

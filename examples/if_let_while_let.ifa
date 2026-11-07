@@ -1,9 +1,16 @@
 // Exemples idiomatiques d'utilisation de `if let` et `while let` en IFA.
-// Démontre le filtrage conditionnel réfutable avec liaison de variables dans la portée locale.
+// Démontre le filtrage conditionnel réfutable avec liaison de variables dans la portée locale,
+// le support des gardes conditionnelles optionnelles (`if <guard>`) et des motifs imbriqués.
+
+struct MetricPoint {
+    x: i64,
+    y: i64,
+}
 
 enum JobStatus {
     Pending(i64),
     Running(i64),
+    Tracked(MetricPoint),
     Completed,
 }
 
@@ -14,10 +21,16 @@ enum TokenStream {
 }
 
 fn describe_job(status: JobStatus) -> i64 {
-    if let JobStatus::Pending(priority) = status {
+    if let JobStatus::Pending(priority) = status if priority > 10 {
+        return priority * 100;
+    } else if let JobStatus::Pending(priority) = status {
         return priority * 10;
+    } else if let JobStatus::Running(progress) = status if progress >= 50 {
+        return 1000 + progress;
     } else if let JobStatus::Running(progress) = status {
         return 100 + progress;
+    } else if let JobStatus::Tracked(MetricPoint { x, y }) = status if x > 0 && y > 0 {
+        return x * y;
     } else {
         return 200;
     }
@@ -35,7 +48,8 @@ fn drain_tokens(initial_count: i64) -> i64 {
     mut counter = initial_count;
     mut accumulated = 0;
 
-    while let TokenStream::Word(weight) = next_token(counter) {
+    // Boucle conditionnelle while let avec garde `if weight > 4`
+    while let TokenStream::Word(weight) = next_token(counter) if weight > 4 {
         accumulated += weight;
         counter -= 1;
     }
@@ -44,25 +58,35 @@ fn drain_tokens(initial_count: i64) -> i64 {
 }
 
 pub fn main() -> i64 {
-    // 1. Filtrage conditionnel if let avec liaisons locales
+    // 1. Filtrage conditionnel if let avec gardes et liaisons locales
     let s1 = JobStatus::Pending(5);
+    let s1_high = JobStatus::Pending(20);
     let s2 = JobStatus::Running(42);
+    let s2_high = JobStatus::Running(75);
+    let s_tracked = JobStatus::Tracked(MetricPoint(x: 6, y: 7));
     let s3 = JobStatus::Completed;
 
-    let d1 = describe_job(s1); // 50
-    let d2 = describe_job(s2); // 142
-    let d3 = describe_job(s3); // 200
+    let d1 = describe_job(s1);           // 50 (priority <= 10)
+    let d1_high = describe_job(s1_high); // 2000 (priority > 10 => 20 * 100)
+    let d2 = describe_job(s2);           // 142 (progress < 50 => 100 + 42)
+    let d2_high = describe_job(s2_high); // 1075 (progress >= 50 => 1000 + 75)
+    let d_tr = describe_job(s_tracked);  // 42 (x * y = 6 * 7)
+    let d3 = describe_job(s3);           // 200
 
-    // 2. if let en tant qu'expression produisant une valeur scalaire
-    let bonus = if let JobStatus::Running(prog) = s2 {
+    // 2. if let en tant qu'expression produisant une valeur scalaire avec garde
+    let bonus = if let JobStatus::Running(prog) = s2 if prog > 40 {
         prog * 3
     } else {
         0
-    }; // 126
+    }; // 42 * 3 = 126
 
-    // 3. Boucle conditionnelle while let
-    let stream_sum = drain_tokens(4); // 8 + 6 + 4 + 2 = 20
+    // 3. Boucle conditionnelle while let avec garde
+    // initial_count = 5 => step 5: Word(10) > 4 -> sum += 10, count = 4
+    //                      step 4: Word(8) > 4  -> sum += 8,  count = 3
+    //                      step 3: Word(6) > 4  -> sum += 6,  count = 2
+    //                      step 2: Word(4) <= 4 -> garde fausse, arrêt boucle !
+    let stream_sum = drain_tokens(5); // 10 + 8 + 6 = 24
 
-    // Total = 50 + 142 + 200 + 126 + 20 = 538
-    return d1 + d2 + d3 + bonus + stream_sum;
+    // Total = 50 + 2000 + 142 + 1075 + 42 + 200 + 126 + 24 = 3659
+    return d1 + d1_high + d2 + d2_high + d_tr + d3 + bonus + stream_sum;
 }

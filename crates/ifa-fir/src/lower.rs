@@ -1048,12 +1048,19 @@ impl<'a> FunctionLoweringContext<'a> {
             Stmt::WhileLet {
                 pattern,
                 expr: cond_expr,
+                guard,
                 body,
                 span: _,
             } => {
                 let cond_block = self.alloc_block();
                 let body_block = self.alloc_block();
                 let exit_block = self.alloc_block();
+                let guard_block = if guard.is_some() {
+                    Some(self.alloc_block())
+                } else {
+                    None
+                };
+                let match_success_target = guard_block.unwrap_or(body_block);
 
                 self.set_terminator(Terminator::Branch {
                     target: cond_block,
@@ -1074,10 +1081,23 @@ impl<'a> FunctionLoweringContext<'a> {
                     target_val,
                     &target_ty,
                     pattern,
-                    body_block,
+                    match_success_target,
                     exit_block,
                     cond_expr.span,
                 );
+
+                // Optional Guard Evaluation Block
+                if let Some(gb) = guard_block {
+                    self.current_block = gb;
+                    let guard_cond = self.lower_expr(guard.as_ref().unwrap());
+                    self.set_terminator(Terminator::BranchCond {
+                        cond: guard_cond,
+                        then_block: body_block,
+                        then_args: Vec::new(),
+                        else_block: exit_block,
+                        else_args: Vec::new(),
+                    });
+                }
 
                 // Body block
                 self.current_block = body_block;
@@ -2346,6 +2366,7 @@ impl<'a> FunctionLoweringContext<'a> {
             ExprKind::IfLet {
                 pattern,
                 expr: cond_expr,
+                guard,
                 then_branch,
                 else_branch,
             } => {
@@ -2357,13 +2378,37 @@ impl<'a> FunctionLoweringContext<'a> {
                 let then_block = self.alloc_block();
                 let else_block = self.alloc_block();
                 let merge_block = self.alloc_block();
+                let guard_block = if guard.is_some() {
+                    Some(self.alloc_block())
+                } else {
+                    None
+                };
+                let match_success_target = guard_block.unwrap_or(then_block);
 
                 let saved_allocas = self.var_allocas.clone();
                 let saved_types = self.var_types.clone();
 
                 self.lower_pattern_match(
-                    target_val, &target_ty, pattern, then_block, else_block, expr.span,
+                    target_val,
+                    &target_ty,
+                    pattern,
+                    match_success_target,
+                    else_block,
+                    expr.span,
                 );
+
+                // Optional Guard Evaluation Block
+                if let Some(gb) = guard_block {
+                    self.current_block = gb;
+                    let guard_cond = self.lower_expr(guard.as_ref().unwrap());
+                    self.set_terminator(Terminator::BranchCond {
+                        cond: guard_cond,
+                        then_block,
+                        then_args: Vec::new(),
+                        else_block,
+                        else_args: Vec::new(),
+                    });
+                }
 
                 // Then branch
                 self.current_block = then_block;
