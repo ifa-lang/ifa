@@ -57,11 +57,17 @@ impl<'a> FunctionLoweringContext<'a> {
         module_structs: &'a [FirStruct],
         module_enums: &'a [FirEnum],
     ) -> Self {
+        let effective_name = func_name_override.unwrap_or(func_ast.name);
+
+        let sema_fn = symbols
+            .lookup_function(&effective_name)
+            .or_else(|| symbols.lookup_function(&func_ast.name));
+
         let ret_ty = func_ast
             .ret_ty
             .as_ref()
             .map(|_t| {
-                if let Some(sema_ty) = symbols.lookup_function(&func_ast.name) {
+                if let Some(sema_ty) = sema_fn {
                     let substituted = sema_ty.ret_ty.substitute(&type_subst);
                     FirType::from_sema_type(&substituted)
                 } else {
@@ -76,7 +82,7 @@ impl<'a> FunctionLoweringContext<'a> {
         for p in &func_ast.params {
             let val = ValueId(next_val);
             next_val += 1;
-            let ty = if let Some(sym_fn) = symbols.lookup_function(&func_ast.name) {
+            let ty = if let Some(sym_fn) = sema_fn {
                 sym_fn
                     .params
                     .iter()
@@ -85,9 +91,19 @@ impl<'a> FunctionLoweringContext<'a> {
                         let substituted = ps.ty.substitute(&type_subst);
                         FirType::from_sema_type(&substituted)
                     })
-                    .unwrap_or(FirType::Unit)
+                    .unwrap_or_else(|| {
+                        let known_structs = HashMap::new();
+                        let known_enums = HashMap::new();
+                        ifa_sema::types::Type::from_ast(&p.ty, &known_structs, &known_enums)
+                            .map(|t| FirType::from_sema_type(&t.substitute(&type_subst)))
+                            .unwrap_or(FirType::Unit)
+                    })
             } else {
-                FirType::Unit
+                let known_structs = HashMap::new();
+                let known_enums = HashMap::new();
+                ifa_sema::types::Type::from_ast(&p.ty, &known_structs, &known_enums)
+                    .map(|t| FirType::from_sema_type(&t.substitute(&type_subst)))
+                    .unwrap_or(FirType::Unit)
             };
             params.push(FirParam {
                 name: p.name,
@@ -97,7 +113,7 @@ impl<'a> FunctionLoweringContext<'a> {
             });
         }
 
-        let name = func_name_override.unwrap_or(func_ast.name);
+        let name = effective_name;
 
         let mut func = FirFunction::new(
             name,
@@ -309,10 +325,40 @@ impl<'a> FunctionLoweringContext<'a> {
                     _ => None,
                 }
             }
-            ExprKind::MethodCall { method, .. } => self
-                .symbols
-                .lookup_function(method)
-                .map(|func| FirType::from_sema_type(&func.ret_ty)),
+            ExprKind::MethodCall {
+                receiver, method, ..
+            } => {
+                if let Some(&resolved) = self.symbols.method_resolutions.get(&expr.span) {
+                    if let Some(func) = self.symbols.lookup_function(&resolved) {
+                        return Some(FirType::from_sema_type(&func.ret_ty));
+                    }
+                }
+                let rec_fir_ty = self.infer_expr_fir_type(receiver);
+                if let Some(mut cur) = rec_fir_ty.as_ref() {
+                    while let FirType::GenerationalRef(inner)
+                    | FirType::Pointer(inner)
+                    | FirType::Optional(inner) = cur
+                    {
+                        cur = inner;
+                    }
+                    if let FirType::Struct(name, _) = cur {
+                        let specialized = INTERNER.intern(&format!(
+                            "{}__{}",
+                            INTERNER.resolve(name),
+                            INTERNER.resolve(method)
+                        ));
+                        if let Some(f) = self.symbols.lookup_function(&specialized) {
+                            return Some(FirType::from_sema_type(&f.ret_ty));
+                        }
+                        if let Some(f) = self.symbols.lookup_type_method(name, method) {
+                            return Some(FirType::from_sema_type(&f.ret_ty));
+                        }
+                    }
+                }
+                self.symbols
+                    .lookup_function(method)
+                    .map(|func| FirType::from_sema_type(&func.ret_ty))
+            }
             ExprKind::Select { arms } => {
                 arms.first().and_then(|a| self.infer_expr_fir_type(&a.body))
             }
@@ -355,6 +401,62 @@ impl<'a> FunctionLoweringContext<'a> {
             }
         }
         0
+    }
+
+    /// Resolves the concrete monomorphic method target, devirtualizing trait and interface calls AOT.
+    fn resolve_method_call_target(&self, receiver: &Expr, method: Symbol, span: Span) -> Symbol {
+        if let Some(&resolved) = self.symbols.method_resolutions.get(&span) {
+            return resolved;
+        }
+
+        // Monomorphic Devirtualization: Check concrete receiver FIR type
+        let rec_fir_ty = self.infer_expr_fir_type(receiver);
+        let mut rec_struct_name = None;
+        if let Some(mut cur) = rec_fir_ty.as_ref() {
+            while let FirType::GenerationalRef(inner)
+            | FirType::Pointer(inner)
+            | FirType::Optional(inner) = cur
+            {
+                cur = inner;
+            }
+            if let FirType::Struct(name, _) = cur {
+                rec_struct_name = Some(*name);
+            }
+        }
+
+        if let Some(st_name) = rec_struct_name {
+            let specialized = INTERNER.intern(&format!(
+                "{}__{}",
+                INTERNER.resolve(&st_name),
+                INTERNER.resolve(&method)
+            ));
+            if self.symbols.lookup_function(&specialized).is_some()
+                || self.symbols.lookup_type_method(&st_name, &method).is_some()
+            {
+                return specialized;
+            }
+        }
+
+        if let Some(fn_sym) = self.symbols.lookup_function(&method) {
+            if !fn_sym.generics.is_empty() {
+                if let Some(call_args) = self.symbols.call_instantiations.get(&span) {
+                    let concrete_args: Vec<_> = call_args
+                        .iter()
+                        .map(|t| t.substitute(&self.type_subst))
+                        .collect();
+                    crate::types::mangle_instantiation_symbol(
+                        &INTERNER.resolve(&method),
+                        &concrete_args,
+                    )
+                } else {
+                    method
+                }
+            } else {
+                method
+            }
+        } else {
+            method
+        }
     }
 
     fn is_expr_null(&self, expr: &Expr) -> bool {
@@ -1582,29 +1684,8 @@ impl<'a> FunctionLoweringContext<'a> {
                         for a in args {
                             arg_vals.push(self.lower_expr(&a.value));
                         }
-                        let target_fn_name = if let Some(fn_sym) =
-                            self.symbols.lookup_function(method)
-                        {
-                            if !fn_sym.generics.is_empty() {
-                                if let Some(call_args) = self.symbols.call_instantiations.get(&span)
-                                {
-                                    let concrete_args: Vec<_> = call_args
-                                        .iter()
-                                        .map(|t| t.substitute(&self.type_subst))
-                                        .collect();
-                                    crate::types::mangle_instantiation_symbol(
-                                        &INTERNER.resolve(method),
-                                        &concrete_args,
-                                    )
-                                } else {
-                                    *method
-                                }
-                            } else {
-                                *method
-                            }
-                        } else {
-                            *method
-                        };
+                        let target_fn_name =
+                            self.resolve_method_call_target(receiver, *method, span);
 
                         let r = self.alloc_value();
                         self.emit(
@@ -1705,27 +1786,7 @@ impl<'a> FunctionLoweringContext<'a> {
                     for a in args {
                         arg_vals.push(self.lower_expr(&a.value));
                     }
-                    let target_fn_name = if let Some(fn_sym) = self.symbols.lookup_function(method)
-                    {
-                        if !fn_sym.generics.is_empty() {
-                            if let Some(call_args) = self.symbols.call_instantiations.get(&span) {
-                                let concrete_args: Vec<_> = call_args
-                                    .iter()
-                                    .map(|t| t.substitute(&self.type_subst))
-                                    .collect();
-                                crate::types::mangle_instantiation_symbol(
-                                    &INTERNER.resolve(method),
-                                    &concrete_args,
-                                )
-                            } else {
-                                *method
-                            }
-                        } else {
-                            *method
-                        }
-                    } else {
-                        *method
-                    };
+                    let target_fn_name = self.resolve_method_call_target(receiver, *method, span);
 
                     let res = self.alloc_value();
                     self.emit(
@@ -2796,14 +2857,27 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
 
     // 3. Collect all functions (free functions and methods in impl blocks)
     let mut all_functions: HashMap<Symbol, &ifa_ast::Function> = HashMap::new();
+    let mut impl_methods: Vec<(Symbol, &ifa_ast::Function)> = Vec::new();
+
     for item in &program.items {
         match item {
             Item::Function(f) => {
                 all_functions.insert(f.name, f);
             }
             Item::Impl(im) => {
+                let target_name = match &im.target_ty.kind {
+                    ifa_ast::TypeKind::Named(s) => *s,
+                    _ => INTERNER.intern("Type"),
+                };
                 for f in &im.methods {
-                    all_functions.insert(f.name, f);
+                    let mangled_name = INTERNER.intern(&format!(
+                        "{}__{}",
+                        INTERNER.resolve(&target_name),
+                        INTERNER.resolve(&f.name)
+                    ));
+                    impl_methods.push((mangled_name, f));
+                    all_functions.insert(mangled_name, f);
+                    all_functions.entry(f.name).or_insert(f);
                 }
             }
             _ => {}
@@ -2811,20 +2885,30 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
     }
 
     // 4. Lower non-generic functions
-    for func_ast in all_functions.values() {
+    let mut lowered_fn_names = HashSet::new();
+    for (fn_name, func_ast) in &all_functions {
+        // Skip bare aliases for impl methods so we don't emit duplicates
+        if !impl_methods.iter().any(|(m, _)| m == fn_name)
+            && impl_methods.iter().any(|(_, f)| &f.name == fn_name)
+        {
+            continue;
+        }
+
         if func_ast.generics.is_empty() {
             if let Some(body) = &func_ast.body {
-                let ctx = FunctionLoweringContext::new(
-                    func_ast,
-                    symbols,
-                    &constants,
-                    None,
-                    HashMap::new(),
-                    &module.structs,
-                    &module.enums,
-                );
-                let fir_func = ctx.lower(body);
-                module.functions.push(fir_func);
+                if lowered_fn_names.insert(*fn_name) {
+                    let ctx = FunctionLoweringContext::new(
+                        func_ast,
+                        symbols,
+                        &constants,
+                        Some(*fn_name),
+                        HashMap::new(),
+                        &module.structs,
+                        &module.enums,
+                    );
+                    let fir_func = ctx.lower(body);
+                    module.functions.push(fir_func);
+                }
             }
         }
     }

@@ -486,6 +486,15 @@ impl<'a> SemanticAnalyzer<'a> {
             }
         };
 
+        let target_sym = match &im.target_ty.kind {
+            ifa_ast::TypeKind::Named(s) => Some(*s),
+            _ => match &target_ty {
+                Type::Struct { name, .. } => Some(*name),
+                Type::Generic { name, .. } => Some(*name),
+                _ => None,
+            },
+        };
+
         if let Some(tr_name) = im.trait_name {
             self.symbols.register_trait_impl(tr_name, target_ty);
         }
@@ -535,13 +544,43 @@ impl<'a> SemanticAnalyzer<'a> {
                 is_comptime: f.is_comptime,
                 is_extern: f.is_extern.clone(),
                 generics: f.generics.clone(),
-                params,
-                ret_ty,
+                params: params.clone(),
+                ret_ty: ret_ty.clone(),
                 span: f.span,
             };
 
-            if let Err(diag) = self.symbols.define_function(fn_sym) {
-                self.diagnostics.push(diag);
+            if let Some(t_sym) = target_sym {
+                let mangled_name = INTERNER.intern(&format!(
+                    "{}__{}",
+                    INTERNER.resolve(&t_sym),
+                    INTERNER.resolve(&f.name)
+                ));
+
+                let specialized_sym = FunctionSymbol {
+                    name: mangled_name,
+                    is_pub: f.is_pub,
+                    is_strict: f.is_strict,
+                    is_comptime: f.is_comptime,
+                    is_extern: f.is_extern.clone(),
+                    generics: f.generics.clone(),
+                    params,
+                    ret_ty,
+                    span: f.span,
+                };
+
+                let _ = self.symbols.define_function(specialized_sym);
+                self.symbols
+                    .register_type_method(t_sym, f.name, fn_sym.clone());
+
+                if let Some(tr_name) = im.trait_name {
+                    self.symbols
+                        .register_trait_method_impl(tr_name, t_sym, f.name, fn_sym.clone());
+                }
+            }
+
+            // Define fallback in functions table only if no conflict exists
+            if self.symbols.lookup_function(&f.name).is_none() {
+                let _ = self.symbols.define_function(fn_sym);
             }
         }
     }
@@ -605,12 +644,18 @@ impl<'a> SemanticAnalyzer<'a> {
         escape_analyzer.check_function(f);
         self.diagnostics.extend(escape_analyzer.diagnostics);
 
-        // Get function return type from symbol table
-        let ret_ty = self
-            .symbols
-            .lookup_function(&f.name)
-            .map(|sym| sym.ret_ty.clone())
-            .unwrap_or(Type::Unit);
+        // Get function return type from symbol table or AST
+        let known_structs = self.get_known_struct_types();
+        let known_enums = self.get_known_enum_types();
+        let ret_ty = if let Some(ret) = &f.ret_ty {
+            Type::from_ast_with_generics(ret, &known_structs, &known_enums, &f.generics)
+                .unwrap_or(Type::Unit)
+        } else {
+            self.symbols
+                .lookup_function(&f.name)
+                .map(|sym| sym.ret_ty.clone())
+                .unwrap_or(Type::Unit)
+        };
 
         let prev_ret = self.current_func_ret_ty.take();
         let prev_strict = self.current_func_is_strict;
@@ -623,11 +668,21 @@ impl<'a> SemanticAnalyzer<'a> {
         self.symbols.enter_scope(false, true);
 
         // Register parameters as variables in the function scope
-        let fn_params = self
-            .symbols
-            .lookup_function(&f.name)
-            .map(|sym| sym.params.clone())
-            .unwrap_or_default();
+        let fn_params: Vec<ParamSymbol> = f
+            .params
+            .iter()
+            .map(|p| {
+                let ty =
+                    Type::from_ast_with_generics(&p.ty, &known_structs, &known_enums, &f.generics)
+                        .unwrap_or(Type::Unknown);
+                ParamSymbol {
+                    mode: p.mode,
+                    name: p.name,
+                    ty,
+                    span: p.span,
+                }
+            })
+            .collect();
 
         for p in fn_params {
             let is_mut = matches!(p.mode, ParamMode::Mut | ParamMode::InOut);
@@ -2697,6 +2752,35 @@ impl<'a> SemanticAnalyzer<'a> {
                 return Type::Unit;
             }
             _ => {}
+        }
+
+        // Concrete type associated method resolution (AOT devirtualization)
+        let mut rec_struct_sym = None;
+        let mut cur_ty = &effective_rec_ty;
+        while let Type::Ref(inner) = cur_ty {
+            cur_ty = inner;
+        }
+        if let Type::Struct { name, .. } = cur_ty {
+            rec_struct_sym = Some(*name);
+        } else if let Type::Generic { name, .. } = cur_ty {
+            rec_struct_sym = Some(*name);
+        }
+
+        if let Some(st_sym) = rec_struct_sym {
+            if let Some(f) = self.symbols.lookup_type_method(&st_sym, &method).cloned() {
+                let mangled_name = INTERNER.intern(&format!(
+                    "{}__{}",
+                    INTERNER.resolve(&st_sym),
+                    INTERNER.resolve(&method)
+                ));
+                self.symbols.method_resolutions.insert(span, mangled_name);
+
+                let mut full_args = Vec::with_capacity(args.len() + 1);
+                full_args.push(Arg::positional(receiver.clone()));
+                full_args.extend_from_slice(args);
+                let ret = self.check_function_call(&f, &full_args, safe, span);
+                return wrap_optional(ret);
+            }
         }
 
         // Polymorphic methods and UFCS (Uniform Function Call Syntax):

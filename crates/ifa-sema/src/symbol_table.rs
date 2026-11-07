@@ -187,6 +187,9 @@ pub struct SymbolTable {
     pub consts: HashMap<Symbol, ConstSymbol>,
     pub traits: HashMap<Symbol, TraitSymbol>,
     pub trait_impls: HashMap<Symbol, Vec<Type>>,
+    pub type_methods: HashMap<Symbol, HashMap<Symbol, FunctionSymbol>>,
+    pub trait_impl_methods: HashMap<(Symbol, Symbol), HashMap<Symbol, FunctionSymbol>>,
+    pub method_resolutions: HashMap<Span, Symbol>,
     pub modules: HashMap<Symbol, ModuleSymbol>,
     pub imports: Vec<(Vec<Symbol>, Option<Symbol>, Span)>,
     pub expr_types: HashMap<Span, Type>,
@@ -208,6 +211,9 @@ impl SymbolTable {
             consts: HashMap::new(),
             traits: HashMap::new(),
             trait_impls: HashMap::new(),
+            type_methods: HashMap::new(),
+            trait_impl_methods: HashMap::new(),
+            method_resolutions: HashMap::new(),
             modules: HashMap::new(),
             imports: Vec::new(),
             expr_types: HashMap::new(),
@@ -1119,6 +1125,54 @@ impl SymbolTable {
         self.trait_impls.entry(trait_name).or_default().push(ty);
     }
 
+    pub fn register_type_method(
+        &mut self,
+        type_name: Symbol,
+        method_name: Symbol,
+        func: FunctionSymbol,
+    ) {
+        self.type_methods
+            .entry(type_name)
+            .or_default()
+            .insert(method_name, func);
+    }
+
+    pub fn lookup_type_method(
+        &self,
+        type_name: &Symbol,
+        method_name: &Symbol,
+    ) -> Option<&FunctionSymbol> {
+        self.type_methods
+            .get(type_name)
+            .and_then(|m| m.get(method_name))
+    }
+
+    pub fn register_trait_method_impl(
+        &mut self,
+        trait_name: Symbol,
+        type_name: Symbol,
+        method_name: Symbol,
+        func: FunctionSymbol,
+    ) {
+        self.trait_impl_methods
+            .entry((trait_name, type_name))
+            .or_default()
+            .insert(method_name, func.clone());
+        self.register_type_method(type_name, method_name, func);
+    }
+
+    pub fn lookup_trait_method_impl(
+        &self,
+        trait_name: &Symbol,
+        type_name: &Symbol,
+        method_name: &Symbol,
+    ) -> Option<&FunctionSymbol> {
+        self.trait_impl_methods
+            .get(&(*trait_name, *type_name))
+            .and_then(|m| m.get(method_name))
+            .or_else(|| self.lookup_type_method(type_name, method_name))
+    }
+
     pub fn type_implements_trait(&self, ty: &Type, trait_name: &Symbol) -> bool {
         // Unknown suppresses cascading errors
         if matches!(ty, Type::Unknown) {
@@ -1134,6 +1188,18 @@ impl SymbolTable {
             }
         }
 
+        // Extract concrete type symbol if struct
+        let mut type_sym = None;
+        let mut cur = ty;
+        while let Type::Ref(inner) = cur {
+            cur = inner;
+        }
+        if let Type::Struct { name, .. } = cur {
+            type_sym = Some(*name);
+        } else if let Type::Generic { name, .. } = cur {
+            type_sym = Some(*name);
+        }
+
         // If trait definition exists, check structural / method conformity
         if let Some(tr) = self.traits.get(trait_name) {
             if tr.methods.is_empty() {
@@ -1142,13 +1208,21 @@ impl SymbolTable {
 
             for req_m in &tr.methods {
                 let mut found = false;
-                if let Some(f) = self.lookup_function(&req_m.name) {
-                    if let Some(first_p) = f.params.first() {
-                        if ty.is_assignable_to(&first_p.ty)
-                            || matches!(&first_p.ty, Type::Ref(inner) if ty.is_assignable_to(inner))
-                            || matches!(&first_p.ty, Type::TypeParam(_))
-                        {
-                            found = true;
+                // Check if concrete type has an associated method
+                if let Some(st_name) = type_sym {
+                    if self.lookup_type_method(&st_name, &req_m.name).is_some() {
+                        found = true;
+                    }
+                }
+                if !found {
+                    if let Some(f) = self.lookup_function(&req_m.name) {
+                        if let Some(first_p) = f.params.first() {
+                            if ty.is_assignable_to(&first_p.ty)
+                                || matches!(&first_p.ty, Type::Ref(inner) if ty.is_assignable_to(inner))
+                                || matches!(&first_p.ty, Type::TypeParam(_))
+                            {
+                                found = true;
+                            }
                         }
                     }
                 }

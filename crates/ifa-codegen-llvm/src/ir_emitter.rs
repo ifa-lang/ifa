@@ -441,6 +441,36 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push('\n');
         }
 
+        // 3.6. Emit AOT Monomorphic Trait VTables
+        let mut type_to_methods: HashMap<String, Vec<String>> = HashMap::new();
+        for func in &module.functions {
+            let fn_name = INTERNER.resolve(&func.name);
+            if let Some((type_prefix, method_name)) = fn_name.split_once("__") {
+                if !type_prefix.is_empty() && !method_name.is_empty() {
+                    type_to_methods
+                        .entry(type_prefix.to_string())
+                        .or_default()
+                        .push(fn_name);
+                }
+            }
+        }
+        if !type_to_methods.is_empty() {
+            out.push_str("; AOT Monomorphic Trait VTables\n");
+            let mut sorted_types: Vec<_> = type_to_methods.into_iter().collect();
+            sorted_types.sort_by(|a, b| a.0.cmp(&b.0));
+            for (type_name, mut methods) in sorted_types {
+                methods.sort();
+                let ptr_list: Vec<String> = methods.iter().map(|m| format!("ptr @{}", m)).collect();
+                out.push_str(&format!(
+                    "@__ifa_vtable_{} = internal constant [{} x ptr] [{}], align 8\n",
+                    type_name,
+                    ptr_list.len(),
+                    ptr_list.join(", ")
+                ));
+            }
+            out.push('\n');
+        }
+
         // 4. Emit function definitions
         for func in &module.functions {
             self.emit_function(func, module, &mut out)?;
@@ -494,6 +524,8 @@ impl<'a> LlvmIrEmitter<'a> {
 
         let linkage = if func.is_pub {
             "dso_local "
+        } else if fn_name.contains("__") {
+            "linkonce_odr "
         } else {
             "internal "
         };
@@ -1062,6 +1094,38 @@ impl<'a> LlvmIrEmitter<'a> {
                     }
                 }
             }
+            ValueExpr::Call { callee, args } => {
+                let ret_ty_str = value_types
+                    .get(&ifa_fir::ValueId(res_id))
+                    .map(|t| fir_to_llvm_type(t).unwrap_or_else(|_| "i64".to_string()))
+                    .unwrap_or_else(|| "i64".to_string());
+                let args_str: Vec<String> = args
+                    .iter()
+                    .map(|a| {
+                        let ty = value_types
+                            .get(a)
+                            .map(|t| fir_to_llvm_type(t).unwrap_or_else(|_| "i64".to_string()))
+                            .unwrap_or_else(|| "i64".to_string());
+                        format!("{} %v{}", ty, a.0)
+                    })
+                    .collect();
+                if ret_ty_str == "void" {
+                    out.push_str(&format!(
+                        "  call void %v{}({})\n",
+                        callee.0,
+                        args_str.join(", ")
+                    ));
+                    out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
+                } else {
+                    out.push_str(&format!(
+                        "  %v{} = call {} %v{}({})\n",
+                        res_id,
+                        ret_ty_str,
+                        callee.0,
+                        args_str.join(", ")
+                    ));
+                }
+            }
             ValueExpr::GenAlloc { .. } => {
                 out.push_str(&format!(
                     "  %v{} = call ptr @ifa_rt_gen_alloc(i64 64, i64 8, i16 0)\n",
@@ -1415,6 +1479,23 @@ impl<'a> LlvmIrEmitter<'a> {
                         args_str.join(", ")
                     ));
                 }
+            }
+            ValueExpr::Call { callee, args } => {
+                let args_str: Vec<String> = args
+                    .iter()
+                    .map(|a| {
+                        let ty = value_types
+                            .get(a)
+                            .map(|t| fir_to_llvm_type(t).unwrap_or_else(|_| "i64".to_string()))
+                            .unwrap_or_else(|| "i64".to_string());
+                        format!("{} %v{}", ty, a.0)
+                    })
+                    .collect();
+                out.push_str(&format!(
+                    "  call void %v{}({})\n",
+                    callee.0,
+                    args_str.join(", ")
+                ));
             }
             ValueExpr::GenFree { ptr } => {
                 out.push_str(&format!("  call void @ifa_rt_gen_free(ptr %v{})\n", ptr.0));

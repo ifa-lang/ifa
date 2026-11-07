@@ -546,3 +546,63 @@ fn test_cranelift_jit_channel_select_operations() {
     let result = jit.run_main().expect("Failed to run select JIT");
     assert_eq!(result, 1);
 }
+
+#[test]
+fn test_cranelift_jit_monomorphized_trait_specialization() {
+    let src = r#"
+        trait Calculator {
+            fn compute(self) -> i64;
+        }
+
+        struct Adder {
+            a: i64,
+            b: i64,
+        }
+
+        impl Calculator for Adder {
+            fn compute(add: Adder) -> i64 {
+                return add.a + add.b;
+            }
+        }
+
+        struct Multiplier {
+            x: i64,
+            y: i64,
+        }
+
+        impl Calculator for Multiplier {
+            fn compute(mul: Multiplier) -> i64 {
+                return mul.x * mul.y;
+            }
+        }
+
+        fn execute_calc<T: Calculator>(c: T) -> i64 {
+            return c.compute();
+        }
+
+        pub fn main() -> i64 {
+            let a = Adder(a: 20, b: 22);
+            let m = Multiplier(x: 10, y: 5);
+            return execute_calc(a) + execute_calc(m);
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("trait_jit.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, _) = parse(fid, tokens);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile monomorphized trait FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 92);
+}

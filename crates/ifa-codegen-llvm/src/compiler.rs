@@ -71,21 +71,24 @@ impl LlvmCompiler {
 
         // Try compiling via clang or llc if available
         let mut clang_cmd = Command::new("clang");
+        clang_cmd.arg(format!("--target={}", self.target.triple));
         clang_cmd.arg(format!("-O{}", self.opt_level));
         if self.lto != "none" {
             clang_cmd.arg(format!("-flto={}", self.lto));
+        } else {
+            clang_cmd.arg("-fno-lto");
         }
-        let clang_status = clang_cmd
+        let clang_output = clang_cmd
             .arg("-c")
             .arg(&ll_path)
             .arg("-o")
             .arg(output_obj)
-            .status();
+            .output();
 
-        match clang_status {
-            Ok(s) if s.success() => Ok(()),
+        match clang_output {
+            Ok(ref out) if out.status.success() => Ok(()),
             _ => {
-                // Clang not found or failed on LLVM IR; fallback to Cranelift AOT object generator
+                // Clang not found or failed; fallback to Cranelift AOT object generator
                 let compiler = ifa_codegen_cranelift::AotCompiler::new()
                     .map_err(|e| LlvmCodegenError::Toolchain(e.to_string()))?;
                 compiler
@@ -254,6 +257,9 @@ impl LlvmCompiler {
 
     /// Link an object file into a standalone executable.
     pub fn link_executable(object_path: &Path, output_bin: &Path) -> Result<(), LlvmCodegenError> {
+        if let Ok(()) = Self::link_executable_with_lto(object_path, output_bin, "thin") {
+            return Ok(());
+        }
         Self::link_executable_with_lto(object_path, output_bin, "none")
     }
 }

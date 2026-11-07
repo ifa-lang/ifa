@@ -499,3 +499,130 @@ fn test_llvm_auto_vectorization_loop_codegen() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_aot_monomorphic_trait_specialization() {
+    let src = r#"
+        trait Shape {
+            fn area(self: Shape) -> i64;
+        }
+
+        struct Circle {
+            r: i64,
+        }
+
+        impl Shape for Circle {
+            fn area(c: Circle) -> i64 {
+                return c.r * c.r;
+            }
+        }
+
+        struct Square {
+            s: i64,
+        }
+
+        impl Shape for Square {
+            fn area(sq: Square) -> i64 {
+                return sq.s * sq.s;
+            }
+        }
+
+        fn compute<T: Shape>(item: T) -> i64 {
+            return item.area();
+        }
+
+        pub fn main() -> i64 {
+            let c = Circle(r: 5);
+            let s = Square(s: 10);
+            return compute(c) + compute(s);
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("trait_monomorph.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).expect("FIR lowering failed");
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&module).expect("Emission failed");
+
+    // 1. Verify AOT monomorphic trait method definitions were emitted with specialized names
+    assert!(
+        ir.contains("@Circle__area"),
+        "IR must contain @Circle__area: {}",
+        ir
+    );
+    assert!(
+        ir.contains("@Square__area"),
+        "IR must contain @Square__area: {}",
+        ir
+    );
+
+    // 2. Verify VTables were generated for both implementors
+    assert!(
+        ir.contains("@__ifa_vtable_Circle"),
+        "IR must contain @__ifa_vtable_Circle"
+    );
+    assert!(
+        ir.contains("@__ifa_vtable_Square"),
+        "IR must contain @__ifa_vtable_Square"
+    );
+
+    // 3. Verify monomorphized generic instantiations were emitted
+    assert!(
+        ir.contains("@compute__Circle"),
+        "IR must contain @compute__Circle"
+    );
+    assert!(
+        ir.contains("@compute__Square"),
+        "IR must contain @compute__Square"
+    );
+
+    // 4. Verify devirtualized direct static calls inside the monomorphized functions
+    assert!(
+        ir.contains("call i64 @Circle__area"),
+        "Trait call must be devirtualized to @Circle__area"
+    );
+    assert!(
+        ir.contains("call i64 @Square__area"),
+        "Trait call must be devirtualized to @Square__area"
+    );
+
+    // 5. Verify compilation to native executable and actual execution produces 125
+    let temp_dir = std::env::temp_dir().join(format!("llvm_trait_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("trait.o");
+    let bin_path = temp_dir.join("trait_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(125),
+        "Native binary output exit code must be 125 (5*5 + 10*10)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

@@ -1306,3 +1306,55 @@ fn test_flow_sensitive_narrowing_reassigned_null_invalidated() {
         "Expected E0007 on access after reassigning null"
     );
 }
+
+#[test]
+fn test_multiple_structs_implementing_same_trait_monomorphic_resolution() {
+    let code = r#"
+        trait Describable {
+            fn describe(self) -> String;
+        }
+
+        struct Book {
+            title: String,
+        }
+
+        impl Describable for Book {
+            fn describe(b: Book) -> String {
+                return b.title;
+            }
+        }
+
+        struct Person {
+            name: String,
+        }
+
+        impl Describable for Person {
+            fn describe(p: Person) -> String {
+                return p.name;
+            }
+        }
+
+        fn print_item<T: Describable>(item: T) -> String {
+            return item.describe();
+        }
+
+        pub fn main() {
+            let b = Book(title: "The IFA Architecture");
+            let p = Person(name: "Dieudonne");
+
+            // Direct devirtualized method calls
+            let desc_b = b.describe();
+            let desc_p = p.describe();
+
+            // Monomorphized generic calls
+            let s1 = print_item(b);
+            let s2 = print_item(p);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Multiple structs implementing same trait without method collision must succeed, diagnostics: {:?}",
+        res.diagnostics
+    );
+}
