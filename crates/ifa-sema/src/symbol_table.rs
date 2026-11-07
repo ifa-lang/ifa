@@ -114,6 +114,49 @@ pub struct ConstSymbol {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleSymbol {
+    pub name: Symbol,
+    pub path: Vec<Symbol>,
+    pub is_pub: bool,
+    pub span: Span,
+    pub functions: HashMap<Symbol, FunctionSymbol>,
+    pub structs: HashMap<Symbol, StructSymbol>,
+    pub enums: HashMap<Symbol, EnumSymbol>,
+    pub consts: HashMap<Symbol, ConstSymbol>,
+}
+
+impl ModuleSymbol {
+    pub fn new(name: Symbol, path: Vec<Symbol>, is_pub: bool, span: Span) -> Self {
+        Self {
+            name,
+            path,
+            is_pub,
+            span,
+            functions: HashMap::new(),
+            structs: HashMap::new(),
+            enums: HashMap::new(),
+            consts: HashMap::new(),
+        }
+    }
+
+    pub fn add_function(&mut self, func: FunctionSymbol) {
+        self.functions.insert(func.name, func);
+    }
+
+    pub fn add_struct(&mut self, st: StructSymbol) {
+        self.structs.insert(st.name, st);
+    }
+
+    pub fn add_enum(&mut self, en: EnumSymbol) {
+        self.enums.insert(en.name, en);
+    }
+
+    pub fn add_const(&mut self, c: ConstSymbol) {
+        self.consts.insert(c.name, c);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Scope {
     pub depth: usize,
@@ -142,6 +185,8 @@ pub struct SymbolTable {
     pub consts: HashMap<Symbol, ConstSymbol>,
     pub traits: HashMap<Symbol, TraitSymbol>,
     pub trait_impls: HashMap<Symbol, Vec<Type>>,
+    pub modules: HashMap<Symbol, ModuleSymbol>,
+    pub imports: Vec<(Vec<Symbol>, Option<Symbol>, Span)>,
     pub expr_types: HashMap<Span, Type>,
     pub generic_function_instances: HashMap<Symbol, Vec<Vec<Type>>>,
     pub generic_struct_instances: HashMap<Symbol, Vec<Vec<Type>>>,
@@ -159,6 +204,8 @@ impl SymbolTable {
             consts: HashMap::new(),
             traits: HashMap::new(),
             trait_impls: HashMap::new(),
+            modules: HashMap::new(),
+            imports: Vec::new(),
             expr_types: HashMap::new(),
             generic_function_instances: HashMap::new(),
             generic_struct_instances: HashMap::new(),
@@ -167,6 +214,75 @@ impl SymbolTable {
         };
         table.init_builtins();
         table
+    }
+
+    /// Define a module namespace in the symbol table.
+    pub fn define_module(&mut self, module: ModuleSymbol) -> Result<(), Diagnostic> {
+        if let Some(existing) = self.modules.get(&module.name) {
+            let mod_name = INTERNER.resolve(&module.name);
+            return Err(
+                Diagnostic::error(format!("module '{}' déjà défini", mod_name))
+                    .with_code("E0008")
+                    .with_primary_label(module.span, "redéfinition du module")
+                    .with_secondary_label(existing.span, "première définition ici"),
+            );
+        }
+        self.modules.insert(module.name, module);
+        Ok(())
+    }
+
+    /// Lookup a module by its local name or alias.
+    pub fn lookup_module(&self, name: &Symbol) -> Option<&ModuleSymbol> {
+        self.modules.get(name)
+    }
+
+    /// Lookup a mutable module by its local name or alias.
+    pub fn lookup_module_mut(&mut self, name: &Symbol) -> Option<&mut ModuleSymbol> {
+        self.modules.get_mut(name)
+    }
+
+    /// Lookup a qualified function in a module (returns the symbol and its `is_pub` visibility).
+    pub fn lookup_qualified_function(
+        &self,
+        module_name: &Symbol,
+        fn_name: &Symbol,
+    ) -> Option<(&FunctionSymbol, bool)> {
+        let module = self.lookup_module(module_name)?;
+        let func = module.functions.get(fn_name)?;
+        Some((func, func.is_pub))
+    }
+
+    /// Lookup a qualified struct in a module (returns the symbol and its `is_pub` visibility).
+    pub fn lookup_qualified_struct(
+        &self,
+        module_name: &Symbol,
+        st_name: &Symbol,
+    ) -> Option<(&StructSymbol, bool)> {
+        let module = self.lookup_module(module_name)?;
+        let st = module.structs.get(st_name)?;
+        Some((st, st.is_pub))
+    }
+
+    /// Lookup a qualified enum in a module (returns the symbol and its `is_pub` visibility).
+    pub fn lookup_qualified_enum(
+        &self,
+        module_name: &Symbol,
+        en_name: &Symbol,
+    ) -> Option<(&EnumSymbol, bool)> {
+        let module = self.lookup_module(module_name)?;
+        let en = module.enums.get(en_name)?;
+        Some((en, en.is_pub))
+    }
+
+    /// Lookup a qualified constant in a module (returns the symbol and its `is_pub` visibility).
+    pub fn lookup_qualified_const(
+        &self,
+        module_name: &Symbol,
+        c_name: &Symbol,
+    ) -> Option<(&ConstSymbol, bool)> {
+        let module = self.lookup_module(module_name)?;
+        let c = module.consts.get(c_name)?;
+        Some((c, c.is_pub))
     }
 
     /// Records a concrete generic function instantiation for monomorphization.
@@ -220,7 +336,500 @@ impl SymbolTable {
     }
 
     fn init_builtins(&mut self) {
-        // Builtin functions could be registered here
+        let dummy = Span::dummy();
+
+        // 1. Module `std::io` / `io`
+        let io_name = INTERNER.intern("io");
+        let std_io_name = INTERNER.intern("std::io");
+        let mut io_mod =
+            ModuleSymbol::new(io_name, vec![INTERNER.intern("std"), io_name], true, dummy);
+        let msg_sym = INTERNER.intern("msg");
+        io_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("println"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: msg_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Unit,
+            span: dummy,
+        });
+        io_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("print"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: msg_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Unit,
+            span: dummy,
+        });
+        io_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("read_line"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        io_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("flush"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Unit,
+            span: dummy,
+        });
+        self.modules.insert(io_name, io_mod.clone());
+        self.modules.insert(std_io_name, io_mod);
+
+        // 2. Module `std::fs` / `fs`
+        let fs_name = INTERNER.intern("fs");
+        let std_fs_name = INTERNER.intern("std::fs");
+        let mut fs_mod =
+            ModuleSymbol::new(fs_name, vec![INTERNER.intern("std"), fs_name], true, dummy);
+        let path_sym = INTERNER.intern("path");
+        let content_sym = INTERNER.intern("content");
+        fs_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("read_to_string"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: path_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        fs_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("write_string"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: path_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: content_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        fs_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("exists"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: path_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        fs_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("file_size"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: path_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::U64),
+            span: dummy,
+        });
+        self.modules.insert(fs_name, fs_mod.clone());
+        self.modules.insert(std_fs_name, fs_mod);
+
+        // 3. Module `net::http` / `http`
+        let http_name = INTERNER.intern("http");
+        let net_http_name = INTERNER.intern("net::http");
+        let mut http_mod = ModuleSymbol::new(
+            http_name,
+            vec![INTERNER.intern("net"), http_name],
+            true,
+            dummy,
+        );
+        let port_sym = INTERNER.intern("port");
+        let url_sym = INTERNER.intern("url");
+        let body_sym = INTERNER.intern("body");
+        let http_server_ty = Type::Struct {
+            name: INTERNER.intern("HttpServer"),
+            fields: Vec::new(),
+        };
+        let http_client_ty = Type::Struct {
+            name: INTERNER.intern("HttpClient"),
+            fields: Vec::new(),
+        };
+        let http_resp_ty = Type::Struct {
+            name: INTERNER.intern("HttpResponse"),
+            fields: Vec::new(),
+        };
+        http_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("Server"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: port_sym,
+                ty: Type::Int(crate::types::IntType::U16),
+                span: dummy,
+            }],
+            ret_ty: http_server_ty,
+            span: dummy,
+        });
+        http_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("Client"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: http_client_ty,
+            span: dummy,
+        });
+        http_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("get"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: url_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: http_resp_ty.clone(),
+            span: dummy,
+        });
+        http_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("post"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: url_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: body_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+            ],
+            ret_ty: http_resp_ty,
+            span: dummy,
+        });
+        self.modules.insert(http_name, http_mod.clone());
+        self.modules.insert(net_http_name, http_mod);
+
+        // 4. Module `encoding::json` / `json`
+        let json_name = INTERNER.intern("json");
+        let enc_json_name = INTERNER.intern("encoding::json");
+        let mut json_mod = ModuleSymbol::new(
+            json_name,
+            vec![INTERNER.intern("encoding"), json_name],
+            true,
+            dummy,
+        );
+        json_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("decode"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("input"),
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Unknown,
+            span: dummy,
+        });
+        json_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("encode"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("val"),
+                ty: Type::Unknown,
+                span: dummy,
+            }],
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        self.modules.insert(json_name, json_mod.clone());
+        self.modules.insert(enc_json_name, json_mod);
+
+        // 5. Module `encoding::csv` / `csv`
+        let csv_name = INTERNER.intern("csv");
+        let enc_csv_name = INTERNER.intern("encoding::csv");
+        let mut csv_mod = ModuleSymbol::new(
+            csv_name,
+            vec![INTERNER.intern("encoding"), csv_name],
+            true,
+            dummy,
+        );
+        let csv_table_ty = Type::Struct {
+            name: INTERNER.intern("CsvTable"),
+            fields: Vec::new(),
+        };
+        csv_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("decode"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("input"),
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: csv_table_ty.clone(),
+            span: dummy,
+        });
+        csv_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("encode"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("table"),
+                ty: csv_table_ty,
+                span: dummy,
+            }],
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        self.modules.insert(csv_name, csv_mod.clone());
+        self.modules.insert(enc_csv_name, csv_mod);
+
+        // 6. Module `crypto`
+        let crypto_name = INTERNER.intern("crypto");
+        let mut crypto_mod = ModuleSymbol::new(crypto_name, vec![crypto_name], true, dummy);
+        crypto_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("sha256_hex"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("data"),
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        crypto_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("blake3_hex"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("data"),
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        self.modules.insert(crypto_name, crypto_mod);
+
+        // 7. Module `sync`
+        let sync_name = INTERNER.intern("sync");
+        let mut sync_mod = ModuleSymbol::new(sync_name, vec![sync_name], true, dummy);
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("channel"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Unknown,
+            span: dummy,
+        });
+        sync_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("WaitGroup"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Struct {
+                name: INTERNER.intern("WaitGroup"),
+                fields: Vec::new(),
+            },
+            span: dummy,
+        });
+        self.modules.insert(sync_name, sync_mod);
+
+        // 8. Module `math`
+        let math_name = INTERNER.intern("math");
+        let mut math_mod = ModuleSymbol::new(math_name, vec![math_name], true, dummy);
+        let x_sym = INTERNER.intern("x");
+        let a_sym = INTERNER.intern("a");
+        let b_sym = INTERNER.intern("b");
+        let f64_ty = Type::Float(crate::types::FloatType::F64);
+        math_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("abs"),
+            is_pub: true,
+            is_strict: true,
+            is_comptime: true,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: x_sym,
+                ty: f64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: f64_ty.clone(),
+            span: dummy,
+        });
+        math_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("sqrt"),
+            is_pub: true,
+            is_strict: true,
+            is_comptime: true,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: x_sym,
+                ty: f64_ty.clone(),
+                span: dummy,
+            }],
+            ret_ty: f64_ty.clone(),
+            span: dummy,
+        });
+        math_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("min"),
+            is_pub: true,
+            is_strict: true,
+            is_comptime: true,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: a_sym,
+                    ty: f64_ty.clone(),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: b_sym,
+                    ty: f64_ty.clone(),
+                    span: dummy,
+                },
+            ],
+            ret_ty: f64_ty.clone(),
+            span: dummy,
+        });
+        math_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("max"),
+            is_pub: true,
+            is_strict: true,
+            is_comptime: true,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: a_sym,
+                    ty: f64_ty.clone(),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: b_sym,
+                    ty: f64_ty.clone(),
+                    span: dummy,
+                },
+            ],
+            ret_ty: f64_ty.clone(),
+            span: dummy,
+        });
+        math_mod.add_const(ConstSymbol {
+            name: INTERNER.intern("PI"),
+            is_pub: true,
+            ty: f64_ty,
+            span: dummy,
+        });
+        self.modules.insert(math_name, math_mod);
     }
 
     pub fn enter_scope(&mut self, is_loop: bool, is_function_root: bool) {

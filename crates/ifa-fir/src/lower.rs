@@ -1099,43 +1099,48 @@ impl<'a> FunctionLoweringContext<'a> {
                     _ => None,
                 };
 
-                // Check if calling a Struct constructor directly (e.g. WindowNode(id: ..., parent: ...))
-                if let Some(struct_name) = direct_name {
-                    if let Some(st) = self.symbols.lookup_struct(&struct_name) {
-                        let target_struct_name = if !st.generics.is_empty() {
-                            if let Some(call_args) = self.symbols.call_instantiations.get(&span) {
-                                let concrete_args: Vec<_> = call_args
-                                    .iter()
-                                    .map(|t| t.substitute(&self.type_subst))
-                                    .collect();
-                                crate::types::mangle_instantiation_symbol(
-                                    &INTERNER.resolve(&struct_name),
-                                    &concrete_args,
-                                )
-                            } else {
-                                struct_name
-                            }
+                // Check if calling a Struct constructor directly (e.g. WindowNode(id: ..., parent: ...) or geo::Rectangle(...))
+                let module_struct = if let ExprKind::Path(path) = &callee.kind {
+                    if path.len() >= 2 {
+                        self.symbols
+                            .lookup_module(&path[0])
+                            .and_then(|m| m.structs.get(&path[1]))
+                            .cloned()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(st) = module_struct.or_else(|| {
+                    direct_name.and_then(|name| self.symbols.lookup_struct(&name).cloned())
+                }) {
+                    let struct_name = st.name;
+                    let target_struct_name = if !st.generics.is_empty() {
+                        if let Some(call_args) = self.symbols.call_instantiations.get(&span) {
+                            let concrete_args: Vec<_> = call_args
+                                .iter()
+                                .map(|t| t.substitute(&self.type_subst))
+                                .collect();
+                            crate::types::mangle_instantiation_symbol(
+                                &INTERNER.resolve(&struct_name),
+                                &concrete_args,
+                            )
                         } else {
                             struct_name
-                        };
+                        }
+                    } else {
+                        struct_name
+                    };
 
-                        let mut ordered_fields = Vec::new();
-                        for field_sym in &st.fields {
-                            if let Some(arg) = args.iter().find(|a| a.name == Some(field_sym.name))
-                            {
+                    let mut ordered_fields = Vec::new();
+                    for field_sym in &st.fields {
+                        if let Some(arg) = args.iter().find(|a| a.name == Some(field_sym.name)) {
+                            ordered_fields.push(self.lower_expr(&arg.value));
+                        } else if let Some(idx) = st.field_indices.get(&field_sym.name) {
+                            if let Some(arg) = args.get(*idx) {
                                 ordered_fields.push(self.lower_expr(&arg.value));
-                            } else if let Some(idx) = st.field_indices.get(&field_sym.name) {
-                                if let Some(arg) = args.get(*idx) {
-                                    ordered_fields.push(self.lower_expr(&arg.value));
-                                } else {
-                                    let unit_val = self.alloc_value();
-                                    self.emit(
-                                        Some(unit_val),
-                                        ValueExpr::Constant(ConstantValue::Unit),
-                                        span,
-                                    );
-                                    ordered_fields.push(unit_val);
-                                }
                             } else {
                                 let unit_val = self.alloc_value();
                                 self.emit(
@@ -1145,18 +1150,26 @@ impl<'a> FunctionLoweringContext<'a> {
                                 );
                                 ordered_fields.push(unit_val);
                             }
+                        } else {
+                            let unit_val = self.alloc_value();
+                            self.emit(
+                                Some(unit_val),
+                                ValueExpr::Constant(ConstantValue::Unit),
+                                span,
+                            );
+                            ordered_fields.push(unit_val);
                         }
-                        let res = self.alloc_value();
-                        self.emit(
-                            Some(res),
-                            ValueExpr::StructInit {
-                                name: target_struct_name,
-                                fields: ordered_fields,
-                            },
-                            span,
-                        );
-                        return res;
                     }
+                    let res = self.alloc_value();
+                    self.emit(
+                        Some(res),
+                        ValueExpr::StructInit {
+                            name: target_struct_name,
+                            fields: ordered_fields,
+                        },
+                        span,
+                    );
+                    return res;
                 }
 
                 let mut arg_vals = Vec::new();

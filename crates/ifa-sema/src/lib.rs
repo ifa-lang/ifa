@@ -57,6 +57,20 @@ pub fn analyze(source_map: &SourceMap, program: &Program) -> AnalysisResult {
     }
 }
 
+/// Performs semantic analysis using a pre-configured symbol table (e.g. with pre-registered modules).
+pub fn analyze_with_symbols(
+    source_map: &SourceMap,
+    program: &Program,
+    symbols: SymbolTable,
+) -> AnalysisResult {
+    let analyzer = SemanticAnalyzer::with_symbols(source_map, symbols);
+    let (symbols, diagnostics) = analyzer.analyze(program);
+    AnalysisResult {
+        symbols,
+        diagnostics,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

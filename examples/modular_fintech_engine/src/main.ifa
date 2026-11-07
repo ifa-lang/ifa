@@ -1,0 +1,33 @@
+//! Entrypoint for the Modular Fintech Engine
+//! Demonstrates cross-module imports, strict deterministic execution, and reconciliation.
+
+import accounting::ledger as ledger;
+import security::hasher as hasher;
+import std::io;
+
+pub fn main() {
+    io::println("Starting IFA Modular Fintech Engine...");
+
+    mut sender_acc = ledger::AccountBalance(account_id: 101, balance_xof: 500000);
+    mut recipient_acc = ledger::AccountBalance(account_id: 202, balance_xof: 100000);
+    let total_capital: i64 = 600000;
+
+    let transfer_amount: i64 = 75000;
+    let tx = ledger::create_transaction(1, transfer_amount, sender_acc.account_id, recipient_acc.account_id);
+
+    // Execute transfer
+    sender_acc = ledger::apply_debit(sender_acc, tx.amount_xof);
+    recipient_acc = ledger::apply_credit(recipient_acc, tx.amount_xof);
+
+    // Audit and cryptographic check
+    let audit = hasher::generate_audit_record(tx.id, tx.amount_xof);
+
+    // Verify system integrity
+    let is_valid = ledger::verify_integrity(sender_acc, recipient_acc, total_capital);
+
+    if is_valid {
+        io::println("Ledger reconciliation integrity verified: 100% matched");
+    } else {
+        io::println("ERROR: Ledger reconciliation discrepancy detected!");
+    }
+}

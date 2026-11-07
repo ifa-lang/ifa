@@ -946,3 +946,124 @@ fn test_impl_trait_for_type_satisfaction() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_import_builtin_modules_and_qualified_access() {
+    let code = r#"
+        import std::io;
+        import math;
+        import encoding::json as j;
+
+        pub fn main() {
+            let s = math::sqrt(16.0);
+            let pi = math::PI;
+            io::println("Computed square root and PI");
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Valid imports of built-in std::io, math and encoding::json must succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_import_nonexistent_module_rejected() {
+    let code = r#"
+        import non::existent::network::adapter;
+
+        pub fn main() {
+            let x = 42;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Importing an unknown/non-existent module must trigger a semantic error"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0010")),
+        "Expected E0010 diagnostic for missing module, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_module_private_member_access_rejected() {
+    use ifa_lexer::tokenize;
+    use ifa_parser::parse;
+    use ifa_sema::symbol_table::{FunctionSymbol, ModuleSymbol, ParamSymbol};
+    use ifa_span::{sym, BytePos, FileId, SourceMap, Span};
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file(
+        "test_mod.ifa",
+        r#"
+        import custom::auth as auth;
+
+        pub fn main() {
+            let pub_ok = auth::login("admin");
+            let priv_fail = auth::internal_hash("secret");
+        }
+    "#,
+    );
+    let tokens = tokenize(fid, sm.get_file(fid).unwrap().src.as_str());
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty());
+
+    let mut analyzer = ifa_sema::SemanticAnalyzer::new(&sm);
+
+    // Pre-register a custom module with 1 public and 1 private function
+    let dummy = Span::new(FileId(0), BytePos(0), BytePos(0));
+    let mut custom_mod = ModuleSymbol::new(
+        sym("custom::auth"),
+        vec![sym("custom"), sym("auth")],
+        true,
+        dummy,
+    );
+    custom_mod.add_function(FunctionSymbol {
+        name: sym("login"),
+        is_pub: true,
+        is_strict: false,
+        is_comptime: false,
+        is_extern: None,
+        generics: Vec::new(),
+        params: vec![ParamSymbol {
+            mode: ifa_ast::ParamMode::In,
+            name: sym("user"),
+            ty: ifa_sema::Type::String,
+            span: dummy,
+        }],
+        ret_ty: ifa_sema::Type::Bool,
+        span: dummy,
+    });
+    custom_mod.add_function(FunctionSymbol {
+        name: sym("internal_hash"),
+        is_pub: false, // Private!
+        is_strict: false,
+        is_comptime: false,
+        is_extern: None,
+        generics: Vec::new(),
+        params: vec![ParamSymbol {
+            mode: ifa_ast::ParamMode::In,
+            name: sym("key"),
+            ty: ifa_sema::Type::String,
+            span: dummy,
+        }],
+        ret_ty: ifa_sema::Type::String,
+        span: dummy,
+    });
+    analyzer.symbols.define_module(custom_mod).unwrap();
+
+    let (_, diagnostics) = analyzer.analyze(&prog);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0011")),
+        "Expected E0011 diagnostic for accessing private module function, got: {:?}",
+        diagnostics
+    );
+}

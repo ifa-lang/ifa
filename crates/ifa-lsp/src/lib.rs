@@ -132,6 +132,68 @@ mod tests {
     }
 
     #[test]
+    fn test_lsp_colon_colon_namespace_completion() {
+        let mut server = LanguageServer::new();
+        let code = r#"
+            import math;
+
+            pub fn main() {
+                let x = math::
+            }
+        "#;
+
+        let open_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/math_test.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": code
+                }
+            }
+        })
+        .to_string();
+
+        server.handle_message(&open_notif);
+
+        // Completion right after `math::` (line 4, column 30)
+        let completion_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 102,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": { "uri": "file:///workspace/math_test.ifa" },
+                "position": { "line": 4, "character": 30 }
+            }
+        })
+        .to_string();
+
+        let (resp, _) = server.handle_message(&completion_req);
+        assert!(resp.is_some());
+        let resp_val: serde_json::Value = serde_json::from_str(&resp.unwrap()).unwrap();
+        let items = resp_val["result"]["items"].as_array().unwrap();
+        assert!(
+            !items.is_empty(),
+            "Completion items after math:: must not be empty"
+        );
+        let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+        assert!(
+            labels.contains(&"sqrt"),
+            "Completion after math:: must propose `sqrt`"
+        );
+        assert!(
+            labels.contains(&"abs"),
+            "Completion after math:: must propose `abs`"
+        );
+        assert!(
+            labels.contains(&"PI"),
+            "Completion after math:: must propose `PI`"
+        );
+    }
+
+    #[test]
     fn test_lsp_hover() {
         let mut server = LanguageServer::new();
         let code = r#"

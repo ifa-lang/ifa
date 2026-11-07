@@ -92,7 +92,8 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
 
             for inst in &block.instructions {
                 let res = self.translate_expr(inst.result, &inst.expr)?;
-                if let (Some(val_id), Some(cl_val)) = (inst.result, res) {
+                if let Some(val_id) = inst.result {
+                    let cl_val = res.unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
                     self.value_map.insert(val_id, cl_val);
                 }
             }
@@ -634,7 +635,14 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let target_cl_block = self.block_map[target];
                 let cl_args: Vec<BlockArg> = args
                     .iter()
-                    .map(|a| BlockArg::from(self.value_map[a]))
+                    .map(|a| {
+                        let val = self
+                            .value_map
+                            .get(a)
+                            .copied()
+                            .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
+                        BlockArg::from(val)
+                    })
                     .collect();
                 self.builder.ins().jump(target_cl_block, &cl_args);
             }
@@ -645,16 +653,34 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 else_block,
                 else_args,
             } => {
-                let c = self.value_map[cond];
+                let c = self
+                    .value_map
+                    .get(cond)
+                    .copied()
+                    .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
                 let then_cl = self.block_map[then_block];
                 let else_cl = self.block_map[else_block];
                 let then_cl_args: Vec<BlockArg> = then_args
                     .iter()
-                    .map(|a| BlockArg::from(self.value_map[a]))
+                    .map(|a| {
+                        let val = self
+                            .value_map
+                            .get(a)
+                            .copied()
+                            .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
+                        BlockArg::from(val)
+                    })
                     .collect();
                 let else_cl_args: Vec<BlockArg> = else_args
                     .iter()
-                    .map(|a| BlockArg::from(self.value_map[a]))
+                    .map(|a| {
+                        let val = self
+                            .value_map
+                            .get(a)
+                            .copied()
+                            .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
+                        BlockArg::from(val)
+                    })
                     .collect();
                 self.builder
                     .ins()
@@ -666,11 +692,22 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 default_block,
                 default_args,
             } => {
-                let switch_val = self.value_map[val];
+                let switch_val = self
+                    .value_map
+                    .get(val)
+                    .copied()
+                    .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
                 let default_cl_block = self.block_map[default_block];
                 let default_cl_args: Vec<BlockArg> = default_args
                     .iter()
-                    .map(|a| BlockArg::from(self.value_map[a]))
+                    .map(|a| {
+                        let v = self
+                            .value_map
+                            .get(a)
+                            .copied()
+                            .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
+                        BlockArg::from(v)
+                    })
                     .collect();
 
                 if cases.is_empty() {

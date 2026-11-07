@@ -656,11 +656,20 @@ impl<'a> LlvmIrEmitter<'a> {
             ValueExpr::GetField {
                 base, field_idx, ..
             } => {
-                out.push_str(&format!(
-                    "  %gep_{} = getelementptr inbounds i64, ptr %v{}, i32 {}\n",
-                    res_id, base.0, field_idx
-                ));
-                out.push_str(&format!("  %v{} = load i64, ptr %gep_{}\n", res_id, res_id));
+                let base_ty = value_types.get(base);
+                if let Some(ifa_fir::FirType::Struct(s_sym, _)) = base_ty {
+                    let s_name = INTERNER.resolve(s_sym);
+                    out.push_str(&format!(
+                        "  %v{} = extractvalue %struct.{} %v{}, {}\n",
+                        res_id, s_name, base.0, field_idx
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  %gep_{} = getelementptr inbounds i64, ptr %v{}, i32 {}\n",
+                        res_id, base.0, field_idx
+                    ));
+                    out.push_str(&format!("  %v{} = load i64, ptr %gep_{}\n", res_id, res_id));
+                }
             }
             ValueExpr::GetElement { base, index } => {
                 out.push_str(&format!(

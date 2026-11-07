@@ -201,6 +201,42 @@ impl Document {
             .ok()
             .map(|s| s.to_string())
     }
+
+    /// Detects a double-colon namespace resolution receiver immediately preceding the position (e.g., `io::` or `math::`).
+    pub fn colon_access_receiver(&self, pos: Position) -> Option<String> {
+        let offset = self.position_to_offset(pos);
+        let bytes = self.text.as_bytes();
+
+        let mut idx = offset;
+        // Skip whitespace backwards
+        while idx > 0 && (bytes[idx - 1] == b' ' || bytes[idx - 1] == b'\t') {
+            idx -= 1;
+        }
+
+        if idx < 2 || bytes[idx - 1] != b':' || bytes[idx - 2] != b':' {
+            return None;
+        }
+
+        idx -= 2; // skip "::"
+
+        // Skip whitespace backwards before "::"
+        while idx > 0 && (bytes[idx - 1] == b' ' || bytes[idx - 1] == b'\t') {
+            idx -= 1;
+        }
+
+        let end_ident = idx;
+        while idx > 0 && is_ident_char(bytes[idx - 1]) {
+            idx -= 1;
+        }
+
+        if idx >= end_ident {
+            return None;
+        }
+
+        std::str::from_utf8(&bytes[idx..end_ident])
+            .ok()
+            .map(|s| s.to_string())
+    }
 }
 
 fn is_ident_char(b: u8) -> bool {

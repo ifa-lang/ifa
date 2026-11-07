@@ -1,0 +1,37 @@
+//! IFA Accounting Ledger Module
+//! Provides immutable value semantics for transaction accounting and reconciliation.
+
+pub struct Transaction {
+    id: i64,
+    amount_xof: i64,
+    sender_id: i64,
+    recipient_id: i64,
+}
+
+pub struct AccountBalance {
+    account_id: i64,
+    balance_xof: i64,
+}
+
+pub fn create_transaction(id: i64, amount: i64, sender: i64, recipient: i64) -> Transaction {
+    return Transaction(
+        id: id,
+        amount_xof: amount,
+        sender_id: sender,
+        recipient_id: recipient
+    );
+}
+
+pub fn apply_debit(mut account: AccountBalance, amount: i64) -> AccountBalance {
+    account.balance_xof = account.balance_xof - amount;
+    return account;
+}
+
+pub fn apply_credit(mut account: AccountBalance, amount: i64) -> AccountBalance {
+    account.balance_xof = account.balance_xof + amount;
+    return account;
+}
+
+pub fn verify_integrity(sender: AccountBalance, recipient: AccountBalance, total_expected: i64) -> bool {
+    return (sender.balance_xof + recipient.balance_xof) == total_expected;
+}

@@ -45,6 +45,105 @@ pub fn handle_completion(doc: &Document, position: Position) -> CompletionList {
         }
     }
 
+    // Check for double-colon namespace resolution: module::member or Enum::Variant
+    if let Some(receiver) = doc.colon_access_receiver(position) {
+        if let Some(analysis) = &doc.analysis {
+            let receiver_sym = sym(&receiver);
+
+            // 1. Module namespace completions (functions, structs, enums, consts)
+            if let Some(module) = analysis.symbols.lookup_module(&receiver_sym) {
+                for (fn_name, func) in &module.functions {
+                    if func.is_pub {
+                        let name_str = fn_name.resolve();
+                        let params_str: Vec<String> = func
+                            .params
+                            .iter()
+                            .map(|p| format!("{}: {}", p.name.resolve(), p.ty))
+                            .collect();
+                        let detail = format!(
+                            "fn {}({}) -> {}",
+                            name_str,
+                            params_str.join(", "),
+                            func.ret_ty
+                        );
+                        items.push(
+                            CompletionItem::new(&name_str, CompletionItemKind::Function)
+                                .with_detail(detail)
+                                .with_doc(format!(
+                                    "Public function exported by module `{}`",
+                                    receiver
+                                )),
+                        );
+                    }
+                }
+                for (st_name, st) in &module.structs {
+                    if st.is_pub {
+                        let name_str = st_name.resolve();
+                        items.push(
+                            CompletionItem::new(&name_str, CompletionItemKind::Struct)
+                                .with_detail(format!("struct {}", name_str))
+                                .with_doc(format!(
+                                    "Public struct exported by module `{}`",
+                                    receiver
+                                )),
+                        );
+                    }
+                }
+                for (en_name, en) in &module.enums {
+                    if en.is_pub {
+                        let name_str = en_name.resolve();
+                        items.push(
+                            CompletionItem::new(&name_str, CompletionItemKind::Enum)
+                                .with_detail(format!("enum {}", name_str))
+                                .with_doc(format!("Public enum exported by module `{}`", receiver)),
+                        );
+                    }
+                }
+                for (c_name, c) in &module.consts {
+                    if c.is_pub {
+                        let name_str = c_name.resolve();
+                        items.push(
+                            CompletionItem::new(&name_str, CompletionItemKind::Constant)
+                                .with_detail(format!("const {}: {}", name_str, c.ty))
+                                .with_doc(format!(
+                                    "Public constant exported by module `{}`",
+                                    receiver
+                                )),
+                        );
+                    }
+                }
+
+                if !items.is_empty() {
+                    return CompletionList {
+                        is_incomplete: false,
+                        items,
+                    };
+                }
+            }
+
+            // 2. Enum variant completions
+            if let Some(enum_sym) = analysis.symbols.enums.get(&receiver_sym) {
+                for (variant_name, var_ty) in &enum_sym.variants {
+                    let v_str = variant_name.resolve();
+                    let detail = if let Some(ty) = var_ty {
+                        format!("Variant {}({})", v_str, ty)
+                    } else {
+                        format!("Variant {}", v_str)
+                    };
+                    items.push(
+                        CompletionItem::new(&v_str, CompletionItemKind::EnumMember)
+                            .with_detail(detail)
+                            .with_doc(format!("Variant of enum `{}`", receiver)),
+                    );
+                }
+                return CompletionList {
+                    is_incomplete: false,
+                    items,
+                };
+            }
+        }
+    }
+
     // Default global & scoped completions
     // 1. IFA Language Keywords
     let keywords = [

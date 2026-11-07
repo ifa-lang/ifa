@@ -553,4 +553,36 @@ impl FirModule {
     pub fn get_function_mut(&mut self, name: &Symbol) -> Option<&mut FirFunction> {
         self.functions.iter_mut().find(|f| &f.name == name)
     }
+
+    /// Merges definitions from another FIR module into this module, avoiding duplicates.
+    pub fn merge(&mut self, other: FirModule) {
+        for s in other.structs {
+            if !self.structs.iter().any(|existing| existing.name == s.name) {
+                self.structs.push(s);
+            }
+        }
+        for e in other.enums {
+            if !self.enums.iter().any(|existing| existing.name == e.name) {
+                self.enums.push(e);
+            }
+        }
+        for c in other.constants {
+            if !self
+                .constants
+                .iter()
+                .any(|existing| existing.name == c.name)
+            {
+                self.constants.push(c);
+            }
+        }
+        for f in other.functions {
+            if !self
+                .functions
+                .iter()
+                .any(|existing| existing.name == f.name)
+            {
+                self.functions.push(f);
+            }
+        }
+    }
 }

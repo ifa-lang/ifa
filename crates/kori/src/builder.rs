@@ -4,13 +4,14 @@ use crate::ffi_gen::FfiBridgeGenerator;
 use crate::lockfile::Lockfile;
 use crate::manifest::{BackendKind, BinTarget, CrateType, LibTarget, Manifest, ProfileConfig};
 use crate::resolver::{DependencyResolver, ResolvedPackage};
+use ifa_ast::Item;
 use ifa_codegen_cranelift::AotCompiler;
 use ifa_codegen_llvm::{LlvmCompiler, LlvmTargetConfig};
 use ifa_fir::compile_to_fir;
 use ifa_lexer::tokenize;
 use ifa_parser::parse;
-use ifa_sema::analyze;
-use ifa_span::SourceMap;
+use ifa_sema::{analyze, analyze_with_symbols, symbol_table::ModuleSymbol, SymbolTable};
+use ifa_span::{SourceMap, Symbol, INTERNER};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -475,6 +476,38 @@ impl BuildOrchestrator {
         Ok(artifacts)
     }
 
+    fn resolve_module_file(base_dir: &Path, module_path: &[Symbol]) -> Option<PathBuf> {
+        if module_path.is_empty() {
+            return None;
+        }
+        let parts: Vec<String> = module_path.iter().map(|s| INTERNER.resolve(s)).collect();
+
+        // 1. Check direct file: base_dir/part1/.../partN.ifa
+        let mut file_path = base_dir.to_path_buf();
+        for (i, part) in parts.iter().enumerate() {
+            if i == parts.len() - 1 {
+                file_path.push(format!("{}.ifa", part));
+            } else {
+                file_path.push(part);
+            }
+        }
+        if file_path.is_file() {
+            return Some(file_path);
+        }
+
+        // 2. Check directory module: base_dir/part1/.../partN/mod.ifa
+        let mut dir_path = base_dir.to_path_buf();
+        for part in &parts {
+            dir_path.push(part);
+        }
+        dir_path.push("mod.ifa");
+        if dir_path.is_file() {
+            return Some(dir_path);
+        }
+
+        None
+    }
+
     fn compile_source_to_fir(
         &self,
         source_path: &Path,
@@ -507,7 +540,99 @@ impl BuildOrchestrator {
             });
         }
 
-        let analysis = analyze(&sm, &ast_prog);
+        let base_dir = source_path.parent().unwrap_or_else(|| Path::new("."));
+
+        let mut symbols = SymbolTable::new();
+        let mut sub_fir_modules = Vec::new();
+
+        // Detect and resolve local submodules imported in the root program
+        for item in &ast_prog.items {
+            if let Item::Import(im) = item {
+                if let Some(sub_path) = Self::resolve_module_file(base_dir, &im.path) {
+                    let sub_source =
+                        fs::read_to_string(&sub_path).map_err(|e| KoriError::CompilationError {
+                            package: pkg_name.to_string(),
+                            message: format!(
+                                "Failed to read module `{}`: {}",
+                                sub_path.display(),
+                                e
+                            ),
+                        })?;
+
+                    let sub_file_id = sm.add_file(sub_path.to_string_lossy(), &sub_source);
+                    let sub_tokens = tokenize(sub_file_id, &sub_source);
+                    let (sub_prog, sub_parse_diags) = parse(sub_file_id, sub_tokens);
+                    if !sub_parse_diags.is_empty() {
+                        let mut msg = String::new();
+                        for diag in &sub_parse_diags {
+                            msg.push_str(&diag.render_to_string(&sm));
+                        }
+                        return Err(KoriError::CompilationError {
+                            package: pkg_name.to_string(),
+                            message: msg,
+                        });
+                    }
+
+                    let sub_analysis = analyze(&sm, &sub_prog);
+                    if sub_analysis.has_errors() {
+                        let mut msg = String::new();
+                        for diag in &sub_analysis.diagnostics {
+                            msg.push_str(&diag.render_to_string(&sm));
+                        }
+                        return Err(KoriError::CompilationError {
+                            package: pkg_name.to_string(),
+                            message: msg,
+                        });
+                    }
+
+                    // Lower submodule to FIR and collect
+                    let sub_fir = compile_to_fir(&sub_prog, &sub_analysis.symbols, true, true)
+                        .map_err(|errors| {
+                            let mut msg = String::new();
+                            for diag in &errors {
+                                msg.push_str(&diag.render_to_string(&sm));
+                            }
+                            KoriError::CompilationError {
+                                package: pkg_name.to_string(),
+                                message: msg,
+                            }
+                        })?;
+                    sub_fir_modules.push(sub_fir);
+
+                    // Build ModuleSymbol containing exported (is_pub) definitions
+                    let local_alias = im.alias.unwrap_or_else(|| *im.path.last().unwrap());
+                    let mut mod_sym =
+                        ModuleSymbol::new(local_alias, im.path.clone(), true, im.span);
+                    for f in sub_analysis.symbols.functions.values() {
+                        mod_sym.add_function(f.clone());
+                    }
+                    for s in sub_analysis.symbols.structs.values() {
+                        mod_sym.add_struct(s.clone());
+                    }
+                    for e in sub_analysis.symbols.enums.values() {
+                        mod_sym.add_enum(e.clone());
+                    }
+                    for c in sub_analysis.symbols.consts.values() {
+                        mod_sym.add_const(c.clone());
+                    }
+
+                    let path_str = im
+                        .path
+                        .iter()
+                        .map(|s| INTERNER.resolve(s))
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    let path_sym = INTERNER.intern(&path_str);
+                    symbols.modules.insert(local_alias, mod_sym.clone());
+                    symbols.modules.insert(path_sym, mod_sym.clone());
+                    if let Some(last) = im.path.last() {
+                        symbols.modules.insert(*last, mod_sym);
+                    }
+                }
+            }
+        }
+
+        let analysis = analyze_with_symbols(&sm, &ast_prog, symbols);
         if analysis.has_errors() {
             let mut msg = String::new();
             for diag in &analysis.diagnostics {
@@ -519,7 +644,7 @@ impl BuildOrchestrator {
             });
         }
 
-        let fir_module =
+        let mut fir_module =
             compile_to_fir(&ast_prog, &analysis.symbols, true, true).map_err(|errors| {
                 let mut msg = String::new();
                 for diag in &errors {
@@ -530,6 +655,11 @@ impl BuildOrchestrator {
                     message: msg,
                 }
             })?;
+
+        // Merge all compiled submodule FIR definitions into the unified root FIR module
+        for sub_fir in sub_fir_modules {
+            fir_module.merge(sub_fir);
+        }
 
         Ok(fir_module)
     }

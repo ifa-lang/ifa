@@ -42,6 +42,10 @@ impl Span {
         end: BytePos(0),
     };
 
+    pub const fn dummy() -> Self {
+        Self::DUMMY
+    }
+
     pub fn new(file_id: FileId, start: BytePos, end: BytePos) -> Self {
         Self {
             file_id,

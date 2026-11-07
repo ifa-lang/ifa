@@ -27,9 +27,13 @@ pub struct SemanticAnalyzer<'a> {
 
 impl<'a> SemanticAnalyzer<'a> {
     pub fn new(source_map: &'a SourceMap) -> Self {
+        Self::with_symbols(source_map, SymbolTable::new())
+    }
+
+    pub fn with_symbols(source_map: &'a SourceMap, symbols: SymbolTable) -> Self {
         Self {
             source_map,
-            symbols: SymbolTable::new(),
+            symbols,
             diagnostics: Vec::new(),
             current_func_ret_ty: None,
             current_func_is_strict: false,
@@ -41,6 +45,9 @@ impl<'a> SemanticAnalyzer<'a> {
     }
 
     pub fn analyze(mut self, program: &Program) -> (SymbolTable, Vec<Diagnostic>) {
+        // Phase 0: Collect and register module imports
+        self.collect_imports(program);
+
         // Phase 1: Collect struct and enum declarations
         self.collect_types(program);
 
@@ -53,6 +60,52 @@ impl<'a> SemanticAnalyzer<'a> {
         self.symbols.expr_types = self.expr_types;
 
         (self.symbols, self.diagnostics)
+    }
+
+    // =========================================================================
+    // Phase 0: Import Collection & Module Resolution
+    // =========================================================================
+
+    fn collect_imports(&mut self, program: &Program) {
+        for item in &program.items {
+            if let Item::Import(im) = item {
+                if im.path.is_empty() {
+                    continue;
+                }
+
+                let full_path: Vec<String> = im.path.iter().map(|s| INTERNER.resolve(s)).collect();
+                let path_str = full_path.join("::");
+                let path_sym = INTERNER.intern(&path_str);
+                let local_alias = im.alias.unwrap_or_else(|| *im.path.last().unwrap());
+
+                if let Some(existing_mod) = self.symbols.lookup_module(&local_alias).cloned() {
+                    // Pre-registered module with this alias
+                    self.symbols.modules.insert(local_alias, existing_mod);
+                } else if let Some(existing_mod) = self.symbols.lookup_module(&path_sym).cloned() {
+                    let mut alias_mod = existing_mod;
+                    alias_mod.name = local_alias;
+                    self.symbols.modules.insert(local_alias, alias_mod);
+                } else if let Some(last_sym) = im.path.last() {
+                    if let Some(existing_mod) = self.symbols.lookup_module(last_sym).cloned() {
+                        let mut alias_mod = existing_mod;
+                        alias_mod.name = local_alias;
+                        self.symbols.modules.insert(local_alias, alias_mod);
+                    } else {
+                        let diag = Diagnostic::error(format!("module '{}' introuvable", path_str))
+                            .with_code("E0010")
+                            .with_primary_label(
+                                im.span,
+                                "aucun module de ce nom dans la bibliothèque standard ou les dépendances",
+                            );
+                        self.diagnostics.push(diag);
+                    }
+                }
+
+                self.symbols
+                    .imports
+                    .push((im.path.clone(), im.alias, im.span));
+            }
+        }
     }
 
     // =========================================================================
@@ -201,6 +254,31 @@ impl<'a> SemanticAnalyzer<'a> {
                 },
             );
         }
+        for (mod_name, module) in &self.symbols.modules {
+            for (st_name, st) in &module.structs {
+                let fields: Vec<(Symbol, Type)> =
+                    st.fields.iter().map(|f| (f.name, f.ty.clone())).collect();
+                map.insert(
+                    *st_name,
+                    Type::Struct {
+                        name: *st_name,
+                        fields: fields.clone(),
+                    },
+                );
+                let qual_str = format!(
+                    "{}::{}",
+                    INTERNER.resolve(mod_name),
+                    INTERNER.resolve(st_name)
+                );
+                map.insert(
+                    INTERNER.intern(&qual_str),
+                    Type::Struct {
+                        name: *st_name,
+                        fields,
+                    },
+                );
+            }
+        }
         map
     }
 
@@ -214,6 +292,29 @@ impl<'a> SemanticAnalyzer<'a> {
                     variants: en.variants.clone(),
                 },
             );
+        }
+        for (mod_name, module) in &self.symbols.modules {
+            for (en_name, en) in &module.enums {
+                map.insert(
+                    *en_name,
+                    Type::Enum {
+                        name: *en_name,
+                        variants: en.variants.clone(),
+                    },
+                );
+                let qual_str = format!(
+                    "{}::{}",
+                    INTERNER.resolve(mod_name),
+                    INTERNER.resolve(en_name)
+                );
+                map.insert(
+                    INTERNER.intern(&qual_str),
+                    Type::Enum {
+                        name: *en_name,
+                        variants: en.variants.clone(),
+                    },
+                );
+            }
         }
         map
     }
@@ -878,6 +979,92 @@ impl<'a> SemanticAnalyzer<'a> {
                             name: *path.first().unwrap(),
                             args: vec![Type::Unknown],
                         }
+                    }
+                } else if path.len() >= 2 {
+                    let mod_sym = path[0];
+                    let member_sym = path[1];
+                    let mod_name_str = INTERNER.resolve(&mod_sym);
+                    let member_name_str = INTERNER.resolve(&member_sym);
+
+                    if let Some(module) = self.symbols.lookup_module(&mod_sym).cloned() {
+                        if let Some(c) = module.consts.get(&member_sym) {
+                            if !c.is_pub {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "la constante '{}' est privée dans le module '{}'",
+                                        member_name_str, mod_name_str
+                                    ))
+                                    .with_code("E0011")
+                                    .with_primary_label(expr.span, "accès à une constante privée"),
+                                );
+                            }
+                            c.ty.clone()
+                        } else if let Some(st) = module.structs.get(&member_sym) {
+                            if !st.is_pub {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "la structure '{}' est privée dans le module '{}'",
+                                        member_name_str, mod_name_str
+                                    ))
+                                    .with_code("E0011")
+                                    .with_primary_label(expr.span, "accès à une structure privée"),
+                                );
+                            }
+                            Type::Struct {
+                                name: member_sym,
+                                fields: st.fields.iter().map(|f| (f.name, f.ty.clone())).collect(),
+                            }
+                        } else if let Some(en) = module.enums.get(&member_sym) {
+                            if !en.is_pub {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "l'énumération '{}' est privée dans le module '{}'",
+                                        member_name_str, mod_name_str
+                                    ))
+                                    .with_code("E0011")
+                                    .with_primary_label(
+                                        expr.span,
+                                        "accès à une énumération privée",
+                                    ),
+                                );
+                            }
+                            Type::Enum {
+                                name: member_sym,
+                                variants: en.variants.clone(),
+                            }
+                        } else if let Some(f) = module.functions.get(&member_sym) {
+                            if !f.is_pub {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "la fonction '{}' est privée dans le module '{}'",
+                                        member_name_str, mod_name_str
+                                    ))
+                                    .with_code("E0011")
+                                    .with_primary_label(expr.span, "accès à une fonction privée"),
+                                );
+                            }
+                            f.ret_ty.clone()
+                        } else {
+                            Type::Unknown
+                        }
+                    } else if let Some(en) = self.symbols.lookup_enum(&mod_sym) {
+                        Type::Enum {
+                            name: mod_sym,
+                            variants: en.variants.clone(),
+                        }
+                    } else if let Some(last) = path.last() {
+                        if let Some(var) = self.symbols.lookup_variable(last) {
+                            var.ty.clone()
+                        } else if let Some(st) = self.symbols.lookup_struct(last) {
+                            Type::Struct {
+                                name: *last,
+                                fields: st.fields.iter().map(|f| (f.name, f.ty.clone())).collect(),
+                            }
+                        } else {
+                            Type::Unknown
+                        }
+                    } else {
+                        Type::Unknown
                     }
                 } else if let Some(last) = path.last() {
                     if let Some(var) = self.symbols.lookup_variable(last) {
@@ -1623,6 +1810,50 @@ impl<'a> SemanticAnalyzer<'a> {
     }
 
     fn check_call_expr(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Type {
+        // First check if callee is a qualified module member or struct constructor
+        if let ExprKind::Path(path) = &callee.kind {
+            if path.len() >= 2 {
+                let mod_sym = path[0];
+                let member_sym = path[1];
+                let mod_name_str = INTERNER.resolve(&mod_sym);
+                let member_name_str = INTERNER.resolve(&member_sym);
+
+                if let Some(module) = self.symbols.lookup_module(&mod_sym).cloned() {
+                    if let Some(st) = module.structs.get(&member_sym).cloned() {
+                        if !st.is_pub {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "la structure '{}' est privée dans le module '{}'",
+                                    member_name_str, mod_name_str
+                                ))
+                                .with_code("E0011")
+                                .with_primary_label(
+                                    span,
+                                    "structure privée inaccessible de l'extérieur",
+                                ),
+                            );
+                        }
+                        return self.check_struct_constructor_call(&st, args, span);
+                    } else if let Some(f) = module.functions.get(&member_sym).cloned() {
+                        if !f.is_pub {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "la fonction '{}' est privée dans le module '{}'",
+                                    member_name_str, mod_name_str
+                                ))
+                                .with_code("E0011")
+                                .with_primary_label(
+                                    span,
+                                    "fonction privée inaccessible de l'extérieur",
+                                ),
+                            );
+                        }
+                        return self.check_function_call(&f, args, span);
+                    }
+                }
+            }
+        }
+
         // First check if callee is a struct constructor (e.g. WindowNode(...) or IoError(...))
         let struct_match = match &callee.kind {
             ExprKind::Ident(sym) => self.symbols.lookup_struct(sym).cloned(),
