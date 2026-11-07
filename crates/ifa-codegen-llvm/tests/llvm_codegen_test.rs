@@ -436,6 +436,97 @@ fn test_llvm_stackless_fibers_and_coroutine_intrinsics() {
 }
 
 #[test]
+fn test_llvm_coroutine_state_machine_lowering() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{BlockId, FirFunction, FirModule, Instruction, Terminator, ValueExpr};
+    use ifa_span::{Span, INTERNER};
+    use std::fs;
+
+    let mut module = FirModule::new(INTERNER.intern("coro_test_mod"));
+    let gen_name = INTERNER.intern("stream_generator");
+
+    let mut func = FirFunction::new(
+        gen_name,
+        vec![],
+        ifa_fir::types::FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let b_entry = BlockId(0);
+    let entry_bb = func.get_block_mut(b_entry).unwrap();
+    entry_bb.push_instruction(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    entry_bb.push_instruction(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    entry_bb.set_terminator(Terminator::Return(None));
+
+    assert!(func.is_coroutine());
+    module.functions.push(func);
+
+    // Also a caller function that spawns the coroutine
+    let main_name = INTERNER.intern("main");
+    let mut main_func = FirFunction::new(
+        main_name,
+        vec![],
+        ifa_fir::types::FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let spawn_res = main_func.alloc_value();
+    let main_entry = main_func.get_block_mut(b_entry).unwrap();
+    main_entry.push_instruction(Instruction::new(
+        Some(spawn_res),
+        ValueExpr::Spawn {
+            target: gen_name,
+            args: vec![],
+        },
+        Span::DUMMY,
+    ));
+    main_entry.set_terminator(Terminator::Return(None));
+    module.functions.push(main_func);
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&module).expect("Emission failed");
+
+    // 1. Assert that generator was lowered with presplitcoroutine attribute and coro intrinsics
+    assert!(ir.contains("define dso_local presplitcoroutine ptr @stream_generator()"));
+    assert!(ir.contains("call token @llvm.coro.id("));
+    assert!(ir.contains("call ptr @llvm.coro.begin("));
+    assert!(ir.contains("call i8 @llvm.coro.suspend("));
+    assert!(ir.contains("call ptr @llvm.coro.free("));
+    assert!(ir.contains("call i1 @llvm.coro.end("));
+
+    // 2. Assert that spawning a coroutine invokes @ifa_coro_llvm_spawn
+    assert!(ir.contains("call ptr @stream_generator()"));
+    assert!(ir.contains("call i64 @ifa_coro_llvm_spawn(ptr %coro_hdl_"));
+
+    // 3. Verify LLVM compiles to native object with clang!
+    let temp_dir =
+        std::env::temp_dir().join(format!("llvm_coro_state_machine_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("coro_sm.o");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Compilation to object failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
 fn test_llvm_auto_vectorization_loop_codegen() {
     let src = r#"
         pub fn sum_f32_vec(arr: [f32; 64]) -> f32 {
