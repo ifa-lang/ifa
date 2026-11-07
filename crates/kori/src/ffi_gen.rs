@@ -222,7 +222,10 @@ impl FfiBridgeGenerator {
         out.push_str("ifa_slice_t ifa_rt_slice_from_raw(const char* ptr, size_t len);\n");
         out.push_str("ifa_mut_slice_t ifa_rt_slice_alloc(size_t len, uint16_t arena_id);\n");
         out.push_str("void ifa_rt_slice_free(ifa_mut_slice_t slice);\n");
-        out.push_str("const char* ifa_rt_version_string(void);\n\n");
+        out.push_str("const char* ifa_rt_version_string(void);\n");
+        out.push_str("void ifa_rt_bounds_check(size_t index, size_t len, const char* msg);\n");
+        out.push_str("void ifa_rt_slice_bounds_check(size_t start, size_t end, size_t len, const char* msg);\n");
+        out.push_str("int ifa_rt_buffer_verify_bounds(const void* ptr, size_t len, size_t required_min, size_t align);\n\n");
 
         for func in functions {
             let ret_str = fir_type_to_c(&func.return_type);
@@ -415,6 +418,9 @@ impl FfiBridgeGenerator {
         out.push_str("ifa_mut_slice_t ifa_rt_slice_alloc(size_t len, uint16_t arena_id);\n");
         out.push_str("void ifa_rt_slice_free(ifa_mut_slice_t slice);\n");
         out.push_str("const char* ifa_rt_version_string(void);\n");
+        out.push_str("void ifa_rt_bounds_check(size_t index, size_t len, const char* msg);\n");
+        out.push_str("void ifa_rt_slice_bounds_check(size_t start, size_t end, size_t len, const char* msg);\n");
+        out.push_str("int ifa_rt_buffer_verify_bounds(const void* ptr, size_t len, size_t required_min, size_t align);\n");
         out.push_str("TYPES_BLOCK;\n");
         out.push_str("        return $types . \"\\n\" . $clean;\n");
         out.push_str("    }\n\n");

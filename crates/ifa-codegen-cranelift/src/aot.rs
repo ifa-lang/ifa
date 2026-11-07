@@ -211,6 +211,34 @@ char* ifa_rt_string_from_bool(int8_t val) {
 const char* ifa_rt_version_string(void) {
     return "IFA Runtime 0.1.0 (Zero-GC Generational Concurrency)";
 }
+
+void ifa_rt_bounds_check(size_t index, size_t len, const char* msg) {
+    if (index >= len) {
+        if (msg) {
+            fprintf(stderr, "\n[IFA RUNTIME ERROR: SAFE BOUNDS CHECK] %s (index: %zu, length: %zu)\n", msg, index, len);
+        } else {
+            fprintf(stderr, "\n[IFA RUNTIME ERROR: SAFE BOUNDS CHECK] Out of bounds (index: %zu, length: %zu)\n", index, len);
+        }
+        abort();
+    }
+}
+
+void ifa_rt_slice_bounds_check(size_t start, size_t end, size_t len, const char* msg) {
+    if (start > end || end > len) {
+        if (msg) {
+            fprintf(stderr, "\n[IFA RUNTIME ERROR: SAFE SLICE BOUNDS CHECK] %s (range [%zu..%zu], length: %zu)\n", msg, start, end, len);
+        } else {
+            fprintf(stderr, "\n[IFA RUNTIME ERROR: SAFE SLICE BOUNDS CHECK] Slice range [%zu..%zu] exceeds length %zu\n", start, end, len);
+        }
+        abort();
+    }
+}
+
+int ifa_rt_buffer_verify_bounds(const void* ptr, size_t len, size_t required_min, size_t align) {
+    if (!ptr || len < required_min) return 0;
+    size_t actual_align = align == 0 ? 1 : align;
+    return ((uintptr_t)ptr % actual_align) == 0;
+}
 "#;
 
 /// Ahead-of-Time (AOT) compiler producing native object files (.o) and linked ELF binaries.

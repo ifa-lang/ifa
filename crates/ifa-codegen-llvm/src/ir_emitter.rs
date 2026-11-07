@@ -1574,6 +1574,14 @@ impl<'a> LlvmIrEmitter<'a> {
                             "  %slice_elem_ptr_{} = extractvalue {{ ptr, i64 }} %v{}, 0\n",
                             res_id, base.0
                         ));
+                        out.push_str(&format!(
+                            "  %slice_len_{} = extractvalue {{ ptr, i64 }} %v{}, 1\n",
+                            res_id, base.0
+                        ));
+                        out.push_str(&format!(
+                            "  call void @ifa_rt_bounds_check(i64 %v{}, i64 %slice_len_{}, ptr null)\n",
+                            index.0, res_id
+                        ));
                         format!("%slice_elem_ptr_{}", res_id)
                     }
                     Some(ifa_fir::FirType::Pointer(inner))
@@ -1587,7 +1595,39 @@ impl<'a> LlvmIrEmitter<'a> {
                             "  %slice_elem_ptr_{} = extractvalue {{ ptr, i64 }} %slice_elem_ld_{}, 0\n",
                             res_id, res_id
                         ));
+                        out.push_str(&format!(
+                            "  %slice_len_{} = extractvalue {{ ptr, i64 }} %slice_elem_ld_{}, 1\n",
+                            res_id, res_id
+                        ));
+                        out.push_str(&format!(
+                            "  call void @ifa_rt_bounds_check(i64 %v{}, i64 %slice_len_{}, ptr null)\n",
+                            index.0, res_id
+                        ));
                         format!("%slice_elem_ptr_{}", res_id)
+                    }
+                    Some(ifa_fir::FirType::Array(_, count)) => {
+                        out.push_str(&format!(
+                            "  call void @ifa_rt_bounds_check(i64 %v{}, i64 {}, ptr null)\n",
+                            index.0, count
+                        ));
+                        array_allocas
+                            .get(base)
+                            .map(|p| format!("%v{}", p.0))
+                            .unwrap_or_else(|| format!("%v{}", base.0))
+                    }
+                    Some(ifa_fir::FirType::Pointer(inner))
+                        if matches!(&**inner, ifa_fir::FirType::Array(..)) =>
+                    {
+                        if let ifa_fir::FirType::Array(_, count) = &**inner {
+                            out.push_str(&format!(
+                                "  call void @ifa_rt_bounds_check(i64 %v{}, i64 {}, ptr null)\n",
+                                index.0, count
+                            ));
+                        }
+                        array_allocas
+                            .get(base)
+                            .map(|p| format!("%v{}", p.0))
+                            .unwrap_or_else(|| format!("%v{}", base.0))
                     }
                     _ => array_allocas
                         .get(base)
@@ -2077,6 +2117,14 @@ impl<'a> LlvmIrEmitter<'a> {
                             "  %sub_base_ptr_{} = extractvalue {{ ptr, i64 }} %v{}, 0\n",
                             res_id, base.0
                         ));
+                        out.push_str(&format!(
+                            "  %sub_slice_len_{} = extractvalue {{ ptr, i64 }} %v{}, 1\n",
+                            res_id, base.0
+                        ));
+                        out.push_str(&format!(
+                            "  call void @ifa_rt_slice_bounds_check(i64 %v{}, i64 %v{}, i64 %sub_slice_len_{}, ptr null)\n",
+                            start.0, end.0, res_id
+                        ));
                         format!("%sub_base_ptr_{}", res_id)
                     }
                     Some(ifa_fir::FirType::Pointer(inner))
@@ -2090,7 +2138,39 @@ impl<'a> LlvmIrEmitter<'a> {
                             "  %sub_base_ptr_{} = extractvalue {{ ptr, i64 }} %sub_slice_ld_{}, 0\n",
                             res_id, res_id
                         ));
+                        out.push_str(&format!(
+                            "  %sub_slice_len_{} = extractvalue {{ ptr, i64 }} %sub_slice_ld_{}, 1\n",
+                            res_id, res_id
+                        ));
+                        out.push_str(&format!(
+                            "  call void @ifa_rt_slice_bounds_check(i64 %v{}, i64 %v{}, i64 %sub_slice_len_{}, ptr null)\n",
+                            start.0, end.0, res_id
+                        ));
                         format!("%sub_base_ptr_{}", res_id)
+                    }
+                    Some(ifa_fir::FirType::Array(_, count)) => {
+                        out.push_str(&format!(
+                            "  call void @ifa_rt_slice_bounds_check(i64 %v{}, i64 %v{}, i64 {}, ptr null)\n",
+                            start.0, end.0, count
+                        ));
+                        array_allocas
+                            .get(base)
+                            .map(|p| format!("%v{}", p.0))
+                            .unwrap_or_else(|| format!("%v{}", base.0))
+                    }
+                    Some(ifa_fir::FirType::Pointer(inner))
+                        if matches!(&**inner, ifa_fir::FirType::Array(..)) =>
+                    {
+                        if let ifa_fir::FirType::Array(_, count) = &**inner {
+                            out.push_str(&format!(
+                                "  call void @ifa_rt_slice_bounds_check(i64 %v{}, i64 %v{}, i64 {}, ptr null)\n",
+                                start.0, end.0, count
+                            ));
+                        }
+                        array_allocas
+                            .get(base)
+                            .map(|p| format!("%v{}", p.0))
+                            .unwrap_or_else(|| format!("%v{}", base.0))
                     }
                     _ => array_allocas
                         .get(base)
@@ -2432,6 +2512,14 @@ impl<'a> LlvmIrEmitter<'a> {
                             "  %slice_set_ptr_{} = extractvalue {{ ptr, i64 }} %v{}, 0\n",
                             val.0, base.0
                         ));
+                        out.push_str(&format!(
+                            "  %slice_set_len_{} = extractvalue {{ ptr, i64 }} %v{}, 1\n",
+                            val.0, base.0
+                        ));
+                        out.push_str(&format!(
+                            "  call void @ifa_rt_bounds_check(i64 %v{}, i64 %slice_set_len_{}, ptr null)\n",
+                            index.0, val.0
+                        ));
                         format!("%slice_set_ptr_{}", val.0)
                     }
                     Some(ifa_fir::FirType::Pointer(inner))
@@ -2445,7 +2533,33 @@ impl<'a> LlvmIrEmitter<'a> {
                             "  %slice_set_ptr_{} = extractvalue {{ ptr, i64 }} %slice_set_ld_{}, 0\n",
                             val.0, val.0
                         ));
+                        out.push_str(&format!(
+                            "  %slice_set_len_{} = extractvalue {{ ptr, i64 }} %slice_set_ld_{}, 1\n",
+                            val.0, val.0
+                        ));
+                        out.push_str(&format!(
+                            "  call void @ifa_rt_bounds_check(i64 %v{}, i64 %slice_set_len_{}, ptr null)\n",
+                            index.0, val.0
+                        ));
                         format!("%slice_set_ptr_{}", val.0)
+                    }
+                    Some(ifa_fir::FirType::Array(_, count)) => {
+                        out.push_str(&format!(
+                            "  call void @ifa_rt_bounds_check(i64 %v{}, i64 {}, ptr null)\n",
+                            index.0, count
+                        ));
+                        format!("%v{}", base.0)
+                    }
+                    Some(ifa_fir::FirType::Pointer(inner))
+                        if matches!(&**inner, ifa_fir::FirType::Array(..)) =>
+                    {
+                        if let ifa_fir::FirType::Array(_, count) = &**inner {
+                            out.push_str(&format!(
+                                "  call void @ifa_rt_bounds_check(i64 %v{}, i64 {}, ptr null)\n",
+                                index.0, count
+                            ));
+                        }
+                        format!("%v{}", base.0)
                     }
                     _ => format!("%v{}", base.0),
                 };

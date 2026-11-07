@@ -297,6 +297,34 @@ size_t ifa_rt_blocking_pool_active_workers(void);
  */
 size_t ifa_rt_blocking_pool_capacity(void);
 
+/* --- Safe Bounds Verification & C-ABI Protection API --- */
+
+/**
+ * 1-cycle CPU bounds verification for universal buffer and slice index access.
+ * Aborts safely on index out of bounds detection without memory corruption or undefined behavior.
+ */
+void ifa_rt_bounds_check(size_t index, size_t len, const char* msg);
+
+/**
+ * Verify that a sub-slice range [start..end] is strictly within bounds [0..len].
+ */
+void ifa_rt_slice_bounds_check(size_t start, size_t end, size_t len, const char* msg);
+
+/**
+ * Validate external buffer pointer alignment, non-null status, and minimum byte length.
+ */
+int ifa_rt_buffer_verify_bounds(const void* ptr, size_t len, size_t required_min, size_t align);
+
+/**
+ * Validate an external IfaSlice passed across foreign boundaries.
+ */
+int ifa_rt_c_abi_validate_slice(ifa_slice_t slice, size_t elem_size, size_t min_elements);
+
+/**
+ * Abort program deterministically on detected out-of-bounds access.
+ */
+void ifa_rt_panic_out_of_bounds(size_t index, size_t len);
+
 #ifdef __cplusplus
 }
 #endif
