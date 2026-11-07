@@ -10,6 +10,10 @@ pub struct WasmBundleResult {
     pub wasm_file: PathBuf,
     pub js_file: PathBuf,
     pub dts_file: PathBuf,
+    pub react_file: PathBuf,
+    pub react_dts_file: PathBuf,
+    pub web_os_file: PathBuf,
+    pub web_os_dts_file: PathBuf,
     pub package_json_file: PathBuf,
 }
 
@@ -69,11 +73,19 @@ impl WasmBundler {
 
         let js_file = output_dir.join("index.js");
         let dts_file = output_dir.join("index.d.ts");
+        let react_file = output_dir.join("react.js");
+        let react_dts_file = output_dir.join("react.d.ts");
+        let web_os_file = output_dir.join("web_os.js");
+        let web_os_dts_file = output_dir.join("web_os.d.ts");
         let package_json_file = output_dir.join("package.json");
         let readme_file = output_dir.join("README.md");
 
         fs::write(&js_file, gen.generate_esm())?;
         fs::write(&dts_file, gen.generate_dts())?;
+        fs::write(&react_file, gen.generate_react_hook_js())?;
+        fs::write(&react_dts_file, gen.generate_react_hook_dts())?;
+        fs::write(&web_os_file, gen.generate_web_os_js())?;
+        fs::write(&web_os_dts_file, gen.generate_web_os_dts())?;
 
         let package_json = format!(
             r#"{{
@@ -83,9 +95,27 @@ impl WasmBundler {
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
+  "exports": {{
+    ".": {{
+      "import": "./index.js",
+      "types": "./index.d.ts"
+    }},
+    "./react": {{
+      "import": "./react.js",
+      "types": "./react.d.ts"
+    }},
+    "./web-os": {{
+      "import": "./web_os.js",
+      "types": "./web_os.d.ts"
+    }}
+  }},
   "files": [
     "index.js",
     "index.d.ts",
+    "react.js",
+    "react.d.ts",
+    "web_os.js",
+    "web_os.d.ts",
     "{name}.wasm"
   ]
 }}
@@ -99,18 +129,39 @@ impl WasmBundler {
 
 Deterministic, zero-GC WebAssembly module powered by the IFA programming language.
 
-## Quickstart in React / Vite / TypeScript
+## Quickstart in React & Web OS
 
+### 1. Vanilla TypeScript / ES Module
 ```typescript
-import {{ init, {example_fn} }} from './pkg/index.js';
+import {{ init, {example_fn} }} from '@{name}/wasm';
 
 async function run() {{
   await init();
   const result = {example_fn}();
   console.log("IFA Wasm Result:", result);
 }}
-
 run();
+```
+
+### 2. React Hook
+```tsx
+import {{ useIfaModule }} from '@{name}/wasm/react';
+
+export function IfaWasmComponent() {{
+  const {{ ready, error }} = useIfaModule();
+  if (error) return <div>Failed to load module: {{error.message}}</div>;
+  if (!ready) return <div>Loading IFA WebAssembly...</div>;
+  return <div>IFA WebAssembly ready!</div>;
+}}
+```
+
+### 3. Web OS Process Sandbox
+```typescript
+import {{ WebOsProcess }} from '@{name}/wasm/web-os';
+
+const proc = new WebOsProcess({{ name: '{name}-task' }});
+proc.onStdout((msg) => console.log('[STDOUT]', msg));
+await proc.spawn();
 ```
 "#,
             name = self.module_name,
@@ -127,6 +178,10 @@ run();
             wasm_file,
             js_file,
             dts_file,
+            react_file,
+            react_dts_file,
+            web_os_file,
+            web_os_dts_file,
             package_json_file,
         })
     }

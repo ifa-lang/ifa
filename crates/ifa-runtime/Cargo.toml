@@ -13,3 +13,13 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 lazy_static = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_IO",
+    "Win32_Networking_WinSock",
+] }

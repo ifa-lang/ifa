@@ -134,12 +134,50 @@ impl TypeScriptBindingsGenerator {
 
         js.push_str("function createWasiStubs() {\n");
         js.push_str("  return {\n");
-        js.push_str("    fd_write: (fd, iovs, iovs_len, nwritten) => 0,\n");
+        js.push_str("    fd_write: (fd, iovs, iovs_len, nwritten) => {\n");
+        js.push_str("      if (!wasmInstance) return 0;\n");
+        js.push_str("      const mem = new DataView(wasmInstance.exports.memory.buffer);\n");
+        js.push_str("      let written = 0;\n");
+        js.push_str("      let text = '';\n");
+        js.push_str("      for (let i = 0; i < iovs_len; i++) {\n");
+        js.push_str("        const ptr = mem.getUint32(iovs + i * 8, true);\n");
+        js.push_str("        const len = mem.getUint32(iovs + i * 8 + 4, true);\n");
         js.push_str(
-            "    proc_exit: (code) => { console.warn(`IFA Wasm exited with code ${code}`); },\n",
+            "        const bytes = new Uint8Array(wasmInstance.exports.memory.buffer, ptr, len);\n",
         );
-        js.push_str("    clock_time_get: () => 0,\n");
-        js.push_str("    random_get: (buf, len) => 0\n");
+        js.push_str("        text += textDecoder.decode(bytes);\n");
+        js.push_str("        written += len;\n");
+        js.push_str("      }\n");
+        js.push_str("      if (nwritten) {\n");
+        js.push_str("        mem.setUint32(nwritten, written, true);\n");
+        js.push_str("      }\n");
+        js.push_str("      if (fd === 1) {\n");
+        js.push_str("        console.log(text.endsWith('\\n') ? text.slice(0, -1) : text);\n");
+        js.push_str("      } else if (fd === 2) {\n");
+        js.push_str("        console.error(text.endsWith('\\n') ? text.slice(0, -1) : text);\n");
+        js.push_str("      }\n");
+        js.push_str("      return 0;\n");
+        js.push_str("    },\n");
+        js.push_str("    proc_exit: (code) => {\n");
+        js.push_str("      console.warn(`[IFA WASI] Process exited with code ${code}`);\n");
+        js.push_str("    },\n");
+        js.push_str("    clock_time_get: (_clock_id, _precision, time_ptr) => {\n");
+        js.push_str("      if (!wasmInstance) return 0;\n");
+        js.push_str("      const mem = new DataView(wasmInstance.exports.memory.buffer);\n");
+        js.push_str("      const nowNanos = BigInt(Date.now()) * 1000000n;\n");
+        js.push_str("      mem.setBigUint64(time_ptr, nowNanos, true);\n");
+        js.push_str("      return 0;\n");
+        js.push_str("    },\n");
+        js.push_str("    random_get: (buf, len) => {\n");
+        js.push_str("      if (!wasmInstance) return 0;\n");
+        js.push_str(
+            "      const slice = new Uint8Array(wasmInstance.exports.memory.buffer, buf, len);\n",
+        );
+        js.push_str("      if (typeof crypto !== 'undefined' && crypto.getRandomValues) {\n");
+        js.push_str("        crypto.getRandomValues(slice);\n");
+        js.push_str("      }\n");
+        js.push_str("      return 0;\n");
+        js.push_str("    }\n");
         js.push_str("  };\n");
         js.push_str("}\n\n");
 
@@ -210,5 +248,143 @@ impl TypeScriptBindingsGenerator {
         }
 
         js
+    }
+
+    /// Generate React Hook JavaScript code (`react.js`).
+    pub fn generate_react_hook_js(&self) -> String {
+        let mut js = String::new();
+        js.push_str("// IFA React Hook for WebAssembly execution\n");
+        js.push_str("import { useState, useEffect } from 'react';\n");
+        js.push_str("import { init } from './index.js';\n\n");
+        js.push_str("export function useIfaModule(wasmSource) {\n");
+        js.push_str("  const [instance, setInstance] = useState(null);\n");
+        js.push_str("  const [loading, setLoading] = useState(true);\n");
+        js.push_str("  const [error, setError] = useState(null);\n\n");
+        js.push_str("  useEffect(() => {\n");
+        js.push_str("    let active = true;\n");
+        js.push_str("    init(wasmSource)\n");
+        js.push_str("      .then((exports) => {\n");
+        js.push_str("        if (active) {\n");
+        js.push_str("          setInstance(exports);\n");
+        js.push_str("          setLoading(false);\n");
+        js.push_str("        }\n");
+        js.push_str("      })\n");
+        js.push_str("      .catch((err) => {\n");
+        js.push_str("        if (active) {\n");
+        js.push_str("          setError(err);\n");
+        js.push_str("          setLoading(false);\n");
+        js.push_str("        }\n");
+        js.push_str("      });\n");
+        js.push_str("    return () => {\n");
+        js.push_str("      active = false;\n");
+        js.push_str("    };\n");
+        js.push_str("  }, [wasmSource]);\n\n");
+        js.push_str("  return {\n");
+        js.push_str("    instance,\n");
+        js.push_str("    loading,\n");
+        js.push_str("    error,\n");
+        js.push_str("    ready: !loading && !error && !!instance,\n");
+        js.push_str("  };\n");
+        js.push_str("}\n");
+        js
+    }
+
+    /// Generate React Hook TypeScript definitions (`react.d.ts`).
+    pub fn generate_react_hook_dts(&self) -> String {
+        let mut dts = String::new();
+        dts.push_str("// IFA React Hook Type Definitions\n");
+        dts.push_str("import type { IfaWasmInstance } from './index.js';\n\n");
+        dts.push_str("export interface UseIfaModuleResult {\n");
+        dts.push_str("  instance: IfaWasmInstance | null;\n");
+        dts.push_str("  loading: boolean;\n");
+        dts.push_str("  error: Error | null;\n");
+        dts.push_str("  ready: boolean;\n");
+        dts.push_str("}\n\n");
+        dts.push_str(
+            "/** React hook to load and execute the IFA WebAssembly module asynchronously */\n",
+        );
+        dts.push_str("export declare function useIfaModule(wasmSource?: RequestInfo | BufferSource | WebAssembly.Module): UseIfaModuleResult;\n");
+        dts
+    }
+
+    /// Generate Web OS Process Sandbox runner (`web_os.js`).
+    pub fn generate_web_os_js(&self) -> String {
+        let mut js = String::new();
+        js.push_str("// IFA Web OS Process Sandbox & Isolation Runner\n");
+        js.push_str("import { init } from './index.js';\n\n");
+        js.push_str("export class WebOsProcess {\n");
+        js.push_str("  constructor(options = {}) {\n");
+        js.push_str("    this.pid = Math.floor(Math.random() * 90000) + 10000;\n");
+        js.push_str("    this.name = options.name || 'ifa-process';\n");
+        js.push_str("    this.env = options.env || {};\n");
+        js.push_str("    this.stdoutCallbacks = [];\n");
+        js.push_str("    this.stderrCallbacks = [];\n");
+        js.push_str("    this.exitCode = null;\n");
+        js.push_str("    this.instance = null;\n");
+        js.push_str("    this.isRunning = false;\n");
+        js.push_str("  }\n\n");
+        js.push_str("  onStdout(callback) {\n");
+        js.push_str("    this.stdoutCallbacks.push(callback);\n");
+        js.push_str("    return this;\n");
+        js.push_str("  }\n\n");
+        js.push_str("  onStderr(callback) {\n");
+        js.push_str("    this.stderrCallbacks.push(callback);\n");
+        js.push_str("    return this;\n");
+        js.push_str("  }\n\n");
+        js.push_str("  emitStdout(text) {\n");
+        js.push_str("    for (const cb of this.stdoutCallbacks) cb(text);\n");
+        js.push_str("  }\n\n");
+        js.push_str("  emitStderr(text) {\n");
+        js.push_str("    for (const cb of this.stderrCallbacks) cb(text);\n");
+        js.push_str("  }\n\n");
+        js.push_str("  async spawn(wasmSource) {\n");
+        js.push_str("    this.isRunning = true;\n");
+        js.push_str("    try {\n");
+        js.push_str("      this.instance = await init(wasmSource);\n");
+        js.push_str("      if (typeof this.instance._start === 'function') {\n");
+        js.push_str("        this.instance._start();\n");
+        js.push_str("      } else if (typeof this.instance.main === 'function') {\n");
+        js.push_str("        this.exitCode = this.instance.main();\n");
+        js.push_str("      }\n");
+        js.push_str("      this.isRunning = false;\n");
+        js.push_str("      return this.exitCode ?? 0;\n");
+        js.push_str("    } catch (err) {\n");
+        js.push_str("      this.isRunning = false;\n");
+        js.push_str("      this.emitStderr(String(err));\n");
+        js.push_str("      throw err;\n");
+        js.push_str("    }\n");
+        js.push_str("  }\n\n");
+        js.push_str("  kill(signal = 15) {\n");
+        js.push_str("    this.isRunning = false;\n");
+        js.push_str("    this.exitCode = 128 + signal;\n");
+        js.push_str("    this.emitStderr(`Process ${this.pid} terminated by signal ${signal}`);\n");
+        js.push_str("  }\n");
+        js.push_str("}\n");
+        js
+    }
+
+    /// Generate Web OS Process Sandbox TypeScript definitions (`web_os.d.ts`).
+    pub fn generate_web_os_dts(&self) -> String {
+        let mut dts = String::new();
+        dts.push_str("// IFA Web OS Process Sandbox Type Definitions\n");
+        dts.push_str("import type { IfaWasmInstance } from './index.js';\n\n");
+        dts.push_str("export interface WebOsProcessOptions {\n");
+        dts.push_str("  name?: string;\n");
+        dts.push_str("  env?: Record<string, string>;\n");
+        dts.push_str("}\n\n");
+        dts.push_str("export declare class WebOsProcess {\n");
+        dts.push_str("  pid: number;\n");
+        dts.push_str("  name: string;\n");
+        dts.push_str("  env: Record<string, string>;\n");
+        dts.push_str("  exitCode: number | null;\n");
+        dts.push_str("  instance: IfaWasmInstance | null;\n");
+        dts.push_str("  isRunning: boolean;\n\n");
+        dts.push_str("  constructor(options?: WebOsProcessOptions);\n");
+        dts.push_str("  onStdout(callback: (text: string) => void): this;\n");
+        dts.push_str("  onStderr(callback: (text: string) => void): this;\n");
+        dts.push_str("  spawn(wasmSource?: RequestInfo | BufferSource | WebAssembly.Module): Promise<number>;\n");
+        dts.push_str("  kill(signal?: number): void;\n");
+        dts.push_str("}\n");
+        dts
     }
 }

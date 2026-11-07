@@ -132,6 +132,85 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n\n");
         }
 
+        // SIMD Vector Reduction Intrinsics
+        out.push_str("; LLVM Vector Reduction Intrinsics\n");
+        out.push_str("declare float @llvm.vector.reduce.fadd.v4f32(float, <4 x float>)\n");
+        out.push_str("declare float @llvm.vector.reduce.fadd.v8f32(float, <8 x float>)\n");
+        out.push_str("declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)\n");
+        out.push_str("declare i32 @llvm.vector.reduce.add.v8i32(<8 x i32>)\n\n");
+
+        // Linkonce SIMD Vectorized Slice Operations
+        out.push_str("; IFA Standard Library SIMD Slice Vectorizers\n");
+        out.push_str("define linkonce_odr void @ifa_simd_slice_add_f32(ptr %dst, ptr %src1, ptr %src2, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %tail_entry\n");
+        out.push_str("vec_step:\n  %p1 = getelementptr inbounds float, ptr %src1, i64 %i\n  %p2 = getelementptr inbounds float, ptr %src2, i64 %i\n  %pd = getelementptr inbounds float, ptr %dst, i64 %i\n");
+        out.push_str("  %v1 = load <8 x float>, ptr %p1, align 4\n  %v2 = load <8 x float>, ptr %p2, align 4\n  %vr = fadd <8 x float> %v1, %v2\n  store <8 x float> %vr, ptr %pd, align 4\n");
+        out.push_str("  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !1\n");
+        out.push_str("tail_entry:\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %tail_entry ], [ %next_ti, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp1 = getelementptr inbounds float, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds float, ptr %src2, i64 %ti\n  %tpd = getelementptr inbounds float, ptr %dst, i64 %ti\n");
+        out.push_str("  %tv1 = load float, ptr %tp1, align 4\n  %tv2 = load float, ptr %tp2, align 4\n  %tvr = fadd float %tv1, %tv2\n  store float %tvr, ptr %tpd, align 4\n");
+        out.push_str("  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_slice_mul_f32(ptr %dst, ptr %src1, ptr %src2, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %tail_entry\n");
+        out.push_str("vec_step:\n  %p1 = getelementptr inbounds float, ptr %src1, i64 %i\n  %p2 = getelementptr inbounds float, ptr %src2, i64 %i\n  %pd = getelementptr inbounds float, ptr %dst, i64 %i\n");
+        out.push_str("  %v1 = load <8 x float>, ptr %p1, align 4\n  %v2 = load <8 x float>, ptr %p2, align 4\n  %vr = fmul <8 x float> %v1, %v2\n  store <8 x float> %vr, ptr %pd, align 4\n");
+        out.push_str("  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !1\n");
+        out.push_str("tail_entry:\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %tail_entry ], [ %next_ti, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp1 = getelementptr inbounds float, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds float, ptr %src2, i64 %ti\n  %tpd = getelementptr inbounds float, ptr %dst, i64 %ti\n");
+        out.push_str("  %tv1 = load float, ptr %tp1, align 4\n  %tv2 = load float, ptr %tp2, align 4\n  %tvr = fmul float %tv1, %tv2\n  store float %tvr, ptr %tpd, align 4\n");
+        out.push_str("  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr float @ifa_simd_slice_dot_f32(ptr %src1, ptr %src2, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x float> [ zeroinitializer, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p1 = getelementptr inbounds float, ptr %src1, i64 %i\n  %p2 = getelementptr inbounds float, ptr %src2, i64 %i\n  %v1 = load <8 x float>, ptr %p1, align 4\n  %v2 = load <8 x float>, ptr %p2, align 4\n");
+        out.push_str("  %prod = fmul <8 x float> %v1, %v2\n  %next_acc = fadd <8 x float> %acc, %prod\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !1\n");
+        out.push_str("reduce:\n  %vec_sum = call float @llvm.vector.reduce.fadd.v8f32(float 0.0, <8 x float> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi float [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp1 = getelementptr inbounds float, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds float, ptr %src2, i64 %ti\n  %tv1 = load float, ptr %tp1, align 4\n  %tv2 = load float, ptr %tp2, align 4\n");
+        out.push_str("  %tprod = fmul float %tv1, %tv2\n  %next_s_acc = fadd float %s_acc, %tprod\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret float %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr float @ifa_simd_slice_sum_f32(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x float> [ zeroinitializer, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds float, ptr %src, i64 %i\n  %v = load <8 x float>, ptr %p, align 4\n  %next_acc = fadd <8 x float> %acc, %v\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !1\n");
+        out.push_str("reduce:\n  %vec_sum = call float @llvm.vector.reduce.fadd.v8f32(float 0.0, <8 x float> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi float [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds float, ptr %src, i64 %ti\n  %tv = load float, ptr %tp, align 4\n  %next_s_acc = fadd float %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret float %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_slice_add_i32(ptr %dst, ptr %src1, ptr %src2, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %tail_entry\n");
+        out.push_str("vec_step:\n  %p1 = getelementptr inbounds i32, ptr %src1, i64 %i\n  %p2 = getelementptr inbounds i32, ptr %src2, i64 %i\n  %pd = getelementptr inbounds i32, ptr %dst, i64 %i\n");
+        out.push_str("  %v1 = load <8 x i32>, ptr %p1, align 4\n  %v2 = load <8 x i32>, ptr %p2, align 4\n  %vr = add <8 x i32> %v1, %v2\n  store <8 x i32> %vr, ptr %pd, align 4\n");
+        out.push_str("  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !1\n");
+        out.push_str("tail_entry:\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %tail_entry ], [ %next_ti, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp1 = getelementptr inbounds i32, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds i32, ptr %src2, i64 %ti\n  %tpd = getelementptr inbounds i32, ptr %dst, i64 %ti\n");
+        out.push_str("  %tv1 = load i32, ptr %tp1, align 4\n  %tv2 = load i32, ptr %tp2, align 4\n  %tvr = add i32 %tv1, %tv2\n  store i32 %tvr, ptr %tpd, align 4\n");
+        out.push_str("  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str(
+            "define linkonce_odr i32 @ifa_simd_slice_sum_i32(ptr %src, i64 %len) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x i32> [ zeroinitializer, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i32, ptr %src, i64 %i\n  %v = load <8 x i32>, ptr %p, align 4\n  %next_acc = add <8 x i32> %acc, %v\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !1\n");
+        out.push_str("reduce:\n  %vec_sum = call i32 @llvm.vector.reduce.add.v8i32(<8 x i32> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i32 [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i32, ptr %src, i64 %ti\n  %tv = load i32, ptr %tp, align 4\n  %next_s_acc = add i32 %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i32 %s_acc\n}\n\n");
+
         // Fast-path 1-cycle CPU inlined generation check (alwaysinline with branch weights)
         out.push_str("; Inlined 1-cycle CPU generation check\n");
         out.push_str("define linkonce_odr void @ifa_rt_gen_check(ptr %ptr, i32 %remembered_gen) alwaysinline {\n");
@@ -190,11 +269,11 @@ impl<'a> LlvmIrEmitter<'a> {
         // 5. Function attribute groups for SIMD vectorization and LTO inlining
         out.push_str("; Function Attributes\n");
         out.push_str(&format!(
-            "attributes #0 = {{ mustprogress nofree nosync nounwind willreturn memory(none) \"target-cpu\"=\"{}\" \"target-features\"=\"{}\" }}\n",
+            "attributes #0 = {{ mustprogress nofree nosync nounwind willreturn memory(none) \"target-cpu\"=\"{}\" \"target-features\"=\"{}\" \"no-trapping-math\"=\"true\" }}\n",
             self.target.cpu, self.target.features
         ));
         out.push_str(&format!(
-            "attributes #1 = {{ \"target-cpu\"=\"{}\" \"target-features\"=\"{}\" }}\n",
+            "attributes #1 = {{ \"target-cpu\"=\"{}\" \"target-features\"=\"{}\" \"no-trapping-math\"=\"true\" }}\n",
             self.target.cpu, self.target.features
         ));
         if self.target.arch == TargetArch::Wasm32Wasi {
@@ -203,8 +282,13 @@ impl<'a> LlvmIrEmitter<'a> {
             );
         }
 
-        // 6. Metadata for branch weights (predicting nominal 1-cycle CPU execution path)
+        // 6. Metadata for branch weights and loop vectorization hints
         out.push_str("\n!0 = !{!\"branch_weights\", i32 1048576, i32 1}\n");
+        out.push_str("!1 = distinct !{!1, !2, !3, !4, !5}\n");
+        out.push_str("!2 = !{!\"llvm.loop.vectorize.enable\", i1 1}\n");
+        out.push_str("!3 = !{!\"llvm.loop.vectorize.width\", i32 8}\n");
+        out.push_str("!4 = !{!\"llvm.loop.interleave.count\", i32 4}\n");
+        out.push_str("!5 = !{!\"llvm.loop.unroll.enable\", i1 1}\n");
 
         Ok(out)
     }
@@ -294,7 +378,22 @@ impl<'a> LlvmIrEmitter<'a> {
                             _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
                         },
                         ValueExpr::CallDirect { name, .. } => {
-                            if let Some(target_fn) =
+                            let callee = INTERNER.resolve(name);
+                            if callee.starts_with("ifa_simd_") {
+                                if callee.ends_with("_f32")
+                                    && (callee.contains("dot") || callee.contains("sum"))
+                                {
+                                    ifa_fir::FirType::Float(ifa_sema::types::FloatType::F32)
+                                } else if callee.ends_with("_i32") && callee.contains("sum") {
+                                    ifa_fir::FirType::Int(ifa_sema::types::IntType::I32)
+                                } else if callee.contains("slice_add")
+                                    || callee.contains("slice_mul")
+                                {
+                                    ifa_fir::FirType::Unit
+                                } else {
+                                    ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                                }
+                            } else if let Some(target_fn) =
                                 module.functions.iter().find(|f| f.name == *name)
                             {
                                 target_fn.ret_ty.clone()
@@ -456,7 +555,8 @@ impl<'a> LlvmIrEmitter<'a> {
                 ));
             }
             ValueExpr::CallDirect { name, args } => {
-                let callee_name = INTERNER.resolve(name);
+                let callee = INTERNER.resolve(name);
+                let callee_name = &callee;
                 if callee_name == "println" || callee_name == "ifa_rt_println" {
                     if let Some(arg) = args.first() {
                         out.push_str(&format!("  call void @ifa_rt_println(ptr %v{})\n", arg.0));
@@ -488,6 +588,34 @@ impl<'a> LlvmIrEmitter<'a> {
                             .map(|p| fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()))
                             .collect();
                         (ret_ty, params)
+                    } else if callee.starts_with("ifa_simd_") {
+                        if callee.ends_with("_f32")
+                            && (callee.contains("dot") || callee.contains("sum"))
+                        {
+                            let p_types = if callee.contains("dot") {
+                                vec!["ptr".to_string(), "ptr".to_string(), "i64".to_string()]
+                            } else {
+                                vec!["ptr".to_string(), "i64".to_string()]
+                            };
+                            ("float".to_string(), p_types)
+                        } else if callee.ends_with("_i32") && callee.contains("sum") {
+                            (
+                                "i32".to_string(),
+                                vec!["ptr".to_string(), "i64".to_string()],
+                            )
+                        } else if callee.contains("slice_add") || callee.contains("slice_mul") {
+                            (
+                                "void".to_string(),
+                                vec![
+                                    "ptr".to_string(),
+                                    "ptr".to_string(),
+                                    "ptr".to_string(),
+                                    "i64".to_string(),
+                                ],
+                            )
+                        } else {
+                            ("i64".to_string(), vec!["i64".to_string(); args.len()])
+                        }
                     } else {
                         ("i64".to_string(), vec!["i64".to_string(); args.len()])
                     };
@@ -712,6 +840,34 @@ impl<'a> LlvmIrEmitter<'a> {
                             .map(|p| fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()))
                             .collect();
                         (ret_ty, params)
+                    } else if callee.starts_with("ifa_simd_") {
+                        if callee.ends_with("_f32")
+                            && (callee.contains("dot") || callee.contains("sum"))
+                        {
+                            let p_types = if callee.contains("dot") {
+                                vec!["ptr".to_string(), "ptr".to_string(), "i64".to_string()]
+                            } else {
+                                vec!["ptr".to_string(), "i64".to_string()]
+                            };
+                            ("float".to_string(), p_types)
+                        } else if callee.ends_with("_i32") && callee.contains("sum") {
+                            (
+                                "i32".to_string(),
+                                vec!["ptr".to_string(), "i64".to_string()],
+                            )
+                        } else if callee.contains("slice_add") || callee.contains("slice_mul") {
+                            (
+                                "void".to_string(),
+                                vec![
+                                    "ptr".to_string(),
+                                    "ptr".to_string(),
+                                    "ptr".to_string(),
+                                    "i64".to_string(),
+                                ],
+                            )
+                        } else {
+                            ("i64".to_string(), vec!["i64".to_string(); args.len()])
+                        }
                     } else {
                         ("i64".to_string(), vec!["i64".to_string(); args.len()])
                     };

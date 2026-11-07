@@ -165,6 +165,18 @@ void ifa_rt_println(const char* str);
 void ifa_rt_print_i64(int64_t n);
 void ifa_rt_println_i64(int64_t n);
 
+/* --- Asynchronous Non-Blocking Reactor API (io_uring / IOCP) --- */
+
+int32_t ifa_rt_async_io_uring_supported(void);
+int32_t ifa_rt_async_iocp_supported(void);
+void ifa_rt_async_sleep(uint64_t millis);
+int32_t ifa_rt_async_tcp_listen(uint16_t port, int32_t backlog);
+int32_t ifa_rt_async_tcp_accept(int32_t listener_fd);
+int32_t ifa_rt_async_tcp_connect(const char* host, uint16_t port);
+intptr_t ifa_rt_async_read(int32_t stream_fd, uint8_t* buf, size_t len);
+intptr_t ifa_rt_async_write(int32_t stream_fd, const uint8_t* buf, size_t len);
+int32_t ifa_rt_async_close(int32_t handle_fd);
+
 #ifdef __cplusplus
 }
 #endif

@@ -305,3 +305,34 @@ fn test_llvm_error_union_try_question_catch_codegen() {
     assert!(llvm_ir.contains("define dso_local i64 @main()"));
     assert!(llvm_ir.contains("call ptr @chain_work()"));
 }
+
+#[test]
+fn test_llvm_simd_slice_vectorization() {
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let module = ifa_fir::FirModule {
+        name: ifa_span::INTERNER.intern("simd_test"),
+        functions: Vec::new(),
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+    let ir = emitter.emit_module(&module).unwrap();
+
+    // Verify SIMD Vector Reduction Intrinsics and Vectorizers are generated
+    assert!(ir.contains("declare float @llvm.vector.reduce.fadd.v8f32"));
+    assert!(ir.contains("declare i32 @llvm.vector.reduce.add.v8i32"));
+    assert!(ir.contains("@ifa_simd_slice_add_f32"));
+    assert!(ir.contains("@ifa_simd_slice_mul_f32"));
+    assert!(ir.contains("@ifa_simd_slice_dot_f32"));
+    assert!(ir.contains("@ifa_simd_slice_sum_f32"));
+    assert!(ir.contains("@ifa_simd_slice_add_i32"));
+    assert!(ir.contains("@ifa_simd_slice_sum_i32"));
+    assert!(ir.contains("<8 x float>"));
+    assert!(ir.contains("<8 x i32>"));
+
+    // Verify loop vectorization metadata
+    assert!(ir.contains("!\"llvm.loop.vectorize.enable\", i1 1"));
+    assert!(ir.contains("!\"llvm.loop.vectorize.width\", i32 8"));
+    assert!(ir.contains("\"no-trapping-math\"=\"true\""));
+}

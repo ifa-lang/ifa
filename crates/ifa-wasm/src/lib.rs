@@ -130,7 +130,21 @@ mod tests {
         assert!(result.wasm_file.exists());
         assert!(result.js_file.exists());
         assert!(result.dts_file.exists());
+        assert!(result.react_file.exists());
+        assert!(result.react_dts_file.exists());
+        assert!(result.web_os_file.exists());
+        assert!(result.web_os_dts_file.exists());
         assert!(result.package_json_file.exists());
+
+        let react_js = std::fs::read_to_string(&result.react_file).unwrap();
+        assert!(react_js.contains("export function useIfaModule"));
+
+        let web_os_js = std::fs::read_to_string(&result.web_os_file).unwrap();
+        assert!(web_os_js.contains("export class WebOsProcess"));
+
+        let pkg = std::fs::read_to_string(&result.package_json_file).unwrap();
+        assert!(pkg.contains("\"./react\""));
+        assert!(pkg.contains("\"./web-os\""));
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp_dir);

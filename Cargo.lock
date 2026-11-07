@@ -640,6 +640,8 @@ name = "ifa-runtime"
 version = "0.1.0"
 dependencies = [
  "lazy_static",
+ "libc",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

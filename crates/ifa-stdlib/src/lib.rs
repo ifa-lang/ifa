@@ -16,7 +16,10 @@ pub use fs::{
     remove_dir_all as fs_remove_dir_all, remove_file as fs_remove_file, rename as fs_rename,
     write as fs_write, write_string as fs_write_string, FileMetadata,
 };
-pub use http::{HttpHeaders, HttpMethod, HttpRequest, HttpResponse, HttpStatus};
+pub use http::{
+    HttpClient, HttpHandler, HttpHeaders, HttpMethod, HttpRequest, HttpResponse, HttpServer,
+    HttpStatus,
+};
 pub use io::{BufferedReader, BufferedWriter, MemoryStream};
 pub use json::{
     decode as decode_json, encode as encode_json, encode_pretty as encode_json_pretty, JsonValue,
@@ -230,5 +233,119 @@ mod tests {
             writer.flush().unwrap();
         }
         assert_eq!(sink, b"Alpha\nBeta\n");
+    }
+
+    #[test]
+    fn test_http_wire_serialization_and_parsing() {
+        let req = HttpRequest::new(HttpMethod::Post, "/api/v1/charge")
+            .header("Host", "localhost:8080")
+            .header("Content-Type", "application/json")
+            .body(br#"{"amount":5000,"currency":"XOF"}"#.to_vec());
+
+        let wire = req.to_wire_bytes();
+        let (parsed_req, size) = HttpRequest::parse_from_wire(&wire).unwrap();
+        assert_eq!(size, wire.len());
+        assert_eq!(parsed_req.method, HttpMethod::Post);
+        assert_eq!(parsed_req.path, "/api/v1/charge");
+        assert_eq!(
+            parsed_req.body_str().unwrap(),
+            r#"{"amount":5000,"currency":"XOF"}"#
+        );
+
+        let resp = HttpResponse::created()
+            .header("X-Powered-By", "IFA")
+            .text("Transaction processed");
+        let resp_wire = resp.to_wire_bytes();
+        let (parsed_resp, resp_size) = HttpResponse::parse_from_wire(&resp_wire).unwrap();
+        assert_eq!(resp_size, resp_wire.len());
+        assert_eq!(parsed_resp.status, HttpStatus::CREATED);
+        assert_eq!(parsed_resp.body_str().unwrap(), "Transaction processed");
+    }
+
+    #[test]
+    fn test_async_http_server_and_client_fibers() {
+        // Start HTTP Server on ephemeral port 0
+        let mut server = HttpServer::new(0);
+
+        server.get("/health", |_req| HttpResponse::ok().text("healthy"));
+
+        server.post("/api/v1/charge", |req| {
+            let body_str = req.body_str().unwrap_or("{}");
+            let json = decode_json(body_str).unwrap_or(JsonValue::Null);
+            let merchant = json
+                .get("merchant_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let amount = json.get("amount_xof").and_then(|v| v.as_i64()).unwrap_or(0);
+
+            let mut resp_map = std::collections::BTreeMap::new();
+            resp_map.insert(
+                "status".to_string(),
+                JsonValue::String("success".to_string()),
+            );
+            resp_map.insert(
+                "merchant".to_string(),
+                JsonValue::String(merchant.to_string()),
+            );
+            resp_map.insert("amount".to_string(), JsonValue::Number(amount as f64));
+            resp_map.insert(
+                "tx_ref".to_string(),
+                JsonValue::String("FA-TX-99482".to_string()),
+            );
+
+            HttpResponse::ok().json(&JsonValue::Object(resp_map))
+        });
+
+        let bound_addr = server
+            .listen_background()
+            .expect("Failed to bind HTTP server");
+        let client = HttpClient::new();
+
+        // 1. Test GET /health
+        let health_resp = client
+            .get("127.0.0.1", bound_addr.port(), "/health")
+            .expect("GET health failed");
+        assert_eq!(health_resp.status, HttpStatus::OK);
+        assert_eq!(health_resp.body_str().unwrap(), "healthy");
+
+        // 2. Test POST /api/v1/charge
+        let mut payload_map = std::collections::BTreeMap::new();
+        payload_map.insert(
+            "merchant_id".to_string(),
+            JsonValue::String("MOMOPAY_01".to_string()),
+        );
+        payload_map.insert("amount_xof".to_string(), JsonValue::Number(7500.0));
+        payload_map.insert("currency".to_string(), JsonValue::String("XOF".to_string()));
+
+        let charge_resp = client
+            .post_json(
+                "127.0.0.1",
+                bound_addr.port(),
+                "/api/v1/charge",
+                &JsonValue::Object(payload_map),
+            )
+            .expect("POST charge failed");
+        assert_eq!(charge_resp.status, HttpStatus::OK);
+        let resp_json = decode_json(charge_resp.body_str().unwrap()).unwrap();
+        assert_eq!(
+            resp_json.get("status").and_then(|v| v.as_str()),
+            Some("success")
+        );
+        assert_eq!(
+            resp_json.get("merchant").and_then(|v| v.as_str()),
+            Some("MOMOPAY_01")
+        );
+        assert_eq!(
+            resp_json.get("tx_ref").and_then(|v| v.as_str()),
+            Some("FA-TX-99482")
+        );
+
+        // 3. Test 404 for unknown route
+        let not_found_resp = client
+            .get("127.0.0.1", bound_addr.port(), "/unknown/path")
+            .expect("GET unknown failed");
+        assert_eq!(not_found_resp.status, HttpStatus::NOT_FOUND);
+
+        server.stop();
     }
 }

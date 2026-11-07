@@ -1127,10 +1127,12 @@ fn main() -> ExitCode {
                             name,
                             out_path.display()
                         );
-                        println!("  WASM: {}", bundle.wasm_file.display());
-                        println!("  JS:   {}", bundle.js_file.display());
-                        println!("  D.TS: {}", bundle.dts_file.display());
-                        println!("  JSON: {}", bundle.package_json_file.display());
+                        println!("  WASM:    {}", bundle.wasm_file.display());
+                        println!("  JS:      {}", bundle.js_file.display());
+                        println!("  D.TS:    {}", bundle.dts_file.display());
+                        println!("  REACT:   {}", bundle.react_file.display());
+                        println!("  WEB-OS:  {}", bundle.web_os_file.display());
+                        println!("  PACKAGE: {}", bundle.package_json_file.display());
                         ExitCode::SUCCESS
                     }
                     Err(e) => {
