@@ -746,3 +746,158 @@ fn test_destructuring_let_and_mut_interp() {
     let res = interp.execute_function("main", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(500));
 }
+
+#[test]
+fn test_if_let_execution_then_and_else() {
+    let src = r#"
+        enum OptionVal {
+            Some(i64),
+            None,
+        }
+
+        fn compute(opt: OptionVal) -> i64 {
+            if let OptionVal::Some(x) = opt {
+                return x * 2;
+            } else {
+                return -1;
+            }
+        }
+
+        fn main() -> i64 {
+            let s = OptionVal::Some(21);
+            let n = OptionVal::None;
+
+            let r1 = compute(s);
+            let r2 = compute(n);
+
+            return r1 + r2; // 42 + (-1) = 41
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("if_let_exec.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(41));
+}
+
+#[test]
+fn test_while_let_execution_accumulator() {
+    let src = r#"
+        enum Stream {
+            Value(i64),
+            End,
+        }
+
+        fn step(current: i64) -> Stream {
+            if current > 0 {
+                return Stream::Value(current - 1);
+            } else {
+                return Stream::End;
+            }
+        }
+
+        fn main() -> i64 {
+            mut s = Stream::Value(4);
+            mut sum = 0;
+
+            while let Stream::Value(n) = s {
+                sum += n;
+                s = step(n);
+            }
+
+            return sum; // 4 + 3 + 2 + 1 + 0 = 10
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("while_let_exec.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(10));
+}
+
+#[test]
+fn test_if_let_expression_phi_value() {
+    let src = r#"
+        enum Flag {
+            Enabled(i64),
+            Disabled,
+        }
+
+        fn main() -> i64 {
+            let f1 = Flag::Enabled(100);
+            let f2 = Flag::Disabled;
+
+            let v1 = if let Flag::Enabled(x) = f1 { x + 10 } else { 0 };
+            let v2 = if let Flag::Enabled(y) = f2 { y + 10 } else { 5 };
+
+            return v1 + v2; // 110 + 5 = 115
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("if_let_expr.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(115));
+}
+
+#[test]
+fn test_example_if_let_while_let_execution() {
+    let src = include_str!("../../../examples/if_let_while_let.ifa");
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("if_let_while_let.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(538));
+}

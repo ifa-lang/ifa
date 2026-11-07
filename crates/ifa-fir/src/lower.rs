@@ -431,6 +431,24 @@ impl<'a> FunctionLoweringContext<'a> {
             ExprKind::Match { arms, .. } => {
                 arms.first().and_then(|a| self.infer_expr_fir_type(&a.body))
             }
+            ExprKind::If {
+                then_branch,
+                else_branch,
+                ..
+            }
+            | ExprKind::IfLet {
+                then_branch,
+                else_branch,
+                ..
+            } => then_branch
+                .expr
+                .as_ref()
+                .and_then(|e| self.infer_expr_fir_type(e))
+                .or_else(|| {
+                    else_branch
+                        .as_ref()
+                        .and_then(|e| self.infer_expr_fir_type(e))
+                }),
             _ => None,
         }
     }
@@ -1022,6 +1040,71 @@ impl<'a> FunctionLoweringContext<'a> {
                     }
                 }
                 self.loop_stack.pop();
+
+                // Exit block
+                self.current_block = exit_block;
+            }
+
+            Stmt::WhileLet {
+                pattern,
+                expr: cond_expr,
+                body,
+                span: _,
+            } => {
+                let cond_block = self.alloc_block();
+                let body_block = self.alloc_block();
+                let exit_block = self.alloc_block();
+
+                self.set_terminator(Terminator::Branch {
+                    target: cond_block,
+                    args: Vec::new(),
+                });
+
+                // Condition block
+                self.current_block = cond_block;
+                let target_val = self.lower_expr(cond_expr);
+                let target_ty = self
+                    .infer_expr_fir_type(cond_expr)
+                    .unwrap_or(FirType::Int(IntType::I64));
+
+                let saved_allocas = self.var_allocas.clone();
+                let saved_types = self.var_types.clone();
+
+                self.lower_pattern_match(
+                    target_val,
+                    &target_ty,
+                    pattern,
+                    body_block,
+                    exit_block,
+                    cond_expr.span,
+                );
+
+                // Body block
+                self.current_block = body_block;
+                self.loop_stack.push(LoopContext {
+                    continue_block: cond_block,
+                    break_block: exit_block,
+                });
+
+                for s in &body.stmts {
+                    self.lower_stmt(s);
+                }
+                if let Some(trailing) = &body.expr {
+                    let _ = self.lower_expr(trailing);
+                }
+
+                if let Some(b) = self.func.get_block(self.current_block) {
+                    if !b.is_terminated() {
+                        self.set_terminator(Terminator::Branch {
+                            target: cond_block,
+                            args: Vec::new(),
+                        });
+                    }
+                }
+                self.loop_stack.pop();
+
+                self.var_allocas = saved_allocas;
+                self.var_types = saved_types;
 
                 // Exit block
                 self.current_block = exit_block;
@@ -2252,6 +2335,111 @@ impl<'a> FunctionLoweringContext<'a> {
                 if let Some(mb) = self.func.get_block_mut(merge_block) {
                     if has_phi {
                         mb.push_param(res, FirType::Int(IntType::I64));
+                    }
+                }
+                if !has_phi {
+                    self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), span);
+                }
+                res
+            }
+
+            ExprKind::IfLet {
+                pattern,
+                expr: cond_expr,
+                then_branch,
+                else_branch,
+            } => {
+                let target_val = self.lower_expr(cond_expr);
+                let target_ty = self
+                    .infer_expr_fir_type(cond_expr)
+                    .unwrap_or(FirType::Int(IntType::I64));
+
+                let then_block = self.alloc_block();
+                let else_block = self.alloc_block();
+                let merge_block = self.alloc_block();
+
+                let saved_allocas = self.var_allocas.clone();
+                let saved_types = self.var_types.clone();
+
+                self.lower_pattern_match(
+                    target_val, &target_ty, pattern, then_block, else_block, expr.span,
+                );
+
+                // Then branch
+                self.current_block = then_block;
+                for s in &then_branch.stmts {
+                    self.lower_stmt(s);
+                }
+                let then_val = then_branch.expr.as_ref().map(|e| self.lower_expr(e));
+                let then_end_block = self.current_block;
+                let then_reaches_merge = self
+                    .func
+                    .get_block(then_end_block)
+                    .is_some_and(|b| !b.is_terminated());
+
+                // Restore variables before lowering else branch so bindings from then don't leak
+                self.var_allocas = saved_allocas.clone();
+                self.var_types = saved_types.clone();
+
+                // Else branch
+                self.current_block = else_block;
+                let else_val = else_branch
+                    .as_ref()
+                    .map(|else_expr| self.lower_expr(else_expr));
+                let else_end_block = self.current_block;
+                let else_reaches_merge = self
+                    .func
+                    .get_block(else_end_block)
+                    .is_some_and(|b| !b.is_terminated());
+
+                let has_phi = else_branch.is_some()
+                    && then_val.is_some()
+                    && else_val.is_some()
+                    && then_reaches_merge
+                    && else_reaches_merge;
+
+                let res = self.alloc_value();
+
+                if then_reaches_merge {
+                    let args = if has_phi {
+                        vec![then_val.unwrap()]
+                    } else {
+                        Vec::new()
+                    };
+                    self.current_block = then_end_block;
+                    self.set_terminator(Terminator::Branch {
+                        target: merge_block,
+                        args,
+                    });
+                }
+
+                if else_reaches_merge {
+                    let args = if has_phi {
+                        vec![else_val.unwrap()]
+                    } else {
+                        Vec::new()
+                    };
+                    self.current_block = else_end_block;
+                    self.set_terminator(Terminator::Branch {
+                        target: merge_block,
+                        args,
+                    });
+                }
+
+                self.var_allocas = saved_allocas;
+                self.var_types = saved_types;
+                self.current_block = merge_block;
+
+                let phi_ty = if has_phi {
+                    self.infer_expr_fir_type(expr)
+                        .unwrap_or(FirType::Int(IntType::I64))
+                } else {
+                    FirType::Int(IntType::I64)
+                };
+
+                if let Some(mb) = self.func.get_block_mut(merge_block) {
+                    if has_phi {
+                        mb.push_param(res, phi_ty);
                     }
                 }
                 if !has_phi {

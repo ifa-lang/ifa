@@ -271,6 +271,25 @@ impl<'a> EscapeAnalyzer<'a> {
                     self.collect_contained_refs_rec(el, out);
                 }
             }
+            ExprKind::IfLet {
+                expr,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.collect_contained_refs_rec(expr, out);
+                for s in &then_branch.stmts {
+                    if let Stmt::Expr(e) = s {
+                        self.collect_contained_refs_rec(e, out);
+                    }
+                }
+                if let Some(e) = &then_branch.expr {
+                    self.collect_contained_refs_rec(e, out);
+                }
+                if let Some(el) = else_branch {
+                    self.collect_contained_refs_rec(el, out);
+                }
+            }
             ExprKind::Block(blk) => {
                 for s in &blk.stmts {
                     if let Stmt::Expr(e) = s {
@@ -395,6 +414,15 @@ impl<'a> EscapeAnalyzer<'a> {
             Stmt::Fail(expr, _) => self.check_expr(expr),
             Stmt::While { cond, body, .. } => {
                 self.check_expr(cond);
+                for s in &body.stmts {
+                    self.check_stmt(s);
+                }
+                if let Some(e) = &body.expr {
+                    self.check_expr(e);
+                }
+            }
+            Stmt::WhileLet { expr, body, .. } => {
+                self.check_expr(expr);
                 for s in &body.stmts {
                     self.check_stmt(s);
                 }
@@ -563,6 +591,23 @@ impl<'a> EscapeAnalyzer<'a> {
                 else_branch,
             } => {
                 self.check_expr(cond);
+                for s in &then_branch.stmts {
+                    self.check_stmt(s);
+                }
+                if let Some(e) = &then_branch.expr {
+                    self.check_expr(e);
+                }
+                if let Some(el) = else_branch {
+                    self.check_expr(el);
+                }
+            }
+            ExprKind::IfLet {
+                expr,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.check_expr(expr);
                 for s in &then_branch.stmts {
                     self.check_stmt(s);
                 }

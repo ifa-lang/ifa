@@ -2130,3 +2130,196 @@ fn test_destructuring_let_without_init_rejected() {
         "Expected E0047 for destructuring let without initializer"
     );
 }
+
+#[test]
+fn test_if_let_refutable_pattern_valid() {
+    let code = r#"
+        enum Status {
+            Active(i64),
+            Inactive,
+        }
+
+        fn check_status(s: Status) -> i64 {
+            if let Status::Active(val) = s {
+                return val;
+            } else {
+                return 0;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Valid refutable if let must succeed without errors: {:?}",
+        res.diagnostics
+    );
+    assert_eq!(
+        res.warning_count(),
+        0,
+        "No warnings expected for refutable pattern"
+    );
+}
+
+#[test]
+fn test_if_let_scoping_isolation() {
+    let code_leak_else = r#"
+        enum OptionI64 {
+            Some(i64),
+            None,
+        }
+
+        fn leak_in_else(opt: OptionI64) -> i64 {
+            if let OptionI64::Some(x) = opt {
+                return x;
+            } else {
+                return x;
+            }
+        }
+    "#;
+    let res_else = run_analysis(code_leak_else);
+    assert!(
+        res_else.has_errors(),
+        "Variable bound in if let must not leak to else branch"
+    );
+    assert!(
+        res_else
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0001") && d.message.contains("inconnu")),
+        "Expected unknown variable error in else branch: {:?}",
+        res_else.diagnostics
+    );
+
+    let code_leak_after = r#"
+        enum OptionI64 {
+            Some(i64),
+            None,
+        }
+
+        fn leak_after(opt: OptionI64) -> i64 {
+            if let OptionI64::Some(x) = opt {
+                let _ = x;
+            }
+            return x;
+        }
+    "#;
+    let res_after = run_analysis(code_leak_after);
+    assert!(
+        res_after.has_errors(),
+        "Variable bound in if let must not leak after if let block"
+    );
+    assert!(
+        res_after
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0001") && d.message.contains("inconnu")),
+        "Expected unknown variable error after if let: {:?}",
+        res_after.diagnostics
+    );
+}
+
+#[test]
+fn test_if_let_irrefutable_warning() {
+    let code = r#"
+        fn test_irrefutable(x: i64) -> i64 {
+            if let val = x {
+                return val;
+            } else {
+                return 0;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Irrefutable pattern in if let is a warning, not an error: {:?}",
+        res.diagnostics
+    );
+    assert!(
+        res.warning_count() > 0,
+        "Expected warning for irrefutable pattern in if let"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("W0001")),
+        "Expected W0001 warning for irrefutable pattern in if let"
+    );
+}
+
+#[test]
+fn test_while_let_refutable_valid_and_scoping() {
+    let code = r#"
+        enum Step {
+            More(i64),
+            Done,
+        }
+
+        fn process_all() -> i64 {
+            mut total = 0;
+            mut step = Step::More(5);
+            while let Step::More(val) = step {
+                total = total + val;
+                step = Step::Done;
+            }
+            return total;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Valid while let must succeed without errors: {:?}",
+        res.diagnostics
+    );
+    assert_eq!(res.warning_count(), 0);
+
+    let code_leak_after = r#"
+        enum Step {
+            More(i64),
+            Done,
+        }
+
+        fn leak_while(step: Step) -> i64 {
+            while let Step::More(val) = step {
+                let _ = val;
+            }
+            return val;
+        }
+    "#;
+    let res_leak = run_analysis(code_leak_after);
+    assert!(
+        res_leak.has_errors(),
+        "Pattern variable from while let must not leak outside loop"
+    );
+    assert!(
+        res_leak
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0001") && d.message.contains("inconnu")),
+        "Expected unknown variable error after while let: {:?}",
+        res_leak.diagnostics
+    );
+}
+
+#[test]
+fn test_while_let_irrefutable_warning() {
+    let code = r#"
+        fn test_irrefutable_loop(n: i64) {
+            while let x = n {
+                let _ = x;
+                break;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Irrefutable pattern in while let should produce warning, not error"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("W0001")),
+        "Expected W0001 warning for irrefutable pattern in while let"
+    );
+}

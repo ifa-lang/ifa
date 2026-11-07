@@ -69,6 +69,10 @@ impl<'a, 'ast> Visitor<'ast> for InlayHintVisitor<'a> {
                 self.visit_expr(cond);
                 self.visit_block(body);
             }
+            Stmt::WhileLet { expr, body, .. } => {
+                self.visit_expr(expr);
+                self.visit_block(body);
+            }
             Stmt::For { iterable, body, .. } => {
                 self.visit_expr(iterable);
                 self.visit_block(body);
@@ -150,6 +154,18 @@ impl<'a, 'ast> Visitor<'ast> for InlayHintVisitor<'a> {
                 else_branch,
             } => {
                 self.visit_expr(cond);
+                self.visit_block(then_branch);
+                if let Some(els) = else_branch {
+                    self.visit_expr(els);
+                }
+            }
+            ExprKind::IfLet {
+                expr,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.visit_expr(expr);
                 self.visit_block(then_branch);
                 if let Some(els) = else_branch {
                     self.visit_expr(els);

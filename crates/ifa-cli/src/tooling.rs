@@ -157,6 +157,11 @@ fn lint_statements(stmts: &[Stmt], warnings: &mut Vec<String>) {
                     then_branch,
                     else_branch,
                     ..
+                }
+                | ExprKind::IfLet {
+                    then_branch,
+                    else_branch,
+                    ..
                 } => {
                     lint_statements(&then_branch.stmts, warnings);
                     if let Some(e) = else_branch {
@@ -168,7 +173,9 @@ fn lint_statements(stmts: &[Stmt], warnings: &mut Vec<String>) {
                 ExprKind::Catch { body, .. } => lint_statements(&body.stmts, warnings),
                 _ => {}
             },
-            Stmt::While { body, .. } => lint_statements(&body.stmts, warnings),
+            Stmt::While { body, .. } | Stmt::WhileLet { body, .. } => {
+                lint_statements(&body.stmts, warnings)
+            }
             Stmt::For { var, body, .. } => {
                 let var_name = INTERNER.resolve(var);
                 if !is_snake_case(&var_name) && !var_name.starts_with('_') {

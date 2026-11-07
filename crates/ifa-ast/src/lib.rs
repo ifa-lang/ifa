@@ -205,6 +205,12 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    WhileLet {
+        pattern: Pattern,
+        expr: Expr,
+        body: Block,
+        span: Span,
+    },
     For {
         var: Symbol,
         iterable: Expr,
@@ -226,6 +232,7 @@ impl Stmt {
             Stmt::Return(_, span) => *span,
             Stmt::Fail(_, span) => *span,
             Stmt::While { span, .. } => *span,
+            Stmt::WhileLet { span, .. } => *span,
             Stmt::For { span, .. } => *span,
             Stmt::Loop(_, span) => *span,
             Stmt::Break(span) => *span,
@@ -492,6 +499,12 @@ pub enum ExprKind {
         then_branch: Block,
         else_branch: Option<Box<Expr>>,
     },
+    IfLet {
+        pattern: Pattern,
+        expr: Box<Expr>,
+        then_branch: Block,
+        else_branch: Option<Box<Expr>>,
+    },
     Match {
         expr: Box<Expr>,
         arms: Vec<MatchArm>,
@@ -600,6 +613,10 @@ pub trait Visitor<'ast>: Sized {
                 self.visit_expr(cond);
                 self.visit_block(body);
             }
+            Stmt::WhileLet { expr, body, .. } => {
+                self.visit_expr(expr);
+                self.visit_block(body);
+            }
             Stmt::For { iterable, body, .. } => {
                 self.visit_expr(iterable);
                 self.visit_block(body);
@@ -655,6 +672,18 @@ pub trait Visitor<'ast>: Sized {
                 else_branch,
             } => {
                 self.visit_expr(cond);
+                self.visit_block(then_branch);
+                if let Some(els) = else_branch {
+                    self.visit_expr(els);
+                }
+            }
+            ExprKind::IfLet {
+                expr,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.visit_expr(expr);
                 self.visit_block(then_branch);
                 if let Some(els) = else_branch {
                     self.visit_expr(els);

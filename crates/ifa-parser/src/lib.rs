@@ -972,14 +972,28 @@ impl Parser {
             }
             TokenKind::While => {
                 let while_tok = self.advance();
-                let cond = self.parse_expr()?;
-                let body = self.parse_block()?;
-                let end = body.span.end;
-                Ok(Stmt::While {
-                    cond,
-                    body,
-                    span: Span::new(self.file_id, while_tok.span.start, end),
-                })
+                if self.match_token(&TokenKind::Let) {
+                    let pattern = self.parse_pattern()?;
+                    self.expect(TokenKind::Eq)?;
+                    let expr = self.parse_expr()?;
+                    let body = self.parse_block()?;
+                    let end = body.span.end;
+                    Ok(Stmt::WhileLet {
+                        pattern,
+                        expr,
+                        body,
+                        span: Span::new(self.file_id, while_tok.span.start, end),
+                    })
+                } else {
+                    let cond = self.parse_expr()?;
+                    let body = self.parse_block()?;
+                    let end = body.span.end;
+                    Ok(Stmt::While {
+                        cond,
+                        body,
+                        span: Span::new(self.file_id, while_tok.span.start, end),
+                    })
+                }
             }
             TokenKind::For => {
                 let for_tok = self.advance();
@@ -1259,34 +1273,68 @@ impl Parser {
             }
             TokenKind::If => {
                 let if_tok = self.advance();
-                let cond = self.parse_expr()?;
-                let then_branch = self.parse_block()?;
-                let mut else_branch = None;
-                let mut end_pos = then_branch.span.end;
+                if self.match_token(&TokenKind::Let) {
+                    let pattern = self.parse_pattern()?;
+                    self.expect(TokenKind::Eq)?;
+                    let expr = self.parse_expr()?;
+                    let then_branch = self.parse_block()?;
+                    let mut else_branch = None;
+                    let mut end_pos = then_branch.span.end;
 
-                if self.match_token(&TokenKind::Else) {
-                    if self.check(&TokenKind::If) {
-                        let else_if = self.parse_expr()?;
-                        end_pos = else_if.span.end;
-                        else_branch = Some(Box::new(else_if));
-                    } else {
-                        let else_blk = self.parse_block()?;
-                        end_pos = else_blk.span.end;
-                        else_branch = Some(Box::new(Expr::new(
-                            ExprKind::Block(else_blk),
-                            Span::new(self.file_id, then_branch.span.end, end_pos),
-                        )));
+                    if self.match_token(&TokenKind::Else) {
+                        if self.check(&TokenKind::If) {
+                            let else_if = self.parse_expr()?;
+                            end_pos = else_if.span.end;
+                            else_branch = Some(Box::new(else_if));
+                        } else {
+                            let else_blk = self.parse_block()?;
+                            end_pos = else_blk.span.end;
+                            else_branch = Some(Box::new(Expr::new(
+                                ExprKind::Block(else_blk),
+                                Span::new(self.file_id, then_branch.span.end, end_pos),
+                            )));
+                        }
                     }
-                }
 
-                Ok(Expr::new(
-                    ExprKind::If {
-                        cond: Box::new(cond),
-                        then_branch,
-                        else_branch,
-                    },
-                    Span::new(self.file_id, if_tok.span.start, end_pos),
-                ))
+                    Ok(Expr::new(
+                        ExprKind::IfLet {
+                            pattern,
+                            expr: Box::new(expr),
+                            then_branch,
+                            else_branch,
+                        },
+                        Span::new(self.file_id, if_tok.span.start, end_pos),
+                    ))
+                } else {
+                    let cond = self.parse_expr()?;
+                    let then_branch = self.parse_block()?;
+                    let mut else_branch = None;
+                    let mut end_pos = then_branch.span.end;
+
+                    if self.match_token(&TokenKind::Else) {
+                        if self.check(&TokenKind::If) {
+                            let else_if = self.parse_expr()?;
+                            end_pos = else_if.span.end;
+                            else_branch = Some(Box::new(else_if));
+                        } else {
+                            let else_blk = self.parse_block()?;
+                            end_pos = else_blk.span.end;
+                            else_branch = Some(Box::new(Expr::new(
+                                ExprKind::Block(else_blk),
+                                Span::new(self.file_id, then_branch.span.end, end_pos),
+                            )));
+                        }
+                    }
+
+                    Ok(Expr::new(
+                        ExprKind::If {
+                            cond: Box::new(cond),
+                            then_branch,
+                            else_branch,
+                        },
+                        Span::new(self.file_id, if_tok.span.start, end_pos),
+                    ))
+                }
             }
             TokenKind::Match => {
                 let match_tok = self.advance();
@@ -2338,6 +2386,61 @@ mod tests {
                 );
             } else {
                 panic!("expected struct let");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_if_let_and_while_let() {
+        let src = r#"
+            fn test_conditions(opt: Option<i64>) {
+                if let Option::Some(val) = opt {
+                    println(val);
+                } else if let Option::None = opt {
+                    println(0);
+                } else {
+                    println(-1);
+                }
+
+                while let Option::Some(x) = next_item() {
+                    process(x);
+                }
+            }
+        "#;
+        let fid = FileId(0);
+        let tokens = tokenize(fid, src);
+        let (prog, diags) = parse(fid, tokens);
+        assert!(diags.is_empty(), "Parser diags: {:?}", diags);
+
+        if let Item::Function(f) = &prog.items[0] {
+            let body = f.body.as_ref().unwrap();
+            assert_eq!(body.stmts.len(), 2);
+
+            // 1. if let with else-if-let and else
+            if let Stmt::Expr(expr) = &body.stmts[0] {
+                if let ExprKind::IfLet {
+                    pattern,
+                    else_branch,
+                    ..
+                } = &expr.kind
+                {
+                    assert!(matches!(pattern, Pattern::Variant { .. }));
+                    assert!(else_branch.is_some());
+                    if let Some(else_expr) = else_branch {
+                        assert!(matches!(else_expr.kind, ExprKind::IfLet { .. }));
+                    }
+                } else {
+                    panic!("expected IfLet expression");
+                }
+            } else {
+                panic!("expected expr statement");
+            }
+
+            // 2. while let
+            if let Stmt::WhileLet { pattern, .. } = &body.stmts[1] {
+                assert!(matches!(pattern, Pattern::Variant { .. }));
+            } else {
+                panic!("expected WhileLet statement");
             }
         }
     }

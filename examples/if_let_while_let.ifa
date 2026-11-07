@@ -1,0 +1,68 @@
+// Exemples idiomatiques d'utilisation de `if let` et `while let` en IFA.
+// Démontre le filtrage conditionnel réfutable avec liaison de variables dans la portée locale.
+
+enum JobStatus {
+    Pending(i64),
+    Running(i64),
+    Completed,
+}
+
+enum TokenStream {
+    Word(i64),
+    Separator,
+    Finished,
+}
+
+fn describe_job(status: JobStatus) -> i64 {
+    if let JobStatus::Pending(priority) = status {
+        return priority * 10;
+    } else if let JobStatus::Running(progress) = status {
+        return 100 + progress;
+    } else {
+        return 200;
+    }
+}
+
+fn next_token(step: i64) -> TokenStream {
+    if step > 0 {
+        return TokenStream::Word(step * 2);
+    } else {
+        return TokenStream::Finished;
+    }
+}
+
+fn drain_tokens(initial_count: i64) -> i64 {
+    mut counter = initial_count;
+    mut accumulated = 0;
+
+    while let TokenStream::Word(weight) = next_token(counter) {
+        accumulated += weight;
+        counter -= 1;
+    }
+
+    return accumulated;
+}
+
+pub fn main() -> i64 {
+    // 1. Filtrage conditionnel if let avec liaisons locales
+    let s1 = JobStatus::Pending(5);
+    let s2 = JobStatus::Running(42);
+    let s3 = JobStatus::Completed;
+
+    let d1 = describe_job(s1); // 50
+    let d2 = describe_job(s2); // 142
+    let d3 = describe_job(s3); // 200
+
+    // 2. if let en tant qu'expression produisant une valeur scalaire
+    let bonus = if let JobStatus::Running(prog) = s2 {
+        prog * 3
+    } else {
+        0
+    }; // 126
+
+    // 3. Boucle conditionnelle while let
+    let stream_sum = drain_tokens(4); // 8 + 6 + 4 + 2 = 20
+
+    // Total = 50 + 142 + 200 + 126 + 20 = 538
+    return d1 + d2 + d3 + bonus + stream_sum;
+}

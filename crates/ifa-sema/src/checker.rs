@@ -1110,6 +1110,34 @@ impl<'a> SemanticAnalyzer<'a> {
                 self.check_block(body, None);
                 self.symbols.exit_scope();
             }
+            Stmt::WhileLet {
+                pattern,
+                expr,
+                body,
+                span: _,
+            } => {
+                let cond_ty = self.infer_expr(expr);
+                let is_irrefutable =
+                    crate::exhaustiveness::is_irrefutable_pattern_for_type(pattern, &cond_ty);
+                if is_irrefutable && cond_ty != Type::Unknown {
+                    self.diagnostics.push(
+                        Diagnostic::warning(format!(
+                            "motif irréfutable dans une boucle 'while let' : le motif couvre toutes les valeurs possibles du type '{}'",
+                            cond_ty
+                        ))
+                        .with_code("W0001")
+                        .with_primary_label(pattern.span(), "motif irréfutable redondant dans 'while let'")
+                        .with_note(
+                            "ce motif correspondra toujours, entraînant une boucle infinie ; envisagez d'utiliser 'loop'",
+                        ),
+                    );
+                }
+
+                self.symbols.enter_scope(true, false);
+                self.check_pattern(pattern, &cond_ty);
+                self.check_block(body, None);
+                self.symbols.exit_scope();
+            }
             Stmt::For {
                 var,
                 iterable,
@@ -1622,6 +1650,66 @@ impl<'a> SemanticAnalyzer<'a> {
                             .with_secondary_label(then_branch.span, format!("branche 'then' de type {}", then_ty)),
                         );
                     }
+                    if then_ty.is_never() {
+                        else_ty
+                    } else {
+                        then_ty
+                    }
+                } else {
+                    Type::Unit
+                }
+            }
+            ExprKind::IfLet {
+                pattern,
+                expr: cond_expr,
+                then_branch,
+                else_branch,
+            } => {
+                let cond_ty = self.infer_expr(cond_expr);
+                let is_irrefutable =
+                    crate::exhaustiveness::is_irrefutable_pattern_for_type(pattern, &cond_ty);
+                if is_irrefutable && cond_ty != Type::Unknown {
+                    self.diagnostics.push(
+                        Diagnostic::warning(format!(
+                            "motif irréfutable dans une expression 'if let' : le motif couvre toutes les valeurs possibles du type '{}'",
+                            cond_ty
+                        ))
+                        .with_code("W0001")
+                        .with_primary_label(pattern.span(), "motif irréfutable redondant dans 'if let'")
+                        .with_note("envisagez d'utiliser une déclaration 'let' ordinaire à la place"),
+                    );
+                }
+
+                self.symbols.enter_scope(false, false);
+                self.check_pattern(pattern, &cond_ty);
+                let then_ty = self.check_block(then_branch, expected);
+                self.symbols.exit_scope();
+
+                if let Some(el) = else_branch {
+                    self.symbols.enter_scope(false, false);
+                    let expected_else = if then_ty.is_never() {
+                        expected
+                    } else {
+                        expected.or(Some(&then_ty))
+                    };
+                    let else_ty = self.check_expr(el, expected_else);
+                    self.symbols.exit_scope();
+
+                    if !then_ty.is_never()
+                        && !else_ty.is_never()
+                        && !else_ty.is_assignable_to(&then_ty)
+                    {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "incompatibilité de type entre les branches 'if let' ({}) et 'else' ({})",
+                                then_ty, else_ty
+                            ))
+                            .with_code("E0001")
+                            .with_primary_label(el.span, format!("branche 'else' de type {}", else_ty))
+                            .with_secondary_label(then_branch.span, format!("branche 'then' de type {}", then_ty)),
+                        );
+                    }
+
                     if then_ty.is_never() {
                         else_ty
                     } else {

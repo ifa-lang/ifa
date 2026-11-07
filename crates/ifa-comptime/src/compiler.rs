@@ -310,6 +310,14 @@ impl Compiler {
             Stmt::Defer(_, _) => {
                 // Defer is evaluated at runtime function exit, ignored in strict pure comptime
             }
+            Stmt::WhileLet { span, .. } => {
+                return Err(ComptimeError::new(
+                    ComptimeErrorKind::CompileError(
+                        "boucle 'while let' non encore supportée en contexte comptime".to_string(),
+                    ),
+                    *span,
+                ));
+            }
         }
         Ok(())
     }
