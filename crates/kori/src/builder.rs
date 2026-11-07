@@ -690,9 +690,18 @@ impl BuildOrchestrator {
         let compilers = ["clang", "gcc", "cc"];
         let mut last_err = String::new();
 
+        static STUB_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let stub_id = STUB_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let rt_stub = ifa_codegen_cranelift::RUNTIME_STUB_C;
-        let rt_path =
-            std::env::temp_dir().join(format!("ifa_runtime_stub_so_{}.c", std::process::id()));
+        let rt_path = std::env::temp_dir().join(format!(
+            "ifa_runtime_stub_so_{}_{}_{}.c",
+            std::process::id(),
+            stub_id,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
         fs::write(&rt_path, rt_stub)?;
 
         for compiler in &compilers {
