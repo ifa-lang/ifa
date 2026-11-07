@@ -120,6 +120,10 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i32 @ifa_rt_coro_status(ptr)\n");
             out.push_str("declare i32 @ifa_rt_coro_is_done(ptr)\n");
             out.push_str("declare ptr @ifa_rt_coro_frame(ptr)\n");
+            out.push_str("declare ptr @ifa_rt_coro_iter_create(ptr, ptr, i64)\n");
+            out.push_str("declare i32 @ifa_rt_coro_iter_next(ptr, ptr)\n");
+            out.push_str("declare i32 @ifa_rt_coro_iter_is_done(ptr)\n");
+            out.push_str("declare void @ifa_rt_coro_iter_destroy(ptr)\n");
             out.push_str("declare ptr @ifa_rt_channel_create(i64)\n");
             out.push_str("declare void @ifa_rt_channel_destroy(ptr)\n");
             out.push_str("declare i32 @ifa_rt_channel_send(ptr, ptr)\n");
@@ -159,6 +163,10 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i32 @ifa_rt_coro_status(ptr)\n");
             out.push_str("declare i32 @ifa_rt_coro_is_done(ptr)\n");
             out.push_str("declare ptr @ifa_rt_coro_frame(ptr)\n");
+            out.push_str("declare ptr @ifa_rt_coro_iter_create(ptr, ptr, i64)\n");
+            out.push_str("declare i32 @ifa_rt_coro_iter_next(ptr, ptr)\n");
+            out.push_str("declare i32 @ifa_rt_coro_iter_is_done(ptr)\n");
+            out.push_str("declare void @ifa_rt_coro_iter_destroy(ptr)\n");
             out.push_str("declare ptr @ifa_rt_channel_create(i64)\n");
             out.push_str("declare void @ifa_rt_channel_destroy(ptr)\n");
             out.push_str("declare i32 @ifa_rt_channel_send(ptr, ptr)\n");
@@ -186,8 +194,10 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("declare token @llvm.coro.id(i32, ptr, ptr, ptr)\n");
         if self.target.arch == TargetArch::Wasm32Wasi {
             out.push_str("declare i32 @llvm.coro.size.i32()\n");
+            out.push_str("declare void @llvm.memcpy.p0.p0.i32(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i32, i1 immarg)\n");
         } else {
             out.push_str("declare i64 @llvm.coro.size.i64()\n");
+            out.push_str("declare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg)\n");
         }
         out.push_str("declare ptr @llvm.coro.begin(token, ptr)\n");
         out.push_str("declare i8 @llvm.coro.suspend(token, i1)\n");
@@ -196,6 +206,7 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("declare void @llvm.coro.destroy(ptr)\n");
         out.push_str("declare i1 @llvm.coro.done(ptr)\n");
         out.push_str("declare ptr @llvm.coro.free(token, ptr)\n");
+        out.push_str("declare ptr @llvm.coro.promise(ptr, i32, i1)\n");
         out.push_str("declare ptr @llvm.coro.frame()\n\n");
 
         // IFA Stackless Fiber Continuous Execution Helpers
@@ -235,6 +246,53 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("resume_step:\n  call void @llvm.coro.resume(ptr %hdl)\n  %done_after = call i1 @llvm.coro.done(ptr %hdl)\n  br i1 %done_after, label %cleanup, label %yield_step\n");
         out.push_str("yield_step:\n  call void @ifa_rt_fiber_yield()\n  br label %step_loop\n");
         out.push_str("cleanup:\n  call void @llvm.coro.destroy(ptr %hdl)\n  ret void\n}\n\n");
+
+        // IFA Stackless Generator Iterator Helpers
+        out.push_str("; IFA Stackless Generator Iterator Helpers\n");
+        out.push_str(
+            "define linkonce_odr ptr @ifa_coro_generator_yield_ptr(ptr %hdl) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  %p = call ptr @llvm.coro.promise(ptr %hdl, i32 8, i1 false)\n  ret ptr %p\n}\n\n");
+
+        out.push_str("define linkonce_odr ptr @ifa_coro_generator_iter_create(ptr %hdl, i64 %elem_size) alwaysinline {\n");
+        out.push_str("entry:\n");
+        out.push_str("  %slot = call ptr @llvm.coro.promise(ptr %hdl, i32 8, i1 false)\n");
+        out.push_str("  %coro = call ptr @ifa_rt_coro_create_custom(ptr %hdl, ptr @ifa_coro_llvm_resume_adapter, ptr @ifa_coro_llvm_destroy_adapter)\n");
+        out.push_str(
+            "  %iter = call ptr @ifa_rt_coro_iter_create(ptr %coro, ptr %slot, i64 %elem_size)\n",
+        );
+        out.push_str("  ret ptr %iter\n}\n\n");
+
+        out.push_str("define linkonce_odr i32 @ifa_coro_generator_iter_next(ptr %iter, ptr %out_val) alwaysinline {\n");
+        out.push_str("entry:\n  %res = call i32 @ifa_rt_coro_iter_next(ptr %iter, ptr %out_val)\n  ret i32 %res\n}\n\n");
+
+        out.push_str(
+            "define linkonce_odr void @ifa_coro_generator_iter_destroy(ptr %iter) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  call void @ifa_rt_coro_iter_destroy(ptr %iter)\n  ret void\n}\n\n");
+
+        // WebAssembly Standalone Stackless Coroutine & Generator Helpers
+        if self.target.arch == TargetArch::Wasm32Wasi {
+            out.push_str("; WebAssembly Standalone Stackless Coroutine & Generator Helpers\n");
+            out.push_str("define dso_local i32 @ifa_wasm_coro_step(ptr %hdl) {\n");
+            out.push_str("entry:\n  %is_done = call i1 @llvm.coro.done(ptr %hdl)\n  br i1 %is_done, label %done, label %resume\n");
+            out.push_str("resume:\n  call void @llvm.coro.resume(ptr %hdl)\n  %after = call i1 @llvm.coro.done(ptr %hdl)\n  %res = select i1 %after, i32 1, i32 0\n  ret i32 %res\n");
+            out.push_str("done:\n  ret i32 1\n}\n\n");
+
+            out.push_str("define dso_local i32 @ifa_wasm_coro_iter_next(ptr %hdl, ptr %yield_slot, ptr %out_val, i32 %size) {\n");
+            out.push_str("entry:\n  %done = call i1 @llvm.coro.done(ptr %hdl)\n  br i1 %done, label %finished, label %resume_step\n");
+            out.push_str("resume_step:\n  call void @llvm.coro.resume(ptr %hdl)\n  %after_done = call i1 @llvm.coro.done(ptr %hdl)\n  br i1 %after_done, label %finished, label %copy_val\n");
+            out.push_str("copy_val:\n  %has_out = icmp ne ptr %out_val, null\n  %has_slot = icmp ne ptr %yield_slot, null\n  %do_copy = and i1 %has_out, %has_slot\n  br i1 %do_copy, label %exec_copy, label %yield_ok\n");
+            out.push_str("exec_copy:\n  call void @llvm.memcpy.p0.p0.i32(ptr %out_val, ptr %yield_slot, i32 %size, i1 false)\n  br label %yield_ok\n");
+            out.push_str("yield_ok:\n  ret i32 1\n");
+            out.push_str("finished:\n  ret i32 0\n}\n\n");
+
+            out.push_str("define dso_local i32 @ifa_wasm_generator_next(ptr %hdl, ptr %out_val, i32 %size) {\n");
+            out.push_str("entry:\n  %slot = call ptr @llvm.coro.promise(ptr %hdl, i32 8, i1 false)\n  %res = call i32 @ifa_wasm_coro_iter_next(ptr %hdl, ptr %slot, ptr %out_val, i32 %size)\n  ret i32 %res\n}\n\n");
+
+            out.push_str("define dso_local void @ifa_wasm_coro_destroy(ptr %hdl) {\n");
+            out.push_str("entry:\n  call void @llvm.coro.destroy(ptr %hdl)\n  ret void\n}\n\n");
+        }
 
         // SIMD Vector Reduction Intrinsics
         out.push_str("; LLVM Vector Reduction Intrinsics\n");
@@ -1127,8 +1185,9 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str(&format!("{}:\n", label));
 
             if is_coro && b_idx == 0 {
+                out.push_str("  %coro.yield_slot = alloca i64, align 8\n");
                 out.push_str(
-                    "  %coro.id = call token @llvm.coro.id(i32 0, ptr null, ptr null, ptr null)\n",
+                    "  %coro.id = call token @llvm.coro.id(i32 0, ptr %coro.yield_slot, ptr null, ptr null)\n",
                 );
                 if self.target.arch == TargetArch::Wasm32Wasi {
                     out.push_str("  %coro.size.32 = call i32 @llvm.coro.size.i32()\n");
@@ -1142,6 +1201,7 @@ impl<'a> LlvmIrEmitter<'a> {
                 out.push_str(
                     "  %coro.hdl = call ptr @llvm.coro.begin(token %coro.id, ptr %coro.alloc)\n",
                 );
+                out.push_str("  store i64 0, ptr %coro.yield_slot, align 8\n");
             }
 
             // Emit PHI nodes for block arguments
@@ -2421,6 +2481,78 @@ impl<'a> LlvmIrEmitter<'a> {
                     out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
                 }
             },
+            ValueExpr::Yield => {
+                if is_coro {
+                    let y_id = *coro_yield_idx;
+                    *coro_yield_idx += 1;
+                    out.push_str(&format!(
+                        "  %coro.susp_{} = call i8 @llvm.coro.suspend(token none, i1 false)\n",
+                        y_id
+                    ));
+                    out.push_str(&format!(
+                        "  switch i8 %coro.susp_{}, label %coro.susp_ret [ i8 0, label %coro.resume_{} i8 1, label %coro.cleanup ]\n",
+                        y_id, y_id
+                    ));
+                    out.push_str(&format!("coro.resume_{}:\n", y_id));
+                    out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
+                } else {
+                    out.push_str("  call void @ifa_rt_fiber_yield()\n");
+                    out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
+                }
+            }
+            ValueExpr::YieldValue { val } => {
+                if is_coro {
+                    let y_id = *coro_yield_idx;
+                    *coro_yield_idx += 1;
+                    let val_ty = value_types.get(val);
+                    let val_llvm_ty = val_ty
+                        .map(fir_to_llvm_type)
+                        .transpose()?
+                        .unwrap_or_else(|| "i64".to_string());
+                    if val_llvm_ty == "i64" {
+                        out.push_str(&format!(
+                            "  store i64 %v{}, ptr %coro.yield_slot, align 8\n",
+                            val.0
+                        ));
+                    } else if val_llvm_ty == "ptr" {
+                        out.push_str(&format!(
+                            "  %coro_ptr_cast_{} = ptrtoint ptr %v{} to i64\n",
+                            val.0, val.0
+                        ));
+                        out.push_str(&format!(
+                            "  store i64 %coro_ptr_cast_{}, ptr %coro.yield_slot, align 8\n",
+                            val.0
+                        ));
+                    } else if val_llvm_ty == "float" || val_llvm_ty == "double" {
+                        out.push_str(&format!(
+                            "  store {} %v{}, ptr %coro.yield_slot, align 8\n",
+                            val_llvm_ty, val.0
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  %coro_val_cast_{} = sext {} %v{} to i64\n",
+                            val.0, val_llvm_ty, val.0
+                        ));
+                        out.push_str(&format!(
+                            "  store i64 %coro_val_cast_{}, ptr %coro.yield_slot, align 8\n",
+                            val.0
+                        ));
+                    }
+                    out.push_str(&format!(
+                        "  %coro.susp_{} = call i8 @llvm.coro.suspend(token none, i1 false)\n",
+                        y_id
+                    ));
+                    out.push_str(&format!(
+                        "  switch i8 %coro.susp_{}, label %coro.susp_ret [ i8 0, label %coro.resume_{} i8 1, label %coro.cleanup ]\n",
+                        y_id, y_id
+                    ));
+                    out.push_str(&format!("coro.resume_{}:\n", y_id));
+                    out.push_str(&format!("  %v{} = add i64 0, %v{}\n", res_id, val.0));
+                } else {
+                    out.push_str("  call void @ifa_rt_fiber_yield()\n");
+                    out.push_str(&format!("  %v{} = add i64 0, %v{}\n", res_id, val.0));
+                }
+            }
             _ => {
                 // Default fallback for intermediate structures
                 out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
@@ -2687,6 +2819,57 @@ impl<'a> LlvmIrEmitter<'a> {
                 if is_coro {
                     let y_id = *coro_yield_idx;
                     *coro_yield_idx += 1;
+                    out.push_str(&format!(
+                        "  %coro.susp_{} = call i8 @llvm.coro.suspend(token none, i1 false)\n",
+                        y_id
+                    ));
+                    out.push_str(&format!(
+                        "  switch i8 %coro.susp_{}, label %coro.susp_ret [ i8 0, label %coro.resume_{} i8 1, label %coro.cleanup ]\n",
+                        y_id, y_id
+                    ));
+                    out.push_str(&format!("coro.resume_{}:\n", y_id));
+                } else {
+                    out.push_str("  call void @ifa_rt_fiber_yield()\n");
+                }
+            }
+            ValueExpr::YieldValue { val } => {
+                if is_coro {
+                    let y_id = *coro_yield_idx;
+                    *coro_yield_idx += 1;
+                    let val_ty = value_types.get(val);
+                    let val_llvm_ty = val_ty
+                        .map(fir_to_llvm_type)
+                        .transpose()?
+                        .unwrap_or_else(|| "i64".to_string());
+                    if val_llvm_ty == "i64" {
+                        out.push_str(&format!(
+                            "  store i64 %v{}, ptr %coro.yield_slot, align 8\n",
+                            val.0
+                        ));
+                    } else if val_llvm_ty == "ptr" {
+                        out.push_str(&format!(
+                            "  %coro_ptr_cast_{} = ptrtoint ptr %v{} to i64\n",
+                            val.0, val.0
+                        ));
+                        out.push_str(&format!(
+                            "  store i64 %coro_ptr_cast_{}, ptr %coro.yield_slot, align 8\n",
+                            val.0
+                        ));
+                    } else if val_llvm_ty == "float" || val_llvm_ty == "double" {
+                        out.push_str(&format!(
+                            "  store {} %v{}, ptr %coro.yield_slot, align 8\n",
+                            val_llvm_ty, val.0
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  %coro_val_cast_{} = sext {} %v{} to i64\n",
+                            val.0, val_llvm_ty, val.0
+                        ));
+                        out.push_str(&format!(
+                            "  store i64 %coro_val_cast_{}, ptr %coro.yield_slot, align 8\n",
+                            val.0
+                        ));
+                    }
                     out.push_str(&format!(
                         "  %coro.susp_{} = call i8 @llvm.coro.suspend(token none, i1 false)\n",
                         y_id

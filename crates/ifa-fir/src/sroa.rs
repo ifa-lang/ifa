@@ -877,6 +877,7 @@ impl SroaPass {
 
         match &mut inst.expr {
             ValueExpr::Constant(_) | ValueExpr::Alloca { .. } | ValueExpr::Yield => {}
+            ValueExpr::YieldValue { val } => replace(val),
             ValueExpr::Load { ptr } => replace(ptr),
             ValueExpr::Store { ptr, val } => {
                 replace(ptr);

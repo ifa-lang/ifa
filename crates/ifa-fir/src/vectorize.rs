@@ -426,6 +426,7 @@ impl VectorizePass {
                 for inst in &block.instructions {
                     match &inst.expr {
                         ValueExpr::Yield
+                        | ValueExpr::YieldValue { .. }
                         | ValueExpr::Spawn { .. }
                         | ValueExpr::ChanCreate { .. }
                         | ValueExpr::ChanSend { .. }

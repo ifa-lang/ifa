@@ -428,6 +428,91 @@ pub extern "C" fn ifa_rt_coro_frame(coro: *mut IfaCoroutine) -> *mut u8 {
     }
 }
 
+/// Opaque handle representing a stackless generator iterator driven by a coroutine.
+#[repr(C)]
+pub struct IfaCoroIterator {
+    pub coro: *mut IfaCoroutine,
+    pub yield_slot: *mut u8,
+    pub elem_size: usize,
+    pub has_next: bool,
+}
+
+unsafe impl Send for IfaCoroIterator {}
+unsafe impl Sync for IfaCoroIterator {}
+
+/// Create a new generator iterator wrapping a coroutine and its yield slot.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_iter_create(
+    coro: *mut IfaCoroutine,
+    yield_slot: *mut u8,
+    elem_size: usize,
+) -> *mut IfaCoroIterator {
+    let iter = Box::new(IfaCoroIterator {
+        coro,
+        yield_slot,
+        elem_size,
+        has_next: true,
+    });
+    Box::into_raw(iter)
+}
+
+/// Advance a generator iterator by resuming its underlying coroutine.
+/// Copies the yielded element into `out_val` (if non-null and elem_size > 0).
+/// Returns 1 if a new element was yielded, 0 if the generator completed, or -1 on error.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_iter_next(iter: *mut IfaCoroIterator, out_val: *mut u8) -> i32 {
+    if iter.is_null() {
+        return -1;
+    }
+    let it = unsafe { &mut *iter };
+    if it.coro.is_null() || !it.has_next {
+        return 0;
+    }
+    let status = ifa_rt_coro_resume(it.coro);
+    if status == CoroStatus::Suspended as i32 {
+        if !out_val.is_null() && !it.yield_slot.is_null() && it.elem_size > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(it.yield_slot, out_val, it.elem_size);
+            }
+        }
+        it.has_next = true;
+        1
+    } else if status == CoroStatus::Completed as i32 {
+        it.has_next = false;
+        0
+    } else {
+        it.has_next = false;
+        -1
+    }
+}
+
+/// Check if a generator iterator has completed execution.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_iter_is_done(iter: *mut IfaCoroIterator) -> i32 {
+    if iter.is_null() {
+        return 1;
+    }
+    let it = unsafe { &*iter };
+    if !it.has_next || ifa_rt_coro_is_done(it.coro) == 1 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Destroy a generator iterator, freeing the underlying coroutine and iterator context.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_iter_destroy(iter: *mut IfaCoroIterator) {
+    if !iter.is_null() {
+        unsafe {
+            let it = Box::from_raw(iter);
+            if !it.coro.is_null() {
+                ifa_rt_coro_destroy(it.coro);
+            }
+        }
+    }
+}
+
 /// Print a null-terminated UTF-8 string.
 #[no_mangle]
 pub extern "C" fn ifa_rt_print(ptr: *const u8) {

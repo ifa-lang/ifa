@@ -548,6 +548,65 @@ fn test_stackless_custom_frame_coroutine_creation_and_lifecycle() {
 }
 
 #[test]
+fn test_stackless_generator_iterator_lifecycle() {
+    use ifa_runtime::ffi::{
+        ifa_rt_coro_create_custom, ifa_rt_coro_iter_create, ifa_rt_coro_iter_destroy,
+        ifa_rt_coro_iter_is_done, ifa_rt_coro_iter_next,
+    };
+
+    struct GenFrame {
+        current_val: i64,
+        step: usize,
+    }
+
+    extern "C" fn gen_resume(frame: *mut u8) -> i32 {
+        let f = unsafe { &mut *(frame as *mut GenFrame) };
+        if f.step < 3 {
+            f.step += 1;
+            f.current_val = (f.step * 10) as i64;
+            0 // Suspended (yielded)
+        } else {
+            1 // Completed
+        }
+    }
+
+    extern "C" fn gen_destroy(frame: *mut u8) {
+        unsafe {
+            let _ = Box::from_raw(frame as *mut GenFrame);
+        }
+    }
+
+    let raw_frame = Box::into_raw(Box::new(GenFrame {
+        current_val: 0,
+        step: 0,
+    }));
+    let slot_ptr = unsafe { &mut (*raw_frame).current_val as *mut i64 as *mut u8 };
+
+    let coro = ifa_rt_coro_create_custom(raw_frame as *mut u8, gen_resume, Some(gen_destroy));
+    let iter = ifa_rt_coro_iter_create(coro, slot_ptr, std::mem::size_of::<i64>());
+    assert_eq!(ifa_rt_coro_iter_is_done(iter), 0);
+
+    let mut out_val: i64 = 0;
+    let next1 = ifa_rt_coro_iter_next(iter, &mut out_val as *mut i64 as *mut u8);
+    assert_eq!(next1, 1);
+    assert_eq!(out_val, 10);
+
+    let next2 = ifa_rt_coro_iter_next(iter, &mut out_val as *mut i64 as *mut u8);
+    assert_eq!(next2, 1);
+    assert_eq!(out_val, 20);
+
+    let next3 = ifa_rt_coro_iter_next(iter, &mut out_val as *mut i64 as *mut u8);
+    assert_eq!(next3, 1);
+    assert_eq!(out_val, 30);
+
+    let next4 = ifa_rt_coro_iter_next(iter, &mut out_val as *mut i64 as *mut u8);
+    assert_eq!(next4, 0); // Done
+    assert_eq!(ifa_rt_coro_iter_is_done(iter), 1);
+
+    ifa_rt_coro_iter_destroy(iter);
+}
+
+#[test]
 fn test_zero_copy_slice_ffi() {
     use ifa_runtime::ffi::{
         ifa_rt_slice_alloc, ifa_rt_slice_free, ifa_rt_slice_from_raw, ifa_rt_version_string,

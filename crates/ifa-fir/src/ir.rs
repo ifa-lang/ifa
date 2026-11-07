@@ -244,6 +244,9 @@ pub enum ValueExpr {
 
     // Concurrency / Fibers Primitives
     Yield,
+    YieldValue {
+        val: ValueId,
+    },
     Spawn {
         target: Symbol,
         args: Vec<ValueId>,
@@ -292,6 +295,7 @@ impl ValueExpr {
     pub fn uses(&self) -> Vec<ValueId> {
         match self {
             ValueExpr::Constant(_) | ValueExpr::Alloca { .. } | ValueExpr::Yield => Vec::new(),
+            ValueExpr::YieldValue { val } => vec![*val],
             ValueExpr::Load { ptr } => vec![*ptr],
             ValueExpr::Store { ptr, val } => vec![*ptr, *val],
             ValueExpr::Binary { lhs, rhs, .. } => vec![*lhs, *rhs],
@@ -588,9 +592,9 @@ impl FirFunction {
     pub fn is_coroutine(&self) -> bool {
         self.is_coroutine
             || self.blocks.iter().any(|b| {
-                b.instructions
-                    .iter()
-                    .any(|inst| matches!(inst.expr, ValueExpr::Yield))
+                b.instructions.iter().any(|inst| {
+                    matches!(inst.expr, ValueExpr::Yield | ValueExpr::YieldValue { .. })
+                })
             })
     }
 

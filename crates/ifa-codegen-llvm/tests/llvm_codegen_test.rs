@@ -2451,3 +2451,199 @@ fn test_llvm_vector_memory_alignment_avx512_and_neon() {
         ir
     );
 }
+
+#[test]
+fn test_llvm_coroutine_iterator_generator_lowering() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+    use std::fs;
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let gen_name = INTERNER.intern("range_generator");
+    let mut func = FirFunction::new(
+        gen_name,
+        vec![],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    let val1 = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(val1),
+        ValueExpr::Constant(ConstantValue::Int(100, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::YieldValue { val: val1 },
+        Span::DUMMY,
+    ));
+
+    let val2 = ValueId(2);
+    bb0.instructions.push(Instruction::new(
+        Some(val2),
+        ValueExpr::Constant(ConstantValue::Int(200, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::YieldValue { val: val2 },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(None));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("range_gen_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    // 1. Verify standard LLVM coroutine attributes and intrinsic bindings
+    assert!(ir.contains("define dso_local ptr @range_generator() presplitcoroutine"));
+    assert!(
+        ir.contains("call token @llvm.coro.id(i32 0, ptr %coro.yield_slot, ptr null, ptr null)")
+    );
+    assert!(ir.contains("call ptr @llvm.coro.begin("));
+    assert!(ir.contains("store i64 %v1, ptr %coro.yield_slot, align 8"));
+    assert!(ir.contains("store i64 %v2, ptr %coro.yield_slot, align 8"));
+    assert!(ir.contains("call i8 @llvm.coro.suspend(token none, i1 false)"));
+    assert!(ir.contains("declare ptr @llvm.coro.promise(ptr, i32, i1)"));
+    assert!(ir.contains("define linkonce_odr ptr @ifa_coro_generator_yield_ptr(ptr %hdl)"));
+    assert!(ir.contains(
+        "define linkonce_odr ptr @ifa_coro_generator_iter_create(ptr %hdl, i64 %elem_size)"
+    ));
+    assert!(ir.contains(
+        "define linkonce_odr i32 @ifa_coro_generator_iter_next(ptr %iter, ptr %out_val)"
+    ));
+
+    // 2. Verify compilation to native object via Clang
+    let temp_dir = std::env::temp_dir().join(format!("llvm_gen_iter_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("gen_iter.o");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation of iterator generator module failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_wasm32_stackless_iterator_generator_lowering() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+    use std::fs;
+
+    let wasm_target = LlvmTargetConfig::wasm32_wasi();
+    let mut emitter = LlvmIrEmitter::new(&wasm_target);
+
+    let fn_name = INTERNER.intern("wasm_counter_gen");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    let v1 = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(v1),
+        ValueExpr::Constant(ConstantValue::Int(42, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::YieldValue { val: v1 },
+        Span::DUMMY,
+    ));
+
+    let v2 = ValueId(2);
+    bb0.instructions.push(Instruction::new(
+        Some(v2),
+        ValueExpr::Constant(ConstantValue::Int(84, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::YieldValue { val: v2 },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(None));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("wasm_counter_pkg"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    // 1. Verify WebAssembly-specific stackless emission
+    assert!(ir.contains("target triple = \"wasm32-unknown-wasi\""));
+    assert!(ir.contains("declare i32 @llvm.coro.size.i32()"));
+    assert!(ir.contains("declare void @llvm.memcpy.p0.p0.i32(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i32, i1 immarg)"));
+    assert!(ir.contains("define dso_local i32 @ifa_wasm_coro_step(ptr %hdl)"));
+    assert!(ir.contains("define dso_local i32 @ifa_wasm_coro_iter_next(ptr %hdl, ptr %yield_slot, ptr %out_val, i32 %size)"));
+    assert!(ir.contains(
+        "define dso_local i32 @ifa_wasm_generator_next(ptr %hdl, ptr %out_val, i32 %size)"
+    ));
+    assert!(ir.contains("define dso_local void @ifa_wasm_coro_destroy(ptr %hdl)"));
+
+    // 2. Compile to standalone WebAssembly module (.wasm)
+    let temp_dir = std::env::temp_dir().join(format!("llvm_wasm_gen_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let wasm_path = temp_dir.join("counter_gen.wasm");
+
+    let compiler = LlvmCompiler::new(wasm_target);
+    let compile_res = compiler.compile_to_wasm(&module, &wasm_path);
+    assert!(
+        compile_res.is_ok(),
+        "WebAssembly compilation of counter generator failed: {:?}",
+        compile_res.err()
+    );
+    assert!(wasm_path.exists());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

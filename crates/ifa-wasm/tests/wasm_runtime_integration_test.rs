@@ -343,3 +343,128 @@ fn test_end_to_end_wasm_coroutine_inspection_and_validation() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_wasm_stackless_iterator_generator_inspection_and_exports() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+    use ifa_wasm::runner::{WasmEngine, WasmEngineRunner};
+    use ifa_wasm::validator::WasmModuleInspector;
+    use std::fs;
+
+    let temp_dir = std::env::temp_dir().join(format!("ifa_wasm_gen_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let fn_name = INTERNER.intern("wasm_prime_stream");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    let prime2 = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(prime2),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::YieldValue { val: prime2 },
+        Span::DUMMY,
+    ));
+
+    let prime3 = ValueId(2);
+    bb0.instructions.push(Instruction::new(
+        Some(prime3),
+        ValueExpr::Constant(ConstantValue::Int(3, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::YieldValue { val: prime3 },
+        Span::DUMMY,
+    ));
+
+    let prime5 = ValueId(3);
+    bb0.instructions.push(Instruction::new(
+        Some(prime5),
+        ValueExpr::Constant(ConstantValue::Int(5, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::YieldValue { val: prime5 },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(None));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("wasm_prime_pkg"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let wasm_path = temp_dir.join("prime_stream.wasm");
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::wasm32_wasi());
+    compiler
+        .compile_to_wasm(&module, &wasm_path)
+        .expect("WebAssembly compilation of prime stream generator failed");
+
+    assert!(wasm_path.exists());
+    let wasm_bytes = fs::read(&wasm_path).unwrap();
+
+    // 1. Inspect WebAssembly binary sections
+    let inspector = WasmModuleInspector::new(&wasm_bytes);
+    let sections = inspector
+        .inspect()
+        .expect("Inspection of wasm generator module failed");
+    assert!(!sections.is_empty());
+
+    // 2. Validate exported generator and helpers
+    let exports = inspector
+        .extract_exports()
+        .expect("Extraction of generator exports failed");
+    let export_names: Vec<String> = exports.into_iter().map(|e| e.name).collect();
+    assert!(
+        export_names.iter().any(|name| name == "wasm_prime_stream"),
+        "Export `wasm_prime_stream` not found in WebAssembly binary: {:?}",
+        export_names
+    );
+    assert!(
+        export_names
+            .iter()
+            .any(|name| name == "ifa_wasm_generator_next"),
+        "Export `ifa_wasm_generator_next` not found in WebAssembly binary: {:?}",
+        export_names
+    );
+    assert!(
+        export_names.iter().any(|name| name == "ifa_wasm_coro_step"),
+        "Export `ifa_wasm_coro_step` not found in WebAssembly binary: {:?}",
+        export_names
+    );
+
+    // 3. Validate through internal WASI engine
+    let res = WasmEngineRunner::run(WasmEngine::Internal, &wasm_path, None, &[])
+        .expect("Internal WASI execution of prime generator module failed");
+    assert_eq!(res.exit_code, 0);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

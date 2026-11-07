@@ -301,6 +301,7 @@ impl<'a> FirPrinter<'a> {
             }
             ValueExpr::GenDeref { ref_val } => write!(self.output, "gen.deref {}", ref_val),
             ValueExpr::Yield => write!(self.output, "yield"),
+            ValueExpr::YieldValue { val } => write!(self.output, "yield {}", val),
             ValueExpr::Spawn { target, args } => {
                 write!(self.output, "spawn @{}(", target.as_str())?;
                 for (i, a) in args.iter().enumerate() {

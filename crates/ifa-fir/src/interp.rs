@@ -2084,6 +2084,7 @@ impl<'a> FirInterpreter<'a> {
             }
 
             ValueExpr::Yield => Ok(FirValue::Unit),
+            ValueExpr::YieldValue { val } => Ok(env.get(val).cloned().unwrap_or(FirValue::Unit)),
             ValueExpr::Spawn { .. } => Ok(FirValue::Unit),
 
             ValueExpr::ChanCreate { .. } => {
