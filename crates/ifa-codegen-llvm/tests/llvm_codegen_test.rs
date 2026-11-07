@@ -626,3 +626,85 @@ fn test_llvm_aot_monomorphic_trait_specialization() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_adt_tagged_union_emission_and_native_execution() {
+    let src = r#"
+enum Event {
+    None,
+    Value(i64),
+}
+
+fn process(e: Event) -> i64 {
+    return match e {
+        Event::None => 10,
+        Event::Value(v) if v > 50 => v * 2,
+        Event::Value(v) => v,
+    }
+}
+
+pub fn main() -> i64 {
+    let e1 = Event::None;
+    let e2 = Event::Value(70);
+    let e3 = Event::Value(30);
+
+    let r1 = process(e1);
+    let r2 = process(e2);
+    let r3 = process(e3);
+
+    return r1 + r2 + r3;
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("adt_llvm.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let host_config = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&host_config);
+    let ir = emitter.emit_module(&module).unwrap();
+    assert!(
+        ir.contains("%enum.Event = type { i64, i64 }"),
+        "LLVM IR must define the tagged union type %enum.Event"
+    );
+
+    let temp_dir = std::env::temp_dir().join(format!("llvm_adt_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("adt.o");
+    let bin_path = temp_dir.join("adt_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(180),
+        "Native binary output exit code must be 180 (10 + 140 + 30)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

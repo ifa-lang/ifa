@@ -322,6 +322,17 @@ pub enum Pattern {
     },
 }
 
+impl Pattern {
+    pub fn span(&self) -> Span {
+        match self {
+            Pattern::Wildcard(sp) => *sp,
+            Pattern::Lit(_, sp) => *sp,
+            Pattern::Ident(_, sp) => *sp,
+            Pattern::Variant { span, .. } => *span,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Arg {
     pub name: Option<Symbol>,

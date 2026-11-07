@@ -441,6 +441,16 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push('\n');
         }
 
+        // 3.5. Emit enumeration / tagged union type definitions
+        if !module.enums.is_empty() {
+            out.push_str("; Enumeration / Tagged Union Type Definitions\n");
+            for en in &module.enums {
+                let en_name = INTERNER.resolve(&en.name);
+                out.push_str(&format!("%enum.{} = type {{ i64, i64 }}\n", en_name));
+            }
+            out.push('\n');
+        }
+
         // 3.6. Emit AOT Monomorphic Trait VTables
         let mut type_to_methods: HashMap<String, Vec<String>> = HashMap::new();
         for func in &module.functions {
@@ -657,6 +667,15 @@ impl<'a> LlvmIrEmitter<'a> {
                                 ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                             }
                         }
+                        ValueExpr::EnumInit { enum_name, .. } => {
+                            let en_def = module.enums.iter().find(|e| e.name == *enum_name);
+                            let variants = en_def.map(|e| e.variants.clone()).unwrap_or_default();
+                            ifa_fir::FirType::Enum(*enum_name, variants)
+                        }
+                        ValueExpr::EnumGetDiscriminant { .. } => {
+                            ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                        }
+                        ValueExpr::EnumGetPayload { payload_ty, .. } => payload_ty.clone(),
                         _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
                     };
                     value_types.insert(res, ty);
@@ -1343,6 +1362,116 @@ impl<'a> LlvmIrEmitter<'a> {
                     out.push_str(&format!(
                         "  %v{} = call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr %spawn_arg_buf_{})\n",
                         res_id, callee, res_id
+                    ));
+                }
+            }
+            ValueExpr::EnumInit {
+                enum_name,
+                discriminant,
+                payload,
+                ..
+            } => {
+                let e_name = INTERNER.resolve(enum_name);
+                out.push_str(&format!(
+                    "  %enum_alloc_{} = alloca %enum.{}, align 8\n",
+                    res_id, e_name
+                ));
+                out.push_str(&format!(
+                    "  %disc_ptr_{} = getelementptr inbounds %enum.{}, ptr %enum_alloc_{}, i32 0, i32 0\n",
+                    res_id, e_name, res_id
+                ));
+                out.push_str(&format!(
+                    "  store i64 {}, ptr %disc_ptr_{}, align 8\n",
+                    discriminant, res_id
+                ));
+                out.push_str(&format!(
+                    "  %pay_ptr_{} = getelementptr inbounds %enum.{}, ptr %enum_alloc_{}, i32 0, i32 1\n",
+                    res_id, e_name, res_id
+                ));
+                if let Some(p_val) = payload {
+                    let p_ty_str = value_types
+                        .get(p_val)
+                        .map(fir_to_llvm_type)
+                        .unwrap_or(Ok("i64".to_string()))?;
+                    if p_ty_str == "i64" {
+                        out.push_str(&format!(
+                            "  store i64 %v{}, ptr %pay_ptr_{}, align 8\n",
+                            p_val.0, res_id
+                        ));
+                    } else if p_ty_str == "ptr" {
+                        out.push_str(&format!(
+                            "  %pay_i64_{} = ptrtoint ptr %v{} to i64\n",
+                            res_id, p_val.0
+                        ));
+                        out.push_str(&format!(
+                            "  store i64 %pay_i64_{}, ptr %pay_ptr_{}, align 8\n",
+                            res_id, res_id
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  store {} %v{}, ptr %pay_ptr_{}, align 8\n",
+                            p_ty_str, p_val.0, res_id
+                        ));
+                    }
+                } else {
+                    out.push_str(&format!(
+                        "  store i64 0, ptr %pay_ptr_{}, align 8\n",
+                        res_id
+                    ));
+                }
+                out.push_str(&format!(
+                    "  %v{} = load %enum.{}, ptr %enum_alloc_{}, align 8\n",
+                    res_id, e_name, res_id
+                ));
+            }
+            ValueExpr::EnumGetDiscriminant { base } => {
+                let base_ty = value_types.get(base);
+                let e_name = match base_ty {
+                    Some(ifa_fir::FirType::Enum(s, _)) => INTERNER.resolve(s),
+                    _ => "unknown".to_string(),
+                };
+                if e_name != "unknown" {
+                    out.push_str(&format!(
+                        "  %v{} = extractvalue %enum.{} %v{}, 0\n",
+                        res_id, e_name, base.0
+                    ));
+                } else {
+                    out.push_str(&format!("  %v{} = add i64 0, %v{}\n", res_id, base.0));
+                }
+            }
+            ValueExpr::EnumGetPayload { base, payload_ty } => {
+                let base_ty = value_types.get(base);
+                let e_name = match base_ty {
+                    Some(ifa_fir::FirType::Enum(s, _)) => INTERNER.resolve(s),
+                    _ => "unknown".to_string(),
+                };
+                let p_ty_str = fir_to_llvm_type(payload_ty)?;
+                out.push_str(&format!(
+                    "  %raw_pay_{} = extractvalue %enum.{} %v{}, 1\n",
+                    res_id, e_name, base.0
+                ));
+                if p_ty_str == "i64" {
+                    out.push_str(&format!(
+                        "  %v{} = add i64 0, %raw_pay_{}\n",
+                        res_id, res_id
+                    ));
+                } else if p_ty_str == "ptr" {
+                    out.push_str(&format!(
+                        "  %v{} = inttoptr i64 %raw_pay_{} to ptr\n",
+                        res_id, res_id
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  %cast_alloca_{} = alloca i64, align 8\n",
+                        res_id
+                    ));
+                    out.push_str(&format!(
+                        "  store i64 %raw_pay_{}, ptr %cast_alloca_{}, align 8\n",
+                        res_id, res_id
+                    ));
+                    out.push_str(&format!(
+                        "  %v{} = load {}, ptr %cast_alloca_{}, align 8\n",
+                        res_id, p_ty_str, res_id
                     ));
                 }
             }

@@ -803,6 +803,17 @@ impl SroaPass {
                     replace(c);
                 }
             }
+            ValueExpr::EnumInit { payload, .. } => {
+                if let Some(p) = payload {
+                    replace(p);
+                }
+            }
+            ValueExpr::EnumGetDiscriminant { base } => {
+                replace(base);
+            }
+            ValueExpr::EnumGetPayload { base, .. } => {
+                replace(base);
+            }
         }
     }
 

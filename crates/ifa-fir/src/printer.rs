@@ -282,6 +282,37 @@ impl<'a> FirPrinter<'a> {
                     if *has_default { " (default)" } else { "" }
                 )
             }
+            ValueExpr::EnumInit {
+                enum_name,
+                variant,
+                discriminant,
+                payload,
+            } => {
+                if let Some(p) = payload {
+                    write!(
+                        self.output,
+                        "enum.init {}::{} (disc: {}, payload: {})",
+                        enum_name.as_str(),
+                        variant.as_str(),
+                        discriminant,
+                        p
+                    )
+                } else {
+                    write!(
+                        self.output,
+                        "enum.init {}::{} (disc: {})",
+                        enum_name.as_str(),
+                        variant.as_str(),
+                        discriminant
+                    )
+                }
+            }
+            ValueExpr::EnumGetDiscriminant { base } => {
+                write!(self.output, "enum.get_disc {}", base)
+            }
+            ValueExpr::EnumGetPayload { base, payload_ty } => {
+                write!(self.output, "enum.get_payload {} as {}", base, payload_ty)
+            }
         }
     }
 

@@ -166,6 +166,37 @@ impl<'a> FunctionLoweringContext<'a> {
         None
     }
 
+    fn lookup_variant_info(
+        &self,
+        variant_name: Symbol,
+    ) -> Option<(Symbol, usize, Option<FirType>)> {
+        for e in self.module_enums {
+            for (idx, (v_name, payload)) in e.variants.iter().enumerate() {
+                if *v_name == variant_name {
+                    return Some((e.name, idx, payload.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    fn lookup_qualified_variant_info(
+        &self,
+        enum_name: Symbol,
+        variant_name: Symbol,
+    ) -> Option<(Symbol, usize, Option<FirType>)> {
+        for e in self.module_enums {
+            if e.name == enum_name {
+                for (idx, (v_name, payload)) in e.variants.iter().enumerate() {
+                    if *v_name == variant_name {
+                        return Some((e.name, idx, payload.clone()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn alloc_value(&mut self) -> ValueId {
         self.func.alloc_value()
     }
@@ -300,9 +331,44 @@ impl<'a> FunctionLoweringContext<'a> {
                             .map(|f| (f.name, FirType::from_sema_type(&f.ty)))
                             .collect();
                         Some(FirType::Struct(*fn_name, fields))
+                    } else if let Some((en_name, _, _)) = self.lookup_variant_info(*fn_name) {
+                        let variants = self
+                            .module_enums
+                            .iter()
+                            .find(|e| e.name == en_name)
+                            .map(|e| e.variants.clone())
+                            .unwrap_or_default();
+                        Some(FirType::Enum(en_name, variants))
                     } else {
                         None
                     }
+                } else if let ExprKind::Path(path) = &callee.kind {
+                    if path.len() >= 2 {
+                        if let Some((en_name, _, _)) = self.lookup_qualified_variant_info(
+                            path[path.len() - 2],
+                            path[path.len() - 1],
+                        ) {
+                            let variants = self
+                                .module_enums
+                                .iter()
+                                .find(|e| e.name == en_name)
+                                .map(|e| e.variants.clone())
+                                .unwrap_or_default();
+                            return Some(FirType::Enum(en_name, variants));
+                        }
+                    }
+                    if let Some(last) = path.last() {
+                        if let Some((en_name, _, _)) = self.lookup_variant_info(*last) {
+                            let variants = self
+                                .module_enums
+                                .iter()
+                                .find(|e| e.name == en_name)
+                                .map(|e| e.variants.clone())
+                                .unwrap_or_default();
+                            return Some(FirType::Enum(en_name, variants));
+                        }
+                    }
+                    None
                 } else {
                     None
                 }
@@ -360,6 +426,9 @@ impl<'a> FunctionLoweringContext<'a> {
                     .map(|func| FirType::from_sema_type(&func.ret_ty))
             }
             ExprKind::Select { arms } => {
+                arms.first().and_then(|a| self.infer_expr_fir_type(&a.body))
+            }
+            ExprKind::Match { arms, .. } => {
                 arms.first().and_then(|a| self.infer_expr_fir_type(&a.body))
             }
             _ => None,
@@ -1174,11 +1243,16 @@ impl<'a> FunctionLoweringContext<'a> {
                     }
                 } else if let Some(c_expr) = self.constants.get(sym) {
                     self.lower_expr(c_expr)
-                } else if let Some(disc) = self.lookup_variant_discriminant(*sym) {
+                } else if let Some((en_name, disc, _)) = self.lookup_variant_info(*sym) {
                     let res = self.alloc_value();
                     self.emit(
                         Some(res),
-                        ValueExpr::Constant(ConstantValue::Int(disc as i128, IntType::I64)),
+                        ValueExpr::EnumInit {
+                            enum_name: en_name,
+                            variant: *sym,
+                            discriminant: disc as u32,
+                            payload: None,
+                        },
                         span,
                     );
                     res
@@ -1537,6 +1611,40 @@ impl<'a> FunctionLoweringContext<'a> {
                         ValueExpr::StructInit {
                             name: target_struct_name,
                             fields: ordered_fields,
+                        },
+                        span,
+                    );
+                    return res;
+                }
+
+                // Check if calling an Enum variant constructor directly (e.g. WebEvent::KeyPress(100) or Some(x))
+                let enum_variant_match = match &callee.kind {
+                    ExprKind::Path(path) if path.len() >= 2 => self
+                        .lookup_qualified_variant_info(path[path.len() - 2], path[path.len() - 1]),
+                    _ => {
+                        if let Some(name) = direct_name {
+                            self.lookup_variant_info(name)
+                        } else {
+                            None
+                        }
+                    }
+                };
+
+                if let Some((en_name, disc, _opt_payload)) = enum_variant_match {
+                    let payload_val = args.first().map(|a| self.lower_expr(&a.value));
+                    let res = self.alloc_value();
+                    let v_sym = match &callee.kind {
+                        ExprKind::Path(path) => *path.last().unwrap(),
+                        ExprKind::Ident(s) => *s,
+                        _ => INTERNER.intern("variant"),
+                    };
+                    self.emit(
+                        Some(res),
+                        ValueExpr::EnumInit {
+                            enum_name: en_name,
+                            variant: v_sym,
+                            discriminant: disc as u32,
+                            payload: payload_val,
                         },
                         span,
                     );
@@ -2420,6 +2528,13 @@ impl<'a> FunctionLoweringContext<'a> {
                     let is_last = arm_idx + 1 == total_arms;
                     let arm_check_block = next_arm_block;
                     let arm_body_block = self.alloc_block();
+                    let arm_guard_block = if arm.guard.is_some() {
+                        Some(self.alloc_block())
+                    } else {
+                        None
+                    };
+                    let success_target = arm_guard_block.unwrap_or(arm_body_block);
+
                     next_arm_block = if is_last {
                         exit_block
                     } else {
@@ -2436,7 +2551,7 @@ impl<'a> FunctionLoweringContext<'a> {
                     match &arm.pattern {
                         Pattern::Wildcard(_) => {
                             self.set_terminator(Terminator::Branch {
-                                target: arm_body_block,
+                                target: success_target,
                                 args: Vec::new(),
                             });
                         }
@@ -2469,7 +2584,7 @@ impl<'a> FunctionLoweringContext<'a> {
                             );
                             self.set_terminator(Terminator::BranchCond {
                                 cond: matches_cond,
-                                then_block: arm_body_block,
+                                then_block: success_target,
                                 then_args: Vec::new(),
                                 else_block: next_arm_block,
                                 else_args: Vec::new(),
@@ -2500,19 +2615,45 @@ impl<'a> FunctionLoweringContext<'a> {
                             self.var_types.insert(*sym, var_ty);
 
                             self.set_terminator(Terminator::Branch {
-                                target: arm_body_block,
+                                target: success_target,
                                 args: Vec::new(),
                             });
                         }
                         Pattern::Variant {
+                            enum_name,
                             variant,
+                            inner,
                             span: v_span,
-                            ..
                         } => {
-                            let disc = self.lookup_variant_discriminant(*variant).unwrap_or(0);
+                            let (disc, opt_payload_ty) = if let Some(e_name) = enum_name {
+                                self.lookup_qualified_variant_info(*e_name, *variant)
+                                    .map(|(_, d, p)| (d, p))
+                                    .unwrap_or_else(|| {
+                                        (
+                                            self.lookup_variant_discriminant(*variant).unwrap_or(0),
+                                            None,
+                                        )
+                                    })
+                            } else {
+                                self.lookup_variant_info(*variant)
+                                    .map(|(_, d, p)| (d, p))
+                                    .unwrap_or_else(|| {
+                                        (
+                                            self.lookup_variant_discriminant(*variant).unwrap_or(0),
+                                            None,
+                                        )
+                                    })
+                            };
+
                             let disc_val = self.alloc_value();
                             self.emit(
                                 Some(disc_val),
+                                ValueExpr::EnumGetDiscriminant { base: target_val },
+                                *v_span,
+                            );
+                            let expected_disc_val = self.alloc_value();
+                            self.emit(
+                                Some(expected_disc_val),
                                 ValueExpr::Constant(ConstantValue::Int(disc as i128, IntType::I64)),
                                 *v_span,
                             );
@@ -2521,19 +2662,83 @@ impl<'a> FunctionLoweringContext<'a> {
                                 Some(matches_cond),
                                 ValueExpr::Binary {
                                     op: BinaryOp::Eq,
-                                    lhs: target_val,
-                                    rhs: disc_val,
+                                    lhs: disc_val,
+                                    rhs: expected_disc_val,
                                 },
                                 *v_span,
                             );
-                            self.set_terminator(Terminator::BranchCond {
-                                cond: matches_cond,
-                                then_block: arm_body_block,
-                                then_args: Vec::new(),
-                                else_block: next_arm_block,
-                                else_args: Vec::new(),
-                            });
+
+                            if let Some(inner_pat) = inner {
+                                let payload_extract_block = self.alloc_block();
+                                self.set_terminator(Terminator::BranchCond {
+                                    cond: matches_cond,
+                                    then_block: payload_extract_block,
+                                    then_args: Vec::new(),
+                                    else_block: next_arm_block,
+                                    else_args: Vec::new(),
+                                });
+
+                                self.current_block = payload_extract_block;
+                                let p_ty = opt_payload_ty.unwrap_or(FirType::Int(IntType::I64));
+                                let payload_val = self.alloc_value();
+                                self.emit(
+                                    Some(payload_val),
+                                    ValueExpr::EnumGetPayload {
+                                        base: target_val,
+                                        payload_ty: p_ty.clone(),
+                                    },
+                                    *v_span,
+                                );
+
+                                if let Pattern::Ident(inner_sym, inner_span) = inner_pat.as_ref() {
+                                    let inner_ptr = self.alloc_value();
+                                    self.emit(
+                                        Some(inner_ptr),
+                                        ValueExpr::Alloca {
+                                            ty: p_ty.clone(),
+                                            name: Some(*inner_sym),
+                                        },
+                                        *inner_span,
+                                    );
+                                    self.emit(
+                                        None,
+                                        ValueExpr::Store {
+                                            ptr: inner_ptr,
+                                            val: payload_val,
+                                        },
+                                        *inner_span,
+                                    );
+                                    self.var_allocas.insert(*inner_sym, inner_ptr);
+                                    self.var_types.insert(*inner_sym, p_ty);
+                                }
+
+                                self.set_terminator(Terminator::Branch {
+                                    target: success_target,
+                                    args: Vec::new(),
+                                });
+                            } else {
+                                self.set_terminator(Terminator::BranchCond {
+                                    cond: matches_cond,
+                                    then_block: success_target,
+                                    then_args: Vec::new(),
+                                    else_block: next_arm_block,
+                                    else_args: Vec::new(),
+                                });
+                            }
                         }
+                    }
+
+                    // Optional Guard Evaluation Block
+                    if let Some(guard_block) = arm_guard_block {
+                        self.current_block = guard_block;
+                        let guard_cond = self.lower_expr(arm.guard.as_ref().unwrap());
+                        self.set_terminator(Terminator::BranchCond {
+                            cond: guard_cond,
+                            then_block: arm_body_block,
+                            then_args: Vec::new(),
+                            else_block: next_arm_block,
+                            else_args: Vec::new(),
+                        });
                     }
 
                     // Arm Body
@@ -2738,12 +2943,36 @@ impl<'a> FunctionLoweringContext<'a> {
                             }
                         }
                     }
-                    if let Some(last_sym) = path.last() {
-                        if let Some(disc) = self.lookup_variant_discriminant(*last_sym) {
+                    if path.len() >= 2 {
+                        if let Some((en_name, disc, _)) = self.lookup_qualified_variant_info(
+                            path[path.len() - 2],
+                            path[path.len() - 1],
+                        ) {
                             let res = self.alloc_value();
                             self.emit(
                                 Some(res),
-                                ValueExpr::Constant(ConstantValue::Int(disc as i128, IntType::I64)),
+                                ValueExpr::EnumInit {
+                                    enum_name: en_name,
+                                    variant: path[path.len() - 1],
+                                    discriminant: disc as u32,
+                                    payload: None,
+                                },
+                                span,
+                            );
+                            return res;
+                        }
+                    }
+                    if let Some(last_sym) = path.last() {
+                        if let Some((en_name, disc, _)) = self.lookup_variant_info(*last_sym) {
+                            let res = self.alloc_value();
+                            self.emit(
+                                Some(res),
+                                ValueExpr::EnumInit {
+                                    enum_name: en_name,
+                                    variant: *last_sym,
+                                    discriminant: disc as u32,
+                                    payload: None,
+                                },
                                 span,
                             );
                             return res;

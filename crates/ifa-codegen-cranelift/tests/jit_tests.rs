@@ -606,3 +606,57 @@ fn test_cranelift_jit_monomorphized_trait_specialization() {
     let result = jit.run_main().expect("Failed to execute native main");
     assert_eq!(result, 92);
 }
+
+#[test]
+fn test_cranelift_jit_adt_and_match_guards() {
+    let src = r#"
+        enum Message {
+            Quit,
+            Move(i64),
+            Write(i64),
+        }
+
+        fn process(msg: Message) -> i64 {
+            return match msg {
+                Message::Quit => 0,
+                Message::Move(dist) if dist > 100 => dist * 2,
+                Message::Move(dist) => dist,
+                Message::Write(len) => len + 10,
+            }
+        }
+
+        pub fn main() -> i64 {
+            let m1 = Message::Quit;
+            let m2 = Message::Move(150);
+            let m3 = Message::Move(40);
+            let m4 = Message::Write(25);
+
+            let r1 = process(m1);
+            let r2 = process(m2);
+            let r3 = process(m3);
+            let r4 = process(m4);
+
+            return r1 + r2 + r3 + r4;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("adt_jit.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile ADT FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 375);
+}

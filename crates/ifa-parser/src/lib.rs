@@ -3,7 +3,7 @@
 use ifa_ast::*;
 use ifa_diagnostics::Diagnostic;
 use ifa_lexer::token::{Token, TokenKind};
-use ifa_span::{sym, BytePos, FileId, Span};
+use ifa_span::{sym, BytePos, FileId, Span, INTERNER};
 
 pub struct Parser {
     file_id: FileId,
@@ -1304,34 +1304,12 @@ impl Parser {
 
                 while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
                     let pat_start = self.current().span.start;
-                    let pattern = if let TokenKind::Ident(s) = self.current().kind {
-                        self.advance();
-                        if s.as_str() == "_" {
-                            Pattern::Wildcard(Span::new(
-                                self.file_id,
-                                pat_start,
-                                self.current().span.end,
-                            ))
-                        } else {
-                            Pattern::Ident(
-                                s,
-                                Span::new(self.file_id, pat_start, self.current().span.end),
-                            )
-                        }
-                    } else if let TokenKind::StringLiteral(s) = self.current().kind {
-                        self.advance();
-                        Pattern::Lit(
-                            Lit::String(s),
-                            Span::new(self.file_id, pat_start, self.current().span.end),
-                        )
-                    } else if let TokenKind::IntLiteral(s) = self.current().kind {
-                        self.advance();
-                        Pattern::Lit(
-                            Lit::Int(s),
-                            Span::new(self.file_id, pat_start, self.current().span.end),
-                        )
+                    let pattern = self.parse_pattern()?;
+
+                    let guard = if self.match_token(&TokenKind::If) {
+                        Some(self.parse_expr()?)
                     } else {
-                        break;
+                        None
                     };
 
                     self.expect(TokenKind::FatArrow)?;
@@ -1339,7 +1317,7 @@ impl Parser {
                     let arm_span = Span::new(self.file_id, pat_start, body.span.end);
                     arms.push(MatchArm {
                         pattern,
-                        guard: None,
+                        guard,
                         body,
                         span: arm_span,
                     });
@@ -1383,28 +1361,7 @@ impl Parser {
                             span: arm_span,
                         });
                     } else if self.match_token(&TokenKind::Let) {
-                        let pat_start = self.current().span.start;
-                        let pattern = if let TokenKind::Ident(s) = self.current().kind {
-                            self.advance();
-                            if s.as_str() == "_" {
-                                Pattern::Wildcard(Span::new(
-                                    self.file_id,
-                                    pat_start,
-                                    self.current().span.end,
-                                ))
-                            } else {
-                                Pattern::Ident(
-                                    s,
-                                    Span::new(self.file_id, pat_start, self.current().span.end),
-                                )
-                            }
-                        } else {
-                            Pattern::Wildcard(Span::new(
-                                self.file_id,
-                                pat_start,
-                                self.current().span.end,
-                            ))
-                        };
+                        let pattern = self.parse_pattern()?;
                         self.expect(TokenKind::Eq)?;
                         let channel = self.parse_expr()?;
                         self.expect(TokenKind::FatArrow)?;
@@ -1550,6 +1507,140 @@ impl Parser {
                 let diag =
                     Diagnostic::error(format!("expression attendue, mais trouvé '{}'", cur.kind))
                         .with_primary_label(cur.span, "expression attendue");
+                self.diagnostics.push(diag.clone());
+                Err(diag)
+            }
+        }
+    }
+
+    pub fn parse_pattern(&mut self) -> Result<Pattern, Diagnostic> {
+        let cur = self.current();
+        let pat_start = cur.span.start;
+        match cur.kind {
+            TokenKind::Ident(s) => {
+                self.advance();
+                if s.as_str() == "_" {
+                    Ok(Pattern::Wildcard(Span::new(
+                        self.file_id,
+                        pat_start,
+                        cur.span.end,
+                    )))
+                } else if self.match_token(&TokenKind::ColonColon) {
+                    let variant_tok = self.current();
+                    let variant_sym = match variant_tok.kind {
+                        TokenKind::Ident(v) => {
+                            self.advance();
+                            v
+                        }
+                        _ => {
+                            let diag = Diagnostic::error("nom de variant attendu après '::'")
+                                .with_primary_label(variant_tok.span, "identifiant attendu");
+                            self.diagnostics.push(diag.clone());
+                            return Err(diag);
+                        }
+                    };
+                    let (inner, end_pos) = if self.match_token(&TokenKind::OpenParen) {
+                        let inner_pat = self.parse_pattern()?;
+                        let close = self.expect(TokenKind::CloseParen)?;
+                        (Some(Box::new(inner_pat)), close.span.end)
+                    } else {
+                        (None, variant_tok.span.end)
+                    };
+                    Ok(Pattern::Variant {
+                        enum_name: Some(s),
+                        variant: variant_sym,
+                        inner,
+                        span: Span::new(self.file_id, pat_start, end_pos),
+                    })
+                } else if self.match_token(&TokenKind::OpenParen) {
+                    let inner_pat = self.parse_pattern()?;
+                    let close = self.expect(TokenKind::CloseParen)?;
+                    Ok(Pattern::Variant {
+                        enum_name: None,
+                        variant: s,
+                        inner: Some(Box::new(inner_pat)),
+                        span: Span::new(self.file_id, pat_start, close.span.end),
+                    })
+                } else {
+                    Ok(Pattern::Ident(
+                        s,
+                        Span::new(self.file_id, pat_start, cur.span.end),
+                    ))
+                }
+            }
+            TokenKind::IntLiteral(s) => {
+                self.advance();
+                Ok(Pattern::Lit(
+                    Lit::Int(s),
+                    Span::new(self.file_id, pat_start, cur.span.end),
+                ))
+            }
+            TokenKind::FloatLiteral(s) => {
+                self.advance();
+                Ok(Pattern::Lit(
+                    Lit::Float(s),
+                    Span::new(self.file_id, pat_start, cur.span.end),
+                ))
+            }
+            TokenKind::StringLiteral(s) => {
+                self.advance();
+                Ok(Pattern::Lit(
+                    Lit::String(s),
+                    Span::new(self.file_id, pat_start, cur.span.end),
+                ))
+            }
+            TokenKind::True => {
+                self.advance();
+                Ok(Pattern::Lit(
+                    Lit::Bool(true),
+                    Span::new(self.file_id, pat_start, cur.span.end),
+                ))
+            }
+            TokenKind::False => {
+                self.advance();
+                Ok(Pattern::Lit(
+                    Lit::Bool(false),
+                    Span::new(self.file_id, pat_start, cur.span.end),
+                ))
+            }
+            TokenKind::Null => {
+                self.advance();
+                Ok(Pattern::Lit(
+                    Lit::Null,
+                    Span::new(self.file_id, pat_start, cur.span.end),
+                ))
+            }
+            TokenKind::Minus => {
+                self.advance();
+                let next_tok = self.current();
+                match next_tok.kind {
+                    TokenKind::IntLiteral(s) => {
+                        self.advance();
+                        let neg_s = INTERNER.intern(&format!("-{}", s.as_str()));
+                        Ok(Pattern::Lit(
+                            Lit::Int(neg_s),
+                            Span::new(self.file_id, pat_start, next_tok.span.end),
+                        ))
+                    }
+                    TokenKind::FloatLiteral(s) => {
+                        self.advance();
+                        let neg_s = INTERNER.intern(&format!("-{}", s.as_str()));
+                        Ok(Pattern::Lit(
+                            Lit::Float(neg_s),
+                            Span::new(self.file_id, pat_start, next_tok.span.end),
+                        ))
+                    }
+                    _ => {
+                        let diag = Diagnostic::error("littéral numérique attendu après '-'")
+                            .with_primary_label(next_tok.span, "littéral attendu");
+                        self.diagnostics.push(diag.clone());
+                        Err(diag)
+                    }
+                }
+            }
+            _ => {
+                let diag = Diagnostic::error(format!("motif attendu, mais trouvé '{}'", cur.kind))
+                    .with_primary_label(cur.span, "motif attendu");
                 self.diagnostics.push(diag.clone());
                 Err(diag)
             }

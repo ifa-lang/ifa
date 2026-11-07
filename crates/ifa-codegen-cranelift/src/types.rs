@@ -31,7 +31,14 @@ pub fn fir_type_to_cranelift(ty: &FirType, ptr_type: types::Type) -> Option<type
         FirType::Optional(inner) => fir_type_to_cranelift(inner, ptr_type),
         FirType::ErrorUnion { .. } => Some(ptr_type),
         FirType::Function { .. } => Some(ptr_type),
-        FirType::Enum(_, _) => Some(types::I32),
+        FirType::Enum(_, vars) => {
+            let has_payload = vars.iter().any(|(_, opt)| opt.is_some());
+            if has_payload {
+                Some(ptr_type)
+            } else {
+                Some(types::I64)
+            }
+        }
     }
 }
 
@@ -73,8 +80,15 @@ pub fn fir_type_byte_size(ty: &FirType) -> usize {
         FirType::Int(IntType::I16 | IntType::U16) => 2,
         FirType::Int(IntType::I32 | IntType::U32)
         | FirType::Float(FloatType::F32)
-        | FirType::Char
-        | FirType::Enum(_, _) => 4,
+        | FirType::Char => 4,
+        FirType::Enum(_, vars) => {
+            let has_payload = vars.iter().any(|(_, opt)| opt.is_some());
+            if has_payload {
+                16
+            } else {
+                8
+            }
+        }
         FirType::Int(IntType::I64 | IntType::U64 | IntType::ISize | IntType::USize)
         | FirType::Float(FloatType::F64)
         | FirType::Str

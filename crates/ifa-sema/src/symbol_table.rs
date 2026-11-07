@@ -1085,6 +1085,57 @@ impl SymbolTable {
         self.enums.get(name)
     }
 
+    /// Lookup an enum variant by enum name and variant name.
+    /// Returns (enum_symbol, discriminant_index, optional_payload_type).
+    pub fn lookup_enum_variant(
+        &self,
+        enum_name: &Symbol,
+        variant: &Symbol,
+    ) -> Option<(&EnumSymbol, usize, Option<&Type>)> {
+        if let Some(en) = self.enums.get(enum_name) {
+            for (idx, (v_name, payload)) in en.variants.iter().enumerate() {
+                if v_name == variant {
+                    return Some((en, idx, payload.as_ref()));
+                }
+            }
+        }
+        for m in self.modules.values() {
+            if let Some(en) = m.enums.get(enum_name) {
+                for (idx, (v_name, payload)) in en.variants.iter().enumerate() {
+                    if v_name == variant {
+                        return Some((en, idx, payload.as_ref()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Lookup an enum variant by variant name only (unqualified).
+    /// Returns (enum_symbol, discriminant_index, optional_payload_type).
+    pub fn lookup_enum_by_variant(
+        &self,
+        variant: &Symbol,
+    ) -> Option<(&EnumSymbol, usize, Option<&Type>)> {
+        for en in self.enums.values() {
+            for (idx, (v_name, payload)) in en.variants.iter().enumerate() {
+                if v_name == variant {
+                    return Some((en, idx, payload.as_ref()));
+                }
+            }
+        }
+        for m in self.modules.values() {
+            for en in m.enums.values() {
+                for (idx, (v_name, payload)) in en.variants.iter().enumerate() {
+                    if v_name == variant {
+                        return Some((en, idx, payload.as_ref()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn define_const(&mut self, c: ConstSymbol) -> Result<(), Diagnostic> {
         if let Some(existing) = self.consts.get(&c.name) {
             let c_name = INTERNER.resolve(&c.name);

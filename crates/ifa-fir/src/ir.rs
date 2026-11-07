@@ -241,6 +241,21 @@ pub enum ValueExpr {
         channels: Vec<ValueId>,
         has_default: bool,
     },
+
+    // Algebraic Data Types (Enums / Tagged Unions) Primitives
+    EnumInit {
+        enum_name: Symbol,
+        variant: Symbol,
+        discriminant: u32,
+        payload: Option<ValueId>,
+    },
+    EnumGetDiscriminant {
+        base: ValueId,
+    },
+    EnumGetPayload {
+        base: ValueId,
+        payload_ty: FirType,
+    },
 }
 
 impl ValueExpr {
@@ -283,6 +298,9 @@ impl ValueExpr {
             | ValueExpr::ChanTryRecv { chan }
             | ValueExpr::ChanClose { chan } => vec![*chan],
             ValueExpr::ChanSelect { channels, .. } => channels.clone(),
+            ValueExpr::EnumInit { payload, .. } => payload.iter().copied().collect(),
+            ValueExpr::EnumGetDiscriminant { base } => vec![*base],
+            ValueExpr::EnumGetPayload { base, .. } => vec![*base],
         }
     }
 }

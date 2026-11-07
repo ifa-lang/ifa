@@ -1231,6 +1231,11 @@ impl<'a> SemanticAnalyzer<'a> {
                         name: *sym,
                         fields: st.fields.iter().map(|f| (f.name, f.ty.clone())).collect(),
                     }
+                } else if let Some((en, _, _)) = self.symbols.lookup_enum_by_variant(sym) {
+                    Type::Enum {
+                        name: en.name,
+                        variants: en.variants.clone(),
+                    }
                 } else {
                     self.diagnostics.push(
                         Diagnostic::error(format!("variable ou identifiant inconnu '{}'", name))
@@ -1330,6 +1335,13 @@ impl<'a> SemanticAnalyzer<'a> {
                             f.ret_ty.clone()
                         } else {
                             Type::Unknown
+                        }
+                    } else if let Some((en, _, _)) =
+                        self.symbols.lookup_enum_variant(&mod_sym, &member_sym)
+                    {
+                        Type::Enum {
+                            name: en.name,
+                            variants: en.variants.clone(),
                         }
                     } else if let Some(en) = self.symbols.lookup_enum(&mod_sym) {
                         Type::Enum {
@@ -1970,37 +1982,89 @@ impl<'a> SemanticAnalyzer<'a> {
                 inner,
                 span,
             } => {
-                if let Type::Enum { name: e_sym, .. } = target_ty {
-                    if let Some(e_decl) = self.symbols.lookup_enum(e_sym) {
-                        if !e_decl.variants.iter().any(|(v, _)| v == variant) {
-                            self.diagnostics.push(
-                                Diagnostic::error(format!(
-                                    "le variant '{}' n'existe pas dans l'énumération '{}'",
-                                    INTERNER.resolve(variant),
-                                    INTERNER.resolve(e_sym)
-                                ))
-                                .with_code("E0037")
-                                .with_primary_label(*span, "variant inconnu"),
-                            );
-                        }
+                let mut found_payload_ty: Option<Type> = None;
+                let mut valid_variant = false;
+
+                if let Type::Enum {
+                    name: e_sym,
+                    variants,
+                } = target_ty
+                {
+                    if let Some((_, opt_ty)) = variants.iter().find(|(v, _)| v == variant) {
+                        valid_variant = true;
+                        found_payload_ty = opt_ty.clone();
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "le variant '{}' n'existe pas dans l'énumération '{}'",
+                                INTERNER.resolve(variant),
+                                INTERNER.resolve(e_sym)
+                            ))
+                            .with_code("E0037")
+                            .with_primary_label(*span, "variant inconnu"),
+                        );
                     }
                 } else if let Some(e_sym) = enum_name {
-                    if let Some(e_decl) = self.symbols.lookup_enum(e_sym) {
-                        if !e_decl.variants.iter().any(|(v, _)| v == variant) {
+                    if let Some((_, _, opt_ty)) = self.symbols.lookup_enum_variant(e_sym, variant) {
+                        valid_variant = true;
+                        found_payload_ty = opt_ty.cloned();
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "le variant '{}' n'existe pas dans l'énumération '{}'",
+                                INTERNER.resolve(variant),
+                                INTERNER.resolve(e_sym)
+                            ))
+                            .with_code("E0037")
+                            .with_primary_label(*span, "variant inconnu"),
+                        );
+                    }
+                } else if let Some((_, _, opt_ty)) = self.symbols.lookup_enum_by_variant(variant) {
+                    valid_variant = true;
+                    found_payload_ty = opt_ty.cloned();
+                } else if *target_ty != Type::Unknown {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "le motif variant '{}' ne correspond pas au type '{}'",
+                            INTERNER.resolve(variant),
+                            target_ty
+                        ))
+                        .with_code("E0036")
+                        .with_primary_label(*span, "type de motif incompatible"),
+                    );
+                }
+
+                if valid_variant {
+                    match (inner, found_payload_ty) {
+                        (Some(inner_pat), Some(payload_ty)) => {
+                            self.check_pattern(inner_pat, &payload_ty);
+                        }
+                        (Some(inner_pat), None) => {
                             self.diagnostics.push(
                                 Diagnostic::error(format!(
-                                    "le variant '{}' n'existe pas dans l'énumération '{}'",
-                                    INTERNER.resolve(variant),
-                                    INTERNER.resolve(e_sym)
+                                    "le variant '{}' ne contient aucune donnée associée",
+                                    INTERNER.resolve(variant)
                                 ))
-                                .with_code("E0037")
-                                .with_primary_label(*span, "variant inconnu"),
+                                .with_code("E0038")
+                                .with_primary_label(
+                                    inner_pat.span(),
+                                    "aucun argument attendu pour ce variant",
+                                ),
                             );
                         }
+                        (None, Some(payload_ty)) => {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "le variant '{}' attend une charge utile de type '{}'",
+                                    INTERNER.resolve(variant),
+                                    payload_ty
+                                ))
+                                .with_code("E0039")
+                                .with_primary_label(*span, "charge utile manquante"),
+                            );
+                        }
+                        (None, None) => {}
                     }
-                }
-                if let Some(inner_pat) = inner {
-                    self.check_pattern(inner_pat, &Type::Unknown);
                 }
             }
         }
@@ -2229,6 +2293,74 @@ impl<'a> SemanticAnalyzer<'a> {
 
         if let Some(st) = struct_match {
             return self.check_struct_constructor_call(&st, args, span);
+        }
+
+        // Check if callee is an enum variant constructor (e.g. WebEvent::KeyPress(...) or Some(...))
+        let enum_variant_match = match &callee.kind {
+            ExprKind::Path(path) => {
+                if path.len() >= 2 {
+                    let en_sym = path[path.len() - 2];
+                    let v_sym = path[path.len() - 1];
+                    self.symbols
+                        .lookup_enum_variant(&en_sym, &v_sym)
+                        .map(|(en, idx, p)| (en.clone(), idx, p.cloned()))
+                } else if let Some(last) = path.last() {
+                    self.symbols
+                        .lookup_enum_by_variant(last)
+                        .map(|(en, idx, p)| (en.clone(), idx, p.cloned()))
+                } else {
+                    None
+                }
+            }
+            ExprKind::Ident(sym) => self
+                .symbols
+                .lookup_enum_by_variant(sym)
+                .map(|(en, idx, p)| (en.clone(), idx, p.cloned())),
+            _ => None,
+        };
+
+        if let Some((en, _variant_idx, opt_payload_ty)) = enum_variant_match {
+            if let Some(payload_ty) = opt_payload_ty {
+                if args.len() != 1 {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "le variant '{}' attend exactement 1 argument de type '{}', mais {} arguments ont été fournis",
+                            INTERNER.resolve(&en.name),
+                            payload_ty,
+                            args.len()
+                        ))
+                        .with_code("E0040")
+                        .with_primary_label(span, "nombre d'arguments invalide pour le variant"),
+                    );
+                } else {
+                    let arg_ty = self.check_expr(&args[0].value, Some(&payload_ty));
+                    if !arg_ty.is_assignable_to(&payload_ty) && arg_ty != Type::Unknown {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "type d'argument invalide pour le variant '{}' : attendu '{}', trouvé '{}'",
+                                INTERNER.resolve(&en.name),
+                                payload_ty,
+                                arg_ty
+                            ))
+                            .with_code("E0041")
+                            .with_primary_label(args[0].span, "type incompatible pour la charge utile du variant"),
+                        );
+                    }
+                }
+            } else {
+                self.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "le variant '{}' n'accepte aucun argument",
+                        INTERNER.resolve(&en.name)
+                    ))
+                    .with_code("E0042")
+                    .with_primary_label(span, "appel invalide sur un variant sans charge utile"),
+                );
+            }
+            return Type::Enum {
+                name: en.name,
+                variants: en.variants,
+            };
         }
 
         // Check if callee is a known function

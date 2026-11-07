@@ -13,10 +13,22 @@ pub enum FirValue {
     Float(f64),
     String(String),
     Pointer(usize),
-    GenRef { slot: usize, generation: u32 },
+    GenRef {
+        slot: usize,
+        generation: u32,
+    },
     Array(Vec<FirValue>),
     Tuple(Vec<FirValue>),
-    Struct { name: Symbol, fields: Vec<FirValue> },
+    Struct {
+        name: Symbol,
+        fields: Vec<FirValue>,
+    },
+    Enum {
+        enum_name: Symbol,
+        variant: Symbol,
+        discriminant: u32,
+        payload: Option<Box<FirValue>>,
+    },
     Null,
 }
 
@@ -82,6 +94,18 @@ impl fmt::Display for FirValue {
                     write!(f, "{}", field)?;
                 }
                 write!(f, "}}")
+            }
+            FirValue::Enum {
+                enum_name,
+                variant,
+                payload,
+                ..
+            } => {
+                if let Some(p) = payload {
+                    write!(f, "{}::{}({})", enum_name.as_str(), variant.as_str(), p)
+                } else {
+                    write!(f, "{}::{}", enum_name.as_str(), variant.as_str())
+                }
             }
             FirValue::Null => write!(f, "null"),
         }
@@ -1435,6 +1459,35 @@ impl<'a> FirInterpreter<'a> {
                     Ok(FirValue::Int(0))
                 }
             }
+            ValueExpr::EnumInit {
+                enum_name,
+                variant,
+                discriminant,
+                payload,
+            } => {
+                let p_val = payload
+                    .as_ref()
+                    .map(|p_id| Box::new(env.get(p_id).cloned().unwrap_or(FirValue::Unit)));
+                Ok(FirValue::Enum {
+                    enum_name: *enum_name,
+                    variant: *variant,
+                    discriminant: *discriminant,
+                    payload: p_val,
+                })
+            }
+            ValueExpr::EnumGetDiscriminant { base } => match env.get(base) {
+                Some(FirValue::Enum { discriminant, .. }) => {
+                    Ok(FirValue::Int(*discriminant as i128))
+                }
+                Some(FirValue::Int(i)) => Ok(FirValue::Int(*i)),
+                _ => Ok(FirValue::Int(0)),
+            },
+            ValueExpr::EnumGetPayload { base, .. } => match env.get(base) {
+                Some(FirValue::Enum {
+                    payload: Some(p), ..
+                }) => Ok((**p).clone()),
+                _ => Ok(FirValue::Unit),
+            },
         }
     }
 

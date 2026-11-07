@@ -85,8 +85,26 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             }
         }
 
-        // 4. Translate instructions and terminator block by block
-        for block in &fir_func.blocks {
+        // 4. Translate instructions and terminator in Reverse Post-Order (RPO)
+        // so that all dominating definitions are visited before their uses.
+        let cfg = ifa_fir::ControlFlowGraph::build(fir_func);
+        let rpo_order = cfg.reverse_post_order();
+        let mut ordered_blocks: Vec<&ifa_fir::BasicBlock> =
+            Vec::with_capacity(fir_func.blocks.len());
+        let mut visited = std::collections::HashSet::new();
+        for block_id in rpo_order {
+            if let Some(b) = fir_func.get_block(block_id) {
+                ordered_blocks.push(b);
+                visited.insert(block_id);
+            }
+        }
+        for b in &fir_func.blocks {
+            if !visited.contains(&b.id) {
+                ordered_blocks.push(b);
+            }
+        }
+
+        for block in ordered_blocks {
             let cl_block = self.block_map[&block.id];
             self.builder.switch_to_block(cl_block);
 
@@ -598,6 +616,54 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             ValueExpr::ArrayLen { array } => {
                 let _ = array;
                 Some(self.builder.ins().iconst(types::I64, 0))
+            }
+
+            ValueExpr::EnumInit {
+                discriminant,
+                payload,
+                ..
+            } => {
+                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    16,
+                    0,
+                ));
+                let base_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+                let disc_val = self.builder.ins().iconst(types::I64, *discriminant as i64);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), disc_val, base_addr, 0);
+                if let Some(p_id) = payload {
+                    let p_val = self.value_map[p_id];
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), p_val, base_addr, 8);
+                } else {
+                    let zero_val = self.builder.ins().iconst(types::I64, 0);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), zero_val, base_addr, 8);
+                }
+                Some(base_addr)
+            }
+
+            ValueExpr::EnumGetDiscriminant { base } => {
+                let base_val = self.value_map[base];
+                let disc =
+                    self.builder
+                        .ins()
+                        .load(types::I64, MemFlagsData::trusted(), base_val, 0);
+                Some(disc)
+            }
+
+            ValueExpr::EnumGetPayload { base, payload_ty } => {
+                let base_val = self.value_map[base];
+                let cl_ty = fir_type_to_cranelift(payload_ty, self.ptr_type).unwrap_or(types::I64);
+                let payload = self
+                    .builder
+                    .ins()
+                    .load(cl_ty, MemFlagsData::trusted(), base_val, 8);
+                Some(payload)
             }
         };
 
