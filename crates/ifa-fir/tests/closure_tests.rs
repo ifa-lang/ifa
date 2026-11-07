@@ -213,12 +213,11 @@ fn test_fir_closure_escape_analysis_and_devirtualization() {
 
 #[test]
 fn test_fir_higher_order_iterators_example() {
-    let src = std::fs::read_to_string("/root/ifa/examples/higher_order_iterators.ifa")
-        .expect("Failed to read higher_order_iterators.ifa");
+    let src = include_str!("../../../examples/higher_order_iterators.ifa");
 
     let mut sm = SourceMap::new();
-    let fid = sm.add_file("higher_order_iterators.ifa", &src);
-    let tokens = tokenize(fid, &src);
+    let fid = sm.add_file("higher_order_iterators.ifa", src);
+    let tokens = tokenize(fid, src);
     let (prog, diags) = parse(fid, tokens);
     assert!(diags.is_empty(), "Parse errors: {:?}", diags);
 
