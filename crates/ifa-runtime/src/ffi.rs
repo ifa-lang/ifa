@@ -174,6 +174,38 @@ pub extern "C" fn ifa_rt_fiber_join(fiber_id: u64) {
     GLOBAL_SCHEDULER.join(fiber_id);
 }
 
+/// Retrieve the identifier of the currently executing fiber on this worker thread (0 if unassigned / main thread).
+#[no_mangle]
+pub extern "C" fn ifa_rt_fiber_current_id() -> u64 {
+    crate::fiber::current_fiber_id()
+}
+
+/// Retrieve the isolated arena ID of the currently executing fiber on this worker thread (0 if none).
+#[no_mangle]
+pub extern "C" fn ifa_rt_fiber_current_arena() -> u16 {
+    crate::fiber::current_fiber_arena()
+}
+
+/// Verify whether the specified fiber is the registered owner of the generational arena.
+#[no_mangle]
+pub extern "C" fn ifa_rt_arena_verify_owner(arena_id: u16, fiber_id: u64) -> bool {
+    GLOBAL_ALLOCATOR.verify_arena_owner(arena_id, fiber_id)
+}
+
+/// Spawn a new colorless fiber with an isolated, automatically managed generational arena.
+#[no_mangle]
+pub extern "C" fn ifa_rt_fiber_spawn_with_arena(
+    entry: extern "C" fn(*mut u8),
+    arg: *mut u8,
+) -> u64 {
+    let arg_addr = arg as usize;
+    let (fiber_id, _arena_id) = GLOBAL_SCHEDULER.spawn_with_arena(move || {
+        let raw_arg = arg_addr as *mut u8;
+        entry(raw_arg);
+    });
+    fiber_id
+}
+
 /// Opaque handle representing an allocated stackless native coroutine.
 pub struct IfaCoroutine {
     pub frame: *mut u8,

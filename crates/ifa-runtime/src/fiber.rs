@@ -80,17 +80,36 @@ pub enum FiberStepResult {
     Suspended,
 }
 
+thread_local! {
+    static CURRENT_FIBER_ID: std::cell::Cell<FiberId> = const { std::cell::Cell::new(0) };
+    static CURRENT_FIBER_ARENA: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+}
+
+/// Retrieve the identifier of the currently executing fiber on this worker thread (0 if unassigned / main thread).
+pub fn current_fiber_id() -> FiberId {
+    CURRENT_FIBER_ID.with(|c| c.get())
+}
+
+/// Retrieve the isolated arena ID of the currently executing fiber on this worker thread (0 if none).
+pub fn current_fiber_arena() -> u16 {
+    CURRENT_FIBER_ARENA.with(|c| c.get())
+}
+
 /// A lightweight unit of execution running cooperatively or on worker pools.
 pub struct Fiber {
     pub id: FiberId,
     pub state: FiberState,
     pub task: Option<FiberTask>,
+    pub arena_id: Option<u16>,
 }
 
 impl Fiber {
     /// Execute one step of the fiber.
     pub fn step(&mut self) -> FiberStepResult {
-        match &mut self.task {
+        let prev_id = CURRENT_FIBER_ID.with(|c| c.replace(self.id));
+        let prev_arena = CURRENT_FIBER_ARENA.with(|c| c.replace(self.arena_id.unwrap_or(0)));
+
+        let step_res = match &mut self.task {
             Some(FiberTask::Once(_)) => {
                 let task = self.task.take().unwrap();
                 if let FiberTask::Once(exec) = task {
@@ -132,7 +151,12 @@ impl Fiber {
                 }
             }
             None => FiberStepResult::Completed,
-        }
+        };
+
+        CURRENT_FIBER_ID.with(|c| c.set(prev_id));
+        CURRENT_FIBER_ARENA.with(|c| c.set(prev_arena));
+
+        step_res
     }
 }
 
@@ -193,6 +217,9 @@ impl FiberScheduler {
                         let step_res = fiber.step();
                         match step_res {
                             FiberStepResult::Completed => {
+                                if let Some(arena_id) = fiber.arena_id {
+                                    crate::allocator::GLOBAL_ALLOCATOR.destroy_arena(arena_id);
+                                }
                                 let mut comp = completed.lock().unwrap();
                                 comp.insert(fiber.id, FiberState::Completed);
                                 notif.notify_all();
@@ -232,6 +259,7 @@ impl FiberScheduler {
             id,
             state: FiberState::Ready,
             task: Some(FiberTask::Once(Box::new(task))),
+            arena_id: None,
         };
 
         {
@@ -241,6 +269,29 @@ impl FiberScheduler {
         self.notifier.notify_one();
 
         id
+    }
+
+    /// Spawn a new colorless fiber configured with an isolated generational arena.
+    pub fn spawn_with_arena<F>(&self, task: F) -> (FiberId, u16)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let id = self.next_fiber_id.fetch_add(1, Ordering::SeqCst);
+        let arena_id = crate::allocator::GLOBAL_ALLOCATOR.create_arena_for_fiber(id);
+        let fiber = Fiber {
+            id,
+            state: FiberState::Ready,
+            task: Some(FiberTask::Once(Box::new(task))),
+            arena_id: Some(arena_id),
+        };
+
+        {
+            let mut queue = self.ready_queue.lock().unwrap();
+            queue.push_back(fiber);
+        }
+        self.notifier.notify_one();
+
+        (id, arena_id)
     }
 
     /// Spawn a new resumable task called repeatedly across scheduler cycles until completion.
@@ -253,6 +304,7 @@ impl FiberScheduler {
             id,
             state: FiberState::Ready,
             task: Some(FiberTask::Resumable(Box::new(task))),
+            arena_id: None,
         };
 
         {
@@ -271,6 +323,7 @@ impl FiberScheduler {
             id,
             state: FiberState::Ready,
             task: Some(FiberTask::Stackless(coro)),
+            arena_id: None,
         };
 
         {
@@ -280,6 +333,26 @@ impl FiberScheduler {
         self.notifier.notify_one();
 
         id
+    }
+
+    /// Spawn a native stackless coroutine configured with an isolated generational arena.
+    pub fn spawn_coro_with_arena(&self, coro: StacklessCoro) -> (FiberId, u16) {
+        let id = self.next_fiber_id.fetch_add(1, Ordering::SeqCst);
+        let arena_id = crate::allocator::GLOBAL_ALLOCATOR.create_arena_for_fiber(id);
+        let fiber = Fiber {
+            id,
+            state: FiberState::Ready,
+            task: Some(FiberTask::Stackless(coro)),
+            arena_id: Some(arena_id),
+        };
+
+        {
+            let mut queue = self.ready_queue.lock().unwrap();
+            queue.push_back(fiber);
+        }
+        self.notifier.notify_one();
+
+        (id, arena_id)
     }
 
     /// Spawn a blocking operation on the dedicated background blocking pool.
@@ -312,6 +385,9 @@ impl FiberScheduler {
             let step_res = fiber.step();
             match step_res {
                 FiberStepResult::Completed => {
+                    if let Some(arena_id) = fiber.arena_id {
+                        crate::allocator::GLOBAL_ALLOCATOR.destroy_arena(arena_id);
+                    }
                     let mut comp = self.completed_fibers.lock().unwrap();
                     comp.insert(fiber.id, FiberState::Completed);
                     self.notifier.notify_all();

@@ -161,6 +161,78 @@ impl FirType {
             FirType::Function { .. } => 16,
         }
     }
+
+    /// Returns the natural memory alignment requirement in bytes for this type.
+    pub fn alignment(&self) -> usize {
+        match self {
+            FirType::Unit => 1,
+            FirType::Bool | FirType::Char => 1,
+            FirType::Int(i) => match i {
+                IntType::I8 | IntType::U8 => 1,
+                IntType::I16 | IntType::U16 => 2,
+                IntType::I32 | IntType::U32 => 4,
+                IntType::I64 | IntType::U64 | IntType::ISize | IntType::USize => 8,
+            },
+            FirType::Float(f) => match f {
+                FloatType::F32 => 4,
+                FloatType::F64 => 8,
+            },
+            FirType::Str | FirType::Slice(_) => 8,
+            FirType::String => 8,
+            FirType::Pointer(_) | FirType::Channel(_) => 8,
+            FirType::GenerationalRef(_) => 8,
+            FirType::Struct(_, fields) => fields
+                .iter()
+                .map(|(_, ty)| ty.alignment())
+                .max()
+                .unwrap_or(8)
+                .max(1),
+            FirType::Enum(_, variants) => {
+                let payload_align = variants
+                    .iter()
+                    .filter_map(|(_, opt)| opt.as_ref().map(|t| t.alignment()))
+                    .max()
+                    .unwrap_or(1);
+                payload_align.max(8)
+            }
+            FirType::Array(elem, _) => elem.alignment(),
+            FirType::Range { elem, .. } => elem.alignment().max(8),
+            FirType::Optional(inner) => inner.alignment(),
+            FirType::ErrorUnion { ok, .. } => ok.alignment().max(8),
+            FirType::Function { .. } => 8,
+        }
+    }
+
+    /// Recursively checks if this type references a specified struct symbol.
+    pub fn is_recursive_with_name(&self, struct_name: Symbol) -> bool {
+        match self {
+            FirType::GenerationalRef(inner)
+            | FirType::Pointer(inner)
+            | FirType::Optional(inner)
+            | FirType::Slice(inner) => inner.is_recursive_with_name(struct_name),
+            FirType::Array(inner, _) => inner.is_recursive_with_name(struct_name),
+            FirType::Struct(name, fields) => {
+                if *name == struct_name {
+                    true
+                } else {
+                    fields
+                        .iter()
+                        .any(|(_, t)| t.is_recursive_with_name(struct_name))
+                }
+            }
+            FirType::Enum(name, variants) => {
+                if *name == struct_name {
+                    true
+                } else {
+                    variants.iter().any(|(_, opt)| {
+                        opt.as_ref()
+                            .is_some_and(|t| t.is_recursive_with_name(struct_name))
+                    })
+                }
+            }
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for FirType {

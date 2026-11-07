@@ -5,6 +5,7 @@ pub mod dominance;
 pub mod gen_opt;
 pub mod interp;
 pub mod ir;
+pub mod layout_opt;
 pub mod lower;
 pub mod printer;
 pub mod sroa;
@@ -20,6 +21,7 @@ pub use dominance::DominanceTree;
 pub use gen_opt::{GenOptStats, GenerationalOptPass, NaturalLoop};
 pub use interp::{FirInterpreter, FirValue, GenHeader, GenHeap, InterpError};
 pub use ir::*;
+pub use layout_opt::{CacheLayoutPass, CacheLayoutStats, CACHE_LINE_SIZE};
 pub use lower::lower_program;
 pub use printer::{format_function, format_module, FirPrinter};
 pub use sroa::{SroaPass, SroaStats};
@@ -56,6 +58,9 @@ pub fn compile_to_fir_with_opts(
     let mut module = lower_program(program, symbols);
 
     if opt_sroa {
+        let mut layout_pass = CacheLayoutPass::new();
+        layout_pass.run_on_module(&mut module);
+
         let mut sroa_pass = SroaPass::new();
         sroa_pass.run_on_module(&mut module);
 

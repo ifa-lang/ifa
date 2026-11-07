@@ -369,4 +369,31 @@ mod tests {
             res.diagnostics
         );
     }
+
+    #[test]
+    fn test_inter_thread_arena_escape_rejected() {
+        let code = r#"
+            fn worker(x: u32) {
+            }
+
+            pub fn main() {
+                let arena_buffer: u32 = 42;
+                spawn worker(arena_buffer);
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(
+            res.has_errors(),
+            "Expected arena escape into spawn rejection"
+        );
+        let has_arena_err = res
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0026"));
+        assert!(
+            has_arena_err,
+            "Expected E0026 diagnostic code, got: {:?}",
+            res.diagnostics
+        );
+    }
 }

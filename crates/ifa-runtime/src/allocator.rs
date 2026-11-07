@@ -155,6 +155,7 @@ impl SizeClassPool {
 /// Generational memory arena managing scoped lifetime allocations.
 pub struct GenArena {
     pub id: u16,
+    pub owner_fiber_id: u64,
     allocated_ptrs: Vec<*mut u8>,
 }
 
@@ -165,8 +166,28 @@ impl GenArena {
     pub fn new(id: u16) -> Self {
         Self {
             id,
+            owner_fiber_id: 0,
             allocated_ptrs: Vec::new(),
         }
+    }
+
+    /// Create an arena strictly bound to a designated fiber.
+    pub fn with_owner(id: u16, owner_fiber_id: u64) -> Self {
+        Self {
+            id,
+            owner_fiber_id,
+            allocated_ptrs: Vec::new(),
+        }
+    }
+
+    /// Set or transfer fiber ownership of the arena.
+    pub fn set_owner(&mut self, owner_fiber_id: u64) {
+        self.owner_fiber_id = owner_fiber_id;
+    }
+
+    /// Check if the calling fiber is the legitimate owner of the arena (0 denotes shared/global).
+    pub fn is_owner(&self, fiber_id: u64) -> bool {
+        self.owner_fiber_id == 0 || self.owner_fiber_id == fiber_id
     }
 
     /// Reset all objects allocated in this arena, invalidating all external references.
@@ -472,6 +493,32 @@ impl GlobalGenAllocator {
         let mut inner = self.inner.lock().unwrap();
         inner.arenas.insert(id, GenArena::new(id));
         id
+    }
+
+    /// Create a scoped arena strictly isolated and owned by a specific fiber.
+    pub fn create_arena_for_fiber(&self, fiber_id: u64) -> u16 {
+        let id = self.next_arena_id.fetch_add(1, Ordering::SeqCst);
+        let mut inner = self.inner.lock().unwrap();
+        inner.arenas.insert(id, GenArena::with_owner(id, fiber_id));
+        id
+    }
+
+    /// Bind or transfer ownership of an existing arena to a target fiber.
+    pub fn set_arena_owner(&self, arena_id: u16, fiber_id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(arena) = inner.arenas.get_mut(&arena_id) {
+            arena.set_owner(fiber_id);
+        }
+    }
+
+    /// Verify whether a fiber is authorized to allocate or reset the specified arena.
+    pub fn verify_arena_owner(&self, arena_id: u16, fiber_id: u64) -> bool {
+        let inner = self.inner.lock().unwrap();
+        if let Some(arena) = inner.arenas.get(&arena_id) {
+            arena.is_owner(fiber_id)
+        } else {
+            false
+        }
     }
 
     /// Reset an arena by invalidating all contained allocations.

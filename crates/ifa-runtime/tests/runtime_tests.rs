@@ -756,3 +756,31 @@ fn test_blocking_pool_c_abi_spawn_and_completion_cb() {
 
     assert_eq!(completion_slot.load(Ordering::Acquire), 60);
 }
+
+#[test]
+fn test_fiber_arena_isolation_and_ownership() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let verified = Arc::new(AtomicBool::new(false));
+    let v_clone = Arc::clone(&verified);
+
+    let (fid, arena_id) = GLOBAL_SCHEDULER.spawn_with_arena(move || {
+        let cur_fid = ifa_rt_fiber_current_id();
+        let cur_arena = ifa_rt_fiber_current_arena();
+        assert!(cur_fid > 0);
+        assert!(cur_arena > 0);
+
+        let is_owner = ifa_rt_arena_verify_owner(cur_arena, cur_fid);
+        assert!(is_owner);
+
+        let wrong_owner = ifa_rt_arena_verify_owner(cur_arena, cur_fid + 999);
+        assert!(!wrong_owner);
+
+        v_clone.store(true, Ordering::SeqCst);
+    });
+
+    GLOBAL_SCHEDULER.join(fid);
+    assert!(verified.load(Ordering::SeqCst));
+    assert!(arena_id > 0);
+}

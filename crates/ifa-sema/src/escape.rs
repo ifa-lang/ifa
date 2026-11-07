@@ -67,6 +67,33 @@ pub fn format_projection_expr(expr: &Expr) -> String {
 pub enum AllocKind {
     Stack,
     HeapGenerational,
+    ArenaScoped,
+}
+
+/// Determines if an expression allocates or evaluates to an arena-scoped object.
+pub fn is_arena_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Ident(sym) => {
+            let name = INTERNER.resolve(sym);
+            name.starts_with("arena") || name.contains("Arena")
+        }
+        ExprKind::Call { callee, .. } => match &callee.kind {
+            ExprKind::Ident(sym) => {
+                let name = INTERNER.resolve(sym);
+                name.contains("arena") || name.contains("Arena")
+            }
+            ExprKind::FieldAccess { field, .. } => {
+                let name = INTERNER.resolve(field);
+                name.contains("arena") || name.contains("Arena")
+            }
+            _ => false,
+        },
+        ExprKind::MethodCall { method, .. } => {
+            let name = INTERNER.resolve(method);
+            name.contains("arena") || name.contains("Arena")
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,8 +346,15 @@ impl<'a> EscapeAnalyzer<'a> {
                 ..
             } => {
                 let bound = pattern.bound_variables();
+                let is_arena = init.as_ref().is_some_and(is_arena_expr);
                 for (sym, p_span) in &bound {
                     self.record_local_var(*sym, *p_span);
+                    let sym_str = INTERNER.resolve(sym);
+                    if is_arena || sym_str.to_lowercase().contains("arena") {
+                        if let Some(info) = self.var_info.get_mut(sym) {
+                            info.alloc_kind = AllocKind::ArenaScoped;
+                        }
+                    }
                 }
                 self.check_pattern_ref_bindings(pattern, init.as_ref(), *span);
                 if let Some(expr) = init {
@@ -396,6 +430,14 @@ impl<'a> EscapeAnalyzer<'a> {
 
                 self.check_expr(target);
                 self.check_expr(val);
+
+                if is_arena_expr(val) {
+                    if let Some((root_sym, _)) = extract_escape_root(target) {
+                        if let Some(info) = self.var_info.get_mut(&root_sym) {
+                            info.alloc_kind = AllocKind::ArenaScoped;
+                        }
+                    }
+                }
 
                 // Track reference assignment to variables or container fields
                 let target_root = extract_escape_root(target).map(|(s, _)| s);
@@ -534,13 +576,52 @@ impl<'a> EscapeAnalyzer<'a> {
                 op: UnaryOp::Ref,
                 expr: inner,
             } => {
+                if self.spawn_depth > 0 {
+                    if let Some((root_sym, root_span)) = extract_escape_root(inner) {
+                        if let Some(info) = self.var_info.get(&root_sym) {
+                            if info.alloc_kind == AllocKind::ArenaScoped {
+                                let var_name = INTERNER.resolve(&root_sym);
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "évasion d'arène interdite : emprunt générationnel 'ref' sur la variable d'arène '{}' interdit au sein d'une fibre 'spawn'",
+                                        var_name
+                                    ))
+                                    .with_code("E0026")
+                                    .with_primary_label(expr.span, format!("emprunt 'ref' sur l'arène '{}' dans spawn", var_name))
+                                    .with_secondary_label(root_span, format!("'{}' appartient à l'arène privée du thread parent", var_name))
+                                    .with_note("Les arènes mémoire pré-allouées sont strictement isolées par fibre/thread dans l'ordonnanceur M:N.")
+                                    .with_help("Utilisez un canal 'Channel', un type atomique ou transférez la variable avec 'sink'."),
+                                );
+                            }
+                        }
+                    }
+                }
                 self.handle_ref_creation(inner, expr.span);
             }
             ExprKind::Call { callee, args } => {
                 self.check_expr(callee);
                 for arg in args {
-                    // Check for invalid inout passing into concurrent spawn
+                    // Check for invalid inout passing or arena escape into concurrent spawn
                     if self.spawn_depth > 0 {
+                        if let Some((root_sym, root_span)) = extract_escape_root(&arg.value) {
+                            if let Some(info) = self.var_info.get(&root_sym) {
+                                if info.alloc_kind == AllocKind::ArenaScoped {
+                                    let var_name = INTERNER.resolve(&root_sym);
+                                    self.diagnostics.push(
+                                        Diagnostic::error(format!(
+                                            "évasion d'arène interdite : la variable '{}' allouée dans une arène locale ne peut pas être transmise au sein d'une fibre 'spawn'",
+                                            var_name
+                                        ))
+                                        .with_code("E0026")
+                                        .with_primary_label(arg.value.span, format!("passage de la variable d'arène '{}' dans spawn", var_name))
+                                        .with_secondary_label(root_span, format!("'{}' est allouée dans l'arène locale du thread parent", var_name))
+                                        .with_note("Les arènes mémoire pré-allouées sont strictement isolées par fibre/thread dans l'ordonnanceur M:N pour garantir la localité de cache et l'absence de contention.")
+                                        .with_help("Allouez sur le tas global, transférez la propriété avec 'sink' ou échangez des messages via un 'Channel'."),
+                                    );
+                                }
+                            }
+                        }
+
                         if let ExprKind::Unary {
                             op: UnaryOp::InOut,
                             expr: inner,
@@ -592,6 +673,25 @@ impl<'a> EscapeAnalyzer<'a> {
                 self.check_expr(receiver);
                 for arg in args {
                     if self.spawn_depth > 0 {
+                        if let Some((root_sym, root_span)) = extract_escape_root(&arg.value) {
+                            if let Some(info) = self.var_info.get(&root_sym) {
+                                if info.alloc_kind == AllocKind::ArenaScoped {
+                                    let var_name = INTERNER.resolve(&root_sym);
+                                    self.diagnostics.push(
+                                        Diagnostic::error(format!(
+                                            "évasion d'arène interdite : la variable '{}' allouée dans une arène locale ne peut pas être transmise au sein d'une fibre 'spawn'",
+                                            var_name
+                                        ))
+                                        .with_code("E0026")
+                                        .with_primary_label(arg.value.span, format!("passage de la variable d'arène '{}' dans spawn", var_name))
+                                        .with_secondary_label(root_span, format!("'{}' est allouée dans l'arène locale du thread parent", var_name))
+                                        .with_note("Les arènes mémoire pré-allouées sont strictement isolées par fibre/thread dans l'ordonnanceur M:N pour garantir la localité de cache et l'absence de contention.")
+                                        .with_help("Allouez sur le tas global, transférez la propriété avec 'sink' ou échangez des messages via un 'Channel'."),
+                                    );
+                                }
+                            }
+                        }
+
                         if let ExprKind::Unary {
                             op: UnaryOp::InOut,
                             expr: inner,
@@ -767,6 +867,24 @@ impl<'a> EscapeAnalyzer<'a> {
                         self.check_expr(chan);
                     }
                     self.check_expr(&arm.body);
+                }
+            }
+            ExprKind::Ident(sym) if self.spawn_depth > 0 => {
+                if let Some(info) = self.var_info.get(sym) {
+                    if info.alloc_kind == AllocKind::ArenaScoped {
+                        let var_name = INTERNER.resolve(sym);
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "évasion d'arène interdite : la variable '{}' allouée dans une arène locale ne peut pas être capturée au sein d'une fibre 'spawn'",
+                                var_name
+                            ))
+                            .with_code("E0026")
+                            .with_primary_label(expr.span, format!("capture interdite de la variable d'arène '{}' dans spawn", var_name))
+                            .with_secondary_label(info.defined_span, format!("'{}' est allouée dans l'arène locale du thread parent", var_name))
+                            .with_note("Les arènes mémoire pré-allouées sont strictement isolées par fibre/thread dans l'ordonnanceur M:N pour garantir la localité de cache et l'absence de contention.")
+                            .with_help("Allouez sur le tas global, transférez la propriété avec 'sink' ou échangez des messages via un 'Channel'."),
+                        );
+                    }
                 }
             }
             _ => {}
