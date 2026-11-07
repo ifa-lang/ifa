@@ -25,7 +25,8 @@ pub use fiber::{
     TrySendError, GLOBAL_SCHEDULER,
 };
 pub use header::{
-    GenHeader, GenRef, FLAG_ACTIVE, FLAG_ARENA_SCOPED, FLAG_FREE, FLAG_PINNED, FLAG_READONLY,
+    GenHeader, GenRef, FLAG_ACTIVE, FLAG_ARENA_SCOPED, FLAG_EPOCH_1, FLAG_FREE, FLAG_PINNED,
+    FLAG_QUARANTINED, FLAG_READONLY,
 };
 pub use reactor::{
     ifa_rt_async_close, ifa_rt_async_io_uring_supported, ifa_rt_async_iocp_supported,

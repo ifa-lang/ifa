@@ -2,7 +2,6 @@ use crate::symbol_table::SymbolTable;
 use ifa_ast::{Arg, Expr, ExprKind, ParamMode, UnaryOp};
 use ifa_diagnostics::Diagnostic;
 use ifa_span::{Span, Symbol, INTERNER};
-use std::collections::HashMap;
 
 /// Identifies the root variable of an lvalue expression.
 /// For example, `x.y.z` or `x[0]` has root variable `x`.
@@ -15,6 +14,95 @@ pub fn extract_root_variable(expr: &Expr) -> Option<(Symbol, Span)> {
             op: UnaryOp::InOut | UnaryOp::Sink,
             expr: inner,
         } => extract_root_variable(inner),
+        _ => None,
+    }
+}
+
+/// A segment in a structured memory access path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PathSegment {
+    Field(Symbol),
+    IndexConst(i64),
+    IndexUnknown,
+}
+
+/// A path-sensitive access descriptor representing variable or field projections (e.g. `node.lhs.rhs` or `p.a`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessPath {
+    pub root: Symbol,
+    pub segments: Vec<PathSegment>,
+    pub display: String,
+}
+
+impl AccessPath {
+    /// Determines whether two access paths overlap (alias).
+    /// If both paths refer to the same root, and their prefix of field/index segments match
+    /// without proven disjointness, they overlap.
+    pub fn overlaps(&self, other: &AccessPath) -> bool {
+        if self.root != other.root {
+            return false;
+        }
+        let min_len = self.segments.len().min(other.segments.len());
+        for i in 0..min_len {
+            match (&self.segments[i], &other.segments[i]) {
+                (PathSegment::Field(f1), PathSegment::Field(f2)) => {
+                    if f1 != f2 {
+                        return false; // distinct fields at the same depth are provably disjoint
+                    }
+                }
+                (PathSegment::IndexConst(c1), PathSegment::IndexConst(c2)) => {
+                    if c1 != c2 {
+                        return false; // distinct constant indices are provably disjoint
+                    }
+                }
+                _ => {
+                    // Unknown index or matching segment -> potentially overlapping
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Extracts a path-sensitive access descriptor from an lvalue expression.
+pub fn extract_access_path(expr: &Expr) -> Option<AccessPath> {
+    match &expr.kind {
+        ExprKind::Ident(sym) => {
+            let name = INTERNER.resolve(sym).to_string();
+            Some(AccessPath {
+                root: *sym,
+                segments: Vec::new(),
+                display: name,
+            })
+        }
+        ExprKind::FieldAccess { receiver, field, .. } => {
+            let mut parent = extract_access_path(receiver)?;
+            let field_name = INTERNER.resolve(field);
+            parent.display.push('.');
+            parent.display.push_str(&field_name);
+            parent.segments.push(PathSegment::Field(*field));
+            Some(parent)
+        }
+        ExprKind::Index { receiver, index } => {
+            let mut parent = extract_access_path(receiver)?;
+            match &index.kind {
+                ExprKind::Lit(ifa_ast::Lit::Int(sym)) => {
+                    let s = INTERNER.resolve(sym);
+                    parent.display.push_str(&format!("[{}]", s));
+                    let val: i64 = s.parse().unwrap_or(0);
+                    parent.segments.push(PathSegment::IndexConst(val));
+                }
+                _ => {
+                    parent.display.push_str("[*]");
+                    parent.segments.push(PathSegment::IndexUnknown);
+                }
+            }
+            Some(parent)
+        }
+        ExprKind::Unary {
+            op: UnaryOp::InOut | UnaryOp::Sink,
+            expr: inner,
+        } => extract_access_path(inner),
         _ => None,
     }
 }
@@ -42,7 +130,7 @@ pub enum BorrowKind {
 
 #[derive(Debug, Clone)]
 pub struct BorrowRecord {
-    pub var: Symbol,
+    pub path: AccessPath,
     pub kind: BorrowKind,
     pub span: Span,
 }
@@ -50,15 +138,15 @@ pub struct BorrowRecord {
 /// Verifies the Law of Exclusivity across arguments of a function or method call.
 /// In IFA: "une même variable racine ne peut jamais être passée deux fois en inout
 /// (ou en inout et in simultanément) dans le même appel de fonction."
-/// De même, le transfert 'sink' exige l'exclusivité totale et ne peut coexister avec
-/// aucun autre passage de la même variable racine dans le même appel.
+/// Path-sensitive analysis permits concurrent inout borrows on provably disjoint fields
+/// (e.g. `p.a` and `p.b`), while statically rejecting overlapping paths (e.g. `node.lhs` and `node.lhs.rhs`).
 pub fn check_call_exclusivity(
     args: &[Arg],
     param_modes: &[ParamMode],
     symbols: &SymbolTable,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let mut borrows: HashMap<Symbol, BorrowRecord> = HashMap::new();
+    let mut borrows: Vec<BorrowRecord> = Vec::new();
 
     for (idx, arg) in args.iter().enumerate() {
         let is_explicit_inout = matches!(
@@ -80,7 +168,8 @@ pub fn check_call_exclusivity(
         let is_sink = is_explicit_sink || param_mode == ParamMode::Sink;
         let is_inout = is_explicit_inout || param_mode == ParamMode::InOut;
 
-        if let Some((root_sym, _root_span)) = extract_root_variable(&arg.value) {
+        if let Some(path) = extract_access_path(&arg.value) {
+            let root_sym = path.root;
             let var_name = INTERNER.resolve(&root_sym);
 
             if is_sink {
@@ -88,13 +177,13 @@ pub fn check_call_exclusivity(
                 let _ = symbols.lookup_variable(&root_sym);
 
                 // 2. Exclusivity check against previous borrows in this call
-                if let Some(existing) = borrows.get(&root_sym) {
+                if let Some(existing) = borrows.iter().find(|b| b.path.overlaps(&path)) {
                     match existing.kind {
                         BorrowKind::Sink => {
                             diagnostics.push(
                                 Diagnostic::error(format!(
                                     "loi d'exclusivité violée : la variable '{}' est transférée ('sink') plusieurs fois dans le même appel",
-                                    var_name
+                                    path.display
                                 ))
                                 .with_code("E0016")
                                 .with_primary_label(
@@ -117,7 +206,7 @@ pub fn check_call_exclusivity(
                             diagnostics.push(
                                 Diagnostic::error(format!(
                                     "loi d'exclusivité violée : la variable '{}' ne peut pas être simultanément transférée ('sink') et passée en '{}'",
-                                    var_name, other_mode
+                                    path.display, other_mode
                                 ))
                                 .with_code("E0017")
                                 .with_primary_label(
@@ -132,10 +221,9 @@ pub fn check_call_exclusivity(
                         }
                     }
                 } else {
-                    borrows.insert(
-                        root_sym,
+                    borrows.push(
                         BorrowRecord {
-                            var: root_sym,
+                            path,
                             kind: BorrowKind::Sink,
                             span: arg.value.span,
                         },
@@ -168,13 +256,13 @@ pub fn check_call_exclusivity(
                 }
 
                 // 2. Exclusivity check against previous borrows in this call
-                if let Some(existing) = borrows.get(&root_sym) {
+                if let Some(existing) = borrows.iter().find(|b| b.path.overlaps(&path)) {
                     match existing.kind {
                         BorrowKind::Sink => {
                             diagnostics.push(
                                 Diagnostic::error(format!(
                                     "loi d'exclusivité violée : la variable '{}' ne peut pas être mutée ('inout') car elle est déjà transférée ('sink')",
-                                    var_name
+                                    path.display
                                 ))
                                 .with_code("E0017")
                                 .with_primary_label(
@@ -188,11 +276,19 @@ pub fn check_call_exclusivity(
                             );
                         }
                         BorrowKind::InOut => {
-                            diagnostics.push(
-                                Diagnostic::error(format!(
+                            let msg = if path.display == existing.path.display {
+                                format!(
                                     "loi d'exclusivité violée : la variable '{}' est empruntée plusieurs fois en 'inout' dans le même appel",
-                                    var_name
-                                ))
+                                    path.display
+                                )
+                            } else {
+                                format!(
+                                    "loi d'exclusivité violée : l'emprunt 'inout' sur '{}' chevauche l'emprunt 'inout' sur '{}'",
+                                    path.display, existing.path.display
+                                )
+                            };
+                            diagnostics.push(
+                                Diagnostic::error(msg)
                                 .with_code("E0011")
                                 .with_primary_label(
                                     arg.value.span,
@@ -209,7 +305,7 @@ pub fn check_call_exclusivity(
                             diagnostics.push(
                                 Diagnostic::error(format!(
                                     "loi d'exclusivité violée : la variable '{}' ne peut pas être passée simultanément en lecture ('in') et en écriture ('inout')",
-                                    var_name
+                                    path.display
                                 ))
                                 .with_code("E0012")
                                 .with_primary_label(
@@ -224,10 +320,9 @@ pub fn check_call_exclusivity(
                         }
                     }
                 } else {
-                    borrows.insert(
-                        root_sym,
+                    borrows.push(
                         BorrowRecord {
-                            var: root_sym,
+                            path,
                             kind: BorrowKind::InOut,
                             span: arg.value.span,
                         },
@@ -235,13 +330,13 @@ pub fn check_call_exclusivity(
                 }
             } else {
                 // Read-only borrow ('in')
-                if let Some(existing) = borrows.get(&root_sym) {
+                if let Some(existing) = borrows.iter().find(|b| b.path.overlaps(&path) && b.kind != BorrowKind::In) {
                     match existing.kind {
                         BorrowKind::Sink => {
                             diagnostics.push(
                                 Diagnostic::error(format!(
                                     "loi d'exclusivité violée : la variable '{}' ne peut pas être passée en lecture ('in') lorsqu'elle est déjà transférée ('sink')",
-                                    var_name
+                                    path.display
                                 ))
                                 .with_code("E0017")
                                 .with_primary_label(
@@ -258,7 +353,7 @@ pub fn check_call_exclusivity(
                             diagnostics.push(
                                 Diagnostic::error(format!(
                                     "loi d'exclusivité violée : la variable '{}' ne peut pas être passée en lecture ('in') lorsqu'elle est déjà empruntée en 'inout'",
-                                    var_name
+                                    path.display
                                 ))
                                 .with_code("E0012")
                                 .with_primary_label(
@@ -274,10 +369,9 @@ pub fn check_call_exclusivity(
                         BorrowKind::In => {}
                     }
                 } else {
-                    borrows.insert(
-                        root_sym,
+                    borrows.push(
                         BorrowRecord {
-                            var: root_sym,
+                            path,
                             kind: BorrowKind::In,
                             span: arg.value.span,
                         },

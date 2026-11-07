@@ -144,6 +144,55 @@ mod tests {
     }
 
     #[test]
+    fn test_exclusivity_disjoint_fields_allowed() {
+        let code = r#"
+            struct Pair {
+                a: u32,
+                b: u32,
+            }
+
+            fn swap(inout x: u32, inout y: u32) {
+                let tmp = x;
+                x = y;
+                y = tmp;
+            }
+
+            pub fn main() {
+                mut p = Pair { a: 1, b: 2 };
+                swap(inout p.a, inout p.b);
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(!res.has_errors(), "Expected disjoint inout fields to succeed: {:?}", res.diagnostics);
+    }
+
+    #[test]
+    fn test_exclusivity_path_overlap_rejected() {
+        let code = r#"
+            struct SubNode {
+                rhs: u32,
+            }
+            struct Node {
+                lhs: SubNode,
+            }
+            fn swap(inout a: SubNode, inout b: u32) {
+                b = a.rhs;
+            }
+            pub fn main() {
+                mut node = Node { lhs: SubNode { rhs: 42 } };
+                swap(inout node.lhs, inout node.lhs.rhs);
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(res.has_errors(), "Expected path overlap violation error");
+        let has_overlap_err = res
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0011"));
+        assert!(has_overlap_err, "Expected E0011 diagnostic code for overlapping path");
+    }
+
+    #[test]
     fn test_exclusivity_in_and_inout_rejected() {
         let code = r#"
             fn inspect_and_modify(val: u32, inout target: u32) {

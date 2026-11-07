@@ -97,8 +97,8 @@ pub fn fir_type_byte_size(ty: &FirType) -> usize {
         | FirType::Pointer(_)
         | FirType::GenerationalRef(_)
         | FirType::Channel(_)
-        | FirType::Slice(_)
         | FirType::Function { .. } => 8,
+        FirType::Slice(_) => 16,
         FirType::Range { elem, .. } => fir_type_byte_size(elem) * 2 + 8,
         FirType::Array(elem_ty, len) => fir_type_byte_size(elem_ty) * (*len as usize),
         FirType::Struct(_, fields) => fields

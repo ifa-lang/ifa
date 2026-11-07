@@ -10,6 +10,8 @@ pub const FLAG_ACTIVE: u16 = 0x0001;
 pub const FLAG_PINNED: u16 = 0x0002;
 pub const FLAG_READONLY: u16 = 0x0004;
 pub const FLAG_ARENA_SCOPED: u16 = 0x0008;
+pub const FLAG_QUARANTINED: u16 = 0x0010;
+pub const FLAG_EPOCH_1: u16 = 0x0020;
 
 /// Bitshift and mask for encoding size-class ID within allocation flags.
 pub const FLAG_CLASS_SHIFT: u16 = 8;
@@ -50,6 +52,12 @@ impl GenHeader {
         (self.allocation_flags & FLAG_ARENA_SCOPED) != 0
     }
 
+    /// Check if the slot is quarantined due to 32-bit generation overflow.
+    #[inline(always)]
+    pub const fn is_quarantined(&self) -> bool {
+        (self.allocation_flags & FLAG_QUARANTINED) != 0
+    }
+
     /// Retrieve the encoded size-class ID (1-based, 0 if unclassified/large).
     #[inline(always)]
     pub const fn size_class_id(&self) -> usize {
@@ -64,10 +72,24 @@ impl GenHeader {
     }
 
     /// Mark slot as freed and increment generation counter safely.
+    /// In case of 32-bit counter overflow (reaching u32::MAX), transitions epoch
+    /// or quarantines the slot permanently to eliminate ABA / Use-After-Free wrap-around.
     #[inline(always)]
     pub fn mark_freed(&mut self) {
         self.allocation_flags &= !FLAG_ACTIVE;
-        self.generation_counter = self.generation_counter.wrapping_add(1);
+        if self.generation_counter == u32::MAX {
+            if (self.allocation_flags & FLAG_EPOCH_1) == 0 {
+                // First 4-billion cycle overflow: toggle epoch bit and restart generation at 1
+                self.allocation_flags |= FLAG_EPOCH_1;
+                self.generation_counter = 1;
+            } else {
+                // Secondary overflow: permanently quarantine slot from pool
+                self.allocation_flags |= FLAG_QUARANTINED;
+                self.generation_counter = 0;
+            }
+        } else {
+            self.generation_counter += 1;
+        }
     }
 }
 
@@ -139,7 +161,7 @@ impl GenRef {
         }
         unsafe {
             let header = self.header();
-            header.is_active() && header.generation_counter == self.remembered_gen
+            header.is_active() && !header.is_quarantined() && header.generation_counter == self.remembered_gen
         }
     }
 }

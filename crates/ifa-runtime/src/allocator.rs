@@ -282,6 +282,11 @@ impl GlobalGenAllocatorInner {
 
     /// Internal recycling after header invalidation.
     pub(crate) unsafe fn recycle_raw(&mut self, ptr: *mut u8, header: *mut GenHeader) {
+        if (*header).is_quarantined() {
+            // Permanently quarantined due to 32-bit generation overflow; do not return to pool
+            return;
+        }
+
         // Locate size class or large allocation
         let addr = ptr as usize;
         if let Some((layout, _)) = self.large_allocations.remove(&addr) {
@@ -425,6 +430,11 @@ impl GlobalGenAllocator {
 
             // Invalidate slot generation
             (*header).mark_freed();
+
+            if (*header).is_quarantined() {
+                // Permanently quarantined due to 32-bit generation overflow; do not re-add to cache
+                return;
+            }
 
             // Fast-path thread-local recycling for standard slab classes
             if !is_arena && class_code >= 1 && class_code <= SIZE_CLASSES.len() {

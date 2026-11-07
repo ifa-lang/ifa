@@ -31,7 +31,7 @@ pub extern "C" fn ifa_rt_gen_check(ptr: *const u8, remembered_gen: u32) {
     }
     unsafe {
         let header = &*(ptr.sub(std::mem::size_of::<GenHeader>()) as *const GenHeader);
-        if !header.is_active() || header.generation_counter != remembered_gen {
+        if !header.is_active() || header.is_quarantined() || header.generation_counter != remembered_gen {
             ifa_rt_panic_uaf(ptr, remembered_gen, header.generation_counter);
         }
     }

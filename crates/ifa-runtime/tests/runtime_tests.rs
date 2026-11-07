@@ -602,3 +602,24 @@ fn test_dynamic_list_ffi_operations() {
 
     ifa_rt_list_free(list, elem_size);
 }
+
+#[test]
+fn test_generational_counter_overflow_and_quarantine() {
+    let mut header = GenHeader::new_active(u32::MAX, 0);
+    assert!(header.is_active());
+    assert_eq!(header.generation_counter, u32::MAX);
+
+    // Free with generation at MAX: toggles epoch 1 and resets generation safely to 1
+    header.mark_freed();
+    assert!(!header.is_active());
+    assert_eq!(header.generation_counter, 1);
+    assert!((header.allocation_flags & FLAG_EPOCH_1) != 0);
+    assert!(!header.is_quarantined());
+
+    // Second time at MAX with epoch 1 already set: slot is quarantined permanently
+    header.allocation_flags |= FLAG_ACTIVE;
+    header.generation_counter = u32::MAX;
+    header.mark_freed();
+    assert!(!header.is_active());
+    assert!(header.is_quarantined());
+}
