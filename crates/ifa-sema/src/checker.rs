@@ -70,7 +70,12 @@ impl<'a> SemanticAnalyzer<'a> {
 
         let mut fields = Vec::new();
         for f in &st.fields {
-            let ty = match Type::from_ast(&f.ty, &known_structs, &known_enums) {
+            let ty = match Type::from_ast_with_generics(
+                &f.ty,
+                &known_structs,
+                &known_enums,
+                &st.generics,
+            ) {
                 Ok(t) => t,
                 Err(d) => {
                     self.diagnostics.push(d);
@@ -85,7 +90,8 @@ impl<'a> SemanticAnalyzer<'a> {
             });
         }
 
-        let struct_sym = StructSymbol::new(st.name, st.is_pub, fields, st.span);
+        let struct_sym =
+            StructSymbol::new(st.name, st.is_pub, st.generics.clone(), fields, st.span);
         if let Err(diag) = self.symbols.define_struct(struct_sym) {
             self.diagnostics.push(diag);
         }
@@ -734,149 +740,35 @@ impl<'a> SemanticAnalyzer<'a> {
             } => self.check_method_call_expr(receiver, *method, args, expr.span),
             ExprKind::FieldAccess { receiver, field } => {
                 let rec_ty = self.infer_expr(receiver);
-                match &rec_ty {
-                    Type::Struct { name, fields } => {
-                        let actual_fields: Vec<(Symbol, Type)> = if fields.is_empty() {
-                            if let Some(st_def) = self.symbols.lookup_struct(name) {
-                                st_def
-                                    .fields
-                                    .iter()
-                                    .map(|f| (f.name, f.ty.clone()))
-                                    .collect()
-                            } else {
-                                fields.clone()
-                            }
-                        } else {
-                            fields.clone()
-                        };
-
-                        if let Some((_, fty)) = actual_fields.iter().find(|(n, _)| n == field) {
-                            fty.clone()
-                        } else {
-                            let f_name = INTERNER.resolve(field);
-                            let s_name = INTERNER.resolve(name);
-                            self.diagnostics.push(
-                                Diagnostic::error(format!(
-                                    "champ '{}' introuvable sur la structure '{}'",
-                                    f_name, s_name
-                                ))
-                                .with_code("E0007")
-                                .with_primary_label(
-                                    expr.span,
-                                    format!("champ '{}' inconnu", f_name),
-                                ),
-                            );
-                            Type::Unknown
-                        }
-                    }
-                    Type::Ref(inner) => {
-                        let actual_struct = match inner.as_ref() {
-                            Type::Struct { name, fields } => Some((*name, fields.clone())),
-                            Type::Optional(opt_inner) => match opt_inner.as_ref() {
-                                Type::Struct { name, fields } => Some((*name, fields.clone())),
-                                _ => None,
-                            },
-                            _ => None,
-                        };
-                        if let Some((name, fields)) = actual_struct {
-                            let actual_fields: Vec<(Symbol, Type)> = if fields.is_empty() {
-                                if let Some(st_def) = self.symbols.lookup_struct(&name) {
-                                    st_def
-                                        .fields
-                                        .iter()
-                                        .map(|f| (f.name, f.ty.clone()))
-                                        .collect()
-                                } else {
-                                    fields
-                                }
-                            } else {
-                                fields
-                            };
-
-                            if let Some((_, fty)) = actual_fields.iter().find(|(n, _)| n == field) {
-                                fty.clone()
-                            } else {
-                                let f_name = INTERNER.resolve(field);
-                                let s_name = INTERNER.resolve(&name);
-                                self.diagnostics.push(
-                                    Diagnostic::error(format!(
-                                        "champ '{}' introuvable sur la référence ref {}",
-                                        f_name, s_name
-                                    ))
-                                    .with_code("E0007")
-                                    .with_primary_label(
-                                        expr.span,
-                                        format!("champ '{}' inconnu", f_name),
-                                    ),
-                                );
-                                Type::Unknown
-                            }
-                        } else {
-                            Type::Unknown
-                        }
-                    }
-                    Type::Optional(inner) => {
-                        let actual_struct = match inner.as_ref() {
-                            Type::Struct { name, fields } => Some((*name, fields.clone())),
-                            Type::Ref(ref_inner) => match ref_inner.as_ref() {
-                                Type::Struct { name, fields } => Some((*name, fields.clone())),
-                                _ => None,
-                            },
-                            _ => None,
-                        };
-                        if let Some((name, fields)) = actual_struct {
-                            let actual_fields: Vec<(Symbol, Type)> = if fields.is_empty() {
-                                if let Some(st_def) = self.symbols.lookup_struct(&name) {
-                                    st_def
-                                        .fields
-                                        .iter()
-                                        .map(|f| (f.name, f.ty.clone()))
-                                        .collect()
-                                } else {
-                                    fields
-                                }
-                            } else {
-                                fields
-                            };
-
-                            if let Some((_, fty)) = actual_fields.iter().find(|(n, _)| n == field) {
-                                fty.clone()
-                            } else {
-                                let f_name = INTERNER.resolve(field);
-                                let s_name = INTERNER.resolve(&name);
-                                self.diagnostics.push(
-                                    Diagnostic::error(format!(
-                                        "champ '{}' introuvable sur l'optionnel {}",
-                                        f_name, s_name
-                                    ))
-                                    .with_code("E0007")
-                                    .with_primary_label(
-                                        expr.span,
-                                        format!("champ '{}' inconnu", f_name),
-                                    ),
-                                );
-                                Type::Unknown
-                            }
-                        } else {
-                            Type::Unknown
-                        }
-                    }
-                    Type::Unknown => Type::Unknown,
-                    _ => {
+                if let Some((name, fields)) = self.resolve_struct_fields(&rec_ty) {
+                    if let Some((_, fty)) = fields.iter().find(|(n, _)| n == field) {
+                        fty.clone()
+                    } else {
                         let f_name = INTERNER.resolve(field);
+                        let s_name = INTERNER.resolve(&name);
                         self.diagnostics.push(
                             Diagnostic::error(format!(
-                                "accès au champ '{}' impossible sur le type non composite '{}'",
-                                f_name, rec_ty
+                                "champ '{}' introuvable sur la structure '{}'",
+                                f_name, s_name
                             ))
                             .with_code("E0007")
-                            .with_primary_label(
-                                receiver.span,
-                                format!("type {} non struct", rec_ty),
-                            ),
+                            .with_primary_label(expr.span, format!("champ '{}' inconnu", f_name)),
                         );
                         Type::Unknown
                     }
+                } else if matches!(rec_ty, Type::Unknown) {
+                    Type::Unknown
+                } else {
+                    let f_name = INTERNER.resolve(field);
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "accès au champ '{}' impossible sur le type non composite '{}'",
+                            f_name, rec_ty
+                        ))
+                        .with_code("E0007")
+                        .with_primary_label(receiver.span, format!("type {} non struct", rec_ty)),
+                    );
+                    Type::Unknown
                 }
             }
             ExprKind::Index { receiver, index } => {
@@ -1056,35 +948,81 @@ impl<'a> SemanticAnalyzer<'a> {
                 if let Some(struct_name) = name.last() {
                     let s_name_str = INTERNER.resolve(struct_name);
                     if let Some(st) = self.symbols.lookup_struct(struct_name).cloned() {
-                        for (f_sym, f_val) in fields {
-                            if let Some(f_def) = st.get_field(f_sym) {
-                                let actual = self.check_expr(f_val, Some(&f_def.ty));
-                                if !actual.is_assignable_to(&f_def.ty) {
+                        if !st.generics.is_empty() {
+                            let mut type_param_map: HashMap<Symbol, Type> = HashMap::new();
+                            for (f_sym, f_val) in fields {
+                                if let Some(f_def) = st.get_field(f_sym) {
+                                    let arg_ty = self.infer_expr(f_val);
+                                    f_def.ty.unify_type_params(&arg_ty, &mut type_param_map);
+                                }
+                            }
+                            for (f_sym, f_val) in fields {
+                                if let Some(f_def) = st.get_field(f_sym) {
+                                    let expected_ty = f_def.ty.substitute(&type_param_map);
+                                    let actual = self.check_expr(f_val, Some(&expected_ty));
+                                    if !actual.is_assignable_to(&expected_ty) {
+                                        let field_name = INTERNER.resolve(f_sym);
+                                        self.diagnostics.push(
+                                            Diagnostic::error(format!(
+                                                "type incompatible pour le champ '{}' de '{}' : attendu {}, trouvé {}",
+                                                field_name, s_name_str, expected_ty, actual
+                                            ))
+                                            .with_code("E0001")
+                                            .with_primary_label(f_val.span, format!("type {}", actual)),
+                                        );
+                                    }
+                                } else {
                                     let field_name = INTERNER.resolve(f_sym);
                                     self.diagnostics.push(
                                         Diagnostic::error(format!(
-                                            "type incompatible pour le champ '{}' de '{}' : attendu {}, trouvé {}",
-                                            field_name, s_name_str, f_def.ty, actual
+                                            "champ inconnu '{}' pour la structure '{}'",
+                                            field_name, s_name_str
                                         ))
-                                        .with_code("E0001")
-                                        .with_primary_label(f_val.span, format!("type {}", actual)),
+                                        .with_code("E0008")
+                                        .with_primary_label(f_val.span, "champ inexistant"),
                                     );
                                 }
-                            } else {
-                                let field_name = INTERNER.resolve(f_sym);
-                                self.diagnostics.push(
-                                    Diagnostic::error(format!(
-                                        "champ inconnu '{}' pour la structure '{}'",
-                                        field_name, s_name_str
-                                    ))
-                                    .with_code("E0008")
-                                    .with_primary_label(f_val.span, "champ inexistant"),
-                                );
                             }
-                        }
-                        Type::Struct {
-                            name: *struct_name,
-                            fields: st.fields.iter().map(|f| (f.name, f.ty.clone())).collect(),
+                            let concrete_args: Vec<Type> = st
+                                .generics
+                                .iter()
+                                .map(|g| type_param_map.get(g).cloned().unwrap_or(Type::Unknown))
+                                .collect();
+                            Type::Generic {
+                                name: *struct_name,
+                                args: concrete_args,
+                            }
+                        } else {
+                            for (f_sym, f_val) in fields {
+                                if let Some(f_def) = st.get_field(f_sym) {
+                                    let actual = self.check_expr(f_val, Some(&f_def.ty));
+                                    if !actual.is_assignable_to(&f_def.ty) {
+                                        let field_name = INTERNER.resolve(f_sym);
+                                        self.diagnostics.push(
+                                            Diagnostic::error(format!(
+                                                "type incompatible pour le champ '{}' de '{}' : attendu {}, trouvé {}",
+                                                field_name, s_name_str, f_def.ty, actual
+                                            ))
+                                            .with_code("E0001")
+                                            .with_primary_label(f_val.span, format!("type {}", actual)),
+                                        );
+                                    }
+                                } else {
+                                    let field_name = INTERNER.resolve(f_sym);
+                                    self.diagnostics.push(
+                                        Diagnostic::error(format!(
+                                            "champ inconnu '{}' pour la structure '{}'",
+                                            field_name, s_name_str
+                                        ))
+                                        .with_code("E0008")
+                                        .with_primary_label(f_val.span, "champ inexistant"),
+                                    );
+                                }
+                            }
+                            Type::Struct {
+                                name: *struct_name,
+                                fields: st.fields.iter().map(|f| (f.name, f.ty.clone())).collect(),
+                            }
                         }
                     } else {
                         Type::Unknown
@@ -1416,6 +1354,45 @@ impl<'a> SemanticAnalyzer<'a> {
         }
     }
 
+    fn resolve_struct_fields(&self, ty: &Type) -> Option<(Symbol, Vec<(Symbol, Type)>)> {
+        match ty {
+            Type::Struct { name, fields } => {
+                let actual_fields: Vec<(Symbol, Type)> = if fields.is_empty() {
+                    if let Some(st_def) = self.symbols.lookup_struct(name) {
+                        st_def
+                            .fields
+                            .iter()
+                            .map(|f| (f.name, f.ty.clone()))
+                            .collect()
+                    } else {
+                        fields.clone()
+                    }
+                } else {
+                    fields.clone()
+                };
+                Some((*name, actual_fields))
+            }
+            Type::Generic { name, args } => {
+                if let Some(st_def) = self.symbols.lookup_struct(name) {
+                    let mut mapping = HashMap::new();
+                    for (param, concrete) in st_def.generics.iter().zip(args.iter()) {
+                        mapping.insert(*param, concrete.clone());
+                    }
+                    let fields = st_def
+                        .fields
+                        .iter()
+                        .map(|f| (f.name, f.ty.substitute(&mapping)))
+                        .collect();
+                    Some((*name, fields))
+                } else {
+                    None
+                }
+            }
+            Type::Ref(inner) | Type::Optional(inner) => self.resolve_struct_fields(inner),
+            _ => None,
+        }
+    }
+
     fn check_struct_constructor_call(
         &mut self,
         st: &StructSymbol,
@@ -1424,33 +1401,83 @@ impl<'a> SemanticAnalyzer<'a> {
     ) -> Type {
         let s_name = INTERNER.resolve(&st.name);
 
-        for (idx, arg) in args.iter().enumerate() {
-            let field_info = if let Some(field_name) = arg.name {
-                st.get_field(&field_name)
-            } else {
-                st.fields.get(idx)
-            };
-
-            if let Some(f_def) = field_info {
-                let arg_ty = self.check_expr(&arg.value, Some(&f_def.ty));
-                if !arg_ty.is_assignable_to(&f_def.ty) {
-                    let f_name = INTERNER.resolve(&f_def.name);
-                    self.diagnostics.push(
-                        Diagnostic::error(format!(
-                            "type incompatible pour le champ '{}' de '{}' : attendu {}, trouvé {}",
-                            f_name, s_name, f_def.ty, arg_ty
-                        ))
-                        .with_code("E0001")
-                        .with_primary_label(arg.value.span, format!("valeur de type {}", arg_ty))
-                        .with_secondary_label(f_def.span, format!("champ déclaré {}", f_def.ty)),
-                    );
+        if !st.generics.is_empty() {
+            // Generic struct: perform bidirectional type parameter inference
+            let mut type_param_map: HashMap<Symbol, Type> = HashMap::new();
+            for (idx, arg) in args.iter().enumerate() {
+                let field_info = if let Some(field_name) = arg.name {
+                    st.get_field(&field_name)
+                } else {
+                    st.fields.get(idx)
+                };
+                if let Some(f_def) = field_info {
+                    let arg_ty = self.infer_expr(&arg.value);
+                    f_def.ty.unify_type_params(&arg_ty, &mut type_param_map);
                 }
             }
-        }
 
-        Type::Struct {
-            name: st.name,
-            fields: st.fields.iter().map(|f| (f.name, f.ty.clone())).collect(),
+            for (idx, arg) in args.iter().enumerate() {
+                let field_info = if let Some(field_name) = arg.name {
+                    st.get_field(&field_name)
+                } else {
+                    st.fields.get(idx)
+                };
+                if let Some(f_def) = field_info {
+                    let expected_ty = f_def.ty.substitute(&type_param_map);
+                    let actual = self.check_expr(&arg.value, Some(&expected_ty));
+                    if !actual.is_assignable_to(&expected_ty) {
+                        let f_name = INTERNER.resolve(&f_def.name);
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "type incompatible pour le champ '{}' de '{}' : attendu {}, trouvé {}",
+                                f_name, s_name, expected_ty, actual
+                            ))
+                            .with_code("E0001")
+                            .with_primary_label(arg.value.span, format!("valeur de type {}", actual))
+                            .with_secondary_label(f_def.span, format!("champ déclaré {}", expected_ty)),
+                        );
+                    }
+                }
+            }
+
+            let concrete_args: Vec<Type> = st
+                .generics
+                .iter()
+                .map(|g| type_param_map.get(g).cloned().unwrap_or(Type::Unknown))
+                .collect();
+            Type::Generic {
+                name: st.name,
+                args: concrete_args,
+            }
+        } else {
+            for (idx, arg) in args.iter().enumerate() {
+                let field_info = if let Some(field_name) = arg.name {
+                    st.get_field(&field_name)
+                } else {
+                    st.fields.get(idx)
+                };
+
+                if let Some(f_def) = field_info {
+                    let arg_ty = self.check_expr(&arg.value, Some(&f_def.ty));
+                    if !arg_ty.is_assignable_to(&f_def.ty) {
+                        let f_name = INTERNER.resolve(&f_def.name);
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "type incompatible pour le champ '{}' de '{}' : attendu {}, trouvé {}",
+                                f_name, s_name, f_def.ty, arg_ty
+                            ))
+                            .with_code("E0001")
+                            .with_primary_label(arg.value.span, format!("valeur de type {}", arg_ty))
+                            .with_secondary_label(f_def.span, format!("champ déclaré {}", f_def.ty)),
+                        );
+                    }
+                }
+            }
+
+            Type::Struct {
+                name: st.name,
+                fields: st.fields.iter().map(|f| (f.name, f.ty.clone())).collect(),
+            }
         }
     }
 

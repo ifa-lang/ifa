@@ -71,6 +71,7 @@ pub struct StructField {
 pub struct Struct {
     pub is_pub: bool,
     pub name: Symbol,
+    pub generics: Vec<Symbol>,
     pub fields: Vec<StructField>,
     pub span: Span,
 }

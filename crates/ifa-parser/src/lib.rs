@@ -313,6 +313,21 @@ impl Parser {
             }
         };
 
+        // Optional generics <T, U>
+        let mut generics = Vec::new();
+        if self.match_token(&TokenKind::Lt) {
+            while !self.check(&TokenKind::Gt) && !self.check(&TokenKind::Eof) {
+                if let TokenKind::Ident(g) = self.current().kind {
+                    self.advance();
+                    generics.push(g);
+                }
+                if !self.match_token(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::Gt)?;
+        }
+
         self.expect(TokenKind::OpenBrace)?;
         let mut fields = Vec::new();
         while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
@@ -348,6 +363,7 @@ impl Parser {
         Ok(Struct {
             is_pub,
             name,
+            generics,
             fields,
             span: Span::new(self.file_id, struct_tok.span.start, close.span.end),
         })

@@ -601,3 +601,72 @@ fn test_comptime_expression_inference() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_generic_struct_box_inference_and_field_access() {
+    let code = r#"
+        struct Box<T> {
+            val: T,
+        }
+
+        pub fn main() {
+            let b = Box(val: 42);
+            let extracted: i64 = b.val;
+            let str_box = Box(val: "hello");
+            let str_val: str = str_box.val;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Generic struct Box<T> inference should typecheck cleanly: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_generic_struct_multi_param_pair() {
+    let code = r#"
+        struct Pair<T, U> {
+            first: T,
+            second: U,
+        }
+
+        pub fn main() {
+            let p = Pair(first: 100, second: true);
+            let a: i64 = p.first;
+            let b: bool = p.second;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Generic struct Pair<T, U> should infer both parameters cleanly: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_generic_struct_with_generational_ref() {
+    let code = r#"
+        struct Box<T> {
+            val: T,
+        }
+
+        pub fn read_box(inout b: Box<i64>) -> i64 {
+            let r: ref Box<i64> = ref b;
+            return r.val;
+        }
+
+        pub fn main() {
+            mut my_box = Box(val: 99);
+            let res = read_box(inout my_box);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Generational ref to generic struct Box<T> should typecheck cleanly: {:?}",
+        res.diagnostics
+    );
+}

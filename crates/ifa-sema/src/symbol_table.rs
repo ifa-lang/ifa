@@ -48,13 +48,20 @@ pub struct FieldSymbol {
 pub struct StructSymbol {
     pub name: Symbol,
     pub is_pub: bool,
+    pub generics: Vec<Symbol>,
     pub fields: Vec<FieldSymbol>,
     pub field_indices: HashMap<Symbol, usize>,
     pub span: Span,
 }
 
 impl StructSymbol {
-    pub fn new(name: Symbol, is_pub: bool, fields: Vec<FieldSymbol>, span: Span) -> Self {
+    pub fn new(
+        name: Symbol,
+        is_pub: bool,
+        generics: Vec<Symbol>,
+        fields: Vec<FieldSymbol>,
+        span: Span,
+    ) -> Self {
         let mut field_indices = HashMap::new();
         for (idx, field) in fields.iter().enumerate() {
             field_indices.insert(field.name, idx);
@@ -62,6 +69,7 @@ impl StructSymbol {
         Self {
             name,
             is_pub,
+            generics,
             fields,
             field_indices,
             span,

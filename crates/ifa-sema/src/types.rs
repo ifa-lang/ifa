@@ -113,6 +113,8 @@ pub enum Type {
     FloatLiteral,
     /// Type for expressions that never return normally (return, fail, infinite loop)
     Never,
+    /// Generic type parameter placeholder (e.g. T in struct Box<T>)
+    TypeParam(Symbol),
     /// Unknown / error sentinel to avoid cascading errors
     Unknown,
 }
@@ -287,7 +289,7 @@ impl Type {
             }
         }
 
-        // Generic structs like List<T>
+        // Generic structs like List<T> or custom Box<T>
         if let (Type::Generic { name: n1, args: a1 }, Type::Generic { name: n2, args: a2 }) =
             (self, target)
         {
@@ -299,9 +301,26 @@ impl Type {
             }
         }
 
+        // Generic struct compatible with base Struct symbol and vice versa
+        if let (Type::Generic { name: n1, .. }, Type::Struct { name: n2, .. }) = (self, target) {
+            if n1 == n2 {
+                return true;
+            }
+        }
+        if let (Type::Struct { name: n1, .. }, Type::Generic { name: n2, .. }) = (self, target) {
+            if n1 == n2 {
+                return true;
+            }
+        }
+
         // Struct by name
         if let (Type::Struct { name: n1, .. }, Type::Struct { name: n2, .. }) = (self, target) {
             return n1 == n2;
+        }
+
+        // Generic type parameter equality
+        if let (Type::TypeParam(s1), Type::TypeParam(s2)) = (self, target) {
+            return s1 == s2;
         }
 
         // Enum by name
@@ -312,15 +331,103 @@ impl Type {
         false
     }
 
+    /// Substitutes generic type parameters according to the provided mapping.
+    pub fn substitute(&self, mapping: &HashMap<Symbol, Type>) -> Type {
+        match self {
+            Type::TypeParam(sym) => mapping.get(sym).cloned().unwrap_or_else(|| self.clone()),
+            Type::Ref(inner) => Type::Ref(Box::new(inner.substitute(mapping))),
+            Type::Optional(inner) => Type::Optional(Box::new(inner.substitute(mapping))),
+            Type::Slice(inner) => Type::Slice(Box::new(inner.substitute(mapping))),
+            Type::Array(inner, n) => Type::Array(Box::new(inner.substitute(mapping)), *n),
+            Type::ErrorUnion { err, ok } => Type::ErrorUnion {
+                err: Box::new(err.substitute(mapping)),
+                ok: Box::new(ok.substitute(mapping)),
+            },
+            Type::Tuple(elems) => {
+                Type::Tuple(elems.iter().map(|e| e.substitute(mapping)).collect())
+            }
+            Type::Generic { name, args } => Type::Generic {
+                name: *name,
+                args: args.iter().map(|a| a.substitute(mapping)).collect(),
+            },
+            Type::Struct { name, fields } => Type::Struct {
+                name: *name,
+                fields: fields
+                    .iter()
+                    .map(|(n, t)| (*n, t.substitute(mapping)))
+                    .collect(),
+            },
+            Type::Fn { params, ret } => Type::Fn {
+                params: params
+                    .iter()
+                    .map(|(m, t)| (*m, t.substitute(mapping)))
+                    .collect(),
+                ret: Box::new(ret.substitute(mapping)),
+            },
+            _ => self.clone(),
+        }
+    }
+
+    /// Unifies any generic type parameters in `self` against concrete types in `concrete`.
+    pub fn unify_type_params(&self, concrete: &Type, mapping: &mut HashMap<Symbol, Type>) {
+        match (self, concrete) {
+            (Type::TypeParam(sym), c) => {
+                mapping.entry(*sym).or_insert_with(|| c.resolve_defaults());
+            }
+            (Type::Ref(inner), Type::Ref(c_inner)) => {
+                inner.unify_type_params(c_inner, mapping);
+            }
+            (Type::Optional(inner), Type::Optional(c_inner)) => {
+                inner.unify_type_params(c_inner, mapping);
+            }
+            (Type::Optional(inner), c) => {
+                // T coercing to ?T
+                inner.unify_type_params(c, mapping);
+            }
+            (Type::Slice(inner), Type::Slice(c_inner)) => {
+                inner.unify_type_params(c_inner, mapping);
+            }
+            (Type::Array(inner, _), Type::Array(c_inner, _)) => {
+                inner.unify_type_params(c_inner, mapping);
+            }
+            (Type::Generic { name: n1, args: a1 }, Type::Generic { name: n2, args: a2 })
+                if n1 == n2 =>
+            {
+                for (a, c) in a1.iter().zip(a2.iter()) {
+                    a.unify_type_params(c, mapping);
+                }
+            }
+            (Type::Tuple(elems1), Type::Tuple(elems2)) => {
+                for (e1, e2) in elems1.iter().zip(elems2.iter()) {
+                    e1.unify_type_params(e2, mapping);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Resolves an AST Type into a semantic Type using known declarations.
     pub fn from_ast(
         ast_ty: &AstType,
         known_structs: &HashMap<Symbol, Type>,
         known_enums: &HashMap<Symbol, Type>,
     ) -> Result<Type, Diagnostic> {
+        Self::from_ast_with_generics(ast_ty, known_structs, known_enums, &[])
+    }
+
+    /// Resolves an AST Type into a semantic Type with awareness of in-scope generic parameters.
+    pub fn from_ast_with_generics(
+        ast_ty: &AstType,
+        known_structs: &HashMap<Symbol, Type>,
+        known_enums: &HashMap<Symbol, Type>,
+        generics: &[Symbol],
+    ) -> Result<Type, Diagnostic> {
         match &ast_ty.kind {
             AstTypeKind::Unit => Ok(Type::Unit),
             AstTypeKind::Named(sym) => {
+                if generics.contains(sym) {
+                    return Ok(Type::TypeParam(*sym));
+                }
                 let name = INTERNER.resolve(sym);
                 match name.as_str() {
                     "bool" => Ok(Type::Bool),
@@ -373,7 +480,7 @@ impl Type {
             AstTypeKind::Generic(sym, args) => {
                 let resolved_args: Result<Vec<Type>, Diagnostic> = args
                     .iter()
-                    .map(|a| Type::from_ast(a, known_structs, known_enums))
+                    .map(|a| Type::from_ast_with_generics(a, known_structs, known_enums, generics))
                     .collect();
                 let args = resolved_args?;
                 let name = INTERNER.resolve(sym);
@@ -384,24 +491,29 @@ impl Type {
                 }
             }
             AstTypeKind::Ref(inner) => {
-                let resolved = Type::from_ast(inner, known_structs, known_enums)?;
+                let resolved =
+                    Type::from_ast_with_generics(inner, known_structs, known_enums, generics)?;
                 Ok(Type::Ref(Box::new(resolved)))
             }
             AstTypeKind::Optional(inner) => {
-                let resolved = Type::from_ast(inner, known_structs, known_enums)?;
+                let resolved =
+                    Type::from_ast_with_generics(inner, known_structs, known_enums, generics)?;
                 Ok(Type::Optional(Box::new(resolved)))
             }
             AstTypeKind::Slice(inner) => {
-                let resolved = Type::from_ast(inner, known_structs, known_enums)?;
+                let resolved =
+                    Type::from_ast_with_generics(inner, known_structs, known_enums, generics)?;
                 Ok(Type::Slice(Box::new(resolved)))
             }
             AstTypeKind::Array(inner, size) => {
-                let resolved = Type::from_ast(inner, known_structs, known_enums)?;
+                let resolved =
+                    Type::from_ast_with_generics(inner, known_structs, known_enums, generics)?;
                 Ok(Type::Array(Box::new(resolved), *size))
             }
             AstTypeKind::ErrorUnion(err_ty, ok_ty) => {
-                let err = Type::from_ast(err_ty, known_structs, known_enums)?;
-                let ok = Type::from_ast(ok_ty, known_structs, known_enums)?;
+                let err =
+                    Type::from_ast_with_generics(err_ty, known_structs, known_enums, generics)?;
+                let ok = Type::from_ast_with_generics(ok_ty, known_structs, known_enums, generics)?;
                 Ok(Type::ErrorUnion {
                     err: Box::new(err),
                     ok: Box::new(ok),
@@ -410,7 +522,7 @@ impl Type {
             AstTypeKind::Tuple(types) => {
                 let resolved: Result<Vec<Type>, Diagnostic> = types
                     .iter()
-                    .map(|t| Type::from_ast(t, known_structs, known_enums))
+                    .map(|t| Type::from_ast_with_generics(t, known_structs, known_enums, generics))
                     .collect();
                 Ok(Type::Tuple(resolved?))
             }
@@ -471,6 +583,7 @@ impl fmt::Display for Type {
             Type::IntegerLiteral(_) => write!(f, "{{integer}}"),
             Type::FloatLiteral => write!(f, "{{float}}"),
             Type::Never => write!(f, "!"),
+            Type::TypeParam(sym) => write!(f, "{}", INTERNER.resolve(sym)),
             Type::Unknown => write!(f, "{{unknown}}"),
         }
     }

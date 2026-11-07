@@ -84,11 +84,8 @@ impl FirType {
                 let tuple_sym = ifa_span::INTERNER.intern("Tuple");
                 FirType::Struct(tuple_sym, fir_fields)
             }
-            SemaType::Generic { name, args } => {
-                let sym_str = format!("{}_{}", name.as_str(), args.len());
-                let gen_sym = ifa_span::INTERNER.intern(&sym_str);
-                FirType::Struct(gen_sym, Vec::new())
-            }
+            SemaType::Generic { name, args: _ } => FirType::Struct(*name, Vec::new()),
+            SemaType::TypeParam(_) => FirType::Int(IntType::I64),
             SemaType::IntegerLiteral(_) => FirType::Int(IntType::I64),
             SemaType::FloatLiteral => FirType::Float(FloatType::F64),
             SemaType::Never | SemaType::Unknown => FirType::Unit,
