@@ -1202,3 +1202,93 @@ fn test_cranelift_jit_higher_order_closures() {
     let result = jit.run_main().expect("Failed to execute native main");
     assert_eq!(result, 48);
 }
+
+#[test]
+fn test_cranelift_jit_named_function_pointer_dispatch() {
+    let src = r#"
+        pub fn square(x: i64) -> i64 {
+            return x * x;
+        }
+
+        pub fn triple(x: i64) -> i64 {
+            return x * 3;
+        }
+
+        pub fn apply(f: fn(i64) -> i64, val: i64) -> i64 {
+            return f(val);
+        }
+
+        pub fn main() -> i64 {
+            let a = apply(square, 7); // 49
+            let b = apply(triple, 5); // 15
+            return a + b; // 64
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("jit_named_fn.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 64);
+}
+
+#[test]
+fn test_cranelift_jit_dynamic_function_pointer_dispatch() {
+    let src = r#"
+        pub fn add_ten(x: i64) -> i64 {
+            return x + 10;
+        }
+
+        pub fn add_twenty(x: i64) -> i64 {
+            return x + 20;
+        }
+
+        pub fn compute(cond: bool, val: i64) -> i64 {
+            mut f = add_ten;
+            if cond {
+                f = add_twenty;
+            }
+            return f(val);
+        }
+
+        pub fn main() -> i64 {
+            let r1 = compute(false, 5); // 15
+            let r2 = compute(true, 5);  // 25
+            return r1 + r2;            // 40
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("jit_dyn_fn.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 40);
+}

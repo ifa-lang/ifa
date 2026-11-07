@@ -1474,6 +1474,11 @@ impl<'a> SemanticAnalyzer<'a> {
                         name: en.name,
                         variants: en.variants.clone(),
                     }
+                } else if let Some(func) = self.symbols.lookup_function(sym) {
+                    Type::Fn {
+                        params: func.params.iter().map(|p| (p.mode, p.ty.clone())).collect(),
+                        ret: Box::new(func.ret_ty.clone()),
+                    }
                 } else {
                     self.diagnostics.push(
                         Diagnostic::error(format!("variable ou identifiant inconnu '{}'", name))
@@ -1570,7 +1575,10 @@ impl<'a> SemanticAnalyzer<'a> {
                                     .with_primary_label(expr.span, "accès à une fonction privée"),
                                 );
                             }
-                            f.ret_ty.clone()
+                            Type::Fn {
+                                params: f.params.iter().map(|p| (p.mode, p.ty.clone())).collect(),
+                                ret: Box::new(f.ret_ty.clone()),
+                            }
                         } else {
                             Type::Unknown
                         }
@@ -1594,6 +1602,11 @@ impl<'a> SemanticAnalyzer<'a> {
                                 name: *last,
                                 fields: st.fields.iter().map(|f| (f.name, f.ty.clone())).collect(),
                             }
+                        } else if let Some(f) = self.symbols.lookup_function(last) {
+                            Type::Fn {
+                                params: f.params.iter().map(|p| (p.mode, p.ty.clone())).collect(),
+                                ret: Box::new(f.ret_ty.clone()),
+                            }
                         } else {
                             Type::Unknown
                         }
@@ -1607,6 +1620,11 @@ impl<'a> SemanticAnalyzer<'a> {
                         Type::Struct {
                             name: *last,
                             fields: st.fields.iter().map(|f| (f.name, f.ty.clone())).collect(),
+                        }
+                    } else if let Some(f) = self.symbols.lookup_function(last) {
+                        Type::Fn {
+                            params: f.params.iter().map(|p| (p.mode, p.ty.clone())).collect(),
+                            ret: Box::new(f.ret_ty.clone()),
                         }
                     } else {
                         // Module path or foreign reference (e.g. io::println, http::Server)

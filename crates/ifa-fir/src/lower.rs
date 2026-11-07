@@ -308,6 +308,74 @@ impl<'a> FunctionLoweringContext<'a> {
         }
     }
 
+    fn get_or_create_fn_thunk(&mut self, fn_name: Symbol, span: Span) -> Symbol {
+        let thunk_sym = INTERNER.intern(&format!("__ifa_thunk_{}", fn_name.as_str()));
+        if self.lifted_functions.iter().any(|f| f.name == thunk_sym) {
+            return thunk_sym;
+        }
+
+        if let Some(func_sym) = self.symbols.lookup_function(&fn_name) {
+            let mut params = Vec::new();
+            params.push(FirParam {
+                name: INTERNER.intern("__env"),
+                ty: FirType::Int(IntType::I64),
+                mode: ifa_ast::ParamMode::In,
+                val: ValueId(0),
+            });
+
+            let mut call_args = Vec::new();
+            for (idx, p) in func_sym.params.iter().enumerate() {
+                let p_vid = ValueId((idx + 1) as u32);
+                params.push(FirParam {
+                    name: p.name,
+                    ty: FirType::from_sema_type(&p.ty),
+                    mode: p.mode,
+                    val: p_vid,
+                });
+                call_args.push(p_vid);
+            }
+
+            let ret_ty = FirType::from_sema_type(&func_sym.ret_ty);
+            let mut thunk_func = FirFunction::new(
+                thunk_sym,
+                params,
+                ret_ty.clone(),
+                false,
+                false,
+                false,
+                None,
+                span,
+            );
+            let block_id = thunk_func.entry_block;
+            let call_res = ValueId(func_sym.params.len() as u32 + 1);
+            let entry_block = thunk_func.get_block_mut(block_id).unwrap();
+
+            if ret_ty == FirType::Unit {
+                entry_block.instructions.push(Instruction::new(
+                    None,
+                    ValueExpr::CallDirect {
+                        name: fn_name,
+                        args: call_args,
+                    },
+                    span,
+                ));
+                entry_block.terminator = Some(Terminator::Return(None));
+            } else {
+                entry_block.instructions.push(Instruction::new(
+                    Some(call_res),
+                    ValueExpr::CallDirect {
+                        name: fn_name,
+                        args: call_args,
+                    },
+                    span,
+                ));
+                entry_block.terminator = Some(Terminator::Return(Some(call_res)));
+            }
+            self.lifted_functions.push(thunk_func);
+        }
+        thunk_sym
+    }
+
     fn extract_field_index_from_fir_type(&self, ty: &FirType, field: Symbol) -> Option<usize> {
         match ty {
             FirType::Struct(name, fields) => {
@@ -939,16 +1007,27 @@ impl<'a> FunctionLoweringContext<'a> {
                         }
 
                         if let Some(init_expr) = init {
-                            if matches!(init_expr.kind, ExprKind::Lambda { .. }) {
-                                let lambda_id = self
-                                    .symbols
-                                    .lambda_ids
-                                    .get(&init_expr.span)
-                                    .copied()
-                                    .unwrap_or(init_expr.span.start.0);
-                                let lambda_fn_name =
-                                    INTERNER.intern(&format!("__ifa_lambda_{}", lambda_id));
-                                self.var_lambda_names.insert(*name, lambda_fn_name);
+                            let is_mut = self
+                                .symbols
+                                .lookup_variable(name)
+                                .map(|v| v.is_mut)
+                                .unwrap_or(false);
+                            if !is_mut {
+                                if matches!(init_expr.kind, ExprKind::Lambda { .. }) {
+                                    let lambda_id = self
+                                        .symbols
+                                        .lambda_ids
+                                        .get(&init_expr.span)
+                                        .copied()
+                                        .unwrap_or(init_expr.span.start.0);
+                                    let lambda_fn_name =
+                                        INTERNER.intern(&format!("__ifa_lambda_{}", lambda_id));
+                                    self.var_lambda_names.insert(*name, lambda_fn_name);
+                                } else if let ExprKind::Ident(fn_name) = &init_expr.kind {
+                                    if self.symbols.lookup_function(fn_name).is_some() {
+                                        self.var_lambda_names.insert(*name, *fn_name);
+                                    }
+                                }
                             }
                             if self.is_expr_null(init_expr) {
                                 self.known_null_vars.insert(*name);
@@ -1156,6 +1235,7 @@ impl<'a> FunctionLoweringContext<'a> {
                 };
 
                 if let ExprKind::Ident(target_sym) = &target.kind {
+                    self.var_lambda_names.remove(target_sym);
                     if self.is_expr_null(val) {
                         self.known_null_vars.insert(*target_sym);
                         self.known_non_null_vars.remove(target_sym);
@@ -1802,6 +1882,33 @@ impl<'a> FunctionLoweringContext<'a> {
                         span,
                     );
                     res
+                } else if self.symbols.lookup_function(sym).is_some() {
+                    let fn_name = *sym;
+                    let thunk_sym = self.get_or_create_fn_thunk(fn_name, span);
+                    let fn_val = self.alloc_value();
+                    self.emit(
+                        Some(fn_val),
+                        ValueExpr::Constant(ConstantValue::Function(thunk_sym)),
+                        span,
+                    );
+                    let env_val = self.alloc_value();
+                    self.emit(
+                        Some(env_val),
+                        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                        span,
+                    );
+                    let closure_val = self.alloc_value();
+                    let closure_struct_name =
+                        INTERNER.intern(&format!("__ifa_closure_{}", thunk_sym.as_str()));
+                    self.emit(
+                        Some(closure_val),
+                        ValueExpr::StructInit {
+                            name: closure_struct_name,
+                            fields: vec![fn_val, env_val],
+                        },
+                        span,
+                    );
+                    closure_val
                 } else {
                     let res = self.alloc_value();
                     self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), span);
@@ -2103,21 +2210,33 @@ impl<'a> FunctionLoweringContext<'a> {
                 };
 
                 if let Some(lambda_fn_name) = closure_target {
-                    let closure_val = self.lower_expr(callee);
-                    let env_val = self.alloc_value();
-                    self.emit(
-                        Some(env_val),
-                        ValueExpr::GetField {
-                            base: closure_val,
-                            field_idx: 1,
-                            field_name: INTERNER.intern("__ifa_env"),
-                        },
-                        span,
-                    );
-                    let mut full_args = vec![env_val];
-                    for a in args {
-                        full_args.push(self.lower_expr(&a.value));
-                    }
+                    let is_lifted_lambda = INTERNER
+                        .resolve(&lambda_fn_name)
+                        .starts_with("__ifa_lambda_");
+                    let full_args = if is_lifted_lambda {
+                        let closure_val = self.lower_expr(callee);
+                        let env_val = self.alloc_value();
+                        self.emit(
+                            Some(env_val),
+                            ValueExpr::GetField {
+                                base: closure_val,
+                                field_idx: 1,
+                                field_name: INTERNER.intern("__ifa_env"),
+                            },
+                            span,
+                        );
+                        let mut fa = vec![env_val];
+                        for a in args {
+                            fa.push(self.lower_expr(&a.value));
+                        }
+                        fa
+                    } else {
+                        let mut fa = Vec::with_capacity(args.len());
+                        for a in args {
+                            fa.push(self.lower_expr(&a.value));
+                        }
+                        fa
+                    };
                     let res = self.alloc_value();
                     self.emit(
                         Some(res),
@@ -3768,7 +3887,64 @@ impl<'a> FunctionLoweringContext<'a> {
                                 span,
                             );
                             return res;
+                        } else if self.symbols.lookup_function(last_sym).is_some() {
+                            let fn_name = *last_sym;
+                            let thunk_sym = self.get_or_create_fn_thunk(fn_name, span);
+                            let fn_val = self.alloc_value();
+                            self.emit(
+                                Some(fn_val),
+                                ValueExpr::Constant(ConstantValue::Function(thunk_sym)),
+                                span,
+                            );
+                            let env_val = self.alloc_value();
+                            self.emit(
+                                Some(env_val),
+                                ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                                span,
+                            );
+                            let closure_val = self.alloc_value();
+                            let closure_struct_name =
+                                INTERNER.intern(&format!("__ifa_closure_{}", thunk_sym.as_str()));
+                            self.emit(
+                                Some(closure_val),
+                                ValueExpr::StructInit {
+                                    name: closure_struct_name,
+                                    fields: vec![fn_val, env_val],
+                                },
+                                span,
+                            );
+                            return closure_val;
                         }
+                    }
+                }
+                if let Some(last_sym) = path.last() {
+                    if self.symbols.lookup_function(last_sym).is_some() {
+                        let fn_name = *last_sym;
+                        let thunk_sym = self.get_or_create_fn_thunk(fn_name, span);
+                        let fn_val = self.alloc_value();
+                        self.emit(
+                            Some(fn_val),
+                            ValueExpr::Constant(ConstantValue::Function(thunk_sym)),
+                            span,
+                        );
+                        let env_val = self.alloc_value();
+                        self.emit(
+                            Some(env_val),
+                            ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+                            span,
+                        );
+                        let closure_val = self.alloc_value();
+                        let closure_struct_name =
+                            INTERNER.intern(&format!("__ifa_closure_{}", thunk_sym.as_str()));
+                        self.emit(
+                            Some(closure_val),
+                            ValueExpr::StructInit {
+                                name: closure_struct_name,
+                                fields: vec![fn_val, env_val],
+                            },
+                            span,
+                        );
+                        return closure_val;
                     }
                 }
                 let res = self.alloc_value();

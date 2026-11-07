@@ -564,3 +564,41 @@ fn test_arena_alloc_and_reset_ffi() {
     // Destroy arena
     ifa_rt_arena_destroy(arena);
 }
+
+#[test]
+fn test_dynamic_list_ffi_operations() {
+    use ifa_runtime::ffi::{
+        ifa_rt_list_free, ifa_rt_list_get, ifa_rt_list_len, ifa_rt_list_new, ifa_rt_list_pop,
+        ifa_rt_list_push,
+    };
+
+    let elem_size = std::mem::size_of::<i64>();
+    let mut list = ifa_rt_list_new(elem_size, 2);
+    assert!(!list.is_null());
+    assert_eq!(ifa_rt_list_len(list), 0);
+
+    // Push 10 elements (forces buffer growth)
+    for i in 0..10i64 {
+        let val = (i + 1) * 11;
+        ifa_rt_list_push(&mut list, &val as *const i64 as *const u8, elem_size);
+    }
+
+    assert_eq!(ifa_rt_list_len(list), 10);
+
+    // Check elements
+    for i in 0..10i64 {
+        let ptr = ifa_rt_list_get(list, i as usize, elem_size);
+        assert!(!ptr.is_null());
+        let val = unsafe { *(ptr as *const i64) };
+        assert_eq!(val, (i + 1) * 11);
+    }
+
+    // Pop element
+    let mut popped_val: i64 = 0;
+    let ok = ifa_rt_list_pop(list, &mut popped_val as *mut i64 as *mut u8, elem_size);
+    assert_eq!(ok, 1);
+    assert_eq!(popped_val, 110);
+    assert_eq!(ifa_rt_list_len(list), 9);
+
+    ifa_rt_list_free(list, elem_size);
+}

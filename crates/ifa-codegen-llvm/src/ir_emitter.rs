@@ -584,6 +584,9 @@ impl<'a> LlvmIrEmitter<'a> {
                         ValueExpr::Constant(ConstantValue::Bool(_)) => ifa_fir::FirType::Bool,
                         ValueExpr::Constant(ConstantValue::Char(_)) => ifa_fir::FirType::Char,
                         ValueExpr::Constant(ConstantValue::String(_)) => ifa_fir::FirType::Str,
+                        ValueExpr::Constant(ConstantValue::Function(_)) => {
+                            ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Unit))
+                        }
                         ValueExpr::Constant(ConstantValue::Null) => {
                             ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                         }
@@ -911,6 +914,13 @@ impl<'a> LlvmIrEmitter<'a> {
                         global_id
                     ));
                 }
+                ConstantValue::Function(sym) => {
+                    let fn_name = INTERNER.resolve(sym);
+                    out.push_str(&format!(
+                        "  %v{} = ptrtoint ptr @{} to i64\n",
+                        res_id, fn_name
+                    ));
+                }
                 ConstantValue::Null => {
                     out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
                 }
@@ -1184,19 +1194,32 @@ impl<'a> LlvmIrEmitter<'a> {
                         format!("{} %v{}", ty, a.0)
                     })
                     .collect();
+                let callee_ty_str = value_types
+                    .get(callee)
+                    .map(|t| fir_to_llvm_type(t).unwrap_or_else(|_| "i64".to_string()))
+                    .unwrap_or_else(|| "i64".to_string());
+                let callee_target = if callee_ty_str == "ptr" {
+                    format!("%v{}", callee.0)
+                } else {
+                    out.push_str(&format!(
+                        "  %callee_ptr_{} = inttoptr i64 %v{} to ptr\n",
+                        res_id, callee.0
+                    ));
+                    format!("%callee_ptr_{}", res_id)
+                };
                 if ret_ty_str == "void" {
                     out.push_str(&format!(
-                        "  call void %v{}({})\n",
-                        callee.0,
+                        "  call void {}({})\n",
+                        callee_target,
                         args_str.join(", ")
                     ));
                     out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
                 } else {
                     out.push_str(&format!(
-                        "  %v{} = call {} %v{}({})\n",
+                        "  %v{} = call {} {}({})\n",
                         res_id,
                         ret_ty_str,
-                        callee.0,
+                        callee_target,
                         args_str.join(", ")
                     ));
                 }

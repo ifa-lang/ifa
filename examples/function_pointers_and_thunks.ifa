@@ -1,0 +1,53 @@
+// Exemple idiomatique IFA : Fonctions de premier ordre, pointeurs de fonctions
+// et thunks adaptateurs pour l'exécution d'ordre supérieur statique et dynamique.
+
+pub fn square(x: i64) -> i64 {
+    return x * x;
+}
+
+pub fn double_val(x: i64) -> i64 {
+    return x * 2;
+}
+
+pub fn add_ten(x: i64) -> i64 {
+    return x + 10;
+}
+
+pub fn add_twenty(x: i64) -> i64 {
+    return x + 20;
+}
+
+// Fonction d'ordre supérieur acceptant tout type fn(i64) -> i64
+pub fn apply_fn(f: fn(i64) -> i64, val: i64) -> i64 {
+    return f(val);
+}
+
+// Sélection dynamique de fonction à l'exécution
+pub fn select_strategy(fast: bool, input: i64) -> i64 {
+    mut strategy = add_ten;
+    if !fast {
+        strategy = add_twenty;
+    }
+    return strategy(input);
+}
+
+pub fn main() -> i64 {
+    // 1. Passage direct de fonctions nommées de premier ordre
+    let step1 = apply_fn(square, 6);     // 6 * 6 = 36
+    let step2 = apply_fn(double_val, 7); // 7 * 2 = 14
+
+    // 2. Dispatch dynamique avec réaffectation mutable
+    let dynamic1 = select_strategy(true, 10);  // 10 + 10 = 20
+    let dynamic2 = select_strategy(false, 10); // 10 + 20 = 30
+
+    // 3. Clôture locale combinée avec pointeur de fonction
+    let offset: i64 = 5;
+    let custom_lambda = fn(v: i64) -> i64 {
+        return v + offset;
+    };
+    let step3 = apply_fn(custom_lambda, 15); // 15 + 5 = 20
+
+    // Total = 36 + 14 + 20 + 30 + 20 = 120
+    let total = step1 + step2 + dynamic1 + dynamic2 + step3;
+    return total;
+}

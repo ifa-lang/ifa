@@ -112,6 +112,8 @@ impl ClosureOptPass {
                     if let Some(res) = inst.result {
                         if let ValueExpr::Constant(ConstantValue::String(s)) = &inst.expr {
                             string_constants.insert(res, *s);
+                        } else if let ValueExpr::Constant(ConstantValue::Function(s)) = &inst.expr {
+                            string_constants.insert(res, *s);
                         }
                     }
                 }
@@ -122,7 +124,10 @@ impl ClosureOptPass {
                     if let Some(res) = inst.result {
                         if let ValueExpr::StructInit { name, fields } = &inst.expr {
                             let name_str = INTERNER.resolve(name);
-                            if name_str.starts_with("__ifa_closure_") && fields.len() >= 2 {
+                            if (name_str.starts_with("__ifa_closure_")
+                                || name_str.starts_with("__ifa_fnref_"))
+                                && fields.len() >= 2
+                            {
                                 let fn_val = fields[0];
                                 let env_val = fields[1];
                                 if let Some(&lambda_sym) = string_constants.get(&fn_val) {

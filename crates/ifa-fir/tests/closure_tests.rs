@@ -233,3 +233,89 @@ fn test_fir_higher_order_iterators_example() {
     let result = interp.execute_function("main", vec![]).unwrap();
     assert_eq!(result, FirValue::Int(82));
 }
+
+#[test]
+fn test_fir_first_class_named_function_items() {
+    let src = r#"
+        pub fn square(x: i64) -> i64 {
+            return x * x;
+        }
+
+        pub fn double_val(x: i64) -> i64 {
+            return x * 2;
+        }
+
+        pub fn apply(f: fn(i64) -> i64, val: i64) -> i64 {
+            return f(val);
+        }
+
+        pub fn main() -> i64 {
+            let res1 = apply(square, 8); // 64
+            let res2 = apply(double_val, 13); // 26
+            return res1 + res2; // 90
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("named_fn_items.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let result = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(result, FirValue::Int(90));
+}
+
+#[test]
+fn test_fir_dynamic_function_pointer_reassignment() {
+    let src = r#"
+        pub fn add_ten(x: i64) -> i64 {
+            return x + 10;
+        }
+
+        pub fn add_twenty(x: i64) -> i64 {
+            return x + 20;
+        }
+
+        pub fn compute(cond: bool, val: i64) -> i64 {
+            mut f = add_ten;
+            if cond {
+                f = add_twenty;
+            }
+            return f(val);
+        }
+
+        pub fn main() -> i64 {
+            let r1 = compute(false, 5); // 15
+            let r2 = compute(true, 5);  // 25
+            return r1 + r2;            // 40
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("dyn_fn_reassign.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let result = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(result, FirValue::Int(40));
+}

@@ -2,8 +2,8 @@ use crate::error::CodegenError;
 use crate::types::fir_type_to_cranelift;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    types, Block as ClBlock, BlockArg, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind,
-    TrapCode, Value as ClValue,
+    types, AbiParam, Block as ClBlock, BlockArg, InstBuilder, MemFlagsData, Signature,
+    StackSlotData, StackSlotKind, TrapCode, Value as ClValue,
 };
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::{FuncId, Module};
@@ -176,6 +176,17 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                         .map_err(|e| CodegenError::Module(e.to_string()))?;
                     let local_data = self.module.declare_data_in_func(data_id, self.builder.func);
                     Some(self.builder.ins().symbol_value(self.ptr_type, local_data))
+                }
+                ConstantValue::Function(s) => {
+                    let s_str = INTERNER.resolve(s);
+                    if let Some(&callee_id) = self.func_ids.get(&s_str) {
+                        let local_func = self
+                            .module
+                            .declare_func_in_func(callee_id, self.builder.func);
+                        Some(self.builder.ins().func_addr(self.ptr_type, local_func))
+                    } else {
+                        Some(self.builder.ins().iconst(self.ptr_type, 0))
+                    }
                 }
             },
 
@@ -366,7 +377,10 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                             self.builder.ins().ineg(v)
                         }
                     }
-                    UnaryOp::Not => self.builder.ins().bnot(v),
+                    UnaryOp::Not => {
+                        let zero = self.builder.ins().iconst(ty_v, 0);
+                        self.builder.ins().icmp(IntCC::Equal, v, zero)
+                    }
                 })
             }
 
@@ -896,8 +910,30 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             ValueExpr::ArrayPush { .. }
             | ValueExpr::StructPushField { .. }
             | ValueExpr::CoWCheckShared { .. }
-            | ValueExpr::Spawn { .. }
-            | ValueExpr::Call { .. } => Some(self.builder.ins().iconst(types::I64, 0)),
+            | ValueExpr::Spawn { .. } => Some(self.builder.ins().iconst(types::I64, 0)),
+
+            ValueExpr::Call { callee, args } => {
+                if let Some(&callee_val) = self.value_map.get(callee) {
+                    let mut arg_vals = Vec::with_capacity(args.len());
+                    let mut sig = Signature::new(self.module.target_config().default_call_conv);
+                    for a in args {
+                        let v = self.value_map[a];
+                        let v_ty = self.builder.func.dfg.value_type(v);
+                        sig.params.push(AbiParam::new(v_ty));
+                        arg_vals.push(v);
+                    }
+                    sig.returns.push(AbiParam::new(types::I64));
+                    let sig_ref = self.builder.import_signature(sig);
+                    let call = self
+                        .builder
+                        .ins()
+                        .call_indirect(sig_ref, callee_val, &arg_vals);
+                    let results = self.builder.inst_results(call);
+                    results.first().copied()
+                } else {
+                    Some(self.builder.ins().iconst(types::I64, 0))
+                }
+            }
 
             ValueExpr::ArrayLen { array } => {
                 let _ = array;

@@ -457,6 +457,191 @@ pub extern "C" fn ifa_rt_version_string() -> *const std::os::raw::c_char {
     c"IFA Runtime 0.1.0 (Zero-GC Generational Concurrency)".as_ptr()
 }
 
+/// Raw memory header for dynamic lists adhering to IFA's mutable value semantics.
+#[repr(C)]
+pub struct IfaListRawHeader {
+    pub ref_count: std::sync::atomic::AtomicUsize,
+    pub len: usize,
+    pub capacity: usize,
+}
+
+/// Allocate a new dynamic list with initial capacity.
+#[no_mangle]
+pub extern "C" fn ifa_rt_list_new(elem_size: usize, initial_cap: usize) -> *mut u8 {
+    let cap = initial_cap.max(4);
+    let esize = elem_size.max(1);
+    let header_size = std::mem::size_of::<IfaListRawHeader>();
+    let total_size = header_size + cap * esize;
+    let align = 8.max(std::mem::align_of::<IfaListRawHeader>());
+    let layout = std::alloc::Layout::from_size_align(total_size, align).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let header = mem as *mut IfaListRawHeader;
+        std::ptr::write(
+            header,
+            IfaListRawHeader {
+                ref_count: std::sync::atomic::AtomicUsize::new(1),
+                len: 0,
+                capacity: cap,
+            },
+        );
+        mem
+    }
+}
+
+/// Return element count of a dynamic list.
+#[no_mangle]
+pub extern "C" fn ifa_rt_list_len(list_handle: *const u8) -> usize {
+    if list_handle.is_null() {
+        return 0;
+    }
+    unsafe {
+        let header = list_handle as *const IfaListRawHeader;
+        (*header).len
+    }
+}
+
+/// Return pointer to element at index `index`.
+#[no_mangle]
+pub extern "C" fn ifa_rt_list_get(
+    list_handle: *const u8,
+    index: usize,
+    elem_size: usize,
+) -> *const u8 {
+    if list_handle.is_null() {
+        return std::ptr::null();
+    }
+    unsafe {
+        let header = list_handle as *const IfaListRawHeader;
+        if index >= (*header).len {
+            return std::ptr::null();
+        }
+        let base = list_handle.add(std::mem::size_of::<IfaListRawHeader>());
+        base.add(index * elem_size.max(1))
+    }
+}
+
+/// Append element to dynamic list, performing Copy-on-Write and resizing if required.
+#[no_mangle]
+pub extern "C" fn ifa_rt_list_push(
+    list_handle_ptr: *mut *mut u8,
+    elem_ptr: *const u8,
+    elem_size: usize,
+) {
+    if list_handle_ptr.is_null() || elem_ptr.is_null() {
+        return;
+    }
+    let esize = elem_size.max(1);
+    unsafe {
+        if (*list_handle_ptr).is_null() {
+            *list_handle_ptr = ifa_rt_list_new(esize, 4);
+        }
+        let mut handle = *list_handle_ptr;
+        let header = handle as *mut IfaListRawHeader;
+        let current_len = (*header).len;
+        let current_cap = (*header).capacity;
+
+        if (*header)
+            .ref_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 1
+            || current_len >= current_cap
+        {
+            let new_cap = if current_len >= current_cap {
+                current_cap * 2
+            } else {
+                current_cap
+            };
+            let new_handle = ifa_rt_list_new(esize, new_cap);
+            let new_header = new_handle as *mut IfaListRawHeader;
+            let src = handle.add(std::mem::size_of::<IfaListRawHeader>());
+            let dst = new_handle.add(std::mem::size_of::<IfaListRawHeader>());
+            std::ptr::copy_nonoverlapping(src, dst, current_len * esize);
+            (*new_header).len = current_len;
+
+            if (*header)
+                .ref_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Release)
+                == 1
+            {
+                let layout = std::alloc::Layout::from_size_align(
+                    std::mem::size_of::<IfaListRawHeader>() + current_cap * esize,
+                    8,
+                )
+                .unwrap();
+                std::alloc::dealloc(handle, layout);
+            }
+
+            *list_handle_ptr = new_handle;
+            handle = new_handle;
+        }
+
+        let cur_header = handle as *mut IfaListRawHeader;
+        let dst = handle
+            .add(std::mem::size_of::<IfaListRawHeader>())
+            .add(current_len * esize);
+        std::ptr::copy_nonoverlapping(elem_ptr, dst, esize);
+        (*cur_header).len = current_len + 1;
+    }
+}
+
+/// Pop last element from dynamic list.
+#[no_mangle]
+pub extern "C" fn ifa_rt_list_pop(
+    list_handle: *mut u8,
+    out_elem_ptr: *mut u8,
+    elem_size: usize,
+) -> i32 {
+    if list_handle.is_null() {
+        return 0;
+    }
+    let esize = elem_size.max(1);
+    unsafe {
+        let header = list_handle as *mut IfaListRawHeader;
+        let len = (*header).len;
+        if len == 0 {
+            return 0;
+        }
+        let last_idx = len - 1;
+        if !out_elem_ptr.is_null() {
+            let src = list_handle
+                .add(std::mem::size_of::<IfaListRawHeader>())
+                .add(last_idx * esize);
+            std::ptr::copy_nonoverlapping(src, out_elem_ptr, esize);
+        }
+        (*header).len = last_idx;
+        1
+    }
+}
+
+/// Release dynamic list memory buffer.
+#[no_mangle]
+pub extern "C" fn ifa_rt_list_free(list_handle: *mut u8, elem_size: usize) {
+    if list_handle.is_null() {
+        return;
+    }
+    unsafe {
+        let header = list_handle as *mut IfaListRawHeader;
+        if (*header)
+            .ref_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Release)
+            == 1
+        {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            let cap = (*header).capacity;
+            let layout = std::alloc::Layout::from_size_align(
+                std::mem::size_of::<IfaListRawHeader>() + cap * elem_size.max(1),
+                8,
+            )
+            .unwrap();
+            std::alloc::dealloc(list_handle, layout);
+        }
+    }
+}
+
 /// Opaque wrapper around an IFA runtime channel for C-ABI FFI.
 pub struct IfaChannelHandle(pub(crate) Channel<*mut u8>);
 

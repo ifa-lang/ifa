@@ -1545,3 +1545,141 @@ fn test_llvm_aot_higher_order_closures() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_aot_named_function_pointer_dispatch() {
+    let src = r#"
+        pub fn square(x: i64) -> i64 {
+            return x * x;
+        }
+
+        pub fn inc(x: i64) -> i64 {
+            return x + 1;
+        }
+
+        pub fn apply(f: fn(i64) -> i64, val: i64) -> i64 {
+            return f(val);
+        }
+
+        pub fn main() -> i64 {
+            let a = apply(square, 6); // 36
+            let b = apply(inc, a);    // 37
+            return b;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_named_fn.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir = std::env::temp_dir().join(format!("ifa_llvm_fn_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("fn.o");
+    let bin_path = temp_dir.join("fn_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&fir_module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(37),
+        "Native binary output exit code must be 37 (6*6 + 1)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_aot_dynamic_function_pointer_dispatch() {
+    let src = r#"
+        pub fn add_ten(x: i64) -> i64 {
+            return x + 10;
+        }
+
+        pub fn add_twenty(x: i64) -> i64 {
+            return x + 20;
+        }
+
+        pub fn compute(cond: bool, val: i64) -> i64 {
+            mut f = add_ten;
+            if cond {
+                f = add_twenty;
+            }
+            return f(val);
+        }
+
+        pub fn main() -> i64 {
+            let r1 = compute(false, 5); // 15
+            let r2 = compute(true, 5);  // 25
+            return r1 + r2;            // 40
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_dyn_fn.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir = std::env::temp_dir().join(format!("ifa_llvm_dyn_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("dyn.o");
+    let bin_path = temp_dir.join("dyn_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&fir_module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(40),
+        "Native binary output exit code must be 40 (15 + 25)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

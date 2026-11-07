@@ -260,6 +260,9 @@ impl VectorizePass {
                         ValueExpr::Constant(ConstantValue::Bool(_)) => FirType::Bool,
                         ValueExpr::Constant(ConstantValue::Char(_)) => FirType::Char,
                         ValueExpr::Constant(ConstantValue::String(_)) => FirType::Str,
+                        ValueExpr::Constant(ConstantValue::Function(_)) => {
+                            FirType::Pointer(Box::new(FirType::Unit))
+                        }
                         ValueExpr::Constant(ConstantValue::Null) => FirType::Int(IntType::I64),
                         ValueExpr::Alloca { ty, .. } => FirType::Pointer(Box::new(ty.clone())),
                         ValueExpr::Load { ptr } => match value_types.get(ptr) {

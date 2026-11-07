@@ -535,6 +535,9 @@ impl<'a> FirInterpreter<'a> {
                             (ConstantValue::String(a), FirValue::String(b)) => {
                                 INTERNER.resolve(a) == *b
                             }
+                            (ConstantValue::Function(a), FirValue::String(b)) => {
+                                INTERNER.resolve(a) == *b
+                            }
                             _ => false,
                         };
 
@@ -593,6 +596,7 @@ impl<'a> FirInterpreter<'a> {
                 ConstantValue::Float(f, _) => FirValue::Float(*f),
                 ConstantValue::Char(ch) => FirValue::Int(*ch as u32 as i128),
                 ConstantValue::String(s) => FirValue::String(INTERNER.resolve(s)),
+                ConstantValue::Function(s) => FirValue::String(INTERNER.resolve(s)),
                 ConstantValue::Null => FirValue::Null,
             }),
 

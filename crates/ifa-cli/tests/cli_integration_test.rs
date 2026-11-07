@@ -437,3 +437,90 @@ fn test_cli_lsp_server_stdio() {
     let status = child.wait().expect("Failed to wait on LSP server process");
     assert!(status.success());
 }
+
+#[test]
+fn test_cli_function_pointers_and_thunks_full_pipeline() {
+    let ifa_bin = get_ifa_binary();
+    let sample_file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("examples")
+        .join("function_pointers_and_thunks.ifa");
+
+    assert!(
+        sample_file.exists(),
+        "Function pointers example file missing at {:?}",
+        sample_file
+    );
+
+    // 1. Static semantic check
+    let check_status = Command::new(&ifa_bin)
+        .arg("check")
+        .arg(&sample_file)
+        .status()
+        .expect("Failed to execute `ifa check`");
+    assert!(
+        check_status.success(),
+        "ifa check failed on function_pointers_and_thunks.ifa"
+    );
+
+    // 2. Interpreter run
+    let run_output = Command::new(&ifa_bin)
+        .arg("run")
+        .arg(&sample_file)
+        .output()
+        .expect("Failed to execute `ifa run`");
+    assert!(run_output.status.success());
+    let run_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        run_stdout.contains("120"),
+        "Interpreter did not return expected value 120: {}",
+        run_stdout
+    );
+
+    // 3. Cranelift Native JIT run
+    let native_output = Command::new(&ifa_bin)
+        .arg("run")
+        .arg("--native")
+        .arg(&sample_file)
+        .output()
+        .expect("Failed to execute `ifa run --native`");
+    assert!(native_output.status.success());
+    let native_stdout = String::from_utf8_lossy(&native_output.stdout);
+    assert!(
+        native_stdout.contains("120"),
+        "Native JIT did not return expected exit code 120: {}",
+        native_stdout
+    );
+
+    // 4. Standalone native binary compilation and execution
+    let temp_bin = std::env::temp_dir().join(format!("ifa_fn_ptr_test_bin_{}", std::process::id()));
+    let build_status = Command::new(&ifa_bin)
+        .arg("build")
+        .arg(&sample_file)
+        .arg("-o")
+        .arg(&temp_bin)
+        .status()
+        .expect("Failed to execute `ifa build`");
+    assert!(
+        build_status.success(),
+        "ifa build failed for function pointers example"
+    );
+
+    let bin_output = Command::new(&temp_bin)
+        .output()
+        .expect("Failed to execute generated standalone binary");
+    let _ = fs::remove_file(&temp_bin);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let exit_code = bin_output
+            .status
+            .code()
+            .or_else(|| bin_output.status.signal());
+        assert_eq!(exit_code, Some(120), "Standalone binary exit code mismatch");
+    }
+}
