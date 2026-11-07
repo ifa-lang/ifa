@@ -36,6 +36,12 @@ impl CowPass {
 
     /// Run the pass on a single function.
     pub fn run_on_function(&mut self, func: &mut FirFunction) {
+        // Strict functions enforce absolute zero-heap determinism and prohibit implicit Copy-on-Write.
+        // Memory mutations in strict fn must remain strictly in-place on the stack or in pre-allocated arenas.
+        if func.is_strict {
+            return;
+        }
+
         // Track variable state: alloca ValueId -> SharingState
         let mut sharing_states: HashMap<ValueId, SharingState> = HashMap::new();
         // Track which values have multiple reads/uses

@@ -129,7 +129,9 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare ptr @ifa_rt_string_concat(ptr, ptr)\n");
             out.push_str("declare ptr @ifa_rt_string_from_i64(i64)\n");
             out.push_str("declare ptr @ifa_rt_string_from_f64(double)\n");
-            out.push_str("declare ptr @ifa_rt_string_from_bool(i1)\n\n");
+            out.push_str("declare ptr @ifa_rt_string_from_bool(i1)\n");
+            out.push_str("declare ptr @ifa_rt_blocking_call(ptr, ptr)\n");
+            out.push_str("declare i64 @ifa_rt_blocking_spawn(ptr, ptr, ptr, ptr)\n\n");
         } else {
             out.push_str("; IFA Runtime Intrinsic Declarations\n");
             out.push_str("declare void @ifa_rt_println(ptr)\n");
@@ -158,7 +160,9 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare ptr @ifa_rt_string_concat(ptr, ptr)\n");
             out.push_str("declare ptr @ifa_rt_string_from_i64(i64)\n");
             out.push_str("declare ptr @ifa_rt_string_from_f64(double)\n");
-            out.push_str("declare ptr @ifa_rt_string_from_bool(i1)\n\n");
+            out.push_str("declare ptr @ifa_rt_string_from_bool(i1)\n");
+            out.push_str("declare ptr @ifa_rt_blocking_call(ptr, ptr)\n");
+            out.push_str("declare i64 @ifa_rt_blocking_spawn(ptr, ptr, ptr, ptr)\n\n");
         }
 
         // LLVM Standard Coroutine Intrinsics

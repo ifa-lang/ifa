@@ -93,16 +93,28 @@ impl FirVerifier {
                     def_block.insert(res, block.id);
                 }
 
-                // Strict function constraint check: no GenAlloc permitted
+                // Strict function constraint check: zero-heap determinism mandates NO GenAlloc or CoWMakeUnique
                 if func.is_strict {
-                    if let crate::ir::ValueExpr::GenAlloc { .. } = &inst.expr {
-                        errors.push(FirVerifyError {
-                            message: format!(
-                                "Strict function '{}' contains prohibited heap generational allocation",
-                                func.name.as_str()
-                            ),
-                            span: inst.span,
-                        });
+                    match &inst.expr {
+                        crate::ir::ValueExpr::GenAlloc { .. } => {
+                            errors.push(FirVerifyError {
+                                message: format!(
+                                    "Strict function '{}' contains prohibited heap generational allocation (zero-heap violation)",
+                                    func.name.as_str()
+                                ),
+                                span: inst.span,
+                            });
+                        }
+                        crate::ir::ValueExpr::CoWMakeUnique { .. } => {
+                            errors.push(FirVerifyError {
+                                message: format!(
+                                    "Strict function '{}' contains prohibited implicit Copy-on-Write clone (zero-heap determinism violation)",
+                                    func.name.as_str()
+                                ),
+                                span: inst.span,
+                            });
+                        }
+                        _ => {}
                     }
                 }
             }

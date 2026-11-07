@@ -108,6 +108,46 @@ impl Value {
         }
     }
 
+    /// Calculates the estimated heap memory footprint of this value in bytes for comptime sandbox monitoring.
+    pub fn heap_size_bytes(&self) -> usize {
+        match self {
+            Value::Unit
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::UInt(_)
+            | Value::Float(_)
+            | Value::Char(_) => 0,
+            Value::String(s) => s.len(),
+            Value::Array(arr) => {
+                let inner: usize = arr.iter().map(|v| v.heap_size_bytes()).sum();
+                arr.capacity() * std::mem::size_of::<Value>() + inner
+            }
+            Value::Tuple(tup) => {
+                let inner: usize = tup.iter().map(|v| v.heap_size_bytes()).sum();
+                tup.capacity() * std::mem::size_of::<Value>() + inner
+            }
+            Value::Struct { fields, .. } => {
+                let inner: usize = fields.iter().map(|(_, v)| v.heap_size_bytes()).sum();
+                fields.capacity() * std::mem::size_of::<(Symbol, Value)>() + inner
+            }
+            Value::EnumVariant { payload, .. } => {
+                if let Some(p) = payload {
+                    std::mem::size_of::<Value>() + p.heap_size_bytes()
+                } else {
+                    0
+                }
+            }
+            Value::Error(inner) => std::mem::size_of::<Value>() + inner.heap_size_bytes(),
+            Value::Option(opt) => {
+                if let Some(inner) = opt {
+                    std::mem::size_of::<Value>() + inner.heap_size_bytes()
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
     /// Evaluates the truthiness of the value in boolean contexts.
     pub fn is_truthy(&self) -> bool {
         match self {

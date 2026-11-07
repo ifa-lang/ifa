@@ -4159,6 +4159,34 @@ impl<'a> SemanticAnalyzer<'a> {
         // Check Law of Exclusivity on arguments!
         check_call_exclusivity(args, &param_modes, &self.symbols, &mut self.diagnostics);
 
+        // Enforce strict fn constraints: a strict fn can only call other strict functions or pure intrinsics
+        if self.current_func_is_strict && !f.is_strict && !f.is_comptime {
+            let fn_name = INTERNER.resolve(&f.name);
+            let is_allowed_intrinsic = fn_name == "assert"
+                || fn_name == "assert_eq"
+                || fn_name == "assert_ne"
+                || fn_name == "sizeof"
+                || fn_name == "alignof"
+                || fn_name == "ifa_rt_println"
+                || fn_name == "ifa_rt_print"
+                || fn_name == "ifa_rt_println_i64"
+                || fn_name == "ifa_rt_print_i64";
+
+            if !is_allowed_intrinsic {
+                self.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "violation du mode strict : appel de la fonction non-stricte '{}' interdit dans une fonction 'strict fn'",
+                        fn_name
+                    ))
+                    .with_code("E0020")
+                    .with_primary_label(span, format!("appel à '{}' non garanti zéro-heap", fn_name))
+                    .with_secondary_label(f.span, format!("'{}' n'est pas annotée 'strict fn'", fn_name))
+                    .with_note("Le mode strict garantit l'absence totale d'allocation sur le tas et le déterminisme temporel.")
+                    .with_help("Annotez la fonction appelée avec 'strict fn' ou effectuez l'appel hors du mode strict."),
+                );
+            }
+        }
+
         // Check argument count
         let fn_name = INTERNER.resolve(&f.name);
         let is_assert_call = (fn_name == "assert" && (args.len() == 1 || args.len() == 2))

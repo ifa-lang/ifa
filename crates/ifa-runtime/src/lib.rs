@@ -2,6 +2,7 @@
 
 pub mod allocator;
 pub mod benchmarks;
+pub mod blocking;
 pub mod collections;
 pub mod ffi;
 pub mod fiber;
@@ -16,6 +17,11 @@ pub use benchmarks::{
     profile_allocator_engine, run_allocator_multithread_suite, run_generational_benchmark_suite,
     AllocatorEngine, AllocatorThroughputResult, BenchmarkReport, BenchmarkResult,
     MultithreadBenchmarkSuiteReport,
+};
+pub use blocking::{
+    ifa_rt_blocking_call, ifa_rt_blocking_pool_active_workers, ifa_rt_blocking_pool_capacity,
+    ifa_rt_blocking_spawn, BlockingHandle, BlockingPool, ExternBlockingFn, ExternCompletionCb,
+    GLOBAL_BLOCKING_POOL,
 };
 pub use collections::{IfaList, IfaMap};
 pub use ffi::*;

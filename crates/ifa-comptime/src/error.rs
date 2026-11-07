@@ -33,6 +33,10 @@ pub enum ComptimeErrorKind {
     GasLimitExceeded {
         limit: u64,
     },
+    MemoryLimitExceeded {
+        limit_bytes: usize,
+        requested_bytes: usize,
+    },
     CallStackOverflow {
         max_depth: usize,
     },
@@ -105,6 +109,16 @@ impl fmt::Display for ComptimeErrorKind {
                     limit
                 )
             }
+            ComptimeErrorKind::MemoryLimitExceeded {
+                limit_bytes,
+                requested_bytes,
+            } => {
+                write!(
+                    f,
+                    "dépassement du quota de mémoire comptime (limite: {} octets, demandé: {} octets)",
+                    limit_bytes, requested_bytes
+                )
+            }
             ComptimeErrorKind::CallStackOverflow { max_depth } => {
                 write!(
                     f,
@@ -174,6 +188,7 @@ impl ComptimeError {
             ComptimeErrorKind::UndefinedFunction(_) => "E0034",
             ComptimeErrorKind::TypeMismatch { .. } => "E0035",
             ComptimeErrorKind::GasLimitExceeded { .. } => "E0036",
+            ComptimeErrorKind::MemoryLimitExceeded { .. } => "E0041",
             ComptimeErrorKind::CallStackOverflow { .. } => "E0037",
             ComptimeErrorKind::AssertionFailed(_) => "E0038",
             ComptimeErrorKind::CompileError(_) => "E0039",

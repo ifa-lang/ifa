@@ -45,15 +45,11 @@ impl AccessPath {
         let min_len = self.segments.len().min(other.segments.len());
         for i in 0..min_len {
             match (&self.segments[i], &other.segments[i]) {
-                (PathSegment::Field(f1), PathSegment::Field(f2)) => {
-                    if f1 != f2 {
-                        return false; // distinct fields at the same depth are provably disjoint
-                    }
+                (PathSegment::Field(f1), PathSegment::Field(f2)) if f1 != f2 => {
+                    return false; // distinct fields at the same depth are provably disjoint
                 }
-                (PathSegment::IndexConst(c1), PathSegment::IndexConst(c2)) => {
-                    if c1 != c2 {
-                        return false; // distinct constant indices are provably disjoint
-                    }
+                (PathSegment::IndexConst(c1), PathSegment::IndexConst(c2)) if c1 != c2 => {
+                    return false; // distinct constant indices are provably disjoint
                 }
                 _ => {
                     // Unknown index or matching segment -> potentially overlapping
@@ -75,7 +71,9 @@ pub fn extract_access_path(expr: &Expr) -> Option<AccessPath> {
                 display: name,
             })
         }
-        ExprKind::FieldAccess { receiver, field, .. } => {
+        ExprKind::FieldAccess {
+            receiver, field, ..
+        } => {
             let mut parent = extract_access_path(receiver)?;
             let field_name = INTERNER.resolve(field);
             parent.display.push('.');
@@ -221,13 +219,11 @@ pub fn check_call_exclusivity(
                         }
                     }
                 } else {
-                    borrows.push(
-                        BorrowRecord {
-                            path,
-                            kind: BorrowKind::Sink,
-                            span: arg.value.span,
-                        },
-                    );
+                    borrows.push(BorrowRecord {
+                        path,
+                        kind: BorrowKind::Sink,
+                        span: arg.value.span,
+                    });
                 }
             } else if is_inout {
                 // 1. Verify variable exists and is mutable
@@ -320,17 +316,18 @@ pub fn check_call_exclusivity(
                         }
                     }
                 } else {
-                    borrows.push(
-                        BorrowRecord {
-                            path,
-                            kind: BorrowKind::InOut,
-                            span: arg.value.span,
-                        },
-                    );
+                    borrows.push(BorrowRecord {
+                        path,
+                        kind: BorrowKind::InOut,
+                        span: arg.value.span,
+                    });
                 }
             } else {
                 // Read-only borrow ('in')
-                if let Some(existing) = borrows.iter().find(|b| b.path.overlaps(&path) && b.kind != BorrowKind::In) {
+                if let Some(existing) = borrows
+                    .iter()
+                    .find(|b| b.path.overlaps(&path) && b.kind != BorrowKind::In)
+                {
                     match existing.kind {
                         BorrowKind::Sink => {
                             diagnostics.push(
@@ -369,13 +366,11 @@ pub fn check_call_exclusivity(
                         BorrowKind::In => {}
                     }
                 } else {
-                    borrows.push(
-                        BorrowRecord {
-                            path,
-                            kind: BorrowKind::In,
-                            span: arg.value.span,
-                        },
-                    );
+                    borrows.push(BorrowRecord {
+                        path,
+                        kind: BorrowKind::In,
+                        span: arg.value.span,
+                    });
                 }
             }
         } else if is_inout || is_sink {

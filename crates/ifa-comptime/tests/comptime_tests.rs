@@ -120,6 +120,19 @@ fn test_comptime_infinite_loop_gas_limit() {
 }
 
 #[test]
+fn test_comptime_memory_limit_exceeded_sandbox() {
+    let mut vm = ifa_comptime::ComptimeVM::new().with_max_memory(1024);
+    let expr = parse_first_expr("const X = [0; 500];");
+    let err = vm
+        .eval_expr(&expr)
+        .expect_err("memory sandbox quota should abort massive allocation");
+    assert!(matches!(
+        err.kind,
+        ComptimeErrorKind::MemoryLimitExceeded { .. }
+    ));
+}
+
+#[test]
 fn test_comptime_for_loop_destructuring() {
     let func = parse_first_fn(
         r#"

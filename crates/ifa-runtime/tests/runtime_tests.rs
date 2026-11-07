@@ -623,3 +623,95 @@ fn test_generational_counter_overflow_and_quarantine() {
     assert!(!header.is_active());
     assert!(header.is_quarantined());
 }
+
+extern "C" fn mock_heavy_c_syscall(arg: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+    let input = arg as usize;
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    (input * 3) as *mut std::ffi::c_void
+}
+
+extern "C" fn mock_completion_callback(res: *mut std::ffi::c_void, cb_arg: *mut std::ffi::c_void) {
+    let res_val = res as usize;
+    let slot = unsafe { &*(cb_arg as *const std::sync::atomic::AtomicUsize) };
+    slot.store(res_val, std::sync::atomic::Ordering::Release);
+}
+
+#[test]
+fn test_isolated_blocking_pool_prevents_scheduler_starvation() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let light_counter = Arc::new(AtomicUsize::new(0));
+    let stop_light = Arc::new(AtomicBool::new(false));
+
+    // Spawn 4 cooperative resumable fibers on the M:N scheduler incrementing rapidly
+    let mut light_fids = Vec::new();
+    for _ in 0..4 {
+        let counter = Arc::clone(&light_counter);
+        let stop = Arc::clone(&stop_light);
+        let fid = GLOBAL_SCHEDULER.spawn_resumable(move || {
+            if stop.load(Ordering::Relaxed) {
+                CoroStatus::Completed
+            } else {
+                counter.fetch_add(1, Ordering::Relaxed);
+                CoroStatus::Suspended
+            }
+        });
+        light_fids.push(fid);
+    }
+
+    // Simultaneously, execute blocking C-ABI calls via ifa_rt_blocking_call
+    // across multiple fibers. The M:N scheduler must not starve.
+    let blocking_done = Arc::new(AtomicBool::new(false));
+    let b_done = Arc::clone(&blocking_done);
+
+    let fid_blocking = GLOBAL_SCHEDULER.spawn(move || {
+        let res = ifa_rt_blocking_call(mock_heavy_c_syscall, 14 as *mut std::ffi::c_void);
+        assert_eq!(res as usize, 42);
+        b_done.store(true, Ordering::Release);
+    });
+
+    // Wait for the blocking call to finish
+    GLOBAL_SCHEDULER.join(fid_blocking);
+    assert!(blocking_done.load(Ordering::Acquire));
+
+    // Cooperative light fibers must have made significant progress despite heavy blocking call
+    let progress = light_counter.load(Ordering::Relaxed);
+    assert!(
+        progress > 10,
+        "Cooperative M:N fibers must continue making progress during isolated blocking call: {}",
+        progress
+    );
+
+    // Stop light fibers and wait
+    stop_light.store(true, Ordering::Release);
+    for fid in light_fids {
+        GLOBAL_SCHEDULER.join(fid);
+    }
+}
+
+#[test]
+fn test_blocking_pool_c_abi_spawn_and_completion_cb() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    assert!(ifa_rt_blocking_pool_capacity() >= 4);
+
+    let completion_slot = AtomicUsize::new(0);
+    let slot_ptr = &completion_slot as *const AtomicUsize as *mut std::ffi::c_void;
+
+    let task_id = ifa_rt_blocking_spawn(
+        mock_heavy_c_syscall,
+        20 as *mut std::ffi::c_void,
+        Some(mock_completion_callback),
+        slot_ptr,
+    );
+    assert!(task_id > 0);
+
+    // Wait for completion callback to update slot
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while completion_slot.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    assert_eq!(completion_slot.load(Ordering::Acquire), 60);
+}

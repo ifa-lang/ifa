@@ -282,6 +282,16 @@ impl FiberScheduler {
         id
     }
 
+    /// Spawn a blocking operation on the dedicated background blocking pool.
+    /// Returns a `BlockingHandle` that can be cooperatively awaited without stalling M:N workers.
+    pub fn spawn_blocking<F, R>(&self, f: F) -> crate::blocking::BlockingHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        crate::blocking::GLOBAL_BLOCKING_POOL.spawn(f)
+    }
+
     /// Cooperative yield: relinquishes current execution slice to allow other fibers to run.
     pub fn yield_now(&self) {
         #[cfg(not(target_arch = "wasm32"))]

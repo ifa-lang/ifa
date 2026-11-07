@@ -266,6 +266,32 @@ intptr_t ifa_rt_async_read(int32_t stream_fd, uint8_t* buf, size_t len);
 intptr_t ifa_rt_async_write(int32_t stream_fd, const uint8_t* buf, size_t len);
 int32_t ifa_rt_async_close(int32_t handle_fd);
 
+/* --- Isolated Blocking FFI Worker Pool API --- */
+
+typedef void* (*ifa_blocking_fn)(void*);
+typedef void (*ifa_completion_cb)(void*, void*);
+
+/**
+ * Execute a blocking external C-ABI function on the dedicated background pool.
+ * Cooperatively yields the current fiber to ensure M:N scheduler workers never freeze.
+ */
+void* ifa_rt_blocking_call(ifa_blocking_fn func, void* arg);
+
+/**
+ * Asynchronously spawn a blocking C-ABI function on the background pool with an optional completion callback.
+ */
+uint64_t ifa_rt_blocking_spawn(ifa_blocking_fn func, void* arg, ifa_completion_cb done_cb, void* cb_arg);
+
+/**
+ * Returns number of worker threads currently running blocking FFI operations.
+ */
+size_t ifa_rt_blocking_pool_active_workers(void);
+
+/**
+ * Returns total capacity of the background blocking worker pool.
+ */
+size_t ifa_rt_blocking_pool_capacity(void);
+
 #ifdef __cplusplus
 }
 #endif

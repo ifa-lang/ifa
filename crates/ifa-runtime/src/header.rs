@@ -161,7 +161,9 @@ impl GenRef {
         }
         unsafe {
             let header = self.header();
-            header.is_active() && !header.is_quarantined() && header.generation_counter == self.remembered_gen
+            header.is_active()
+                && !header.is_quarantined()
+                && header.generation_counter == self.remembered_gen
         }
     }
 }

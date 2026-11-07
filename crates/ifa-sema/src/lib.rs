@@ -163,7 +163,11 @@ mod tests {
             }
         "#;
         let res = parse_and_analyze(code);
-        assert!(!res.has_errors(), "Expected disjoint inout fields to succeed: {:?}", res.diagnostics);
+        assert!(
+            !res.has_errors(),
+            "Expected disjoint inout fields to succeed: {:?}",
+            res.diagnostics
+        );
     }
 
     #[test]
@@ -189,7 +193,10 @@ mod tests {
             .diagnostics
             .iter()
             .any(|d| d.code.as_deref() == Some("E0011"));
-        assert!(has_overlap_err, "Expected E0011 diagnostic code for overlapping path");
+        assert!(
+            has_overlap_err,
+            "Expected E0011 diagnostic code for overlapping path"
+        );
     }
 
     #[test]

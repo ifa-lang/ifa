@@ -26,6 +26,8 @@ pub struct ComptimeVM {
     pub gas_limit: u64,
     pub gas_used: u64,
     pub max_call_depth: usize,
+    pub max_memory_bytes: usize,
+    pub memory_allocated: usize,
 }
 
 impl Default for ComptimeVM {
@@ -35,7 +37,7 @@ impl Default for ComptimeVM {
 }
 
 impl ComptimeVM {
-    /// Creates a fresh VM instance with safe defaults (1,000,000 max gas steps, max 512 call depth).
+    /// Creates a fresh VM instance with safe defaults (1,000,000 max gas steps, max 512 call depth, 64 MiB memory sandbox).
     pub fn new() -> Self {
         Self {
             functions: HashMap::new(),
@@ -45,6 +47,8 @@ impl ComptimeVM {
             gas_limit: 1_000_000,
             gas_used: 0,
             max_call_depth: 512,
+            max_memory_bytes: 64 * 1024 * 1024,
+            memory_allocated: 0,
         }
     }
 
@@ -52,6 +56,28 @@ impl ComptimeVM {
     pub fn with_gas_limit(mut self, limit: u64) -> Self {
         self.gas_limit = limit;
         self
+    }
+
+    /// Configures the maximum heap memory sandbox quota (in bytes) allowed before aborting.
+    pub fn with_max_memory(mut self, limit_bytes: usize) -> Self {
+        self.max_memory_bytes = limit_bytes;
+        self
+    }
+
+    /// Checks if allocating `bytes` exceeds the memory sandbox quota.
+    #[inline]
+    pub fn check_memory_quota(&mut self, bytes: usize, span: Span) -> Result<(), ComptimeError> {
+        if self.memory_allocated.saturating_add(bytes) > self.max_memory_bytes {
+            return Err(ComptimeError::new(
+                ComptimeErrorKind::MemoryLimitExceeded {
+                    limit_bytes: self.max_memory_bytes,
+                    requested_bytes: bytes,
+                },
+                span,
+            ));
+        }
+        self.memory_allocated = self.memory_allocated.saturating_add(bytes);
+        Ok(())
     }
 
     /// Registers a compiled function bytecode into the VM's function table.
@@ -91,6 +117,7 @@ impl ComptimeVM {
         self.stack.clear();
         self.frames.clear();
         self.gas_used = 0;
+        self.memory_allocated = 0;
 
         let frame = CallFrame {
             func_name: sym("__comptime_eval"),
@@ -130,6 +157,7 @@ impl ComptimeVM {
         self.stack.clear();
         self.frames.clear();
         self.gas_used = 0;
+        self.memory_allocated = 0;
 
         let base_pointer = 0;
         for arg in args {
@@ -350,6 +378,8 @@ impl ComptimeVM {
                     }
                 }
                 OpCode::MakeArray(count) => {
+                    let mem_req = (count as usize).saturating_mul(std::mem::size_of::<Value>());
+                    self.check_memory_quota(mem_req, span)?;
                     let mut elems = Vec::with_capacity(count as usize);
                     for _ in 0..count {
                         elems.push(self.pop_stack(span)?);
@@ -375,10 +405,15 @@ impl ComptimeVM {
                             span,
                         ));
                     }
+                    let requested_bytes =
+                        (count as usize).saturating_mul(std::mem::size_of::<Value>());
+                    self.check_memory_quota(requested_bytes, span)?;
                     let arr = vec![initial_val; count as usize];
                     self.stack.push(Value::Array(arr));
                 }
                 OpCode::MakeTuple(count) => {
+                    let mem_req = (count as usize).saturating_mul(std::mem::size_of::<Value>());
+                    self.check_memory_quota(mem_req, span)?;
                     let mut items = Vec::with_capacity(count as usize);
                     for _ in 0..count {
                         items.push(self.pop_stack(span)?);
@@ -387,6 +422,10 @@ impl ComptimeVM {
                     self.stack.push(Value::Tuple(items));
                 }
                 OpCode::MakeStruct(name, field_names) => {
+                    let mem_req = field_names
+                        .len()
+                        .saturating_mul(std::mem::size_of::<(Symbol, Value)>());
+                    self.check_memory_quota(mem_req, span)?;
                     let mut fields = Vec::with_capacity(field_names.len());
                     for &fname in field_names.iter().rev() {
                         let val = self.pop_stack(span)?;
