@@ -1,9 +1,10 @@
 use crate::error::KoriError;
 use crate::lockfile::{LockedPackage, Lockfile};
 use crate::manifest::{DependencySpec, Manifest};
+use crate::packager::PackageArchive;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,14 +20,34 @@ pub struct ResolvedPackage {
 }
 
 /// Dependency graph resolver producing a deterministic topological build plan.
+#[derive(Debug, Clone)]
 pub struct DependencyResolver {
     root_dir: PathBuf,
+    registries: BTreeMap<String, String>,
+    cache_dir: Option<PathBuf>,
 }
 
 impl DependencyResolver {
     /// Create a resolver with the specified root project workspace directory.
     pub fn new(root_dir: PathBuf) -> Self {
-        Self { root_dir }
+        Self {
+            root_dir,
+            registries: BTreeMap::new(),
+            cache_dir: None,
+        }
+    }
+
+    /// Add a configured registry mapping.
+    pub fn with_registry(mut self, name: &str, path_or_url: &str) -> Self {
+        self.registries
+            .insert(name.to_string(), path_or_url.to_string());
+        self
+    }
+
+    /// Override the local package download cache directory.
+    pub fn with_cache_dir(mut self, cache_dir: PathBuf) -> Self {
+        self.cache_dir = Some(cache_dir);
+        self
     }
 
     /// Compute cryptographic BLAKE3 checksum for all `.ifa` source files and `kori.toml` in package.
@@ -76,6 +97,14 @@ impl DependencyResolver {
         root_manifest: &Manifest,
         existing_lock: Option<&Lockfile>,
     ) -> Result<(Vec<ResolvedPackage>, Lockfile), KoriError> {
+        let mut active_resolver = self.clone();
+        for (k, v) in &root_manifest.registries {
+            active_resolver
+                .registries
+                .entry(k.clone())
+                .or_insert_with(|| v.clone());
+        }
+
         let mut graph = DiGraph::<ResolvedPackage, ()>::new();
         let mut visited = HashMap::<String, NodeIndex>::new();
 
@@ -98,8 +127,12 @@ impl DependencyResolver {
                 let child_idx = if let Some(&idx) = visited.get(dep_name) {
                     idx
                 } else {
-                    let (child_pkg, child_manifest) =
-                        self.resolve_dependency(dep_name, dep_spec, &parent_dir, existing_lock)?;
+                    let (child_pkg, child_manifest) = active_resolver.resolve_dependency(
+                        dep_name,
+                        dep_spec,
+                        &parent_dir,
+                        existing_lock,
+                    )?;
                     let child_dir = child_pkg.root_dir.clone();
                     let idx = graph.add_node(child_pkg);
                     visited.insert(dep_name.clone(), idx);
@@ -160,10 +193,7 @@ impl DependencyResolver {
                 if local_path.join("kori.toml").exists() {
                     self.load_local_package(name, &local_path, Some(ver_req_str))
                 } else {
-                    Err(KoriError::PackageNotFound(format!(
-                        "Dependency `{}` ({}) could not be resolved locally. Remote registries will be supported in future releases.",
-                        name, ver_req_str
-                    )))
+                    self.resolve_remote_package(name, Some(ver_req_str), None)
                 }
             }
             DependencySpec::Detailed(detailed) => {
@@ -174,6 +204,17 @@ impl DependencyResolver {
                         parent_dir.join(path)
                     };
                     self.load_local_package(name, &target_path, detailed.version.as_deref())
+                } else if let Some(ver_str) = &detailed.version {
+                    let local_path = parent_dir.join(name);
+                    if local_path.join("kori.toml").exists() {
+                        self.load_local_package(name, &local_path, Some(ver_str))
+                    } else {
+                        self.resolve_remote_package(
+                            name,
+                            Some(ver_str),
+                            detailed.registry.as_deref(),
+                        )
+                    }
                 } else if let Some(git_url) = &detailed.git {
                     Err(KoriError::PackageNotFound(format!(
                         "Git dependency `{}` ({}) requires git fetcher module.",
@@ -187,6 +228,84 @@ impl DependencyResolver {
                 }
             }
         }
+    }
+
+    fn resolve_remote_package(
+        &self,
+        name: &str,
+        version_req: Option<&str>,
+        custom_registry: Option<&str>,
+    ) -> Result<(ResolvedPackage, Manifest), KoriError> {
+        let mut candidate_registries: Vec<PathBuf> = Vec::new();
+
+        if let Some(reg_val) = custom_registry {
+            let p = PathBuf::from(reg_val);
+            if p.exists() {
+                candidate_registries.push(p);
+            } else if let Some(reg_url) = self.registries.get(reg_val) {
+                candidate_registries.push(PathBuf::from(reg_url));
+            }
+        }
+
+        for reg in self.registries.values() {
+            candidate_registries.push(PathBuf::from(reg));
+        }
+
+        if let Ok(env_reg) = std::env::var("KORI_REGISTRY") {
+            for part in env_reg.split(':') {
+                if !part.trim().is_empty() {
+                    candidate_registries.push(PathBuf::from(part.trim()));
+                }
+            }
+        }
+
+        let local_proj_reg = self.root_dir.join(".kori").join("registry");
+        if local_proj_reg.exists() {
+            candidate_registries.push(local_proj_reg);
+        }
+
+        candidate_registries.push(PackageArchive::default_registry_dir());
+
+        let cache_root = self
+            .cache_dir
+            .clone()
+            .unwrap_or_else(|| self.root_dir.join(".kori").join("cache").join("packages"));
+
+        let mut last_err = None;
+        for reg_path in &candidate_registries {
+            match PackageArchive::fetch_and_unpack(
+                name,
+                version_req,
+                Some(reg_path),
+                Some(&cache_root),
+            ) {
+                Ok((unpacked_dir, entry)) => {
+                    let manifest_path = unpacked_dir.join("kori.toml");
+                    let manifest = Manifest::from_file(&manifest_path)?;
+                    let source = format!("registry+file://{}", reg_path.display());
+                    let pkg = ResolvedPackage {
+                        name: entry.name,
+                        version: entry.version,
+                        root_dir: unpacked_dir,
+                        source,
+                        checksum: Some(entry.checksum),
+                        manifest: manifest.clone(),
+                    };
+                    return Ok((pkg, manifest));
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            KoriError::PackageNotFound(format!(
+                "Dependency `{}` ({}) could not be resolved from any configured registry.",
+                name,
+                version_req.unwrap_or("*")
+            ))
+        }))
     }
 
     fn load_local_package(

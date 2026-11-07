@@ -112,6 +112,7 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i32 @ifa_rt_channel_send(ptr, ptr)\n");
             out.push_str("declare i32 @ifa_rt_channel_recv(ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_channel_close(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_channel_select(ptr, i64, i32)\n");
             out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n\n");
         } else {
             out.push_str("; IFA Runtime Intrinsic Declarations\n");
@@ -127,6 +128,7 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i32 @ifa_rt_channel_send(ptr, ptr)\n");
             out.push_str("declare i32 @ifa_rt_channel_recv(ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_channel_close(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_channel_select(ptr, i64, i32)\n");
             out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n\n");
         }
 
@@ -627,6 +629,34 @@ impl<'a> LlvmIrEmitter<'a> {
                 out.push_str(&format!(
                     "  %v{} = load ptr, ptr %chan_out_slot_{}, align 8\n",
                     res_id, res_id
+                ));
+            }
+            ValueExpr::ChanSelect {
+                channels,
+                has_default,
+            } => {
+                let n = channels.len();
+                let arr_len = n.max(1);
+                out.push_str(&format!(
+                    "  %select_arr_{} = alloca [{} x ptr], align 8\n",
+                    res_id, arr_len
+                ));
+                for (i, chan_id) in channels.iter().enumerate() {
+                    out.push_str(&format!(
+                        "  %select_elem_{}_{} = getelementptr inbounds [{} x ptr], ptr %select_arr_{}, i64 0, i64 {}\n",
+                        res_id, i, arr_len, res_id, i
+                    ));
+                    out.push_str(&format!(
+                        "  store ptr %v{}, ptr %select_elem_{}_{}, align 8\n",
+                        chan_id.0, res_id, i
+                    ));
+                }
+                out.push_str(&format!(
+                    "  %v{} = call i64 @ifa_rt_channel_select(ptr %select_arr_{}, i64 {}, i32 {})\n",
+                    res_id,
+                    res_id,
+                    n,
+                    if *has_default { 1 } else { 0 }
                 ));
             }
             _ => {

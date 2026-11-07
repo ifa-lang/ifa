@@ -700,3 +700,82 @@ fn test_fir_channel_ssa_instructions_and_interp() {
     let res = interp.execute_function("channel_test", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(42));
 }
+
+#[test]
+fn test_fir_channel_select_execution() {
+    let fn_name = INTERNER.intern("select_test");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let v_chan1 = func.alloc_value();
+    let v_chan2 = func.alloc_value();
+    let v_val = func.alloc_value();
+    let v_sel = func.alloc_value();
+    let v_out = func.alloc_value();
+
+    let entry = func.get_block_mut(func.entry_block).unwrap();
+
+    entry.push_instruction(Instruction::new(
+        Some(v_chan1),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+    entry.push_instruction(Instruction::new(
+        Some(v_chan2),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+
+    entry.push_instruction(Instruction::new(
+        Some(v_val),
+        ValueExpr::Constant(ConstantValue::Int(100, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    entry.push_instruction(Instruction::new(
+        None,
+        ValueExpr::ChanSend {
+            chan: v_chan2,
+            val: v_val,
+        },
+        Span::DUMMY,
+    ));
+
+    entry.push_instruction(Instruction::new(
+        Some(v_sel),
+        ValueExpr::ChanSelect {
+            channels: vec![v_chan1, v_chan2],
+            has_default: false,
+        },
+        Span::DUMMY,
+    ));
+
+    entry.push_instruction(Instruction::new(
+        Some(v_out),
+        ValueExpr::ChanRecv { chan: v_chan2 },
+        Span::DUMMY,
+    ));
+
+    entry.set_terminator(Terminator::Return(Some(v_out)));
+
+    let mut module = FirModule::new(INTERNER.intern("test_mod"));
+    module.functions.push(func);
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("select_test", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(100));
+}

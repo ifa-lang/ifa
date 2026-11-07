@@ -1352,7 +1352,10 @@ impl<'a> FirInterpreter<'a> {
                 self.channels.remove(&cid);
                 Ok(FirValue::Unit)
             }
-            ValueExpr::ChanSelect { channels, .. } => {
+            ValueExpr::ChanSelect {
+                channels,
+                has_default,
+            } => {
                 for (idx, c) in channels.iter().enumerate() {
                     let cid = match env.get(c) {
                         Some(FirValue::Int(id)) => *id as u64,
@@ -1364,7 +1367,11 @@ impl<'a> FirInterpreter<'a> {
                         }
                     }
                 }
-                Ok(FirValue::Int(0))
+                if *has_default {
+                    Ok(FirValue::Int(channels.len() as i128))
+                } else {
+                    Ok(FirValue::Int(0))
+                }
             }
         }
     }

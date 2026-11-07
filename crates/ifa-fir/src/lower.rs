@@ -1,6 +1,8 @@
 use crate::ir::*;
 use crate::types::FirType;
-use ifa_ast::{BinOp, Block, Expr, ExprKind, Item, Lit, Pattern, Program, Stmt, UnaryOp};
+use ifa_ast::{
+    BinOp, Block, Expr, ExprKind, Item, Lit, Pattern, Program, SelectArm, Stmt, UnaryOp,
+};
 use ifa_sema::types::{FloatType, IntType};
 use ifa_sema::SymbolTable;
 use ifa_span::{Span, Symbol, INTERNER};
@@ -281,6 +283,9 @@ impl<'a> FunctionLoweringContext<'a> {
                 .symbols
                 .lookup_function(method)
                 .map(|func| FirType::from_sema_type(&func.ret_ty)),
+            ExprKind::Select { arms } => {
+                arms.first().and_then(|a| self.infer_expr_fir_type(&a.body))
+            }
             _ => None,
         }
     }
@@ -1897,6 +1902,161 @@ impl<'a> FunctionLoweringContext<'a> {
                                 args: Vec::new(),
                             });
                         }
+                    }
+                }
+
+                self.current_block = exit_block;
+                let final_res = self.alloc_value();
+                self.emit(Some(final_res), ValueExpr::Load { ptr: res_ptr }, span);
+                final_res
+            }
+
+            ExprKind::Select { arms } => {
+                let exit_block = self.alloc_block();
+                let res_ptr = self.alloc_value();
+                let res_ty = self.infer_expr_fir_type(expr).unwrap_or(FirType::Unit);
+                self.emit(
+                    Some(res_ptr),
+                    ValueExpr::Alloca {
+                        ty: res_ty.clone(),
+                        name: Some(
+                            INTERNER.intern(&format!("__select_res_{}", self.func.next_value_id)),
+                        ),
+                    },
+                    span,
+                );
+
+                let mut chan_arms = Vec::new();
+                let mut default_arm: Option<&SelectArm> = None;
+
+                for arm in arms {
+                    if arm.is_default {
+                        default_arm = Some(arm);
+                    } else if let Some(chan_expr) = &arm.channel {
+                        let chan_val = self.lower_expr(chan_expr);
+                        chan_arms.push((arm, chan_val));
+                    }
+                }
+
+                let has_default = default_arm.is_some();
+                let channel_vals: Vec<ValueId> = chan_arms.iter().map(|(_, c)| *c).collect();
+
+                let select_idx = self.alloc_value();
+                self.emit(
+                    Some(select_idx),
+                    ValueExpr::ChanSelect {
+                        channels: channel_vals,
+                        has_default,
+                    },
+                    span,
+                );
+
+                let mut next_arm_check = self.alloc_block();
+                self.set_terminator(Terminator::Branch {
+                    target: next_arm_check,
+                    args: Vec::new(),
+                });
+
+                for (idx, (arm, chan_val)) in chan_arms.iter().enumerate() {
+                    let cur_check_block = next_arm_check;
+                    let arm_body_block = self.alloc_block();
+                    next_arm_check = self.alloc_block();
+
+                    self.current_block = cur_check_block;
+                    let idx_val = self.alloc_value();
+                    self.emit(
+                        Some(idx_val),
+                        ValueExpr::Constant(ConstantValue::Int(idx as i128, IntType::I64)),
+                        arm.span,
+                    );
+                    let is_match = self.alloc_value();
+                    self.emit(
+                        Some(is_match),
+                        ValueExpr::Binary {
+                            op: BinaryOp::Eq,
+                            lhs: select_idx,
+                            rhs: idx_val,
+                        },
+                        arm.span,
+                    );
+                    self.set_terminator(Terminator::BranchCond {
+                        cond: is_match,
+                        then_block: arm_body_block,
+                        then_args: Vec::new(),
+                        else_block: next_arm_check,
+                        else_args: Vec::new(),
+                    });
+
+                    // Arm Body
+                    self.current_block = arm_body_block;
+
+                    if let Some(Pattern::Ident(var_sym, p_span)) = &arm.pattern {
+                        let recv_val = self.alloc_value();
+                        self.emit(
+                            Some(recv_val),
+                            ValueExpr::ChanRecv { chan: *chan_val },
+                            *p_span,
+                        );
+                        let var_ptr = self.alloc_value();
+                        let elem_ty = FirType::Int(IntType::I64);
+                        self.emit(
+                            Some(var_ptr),
+                            ValueExpr::Alloca {
+                                ty: elem_ty.clone(),
+                                name: Some(*var_sym),
+                            },
+                            *p_span,
+                        );
+                        self.emit(
+                            None,
+                            ValueExpr::Store {
+                                ptr: var_ptr,
+                                val: recv_val,
+                            },
+                            *p_span,
+                        );
+                        self.var_allocas.insert(*var_sym, var_ptr);
+                        self.var_types.insert(*var_sym, elem_ty);
+                    }
+
+                    let arm_res = self.lower_expr(&arm.body);
+                    self.emit(
+                        None,
+                        ValueExpr::Store {
+                            ptr: res_ptr,
+                            val: arm_res,
+                        },
+                        arm.span,
+                    );
+                    if let Some(b) = self.func.get_block(self.current_block) {
+                        if !b.is_terminated() {
+                            self.set_terminator(Terminator::Branch {
+                                target: exit_block,
+                                args: Vec::new(),
+                            });
+                        }
+                    }
+                }
+
+                // Default arm or fallthrough
+                self.current_block = next_arm_check;
+                if let Some(def_arm) = default_arm {
+                    let def_res = self.lower_expr(&def_arm.body);
+                    self.emit(
+                        None,
+                        ValueExpr::Store {
+                            ptr: res_ptr,
+                            val: def_res,
+                        },
+                        def_arm.span,
+                    );
+                }
+                if let Some(b) = self.func.get_block(self.current_block) {
+                    if !b.is_terminated() {
+                        self.set_terminator(Terminator::Branch {
+                            target: exit_block,
+                            args: Vec::new(),
+                        });
                     }
                 }
 

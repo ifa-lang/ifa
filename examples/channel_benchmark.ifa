@@ -1,0 +1,37 @@
+// IFA High-Throughput Inter-Fiber Message Passing Benchmark
+// Benchmarks lock-free MPMC atomic ring buffer channels under fiber multiplexing.
+
+import std::sync;
+import std::io;
+
+fn producer_fiber(ch: sync::Channel<i64>, total_messages: i64) {
+    mut counter: i64 = 0;
+    while counter < total_messages {
+        ch.send(counter);
+        counter += 1;
+    }
+}
+
+pub fn main() -> () {
+    let total_messages: i64 = 100000;
+    let chan: sync::Channel<i64> = sync::bounded(1024);
+
+    // Spawn producer fiber without async/await overhead
+    spawn producer_fiber(chan, total_messages);
+
+    mut received_count: i64 = 0;
+    while received_count < total_messages {
+        select {
+            let msg = chan => {
+                received_count += 1;
+            },
+            default => {
+                sync::yield_now();
+            }
+        }
+    }
+
+    io::println("IFA Colorless Fiber Channel Benchmark completed:");
+    io::println_i64(received_count);
+    io::println("Messages processed without GC pauses or color contagion.");
+}

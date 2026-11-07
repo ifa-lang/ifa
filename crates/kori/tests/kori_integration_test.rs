@@ -202,6 +202,7 @@ fn test_build_cache_fingerprint_and_staleness() {
             targets: TargetsConfig::default(),
             dependencies: BTreeMap::new(),
             dev_dependencies: BTreeMap::new(),
+            registries: BTreeMap::new(),
             profiles: Default::default(),
             ffi: None,
         },
@@ -551,6 +552,102 @@ crate_types = ["ifalib"]
     assert_eq!(info.len(), 1);
     assert_eq!(info[0].name, "algo-fast");
     assert_eq!(info[0].license.as_deref(), Some("Apache-2.0"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_remote_dependency_resolution_from_registry() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kori_remote_res_test_{}", std::process::id()));
+    let registry_dir = temp_dir.join("registry");
+    let lib_project_dir = temp_dir.join("remote_lib");
+    let app_project_dir = temp_dir.join("app_consumer");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(lib_project_dir.join("src")).unwrap();
+    fs::create_dir_all(app_project_dir.join("src")).unwrap();
+
+    // 1. Create and publish library package to mock registry
+    let lib_manifest = r#"
+[package]
+name = "remote-math"
+version = "0.1.0"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
+license = "MIT"
+description = "Remote math library for IFA"
+
+[targets.lib]
+name = "remote_math"
+path = "src/lib.ifa"
+crate_types = ["ifalib"]
+"#;
+    fs::write(lib_project_dir.join("kori.toml"), lib_manifest).unwrap();
+    fs::write(
+        lib_project_dir.join("src/lib.ifa"),
+        "pub fn compute_value() -> i64 { return 42; }",
+    )
+    .unwrap();
+
+    let pub_report = kori::Packager::publish(&lib_project_dir, Some(&registry_dir), false)
+        .expect("Publish to mock registry failed");
+    assert_eq!(pub_report.name, "remote-math");
+
+    // 2. Create consumer app depending on "remote-math" by version only (no local path)
+    let app_manifest_content = format!(
+        r#"
+[package]
+name = "app-consumer"
+version = "0.1.0"
+
+[targets]
+bin = [
+    {{ name = "app", path = "src/main.ifa" }}
+]
+
+[registries]
+local-mock = "{}"
+
+[dependencies]
+remote-math = "0.1.0"
+"#,
+        registry_dir.display()
+    );
+    fs::write(app_project_dir.join("kori.toml"), &app_manifest_content).unwrap();
+    fs::write(
+        app_project_dir.join("src/main.ifa"),
+        "import remote_math;\nfn main() { return 0; }",
+    )
+    .unwrap();
+
+    // 3. Resolve dependencies using DependencyResolver
+    let app_manifest: Manifest = app_manifest_content.parse().unwrap();
+    let resolver = DependencyResolver::new(app_project_dir.clone());
+    let (build_order, lockfile) = resolver
+        .resolve(&app_manifest, None)
+        .expect("Remote dependency resolution failed");
+
+    // 4. Assert topological order: remote-math must be built before app-consumer
+    assert_eq!(build_order.len(), 2);
+    assert_eq!(build_order[0].name, "remote-math");
+    assert_eq!(build_order[0].version, "0.1.0");
+    assert!(build_order[0].source.starts_with("registry+"));
+    assert_eq!(build_order[1].name, "app-consumer");
+
+    // 5. Assert lockfile contains remote package with checksum
+    assert_eq!(lockfile.packages.len(), 2);
+    let locked_dep = lockfile
+        .packages
+        .iter()
+        .find(|p| p.name == "remote-math")
+        .expect("remote-math missing from lockfile");
+    assert_eq!(locked_dep.version, "0.1.0");
+    assert!(locked_dep.checksum.is_some());
+    assert!(locked_dep.source.starts_with("registry+"));
+
+    // 6. Verify unpacked cache contains kori.toml and source
+    assert!(build_order[0].root_dir.join("kori.toml").exists());
+    assert!(build_order[0].root_dir.join("src/lib.ifa").exists());
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

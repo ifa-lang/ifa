@@ -549,4 +549,119 @@ impl Packager {
 
         Ok(entries)
     }
+
+    /// Resolve package download cache directory (defaults to ~/.kori/cache/packages).
+    pub fn default_cache_dir() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home)
+            .join(".kori")
+            .join("cache")
+            .join("packages")
+    }
+
+    /// Fetch and unpack a package archive from the registry into the local cache directory.
+    ///
+    /// Verifies the SHA-256 integrity checksum against the index entry before extracting.
+    pub fn fetch_and_unpack(
+        package_name: &str,
+        version_req: Option<&str>,
+        registry_path: Option<&Path>,
+        cache_dir: Option<&Path>,
+    ) -> Result<(PathBuf, PackageIndexEntry), KoriError> {
+        let reg_root = match registry_path {
+            Some(p) => p.to_path_buf(),
+            None => Self::default_registry_dir(),
+        };
+
+        let entries = Self::info(package_name, Some(&reg_root))?;
+        if entries.is_empty() {
+            return Err(KoriError::PackageNotFound(format!(
+                "Package `{}` not found in registry at `{}`",
+                package_name,
+                reg_root.display()
+            )));
+        }
+
+        // Match version according to semver requirements
+        let mut candidates: Vec<PackageIndexEntry> = if let Some(req_str) = version_req {
+            if let Ok(req) = semver::VersionReq::parse(req_str) {
+                entries
+                    .into_iter()
+                    .filter(|e| {
+                        semver::Version::parse(&e.version)
+                            .map(|v| req.matches(&v))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            } else {
+                entries
+                    .into_iter()
+                    .filter(|e| e.version == req_str)
+                    .collect()
+            }
+        } else {
+            entries
+        };
+
+        if candidates.is_empty() {
+            return Err(KoriError::VersionMismatch {
+                package: package_name.to_string(),
+                required: version_req.unwrap_or("*").to_string(),
+                found: "no matching version found in registry".to_string(),
+            });
+        }
+
+        candidates.sort_by(|a, b| {
+            let va = semver::Version::parse(&a.version).ok();
+            let vb = semver::Version::parse(&b.version).ok();
+            vb.cmp(&va)
+        });
+
+        let chosen = candidates.remove(0);
+
+        let cache_root = match cache_dir {
+            Some(p) => p.to_path_buf(),
+            None => Self::default_cache_dir(),
+        };
+
+        let target_dir = cache_root.join(format!("{}-{}", chosen.name, chosen.version));
+        let manifest_path = target_dir.join("kori.toml");
+
+        if target_dir.exists() && manifest_path.exists() {
+            return Ok((target_dir, chosen));
+        }
+
+        let archive_path = reg_root
+            .join("packages")
+            .join(&chosen.name)
+            .join(format!("{}-{}.kori", chosen.name, chosen.version));
+
+        if !archive_path.exists() {
+            return Err(KoriError::PackageNotFound(format!(
+                "Archive file not found for package `{}-{}` at `{}`",
+                chosen.name,
+                chosen.version,
+                archive_path.display()
+            )));
+        }
+
+        let archive_bytes = fs::read(&archive_path)?;
+        let actual_checksum = sha256_hex(&archive_bytes);
+        if actual_checksum != chosen.checksum {
+            return Err(KoriError::Registry(format!(
+                "Integrity verification failed for `{}`: expected SHA-256 `{}` but computed `{}`",
+                archive_path.display(),
+                chosen.checksum,
+                actual_checksum
+            )));
+        }
+
+        fs::create_dir_all(&target_dir)?;
+        Self::unpack_archive(&archive_bytes, &target_dir)?;
+
+        Ok((target_dir, chosen))
+    }
 }
+
+/// Alias for package archive manager.
+pub type PackageArchive = Packager;

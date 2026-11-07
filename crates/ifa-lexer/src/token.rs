@@ -70,6 +70,10 @@ pub enum RawToken {
     Catch,
     #[token("spawn")]
     Spawn,
+    #[token("select")]
+    Select,
+    #[token("default")]
+    Default,
     #[token("trait")]
     Trait,
     #[token("interface")]
@@ -233,6 +237,8 @@ pub enum TokenKind {
     Try,
     Catch,
     Spawn,
+    Select,
+    Default,
     Trait,
     Interface,
     Impl,
@@ -336,6 +342,8 @@ impl fmt::Display for TokenKind {
             TokenKind::Try => write!(f, "try"),
             TokenKind::Catch => write!(f, "catch"),
             TokenKind::Spawn => write!(f, "spawn"),
+            TokenKind::Select => write!(f, "select"),
+            TokenKind::Default => write!(f, "default"),
             TokenKind::Trait => write!(f, "trait"),
             TokenKind::Interface => write!(f, "interface"),
             TokenKind::Impl => write!(f, "impl"),

@@ -607,6 +607,14 @@ impl<'a> EscapeAnalyzer<'a> {
                     self.check_expr(&arm.body);
                 }
             }
+            ExprKind::Select { arms } => {
+                for arm in arms {
+                    if let Some(chan) = &arm.channel {
+                        self.check_expr(chan);
+                    }
+                    self.check_expr(&arm.body);
+                }
+            }
             _ => {}
         }
     }

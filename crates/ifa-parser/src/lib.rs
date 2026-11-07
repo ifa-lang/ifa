@@ -1271,12 +1271,20 @@ impl Parser {
 
                 while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
                     let pat_start = self.current().span.start;
-                    let pattern = if self.match_token(&TokenKind::Ident(sym("_"))) {
-                        Pattern::Wildcard(Span::new(
-                            self.file_id,
-                            pat_start,
-                            self.current().span.end,
-                        ))
+                    let pattern = if let TokenKind::Ident(s) = self.current().kind {
+                        self.advance();
+                        if s.as_str() == "_" {
+                            Pattern::Wildcard(Span::new(
+                                self.file_id,
+                                pat_start,
+                                self.current().span.end,
+                            ))
+                        } else {
+                            Pattern::Ident(
+                                s,
+                                Span::new(self.file_id, pat_start, self.current().span.end),
+                            )
+                        }
                     } else if let TokenKind::StringLiteral(s) = self.current().kind {
                         self.advance();
                         Pattern::Lit(
@@ -1287,12 +1295,6 @@ impl Parser {
                         self.advance();
                         Pattern::Lit(
                             Lit::Int(s),
-                            Span::new(self.file_id, pat_start, self.current().span.end),
-                        )
-                    } else if let TokenKind::Ident(s) = self.current().kind {
-                        self.advance();
-                        Pattern::Ident(
-                            s,
                             Span::new(self.file_id, pat_start, self.current().span.end),
                         )
                     } else {
@@ -1319,6 +1321,108 @@ impl Parser {
                         arms,
                     },
                     Span::new(self.file_id, match_tok.span.start, close.span.end),
+                ))
+            }
+            TokenKind::Select => {
+                let select_tok = self.advance();
+                self.expect(TokenKind::OpenBrace)?;
+                let mut arms = Vec::new();
+
+                while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
+                    let arm_start = self.current().span.start;
+
+                    // Optional 'case' keyword
+                    if let TokenKind::Ident(s) = self.current().kind {
+                        if s.as_str() == "case" {
+                            self.advance();
+                        }
+                    }
+
+                    if self.match_token(&TokenKind::Default) {
+                        self.expect(TokenKind::FatArrow)?;
+                        let body = self.parse_expr()?;
+                        let arm_span = Span::new(self.file_id, arm_start, body.span.end);
+                        arms.push(SelectArm {
+                            pattern: None,
+                            channel: None,
+                            is_default: true,
+                            body,
+                            span: arm_span,
+                        });
+                    } else if self.match_token(&TokenKind::Let) {
+                        let pat_start = self.current().span.start;
+                        let pattern = if let TokenKind::Ident(s) = self.current().kind {
+                            self.advance();
+                            if s.as_str() == "_" {
+                                Pattern::Wildcard(Span::new(
+                                    self.file_id,
+                                    pat_start,
+                                    self.current().span.end,
+                                ))
+                            } else {
+                                Pattern::Ident(
+                                    s,
+                                    Span::new(self.file_id, pat_start, self.current().span.end),
+                                )
+                            }
+                        } else {
+                            Pattern::Wildcard(Span::new(
+                                self.file_id,
+                                pat_start,
+                                self.current().span.end,
+                            ))
+                        };
+                        self.expect(TokenKind::Eq)?;
+                        let channel = self.parse_expr()?;
+                        self.expect(TokenKind::FatArrow)?;
+                        let body = self.parse_expr()?;
+                        let arm_span = Span::new(self.file_id, arm_start, body.span.end);
+                        arms.push(SelectArm {
+                            pattern: Some(pattern),
+                            channel: Some(channel),
+                            is_default: false,
+                            body,
+                            span: arm_span,
+                        });
+                    } else {
+                        let expr = self.parse_expr()?;
+                        if self.match_token(&TokenKind::Eq) {
+                            let channel = self.parse_expr()?;
+                            self.expect(TokenKind::FatArrow)?;
+                            let body = self.parse_expr()?;
+                            let arm_span = Span::new(self.file_id, arm_start, body.span.end);
+                            let pat = match expr.kind {
+                                ExprKind::Ident(sym) => Pattern::Ident(sym, expr.span),
+                                _ => Pattern::Wildcard(expr.span),
+                            };
+                            arms.push(SelectArm {
+                                pattern: Some(pat),
+                                channel: Some(channel),
+                                is_default: false,
+                                body,
+                                span: arm_span,
+                            });
+                        } else {
+                            self.expect(TokenKind::FatArrow)?;
+                            let body = self.parse_expr()?;
+                            let arm_span = Span::new(self.file_id, arm_start, body.span.end);
+                            arms.push(SelectArm {
+                                pattern: None,
+                                channel: Some(expr),
+                                is_default: false,
+                                body,
+                                span: arm_span,
+                            });
+                        }
+                    }
+
+                    self.match_token(&TokenKind::Comma);
+                }
+
+                let close = self.expect(TokenKind::CloseBrace)?;
+                Ok(Expr::new(
+                    ExprKind::Select { arms },
+                    Span::new(self.file_id, select_tok.span.start, close.span.end),
                 ))
             }
             TokenKind::Spawn => {
@@ -1692,5 +1796,51 @@ mod tests {
 
         assert!(diags.is_empty(), "Diagnostics: {:?}", diags);
         assert_eq!(prog.items.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_select_statement() {
+        let src = r#"
+            fn monitor(ch1: Channel, ch2: Channel) {
+                select {
+                    msg = ch1 => {
+                        handle(msg);
+                    },
+                    let data = ch2 => {
+                        process(data);
+                    },
+                    default => {
+                        idle();
+                    }
+                }
+            }
+        "#;
+        let fid = FileId(0);
+        let tokens = tokenize(fid, src);
+        let (prog, diags) = parse(fid, tokens);
+
+        assert!(diags.is_empty(), "Diagnostics: {:?}", diags);
+        assert_eq!(prog.items.len(), 1);
+        if let Item::Function(f) = &prog.items[0] {
+            let body = f.body.as_ref().unwrap();
+            let expr = body
+                .expr
+                .as_deref()
+                .or_else(|| {
+                    body.stmts.first().and_then(|s| match s {
+                        Stmt::Expr(e) => Some(e),
+                        _ => None,
+                    })
+                })
+                .expect("expected select expression");
+            if let ExprKind::Select { arms } = &expr.kind {
+                assert_eq!(arms.len(), 3);
+                assert!(!arms[0].is_default);
+                assert!(!arms[1].is_default);
+                assert!(arms[2].is_default);
+            } else {
+                panic!("expected ExprKind::Select");
+            }
+        }
     }
 }

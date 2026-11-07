@@ -1347,6 +1347,59 @@ impl<'a> SemanticAnalyzer<'a> {
                     unified
                 }
             }
+            ExprKind::Select { arms } => {
+                if arms.is_empty() {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "l'expression 'select' doit comporter au moins une branche",
+                        )
+                        .with_code("E0036")
+                        .with_primary_label(expr.span, "branches manquantes"),
+                    );
+                    Type::Unknown
+                } else {
+                    let mut arm_types = Vec::new();
+                    for arm in arms {
+                        self.symbols.enter_scope(false, false);
+                        let mut elem_ty = Type::Unknown;
+                        if let Some(chan_expr) = &arm.channel {
+                            let chan_ty = self.infer_expr(chan_expr);
+                            if let Type::Generic { name, args } = &chan_ty {
+                                if INTERNER.resolve(name) == "Channel" && !args.is_empty() {
+                                    elem_ty = args[0].clone();
+                                }
+                            }
+                            if let Some(pat) = &arm.pattern {
+                                self.check_pattern(pat, &elem_ty);
+                            }
+                        }
+                        let arm_ty = match &arm.body.kind {
+                            ExprKind::Block(b) => self.check_block(b, expected),
+                            _ => self.check_expr(&arm.body, expected),
+                        };
+                        self.symbols.exit_scope();
+                        arm_types.push(arm_ty);
+                    }
+
+                    if arm_types.is_empty() {
+                        Type::Unit
+                    } else {
+                        let mut unified = arm_types[0].clone();
+                        for arm_ty in &arm_types[1..] {
+                            if !arm_ty.is_assignable_to(&unified)
+                                && !unified.is_assignable_to(arm_ty)
+                                && *arm_ty != Type::Unknown
+                                && unified != Type::Unknown
+                            {
+                                // Types differ, fallback to unit or report error
+                            } else if unified == Type::Unknown {
+                                unified = arm_ty.clone();
+                            }
+                        }
+                        unified
+                    }
+                }
+            }
         };
 
         self.expr_types.insert(expr.span, ty.clone());
@@ -1979,6 +2032,39 @@ impl<'a> SemanticAnalyzer<'a> {
         }
         if m_name == "is_empty" {
             return Type::Bool;
+        }
+        if m_name == "send" {
+            for arg in args {
+                self.infer_expr(&arg.value);
+            }
+            return Type::Unit;
+        }
+        if m_name == "recv" {
+            if let Type::Generic {
+                name,
+                args: gen_args,
+            } = &rec_ty
+            {
+                if INTERNER.resolve(name) == "Channel" && !gen_args.is_empty() {
+                    return gen_args[0].clone();
+                }
+            }
+            return Type::Unknown;
+        }
+        if m_name == "try_recv" {
+            if let Type::Generic {
+                name,
+                args: gen_args,
+            } = &rec_ty
+            {
+                if INTERNER.resolve(name) == "Channel" && !gen_args.is_empty() {
+                    return Type::Optional(Box::new(gen_args[0].clone()));
+                }
+            }
+            return Type::Optional(Box::new(Type::Unknown));
+        }
+        if m_name == "close" {
+            return Type::Unit;
         }
 
         // Bounded generic type parameter method resolution:

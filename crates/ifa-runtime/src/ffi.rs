@@ -283,3 +283,57 @@ pub extern "C" fn ifa_rt_channel_is_closed(chan: *mut IfaChannelHandle) -> i32 {
         0
     }
 }
+
+/// Non-blocking or cooperative select over an array of channels.
+///
+/// Returns:
+/// - index >= 0: the index of the ready channel
+/// - num_channels: if `has_default != 0` and no channel is ready
+/// - -2: if all channels are closed
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_select(
+    channels: *const *mut IfaChannelHandle,
+    num_channels: usize,
+    has_default: i32,
+) -> i64 {
+    if channels.is_null() || num_channels == 0 {
+        return if has_default != 0 { 0 } else { -2 };
+    }
+
+    let chan_slice = unsafe { std::slice::from_raw_parts(channels, num_channels) };
+    let mut spins: u32 = 0;
+
+    loop {
+        let mut any_open = false;
+        for (idx, &handle_ptr) in chan_slice.iter().enumerate() {
+            if handle_ptr.is_null() {
+                continue;
+            }
+            let handle = unsafe { &*handle_ptr };
+            if !handle.0.is_closed() {
+                any_open = true;
+            }
+            if !handle.0.is_empty() {
+                return idx as i64;
+            }
+        }
+
+        if has_default != 0 {
+            return num_channels as i64;
+        }
+
+        if !any_open {
+            return -2;
+        }
+
+        spins += 1;
+        if spins < 32 {
+            std::hint::spin_loop();
+        } else if spins < 64 {
+            GLOBAL_SCHEDULER.yield_now();
+        } else {
+            std::thread::yield_now();
+            spins = 32;
+        }
+    }
+}

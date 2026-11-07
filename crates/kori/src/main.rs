@@ -231,6 +231,7 @@ fn handle_new(name: &str, lib: bool) -> ExitCode {
         },
         dependencies: BTreeMap::new(),
         dev_dependencies: BTreeMap::new(),
+        registries: BTreeMap::new(),
         profiles: Default::default(),
         ffi: if lib { Some(Default::default()) } else { None },
     };

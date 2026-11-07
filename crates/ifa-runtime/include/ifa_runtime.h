@@ -152,6 +152,12 @@ void ifa_rt_channel_close(ifa_channel_handle_t* chan);
  */
 int32_t ifa_rt_channel_is_closed(ifa_channel_handle_t* chan);
 
+/**
+ * Multiplex multiple channels non-blocking or cooperatively yielding until one has data.
+ * Returns the index of the ready channel, num_channels if has_default and none ready, or -2 if all closed.
+ */
+int64_t ifa_rt_channel_select(ifa_channel_handle_t** channels, size_t num_channels, int32_t has_default);
+
 /* --- Stream I/O API --- */
 
 void ifa_rt_print(const char* str);

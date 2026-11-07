@@ -15,6 +15,8 @@ pub struct Manifest {
     #[serde(default, rename = "dev-dependencies")]
     pub dev_dependencies: BTreeMap<String, DependencySpec>,
     #[serde(default)]
+    pub registries: BTreeMap<String, String>,
+    #[serde(default)]
     pub profiles: ProfilesConfig,
     #[serde(default)]
     pub ffi: Option<FfiConfig>,
@@ -126,6 +128,7 @@ pub struct DetailedDependency {
     pub git: Option<String>,
     pub branch: Option<String>,
     pub tag: Option<String>,
+    pub registry: Option<String>,
     #[serde(default)]
     pub features: Vec<String>,
 }

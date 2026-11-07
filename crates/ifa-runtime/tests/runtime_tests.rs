@@ -361,3 +361,32 @@ fn test_channel_c_abi_ffi() {
 
     ifa_rt_channel_destroy(chan_handle);
 }
+
+#[test]
+fn test_c_abi_channel_select() {
+    use ifa_runtime::ffi::ifa_rt_channel_select;
+
+    let ch1 = ifa_rt_channel_create(4);
+    let ch2 = ifa_rt_channel_create(4);
+
+    let arr = [ch1, ch2];
+
+    // Non-blocking select with default when empty returns 2 (num_channels)
+    let res = ifa_rt_channel_select(arr.as_ptr(), 2, 1);
+    assert_eq!(res, 2);
+
+    // Send into ch2
+    let val = 0xbeef as *mut u8;
+    assert_eq!(ifa_rt_channel_send(ch2, val), 0);
+
+    // Now select should immediately select channel 1 (ch2)
+    let res = ifa_rt_channel_select(arr.as_ptr(), 2, 0);
+    assert_eq!(res, 1);
+
+    let mut out: *mut u8 = std::ptr::null_mut();
+    assert_eq!(ifa_rt_channel_recv(ch2, &mut out), 0);
+    assert_eq!(out, val);
+
+    ifa_rt_channel_destroy(ch1);
+    ifa_rt_channel_destroy(ch2);
+}

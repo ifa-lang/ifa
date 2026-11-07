@@ -1,0 +1,48 @@
+// IFA Colorless Concurrency & Channel Multiplexing Showcase
+// Demonstrates fibers without async/await coloration, atomic ring buffers, and select branching.
+
+import std::sync;
+import std::io;
+
+struct Order {
+    order_id: i64,
+    amount_xof: i64,
+}
+
+fn worker_processor(orders_chan: sync::Channel<Order>, results_chan: sync::Channel<i64>) {
+    loop {
+        select {
+            let order = orders_chan => {
+                let fee = order.amount_xof / 100;
+                results_chan.send(fee);
+            },
+            default => {
+                sync::yield_now();
+            }
+        }
+    }
+}
+
+pub fn main() -> () {
+    let orders: sync::Channel<Order> = sync::channel();
+    let results: sync::Channel<i64> = sync::channel();
+
+    // Spawn colorless lightweight fiber worker
+    spawn worker_processor(orders, results);
+
+    let o1 = Order {
+        order_id: 1001,
+        amount_xof: 50000,
+    };
+    orders.send(o1);
+
+    select {
+        let fee = results => {
+            io::println("Fee processed successfully:");
+            io::println_i64(fee);
+        },
+        default => {
+            io::println("Pending processing...");
+        }
+    }
+}

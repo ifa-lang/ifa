@@ -298,6 +298,16 @@ pub struct MatchArm {
     pub span: Span,
 }
 
+/// A single branch in a concurrent multi-channel `select` statement or expression.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectArm {
+    pub pattern: Option<Pattern>,
+    pub channel: Option<Expr>,
+    pub is_default: bool,
+    pub body: Expr,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     Wildcard(Span),
@@ -380,6 +390,9 @@ pub enum ExprKind {
     Match {
         expr: Box<Expr>,
         arms: Vec<MatchArm>,
+    },
+    Select {
+        arms: Vec<SelectArm>,
     },
     Spawn(Box<Expr>),
     Catch {
@@ -547,6 +560,14 @@ pub trait Visitor<'ast>: Sized {
                 for arm in arms {
                     if let Some(guard) = &arm.guard {
                         self.visit_expr(guard);
+                    }
+                    self.visit_expr(&arm.body);
+                }
+            }
+            ExprKind::Select { arms } => {
+                for arm in arms {
+                    if let Some(chan) = &arm.channel {
+                        self.visit_expr(chan);
                     }
                     self.visit_expr(&arm.body);
                 }
