@@ -822,6 +822,11 @@ impl SroaPass {
             ValueExpr::EnumGetPayload { base, .. } => {
                 replace(base);
             }
+            ValueExpr::SliceSub { base, start, end } => {
+                replace(base);
+                replace(start);
+                replace(end);
+            }
         }
     }
 

@@ -2329,6 +2329,66 @@ impl<'a> SemanticAnalyzer<'a> {
                     self.check_pattern(e, target_ty);
                 }
             }
+            Pattern::Slice {
+                prefix,
+                rest,
+                suffix,
+                span,
+            } => {
+                let elem_ty = match target_ty {
+                    Type::Array(elem, len) => {
+                        let min_len = prefix.len() + suffix.len();
+                        if rest.is_none() {
+                            if min_len as u32 != *len {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "le motif de tableau attend {} élément(s), mais le tableau '{}' en compte {}",
+                                        min_len, target_ty, len
+                                    ))
+                                    .with_code("E0036")
+                                    .with_primary_label(*span, "arité de tableau incompatible"),
+                                );
+                            }
+                        } else if (min_len as u32) > *len {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "le motif de tranche requiert au moins {} élément(s), mais le tableau '{}' n'en compte que {}",
+                                    min_len, target_ty, len
+                                ))
+                                .with_code("E0036")
+                                .with_primary_label(*span, "nombre d'éléments insuffisant"),
+                            );
+                        }
+                        *elem.clone()
+                    }
+                    Type::Slice(elem) => *elem.clone(),
+                    Type::Unknown => Type::Unknown,
+                    _ => {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "le motif de tranche est incompatible avec le type non-indexable '{}'",
+                                target_ty
+                            ))
+                            .with_code("E0036")
+                            .with_primary_label(*span, "type de motif incompatible"),
+                        );
+                        Type::Unknown
+                    }
+                };
+
+                for p in prefix {
+                    self.check_pattern(p, &elem_ty);
+                }
+
+                if let Some(Some(rest_pat)) = rest {
+                    let slice_ty = Type::Slice(Box::new(elem_ty.clone()));
+                    self.check_pattern(rest_pat, &slice_ty);
+                }
+
+                for s in suffix {
+                    self.check_pattern(s, &elem_ty);
+                }
+            }
         }
     }
 

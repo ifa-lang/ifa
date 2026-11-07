@@ -33,6 +33,72 @@ fn is_irrefutable_pattern(pat: &Pattern) -> bool {
         Pattern::Tuple(elems, _) => elems.iter().all(is_irrefutable_pattern),
         Pattern::Struct { fields, .. } => fields.iter().all(|f| is_irrefutable_pattern(&f.pattern)),
         Pattern::Or(pats, _) => pats.iter().any(is_irrefutable_pattern),
+        Pattern::Slice {
+            prefix,
+            rest,
+            suffix,
+            ..
+        } => {
+            let rest_ok = rest
+                .as_ref()
+                .is_none_or(|r| r.as_ref().is_none_or(|p| is_irrefutable_pattern(p)));
+            prefix.is_empty() && suffix.is_empty() && rest.is_some() && rest_ok
+        }
+        Pattern::Variant { .. } | Pattern::Lit(_, _) | Pattern::Range { .. } => false,
+    }
+}
+
+/// Helper returning whether a pattern unconditionally matches any value of the target type.
+fn is_irrefutable_pattern_for_type(pat: &Pattern, target_ty: &Type) -> bool {
+    match pat {
+        Pattern::Wildcard(_) | Pattern::Ident(_, _) => true,
+        Pattern::Tuple(elems, _) => match target_ty {
+            Type::Tuple(expected) if expected.len() == elems.len() => elems
+                .iter()
+                .zip(expected.iter())
+                .all(|(p, t)| is_irrefutable_pattern_for_type(p, t)),
+            _ => elems.iter().all(is_irrefutable_pattern),
+        },
+        Pattern::Struct { fields, .. } => fields.iter().all(|f| is_irrefutable_pattern(&f.pattern)),
+        Pattern::Or(pats, _) => pats
+            .iter()
+            .any(|p| is_irrefutable_pattern_for_type(p, target_ty)),
+        Pattern::Slice {
+            prefix,
+            rest,
+            suffix,
+            ..
+        } => match target_ty {
+            Type::Array(elem_ty, len) => {
+                let prefix_ok = prefix
+                    .iter()
+                    .all(|p| is_irrefutable_pattern_for_type(p, elem_ty));
+                let suffix_ok = suffix
+                    .iter()
+                    .all(|s| is_irrefutable_pattern_for_type(s, elem_ty));
+                let rest_ok = rest.as_ref().is_none_or(|r| {
+                    r.as_ref().is_none_or(|p| {
+                        is_irrefutable_pattern_for_type(p, &Type::Slice(elem_ty.clone()))
+                    })
+                });
+
+                let total_min = (prefix.len() + suffix.len()) as u32;
+                if rest.is_none() {
+                    total_min == *len && prefix_ok && suffix_ok
+                } else {
+                    total_min <= *len && prefix_ok && suffix_ok && rest_ok
+                }
+            }
+            Type::Slice(elem_ty) => {
+                let rest_ok = rest.as_ref().is_none_or(|r| {
+                    r.as_ref().is_none_or(|p| {
+                        is_irrefutable_pattern_for_type(p, &Type::Slice(elem_ty.clone()))
+                    })
+                });
+                prefix.is_empty() && suffix.is_empty() && rest.is_some() && rest_ok
+            }
+            _ => false,
+        },
         Pattern::Variant { .. } | Pattern::Lit(_, _) | Pattern::Range { .. } => false,
     }
 }
@@ -135,7 +201,8 @@ impl<'a> CoverageState<'a> {
             Pattern::Wildcard(_)
             | Pattern::Ident(_, _)
             | Pattern::Tuple(_, _)
-            | Pattern::Struct { .. } => {}
+            | Pattern::Struct { .. }
+            | Pattern::Slice { .. } => {}
             Pattern::Variant { variant, inner, .. } => match inner.as_deref() {
                 None | Some(Pattern::Wildcard(_)) | Some(Pattern::Ident(_, _)) => {
                     self.fully_covered_variants.insert(*variant);
@@ -154,7 +221,8 @@ impl<'a> CoverageState<'a> {
                 | Some(Pattern::Tuple(_, _))
                 | Some(Pattern::Struct { .. })
                 | Some(Pattern::Or(_, _))
-                | Some(Pattern::Range { .. }) => {}
+                | Some(Pattern::Range { .. })
+                | Some(Pattern::Slice { .. }) => {}
             },
             Pattern::Lit(lit, _) => {
                 if *self.target_ty == Type::Bool {
@@ -268,7 +336,7 @@ pub fn check_match_exhaustiveness(
 
         // 2. Accumulate Coverage (ONLY for unguarded arms)
         if !is_guarded {
-            if is_irrefutable_pattern(&arm.pattern) {
+            if is_irrefutable_pattern_for_type(&arm.pattern, target_ty) {
                 has_universal_catch_all = true;
                 if let Some(ref all_variants) = enum_variants_info {
                     for (v, _) in all_variants {

@@ -210,6 +210,9 @@ impl<'a> FirPrinter<'a> {
             ValueExpr::ArrayLen { array } => {
                 write!(self.output, "array.len {}", array)
             }
+            ValueExpr::SliceSub { base, start, end } => {
+                write!(self.output, "slicesub {}, {}, {}", base, start, end)
+            }
             ValueExpr::StructPushField {
                 base,
                 field_idx,

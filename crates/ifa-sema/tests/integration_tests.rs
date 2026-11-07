@@ -1837,3 +1837,127 @@ fn test_range_pattern_non_scalar_rejected() {
         .iter()
         .any(|d| d.code.as_deref() == Some("E0036")));
 }
+
+#[test]
+fn test_slice_pattern_matching_fixed_array_success() {
+    let code = r#"
+        fn classify_trio(arr: [i64; 3]) -> i64 {
+            return match arr {
+                [0, 0, 0] => 0,
+                [first, 2, third] => first + third,
+                [x, y, z] => x + y + z,
+            };
+        }
+
+        fn classify_with_rest(arr: [i64; 4]) -> i64 {
+            return match arr {
+                [0, ..mid, 0] => 100,
+                [first, ..mid, last] => first + last,
+            };
+        }
+
+        fn test_rest_wildcards(arr: [i64; 4]) -> i64 {
+            return match arr {
+                [1, ..] => 1,
+                [.., 9] => 9,
+                [..] => 0,
+            };
+        }
+
+        pub fn main() {
+            let a = classify_trio([1, 2, 3]);
+            let b = classify_with_rest([10, 20, 30, 40]);
+            let c = test_rest_wildcards([1, 2, 3, 4]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Slice pattern matching on fixed arrays must pass type checking: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_slice_pattern_arity_mismatch_rejected() {
+    let code = r#"
+        fn bad_arity(arr: [i64; 3]) -> i64 {
+            return match arr {
+                [a, b] => a + b,
+                _ => 0,
+            };
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Slice pattern with incorrect fixed arity must fail with E0036"
+    );
+    assert!(res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0036")));
+}
+
+#[test]
+fn test_slice_pattern_insufficient_elements_rejected() {
+    let code = r#"
+        fn too_many_elements(arr: [i64; 2]) -> i64 {
+            return match arr {
+                [a, b, c, ..rest] => a + b + c,
+                _ => 0,
+            };
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Slice pattern with more elements than fixed array must fail with E0036"
+    );
+    assert!(res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0036")));
+}
+
+#[test]
+fn test_slice_pattern_multiple_rest_rejected() {
+    let code = r#"
+        fn double_rest(arr: [i64; 4]) -> i64 {
+            return match arr {
+                [a, ..mid1, ..mid2, z] => a + z,
+                _ => 0,
+            };
+        }
+    "#;
+    let mut source_map = SourceMap::new();
+    let file_id = source_map.add_file("test_double_rest.ifa", code);
+    let tokens = tokenize(file_id, code);
+    let (_, diags) = parse(file_id, tokens);
+    assert!(
+        !diags.is_empty(),
+        "Multiple rest patterns in a slice pattern must be rejected with E0046"
+    );
+    assert!(diags.iter().any(|d| d.code.as_deref() == Some("E0046")));
+}
+
+#[test]
+fn test_slice_pattern_non_indexable_rejected() {
+    let code = r#"
+        fn slice_on_scalar(n: i64) -> i64 {
+            return match n {
+                [a, b] => a + b,
+                _ => 0,
+            };
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Slice pattern on non-indexable scalar must fail with E0036"
+    );
+    assert!(res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0036")));
+}

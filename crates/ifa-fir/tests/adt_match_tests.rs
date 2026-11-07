@@ -578,3 +578,122 @@ fn test_or_pattern_with_shared_bindings_execution() {
     // r1: 42, r2: 100, r3: 0 => sum = 142
     assert_eq!(res, FirValue::Int(142));
 }
+
+#[test]
+fn test_slice_pattern_matching_fixed_array_interp() {
+    let src = r#"
+        fn classify_trio(arr: [i64; 3]) -> i64 {
+            return match arr {
+                [0, 0, 0] => 0,
+                [first, 2, third] => first * 10 + third,
+                [x, y, z] => x + y + z,
+            };
+        }
+
+        pub fn main() -> i64 {
+            let a = classify_trio([0, 0, 0]);
+            let b = classify_trio([5, 2, 7]);
+            let c = classify_trio([10, 20, 30]);
+            return a + b + c;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("slice_pattern_fixed.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    // a = 0
+    // b = 5 * 10 + 7 = 57
+    // c = 10 + 20 + 30 = 60
+    // sum = 117
+    assert_eq!(res, FirValue::Int(117));
+}
+
+#[test]
+fn test_slice_pattern_with_rest_and_subslice_interp() {
+    let src = r#"
+        fn classify_with_rest(arr: [i64; 4]) -> i64 {
+            return match arr {
+                [0, ..mid, 0] => 1000,
+                [first, ..mid, last] => first * 100 + last,
+            };
+        }
+
+        pub fn main() -> i64 {
+            let r1 = classify_with_rest([0, 5, 8, 0]);
+            let r2 = classify_with_rest([3, 7, 11, 9]);
+            return r1 + r2;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("slice_pattern_rest.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    // r1: 1000
+    // r2: 3 * 100 + 9 = 309
+    // sum = 1309
+    assert_eq!(res, FirValue::Int(1309));
+}
+
+#[test]
+fn test_nested_slice_pattern_matching_interp() {
+    let src = r#"
+        fn sum_matrix_2x2(m: [[i64; 2]; 2]) -> i64 {
+            return match m {
+                [[a, b], [c, d]] => a + b + c + d,
+            };
+        }
+
+        pub fn main() -> i64 {
+            let m: [[i64; 2]; 2] = [[10, 20], [30, 40]];
+            return sum_matrix_2x2(m);
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("nested_slice_pattern.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    // 10 + 20 + 30 + 40 = 100
+    assert_eq!(res, FirValue::Int(100));
+}

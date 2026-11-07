@@ -625,6 +625,24 @@ impl<'a> LlvmIrEmitter<'a> {
                             },
                             _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
                         },
+                        ValueExpr::SliceSub { base, .. } => match value_types.get(base) {
+                            Some(ifa_fir::FirType::Array(inner, _))
+                            | Some(ifa_fir::FirType::Slice(inner)) => {
+                                ifa_fir::FirType::Slice(inner.clone())
+                            }
+                            Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
+                                ifa_fir::FirType::Array(elem, _)
+                                | ifa_fir::FirType::Slice(elem) => {
+                                    ifa_fir::FirType::Slice(elem.clone())
+                                }
+                                _ => ifa_fir::FirType::Slice(Box::new(ifa_fir::FirType::Int(
+                                    ifa_sema::types::IntType::I64,
+                                ))),
+                            },
+                            _ => ifa_fir::FirType::Slice(Box::new(ifa_fir::FirType::Int(
+                                ifa_sema::types::IntType::I64,
+                            ))),
+                        },
                         ValueExpr::ArrayInit(elements) => {
                             let elem_ty = elements
                                 .first()
@@ -1474,6 +1492,27 @@ impl<'a> LlvmIrEmitter<'a> {
                         res_id, p_ty_str, res_id
                     ));
                 }
+            }
+            ValueExpr::SliceSub { base, start, .. } => {
+                let (elem_ty_str, _) = match value_types.get(base) {
+                    Some(ifa_fir::FirType::Array(inner, _))
+                    | Some(ifa_fir::FirType::Slice(inner)) => (
+                        fir_to_llvm_type(inner).unwrap_or_else(|_| "i64".to_string()),
+                        llvm_align_for_type(inner),
+                    ),
+                    Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
+                        ifa_fir::FirType::Array(elem, _) | ifa_fir::FirType::Slice(elem) => (
+                            fir_to_llvm_type(elem).unwrap_or_else(|_| "i64".to_string()),
+                            llvm_align_for_type(elem),
+                        ),
+                        _ => ("i64".to_string(), 8),
+                    },
+                    _ => ("i64".to_string(), 8),
+                };
+                out.push_str(&format!(
+                    "  %v{} = getelementptr inbounds {}, ptr %v{}, i64 %v{}\n",
+                    res_id, elem_ty_str, base.0, start.0
+                ));
             }
             _ => {
                 // Default fallback for intermediate structures

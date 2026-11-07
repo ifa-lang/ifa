@@ -3325,6 +3325,308 @@ impl<'a> FunctionLoweringContext<'a> {
                     }
                 }
             }
+            Pattern::Slice {
+                prefix,
+                rest,
+                suffix,
+                span: sl_span,
+            } => {
+                let prefix_len = prefix.len();
+                let suffix_len = suffix.len();
+                let min_len = prefix_len + suffix_len;
+
+                let elem_fir_ty = match target_ty {
+                    FirType::Array(elem, _) => (**elem).clone(),
+                    FirType::Slice(elem) => (**elem).clone(),
+                    FirType::Pointer(inner) => match &**inner {
+                        FirType::Array(elem, _) | FirType::Slice(elem) => (**elem).clone(),
+                        _ => FirType::Int(IntType::I64),
+                    },
+                    _ => FirType::Int(IntType::I64),
+                };
+
+                let mut start_matching_block = self.current_block;
+
+                match target_ty {
+                    FirType::Array(_, arr_len) => {
+                        let actual_len = *arr_len as usize;
+                        if rest.is_none() {
+                            if min_len != actual_len {
+                                self.set_terminator(Terminator::Branch {
+                                    target: fail_target,
+                                    args: Vec::new(),
+                                });
+                                return;
+                            }
+                        } else if min_len > actual_len {
+                            self.set_terminator(Terminator::Branch {
+                                target: fail_target,
+                                args: Vec::new(),
+                            });
+                            return;
+                        }
+                    }
+                    _ => {
+                        let total_len = self.alloc_value();
+                        self.emit(
+                            Some(total_len),
+                            ValueExpr::ArrayLen { array: target_val },
+                            *sl_span,
+                        );
+
+                        let min_len_val = self.alloc_value();
+                        self.emit(
+                            Some(min_len_val),
+                            ValueExpr::Constant(ConstantValue::Int(min_len as i128, IntType::I64)),
+                            *sl_span,
+                        );
+
+                        let cmp_op = if rest.is_none() {
+                            BinaryOp::Eq
+                        } else {
+                            BinaryOp::Ge
+                        };
+                        let cond = self.alloc_value();
+                        self.emit(
+                            Some(cond),
+                            ValueExpr::Binary {
+                                op: cmp_op,
+                                lhs: total_len,
+                                rhs: min_len_val,
+                            },
+                            *sl_span,
+                        );
+
+                        let next_block = self.alloc_block();
+                        self.set_terminator(Terminator::BranchCond {
+                            cond,
+                            then_block: next_block,
+                            then_args: Vec::new(),
+                            else_block: fail_target,
+                            else_args: Vec::new(),
+                        });
+                        self.current_block = next_block;
+                        start_matching_block = next_block;
+                    }
+                }
+
+                let has_rest_pat = rest.as_ref().and_then(|r| r.as_ref()).is_some();
+                let total_sub = prefix_len + (if has_rest_pat { 1 } else { 0 }) + suffix_len;
+
+                if total_sub == 0 {
+                    self.set_terminator(Terminator::Branch {
+                        target: success_target,
+                        args: Vec::new(),
+                    });
+                    return;
+                }
+
+                let mut intermediate_blocks = Vec::with_capacity(total_sub);
+                intermediate_blocks.push(start_matching_block);
+                for _ in 0..total_sub - 1 {
+                    intermediate_blocks.push(self.alloc_block());
+                }
+
+                let mut step_idx = 0;
+
+                // 1. Lower prefix elements
+                for (i, p) in prefix.iter().enumerate() {
+                    let block_for_this = intermediate_blocks[step_idx];
+                    let next_success = if step_idx + 1 < total_sub {
+                        intermediate_blocks[step_idx + 1]
+                    } else {
+                        success_target
+                    };
+                    self.current_block = block_for_this;
+
+                    let idx_val = self.alloc_value();
+                    self.emit(
+                        Some(idx_val),
+                        ValueExpr::Constant(ConstantValue::Int(i as i128, IntType::I64)),
+                        p.span(),
+                    );
+
+                    let elem_val = self.alloc_value();
+                    self.emit(
+                        Some(elem_val),
+                        ValueExpr::GetElement {
+                            base: target_val,
+                            index: idx_val,
+                        },
+                        p.span(),
+                    );
+
+                    self.lower_pattern_match(
+                        elem_val,
+                        &elem_fir_ty,
+                        p,
+                        next_success,
+                        fail_target,
+                        p.span(),
+                    );
+                    step_idx += 1;
+                }
+
+                // 2. Lower rest sub-slice pattern (if bound, e.g. `..rest`)
+                if let Some(Some(rest_pat)) = rest {
+                    let block_for_this = intermediate_blocks[step_idx];
+                    let next_success = if step_idx + 1 < total_sub {
+                        intermediate_blocks[step_idx + 1]
+                    } else {
+                        success_target
+                    };
+                    self.current_block = block_for_this;
+
+                    let start_val = self.alloc_value();
+                    self.emit(
+                        Some(start_val),
+                        ValueExpr::Constant(ConstantValue::Int(prefix_len as i128, IntType::I64)),
+                        rest_pat.span(),
+                    );
+
+                    let end_val = match target_ty {
+                        FirType::Array(_, arr_len) => {
+                            let end_idx = (*arr_len as usize).saturating_sub(suffix_len);
+                            let end_c = self.alloc_value();
+                            self.emit(
+                                Some(end_c),
+                                ValueExpr::Constant(ConstantValue::Int(
+                                    end_idx as i128,
+                                    IntType::I64,
+                                )),
+                                rest_pat.span(),
+                            );
+                            end_c
+                        }
+                        _ => {
+                            let total_len = self.alloc_value();
+                            self.emit(
+                                Some(total_len),
+                                ValueExpr::ArrayLen { array: target_val },
+                                rest_pat.span(),
+                            );
+                            if suffix_len == 0 {
+                                total_len
+                            } else {
+                                let suf_c = self.alloc_value();
+                                self.emit(
+                                    Some(suf_c),
+                                    ValueExpr::Constant(ConstantValue::Int(
+                                        suffix_len as i128,
+                                        IntType::I64,
+                                    )),
+                                    rest_pat.span(),
+                                );
+                                let sub_res = self.alloc_value();
+                                self.emit(
+                                    Some(sub_res),
+                                    ValueExpr::Binary {
+                                        op: BinaryOp::Sub,
+                                        lhs: total_len,
+                                        rhs: suf_c,
+                                    },
+                                    rest_pat.span(),
+                                );
+                                sub_res
+                            }
+                        }
+                    };
+
+                    let slice_val = self.alloc_value();
+                    self.emit(
+                        Some(slice_val),
+                        ValueExpr::SliceSub {
+                            base: target_val,
+                            start: start_val,
+                            end: end_val,
+                        },
+                        rest_pat.span(),
+                    );
+
+                    self.lower_pattern_match(
+                        slice_val,
+                        &FirType::Slice(Box::new(elem_fir_ty.clone())),
+                        rest_pat,
+                        next_success,
+                        fail_target,
+                        rest_pat.span(),
+                    );
+                    step_idx += 1;
+                }
+
+                // 3. Lower suffix elements
+                for (j, s) in suffix.iter().enumerate() {
+                    let block_for_this = intermediate_blocks[step_idx];
+                    let next_success = if step_idx + 1 < total_sub {
+                        intermediate_blocks[step_idx + 1]
+                    } else {
+                        success_target
+                    };
+                    self.current_block = block_for_this;
+
+                    let idx_val = match target_ty {
+                        FirType::Array(_, arr_len) => {
+                            let target_idx = (*arr_len as usize) - suffix_len + j;
+                            let idx_c = self.alloc_value();
+                            self.emit(
+                                Some(idx_c),
+                                ValueExpr::Constant(ConstantValue::Int(
+                                    target_idx as i128,
+                                    IntType::I64,
+                                )),
+                                s.span(),
+                            );
+                            idx_c
+                        }
+                        _ => {
+                            let total_len = self.alloc_value();
+                            self.emit(
+                                Some(total_len),
+                                ValueExpr::ArrayLen { array: target_val },
+                                s.span(),
+                            );
+                            let diff = suffix_len - j;
+                            let diff_c = self.alloc_value();
+                            self.emit(
+                                Some(diff_c),
+                                ValueExpr::Constant(ConstantValue::Int(diff as i128, IntType::I64)),
+                                s.span(),
+                            );
+                            let sub_res = self.alloc_value();
+                            self.emit(
+                                Some(sub_res),
+                                ValueExpr::Binary {
+                                    op: BinaryOp::Sub,
+                                    lhs: total_len,
+                                    rhs: diff_c,
+                                },
+                                s.span(),
+                            );
+                            sub_res
+                        }
+                    };
+
+                    let elem_val = self.alloc_value();
+                    self.emit(
+                        Some(elem_val),
+                        ValueExpr::GetElement {
+                            base: target_val,
+                            index: idx_val,
+                        },
+                        s.span(),
+                    );
+
+                    self.lower_pattern_match(
+                        elem_val,
+                        &elem_fir_ty,
+                        s,
+                        next_success,
+                        fail_target,
+                        s.span(),
+                    );
+                    step_idx += 1;
+                }
+            }
         }
     }
 }

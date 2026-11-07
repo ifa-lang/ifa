@@ -1028,6 +1028,63 @@ impl<'a> FirInterpreter<'a> {
                 }
             }
 
+            ValueExpr::SliceSub { base, start, end } => {
+                let base_val = env.get(base).ok_or(InterpError::UndefinedValue(*base))?;
+                let start_val = env.get(start).ok_or(InterpError::UndefinedValue(*start))?;
+                let end_val = env.get(end).ok_or(InterpError::UndefinedValue(*end))?;
+                let s_idx = match start_val {
+                    FirValue::Int(i) => (*i).max(0) as usize,
+                    _ => {
+                        return Err(InterpError::TypeMismatch(
+                            "Slice start must be an integer".into(),
+                        ))
+                    }
+                };
+                let e_idx = match end_val {
+                    FirValue::Int(i) => (*i).max(0) as usize,
+                    _ => {
+                        return Err(InterpError::TypeMismatch(
+                            "Slice end must be an integer".into(),
+                        ))
+                    }
+                };
+
+                let extract_sub = |elements: &[FirValue]| -> FirValue {
+                    let s = s_idx.min(elements.len());
+                    let e = e_idx.min(elements.len()).max(s);
+                    FirValue::Array(elements[s..e].to_vec())
+                };
+
+                match base_val {
+                    FirValue::Array(elements) => Ok(extract_sub(elements)),
+                    FirValue::Pointer(addr) => {
+                        if let Some(target) = self.stack_memory.get(addr) {
+                            match target {
+                                FirValue::Array(elements) => Ok(extract_sub(elements)),
+                                _ => Err(InterpError::TypeMismatch(
+                                    "Referenced target is not an array".into(),
+                                )),
+                            }
+                        } else {
+                            Err(InterpError::InvalidPointer(*addr))
+                        }
+                    }
+                    FirValue::GenRef { slot, generation } => {
+                        self.heap.check(*slot, *generation)?;
+                        if let FirValue::Array(elements) = self.heap.deref(*slot)? {
+                            Ok(extract_sub(elements))
+                        } else {
+                            Err(InterpError::TypeMismatch(
+                                "Referenced target is not an array".into(),
+                            ))
+                        }
+                    }
+                    _ => Err(InterpError::TypeMismatch(
+                        "Base for SliceSub must be an array or slice".into(),
+                    )),
+                }
+            }
+
             ValueExpr::StructPushField {
                 base,
                 field_idx,

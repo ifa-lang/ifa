@@ -762,3 +762,45 @@ fn test_cranelift_jit_or_and_range_pattern_matching() {
     // r1: 10, r2: 50, r3: 100, r4: 100, r5: 0 => 10 + 50 + 100 + 100 + 0 = 260
     assert_eq!(result, 260);
 }
+
+#[test]
+fn test_cranelift_slice_pattern_matching_jit() {
+    let src = r#"
+        fn classify_trio(arr: [i64; 3]) -> i64 {
+            return match arr {
+                [0, 0, 0] => 0,
+                [first, 2, third] => first * 10 + third,
+                [x, y, z] => x + y + z,
+            };
+        }
+
+        pub fn main() -> i64 {
+            let a = classify_trio([0, 0, 0]);
+            let b = classify_trio([5, 2, 7]);
+            let c = classify_trio([10, 20, 30]);
+
+            return a + b + c;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("cranelift_slice_pattern.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    // a = 0, b = 57, c = 60 => 117
+    assert_eq!(result, 117);
+}

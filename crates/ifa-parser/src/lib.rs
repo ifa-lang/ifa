@@ -1604,6 +1604,70 @@ impl Parser {
         let cur = self.current();
         let pat_start = cur.span.start;
         match cur.kind {
+            TokenKind::OpenBracket => {
+                self.advance();
+                if self.match_token(&TokenKind::CloseBracket) {
+                    let span = Span::new(
+                        self.file_id,
+                        pat_start,
+                        self.tokens[self.cursor - 1].span.end,
+                    );
+                    Ok(Pattern::Slice {
+                        prefix: Vec::new(),
+                        rest: None,
+                        suffix: Vec::new(),
+                        span,
+                    })
+                } else {
+                    let mut prefix = Vec::new();
+                    let mut rest: Option<Option<Box<Pattern>>> = None;
+                    let mut suffix = Vec::new();
+
+                    while !self.check(&TokenKind::CloseBracket) && !self.check(&TokenKind::Eof) {
+                        if self.match_token(&TokenKind::DotDot) {
+                            let dotdot_span = self.tokens[self.cursor - 1].span;
+                            if rest.is_some() {
+                                let diag = Diagnostic::error(
+                                    "plus d'un motif de reste '..' dans un motif de tranche",
+                                )
+                                .with_code("E0046")
+                                .with_primary_label(dotdot_span, "motif de reste en double");
+                                self.diagnostics.push(diag.clone());
+                                return Err(diag);
+                            }
+
+                            if !self.check(&TokenKind::Comma)
+                                && !self.check(&TokenKind::CloseBracket)
+                            {
+                                let rest_pat = self.parse_primary_pattern()?;
+                                rest = Some(Some(Box::new(rest_pat)));
+                            } else {
+                                rest = Some(None);
+                            }
+                        } else {
+                            let elem_pat = self.parse_pattern()?;
+                            if rest.is_some() {
+                                suffix.push(elem_pat);
+                            } else {
+                                prefix.push(elem_pat);
+                            }
+                        }
+
+                        if !self.match_token(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+
+                    let close = self.expect(TokenKind::CloseBracket)?;
+                    let span = Span::new(self.file_id, pat_start, close.span.end);
+                    Ok(Pattern::Slice {
+                        prefix,
+                        rest,
+                        suffix,
+                        span,
+                    })
+                }
+            }
             TokenKind::OpenParen => {
                 self.advance();
                 if self.match_token(&TokenKind::CloseParen) {

@@ -665,6 +665,15 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     .load(cl_ty, MemFlagsData::trusted(), base_val, 8);
                 Some(payload)
             }
+
+            ValueExpr::SliceSub { base, start, .. } => {
+                let base_addr = self.value_map[base];
+                let start_idx = self.value_map[start];
+                let elem_size = self.builder.ins().iconst(self.ptr_type, 8);
+                let offset = self.builder.ins().imul(start_idx, elem_size);
+                let sub_addr = self.builder.ins().iadd(base_addr, offset);
+                Some(sub_addr)
+            }
         };
 
         Ok(val)

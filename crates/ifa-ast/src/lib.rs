@@ -341,6 +341,12 @@ pub enum Pattern {
         inclusive: bool,
         span: Span,
     },
+    Slice {
+        prefix: Vec<Pattern>,
+        rest: Option<Option<Box<Pattern>>>,
+        suffix: Vec<Pattern>,
+        span: Span,
+    },
 }
 
 impl Pattern {
@@ -354,6 +360,7 @@ impl Pattern {
             Pattern::Struct { span, .. } => *span,
             Pattern::Or(_, sp) => *sp,
             Pattern::Range { span, .. } => *span,
+            Pattern::Slice { span, .. } => *span,
         }
     }
 }
