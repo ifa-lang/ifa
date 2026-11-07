@@ -1028,25 +1028,13 @@ impl Parser {
             }
             TokenKind::For => {
                 let for_tok = self.advance();
-                let var = match self.current().kind {
-                    TokenKind::Ident(s) => {
-                        self.advance();
-                        s
-                    }
-                    _ => {
-                        let c = self.current();
-                        let diag = Diagnostic::error("nom de variable attendu après 'for'")
-                            .with_primary_label(c.span, "identifiant attendu");
-                        self.diagnostics.push(diag.clone());
-                        return Err(diag);
-                    }
-                };
+                let pattern = self.parse_pattern()?;
                 self.expect(TokenKind::In)?;
                 let iterable = self.parse_expr()?;
                 let body = self.parse_block()?;
                 let end = body.span.end;
                 Ok(Stmt::For {
-                    var,
+                    pattern,
                     iterable,
                     body,
                     span: Span::new(self.file_id, for_tok.span.start, end),

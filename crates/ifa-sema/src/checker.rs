@@ -1219,10 +1219,10 @@ impl<'a> SemanticAnalyzer<'a> {
                 self.symbols.exit_scope();
             }
             Stmt::For {
-                var,
+                pattern,
                 iterable,
                 body,
-                span,
+                span: _,
             } => {
                 let iter_ty = self.infer_expr(iterable);
                 let elem_ty = match &iter_ty {
@@ -1246,13 +1246,9 @@ impl<'a> SemanticAnalyzer<'a> {
                     }
                 };
 
+                self.check_pattern_binding_duplicates(pattern);
                 self.symbols.enter_scope(true, false);
-                if let Err(diag) = self
-                    .symbols
-                    .define_variable(*var, elem_ty, false, true, None, *span)
-                {
-                    self.diagnostics.push(diag);
-                }
+                self.check_pattern(pattern, &elem_ty);
                 self.check_block(body, None);
                 self.symbols.exit_scope();
             }

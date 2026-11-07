@@ -118,3 +118,21 @@ fn test_comptime_infinite_loop_gas_limit() {
         ComptimeErrorKind::GasLimitExceeded { .. }
     ));
 }
+
+#[test]
+fn test_comptime_for_loop_destructuring() {
+    let func = parse_first_fn(
+        r#"
+        comptime fn sum_pairs() -> i64 {
+            let pairs = [(1, 10), (2, 20), (3, 30)];
+            mut sum = 0;
+            for (x, y) in pairs {
+                sum = sum + x * y;
+            }
+            return sum;
+        }
+    "#,
+    );
+    let res = eval_function(&func, vec![]).expect("comptime sum_pairs failed");
+    assert_eq!(res, Value::Int(140));
+}

@@ -1383,7 +1383,7 @@ impl<'a> FunctionLoweringContext<'a> {
             }
 
             Stmt::For {
-                var,
+                pattern,
                 iterable,
                 body,
                 span,
@@ -1438,18 +1438,29 @@ impl<'a> FunctionLoweringContext<'a> {
                     *span,
                 );
 
-                // Allocate loop element variable
-                let var_ptr = self.alloc_value();
-                self.emit(
-                    Some(var_ptr),
-                    ValueExpr::Alloca {
-                        ty: elem_ty.clone(),
-                        name: Some(*var),
-                    },
-                    *span,
-                );
-                self.var_allocas.insert(*var, var_ptr);
-                self.var_types.insert(*var, elem_ty);
+                // Allocate loop element variable if single ident or simple binding
+                let simple_var_info = match pattern {
+                    Pattern::Ident(var, p_span)
+                    | Pattern::Binding {
+                        mode: BindingMode::Value | BindingMode::Mut,
+                        name: var,
+                        span: p_span,
+                    } => {
+                        let var_ptr = self.alloc_value();
+                        self.emit(
+                            Some(var_ptr),
+                            ValueExpr::Alloca {
+                                ty: elem_ty.clone(),
+                                name: Some(*var),
+                            },
+                            *p_span,
+                        );
+                        self.var_allocas.insert(*var, var_ptr);
+                        self.var_types.insert(*var, elem_ty.clone());
+                        Some((*p_span, var_ptr))
+                    }
+                    _ => None,
+                };
 
                 let cond_block = self.alloc_block();
                 let body_block = self.alloc_block();
@@ -1499,14 +1510,31 @@ impl<'a> FunctionLoweringContext<'a> {
                     },
                     *span,
                 );
-                self.emit(
-                    None,
-                    ValueExpr::Store {
-                        ptr: var_ptr,
-                        val: elem_val,
-                    },
-                    *span,
-                );
+
+                if let Some((p_span, var_ptr)) = simple_var_info {
+                    self.emit(
+                        None,
+                        ValueExpr::Store {
+                            ptr: var_ptr,
+                            val: elem_val,
+                        },
+                        p_span,
+                    );
+                } else if !matches!(pattern, Pattern::Wildcard(_)) {
+                    let match_body_block = self.alloc_block();
+                    let match_fail_block = step_block;
+
+                    self.lower_pattern_match(
+                        elem_val,
+                        &elem_ty,
+                        pattern,
+                        match_body_block,
+                        match_fail_block,
+                        *span,
+                    );
+
+                    self.current_block = match_body_block;
+                }
 
                 for s in &body.stmts {
                     self.lower_stmt(s);

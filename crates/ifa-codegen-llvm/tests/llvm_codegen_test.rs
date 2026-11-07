@@ -1296,3 +1296,61 @@ pub fn main() -> i64 {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_for_loop_pattern_destructuring_native_execution() {
+    let src = r#"
+        pub fn main() -> i64 {
+            let pairs = [(1, 10), (2, 20), (3, 30)];
+            mut sum = 0;
+            for (x, y) in pairs {
+                sum = sum + x * y;
+            }
+            return sum;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("for_tuple_llvm.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir = std::env::temp_dir().join(format!("ifa_llvm_for_tuple_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("for_tuple.o");
+    let bin_path = temp_dir.join("for_tuple_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&fir_module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(140),
+        "Native binary output exit code must be 140 (1*10 + 2*20 + 3*30)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

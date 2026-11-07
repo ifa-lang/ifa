@@ -1369,3 +1369,153 @@ fn test_tuple_ref_destructuring_interp() {
     let res = interp.execute_function("main", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(42));
 }
+
+#[test]
+fn test_for_loop_tuple_pattern_destructuring_interp() {
+    let src = r#"
+        pub fn main() -> i64 {
+            let pairs = [(1, 10), (2, 20), (3, 30)];
+            mut sum = 0;
+            for (x, y) in pairs {
+                sum = sum + x * y;
+            }
+            return sum;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("for_tuple.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(140));
+}
+
+#[test]
+fn test_for_loop_struct_pattern_destructuring_interp() {
+    let src = r#"
+        struct Entry {
+            id: i64,
+            weight: i64,
+        }
+
+        pub fn main() -> i64 {
+            let entries = [
+                Entry(id: 10, weight: 5),
+                Entry(id: 20, weight: 15),
+                Entry(id: 30, weight: 25)
+            ];
+            mut total = 0;
+            for Entry { id, weight } in entries {
+                total = total + id + weight;
+            }
+            return total;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("for_struct.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(105));
+}
+
+#[test]
+fn test_for_loop_nested_pattern_destructuring_interp() {
+    let src = r#"
+        struct Coord {
+            x: i64,
+            y: i64,
+        }
+
+        pub fn main() -> i64 {
+            let items = [
+                (1, Coord(x: 10, y: 100)),
+                (2, Coord(x: 20, y: 200)),
+                (3, Coord(x: 30, y: 300))
+            ];
+            mut acc = 0;
+            for (step, Coord { x, y }) in items {
+                acc = acc + step * (x + y);
+            }
+            return acc;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("for_nested.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(1540));
+}
+
+#[test]
+fn test_for_loop_ref_binding_destructuring_interp() {
+    let src = r#"
+        struct Node {
+            val: i64,
+        }
+
+        pub fn main() -> i64 {
+            let nodes = [Node(val: 7), Node(val: 14), Node(val: 21)];
+            mut total = 0;
+            for ref n in nodes {
+                total = total + n.val;
+            }
+            return total;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("for_ref.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(42));
+}

@@ -218,7 +218,7 @@ pub enum Stmt {
         span: Span,
     },
     For {
-        var: Symbol,
+        pattern: Pattern,
         iterable: Expr,
         body: Block,
         span: Span,

@@ -963,3 +963,123 @@ fn test_cranelift_nested_graph_destructuring_ref_bindings() {
     // 3 + 12 + 50 = 65
     assert_eq!(result, 65);
 }
+
+#[test]
+fn test_cranelift_for_loop_tuple_pattern_destructuring() {
+    let src = r#"
+        pub fn main() -> i64 {
+            let pairs = [(1, 10), (2, 20), (3, 30)];
+            mut sum = 0;
+            for (x, y) in pairs {
+                sum = sum + x * y;
+            }
+            return sum;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("for_tuple_jit.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 140);
+}
+
+#[test]
+fn test_cranelift_for_loop_struct_pattern_destructuring() {
+    let src = r#"
+        struct Entry {
+            id: i64,
+            weight: i64,
+        }
+
+        pub fn main() -> i64 {
+            let entries = [
+                Entry(id: 10, weight: 5),
+                Entry(id: 20, weight: 15),
+                Entry(id: 30, weight: 25)
+            ];
+            mut total = 0;
+            for Entry { id, weight } in entries {
+                total = total + id + weight;
+            }
+            return total;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("for_struct_jit.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 105);
+}
+
+#[test]
+fn test_cranelift_for_loop_nested_composite_destructuring() {
+    let src = r#"
+        struct Coord {
+            x: i64,
+            y: i64,
+        }
+
+        pub fn main() -> i64 {
+            let items = [
+                (1, Coord(x: 10, y: 100)),
+                (2, Coord(x: 20, y: 200)),
+                (3, Coord(x: 30, y: 300))
+            ];
+            mut acc = 0;
+            for (step, Coord { x, y }) in items {
+                acc = acc + step * (x + y);
+            }
+            return acc;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("for_nested_jit.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 1540);
+}

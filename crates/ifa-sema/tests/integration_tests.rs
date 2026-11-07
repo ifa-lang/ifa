@@ -2764,3 +2764,54 @@ fn test_tuple_ref_destructuring_valid() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_for_loop_pattern_destructuring_semantic_success() {
+    let code = r#"
+        struct Point {
+            x: i64,
+            y: i64,
+        }
+
+        pub fn main() {
+            let points = [Point(x: 1, y: 2), Point(x: 3, y: 4)];
+            for Point { x, y } in points {
+                let _ = x + y;
+            }
+
+            let pairs = [(10, 100), (20, 200)];
+            for (idx, msg) in pairs {
+                let _ = idx + msg;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "For loop pattern destructuring should succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_for_loop_pattern_duplicate_binding_semantic_error() {
+    let code = r#"
+        pub fn main() {
+            let pairs = [(10, 20)];
+            for (a, a) in pairs {
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Duplicate binding in for loop pattern must produce an error"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0048")),
+        "Expected E0048 for duplicate binding, got: {:?}",
+        res.diagnostics
+    );
+}

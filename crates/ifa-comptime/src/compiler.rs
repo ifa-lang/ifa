@@ -239,7 +239,7 @@ impl Compiler {
                 self.chunk.patch_jump(exit_jump);
             }
             Stmt::For {
-                var,
+                pattern,
                 iterable,
                 body,
                 span,
@@ -261,13 +261,42 @@ impl Compiler {
                 self.chunk.emit(OpCode::Lt, *span);
                 let exit_jump = self.chunk.emit_jump(OpCode::JumpIfFalse(0), *span);
 
-                // var = arr[idx]
+                // Bind pattern variables from arr[idx]
                 self.push_scope();
-                let var_slot = self.define_local(*var);
-                self.chunk.emit(OpCode::LoadLocal(arr_slot), *span);
-                self.chunk.emit(OpCode::LoadLocal(idx_slot), *span);
-                self.chunk.emit(OpCode::GetIndex, *span);
-                self.chunk.emit(OpCode::StoreLocal(var_slot), *span);
+                match pattern {
+                    Pattern::Ident(var, _) | Pattern::Binding { name: var, .. } => {
+                        let var_slot = self.define_local(*var);
+                        self.chunk.emit(OpCode::LoadLocal(arr_slot), *span);
+                        self.chunk.emit(OpCode::LoadLocal(idx_slot), *span);
+                        self.chunk.emit(OpCode::GetIndex, *span);
+                        self.chunk.emit(OpCode::StoreLocal(var_slot), *span);
+                    }
+                    Pattern::Tuple(elements, _) => {
+                        for (i, elem_pat) in elements.iter().enumerate() {
+                            if let Pattern::Ident(var, _) | Pattern::Binding { name: var, .. } =
+                                elem_pat
+                            {
+                                let var_slot = self.define_local(*var);
+                                self.chunk.emit(OpCode::LoadLocal(arr_slot), *span);
+                                self.chunk.emit(OpCode::LoadLocal(idx_slot), *span);
+                                self.chunk.emit(OpCode::GetIndex, *span);
+                                self.chunk.emit(OpCode::ConstInt(i as i64), *span);
+                                self.chunk.emit(OpCode::GetIndex, *span);
+                                self.chunk.emit(OpCode::StoreLocal(var_slot), *span);
+                            }
+                        }
+                    }
+                    Pattern::Wildcard(_) => {}
+                    _ => {
+                        for (var, _) in pattern.bound_variables() {
+                            let var_slot = self.define_local(var);
+                            self.chunk.emit(OpCode::LoadLocal(arr_slot), *span);
+                            self.chunk.emit(OpCode::LoadLocal(idx_slot), *span);
+                            self.chunk.emit(OpCode::GetIndex, *span);
+                            self.chunk.emit(OpCode::StoreLocal(var_slot), *span);
+                        }
+                    }
+                }
 
                 self.compile_block(body)?;
                 if body.expr.is_some() {

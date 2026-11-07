@@ -176,13 +176,15 @@ fn lint_statements(stmts: &[Stmt], warnings: &mut Vec<String>) {
             Stmt::While { body, .. } | Stmt::WhileLet { body, .. } => {
                 lint_statements(&body.stmts, warnings)
             }
-            Stmt::For { var, body, .. } => {
-                let var_name = INTERNER.resolve(var);
-                if !is_snake_case(&var_name) && !var_name.starts_with('_') {
-                    warnings.push(format!(
-                        "style warning: loop variable `{}` should follow snake_case convention",
-                        var_name
-                    ));
+            Stmt::For { pattern, body, .. } => {
+                for (var, _) in pattern.bound_variables() {
+                    let var_name = INTERNER.resolve(&var);
+                    if !is_snake_case(&var_name) && !var_name.starts_with('_') {
+                        warnings.push(format!(
+                            "style warning: loop variable `{}` should follow snake_case convention",
+                            var_name
+                        ));
+                    }
                 }
                 lint_statements(&body.stmts, warnings);
             }
