@@ -2815,3 +2815,141 @@ fn test_for_loop_pattern_duplicate_binding_semantic_error() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_refutable_let_with_diverging_else_clause_valid() {
+    let code = r#"
+        enum OptionI64 {
+            Some(i64),
+            None,
+        }
+
+        pub fn unwrap_or_zero(opt: OptionI64) -> i64 {
+            let OptionI64::Some(val) = opt else {
+                return 0;
+            };
+            return val + 1;
+        }
+
+        pub fn fail_on_none(opt: OptionI64) -> String!i64 {
+            let OptionI64::Some(val) = opt else {
+                fail "missing value";
+            };
+            return val * 2;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Refutable let with diverging else must succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_refutable_let_else_non_divergent_rejected() {
+    let code = r#"
+        enum Status {
+            Active(i64),
+            Inactive,
+        }
+
+        pub fn test(s: Status) -> i64 {
+            let Status::Active(code) = s else {
+                let _ = 123;
+            };
+            return code;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Non-diverging else block in let ... else must produce an error"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0049")),
+        "Expected E0049 for non-divergent else block, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_irrefutable_let_else_warning() {
+    let code = r#"
+        pub fn test(pair: (i64, i64)) -> i64 {
+            let (a, b) = pair else {
+                return 0;
+            };
+            return a + b;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Irrefutable let with else should not error: {:?}",
+        res.diagnostics
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("W0001")),
+        "Expected W0001 warning for irrefutable pattern in let ... else, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_refutable_destructuring_assignment_with_else_valid() {
+    let code = r#"
+        enum Token {
+            Number(i64),
+            Identifier,
+        }
+
+        pub fn parse_num(t: Token) -> i64 {
+            mut val = 0;
+            Token::Number(val) = t else {
+                return -1;
+            };
+            return val;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Refutable destructuring assignment with diverging else must succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_refutable_destructuring_assignment_non_divergent_rejected() {
+    let code = r#"
+        enum Token {
+            Number(i64),
+            Identifier,
+        }
+
+        pub fn parse_num(t: Token) -> i64 {
+            mut val = 0;
+            Token::Number(val) = t else {
+                val = 42;
+            };
+            return val;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Non-diverging else block in destructuring assignment must produce an error"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0049")),
+        "Expected E0049 for non-divergent assignment else, got: {:?}",
+        res.diagnostics
+    );
+}

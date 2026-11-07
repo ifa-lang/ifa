@@ -196,13 +196,53 @@ impl GenerationalOptPass {
     fn run_dominance_elimination(
         &mut self,
         func: &mut FirFunction,
-        _cfg: &ControlFlowGraph,
+        cfg: &ControlFlowGraph,
         dom_tree: &DominanceTree,
         freeing_blocks: &HashSet<BlockId>,
         ref_defs: &HashMap<ValueId, BlockId>,
     ) {
         let is_strict = func.is_strict;
         let mut verified_at_exit: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
+
+        // Helper to extract argument slice passed to a specific target block from a terminator
+        let get_branch_args = |term: &Terminator, target: BlockId| -> Option<Vec<ValueId>> {
+            match term {
+                Terminator::Branch { target: t, args } if *t == target => Some(args.clone()),
+                Terminator::BranchCond {
+                    then_block,
+                    then_args,
+                    else_block,
+                    else_args,
+                    ..
+                } => {
+                    if *then_block == target {
+                        Some(then_args.clone())
+                    } else if *else_block == target {
+                        Some(else_args.clone())
+                    } else {
+                        None
+                    }
+                }
+                Terminator::Switch {
+                    cases,
+                    default_block,
+                    default_args,
+                    ..
+                } => {
+                    for (_, c_target, c_args) in cases {
+                        if *c_target == target {
+                            return Some(c_args.clone());
+                        }
+                    }
+                    if *default_block == target {
+                        Some(default_args.clone())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
 
         for &block_id in &dom_tree.rpo_blocks {
             let mut available: HashSet<ValueId> = HashSet::new();
@@ -224,7 +264,77 @@ impl GenerationalOptPass {
                     }
                 }
 
-                // 2. Direct lexical dominance: created in dominating block with no intervening frees
+                // 2. Confluent dataflow intersection across all predecessors
+                if let Some(preds) = cfg.predecessors.get(&block_id) {
+                    if !preds.is_empty() {
+                        let processed_preds: Vec<BlockId> = preds
+                            .iter()
+                            .copied()
+                            .filter(|p| verified_at_exit.contains_key(p))
+                            .collect();
+
+                        if processed_preds.len() == preds.len() {
+                            let mut common: Option<HashSet<ValueId>> = None;
+                            for &pred_id in &processed_preds {
+                                if let Some(pred_checks) = verified_at_exit.get(&pred_id) {
+                                    match &mut common {
+                                        None => common = Some(pred_checks.clone()),
+                                        Some(c) => c.retain(|val| pred_checks.contains(val)),
+                                    }
+                                }
+                            }
+                            if let Some(c) = common {
+                                available.extend(c);
+                            }
+                        }
+                    }
+                }
+
+                // 3. SSA Block Parameters / Phi Promotion Resolution (SROA Stability)
+                if let Some(block) = func.get_block(block_id) {
+                    if !block.params.is_empty() {
+                        if let Some(preds) = cfg.predecessors.get(&block_id) {
+                            for (param_idx, (param_val, _)) in block.params.iter().enumerate() {
+                                let mut all_preds_verified = !preds.is_empty();
+                                for &pred_id in preds {
+                                    if let Some(pred_block) = func.get_block(pred_id) {
+                                        if let Some(term) = &pred_block.terminator {
+                                            if let Some(args) = get_branch_args(term, block_id) {
+                                                if let Some(&arg_val) = args.get(param_idx) {
+                                                    let is_verified_in_pred = verified_at_exit
+                                                        .get(&pred_id)
+                                                        .is_some_and(|set| set.contains(&arg_val));
+                                                    if !is_verified_in_pred {
+                                                        all_preds_verified = false;
+                                                        break;
+                                                    }
+                                                } else {
+                                                    all_preds_verified = false;
+                                                    break;
+                                                }
+                                            } else {
+                                                all_preds_verified = false;
+                                                break;
+                                            }
+                                        } else {
+                                            all_preds_verified = false;
+                                            break;
+                                        }
+                                    } else {
+                                        all_preds_verified = false;
+                                        break;
+                                    }
+                                }
+
+                                if all_preds_verified {
+                                    available.insert(*param_val);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 4. Direct lexical dominance: created in dominating block with no intervening frees
                 for (&ref_val, &def_block) in ref_defs {
                     if dom_tree.dominates(def_block, block_id) {
                         let no_free = !freeing_blocks.iter().any(|&fb| {
@@ -237,9 +347,22 @@ impl GenerationalOptPass {
                 }
             }
 
+            // Local store-to-load reference alias tracking
+            let mut ptr_aliases: HashMap<ValueId, ValueId> = HashMap::new();
+
             if let Some(block) = func.get_block_mut(block_id) {
                 for inst in &mut block.instructions {
                     match &mut inst.expr {
+                        ValueExpr::Store { ptr, val } => {
+                            ptr_aliases.insert(*ptr, *val);
+                        }
+                        ValueExpr::Load { ptr } => {
+                            if let (Some(res), Some(&val)) = (inst.result, ptr_aliases.get(ptr)) {
+                                if available.contains(&val) {
+                                    available.insert(res);
+                                }
+                            }
+                        }
                         ValueExpr::GenRef { .. } => {
                             if let Some(res) = inst.result {
                                 available.insert(res);
@@ -247,6 +370,7 @@ impl GenerationalOptPass {
                         }
                         ValueExpr::GenFree { ptr } => {
                             available.remove(ptr);
+                            ptr_aliases.remove(ptr);
                         }
                         ValueExpr::GenCheck { ref_val, redundant } => {
                             self.stats.total_checks += 1;

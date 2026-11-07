@@ -906,6 +906,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 pattern,
                 ty: annotated_ty,
                 init,
+                else_block,
                 span,
             } => {
                 let declared_ty = if let Some(ast_ty) = annotated_ty {
@@ -977,24 +978,82 @@ impl<'a> SemanticAnalyzer<'a> {
 
                 self.symbols.register_type_if_generic_instance(&actual_ty);
 
-                // Validation obligatoire d'irréfutabilité en mode déclaration locale
-                let is_irrefutable =
-                    crate::exhaustiveness::is_irrefutable_pattern_for_type(pattern, &actual_ty);
-                if !is_irrefutable && actual_ty != Type::Unknown {
-                    self.diagnostics.push(
-                        Diagnostic::error(format!(
-                            "motif réfutable dans une déclaration de variable : le motif ne couvre pas toutes les valeurs possibles du type '{}'",
-                            actual_ty
-                        ))
-                        .with_code("E0047")
-                        .with_primary_label(
-                            pattern.span(),
-                            "motif réfutable non autorisé dans une déclaration 'let' ou 'mut'",
-                        )
-                        .with_note(
-                            "les motifs réfutables ne sont autorisés que dans les instructions 'match' ou 'if let'",
-                        ),
-                    );
+                // Validation de la clause else ou de l'irréfutabilité
+                if let Some(else_blk) = else_block {
+                    if init.is_none() {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "une clause 'else' sur une déclaration 'let' requiert une expression d'initialisation",
+                            )
+                            .with_code("E0047")
+                            .with_primary_label(
+                                *span,
+                                "déclaration 'let ... else' sans initialisation",
+                            ),
+                        );
+                    }
+
+                    self.symbols.enter_scope(false, false);
+                    self.check_block(else_blk, None);
+                    self.symbols.exit_scope();
+
+                    if !block_always_terminates(else_blk) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "le bloc 'else' d'une déclaration 'let ... else' doit diverger (se terminer par 'return', 'fail', 'break' ou 'continue')",
+                            )
+                            .with_code("E0049")
+                            .with_primary_label(
+                                else_blk.span,
+                                "ce bloc peut terminer normalement sans diverger",
+                            )
+                            .with_note(
+                                "un bloc 'else' dans 'let ... else' doit empêcher l'exécution de continuer en cas de non-concordance du motif",
+                            )
+                            .with_help(
+                                "ajoutez un 'return', 'fail', 'break' ou 'continue' à la fin du bloc",
+                            ),
+                        );
+                    }
+
+                    let is_irrefutable =
+                        crate::exhaustiveness::is_irrefutable_pattern_for_type(pattern, &actual_ty);
+                    if is_irrefutable && actual_ty != Type::Unknown {
+                        self.diagnostics.push(
+                            Diagnostic::warning(
+                                "motif irréfutable dans une déclaration 'let ... else' : la clause 'else' est superflue",
+                            )
+                            .with_code("W0001")
+                            .with_primary_label(
+                                pattern.span(),
+                                "ce motif couvre déjà toutes les valeurs possibles",
+                            )
+                            .with_secondary_label(
+                                else_blk.span,
+                                "cette clause 'else' ne sera jamais exécutée",
+                            ),
+                        );
+                    }
+                } else {
+                    // Validation obligatoire d'irréfutabilité en mode déclaration sans clause else
+                    let is_irrefutable =
+                        crate::exhaustiveness::is_irrefutable_pattern_for_type(pattern, &actual_ty);
+                    if !is_irrefutable && actual_ty != Type::Unknown {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "motif réfutable dans une déclaration de variable : le motif ne couvre pas toutes les valeurs possibles du type '{}'",
+                                actual_ty
+                            ))
+                            .with_code("E0047")
+                            .with_primary_label(
+                                pattern.span(),
+                                "motif réfutable non autorisé dans une déclaration sans clause 'else'",
+                            )
+                            .with_note(
+                                "ajoutez une clause 'else { return / fail }' ou utilisez une instruction 'match' ou 'if let'",
+                            ),
+                        );
+                    }
                 }
 
                 self.check_pattern_binding_duplicates(pattern);
@@ -1056,31 +1115,76 @@ impl<'a> SemanticAnalyzer<'a> {
             Stmt::AssignPattern {
                 pattern,
                 val,
+                else_block,
                 span: _,
             } => {
                 let val_ty = self.infer_expr(val);
 
-                // Validation obligatoire d'irréfutabilité en mode assignation par déstructuration
-                let is_irrefutable =
-                    crate::exhaustiveness::is_irrefutable_pattern_for_type(pattern, &val_ty);
-                if !is_irrefutable && val_ty != Type::Unknown {
-                    self.diagnostics.push(
-                        Diagnostic::error(format!(
-                            "motif réfutable dans une assignation par déstructuration : le motif ne couvre pas toutes les valeurs possibles du type '{}'",
-                            val_ty
-                        ))
-                        .with_code("E0047")
-                        .with_primary_label(
-                            pattern.span(),
-                            "motif réfutable non autorisé dans une assignation sans condition",
-                        )
-                        .with_note(
-                            "les motifs réfutables ne sont autorisés que dans les instructions 'match' ou 'if let'",
-                        ),
-                    );
+                if let Some(else_blk) = else_block {
+                    self.symbols.enter_scope(false, false);
+                    self.check_block(else_blk, None);
+                    self.symbols.exit_scope();
+
+                    if !block_always_terminates(else_blk) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "le bloc 'else' d'une assignation par déstructuration doit diverger (se terminer par 'return', 'fail', 'break' ou 'continue')",
+                            )
+                            .with_code("E0049")
+                            .with_primary_label(
+                                else_blk.span,
+                                "ce bloc peut terminer normalement sans diverger",
+                            )
+                            .with_note(
+                                "un bloc 'else' de garde doit empêcher l'exécution de continuer en cas de non-concordance du motif",
+                            )
+                            .with_help(
+                                "ajoutez un 'return', 'fail', 'break' ou 'continue' à la fin du bloc",
+                            ),
+                        );
+                    }
+
+                    let is_irrefutable =
+                        crate::exhaustiveness::is_irrefutable_pattern_for_type(pattern, &val_ty);
+                    if is_irrefutable && val_ty != Type::Unknown {
+                        self.diagnostics.push(
+                            Diagnostic::warning(
+                                "motif irréfutable dans une assignation avec clause 'else' : la clause 'else' est superflue",
+                            )
+                            .with_code("W0001")
+                            .with_primary_label(
+                                pattern.span(),
+                                "ce motif couvre déjà toutes les valeurs possibles",
+                            )
+                            .with_secondary_label(
+                                else_blk.span,
+                                "cette clause 'else' ne sera jamais exécutée",
+                            ),
+                        );
+                    }
+                } else {
+                    // Validation obligatoire d'irréfutabilité en mode assignation sans clause else
+                    let is_irrefutable =
+                        crate::exhaustiveness::is_irrefutable_pattern_for_type(pattern, &val_ty);
+                    if !is_irrefutable && val_ty != Type::Unknown {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "motif réfutable dans une assignation par déstructuration : le motif ne couvre pas toutes les valeurs possibles du type '{}'",
+                                val_ty
+                            ))
+                            .with_code("E0047")
+                            .with_primary_label(
+                                pattern.span(),
+                                "motif réfutable non autorisé dans une assignation sans clause 'else'",
+                            )
+                            .with_note(
+                                "ajoutez une clause 'else { return / fail }' ou utilisez une instruction 'match' ou 'if let'",
+                            ),
+                        );
+                    }
                 }
 
-                self.check_destructuring_assignment(pattern, &val_ty);
+                self.check_destructuring_assignment(pattern, &val_ty, else_block.is_some());
             }
             Stmt::Expr(expr) => {
                 self.infer_expr(expr);
@@ -2169,7 +2273,7 @@ impl<'a> SemanticAnalyzer<'a> {
         self.check_pattern_with_mut(pat, target_ty, false, true);
     }
 
-    fn check_destructuring_assignment(&mut self, pat: &Pattern, target_ty: &Type) {
+    fn check_destructuring_assignment(&mut self, pat: &Pattern, target_ty: &Type, has_else: bool) {
         match pat {
             Pattern::Wildcard(_) => {}
             Pattern::Lit(lit, span) => {
@@ -2263,14 +2367,14 @@ impl<'a> SemanticAnalyzer<'a> {
                         );
                     } else {
                         for (elem_pat, elem_ty) in elems.iter().zip(expected_elems.iter()) {
-                            self.check_destructuring_assignment(elem_pat, elem_ty);
+                            self.check_destructuring_assignment(elem_pat, elem_ty, has_else);
                         }
                     }
                 }
                 Type::Unit if elems.is_empty() => {}
                 Type::Unknown => {
                     for elem_pat in elems {
-                        self.check_destructuring_assignment(elem_pat, &Type::Unknown);
+                        self.check_destructuring_assignment(elem_pat, &Type::Unknown, has_else);
                     }
                 }
                 _ => {
@@ -2341,7 +2445,7 @@ impl<'a> SemanticAnalyzer<'a> {
 
                 for f in fields {
                     if let Some(struct_field) = st.get_field(&f.name) {
-                        self.check_destructuring_assignment(&f.pattern, &struct_field.ty);
+                        self.check_destructuring_assignment(&f.pattern, &struct_field.ty, has_else);
                     } else {
                         self.diagnostics.push(
                             Diagnostic::error(format!(
@@ -2383,37 +2487,37 @@ impl<'a> SemanticAnalyzer<'a> {
                         );
                     }
                     for p in prefix {
-                        self.check_destructuring_assignment(p, elem_ty);
+                        self.check_destructuring_assignment(p, elem_ty, has_else);
                     }
                     if let Some(Some(r)) = rest {
                         let rest_ty = Type::Slice(elem_ty.clone());
-                        self.check_destructuring_assignment(r, &rest_ty);
+                        self.check_destructuring_assignment(r, &rest_ty, has_else);
                     }
                     for s in suffix {
-                        self.check_destructuring_assignment(s, elem_ty);
+                        self.check_destructuring_assignment(s, elem_ty, has_else);
                     }
                 }
                 Type::Slice(elem_ty) => {
                     for p in prefix {
-                        self.check_destructuring_assignment(p, elem_ty);
+                        self.check_destructuring_assignment(p, elem_ty, has_else);
                     }
                     if let Some(Some(r)) = rest {
                         let rest_ty = Type::Slice(elem_ty.clone());
-                        self.check_destructuring_assignment(r, &rest_ty);
+                        self.check_destructuring_assignment(r, &rest_ty, has_else);
                     }
                     for s in suffix {
-                        self.check_destructuring_assignment(s, elem_ty);
+                        self.check_destructuring_assignment(s, elem_ty, has_else);
                     }
                 }
                 Type::Unknown => {
                     for p in prefix {
-                        self.check_destructuring_assignment(p, &Type::Unknown);
+                        self.check_destructuring_assignment(p, &Type::Unknown, has_else);
                     }
                     if let Some(Some(r)) = rest {
-                        self.check_destructuring_assignment(r, &Type::Unknown);
+                        self.check_destructuring_assignment(r, &Type::Unknown, has_else);
                     }
                     for s in suffix {
-                        self.check_destructuring_assignment(s, &Type::Unknown);
+                        self.check_destructuring_assignment(s, &Type::Unknown, has_else);
                     }
                 }
                 _ => {
@@ -2427,32 +2531,106 @@ impl<'a> SemanticAnalyzer<'a> {
                     );
                 }
             },
-            Pattern::Variant { span, .. } => {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        "les motifs de variant d'énumération ne sont pas autorisés dans une assignation par déstructuration inconditionnelle",
-                    )
-                    .with_code("E0047")
-                    .with_primary_label(*span, "motif de variant non autorisé ici"),
-                );
+            Pattern::Variant {
+                enum_name,
+                variant,
+                inner,
+                span,
+            } => {
+                if !has_else {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "les motifs de variant d'énumération ne sont pas autorisés dans une assignation par déstructuration sans clause 'else'",
+                        )
+                        .with_code("E0047")
+                        .with_primary_label(*span, "motif de variant non autorisé ici"),
+                    );
+                    return;
+                }
+
+                let mut cur_ty = target_ty;
+                while let Type::Ref(inner_ref) = cur_ty {
+                    cur_ty = inner_ref;
+                }
+
+                let mut found_payload_ty: Option<Type> = None;
+                if let Type::Enum {
+                    name: e_sym,
+                    variants,
+                } = cur_ty
+                {
+                    if let Some((_, opt_ty)) = variants.iter().find(|(v, _)| v == variant) {
+                        found_payload_ty = opt_ty.clone();
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "le variant '{}' n'existe pas dans l'énumération '{}'",
+                                INTERNER.resolve(variant),
+                                INTERNER.resolve(e_sym)
+                            ))
+                            .with_code("E0037")
+                            .with_primary_label(*span, "variant inconnu"),
+                        );
+                    }
+                } else if let Some(e_sym) = enum_name {
+                    if let Some((_, _, opt_ty)) = self.symbols.lookup_enum_variant(e_sym, variant) {
+                        found_payload_ty = opt_ty.cloned();
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "le variant '{}' n'existe pas dans l'énumération '{}'",
+                                INTERNER.resolve(variant),
+                                INTERNER.resolve(e_sym)
+                            ))
+                            .with_code("E0037")
+                            .with_primary_label(*span, "variant inconnu"),
+                        );
+                    }
+                } else if let Some((_, _, opt_ty)) = self.symbols.lookup_enum_by_variant(variant) {
+                    found_payload_ty = opt_ty.cloned();
+                } else if *cur_ty != Type::Unknown {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "le motif variant '{}' ne correspond pas au type '{}'",
+                            INTERNER.resolve(variant),
+                            target_ty
+                        ))
+                        .with_code("E0036")
+                        .with_primary_label(*span, "type de motif incompatible"),
+                    );
+                }
+
+                if let Some(inner_pat) = inner {
+                    if let Some(p_ty) = found_payload_ty {
+                        self.check_destructuring_assignment(inner_pat, &p_ty, has_else);
+                    }
+                }
             }
-            Pattern::Or(_, span) => {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        "les motifs d'alternative 'or' ('|') ne sont pas autorisés dans une assignation par déstructuration",
-                    )
-                    .with_code("E0047")
-                    .with_primary_label(*span, "motif 'or' non autorisé ici"),
-                );
+            Pattern::Or(sub_patterns, span) => {
+                if !has_else {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "les motifs d'alternative 'or' ('|') ne sont pas autorisés dans une assignation par déstructuration sans clause 'else'",
+                        )
+                        .with_code("E0047")
+                        .with_primary_label(*span, "motif 'or' non autorisé ici"),
+                    );
+                } else {
+                    for sp in sub_patterns {
+                        self.check_destructuring_assignment(sp, target_ty, has_else);
+                    }
+                }
             }
             Pattern::Range { span, .. } => {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        "les motifs d'intervalle ne sont pas autorisés dans une assignation par déstructuration",
-                    )
-                    .with_code("E0047")
-                    .with_primary_label(*span, "motif d'intervalle non autorisé ici"),
-                );
+                if !has_else {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "les motifs d'intervalle ne sont pas autorisés dans une assignation par déstructuration sans clause 'else'",
+                        )
+                        .with_code("E0047")
+                        .with_primary_label(*span, "motif d'intervalle non autorisé ici"),
+                    );
+                }
             }
         }
     }

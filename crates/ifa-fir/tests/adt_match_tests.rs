@@ -1519,3 +1519,88 @@ fn test_for_loop_ref_binding_destructuring_interp() {
     let res = interp.execute_function("main", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(42));
 }
+
+#[test]
+fn test_destructuring_let_else_fir_execution() {
+    let src = r#"
+        enum MaybeVal {
+            Present(i64),
+            Missing,
+        }
+
+        fn extract_or_default(m: MaybeVal, def: i64) -> i64 {
+            let MaybeVal::Present(x) = m else {
+                return def;
+            };
+            return x * 10;
+        }
+
+        pub fn main() -> i64 {
+            let r1 = extract_or_default(MaybeVal::Present(5), 99);
+            let r2 = extract_or_default(MaybeVal::Missing, 42);
+            return r1 + r2;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("let_else.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    // r1: 5 * 10 = 50, r2: 42 => 92
+    assert_eq!(res, FirValue::Int(92));
+}
+
+#[test]
+fn test_destructuring_assignment_else_fir_execution() {
+    let src = r#"
+        enum Step {
+            Advance(i64),
+            Halt,
+        }
+
+        fn run_step(s: Step) -> i64 {
+            mut offset = 0;
+            Step::Advance(offset) = s else {
+                return -1;
+            };
+            return offset + 100;
+        }
+
+        pub fn main() -> i64 {
+            let a = run_step(Step::Advance(23));
+            let b = run_step(Step::Halt);
+            return a + b;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("assign_else.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parsing errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    // a: 123, b: -1 => 122
+    assert_eq!(res, FirValue::Int(122));
+}

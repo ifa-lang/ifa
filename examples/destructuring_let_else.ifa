@@ -1,0 +1,41 @@
+enum RequestStatus {
+    Authorized(i64),
+    Pending,
+    Denied,
+}
+
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+fn process_request(status: RequestStatus) -> i64 {
+    let RequestStatus::Authorized(token_id) = status else {
+        return -1;
+    };
+    return token_id * 2;
+}
+
+fn update_offset(p: Point) -> i64 {
+    mut current_y = 0;
+
+    // Motif réfutable filtrant les points dont x vaut 100
+    (100, current_y) = (p.x, p.y) else {
+        return 0;
+    };
+
+    return current_y;
+}
+
+pub fn main() -> i64 {
+    let s1 = RequestStatus::Authorized(21);
+    let s2 = RequestStatus::Denied;
+
+    let res1 = process_request(s1);
+    let res2 = process_request(s2);
+
+    let pt = Point(x: 100, y: 50);
+    let total_offset = update_offset(pt);
+
+    return res1 + res2 + total_offset;
+}

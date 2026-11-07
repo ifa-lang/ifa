@@ -765,6 +765,28 @@ impl<'a> FunctionLoweringContext<'a> {
         self.func
     }
 
+    fn lower_block(&mut self, b: &Block) -> ValueId {
+        let defer_checkpoint = self.defer_stack.len();
+        for s in &b.stmts {
+            self.lower_stmt(s);
+        }
+        let res = if let Some(e) = &b.expr {
+            self.lower_expr(e)
+        } else {
+            let res = self.alloc_value();
+            self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), b.span);
+            res
+        };
+        while self.defer_stack.len() > defer_checkpoint {
+            if let Some(def) = self.defer_stack.pop() {
+                for s in &def.stmts {
+                    self.lower_stmt(s);
+                }
+            }
+        }
+        res
+    }
+
     fn lower_stmt(&mut self, stmt: &Stmt) {
         if let Some(block) = self.func.get_block(self.current_block) {
             if block.is_terminated() {
@@ -776,6 +798,7 @@ impl<'a> FunctionLoweringContext<'a> {
             Stmt::Let {
                 pattern,
                 init,
+                else_block,
                 span,
                 ..
             } => {
@@ -972,7 +995,15 @@ impl<'a> FunctionLoweringContext<'a> {
                                 *span,
                             );
 
-                            if let Some(b) = self.func.get_block_mut(fail_block) {
+                            if let Some(else_blk) = else_block {
+                                self.current_block = fail_block;
+                                self.lower_block(else_blk);
+                                if let Some(b) = self.func.get_block_mut(self.current_block) {
+                                    if b.terminator.is_none() {
+                                        b.terminator = Some(Terminator::Unreachable);
+                                    }
+                                }
+                            } else if let Some(b) = self.func.get_block_mut(fail_block) {
                                 b.terminator = Some(Terminator::Unreachable);
                             }
 
@@ -1082,7 +1113,12 @@ impl<'a> FunctionLoweringContext<'a> {
                 }
             }
 
-            Stmt::AssignPattern { pattern, val, span } => {
+            Stmt::AssignPattern {
+                pattern,
+                val,
+                else_block,
+                span,
+            } => {
                 let val_id = self.lower_expr(val);
                 let target_ty = self
                     .infer_expr_fir_type(val)
@@ -1100,7 +1136,15 @@ impl<'a> FunctionLoweringContext<'a> {
                     *span,
                 );
 
-                if let Some(b) = self.func.get_block_mut(fail_block) {
+                if let Some(else_blk) = else_block {
+                    self.current_block = fail_block;
+                    self.lower_block(else_blk);
+                    if let Some(b) = self.func.get_block_mut(self.current_block) {
+                        if b.terminator.is_none() {
+                            b.terminator = Some(Terminator::Unreachable);
+                        }
+                    }
+                } else if let Some(b) = self.func.get_block_mut(fail_block) {
                     b.terminator = Some(Terminator::Unreachable);
                 }
 
@@ -2725,27 +2769,7 @@ impl<'a> FunctionLoweringContext<'a> {
                 res
             }
 
-            ExprKind::Block(b) => {
-                let defer_checkpoint = self.defer_stack.len();
-                for s in &b.stmts {
-                    self.lower_stmt(s);
-                }
-                let res = if let Some(e) = &b.expr {
-                    self.lower_expr(e)
-                } else {
-                    let res = self.alloc_value();
-                    self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), span);
-                    res
-                };
-                while self.defer_stack.len() > defer_checkpoint {
-                    if let Some(def) = self.defer_stack.pop() {
-                        for s in &def.stmts {
-                            self.lower_stmt(s);
-                        }
-                    }
-                }
-                res
-            }
+            ExprKind::Block(b) => self.lower_block(b),
 
             ExprKind::StructInit { name, fields } => {
                 let mut field_vals = Vec::new();

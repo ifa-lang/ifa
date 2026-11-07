@@ -214,7 +214,9 @@ impl Compiler {
                     ));
                 }
             },
-            Stmt::AssignPattern { pattern, val, span } => {
+            Stmt::AssignPattern {
+                pattern, val, span, ..
+            } => {
                 self.compile_expr(val)?;
                 for (sym, _) in pattern.bound_variables() {
                     if let Some(slot) = self.resolve_local(&sym) {

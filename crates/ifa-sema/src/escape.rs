@@ -313,6 +313,7 @@ impl<'a> EscapeAnalyzer<'a> {
             Stmt::Let {
                 pattern,
                 init,
+                else_block,
                 span,
                 ..
             } => {
@@ -338,6 +339,14 @@ impl<'a> EscapeAnalyzer<'a> {
                         self.detect_and_handle_cycles();
                     }
                     self.check_expr(expr);
+                }
+                if let Some(eb) = else_block {
+                    for s in &eb.stmts {
+                        self.check_stmt(s);
+                    }
+                    if let Some(e) = &eb.expr {
+                        self.check_expr(e);
+                    }
                 }
             }
             Stmt::Assign {
@@ -415,7 +424,12 @@ impl<'a> EscapeAnalyzer<'a> {
                     self.handle_ref_assignment(target, ref_target, val.span);
                 }
             }
-            Stmt::AssignPattern { pattern, val, span } => {
+            Stmt::AssignPattern {
+                pattern,
+                val,
+                else_block,
+                span,
+            } => {
                 self.check_pattern_ref_bindings(pattern, Some(val), *span);
                 if self.spawn_depth > 0 {
                     for (root_sym, root_span) in pattern.bound_variables() {
@@ -439,6 +453,14 @@ impl<'a> EscapeAnalyzer<'a> {
                     }
                 }
                 self.check_expr(val);
+                if let Some(eb) = else_block {
+                    for s in &eb.stmts {
+                        self.check_stmt(s);
+                    }
+                    if let Some(e) = &eb.expr {
+                        self.check_expr(e);
+                    }
+                }
             }
             Stmt::Expr(expr) => self.check_expr(expr),
             Stmt::Return(ret_expr, _) => {

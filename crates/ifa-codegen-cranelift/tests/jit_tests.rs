@@ -1083,3 +1083,47 @@ fn test_cranelift_for_loop_nested_composite_destructuring() {
     let result = jit.run_main().expect("Failed to execute native main");
     assert_eq!(result, 1540);
 }
+
+#[test]
+fn test_cranelift_jit_destructuring_let_and_assign_else() {
+    let src = r#"
+        enum ResultI64 {
+            Ok(i64),
+            Err(i64),
+        }
+
+        fn compute_safe(r: ResultI64) -> i64 {
+            let ResultI64::Ok(val) = r else {
+                return 42;
+            };
+            return val * 10;
+        }
+
+        pub fn main() -> i64 {
+            let res1 = compute_safe(ResultI64::Ok(7));
+            let res2 = compute_safe(ResultI64::Err(999));
+            return res1 + res2;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("let_else_jit.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    // res1: 70, res2: 42 => 112
+    assert_eq!(result, 112);
+}

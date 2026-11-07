@@ -944,17 +944,26 @@ impl Parser {
                     None
                 };
 
+                let else_block = if init.is_some() && self.match_token(&TokenKind::Else) {
+                    Some(self.parse_block()?)
+                } else {
+                    None
+                };
+
                 self.match_token(&TokenKind::Semicolon);
-                let end = init.as_ref().map(|e| e.span.end).unwrap_or_else(|| {
-                    ty.as_ref()
-                        .map(|t| t.span.end)
-                        .unwrap_or(pattern.span().end)
+                let end = else_block.as_ref().map(|b| b.span.end).unwrap_or_else(|| {
+                    init.as_ref().map(|e| e.span.end).unwrap_or_else(|| {
+                        ty.as_ref()
+                            .map(|t| t.span.end)
+                            .unwrap_or(pattern.span().end)
+                    })
                 });
                 Ok(Stmt::Let {
                     is_mut,
                     pattern,
                     ty,
                     init,
+                    else_block,
                     span: Span::new(self.file_id, cur.span.start, end),
                 })
             }
@@ -1069,9 +1078,23 @@ impl Parser {
                     if let Ok(pattern) = self.parse_pattern() {
                         if self.match_token(&TokenKind::Eq) {
                             let val = self.parse_expr()?;
+                            let else_block = if self.match_token(&TokenKind::Else) {
+                                Some(self.parse_block()?)
+                            } else {
+                                None
+                            };
                             self.match_token(&TokenKind::Semicolon);
-                            let span = Span::new(self.file_id, pattern.span().start, val.span.end);
-                            return Ok(Stmt::AssignPattern { pattern, val, span });
+                            let end = else_block
+                                .as_ref()
+                                .map(|b| b.span.end)
+                                .unwrap_or(val.span.end);
+                            let span = Span::new(self.file_id, pattern.span().start, end);
+                            return Ok(Stmt::AssignPattern {
+                                pattern,
+                                val,
+                                else_block,
+                                span,
+                            });
                         }
                     }
                     self.cursor = saved_cursor;
@@ -2682,6 +2705,74 @@ mod tests {
                 assert!(guard.is_some(), "while let guard must be parsed");
             } else {
                 panic!("expected WhileLet statement");
+            }
+        }
+    }
+
+    #[test]
+    fn test_destructuring_let_and_assign_with_else_clause() {
+        let src = r#"
+            fn test_else_clauses(opt: ?i64, pair: (i64, i64)) -> i64 {
+                let Some(val) = opt else {
+                    return 0;
+                };
+                mut (a, b) = pair else {
+                    fail "impossible";
+                };
+                (a, b) = (10, 20) else {
+                    return -1;
+                };
+                return val + a + b;
+            }
+        "#;
+        let fid = FileId(0);
+        let tokens = tokenize(fid, src);
+        let (prog, diags) = parse(fid, tokens);
+        assert!(diags.is_empty(), "Parser diags: {:?}", diags);
+
+        if let Item::Function(f) = &prog.items[0] {
+            let body = f.body.as_ref().unwrap();
+            assert_eq!(body.stmts.len(), 4);
+
+            // 1. let Some(val) = opt else { return 0; };
+            if let Stmt::Let {
+                pattern,
+                else_block,
+                ..
+            } = &body.stmts[0]
+            {
+                assert!(matches!(pattern, Pattern::Variant { .. }));
+                assert!(else_block.is_some());
+            } else {
+                panic!("expected let ... else");
+            }
+
+            // 2. mut (a, b) = pair else { fail "impossible"; };
+            if let Stmt::Let {
+                is_mut,
+                pattern,
+                else_block,
+                ..
+            } = &body.stmts[1]
+            {
+                assert!(is_mut);
+                assert!(matches!(pattern, Pattern::Tuple(..)));
+                assert!(else_block.is_some());
+            } else {
+                panic!("expected mut ... else");
+            }
+
+            // 3. (a, b) = (10, 20) else { return -1; };
+            if let Stmt::AssignPattern {
+                pattern,
+                else_block,
+                ..
+            } = &body.stmts[2]
+            {
+                assert!(matches!(pattern, Pattern::Tuple(..)));
+                assert!(else_block.is_some());
+            } else {
+                panic!("expected assign pattern with else");
             }
         }
     }

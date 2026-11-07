@@ -188,6 +188,7 @@ pub enum Stmt {
         pattern: Pattern,
         ty: Option<Type>,
         init: Option<Expr>,
+        else_block: Option<Block>,
         span: Span,
     },
     Assign {
@@ -199,6 +200,7 @@ pub enum Stmt {
     AssignPattern {
         pattern: Pattern,
         val: Expr,
+        else_block: Option<Block>,
         span: Span,
     },
     Expr(Expr),
@@ -673,17 +675,27 @@ pub trait Visitor<'ast>: Sized {
 
     fn visit_stmt(&mut self, stmt: &'ast Stmt) {
         match stmt {
-            Stmt::Let { init, .. } => {
+            Stmt::Let {
+                init, else_block, ..
+            } => {
                 if let Some(e) = init {
                     self.visit_expr(e);
+                }
+                if let Some(eb) = else_block {
+                    self.visit_block(eb);
                 }
             }
             Stmt::Assign { target, val, .. } => {
                 self.visit_expr(target);
                 self.visit_expr(val);
             }
-            Stmt::AssignPattern { val, .. } => {
+            Stmt::AssignPattern {
+                val, else_block, ..
+            } => {
                 self.visit_expr(val);
+                if let Some(eb) = else_block {
+                    self.visit_block(eb);
+                }
             }
             Stmt::Expr(e) => self.visit_expr(e),
             Stmt::Defer(b, _) => self.visit_block(b),

@@ -379,3 +379,48 @@ fn test_multiple_refs_in_loop_hoisting() {
         stats.eliminated_checks
     );
 }
+
+#[test]
+fn test_confluent_dataflow_and_sroa_stability_check_elimination() {
+    let src = r#"
+        struct Data {
+            val: i64,
+        }
+
+        pub fn confluent_checks(cond: bool, d: ref Data) -> i64 {
+            mut factor = 1;
+            if cond {
+                factor = d.val * 2;
+            } else {
+                factor = d.val + 10;
+            }
+            // In the merge block, d has already been checked along both branches
+            return factor + d.val;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("confluent_gce.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    // Compile with SROA enabled and GCE disabled initially, then run GCE pass
+    let mut module = compile_to_fir(&prog, &analysis.symbols, true, false).unwrap();
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_module(&mut module);
+
+    let stats = gce.stats();
+    assert!(
+        stats.eliminated_checks >= 1,
+        "Post-merge block check must be eliminated via confluent dataflow dominance, eliminated: {}",
+        stats.eliminated_checks
+    );
+}

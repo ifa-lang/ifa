@@ -1354,3 +1354,71 @@ fn test_llvm_for_loop_pattern_destructuring_native_execution() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_aot_destructuring_let_else() {
+    let src = r#"
+        enum Opt {
+            Val(i64),
+            None,
+        }
+
+        fn extract(o: Opt) -> i64 {
+            let Opt::Val(x) = o else {
+                return 15;
+            };
+            return x * 3;
+        }
+
+        pub fn main() -> i64 {
+            let a = extract(Opt::Val(10));
+            let b = extract(Opt::None);
+            return a + b;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_let_else.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir = std::env::temp_dir().join(format!("ifa_llvm_let_else_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("let_else.o");
+    let bin_path = temp_dir.join("let_else_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&fir_module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    // a: 10 * 3 = 30, b: 15 => 45
+    assert_eq!(
+        output.status.code(),
+        Some(45),
+        "Native binary output exit code must be 45"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
