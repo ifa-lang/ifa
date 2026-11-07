@@ -185,3 +185,132 @@ fn test_vectorize_pass_array_copy_map_i32() {
     assert_eq!(stats.loops_vectorized, 1);
     assert!(stats.maps_vectorized >= 1);
 }
+
+#[test]
+fn test_vectorize_pass_slice_sum_f32() {
+    let src = r#"
+        pub fn sum_slice_f32(s: Slice<f32>) -> f32 {
+            let mut acc: f32 = 0.0;
+            for x in s {
+                acc = acc + x;
+            }
+            return acc;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("slice_vec_f32.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_analyzed, 1);
+    assert_eq!(stats.loops_vectorized, 1);
+    assert!(stats.slices_vectorized >= 1);
+    assert!(stats.eliminated_bounds_loops >= 1);
+}
+
+#[test]
+fn test_vectorize_pass_subslice_induction_f64() {
+    let src = r#"
+        pub fn subslice_vec(arr: [f64; 64]) -> f64 {
+            let s = arr[0..32];
+            let mut acc: f64 = 0.0;
+            for x in s {
+                acc = acc + x;
+            }
+            return acc;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("subslice_vec.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [vector_hint: width=4, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_analyzed, 1);
+    assert_eq!(stats.loops_vectorized, 1);
+    assert!(stats.slices_vectorized >= 1);
+    assert!(stats.eliminated_bounds_loops >= 1);
+}
+
+#[test]
+fn test_vectorize_pass_slice_mutation_map_i32() {
+    let src = r#"
+        pub fn scale_slice(mut s: [i32], factor: i32) -> [i32] {
+            let mut i: i64 = 0;
+            let len: i64 = s.len();
+            while i < len {
+                s[i] = s[i] * factor;
+                i = i + 1;
+            }
+            return s;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("scale_slice.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_analyzed, 1);
+    assert_eq!(stats.loops_vectorized, 1);
+    assert!(stats.slices_vectorized >= 1);
+    assert!(stats.maps_vectorized >= 1);
+}

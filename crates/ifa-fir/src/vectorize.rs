@@ -20,6 +20,10 @@ pub struct VectorizeStats {
     pub reductions_vectorized: usize,
     /// Number of array/slice transformation maps identified and accelerated.
     pub maps_vectorized: usize,
+    /// Number of primitive slice accesses vectorized with statically eliminated bounds checks.
+    pub slices_vectorized: usize,
+    /// Number of loops vectorized specifically leveraging statically eliminated bounds checks.
+    pub eliminated_bounds_loops: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -74,7 +78,10 @@ impl VectorizePass {
             let mut detected_elem_types: Vec<FirType> = Vec::new();
             let mut read_elements = 0;
             let mut write_elements = 0;
+            let mut array_elements = 0;
+            let mut slice_elements = 0;
             let mut has_reduction_op = false;
+            let mut had_eliminated_bounds = false;
 
             for &b_id in &loop_info.blocks {
                 if let Some(block) = func.get_block(b_id) {
@@ -87,6 +94,11 @@ impl VectorizePass {
                                     if Self::is_simd_primitive_type(&elem_ty) {
                                         detected_elem_types.push(elem_ty);
                                         read_elements += 1;
+                                        if Self::is_slice_aggregate(&value_types, *base) {
+                                            slice_elements += 1;
+                                        } else {
+                                            array_elements += 1;
+                                        }
                                     }
                                 }
                             }
@@ -97,8 +109,35 @@ impl VectorizePass {
                                     if Self::is_simd_primitive_type(&elem_ty) {
                                         detected_elem_types.push(elem_ty);
                                         write_elements += 1;
+                                        if Self::is_slice_aggregate(&value_types, *base) {
+                                            slice_elements += 1;
+                                        } else {
+                                            array_elements += 1;
+                                        }
                                     }
                                 }
+                            }
+                            ValueExpr::GetElementPtr { base, .. } => {
+                                if let Some(elem_ty) =
+                                    Self::get_aggregate_elem_type(&value_types, *base)
+                                {
+                                    if Self::is_simd_primitive_type(&elem_ty) {
+                                        detected_elem_types.push(elem_ty);
+                                        if Self::is_slice_aggregate(&value_types, *base) {
+                                            slice_elements += 1;
+                                        } else {
+                                            array_elements += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            ValueExpr::BoundsCheck {
+                                redundant: true, ..
+                            }
+                            | ValueExpr::SliceBoundsCheck {
+                                redundant: true, ..
+                            } => {
+                                had_eliminated_bounds = true;
                             }
                             ValueExpr::Binary { op, .. } => {
                                 if matches!(
@@ -163,7 +202,11 @@ impl VectorizePass {
                         }
                     }
                     self.stats.loops_vectorized += 1;
-                    self.stats.arrays_vectorized += detected_elem_types.len();
+                    self.stats.arrays_vectorized += array_elements;
+                    self.stats.slices_vectorized += slice_elements;
+                    if had_eliminated_bounds {
+                        self.stats.eliminated_bounds_loops += 1;
+                    }
                     if write_elements > 0 {
                         self.stats.maps_vectorized += 1;
                     } else if read_elements > 0 && has_reduction_op {
@@ -212,6 +255,15 @@ impl VectorizePass {
         }
     }
 
+    /// Check whether a given aggregate value ID represents a slice.
+    fn is_slice_aggregate(value_types: &HashMap<ValueId, FirType>, base_id: ValueId) -> bool {
+        match value_types.get(&base_id) {
+            Some(FirType::Slice(_)) => true,
+            Some(FirType::Pointer(inner)) => matches!(&**inner, FirType::Slice(_)),
+            _ => false,
+        }
+    }
+
     /// Verify whether all blocks in a loop are free of side effects (I/O, concurrency, deallocation).
     fn is_loop_side_effect_free(func: &FirFunction, loop_blocks: &HashSet<BlockId>) -> bool {
         for &b_id in loop_blocks {
@@ -227,6 +279,14 @@ impl VectorizePass {
                         | ValueExpr::ChanClose { .. }
                         | ValueExpr::ChanSelect { .. }
                         | ValueExpr::GenFree { .. } => return false,
+                        ValueExpr::BoundsCheck { redundant, .. }
+                        | ValueExpr::SliceBoundsCheck { redundant, .. } => {
+                            // If a bounds check is not statically eliminated, it can trigger
+                            // a dynamic panic or branching, inhibiting safe auto-vectorization
+                            if !*redundant {
+                                return false;
+                            }
+                        }
                         ValueExpr::CallDirect { name, .. } => {
                             let callee = INTERNER.resolve(name);
                             if callee == "println"
@@ -235,6 +295,8 @@ impl VectorizePass {
                                 || callee == "ifa_rt_print"
                                 || callee == "ifa_rt_println_i64"
                                 || callee == "ifa_rt_panic_uaf"
+                                || callee == "ifa_rt_bounds_check"
+                                || callee == "ifa_rt_panic_bounds"
                             {
                                 return false;
                             }
@@ -284,6 +346,24 @@ impl VectorizePass {
                                 None => FirType::Int(IntType::I64),
                             }
                         }
+                        ValueExpr::SliceSub { base, .. } => {
+                            match Self::get_aggregate_elem_type(&value_types, *base) {
+                                Some(elem_ty) => FirType::Slice(Box::new(elem_ty)),
+                                None => FirType::Slice(Box::new(FirType::Int(IntType::I64))),
+                            }
+                        }
+                        ValueExpr::GetElementPtr { base, .. } => match value_types.get(base) {
+                            Some(FirType::Array(elem, _)) | Some(FirType::Slice(elem)) => {
+                                FirType::Pointer(elem.clone())
+                            }
+                            Some(FirType::Pointer(inner)) => match &**inner {
+                                FirType::Array(elem, _) | FirType::Slice(elem) => {
+                                    FirType::Pointer(elem.clone())
+                                }
+                                _ => FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
+                            },
+                            _ => FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
+                        },
                         ValueExpr::ArrayInit(elements) => {
                             let elem_ty = elements
                                 .first()

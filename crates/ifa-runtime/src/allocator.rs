@@ -5,11 +5,103 @@
 use crate::header::{GenHeader, FLAG_ACTIVE, FLAG_ARENA_SCOPED};
 use std::alloc::{alloc, dealloc, Layout};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Standard slab size classes in bytes (excluding 8-byte GenHeader).
 pub const SIZE_CLASSES: [usize; 7] = [16, 32, 64, 128, 256, 512, 1024];
+
+/// Statistics regarding generational lifetime and epoch management in the slab allocator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EpochStats {
+    /// Monotonic global epoch counter.
+    pub global_epoch: u64,
+    /// Total number of 32-bit generation overflow epoch switches (to FLAG_EPOCH_1).
+    pub epoch_transitions: usize,
+    /// Total number of slots permanently quarantined due to secondary generation overflow.
+    pub quarantined_slots: usize,
+    /// Current active epoch pins held by concurrent readers/fibers.
+    pub active_pins: usize,
+}
+
+/// Thread-safe concurrent epoch coordinator and lifetime analyzer.
+pub struct EpochManager {
+    global_epoch: AtomicU64,
+    epoch_transitions: AtomicUsize,
+    quarantined_slots: AtomicUsize,
+    active_pins: AtomicUsize,
+}
+
+impl EpochManager {
+    pub const fn new() -> Self {
+        Self {
+            global_epoch: AtomicU64::new(1),
+            epoch_transitions: AtomicUsize::new(0),
+            quarantined_slots: AtomicUsize::new(0),
+            active_pins: AtomicUsize::new(0),
+        }
+    }
+
+    /// Current monotonic global epoch.
+    #[inline(always)]
+    pub fn current_epoch(&self) -> u64 {
+        self.global_epoch.load(Ordering::Acquire)
+    }
+
+    /// Advance the global monotonic epoch.
+    pub fn advance_epoch(&self) -> u64 {
+        self.global_epoch.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Record a 32-bit generation counter overflow transition to Epoch 1.
+    pub fn record_epoch_switch(&self) {
+        self.epoch_transitions.fetch_add(1, Ordering::Relaxed);
+        self.advance_epoch();
+    }
+
+    /// Record a permanent slot quarantine.
+    pub fn record_quarantine(&self) {
+        self.quarantined_slots.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Pin the current execution context into the current epoch.
+    pub fn pin(&self) -> EpochGuard<'_> {
+        self.active_pins.fetch_add(1, Ordering::SeqCst);
+        let epoch = self.current_epoch();
+        EpochGuard {
+            manager: self,
+            pinned_epoch: epoch,
+        }
+    }
+
+    /// Retrieve a snapshot of epoch statistics.
+    pub fn stats(&self) -> EpochStats {
+        EpochStats {
+            global_epoch: self.current_epoch(),
+            epoch_transitions: self.epoch_transitions.load(Ordering::Relaxed),
+            quarantined_slots: self.quarantined_slots.load(Ordering::Relaxed),
+            active_pins: self.active_pins.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for EpochManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RAII lifetime guard pinning the active epoch during safe generational reference dereferencing.
+pub struct EpochGuard<'a> {
+    manager: &'a EpochManager,
+    pub pinned_epoch: u64,
+}
+
+impl<'a> Drop for EpochGuard<'a> {
+    fn drop(&mut self) {
+        self.manager.active_pins.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Free slot node stored in intrusive free-lists when a slot is inactive.
 #[repr(C)]
@@ -89,11 +181,12 @@ impl SizeClassPool {
             let payload_ptr = node as *mut u8;
             let header_ptr = (payload_ptr as *mut GenHeader).sub(1);
             let current_gen = (*header_ptr).generation_counter;
+            let preserved_epoch = (*header_ptr).allocation_flags & crate::header::FLAG_EPOCH_1;
             let class_flag = (((class_idx + 1) as u16) << crate::header::FLAG_CLASS_SHIFT)
                 & crate::header::FLAG_CLASS_MASK;
             *header_ptr = GenHeader {
                 generation_counter: if current_gen == 0 { 1 } else { current_gen },
-                allocation_flags: FLAG_ACTIVE | class_flag,
+                allocation_flags: FLAG_ACTIVE | class_flag | preserved_epoch,
                 arena_id,
             };
             payload_ptr
@@ -110,6 +203,11 @@ impl SizeClassPool {
 
     fn recycle(&mut self, payload_ptr: *mut u8) {
         unsafe {
+            let header = (payload_ptr as *mut GenHeader).sub(1);
+            if (*header).is_quarantined() {
+                // Permanently retired slot; do not recycle
+                return;
+            }
             let node = payload_ptr as *mut FreeNode;
             (*node).next = self.free_head;
             self.free_head = node;
@@ -196,7 +294,7 @@ impl GenArena {
             unsafe {
                 let header = (ptr as *mut GenHeader).sub(1);
                 if (*header).is_active() {
-                    (*header).mark_freed();
+                    let _ = (*header).mark_freed();
                 }
             }
         }
@@ -377,6 +475,7 @@ pub struct GlobalGenAllocator {
     inner: Mutex<GlobalGenAllocatorInner>,
     next_arena_id: AtomicU16,
     allocated_bytes: AtomicUsize,
+    pub epoch_manager: EpochManager,
 }
 
 impl GlobalGenAllocator {
@@ -385,7 +484,23 @@ impl GlobalGenAllocator {
             inner: Mutex::new(GlobalGenAllocatorInner::new()),
             next_arena_id: AtomicU16::new(1),
             allocated_bytes: AtomicUsize::new(0),
+            epoch_manager: EpochManager::new(),
         }
+    }
+
+    /// Retrieve current epoch statistics from the concurrent epoch manager.
+    pub fn epoch_stats(&self) -> EpochStats {
+        self.epoch_manager.stats()
+    }
+
+    /// Pin the active thread or fiber in the current epoch.
+    pub fn pin_epoch(&self) -> EpochGuard<'_> {
+        self.epoch_manager.pin()
+    }
+
+    /// Manually advance the global epoch counter.
+    pub fn advance_epoch(&self) -> u64 {
+        self.epoch_manager.advance_epoch()
     }
 
     /// Allocate a slot on the generational heap.
@@ -404,11 +519,13 @@ impl GlobalGenAllocator {
                     unsafe {
                         let header = (ptr as *mut GenHeader).sub(1);
                         let cur_gen = (*header).generation_counter;
+                        let preserved_epoch =
+                            (*header).allocation_flags & crate::header::FLAG_EPOCH_1;
                         let class_flag = (((idx + 1) as u16) << crate::header::FLAG_CLASS_SHIFT)
                             & crate::header::FLAG_CLASS_MASK;
                         *header = GenHeader {
                             generation_counter: if cur_gen == 0 { 1 } else { cur_gen },
-                            allocation_flags: FLAG_ACTIVE | class_flag,
+                            allocation_flags: FLAG_ACTIVE | class_flag | preserved_epoch,
                             arena_id: 0,
                         };
                     }
@@ -449,12 +566,18 @@ impl GlobalGenAllocator {
             let class_code = (*header).size_class_id();
             let is_arena = (*header).is_arena_scoped();
 
-            // Invalidate slot generation
-            (*header).mark_freed();
-
-            if (*header).is_quarantined() {
-                // Permanently quarantined due to 32-bit generation overflow; do not re-add to cache
-                return;
+            // Invalidate slot generation and observe epoch transitions
+            let transition = (*header).mark_freed();
+            match transition {
+                crate::header::EpochTransition::SwitchedToEpoch1 => {
+                    self.epoch_manager.record_epoch_switch();
+                }
+                crate::header::EpochTransition::Quarantined => {
+                    self.epoch_manager.record_quarantine();
+                    // Permanently quarantined due to 32-bit generation overflow; do not re-add to cache or pool
+                    return;
+                }
+                crate::header::EpochTransition::None => {}
             }
 
             // Fast-path thread-local recycling for standard slab classes

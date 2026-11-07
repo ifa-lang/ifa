@@ -784,3 +784,128 @@ fn test_fiber_arena_isolation_and_ownership() {
     assert!(verified.load(Ordering::SeqCst));
     assert!(arena_id > 0);
 }
+
+#[test]
+fn test_gen_ref_epoch_consistency_and_stale_detection() {
+    let header = GenHeader::new_active(u32::MAX, 1);
+
+    // Simulate header directly preceding payload
+    unsafe {
+        let fake_mem = std::alloc::alloc(std::alloc::Layout::from_size_align(16, 8).unwrap());
+        let h_ptr = fake_mem as *mut GenHeader;
+        *h_ptr = header;
+        let p_ptr = fake_mem.add(8);
+
+        // Create reference in Epoch 0
+        let ref_epoch_0 = GenRef::from_payload(p_ptr, 1);
+        assert_eq!(ref_epoch_0.epoch_id(), 0);
+        assert!(!ref_epoch_0.is_stale_epoch());
+        assert!(ref_epoch_0.is_valid());
+
+        // Free slot at generation u32::MAX -> transitions to Epoch 1, reset gen to 1
+        let tr = (*h_ptr).mark_freed();
+        assert_eq!(tr, EpochTransition::SwitchedToEpoch1);
+        assert_eq!((*h_ptr).epoch_id(), 1);
+        assert_eq!((*h_ptr).generation_counter, 1);
+
+        // Reallocate slot in Epoch 1 with generation 1
+        (*h_ptr).allocation_flags |= FLAG_ACTIVE;
+
+        // Old reference recorded epoch 0; current slot is in Epoch 1!
+        // Even though generation is 1 (hypothetically matching an old gen 1 ref), epoch mismatch blocks it!
+        assert!(ref_epoch_0.is_stale_epoch());
+        assert!(!ref_epoch_0.is_valid());
+
+        // A new reference formed in Epoch 1 is completely valid
+        let ref_epoch_1 = GenRef::from_payload(p_ptr, 1);
+        assert_eq!(ref_epoch_1.epoch_id(), 1);
+        assert!(!ref_epoch_1.is_stale_epoch());
+        assert!(ref_epoch_1.is_valid());
+
+        // Secondary overflow -> permanently quarantined
+        (*h_ptr).generation_counter = u32::MAX;
+        let tr2 = (*h_ptr).mark_freed();
+        assert_eq!(tr2, EpochTransition::Quarantined);
+        assert!((*h_ptr).is_quarantined());
+        assert!(!ref_epoch_1.is_valid());
+
+        std::alloc::dealloc(
+            fake_mem,
+            std::alloc::Layout::from_size_align(16, 8).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn test_concurrent_epoch_manager_pins_and_quarantine() {
+    let stats_before = GLOBAL_ALLOCATOR.epoch_stats();
+    assert!(stats_before.global_epoch >= 1);
+
+    // Test RAII pin
+    {
+        let guard1 = GLOBAL_ALLOCATOR.pin_epoch();
+        assert_eq!(
+            guard1.pinned_epoch,
+            GLOBAL_ALLOCATOR.epoch_manager.current_epoch()
+        );
+        assert!(GLOBAL_ALLOCATOR.epoch_stats().active_pins >= 1);
+
+        {
+            let _guard2 = GLOBAL_ALLOCATOR.pin_epoch();
+            assert!(GLOBAL_ALLOCATOR.epoch_stats().active_pins >= 2);
+        }
+
+        assert!(GLOBAL_ALLOCATOR.epoch_stats().active_pins >= 1);
+    }
+    assert_eq!(GLOBAL_ALLOCATOR.epoch_stats().active_pins, 0);
+
+    // Test epoch advance
+    let next_epoch = GLOBAL_ALLOCATOR.advance_epoch();
+    assert_eq!(next_epoch, GLOBAL_ALLOCATOR.epoch_manager.current_epoch());
+    assert_eq!(ifa_rt_epoch_current(), next_epoch);
+
+    // Test C-ABI exports
+    let c_epoch = ifa_rt_epoch_advance();
+    assert_eq!(c_epoch, next_epoch + 1);
+}
+
+#[test]
+fn test_slab_allocator_epoch_preservation_and_quarantine() {
+    // Allocate 32-byte slot
+    let ptr = GLOBAL_ALLOCATOR.alloc(32, 8, 0);
+    assert!(!ptr.is_null());
+
+    unsafe {
+        let header = (ptr as *mut GenHeader).sub(1);
+        assert!((*header).is_active());
+        assert_eq!((*header).epoch_id(), 0);
+
+        // Force overflow to Epoch 1
+        (*header).generation_counter = u32::MAX;
+    }
+
+    // Free the slot -> should trigger epoch switch to Epoch 1 and update EpochManager
+    let transitions_before = GLOBAL_ALLOCATOR.epoch_stats().epoch_transitions;
+    GLOBAL_ALLOCATOR.free(ptr);
+    let transitions_after = GLOBAL_ALLOCATOR.epoch_stats().epoch_transitions;
+    assert_eq!(transitions_after, transitions_before + 1);
+
+    // Reallocate from slab cache -> verify preserved epoch bit
+    let ptr2 = GLOBAL_ALLOCATOR.alloc(32, 8, 0);
+    unsafe {
+        let header2 = (ptr2 as *mut GenHeader).sub(1);
+        assert!((*header2).is_active());
+        // Epoch 1 must be preserved upon reallocation!
+        assert_eq!((*header2).epoch_id(), 1);
+        assert_eq!((*header2).allocation_flags & FLAG_EPOCH_1, FLAG_EPOCH_1);
+
+        // Force secondary overflow on this slot to test quarantine
+        (*header2).generation_counter = u32::MAX;
+    }
+
+    let quarantined_before = GLOBAL_ALLOCATOR.epoch_stats().quarantined_slots;
+    GLOBAL_ALLOCATOR.free(ptr2);
+    let quarantined_after = GLOBAL_ALLOCATOR.epoch_stats().quarantined_slots;
+    assert_eq!(quarantined_after, quarantined_before + 1);
+    assert_eq!(ifa_rt_epoch_quarantined_count(), quarantined_after);
+}

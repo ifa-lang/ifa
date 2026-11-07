@@ -40,6 +40,74 @@ pub extern "C" fn ifa_rt_gen_check(ptr: *const u8, remembered_gen: u32) {
     }
 }
 
+/// 1-cycle CPU generation and epoch check: aborts safely on Use-After-Free or epoch mismatch detection.
+#[no_mangle]
+pub extern "C" fn ifa_rt_gen_check_epoch(
+    ptr: *const u8,
+    remembered_gen: u32,
+    remembered_epoch: u16,
+) {
+    if ptr.is_null() {
+        ifa_rt_panic_null_ref();
+    }
+    unsafe {
+        let header = &*(ptr.sub(std::mem::size_of::<GenHeader>()) as *const GenHeader);
+        if !header.is_active()
+            || header.is_quarantined()
+            || header.generation_counter != remembered_gen
+        {
+            ifa_rt_panic_uaf(ptr, remembered_gen, header.generation_counter);
+        }
+        let current_epoch = header.allocation_flags & crate::header::FLAG_EPOCH_1;
+        let expected_epoch = remembered_epoch & crate::header::FLAG_EPOCH_1;
+        if current_epoch != expected_epoch {
+            ifa_rt_panic_epoch_mismatch(ptr, expected_epoch, current_epoch);
+        }
+    }
+}
+
+/// Retrieve current runtime epoch counter.
+#[no_mangle]
+pub extern "C" fn ifa_rt_epoch_current() -> u64 {
+    GLOBAL_ALLOCATOR.epoch_manager.current_epoch()
+}
+
+/// Manually trigger runtime epoch progression.
+#[no_mangle]
+pub extern "C" fn ifa_rt_epoch_advance() -> u64 {
+    GLOBAL_ALLOCATOR.epoch_manager.advance_epoch()
+}
+
+/// Number of quarantined slots retired due to generation overflow.
+#[no_mangle]
+pub extern "C" fn ifa_rt_epoch_quarantined_count() -> usize {
+    GLOBAL_ALLOCATOR.epoch_stats().quarantined_slots
+}
+
+/// Number of epoch switches caused by 32-bit generation overflows.
+#[no_mangle]
+pub extern "C" fn ifa_rt_epoch_transitions_count() -> usize {
+    GLOBAL_ALLOCATOR.epoch_stats().epoch_transitions
+}
+
+/// Intercept and abort program on detected epoch mismatch wrap-around.
+#[no_mangle]
+pub extern "C" fn ifa_rt_panic_epoch_mismatch(
+    ptr: *const u8,
+    expected_epoch: u16,
+    actual_epoch: u16,
+) -> ! {
+    eprintln!(
+        "\n[IFA RUNTIME ERROR: SAFE INTERCEPTION]\n\
+         Epoch mismatch / wrap-around ABA attempt detected on slot address {:p}!\n\
+         Expected epoch flag: 0x{:04x}\n\
+         Actual current epoch flag: 0x{:04x}\n\
+         Execution terminated deterministically before memory corruption.\n",
+        ptr, expected_epoch, actual_epoch
+    );
+    std::process::abort();
+}
+
 /// Intercept and abort program on detected Use-After-Free without memory corruption.
 #[no_mangle]
 pub extern "C" fn ifa_rt_panic_uaf(ptr: *const u8, expected_gen: u32, actual_gen: u32) -> ! {

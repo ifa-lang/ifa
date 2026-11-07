@@ -74,32 +74,20 @@ impl BcePass {
         let dom_tree = DominanceTree::build(&cfg);
 
         // 1. Infer constants, array capacities, and slice bounds
-        let (constants, array_capacities, slice_lengths, aliases) = Self::infer_ranges(func);
+        let ranges = Self::infer_ranges(func);
+        let (constants, array_capacities, slice_lengths, aliases) = &ranges;
 
         // 2. Loop-Invariant Check Hoisting (LICM for Bounds Checks)
-        self.hoist_loop_invariant_checks(func, &cfg, &dom_tree, &constants, &aliases);
+        self.hoist_loop_invariant_checks(func, &cfg, &dom_tree, constants, aliases);
 
         // 3. Constant Propagation Elimination
-        self.eliminate_constant_checks(
-            func,
-            &constants,
-            &array_capacities,
-            &slice_lengths,
-            &aliases,
-        );
+        self.eliminate_constant_checks(func, constants, array_capacities, slice_lengths, aliases);
 
         // 4. Induction Variable Range Elimination in Natural Loops
-        self.eliminate_loop_induction_checks(
-            func,
-            &cfg,
-            &dom_tree,
-            &constants,
-            &array_capacities,
-            &aliases,
-        );
+        self.eliminate_loop_induction_checks(func, &cfg, &dom_tree, &ranges);
 
         // 5. Dominance-based and Lexical Redundancy Elimination
-        self.eliminate_dominance_checks(func, &dom_tree, &aliases);
+        self.eliminate_dominance_checks(func, &dom_tree, aliases);
     }
 
     /// Resolves a value through single-store load alias chains to its canonical root definition.
@@ -202,7 +190,10 @@ impl BcePass {
                                     if e >= s && s >= 0 {
                                         slice_lengths.insert(res, (e - s) as usize);
                                     }
-                                } else if let Some(&cap) = array_capacities.get(base) {
+                                } else if let Some(&cap) = array_capacities
+                                    .get(base)
+                                    .or_else(|| slice_lengths.get(base))
+                                {
                                     slice_lengths.insert(res, cap);
                                 }
                             }
@@ -460,10 +451,9 @@ impl BcePass {
         func: &mut FirFunction,
         cfg: &ControlFlowGraph,
         dom_tree: &DominanceTree,
-        constants: &HashMap<ValueId, i64>,
-        array_capacities: &HashMap<ValueId, usize>,
-        aliases: &HashMap<ValueId, ValueId>,
+        ranges: &InferredRanges,
     ) {
+        let (constants, array_capacities, slice_lengths, aliases) = ranges;
         let loops = GenerationalOptPass::find_natural_loops(cfg, dom_tree);
 
         for loop_info in loops {
@@ -511,11 +501,34 @@ impl BcePass {
                 }
             }
 
+            let mut induction_limit_ptr: Option<ValueId> = None;
+            if let Some(arr_val) = induction_limit_arr {
+                let c_arr = Self::canonical(arr_val, aliases);
+                for b in &func.blocks {
+                    for inst in &b.instructions {
+                        if inst.result == Some(arr_val) || inst.result == Some(c_arr) {
+                            if let ValueExpr::Load { ptr } = &inst.expr {
+                                induction_limit_ptr = Some(*ptr);
+                            }
+                        }
+                    }
+                }
+            }
+
             let ind_var = match induction_var {
                 Some(v) => v,
                 None => continue,
             };
             let c_ind = Self::canonical(ind_var, aliases);
+
+            let mut induction_var_ptr: Option<ValueId> = None;
+            for inst in &header_block.instructions {
+                if inst.result == Some(ind_var) {
+                    if let ValueExpr::Load { ptr } = &inst.expr {
+                        induction_var_ptr = Some(*ptr);
+                    }
+                }
+            }
 
             // Eliminate matching bounds checks in the loop body
             for &b_id in &loop_info.blocks {
@@ -523,7 +536,27 @@ impl BcePass {
                     continue;
                 }
                 if let Some(block) = func.get_block_mut(b_id) {
+                    let mut body_aliases: HashSet<ValueId> = HashSet::new();
+                    body_aliases.insert(ind_var);
+                    body_aliases.insert(c_ind);
+                    let mut ptr_modified = false;
+
                     for inst in &mut block.instructions {
+                        if let ValueExpr::Store { ptr, .. } = &inst.expr {
+                            if Some(*ptr) == induction_var_ptr {
+                                ptr_modified = true;
+                            }
+                        }
+                        if !ptr_modified {
+                            if let ValueExpr::Load { ptr } = &inst.expr {
+                                if Some(*ptr) == induction_var_ptr {
+                                    if let Some(res) = inst.result {
+                                        body_aliases.insert(res);
+                                    }
+                                }
+                            }
+                        }
+
                         if let ValueExpr::BoundsCheck {
                             base,
                             index,
@@ -532,13 +565,17 @@ impl BcePass {
                         {
                             let c_base = Self::canonical(*base, aliases);
                             let c_idx = Self::canonical(*index, aliases);
-                            if !*redundant
-                                && (*index == ind_var || c_idx == ind_var || c_idx == c_ind)
-                            {
+                            let is_ind_idx =
+                                body_aliases.contains(index) || body_aliases.contains(&c_idx);
+                            if !*redundant && is_ind_idx {
                                 let mut is_safe = false;
                                 if let Some(lim_arr) = induction_limit_arr {
                                     let c_lim_arr = Self::canonical(lim_arr, aliases);
-                                    if *base == lim_arr || c_base == lim_arr || c_base == c_lim_arr
+                                    if *base == lim_arr
+                                        || c_base == lim_arr
+                                        || c_base == c_lim_arr
+                                        || Some(*base) == induction_limit_ptr
+                                        || Some(c_base) == induction_limit_ptr
                                     {
                                         is_safe = true;
                                     }
@@ -548,7 +585,64 @@ impl BcePass {
                                         let cap = array_capacities
                                             .get(base)
                                             .or_else(|| array_capacities.get(&c_base))
-                                            .copied();
+                                            .copied()
+                                            .or_else(|| {
+                                                slice_lengths
+                                                    .get(base)
+                                                    .or_else(|| slice_lengths.get(&c_base))
+                                                    .copied()
+                                            });
+                                        if let Some(c) = cap {
+                                            if lim_c <= c {
+                                                is_safe = true;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if is_safe {
+                                    *redundant = true;
+                                    self.stats.eliminated_checks += 1;
+                                    self.stats.loop_induction_checks_eliminated += 1;
+                                }
+                            }
+                        }
+                        if let ValueExpr::SliceBoundsCheck {
+                            base,
+                            start: _,
+                            end,
+                            redundant,
+                        } = &mut inst.expr
+                        {
+                            let c_base = Self::canonical(*base, aliases);
+                            let c_end = Self::canonical(*end, aliases);
+                            let is_ind_end =
+                                body_aliases.contains(end) || body_aliases.contains(&c_end);
+                            if !*redundant && is_ind_end {
+                                let mut is_safe = false;
+                                if let Some(lim_arr) = induction_limit_arr {
+                                    let c_lim_arr = Self::canonical(lim_arr, aliases);
+                                    if *base == lim_arr
+                                        || c_base == lim_arr
+                                        || c_base == c_lim_arr
+                                        || Some(*base) == induction_limit_ptr
+                                        || Some(c_base) == induction_limit_ptr
+                                    {
+                                        is_safe = true;
+                                    }
+                                }
+                                if !is_safe {
+                                    if let Some(lim_c) = constant_limit {
+                                        let cap = array_capacities
+                                            .get(base)
+                                            .or_else(|| array_capacities.get(&c_base))
+                                            .copied()
+                                            .or_else(|| {
+                                                slice_lengths
+                                                    .get(base)
+                                                    .or_else(|| slice_lengths.get(&c_base))
+                                                    .copied()
+                                            });
                                         if let Some(c) = cap {
                                             if lim_c <= c {
                                                 is_safe = true;

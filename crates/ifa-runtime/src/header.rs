@@ -13,6 +13,17 @@ pub const FLAG_ARENA_SCOPED: u16 = 0x0008;
 pub const FLAG_QUARANTINED: u16 = 0x0010;
 pub const FLAG_EPOCH_1: u16 = 0x0020;
 
+/// Result of marking a generational memory slot as freed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochTransition {
+    /// Normal generation increment within current epoch.
+    None,
+    /// 32-bit generation overflowed u32::MAX, transitioned into Epoch 1.
+    SwitchedToEpoch1,
+    /// Secondary generation overflow, slot permanently quarantined from pool.
+    Quarantined,
+}
+
 /// Bitshift and mask for encoding size-class ID within allocation flags.
 pub const FLAG_CLASS_SHIFT: u16 = 8;
 pub const FLAG_CLASS_MASK: u16 = 0xFF00;
@@ -64,6 +75,16 @@ impl GenHeader {
         ((self.allocation_flags & FLAG_CLASS_MASK) >> FLAG_CLASS_SHIFT) as usize
     }
 
+    /// Retrieve the epoch bit index (0 or 1).
+    #[inline(always)]
+    pub const fn epoch_id(&self) -> u8 {
+        if (self.allocation_flags & FLAG_EPOCH_1) != 0 {
+            1
+        } else {
+            0
+        }
+    }
+
     /// Store a 1-based size-class ID into the header flags.
     #[inline(always)]
     pub fn set_size_class_id(&mut self, class_id: usize) {
@@ -75,20 +96,23 @@ impl GenHeader {
     /// In case of 32-bit counter overflow (reaching u32::MAX), transitions epoch
     /// or quarantines the slot permanently to eliminate ABA / Use-After-Free wrap-around.
     #[inline(always)]
-    pub fn mark_freed(&mut self) {
+    pub fn mark_freed(&mut self) -> EpochTransition {
         self.allocation_flags &= !FLAG_ACTIVE;
         if self.generation_counter == u32::MAX {
             if (self.allocation_flags & FLAG_EPOCH_1) == 0 {
                 // First 4-billion cycle overflow: toggle epoch bit and restart generation at 1
                 self.allocation_flags |= FLAG_EPOCH_1;
                 self.generation_counter = 1;
+                EpochTransition::SwitchedToEpoch1
             } else {
                 // Secondary overflow: permanently quarantine slot from pool
                 self.allocation_flags |= FLAG_QUARANTINED;
                 self.generation_counter = 0;
+                EpochTransition::Quarantined
             }
         } else {
             self.generation_counter += 1;
+            EpochTransition::None
         }
     }
 }
@@ -136,11 +160,40 @@ impl GenRef {
         }
         let header_ptr = (ptr as *const GenHeader).sub(1);
         let remembered_gen = (*header_ptr).generation_counter;
+        let remembered_epoch = (*header_ptr).allocation_flags & (FLAG_EPOCH_1 | FLAG_QUARANTINED);
         Self {
             ptr,
             remembered_gen,
             arena_id,
-            _reserved: 0,
+            _reserved: remembered_epoch,
+        }
+    }
+
+    /// Retrieve the remembered epoch flag recorded at reference creation.
+    #[inline(always)]
+    pub const fn remembered_epoch(&self) -> u16 {
+        self._reserved & FLAG_EPOCH_1
+    }
+
+    /// Retrieve the epoch bit index (0 or 1).
+    #[inline(always)]
+    pub const fn epoch_id(&self) -> u8 {
+        if (self._reserved & FLAG_EPOCH_1) != 0 {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Check whether the reference's recorded epoch no longer matches the target's current epoch.
+    #[inline(always)]
+    pub fn is_stale_epoch(&self) -> bool {
+        if self.ptr.is_null() {
+            return true;
+        }
+        unsafe {
+            let header = self.header();
+            (header.allocation_flags & FLAG_EPOCH_1) != (self._reserved & FLAG_EPOCH_1)
         }
     }
 
@@ -154,6 +207,7 @@ impl GenRef {
     }
 
     /// Validate in 1 CPU cycle that the target is still alive and has not been freed/reallocated.
+    /// Verifies active state, absence of quarantine, generation match, and epoch consistency.
     #[inline(always)]
     pub fn is_valid(&self) -> bool {
         if self.ptr.is_null() {
@@ -164,6 +218,7 @@ impl GenRef {
             header.is_active()
                 && !header.is_quarantined()
                 && header.generation_counter == self.remembered_gen
+                && (header.allocation_flags & FLAG_EPOCH_1) == (self._reserved & FLAG_EPOCH_1)
         }
     }
 }
