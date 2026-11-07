@@ -1864,6 +1864,14 @@ impl<'a> SemanticAnalyzer<'a> {
                         arm_types.push(arm_ty);
                     }
 
+                    crate::exhaustiveness::check_match_exhaustiveness(
+                        &self.symbols,
+                        arms,
+                        &target_ty,
+                        expr.span,
+                        &mut self.diagnostics,
+                    );
+
                     let mut unified = arm_types[0].clone();
                     for arm_ty in &arm_types[1..] {
                         if !arm_ty.is_assignable_to(&unified)

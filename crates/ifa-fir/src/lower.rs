@@ -2521,6 +2521,10 @@ impl<'a> FunctionLoweringContext<'a> {
                     span,
                 );
 
+                let target_ty = self
+                    .infer_expr_fir_type(target_expr)
+                    .unwrap_or(FirType::Int(IntType::I64));
+
                 let mut next_arm_block = self.alloc_block();
                 let total_arms = arms.len();
 
@@ -2548,185 +2552,14 @@ impl<'a> FunctionLoweringContext<'a> {
 
                     self.current_block = arm_check_block;
 
-                    match &arm.pattern {
-                        Pattern::Wildcard(_) => {
-                            self.set_terminator(Terminator::Branch {
-                                target: success_target,
-                                args: Vec::new(),
-                            });
-                        }
-                        Pattern::Lit(lit, _) => {
-                            let lit_const = match lit {
-                                Lit::Int(s) => {
-                                    let v: i128 = s.as_str().replace('_', "").parse().unwrap_or(0);
-                                    ConstantValue::Int(v, IntType::I64)
-                                }
-                                Lit::Float(s) => {
-                                    let v: f64 = s.as_str().parse().unwrap_or(0.0);
-                                    ConstantValue::Float(v, FloatType::F64)
-                                }
-                                Lit::Bool(b) => ConstantValue::Bool(*b),
-                                Lit::Char(c) => ConstantValue::Char(*c),
-                                Lit::String(s) => ConstantValue::String(*s),
-                                Lit::Null => ConstantValue::Null,
-                            };
-                            let lit_val = self.alloc_value();
-                            self.emit(Some(lit_val), ValueExpr::Constant(lit_const), arm.span);
-                            let matches_cond = self.alloc_value();
-                            self.emit(
-                                Some(matches_cond),
-                                ValueExpr::Binary {
-                                    op: BinaryOp::Eq,
-                                    lhs: target_val,
-                                    rhs: lit_val,
-                                },
-                                arm.span,
-                            );
-                            self.set_terminator(Terminator::BranchCond {
-                                cond: matches_cond,
-                                then_block: success_target,
-                                then_args: Vec::new(),
-                                else_block: next_arm_block,
-                                else_args: Vec::new(),
-                            });
-                        }
-                        Pattern::Ident(sym, p_span) => {
-                            let var_ptr = self.alloc_value();
-                            let var_ty = self
-                                .infer_expr_fir_type(target_expr)
-                                .unwrap_or(FirType::Int(IntType::I64));
-                            self.emit(
-                                Some(var_ptr),
-                                ValueExpr::Alloca {
-                                    ty: var_ty.clone(),
-                                    name: Some(*sym),
-                                },
-                                *p_span,
-                            );
-                            self.emit(
-                                None,
-                                ValueExpr::Store {
-                                    ptr: var_ptr,
-                                    val: target_val,
-                                },
-                                *p_span,
-                            );
-                            self.var_allocas.insert(*sym, var_ptr);
-                            self.var_types.insert(*sym, var_ty);
-
-                            self.set_terminator(Terminator::Branch {
-                                target: success_target,
-                                args: Vec::new(),
-                            });
-                        }
-                        Pattern::Variant {
-                            enum_name,
-                            variant,
-                            inner,
-                            span: v_span,
-                        } => {
-                            let (disc, opt_payload_ty) = if let Some(e_name) = enum_name {
-                                self.lookup_qualified_variant_info(*e_name, *variant)
-                                    .map(|(_, d, p)| (d, p))
-                                    .unwrap_or_else(|| {
-                                        (
-                                            self.lookup_variant_discriminant(*variant).unwrap_or(0),
-                                            None,
-                                        )
-                                    })
-                            } else {
-                                self.lookup_variant_info(*variant)
-                                    .map(|(_, d, p)| (d, p))
-                                    .unwrap_or_else(|| {
-                                        (
-                                            self.lookup_variant_discriminant(*variant).unwrap_or(0),
-                                            None,
-                                        )
-                                    })
-                            };
-
-                            let disc_val = self.alloc_value();
-                            self.emit(
-                                Some(disc_val),
-                                ValueExpr::EnumGetDiscriminant { base: target_val },
-                                *v_span,
-                            );
-                            let expected_disc_val = self.alloc_value();
-                            self.emit(
-                                Some(expected_disc_val),
-                                ValueExpr::Constant(ConstantValue::Int(disc as i128, IntType::I64)),
-                                *v_span,
-                            );
-                            let matches_cond = self.alloc_value();
-                            self.emit(
-                                Some(matches_cond),
-                                ValueExpr::Binary {
-                                    op: BinaryOp::Eq,
-                                    lhs: disc_val,
-                                    rhs: expected_disc_val,
-                                },
-                                *v_span,
-                            );
-
-                            if let Some(inner_pat) = inner {
-                                let payload_extract_block = self.alloc_block();
-                                self.set_terminator(Terminator::BranchCond {
-                                    cond: matches_cond,
-                                    then_block: payload_extract_block,
-                                    then_args: Vec::new(),
-                                    else_block: next_arm_block,
-                                    else_args: Vec::new(),
-                                });
-
-                                self.current_block = payload_extract_block;
-                                let p_ty = opt_payload_ty.unwrap_or(FirType::Int(IntType::I64));
-                                let payload_val = self.alloc_value();
-                                self.emit(
-                                    Some(payload_val),
-                                    ValueExpr::EnumGetPayload {
-                                        base: target_val,
-                                        payload_ty: p_ty.clone(),
-                                    },
-                                    *v_span,
-                                );
-
-                                if let Pattern::Ident(inner_sym, inner_span) = inner_pat.as_ref() {
-                                    let inner_ptr = self.alloc_value();
-                                    self.emit(
-                                        Some(inner_ptr),
-                                        ValueExpr::Alloca {
-                                            ty: p_ty.clone(),
-                                            name: Some(*inner_sym),
-                                        },
-                                        *inner_span,
-                                    );
-                                    self.emit(
-                                        None,
-                                        ValueExpr::Store {
-                                            ptr: inner_ptr,
-                                            val: payload_val,
-                                        },
-                                        *inner_span,
-                                    );
-                                    self.var_allocas.insert(*inner_sym, inner_ptr);
-                                    self.var_types.insert(*inner_sym, p_ty);
-                                }
-
-                                self.set_terminator(Terminator::Branch {
-                                    target: success_target,
-                                    args: Vec::new(),
-                                });
-                            } else {
-                                self.set_terminator(Terminator::BranchCond {
-                                    cond: matches_cond,
-                                    then_block: success_target,
-                                    then_args: Vec::new(),
-                                    else_block: next_arm_block,
-                                    else_args: Vec::new(),
-                                });
-                            }
-                        }
-                    }
+                    self.lower_pattern_match(
+                        target_val,
+                        &target_ty,
+                        &arm.pattern,
+                        success_target,
+                        next_arm_block,
+                        arm.span,
+                    );
 
                     // Optional Guard Evaluation Block
                     if let Some(guard_block) = arm_guard_block {
@@ -2994,6 +2827,177 @@ impl<'a> FunctionLoweringContext<'a> {
                 let res = self.alloc_value();
                 self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), span);
                 res
+            }
+        }
+    }
+
+    /// Recursively lowers pattern matching against an SSA value, supporting nested variant destructuring,
+    /// literals, variables, and wildcards.
+    fn lower_pattern_match(
+        &mut self,
+        target_val: ValueId,
+        target_ty: &FirType,
+        pat: &Pattern,
+        success_target: BlockId,
+        fail_target: BlockId,
+        _span: Span,
+    ) {
+        match pat {
+            Pattern::Wildcard(_) => {
+                self.set_terminator(Terminator::Branch {
+                    target: success_target,
+                    args: Vec::new(),
+                });
+            }
+            Pattern::Lit(lit, l_span) => {
+                let lit_const = match lit {
+                    Lit::Int(s) => {
+                        let v: i128 = s.as_str().replace('_', "").parse().unwrap_or(0);
+                        ConstantValue::Int(v, IntType::I64)
+                    }
+                    Lit::Float(s) => {
+                        let v: f64 = s.as_str().parse().unwrap_or(0.0);
+                        ConstantValue::Float(v, FloatType::F64)
+                    }
+                    Lit::Bool(b) => ConstantValue::Bool(*b),
+                    Lit::Char(c) => ConstantValue::Char(*c),
+                    Lit::String(s) => ConstantValue::String(*s),
+                    Lit::Null => ConstantValue::Null,
+                };
+                let lit_val = self.alloc_value();
+                self.emit(Some(lit_val), ValueExpr::Constant(lit_const), *l_span);
+                let matches_cond = self.alloc_value();
+                self.emit(
+                    Some(matches_cond),
+                    ValueExpr::Binary {
+                        op: BinaryOp::Eq,
+                        lhs: target_val,
+                        rhs: lit_val,
+                    },
+                    *l_span,
+                );
+                self.set_terminator(Terminator::BranchCond {
+                    cond: matches_cond,
+                    then_block: success_target,
+                    then_args: Vec::new(),
+                    else_block: fail_target,
+                    else_args: Vec::new(),
+                });
+            }
+            Pattern::Ident(sym, p_span) => {
+                let var_ptr = self.alloc_value();
+                self.emit(
+                    Some(var_ptr),
+                    ValueExpr::Alloca {
+                        ty: target_ty.clone(),
+                        name: Some(*sym),
+                    },
+                    *p_span,
+                );
+                self.emit(
+                    None,
+                    ValueExpr::Store {
+                        ptr: var_ptr,
+                        val: target_val,
+                    },
+                    *p_span,
+                );
+                self.var_allocas.insert(*sym, var_ptr);
+                self.var_types.insert(*sym, target_ty.clone());
+
+                self.set_terminator(Terminator::Branch {
+                    target: success_target,
+                    args: Vec::new(),
+                });
+            }
+            Pattern::Variant {
+                enum_name,
+                variant,
+                inner,
+                span: v_span,
+            } => {
+                let (disc, opt_payload_ty) = if let Some(e_name) = enum_name {
+                    self.lookup_qualified_variant_info(*e_name, *variant)
+                        .map(|(_, d, p)| (d, p))
+                        .unwrap_or_else(|| {
+                            (
+                                self.lookup_variant_discriminant(*variant).unwrap_or(0),
+                                None,
+                            )
+                        })
+                } else {
+                    self.lookup_variant_info(*variant)
+                        .map(|(_, d, p)| (d, p))
+                        .unwrap_or_else(|| {
+                            (
+                                self.lookup_variant_discriminant(*variant).unwrap_or(0),
+                                None,
+                            )
+                        })
+                };
+
+                let disc_val = self.alloc_value();
+                self.emit(
+                    Some(disc_val),
+                    ValueExpr::EnumGetDiscriminant { base: target_val },
+                    *v_span,
+                );
+                let expected_disc_val = self.alloc_value();
+                self.emit(
+                    Some(expected_disc_val),
+                    ValueExpr::Constant(ConstantValue::Int(disc as i128, IntType::I64)),
+                    *v_span,
+                );
+                let matches_cond = self.alloc_value();
+                self.emit(
+                    Some(matches_cond),
+                    ValueExpr::Binary {
+                        op: BinaryOp::Eq,
+                        lhs: disc_val,
+                        rhs: expected_disc_val,
+                    },
+                    *v_span,
+                );
+
+                if let Some(inner_pat) = inner {
+                    let payload_extract_block = self.alloc_block();
+                    self.set_terminator(Terminator::BranchCond {
+                        cond: matches_cond,
+                        then_block: payload_extract_block,
+                        then_args: Vec::new(),
+                        else_block: fail_target,
+                        else_args: Vec::new(),
+                    });
+
+                    self.current_block = payload_extract_block;
+                    let p_ty = opt_payload_ty.unwrap_or(FirType::Int(IntType::I64));
+                    let payload_val = self.alloc_value();
+                    self.emit(
+                        Some(payload_val),
+                        ValueExpr::EnumGetPayload {
+                            base: target_val,
+                            payload_ty: p_ty.clone(),
+                        },
+                        *v_span,
+                    );
+
+                    self.lower_pattern_match(
+                        payload_val,
+                        &p_ty,
+                        inner_pat,
+                        success_target,
+                        fail_target,
+                        *v_span,
+                    );
+                } else {
+                    self.set_terminator(Terminator::BranchCond {
+                        cond: matches_cond,
+                        then_block: success_target,
+                        then_args: Vec::new(),
+                        else_block: fail_target,
+                        else_args: Vec::new(),
+                    });
+                }
             }
         }
     }

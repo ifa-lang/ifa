@@ -1,4 +1,5 @@
-use ifa_sema::types::{FloatType, IntType, Type as SemaType};
+use ifa_sema::types::Type as SemaType;
+pub use ifa_sema::types::{FloatType, IntType};
 use ifa_span::{Symbol, INTERNER};
 use std::fmt;
 

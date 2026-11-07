@@ -1358,3 +1358,183 @@ fn test_multiple_structs_implementing_same_trait_monomorphic_resolution() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_match_exhaustiveness_missing_enum_variants_rejected() {
+    let code = r#"
+        enum Light {
+            Red,
+            Yellow,
+            Green,
+        }
+
+        fn action(l: Light) -> i64 {
+            return match l {
+                Light::Red => 1,
+                Light::Yellow => 2,
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Non-exhaustive enum match must be rejected"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0043")),
+        "Expected E0043 diagnostic for non-exhaustive enum match: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_match_exhaustiveness_missing_bool_branch_rejected() {
+    let code = r#"
+        fn test_bool(b: bool) -> i64 {
+            return match b {
+                true => 10,
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Non-exhaustive bool match must be rejected"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0043")),
+        "Expected E0043 diagnostic for non-exhaustive bool match: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_match_exhaustiveness_missing_scalar_catch_all_rejected() {
+    let code = r#"
+        fn classify_int(n: i64) -> i64 {
+            return match n {
+                0 => 100,
+                1 => 200,
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Match on infinite scalar domain without wildcard must be rejected"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0043")),
+        "Expected E0043 diagnostic for missing catch-all: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_match_unreachable_pattern_after_catch_all_rejected() {
+    let code = r#"
+        enum State {
+            On,
+            Off,
+        }
+
+        fn handle(s: State) -> i64 {
+            return match s {
+                _ => 1,
+                State::On => 2,
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Unreachable branch after wildcard must be rejected"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0044")),
+        "Expected E0044 diagnostic for unreachable pattern: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_match_unreachable_pattern_redundant_variant_rejected() {
+    let code = r#"
+        enum Color {
+            Red,
+            Blue,
+        }
+
+        fn inspect_color(c: Color) -> i64 {
+            return match c {
+                Color::Red => 1,
+                Color::Red => 2,
+                Color::Blue => 3,
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Redundant variant pattern must be rejected"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0044")),
+        "Expected E0044 diagnostic for duplicate variant: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_match_exhaustive_enum_and_bool_succeeds() {
+    let code = r#"
+        enum OptionI64 {
+            Some(i64),
+            None,
+        }
+
+        fn unwrap_or_zero(opt: OptionI64) -> i64 {
+            return match opt {
+                OptionI64::Some(v) => v,
+                OptionI64::None => 0,
+            }
+        }
+
+        fn negate_bool(b: bool) -> bool {
+            return match b {
+                true => false,
+                false => true,
+            }
+        }
+
+        fn classify_with_fallback(x: i64) -> i64 {
+            return match x {
+                1 => 10,
+                2 => 20,
+                _ => 0,
+            }
+        }
+
+        pub fn main() {
+            let res = unwrap_or_zero(OptionI64::Some(42));
+            let b = negate_bool(true);
+            let c = classify_with_fallback(5);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Exhaustive pattern matches must succeed without semantic errors: {:?}",
+        res.diagnostics
+    );
+}

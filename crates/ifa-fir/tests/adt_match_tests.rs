@@ -155,3 +155,100 @@ fn test_adt_semantic_validation_errors() {
         .iter()
         .any(|d| d.code.as_deref() == Some("E0042")));
 }
+
+#[test]
+fn test_nested_variant_and_literal_pattern_matching() {
+    let src = r#"
+        enum TreeVal {
+            Leaf(i64),
+            Empty,
+        }
+
+        fn eval_tree(t: TreeVal) -> i64 {
+            return match t {
+                TreeVal::Leaf(0) => 1000,
+                TreeVal::Leaf(val) => val * 10,
+                TreeVal::Empty => 0,
+            }
+        }
+
+        fn main() -> i64 {
+            let t1 = TreeVal::Leaf(0);
+            let t2 = TreeVal::Leaf(5);
+            let t3 = TreeVal::Empty;
+
+            let r1 = eval_tree(t1);
+            let r2 = eval_tree(t2);
+            let r3 = eval_tree(t3);
+
+            return r1 + r2 + r3;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("nested_match.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("main", vec![]).unwrap();
+    // r1: 1000 (Leaf(0) matched), r2: 50 (Leaf(val)), r3: 0 (Empty) => 1050
+    assert_eq!(res, FirValue::Int(1050));
+}
+
+#[test]
+fn test_sroa_tagged_union_folding() {
+    use ifa_fir::{lower_program, SroaPass};
+
+    let src = r#"
+        enum Choice {
+            First(i64),
+            Second,
+        }
+
+        fn compute() -> i64 {
+            let c = Choice::First(99);
+            return match c {
+                Choice::First(x) => x,
+                Choice::Second => 0,
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("sroa_tagged.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+
+    let mut fir_module = lower_program(&prog, &analysis.symbols);
+    let mut sroa = SroaPass::new();
+    sroa.run_on_module(&mut fir_module);
+
+    assert!(
+        sroa.stats().folded_discriminants > 0,
+        "Expected at least one tagged union discriminant to be folded, stats: {:?}",
+        sroa.stats()
+    );
+    assert!(
+        sroa.stats().forwarded_payloads > 0,
+        "Expected at least one tagged union payload to be forwarded, stats: {:?}",
+        sroa.stats()
+    );
+
+    let mut interp = FirInterpreter::new(&fir_module);
+    let res = interp.execute_function("compute", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(99));
+}

@@ -1,7 +1,7 @@
 use crate::cfg::ControlFlowGraph;
 use crate::dominance::DominanceTree;
 use crate::ir::*;
-use crate::types::FirType;
+use crate::types::{FirType, IntType};
 use ifa_span::{Span, Symbol, INTERNER};
 use std::collections::{HashMap, HashSet};
 
@@ -15,6 +15,10 @@ pub struct SroaStats {
     pub eliminated_stores: usize,
     pub promoted_loads: usize,
     pub eliminated_dead_insts: usize,
+    /// Number of tagged union discriminant queries folded to constants.
+    pub folded_discriminants: usize,
+    /// Number of tagged union payloads forwarded directly.
+    pub forwarded_payloads: usize,
 }
 
 /// Optimizes SSA FIR by decomposing non-escaping aggregate structures into scalar fields (SROA)
@@ -94,7 +98,10 @@ impl SroaPass {
         // Step 4: Promote non-escaping allocations to SSA values (Store-to-Load forwarding)
         self.promote_allocations_to_registers(func, &candidates);
 
-        // Step 5: Clean up dead pure instructions
+        // Step 5: Optimize tagged unions (fold discriminants, forward payloads, fold branch conds)
+        self.optimize_tagged_unions(func);
+
+        // Step 6: Clean up dead pure instructions
         self.eliminate_dead_instructions(func);
     }
 
@@ -865,6 +872,79 @@ impl SroaPass {
             Terminator::Return(None) => {}
             Terminator::Fail(val) => replace(val),
             Terminator::Unreachable => {}
+        }
+    }
+
+    /// Optimizes tagged union operations when the variant discriminant or payload is statically known.
+    ///
+    /// Folds `EnumGetDiscriminant` to constant integers and forwards `EnumGetPayload` directly
+    /// to the initialized payload SSA value.
+    fn optimize_tagged_unions(&mut self, func: &mut FirFunction) {
+        let mut enum_inits: HashMap<ValueId, (u32, Option<ValueId>)> = HashMap::new();
+        let mut substitutions: HashMap<ValueId, ValueId> = HashMap::new();
+
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Some(res) = inst.result {
+                    if let ValueExpr::EnumInit {
+                        discriminant,
+                        payload,
+                        ..
+                    } = &inst.expr
+                    {
+                        enum_inits.insert(res, (*discriminant, *payload));
+                    }
+                }
+            }
+        }
+
+        if enum_inits.is_empty() {
+            return;
+        }
+
+        // Fold EnumGetDiscriminant and forward EnumGetPayload
+        for block in &mut func.blocks {
+            for inst in &mut block.instructions {
+                if let Some(res) = inst.result {
+                    match &inst.expr {
+                        ValueExpr::EnumGetDiscriminant { base } => {
+                            let actual_base = substitutions.get(base).copied().unwrap_or(*base);
+                            if let Some(&(disc, _)) = enum_inits.get(&actual_base) {
+                                inst.expr = ValueExpr::Constant(ConstantValue::Int(
+                                    disc as i128,
+                                    IntType::I64,
+                                ));
+                                self.stats.folded_discriminants += 1;
+                            }
+                        }
+                        ValueExpr::EnumGetPayload { base, .. } => {
+                            let actual_base = substitutions.get(base).copied().unwrap_or(*base);
+                            if let Some(&(_, Some(payload_val))) = enum_inits.get(&actual_base) {
+                                let actual_payload = substitutions
+                                    .get(&payload_val)
+                                    .copied()
+                                    .unwrap_or(payload_val);
+                                substitutions.insert(res, actual_payload);
+                                self.stats.forwarded_payloads += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Apply payload substitutions across instructions and terminators
+        if !substitutions.is_empty() {
+            Self::resolve_substitution_chains(&mut substitutions);
+            for block in &mut func.blocks {
+                for inst in &mut block.instructions {
+                    Self::substitute_instruction_operands(inst, &substitutions);
+                }
+                if let Some(term) = &mut block.terminator {
+                    Self::substitute_terminator_operands(term, &substitutions);
+                }
+            }
         }
     }
 

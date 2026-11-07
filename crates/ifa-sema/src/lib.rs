@@ -3,6 +3,7 @@
 pub mod checker;
 pub mod escape;
 pub mod exclusivity;
+pub mod exhaustiveness;
 pub mod symbol_table;
 pub mod types;
 
