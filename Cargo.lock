@@ -562,6 +562,7 @@ dependencies = [
  "ifa-fir",
  "ifa-lexer",
  "ifa-parser",
+ "ifa-runtime",
  "ifa-sema",
  "ifa-span",
  "target-lexicon",

@@ -18,3 +18,4 @@ thiserror.workspace = true
 [dev-dependencies]
 ifa-lexer.workspace = true
 ifa-parser.workspace = true
+ifa-runtime.workspace = true

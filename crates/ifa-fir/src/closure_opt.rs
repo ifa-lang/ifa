@@ -401,10 +401,27 @@ impl ClosureOptPass {
             return;
         }
 
-        let closure_val_to_lambda: HashMap<ValueId, Symbol> = closures
+        let mut closure_val_to_lambda: HashMap<ValueId, Symbol> = closures
             .iter()
             .map(|c| (c.closure_val, c.lambda_sym))
             .collect();
+
+        // Also register direct native function pointers and pure lambdas
+        for func in &module.functions {
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Some(res) = inst.result {
+                        match &inst.expr {
+                            ValueExpr::Constant(ConstantValue::Function(sym))
+                            | ValueExpr::Constant(ConstantValue::String(sym)) => {
+                                closure_val_to_lambda.insert(res, *sym);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
 
         for func in &mut module.functions {
             let mut func_subst: HashMap<ValueId, ValueId> = HashMap::new();
@@ -933,13 +950,22 @@ impl ClosureOptPass {
             }
         }
 
-        // Devirtualize indirect Call to CallDirect when callee resolves to a known lambda or thunk
+        // Devirtualize indirect Call to CallDirect when callee resolves to a known lambda, direct fn, or thunk
         for block in &mut func.blocks {
             for inst in &mut block.instructions {
                 if let ValueExpr::Call { callee, args } = &inst.expr {
                     let actual_callee = substitutions.get(callee).copied().unwrap_or(*callee);
-                    if let Some(&lambda_sym) = fn_sym_values.get(&actual_callee) {
-                        let mut rewritten_args = Vec::with_capacity(args.len());
+                    let target_info_opt = fn_sym_values
+                        .get(&actual_callee)
+                        .map(|&s| (s, ValueId(0)))
+                        .or_else(|| closure_map.get(&actual_callee).copied());
+
+                    if let Some((lambda_sym, env_val)) = target_info_opt {
+                        let mut rewritten_args = Vec::with_capacity(args.len() + 1);
+                        if env_val != ValueId(0) {
+                            let sub_env = substitutions.get(&env_val).copied().unwrap_or(env_val);
+                            rewritten_args.push(sub_env);
+                        }
                         for a in args {
                             let sub_a = substitutions.get(a).copied().unwrap_or(*a);
                             rewritten_args.push(sub_a);

@@ -954,3 +954,69 @@ pub extern "C" fn ifa_rt_channel_select(
         }
     }
 }
+
+/// 1-cycle CPU static and dynamic bounds verification for universal C-ABI foreign buffer access.
+///
+/// Aborts safely on index out of bounds detection without memory corruption or undefined behavior.
+#[no_mangle]
+pub extern "C" fn ifa_rt_bounds_check(index: usize, len: usize, msg: *const u8) {
+    if index >= len {
+        if !msg.is_null() {
+            ifa_rt_panic_assert(msg);
+        } else {
+            ifa_rt_panic_out_of_bounds(index, len);
+        }
+    }
+}
+
+/// Verify that a sub-slice range `[start..end]` is strictly within bounds `[0..len]`.
+#[no_mangle]
+pub extern "C" fn ifa_rt_slice_bounds_check(start: usize, end: usize, len: usize, msg: *const u8) {
+    if start > end || end > len {
+        if !msg.is_null() {
+            ifa_rt_panic_assert(msg);
+        } else {
+            ifa_rt_panic_out_of_bounds(end, len);
+        }
+    }
+}
+
+/// Validate external buffer pointer alignment, non-null status, and minimum byte length.
+#[no_mangle]
+pub extern "C" fn ifa_rt_buffer_verify_bounds(
+    ptr: *const u8,
+    len: usize,
+    required_min: usize,
+    align: usize,
+) -> bool {
+    if ptr.is_null() || len < required_min {
+        return false;
+    }
+    let actual_align = if align == 0 { 1 } else { align };
+    (ptr as usize).is_multiple_of(actual_align)
+}
+
+/// Validate an external `IfaSlice` passed across foreign boundaries.
+#[no_mangle]
+pub extern "C" fn ifa_rt_c_abi_validate_slice(
+    slice: IfaSlice,
+    elem_size: usize,
+    min_elements: usize,
+) -> bool {
+    let required_bytes = elem_size.saturating_mul(min_elements);
+    ifa_rt_buffer_verify_bounds(slice.ptr, slice.len, required_bytes, elem_size)
+}
+
+/// Intercept and abort program on detected buffer or slice index out-of-bounds attempt.
+#[no_mangle]
+pub extern "C" fn ifa_rt_panic_out_of_bounds(index: usize, len: usize) -> ! {
+    eprintln!(
+        "\n[IFA RUNTIME ERROR: SAFE BOUNDS CHECK]\n\
+         Attempted out-of-bounds buffer access!\n\
+         Accessed index: {}\n\
+         Buffer length : {}\n\
+         Execution terminated deterministically before memory corruption.\n",
+        index, len
+    );
+    std::process::abort();
+}

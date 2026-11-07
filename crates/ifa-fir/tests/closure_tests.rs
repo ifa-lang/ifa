@@ -422,10 +422,18 @@ fn test_fir_closure_opt_stats_and_thunk_elimination() {
     closure_pass.run_on_module(&mut module);
 
     let stats = closure_pass.stats();
+    // Verify zero thunk allocation due to direct native function lowering
+    let has_thunk = module
+        .functions
+        .iter()
+        .any(|f| f.name.as_str().starts_with("__ifa_thunk_"));
     assert!(
-        stats.inlined_thunk_adapters > 0,
-        "Expected inlined_thunk_adapters > 0, got {}",
-        stats.inlined_thunk_adapters
+        !has_thunk,
+        "Direct lowering must guarantee zero thunk allocations in FIR module"
+    );
+    assert!(
+        stats.inlined_higher_order_calls > 0 || stats.devirtualized_calls > 0,
+        "Direct native higher-order call must be optimized directly"
     );
 
     let mut interp = FirInterpreter::new(&module);

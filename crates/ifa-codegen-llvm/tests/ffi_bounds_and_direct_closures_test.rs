@@ -1,0 +1,150 @@
+use ifa_codegen_llvm::{LlvmIrEmitter, LlvmTargetConfig};
+use ifa_fir::{compile_to_fir, FirInterpreter, FirValue};
+use ifa_lexer::tokenize;
+use ifa_parser::parse;
+use ifa_sema::analyze;
+use ifa_span::SourceMap;
+
+#[test]
+fn test_pure_closure_direct_lowering_without_thunk() {
+    let src = r#"
+        pub fn square(x: i64) -> i64 {
+            return x * x;
+        }
+
+        pub fn apply(f: fn(i64) -> i64, v: i64) -> i64 {
+            return f(v);
+        }
+
+        pub fn main() -> i64 {
+            let pure_lambda = fn(n: i64) -> i64 {
+                return n + 10;
+            };
+            let a = apply(square, 6);        // 36
+            let b = apply(pure_lambda, 15);   // 25
+            return a + b;                    // 61
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let file_id = sm.add_file("direct_closure.ifa".to_string(), src);
+    let tokens = tokenize(file_id, src);
+    let (prog, diags) = parse(file_id, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).expect("FIR failed");
+
+    // 1. Verify zero thunk allocation across the entire module
+    let has_thunk = fir_module
+        .functions
+        .iter()
+        .any(|f| f.name.as_str().starts_with("__ifa_thunk_"));
+    assert!(
+        !has_thunk,
+        "Module must have ZERO thunk allocations for native functions and pure closures"
+    );
+
+    // 2. Verify pure lambda does not possess dummy __env parameter
+    for f in &fir_module.functions {
+        if f.name.as_str().starts_with("__ifa_lambda_") {
+            assert!(
+                !f.params.iter().any(|p| p.name.as_str() == "__env"),
+                "Pure lambda {} must not have a dummy __env parameter",
+                f.name.as_str()
+            );
+        }
+    }
+
+    // 3. Verify execution via FIR interpreter produces expected mathematical result
+    let mut interp = FirInterpreter::new(&fir_module);
+    let result = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(result, FirValue::Int(61));
+
+    // 4. Verify LLVM IR emission includes proper declarations
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let llvm_ir = emitter
+        .emit_module(&fir_module)
+        .expect("LLVM emission failed");
+    assert!(llvm_ir.contains("declare void @ifa_rt_bounds_check(i64, i64, ptr)"));
+    assert!(llvm_ir.contains("declare i1 @ifa_rt_buffer_verify_bounds(ptr, i64, i64, i64)"));
+}
+
+#[test]
+fn test_c_abi_ffi_bounds_check_intrinsics_emission() {
+    let src = r#"
+        pub extern "C" strict fn sum_two(a: i64, b: i64) -> i64 {
+            return a + b;
+        }
+
+        pub fn main() -> i64 {
+            return sum_two(18, 24);
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let file_id = sm.add_file("c_abi_export.ifa".to_string(), src);
+    let tokens = tokenize(file_id, src);
+    let (prog, diags) = parse(file_id, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).expect("FIR failed");
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let llvm_ir = emitter
+        .emit_module(&fir_module)
+        .expect("LLVM emission failed");
+
+    // Verify C-ABI function is emitted with dso_local linkage and no mangling
+    assert!(llvm_ir.contains("define dso_local i64 @sum_two(i64 %v0, i64 %v1)"));
+    // Verify static bounds check and slice verification runtime declarations are present
+    assert!(llvm_ir.contains("declare void @ifa_rt_bounds_check(i64, i64, ptr)"));
+    assert!(llvm_ir.contains("declare void @ifa_rt_slice_bounds_check(i64, i64, i64, ptr)"));
+    assert!(llvm_ir.contains("declare i1 @ifa_rt_buffer_verify_bounds(ptr, i64, i64, i64)"));
+}
+
+#[test]
+fn test_runtime_c_abi_bounds_verification_unit() {
+    use ifa_runtime::ffi::{
+        ifa_rt_bounds_check, ifa_rt_buffer_verify_bounds, ifa_rt_c_abi_validate_slice,
+        ifa_rt_slice_bounds_check, IfaSlice,
+    };
+
+    // Valid index check
+    ifa_rt_bounds_check(0, 10, std::ptr::null());
+    ifa_rt_bounds_check(9, 10, std::ptr::null());
+
+    // Valid slice check
+    ifa_rt_slice_bounds_check(0, 5, 10, std::ptr::null());
+    ifa_rt_slice_bounds_check(2, 2, 10, std::ptr::null());
+    ifa_rt_slice_bounds_check(0, 10, 10, std::ptr::null());
+
+    // Buffer verification
+    let buffer = [0u8; 64];
+    assert!(ifa_rt_buffer_verify_bounds(buffer.as_ptr(), 64, 32, 8));
+    assert!(!ifa_rt_buffer_verify_bounds(std::ptr::null(), 64, 32, 8));
+    assert!(!ifa_rt_buffer_verify_bounds(buffer.as_ptr(), 16, 32, 8));
+
+    // Slice validation
+    let slice = IfaSlice {
+        ptr: buffer.as_ptr(),
+        len: 64,
+    };
+    assert!(ifa_rt_c_abi_validate_slice(slice, 8, 8)); // 8 elements of 8 bytes = 64 bytes
+    assert!(!ifa_rt_c_abi_validate_slice(slice, 8, 9)); // 9 elements of 8 bytes = 72 bytes > 64
+}

@@ -135,7 +135,11 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare ptr @ifa_rt_string_from_f64(double)\n");
             out.push_str("declare ptr @ifa_rt_string_from_bool(i1)\n");
             out.push_str("declare ptr @ifa_rt_blocking_call(ptr, ptr)\n");
-            out.push_str("declare i64 @ifa_rt_blocking_spawn(ptr, ptr, ptr, ptr)\n\n");
+            out.push_str("declare i64 @ifa_rt_blocking_spawn(ptr, ptr, ptr, ptr)\n");
+            out.push_str("declare void @ifa_rt_bounds_check(i64, i64, ptr)\n");
+            out.push_str("declare void @ifa_rt_slice_bounds_check(i64, i64, i64, ptr)\n");
+            out.push_str("declare i1 @ifa_rt_buffer_verify_bounds(ptr, i64, i64, i64)\n");
+            out.push_str("declare void @ifa_rt_panic_out_of_bounds(i64, i64)\n\n");
         } else {
             out.push_str("; IFA Runtime Intrinsic Declarations\n");
             out.push_str("declare void @ifa_rt_println(ptr)\n");
@@ -170,7 +174,11 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare ptr @ifa_rt_string_from_f64(double)\n");
             out.push_str("declare ptr @ifa_rt_string_from_bool(i1)\n");
             out.push_str("declare ptr @ifa_rt_blocking_call(ptr, ptr)\n");
-            out.push_str("declare i64 @ifa_rt_blocking_spawn(ptr, ptr, ptr, ptr)\n\n");
+            out.push_str("declare i64 @ifa_rt_blocking_spawn(ptr, ptr, ptr, ptr)\n");
+            out.push_str("declare void @ifa_rt_bounds_check(i64, i64, ptr)\n");
+            out.push_str("declare void @ifa_rt_slice_bounds_check(i64, i64, i64, ptr)\n");
+            out.push_str("declare i1 @ifa_rt_buffer_verify_bounds(ptr, i64, i64, i64)\n");
+            out.push_str("declare void @ifa_rt_panic_out_of_bounds(i64, i64)\n\n");
         }
 
         // LLVM Standard Coroutine Intrinsics
@@ -1149,7 +1157,7 @@ impl<'a> LlvmIrEmitter<'a> {
                 ConstantValue::Function(sym) => {
                     let fn_name = INTERNER.resolve(sym);
                     out.push_str(&format!(
-                        "  %v{} = ptrtoint ptr @{} to i64\n",
+                        "  %v{} = getelementptr i8, ptr @{}, i64 0\n",
                         res_id, fn_name
                     ));
                 }
