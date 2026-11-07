@@ -14,7 +14,10 @@ pub use allocator::{GenArena, GlobalGenAllocator, GLOBAL_ALLOCATOR};
 pub use benchmarks::{run_generational_benchmark_suite, BenchmarkReport, BenchmarkResult};
 pub use collections::{IfaList, IfaMap};
 pub use ffi::*;
-pub use fiber::{Channel, FiberId, FiberScheduler, FiberState, GLOBAL_SCHEDULER};
+pub use fiber::{
+    AtomicRingBuffer, Channel, FiberId, FiberScheduler, FiberState, RecvError, SendError,
+    TryRecvError, TrySendError, GLOBAL_SCHEDULER,
+};
 pub use header::{
     GenHeader, GenRef, FLAG_ACTIVE, FLAG_ARENA_SCOPED, FLAG_FREE, FLAG_PINNED, FLAG_READONLY,
 };

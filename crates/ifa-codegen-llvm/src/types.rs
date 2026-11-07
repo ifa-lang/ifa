@@ -21,6 +21,7 @@ pub fn fir_to_llvm_type(ty: &FirType) -> Result<String, LlvmCodegenError> {
         FirType::Char => Ok("i8".to_string()),
         FirType::Str | FirType::String => Ok("ptr".to_string()),
         FirType::Pointer(_) => Ok("ptr".to_string()),
+        FirType::Channel(_) => Ok("ptr".to_string()),
         FirType::GenerationalRef(_) => Ok("{ ptr, i32, i16, i16 }".to_string()),
         FirType::Struct(sym, _) => {
             let name = INTERNER.resolve(sym);

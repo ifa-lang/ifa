@@ -105,6 +105,53 @@ void ifa_rt_fiber_yield(void);
  */
 void ifa_rt_fiber_join(uint64_t fiber_id);
 
+/* --- Concurrency Channels API --- */
+
+typedef struct ifa_channel_handle ifa_channel_handle_t;
+
+/**
+ * Create an asynchronous communication channel.
+ * Pass capacity = 0 for unbounded, or >0 for a bounded lock-free atomic ring buffer.
+ */
+ifa_channel_handle_t* ifa_rt_channel_create(size_t capacity);
+
+/**
+ * Destroy a channel handle and release associated buffers.
+ */
+void ifa_rt_channel_destroy(ifa_channel_handle_t* chan);
+
+/**
+ * Send a pointer value over the channel (blocks or yields fiber on backpressure).
+ * Returns 0 on success, -1 on null handle, -2 if channel is closed.
+ */
+int32_t ifa_rt_channel_send(ifa_channel_handle_t* chan, void* val);
+
+/**
+ * Receive a pointer value from the channel (blocks or yields fiber until data arrives).
+ * Returns 0 on success, -1 on invalid argument, -2 if channel is closed and empty.
+ */
+int32_t ifa_rt_channel_recv(ifa_channel_handle_t* chan, void** out_val);
+
+/**
+ * Non-blocking send: returns 0 on success, 1 if full, -1 if null handle, -2 if closed.
+ */
+int32_t ifa_rt_channel_try_send(ifa_channel_handle_t* chan, void* val);
+
+/**
+ * Non-blocking receive: returns 0 on success, 1 if empty, -1 if null, -2 if closed.
+ */
+int32_t ifa_rt_channel_try_recv(ifa_channel_handle_t* chan, void** out_val);
+
+/**
+ * Close the channel, waking all waiting receivers and rejecting further sends.
+ */
+void ifa_rt_channel_close(ifa_channel_handle_t* chan);
+
+/**
+ * Check if the channel is closed. Returns 1 if closed or null, 0 if active.
+ */
+int32_t ifa_rt_channel_is_closed(ifa_channel_handle_t* chan);
+
 /* --- Stream I/O API --- */
 
 void ifa_rt_print(const char* str);

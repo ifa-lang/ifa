@@ -218,6 +218,27 @@ pub enum ValueExpr {
         target: Symbol,
         args: Vec<ValueId>,
     },
+    ChanCreate {
+        elem_ty: FirType,
+        capacity: Option<ValueId>,
+    },
+    ChanSend {
+        chan: ValueId,
+        val: ValueId,
+    },
+    ChanRecv {
+        chan: ValueId,
+    },
+    ChanTryRecv {
+        chan: ValueId,
+    },
+    ChanClose {
+        chan: ValueId,
+    },
+    ChanSelect {
+        channels: Vec<ValueId>,
+        has_default: bool,
+    },
 }
 
 impl ValueExpr {
@@ -254,6 +275,12 @@ impl ValueExpr {
             ValueExpr::GenCheck { ref_val, .. } => vec![*ref_val],
             ValueExpr::GenDeref { ref_val } => vec![*ref_val],
             ValueExpr::Spawn { args, .. } => args.clone(),
+            ValueExpr::ChanCreate { capacity, .. } => capacity.iter().copied().collect(),
+            ValueExpr::ChanSend { chan, val } => vec![*chan, *val],
+            ValueExpr::ChanRecv { chan }
+            | ValueExpr::ChanTryRecv { chan }
+            | ValueExpr::ChanClose { chan } => vec![*chan],
+            ValueExpr::ChanSelect { channels, .. } => channels.clone(),
         }
     }
 }

@@ -6,6 +6,7 @@ pub mod error;
 pub mod ffi_gen;
 pub mod lockfile;
 pub mod manifest;
+pub mod packager;
 pub mod resolver;
 
 pub use builder::{ArtifactKind, BuildOrchestrator, BuildReport, BuiltArtifact};
@@ -17,4 +18,5 @@ pub use manifest::{
     BackendKind, BinTarget, CrateType, DependencySpec, LibTarget, Manifest, PackageMetadata,
     ProfileConfig, ProfilesConfig,
 };
+pub use packager::{PackageIndexEntry, PackageReport, Packager, PublishReport};
 pub use resolver::{DependencyResolver, ResolvedPackage};

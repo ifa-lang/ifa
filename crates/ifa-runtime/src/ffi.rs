@@ -3,7 +3,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::allocator::GLOBAL_ALLOCATOR;
-use crate::fiber::GLOBAL_SCHEDULER;
+use crate::fiber::{Channel, TryRecvError, TrySendError, GLOBAL_SCHEDULER};
 use crate::header::GenHeader;
 
 /// Allocate a generational memory slot.
@@ -164,5 +164,122 @@ impl IfaErrorUnion {
 
     pub fn is_err(&self) -> bool {
         self.status != 0
+    }
+}
+
+/// Opaque wrapper around an IFA runtime channel for C-ABI FFI.
+pub struct IfaChannelHandle(pub(crate) Channel<*mut u8>);
+
+/// Create a new channel for message passing between fibers and foreign threads.
+/// Capacity 0 indicates unbounded; >0 indicates bounded atomic ring buffer.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_create(capacity: usize) -> *mut IfaChannelHandle {
+    let chan = if capacity == 0 {
+        Channel::new()
+    } else {
+        Channel::with_capacity(capacity)
+    };
+    Box::into_raw(Box::new(IfaChannelHandle(chan)))
+}
+
+/// Destroy an IFA runtime channel handle and release allocated resources.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_destroy(chan: *mut IfaChannelHandle) {
+    if !chan.is_null() {
+        unsafe {
+            drop(Box::from_raw(chan));
+        }
+    }
+}
+
+/// Send a pointer value over the channel (blocks or yields fiber on backpressure).
+/// Returns 0 on success, -1 if handle is null, -2 if channel is closed.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_send(chan: *mut IfaChannelHandle, val: *mut u8) -> i32 {
+    if chan.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*chan };
+    match handle.0.send_checked(val) {
+        Ok(()) => 0,
+        Err(_) => -2,
+    }
+}
+
+/// Receive a pointer value from the channel (blocks or yields fiber until data arrives).
+/// Returns 0 on success, -1 if invalid argument, -2 if channel is closed and empty.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_recv(chan: *mut IfaChannelHandle, out_val: *mut *mut u8) -> i32 {
+    if chan.is_null() || out_val.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*chan };
+    match handle.0.recv_checked() {
+        Ok(val) => {
+            unsafe {
+                *out_val = val;
+            }
+            0
+        }
+        Err(_) => -2,
+    }
+}
+
+/// Non-blocking send: returns 0 on success, 1 if channel is full, -1 if null handle, -2 if closed.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_try_send(chan: *mut IfaChannelHandle, val: *mut u8) -> i32 {
+    if chan.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*chan };
+    match handle.0.try_send_checked(val) {
+        Ok(()) => 0,
+        Err(TrySendError::Full(_)) => 1,
+        Err(TrySendError::Closed(_)) => -2,
+    }
+}
+
+/// Non-blocking receive: returns 0 on success, 1 if channel is empty, -1 if null, -2 if closed.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_try_recv(
+    chan: *mut IfaChannelHandle,
+    out_val: *mut *mut u8,
+) -> i32 {
+    if chan.is_null() || out_val.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*chan };
+    match handle.0.try_recv_checked() {
+        Ok(val) => {
+            unsafe {
+                *out_val = val;
+            }
+            0
+        }
+        Err(TryRecvError::Empty) => 1,
+        Err(TryRecvError::Closed) => -2,
+    }
+}
+
+/// Close the channel to reject new sends and unblock waiting receivers.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_close(chan: *mut IfaChannelHandle) {
+    if !chan.is_null() {
+        let handle = unsafe { &*chan };
+        handle.0.close();
+    }
+}
+
+/// Check if channel is closed. Returns 1 if closed or null, 0 if active.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_is_closed(chan: *mut IfaChannelHandle) -> i32 {
+    if chan.is_null() {
+        return 1;
+    }
+    let handle = unsafe { &*chan };
+    if handle.0.is_closed() {
+        1
+    } else {
+        0
     }
 }

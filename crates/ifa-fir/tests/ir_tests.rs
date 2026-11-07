@@ -628,3 +628,75 @@ fn test_fir_question_operator_catch() {
     let res = interp.execute_function("main", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(88));
 }
+
+#[test]
+fn test_fir_channel_ssa_instructions_and_interp() {
+    let fn_name = INTERNER.intern("channel_test");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let v_chan = func.alloc_value();
+    let v_send_val = func.alloc_value();
+    let v_recv_val = func.alloc_value();
+
+    let entry = func.get_block_mut(func.entry_block).unwrap();
+
+    // 1. Create channel
+    entry.push_instruction(Instruction::new(
+        Some(v_chan),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+
+    // 2. Prepare value 42
+    entry.push_instruction(Instruction::new(
+        Some(v_send_val),
+        ValueExpr::Constant(ConstantValue::Int(42, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    // 3. Send 42 into channel
+    entry.push_instruction(Instruction::new(
+        None,
+        ValueExpr::ChanSend {
+            chan: v_chan,
+            val: v_send_val,
+        },
+        Span::DUMMY,
+    ));
+
+    // 4. Receive from channel
+    entry.push_instruction(Instruction::new(
+        Some(v_recv_val),
+        ValueExpr::ChanRecv { chan: v_chan },
+        Span::DUMMY,
+    ));
+
+    // 5. Close channel
+    entry.push_instruction(Instruction::new(
+        None,
+        ValueExpr::ChanClose { chan: v_chan },
+        Span::DUMMY,
+    ));
+
+    // 6. Return received value
+    entry.set_terminator(Terminator::Return(Some(v_recv_val)));
+
+    let mut module = FirModule::new(INTERNER.intern("test_mod"));
+    module.functions.push(func);
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("channel_test", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(42));
+}

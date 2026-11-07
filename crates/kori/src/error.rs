@@ -41,4 +41,10 @@ pub enum KoriError {
 
     #[error("FFI generation error: {0}")]
     Ffi(String),
+
+    #[error("Packaging error: {0}")]
+    Packaging(String),
+
+    #[error("Registry error: {0}")]
+    Registry(String),
 }

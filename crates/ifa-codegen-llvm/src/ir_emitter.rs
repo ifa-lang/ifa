@@ -107,6 +107,11 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare ptr @ifa_rt_gen_alloc(i64, i64, i16)\n");
             out.push_str("declare void @ifa_rt_gen_free(ptr)\n");
             out.push_str("declare void @ifa_rt_fiber_yield()\n");
+            out.push_str("declare ptr @ifa_rt_channel_create(i64)\n");
+            out.push_str("declare void @ifa_rt_channel_destroy(ptr)\n");
+            out.push_str("declare i32 @ifa_rt_channel_send(ptr, ptr)\n");
+            out.push_str("declare i32 @ifa_rt_channel_recv(ptr, ptr)\n");
+            out.push_str("declare void @ifa_rt_channel_close(ptr)\n");
             out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n\n");
         } else {
             out.push_str("; IFA Runtime Intrinsic Declarations\n");
@@ -117,6 +122,11 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare ptr @ifa_rt_gen_alloc(i64, i64, i16)\n");
             out.push_str("declare void @ifa_rt_gen_free(ptr)\n");
             out.push_str("declare void @ifa_rt_fiber_yield()\n");
+            out.push_str("declare ptr @ifa_rt_channel_create(i64)\n");
+            out.push_str("declare void @ifa_rt_channel_destroy(ptr)\n");
+            out.push_str("declare i32 @ifa_rt_channel_send(ptr, ptr)\n");
+            out.push_str("declare i32 @ifa_rt_channel_recv(ptr, ptr)\n");
+            out.push_str("declare void @ifa_rt_channel_close(ptr)\n");
             out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n\n");
         }
 
@@ -592,6 +602,33 @@ impl<'a> LlvmIrEmitter<'a> {
                     res_id, count, res_id
                 ));
             }
+            ValueExpr::ChanCreate { capacity, .. } => {
+                if let Some(cap) = capacity {
+                    out.push_str(&format!(
+                        "  %v{} = call ptr @ifa_rt_channel_create(i64 %v{})\n",
+                        res_id, cap.0
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  %v{} = call ptr @ifa_rt_channel_create(i64 0)\n",
+                        res_id
+                    ));
+                }
+            }
+            ValueExpr::ChanRecv { chan } | ValueExpr::ChanTryRecv { chan } => {
+                out.push_str(&format!(
+                    "  %chan_out_slot_{} = alloca ptr, align 8\n",
+                    res_id
+                ));
+                out.push_str(&format!(
+                    "  call i32 @ifa_rt_channel_recv(ptr %v{}, ptr %chan_out_slot_{})\n",
+                    chan.0, res_id
+                ));
+                out.push_str(&format!(
+                    "  %v{} = load ptr, ptr %chan_out_slot_{}, align 8\n",
+                    res_id, res_id
+                ));
+            }
             _ => {
                 // Default fallback for intermediate structures
                 out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
@@ -677,6 +714,22 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             ValueExpr::Yield => {
                 out.push_str("  call void @ifa_rt_fiber_yield()\n");
+            }
+            ValueExpr::ChanSend { chan, val } => {
+                out.push_str(&format!(
+                    "  %chan_val_cast_{} = inttoptr i64 %v{} to ptr\n",
+                    val.0, val.0
+                ));
+                out.push_str(&format!(
+                    "  call i32 @ifa_rt_channel_send(ptr %v{}, ptr %chan_val_cast_{})\n",
+                    chan.0, val.0
+                ));
+            }
+            ValueExpr::ChanClose { chan } => {
+                out.push_str(&format!(
+                    "  call void @ifa_rt_channel_close(ptr %v{})\n",
+                    chan.0
+                ));
             }
             ValueExpr::SetField {
                 base,

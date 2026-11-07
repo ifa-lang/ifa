@@ -244,6 +244,36 @@ impl<'a> FirPrinter<'a> {
                 }
                 write!(self.output, ")")
             }
+            ValueExpr::ChanCreate { elem_ty, capacity } => {
+                if let Some(cap) = capacity {
+                    write!(self.output, "chan.create <{}>, cap: {}", elem_ty, cap)
+                } else {
+                    write!(self.output, "chan.create <{}>", elem_ty)
+                }
+            }
+            ValueExpr::ChanSend { chan, val } => {
+                write!(self.output, "chan.send {}, {}", chan, val)
+            }
+            ValueExpr::ChanRecv { chan } => write!(self.output, "chan.recv {}", chan),
+            ValueExpr::ChanTryRecv { chan } => write!(self.output, "chan.try_recv {}", chan),
+            ValueExpr::ChanClose { chan } => write!(self.output, "chan.close {}", chan),
+            ValueExpr::ChanSelect {
+                channels,
+                has_default,
+            } => {
+                write!(self.output, "chan.select [")?;
+                for (i, c) in channels.iter().enumerate() {
+                    if i > 0 {
+                        write!(self.output, ", ")?;
+                    }
+                    write!(self.output, "{}", c)?;
+                }
+                write!(
+                    self.output,
+                    "]{}",
+                    if *has_default { " (default)" } else { "" }
+                )
+            }
         }
     }
 

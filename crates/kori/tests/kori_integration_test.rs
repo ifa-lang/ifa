@@ -432,3 +432,125 @@ pub extern "C" strict fn compute_hash(seed: i64, multiplier: i64) -> i64 {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_packager_pack_and_unpack_deterministic() {
+    let temp_dir = std::env::temp_dir().join(format!("kori_pkg_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(temp_dir.join("src")).unwrap();
+
+    let manifest_content = r#"
+[package]
+name = "math-utils"
+version = "0.1.0"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
+license = "MIT"
+description = "Deterministic math utilities"
+keywords = ["math", "crypto", "ifa"]
+
+[targets.lib]
+name = "math_utils"
+path = "src/lib.ifa"
+crate_types = ["ifalib"]
+"#;
+    fs::write(temp_dir.join("kori.toml"), manifest_content).unwrap();
+
+    let lib_src = r#"
+pub extern "C" strict fn square(x: i64) -> i64 {
+    return x * x
+}
+"#;
+    fs::write(temp_dir.join("src/lib.ifa"), lib_src).unwrap();
+
+    // 1. Pack
+    let report = kori::Packager::pack(&temp_dir, None).expect("Packaging failed");
+    assert_eq!(report.name, "math-utils");
+    assert_eq!(report.version, "0.1.0");
+    assert!(report.package_path.exists());
+    assert!(report.checksum_path.exists());
+    assert_eq!(report.checksum.len(), 64);
+    assert!(report.file_count >= 2);
+
+    // 2. Read archive bytes & unpack to new destination
+    let archive_bytes = fs::read(&report.package_path).unwrap();
+    let unpack_dest = temp_dir.join("unpacked");
+    let unpacked = kori::Packager::unpack_archive(&archive_bytes, &unpack_dest)
+        .expect("Unpacking archive failed");
+
+    assert!(unpacked.iter().any(|p| p.ends_with("kori.toml")));
+    assert!(unpacked.iter().any(|p| p.ends_with("src/lib.ifa")));
+
+    let unpacked_code = fs::read_to_string(unpack_dest.join("src/lib.ifa")).unwrap();
+    assert_eq!(unpacked_code.trim(), lib_src.trim());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_packager_publish_search_and_info() {
+    let temp_dir = std::env::temp_dir().join(format!("kori_pub_test_{}", std::process::id()));
+    let registry_dir = temp_dir.join("registry");
+    let project_dir = temp_dir.join("project");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(project_dir.join("src")).unwrap();
+
+    let manifest_content = r#"
+[package]
+name = "algo-fast"
+version = "0.2.0"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
+license = "Apache-2.0"
+description = "High-speed algorithms library"
+keywords = ["algorithms", "sorting", "search"]
+
+[targets.lib]
+name = "algo_fast"
+path = "src/lib.ifa"
+crate_types = ["ifalib"]
+"#;
+    fs::write(project_dir.join("kori.toml"), manifest_content).unwrap();
+    fs::write(
+        project_dir.join("src/lib.ifa"),
+        "pub fn fast_sort() -> i64 { return 1; }",
+    )
+    .unwrap();
+
+    // 1. Publish with dry_run = true
+    let dry_report = kori::Packager::publish(&project_dir, Some(&registry_dir), true)
+        .expect("Dry run publish failed");
+    assert!(dry_report.dry_run);
+    assert!(!registry_dir.join("packages").exists());
+
+    // 2. Publish with dry_run = false
+    let real_report = kori::Packager::publish(&project_dir, Some(&registry_dir), false)
+        .expect("Real publish failed");
+    assert!(!real_report.dry_run);
+    assert_eq!(real_report.name, "algo-fast");
+    assert_eq!(real_report.version, "0.2.0");
+
+    let expected_pkg_file = registry_dir.join("packages/algo-fast/algo-fast-0.2.0.kori");
+    assert!(expected_pkg_file.exists());
+
+    let expected_index_file = registry_dir.join("index/algo-fast.json");
+    assert!(expected_index_file.exists());
+
+    // 3. Search registry
+    let results =
+        kori::Packager::search("algo", Some(&registry_dir)).expect("Registry search failed");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name, "algo-fast");
+    assert_eq!(results[0].version, "0.2.0");
+
+    let empty_results =
+        kori::Packager::search("nonexistent", Some(&registry_dir)).expect("Search failed");
+    assert!(empty_results.is_empty());
+
+    // 4. Info registry
+    let info = kori::Packager::info("algo-fast", Some(&registry_dir)).expect("Package info failed");
+    assert_eq!(info.len(), 1);
+    assert_eq!(info[0].name, "algo-fast");
+    assert_eq!(info[0].license.as_deref(), Some("Apache-2.0"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

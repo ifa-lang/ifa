@@ -784,6 +784,25 @@ impl SroaPass {
                     replace(a);
                 }
             }
+            ValueExpr::ChanCreate { capacity, .. } => {
+                if let Some(cap) = capacity {
+                    replace(cap);
+                }
+            }
+            ValueExpr::ChanSend { chan, val } => {
+                replace(chan);
+                replace(val);
+            }
+            ValueExpr::ChanRecv { chan }
+            | ValueExpr::ChanTryRecv { chan }
+            | ValueExpr::ChanClose { chan } => {
+                replace(chan);
+            }
+            ValueExpr::ChanSelect { channels, .. } => {
+                for c in channels {
+                    replace(c);
+                }
+            }
         }
     }
 

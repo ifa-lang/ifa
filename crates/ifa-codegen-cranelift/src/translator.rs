@@ -458,6 +458,12 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             | ValueExpr::StructPushField { .. }
             | ValueExpr::CoWCheckShared { .. }
             | ValueExpr::Spawn { .. }
+            | ValueExpr::ChanCreate { .. }
+            | ValueExpr::ChanSend { .. }
+            | ValueExpr::ChanRecv { .. }
+            | ValueExpr::ChanTryRecv { .. }
+            | ValueExpr::ChanClose { .. }
+            | ValueExpr::ChanSelect { .. }
             | ValueExpr::Call { .. } => Some(self.builder.ins().iconst(types::I64, 0)),
 
             ValueExpr::ArrayLen { array } => {

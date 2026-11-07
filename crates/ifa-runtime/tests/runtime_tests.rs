@@ -254,3 +254,110 @@ fn test_multithread_interoperability_and_bounded_channels() {
     sched.shutdown();
     assert!(!sched.is_running());
 }
+
+#[test]
+fn test_atomic_ring_buffer_lock_free_mpmc() {
+    let ring = AtomicRingBuffer::<u64>::new(4);
+    assert_eq!(ring.capacity(), 4);
+    assert_eq!(ring.buffer_capacity(), 4);
+    assert!(ring.is_empty());
+    assert!(!ring.is_full());
+
+    // Push 4 elements
+    assert!(ring.try_push(10).is_ok());
+    assert!(ring.try_push(20).is_ok());
+    assert!(ring.try_push(30).is_ok());
+    assert!(ring.try_push(40).is_ok());
+
+    // 5th element should fail (full)
+    assert_eq!(ring.try_push(50), Err(50));
+    assert!(ring.is_full());
+    assert_eq!(ring.len(), 4);
+
+    // Pop 2 elements
+    assert_eq!(ring.try_pop(), Some(10));
+    assert_eq!(ring.try_pop(), Some(20));
+    assert_eq!(ring.len(), 2);
+    assert!(!ring.is_full());
+
+    // Push 2 more elements (wrapping around ring)
+    assert!(ring.try_push(50).is_ok());
+    assert!(ring.try_push(60).is_ok());
+    assert!(ring.is_full());
+
+    // Drain all remaining
+    assert_eq!(ring.try_pop(), Some(30));
+    assert_eq!(ring.try_pop(), Some(40));
+    assert_eq!(ring.try_pop(), Some(50));
+    assert_eq!(ring.try_pop(), Some(60));
+    assert_eq!(ring.try_pop(), None);
+    assert!(ring.is_empty());
+}
+
+#[test]
+fn test_channel_close_and_drain() {
+    let chan = Channel::<i32>::with_capacity(3);
+    assert!(!chan.is_closed());
+
+    chan.send(100);
+    chan.send(200);
+    assert_eq!(chan.len(), 2);
+
+    chan.close();
+    assert!(chan.is_closed());
+
+    // Sending on closed channel fails
+    assert_eq!(chan.send_checked(300), Err(SendError::Closed(300)));
+    assert_eq!(chan.try_send_checked(300), Err(TrySendError::Closed(300)));
+
+    // Existing queued items can be drained
+    assert_eq!(chan.recv_checked(), Ok(100));
+    assert_eq!(chan.try_recv_checked(), Ok(200));
+
+    // After draining, recv returns Closed
+    assert_eq!(chan.recv_checked(), Err(RecvError::Closed));
+    assert_eq!(chan.try_recv_checked(), Err(TryRecvError::Closed));
+}
+
+#[test]
+fn test_channel_c_abi_ffi() {
+    let chan_handle = ifa_rt_channel_create(2);
+    assert!(!chan_handle.is_null());
+    assert_eq!(ifa_rt_channel_is_closed(chan_handle), 0);
+
+    let val1 = 42 as *mut u8;
+    let val2 = 99 as *mut u8;
+
+    assert_eq!(ifa_rt_channel_send(chan_handle, val1), 0);
+    assert_eq!(ifa_rt_channel_try_send(chan_handle, val2), 0);
+
+    // Buffer of size 2 is now full
+    let val3 = 100 as *mut u8;
+    assert_eq!(ifa_rt_channel_try_send(chan_handle, val3), 1);
+
+    let mut out: *mut u8 = std::ptr::null_mut();
+    assert_eq!(ifa_rt_channel_recv(chan_handle, &mut out), 0);
+    assert_eq!(out, val1);
+
+    let mut out2: *mut u8 = std::ptr::null_mut();
+    assert_eq!(ifa_rt_channel_try_recv(chan_handle, &mut out2), 0);
+    assert_eq!(out2, val2);
+
+    // Empty channel try_recv returns 1
+    let mut out3: *mut u8 = std::ptr::null_mut();
+    assert_eq!(ifa_rt_channel_try_recv(chan_handle, &mut out3), 1);
+
+    // Close channel
+    ifa_rt_channel_close(chan_handle);
+    assert_eq!(ifa_rt_channel_is_closed(chan_handle), 1);
+
+    // Send fails after close (-2)
+    assert_eq!(ifa_rt_channel_send(chan_handle, val1), -2);
+    assert_eq!(ifa_rt_channel_try_send(chan_handle, val1), -2);
+
+    // Recv fails after close (-2)
+    assert_eq!(ifa_rt_channel_recv(chan_handle, &mut out), -2);
+    assert_eq!(ifa_rt_channel_try_recv(chan_handle, &mut out), -2);
+
+    ifa_rt_channel_destroy(chan_handle);
+}

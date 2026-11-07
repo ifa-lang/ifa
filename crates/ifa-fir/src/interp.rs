@@ -1,7 +1,7 @@
 use crate::ir::*;
 use crate::types::FirType;
 use ifa_span::{Symbol, INTERNER};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 /// Runtime value representation for FIR SSA execution.
@@ -220,6 +220,8 @@ pub struct FirInterpreter<'a> {
     pub stack_memory: HashMap<usize, FirValue>,
     next_stack_addr: usize,
     pub captured_output: Vec<String>,
+    pub channels: HashMap<u64, VecDeque<FirValue>>,
+    next_chan_id: u64,
 }
 
 impl<'a> FirInterpreter<'a> {
@@ -230,6 +232,8 @@ impl<'a> FirInterpreter<'a> {
             stack_memory: HashMap::new(),
             next_stack_addr: 0x1000,
             captured_output: Vec::new(),
+            channels: HashMap::new(),
+            next_chan_id: 1,
         }
     }
 
@@ -1309,6 +1313,59 @@ impl<'a> FirInterpreter<'a> {
 
             ValueExpr::Yield => Ok(FirValue::Unit),
             ValueExpr::Spawn { .. } => Ok(FirValue::Unit),
+
+            ValueExpr::ChanCreate { .. } => {
+                let id = self.next_chan_id;
+                self.next_chan_id += 1;
+                self.channels.insert(id, VecDeque::new());
+                Ok(FirValue::Int(id as i128))
+            }
+            ValueExpr::ChanSend { chan, val } => {
+                let cid = match env.get(chan) {
+                    Some(FirValue::Int(id)) => *id as u64,
+                    _ => 0,
+                };
+                if let Some(v) = env.get(val) {
+                    if let Some(q) = self.channels.get_mut(&cid) {
+                        q.push_back(v.clone());
+                    }
+                }
+                Ok(FirValue::Unit)
+            }
+            ValueExpr::ChanRecv { chan } | ValueExpr::ChanTryRecv { chan } => {
+                let cid = match env.get(chan) {
+                    Some(FirValue::Int(id)) => *id as u64,
+                    _ => 0,
+                };
+                if let Some(q) = self.channels.get_mut(&cid) {
+                    if let Some(v) = q.pop_front() {
+                        return Ok(v);
+                    }
+                }
+                Ok(FirValue::Unit)
+            }
+            ValueExpr::ChanClose { chan } => {
+                let cid = match env.get(chan) {
+                    Some(FirValue::Int(id)) => *id as u64,
+                    _ => 0,
+                };
+                self.channels.remove(&cid);
+                Ok(FirValue::Unit)
+            }
+            ValueExpr::ChanSelect { channels, .. } => {
+                for (idx, c) in channels.iter().enumerate() {
+                    let cid = match env.get(c) {
+                        Some(FirValue::Int(id)) => *id as u64,
+                        _ => 0,
+                    };
+                    if let Some(q) = self.channels.get_mut(&cid) {
+                        if !q.is_empty() {
+                            return Ok(FirValue::Int(idx as i128));
+                        }
+                    }
+                }
+                Ok(FirValue::Int(0))
+            }
         }
     }
 

@@ -23,6 +23,7 @@ pub enum FirType {
         err: Box<FirType>,
         ok: Box<FirType>,
     },
+    Channel(Box<FirType>),
     Function {
         params: Vec<FirType>,
         ret: Box<FirType>,
@@ -132,6 +133,7 @@ impl fmt::Display for FirType {
             FirType::Slice(inner) => write!(f, "Slice<{}>", inner),
             FirType::Optional(inner) => write!(f, "?{}", inner),
             FirType::ErrorUnion { err, ok } => write!(f, "{}!{}", err, ok),
+            FirType::Channel(inner) => write!(f, "chan<{}>", inner),
             FirType::Function { params, ret } => {
                 write!(f, "fn(")?;
                 for (i, p) in params.iter().enumerate() {

@@ -4,6 +4,7 @@ use kori::manifest::{
     BackendKind, BinTarget, CrateType, DependencySpec, DetailedDependency, LibTarget, Manifest,
     PackageMetadata,
 };
+use kori::packager::Packager;
 use kori::resolver::DependencyResolver;
 use std::collections::BTreeMap;
 use std::fs;
@@ -81,6 +82,43 @@ enum Commands {
     Tree,
     /// Resolve and pin dependencies into deterministic kori.lock
     Lock,
+    /// Package the project into a deterministic redistributable archive
+    Package {
+        /// Optional custom output directory
+        #[arg(short, long)]
+        out_dir: Option<PathBuf>,
+        /// Path to kori.toml manifest file or project directory
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+    },
+    /// Publish the package to a registry
+    Publish {
+        /// Perform all checks and packaging without publishing to registry
+        #[arg(long)]
+        dry_run: bool,
+        /// Custom registry path
+        #[arg(long)]
+        registry: Option<PathBuf>,
+        /// Path to kori.toml manifest file or project directory
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+    },
+    /// Search for packages in the registry
+    Search {
+        /// Search query (package name, description, or keyword)
+        query: String,
+        /// Custom registry path
+        #[arg(long)]
+        registry: Option<PathBuf>,
+    },
+    /// Display information about a package in the registry
+    Info {
+        /// Package name
+        name: String,
+        /// Custom registry path
+        #[arg(long)]
+        registry: Option<PathBuf>,
+    },
 }
 
 fn resolve_project_dir(manifest_path: Option<PathBuf>, fallback: &Path) -> PathBuf {
@@ -129,6 +167,23 @@ fn main() -> ExitCode {
         Commands::Remove { name } => handle_remove(&current_dir, &name),
         Commands::Tree => handle_tree(&current_dir),
         Commands::Lock => handle_lock(&current_dir),
+        Commands::Package {
+            out_dir,
+            manifest_path,
+        } => {
+            let target_dir = resolve_project_dir(manifest_path, &current_dir);
+            handle_package(&target_dir, out_dir.as_deref())
+        }
+        Commands::Publish {
+            dry_run,
+            registry,
+            manifest_path,
+        } => {
+            let target_dir = resolve_project_dir(manifest_path, &current_dir);
+            handle_publish(&target_dir, registry.as_deref(), dry_run)
+        }
+        Commands::Search { query, registry } => handle_search(&query, registry.as_deref()),
+        Commands::Info { name, registry } => handle_info(&name, registry.as_deref()),
     }
 }
 
@@ -435,6 +490,109 @@ fn handle_lock(current_dir: &Path) -> ExitCode {
         }
         Err(e) => {
             eprintln!("error: failed to resolve dependencies: {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn handle_package(project_dir: &Path, out_dir: Option<&Path>) -> ExitCode {
+    match Packager::pack(project_dir, out_dir) {
+        Ok(report) => {
+            println!(
+                "Packaged `{}` v{} ({} files, {} bytes)",
+                report.name, report.version, report.file_count, report.total_bytes
+            );
+            println!("  Archive:  {}", report.package_path.display());
+            println!("  Checksum: {}", report.checksum);
+            println!("  SHA-256:  {}", report.checksum_path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: packaging failed: {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn handle_publish(project_dir: &Path, registry_path: Option<&Path>, dry_run: bool) -> ExitCode {
+    match Packager::publish(project_dir, registry_path, dry_run) {
+        Ok(report) => {
+            if report.dry_run {
+                println!(
+                    "[dry-run] Validated package `{}` v{} for publishing",
+                    report.name, report.version
+                );
+                println!("  Checksum: {}", report.checksum);
+                println!("  Registry: {}", report.registry_path.display());
+            } else {
+                println!(
+                    "Published `{}` v{} to registry `{}`",
+                    report.name,
+                    report.version,
+                    report.registry_path.display()
+                );
+                println!("  Checksum: {}", report.checksum);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: publishing failed: {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn handle_search(query: &str, registry_path: Option<&Path>) -> ExitCode {
+    match Packager::search(query, registry_path) {
+        Ok(results) => {
+            if results.is_empty() {
+                println!("No packages found matching `{}`", query);
+            } else {
+                println!("Found {} package(s) matching `{}`:", results.len(), query);
+                for pkg in results {
+                    println!(
+                        "  {} = \"{}\" - {}",
+                        pkg.name,
+                        pkg.version,
+                        pkg.description.as_deref().unwrap_or("No description")
+                    );
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: search failed: {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn handle_info(name: &str, registry_path: Option<&Path>) -> ExitCode {
+    match Packager::info(name, registry_path) {
+        Ok(entries) => {
+            println!("Package `{}`:", name);
+            for entry in entries {
+                println!("  Version:     {}", entry.version);
+                println!("  Checksum:    {}", entry.checksum);
+                println!(
+                    "  Description: {}",
+                    entry.description.as_deref().unwrap_or("N/A")
+                );
+                println!("  Authors:     {}", entry.authors.join(", "));
+                if let Some(lic) = &entry.license {
+                    println!("  License:     {}", lic);
+                }
+                if !entry.dependencies.is_empty() {
+                    println!("  Dependencies:");
+                    for (dep, spec) in &entry.dependencies {
+                        println!("    - {}: {:?}", dep, spec);
+                    }
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: failed to inspect package `{}`: {}", name, e);
             ExitCode::FAILURE
         }
     }

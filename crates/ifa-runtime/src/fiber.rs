@@ -1,7 +1,8 @@
 //! Colorless concurrency primitives and M:N lightweight fibers without GC.
 
+use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
 use std::thread;
@@ -265,99 +266,555 @@ impl Drop for FiberScheduler {
     }
 }
 
+/// Error returned when sending to a closed channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendError<T> {
+    Closed(T),
+}
+
+/// Error returned when receiving from a closed empty channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvError {
+    Closed,
+}
+
+/// Non-blocking send error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrySendError<T> {
+    Full(T),
+    Closed(T),
+}
+
+/// Non-blocking receive error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryRecvError {
+    Empty,
+    Closed,
+}
+
+/// Cacheline-aligned slot in the lock-free atomic ring buffer.
+#[repr(align(64))]
+struct RingSlot<T> {
+    sequence: AtomicUsize,
+    value: UnsafeCell<Option<T>>,
+}
+
+/// High-performance lock-free bounded MPMC atomic ring buffer without GC.
+/// Uses atomic sequence counters and cacheline alignment to eliminate false sharing.
+pub struct AtomicRingBuffer<T> {
+    buffer: Box<[RingSlot<T>]>,
+    mask: usize,
+    buffer_capacity: usize,
+    capacity: usize,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+}
+
+unsafe impl<T: Send> Send for AtomicRingBuffer<T> {}
+unsafe impl<T: Send> Sync for AtomicRingBuffer<T> {}
+
+impl<T> AtomicRingBuffer<T> {
+    /// Create a new atomic ring buffer with the requested user capacity.
+    pub fn new(capacity: usize) -> Self {
+        let user_cap = capacity.max(1);
+        let cap = user_cap.max(2).next_power_of_two();
+        let mask = cap - 1;
+        let mut slots = Vec::with_capacity(cap);
+        for i in 0..cap {
+            slots.push(RingSlot {
+                sequence: AtomicUsize::new(i),
+                value: UnsafeCell::new(None),
+            });
+        }
+        Self {
+            buffer: slots.into_boxed_slice(),
+            mask,
+            buffer_capacity: cap,
+            capacity: user_cap,
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
+    }
+
+    /// Maximum capacity of the ring buffer.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Internal power-of-two buffer capacity.
+    pub fn buffer_capacity(&self) -> usize {
+        self.buffer_capacity
+    }
+
+    /// Approximate count of elements currently stored.
+    pub fn len(&self) -> usize {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Relaxed);
+        head.saturating_sub(tail)
+    }
+
+    /// Check if the ring buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Check if the ring buffer is full.
+    pub fn is_full(&self) -> bool {
+        self.len() >= self.capacity
+    }
+
+    /// Attempt to push an element into the buffer without blocking.
+    pub fn try_push(&self, val: T) -> Result<(), T> {
+        let mut pos = self.head.load(Ordering::Relaxed);
+        let mut item = Some(val);
+        loop {
+            let slot = &self.buffer[pos & self.mask];
+            let seq = slot.sequence.load(Ordering::Acquire);
+            let dif = seq as isize - pos as isize;
+
+            if dif == 0 {
+                let tail_pos = self.tail.load(Ordering::Relaxed);
+                if pos >= tail_pos + self.capacity {
+                    return Err(item.unwrap());
+                }
+
+                match self.head.compare_exchange_weak(
+                    pos,
+                    pos + 1,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        let to_store = item.take().unwrap();
+                        unsafe {
+                            *slot.value.get() = Some(to_store);
+                        }
+                        slot.sequence.store(pos + 1, Ordering::Release);
+                        return Ok(());
+                    }
+                    Err(actual) => pos = actual,
+                }
+            } else if dif < 0 {
+                return Err(item.unwrap());
+            } else {
+                pos = self.head.load(Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Attempt to pop an element from the buffer without blocking.
+    pub fn try_pop(&self) -> Option<T> {
+        let mut pos = self.tail.load(Ordering::Relaxed);
+        loop {
+            let slot = &self.buffer[pos & self.mask];
+            let seq = slot.sequence.load(Ordering::Acquire);
+            let dif = seq as isize - (pos + 1) as isize;
+
+            if dif == 0 {
+                match self.tail.compare_exchange_weak(
+                    pos,
+                    pos + 1,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        let val =
+                            unsafe { (*slot.value.get()).take().expect("slot must contain value") };
+                        slot.sequence.store(pos + self.mask + 1, Ordering::Release);
+                        return Some(val);
+                    }
+                    Err(actual) => pos = actual,
+                }
+            } else if dif < 0 {
+                return None;
+            } else {
+                pos = self.tail.load(Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl<T> Drop for AtomicRingBuffer<T> {
+    fn drop(&mut self) {
+        while self.try_pop().is_some() {}
+    }
+}
+
 /// Communication channel between fibers ensuring message passing without shared mutable memory.
+/// Powered by lock-free atomic ring buffers for bounded channels and cooperative fiber scheduling.
 pub struct Channel<T> {
-    queue: Mutex<VecDeque<T>>,
+    ring: Option<AtomicRingBuffer<T>>,
+    unbounded: Option<Mutex<VecDeque<T>>>,
+    notif_mutex: Mutex<()>,
     cond: Condvar,
-    capacity: Option<usize>,
+    is_closed: AtomicBool,
 }
 
 impl<T> Channel<T> {
     /// Create an unbounded communication channel.
     pub fn new() -> Self {
         Self {
-            queue: Mutex::new(VecDeque::new()),
+            ring: None,
+            unbounded: Some(Mutex::new(VecDeque::new())),
+            notif_mutex: Mutex::new(()),
             cond: Condvar::new(),
-            capacity: None,
+            is_closed: AtomicBool::new(false),
         }
     }
 
-    /// Create a bounded communication channel with backpressure.
+    /// Create a bounded communication channel backed by lock-free atomic ring buffer.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            queue: Mutex::new(VecDeque::new()),
+            ring: Some(AtomicRingBuffer::new(capacity)),
+            unbounded: None,
+            notif_mutex: Mutex::new(()),
             cond: Condvar::new(),
-            capacity: Some(capacity.max(1)),
+            is_closed: AtomicBool::new(false),
         }
+    }
+
+    #[inline]
+    fn notify_waiters(&self) {
+        self.cond.notify_all();
     }
 
     /// Send a value to the channel (blocks if bounded and full).
-    pub fn send(&self, val: T) {
-        let mut q = self.queue.lock().unwrap();
-        if let Some(cap) = self.capacity {
-            while q.len() >= cap {
-                q = self.cond.wait(q).unwrap();
+    /// Cooperatively yields the fiber on backpressure before thread wait.
+    pub fn send(&self, mut val: T) {
+        if let Some(ring) = &self.ring {
+            let mut spins: u32 = 0;
+            loop {
+                if self.is_closed.load(Ordering::Acquire) {
+                    panic!("Cannot send on closed channel");
+                }
+                match ring.try_push(val) {
+                    Ok(()) => {
+                        self.notify_waiters();
+                        return;
+                    }
+                    Err(returned_val) => {
+                        val = returned_val;
+                        spins += 1;
+                        if spins < 32 {
+                            std::hint::spin_loop();
+                        } else if spins < 64 {
+                            GLOBAL_SCHEDULER.yield_now();
+                        } else {
+                            let guard = self.notif_mutex.lock().unwrap();
+                            if ring.is_full() && !self.is_closed.load(Ordering::Relaxed) {
+                                let _ = self.cond.wait_timeout(guard, Duration::from_micros(250));
+                            }
+                        }
+                    }
+                }
             }
+        } else if let Some(queue) = &self.unbounded {
+            if self.is_closed.load(Ordering::Acquire) {
+                panic!("Cannot send on closed channel");
+            }
+            let mut q = queue.lock().unwrap();
+            q.push_back(val);
+            self.notify_waiters();
         }
-        q.push_back(val);
-        self.cond.notify_all();
     }
 
-    /// Non-blocking send: returns Err(val) if channel capacity is exhausted.
-    pub fn try_send(&self, val: T) -> Result<(), T> {
-        let mut q = self.queue.lock().unwrap();
-        if let Some(cap) = self.capacity {
-            if q.len() >= cap {
-                return Err(val);
+    /// Send a value returning Result with typed SendError if closed.
+    pub fn send_checked(&self, mut val: T) -> Result<(), SendError<T>> {
+        if let Some(ring) = &self.ring {
+            let mut spins: u32 = 0;
+            loop {
+                if self.is_closed.load(Ordering::Acquire) {
+                    return Err(SendError::Closed(val));
+                }
+                match ring.try_push(val) {
+                    Ok(()) => {
+                        self.notify_waiters();
+                        return Ok(());
+                    }
+                    Err(returned_val) => {
+                        val = returned_val;
+                        spins += 1;
+                        if spins < 32 {
+                            std::hint::spin_loop();
+                        } else if spins < 64 {
+                            GLOBAL_SCHEDULER.yield_now();
+                        } else {
+                            let guard = self.notif_mutex.lock().unwrap();
+                            if ring.is_full() && !self.is_closed.load(Ordering::Relaxed) {
+                                let _ = self.cond.wait_timeout(guard, Duration::from_micros(250));
+                            }
+                        }
+                    }
+                }
             }
+        } else if let Some(queue) = &self.unbounded {
+            if self.is_closed.load(Ordering::Acquire) {
+                return Err(SendError::Closed(val));
+            }
+            let mut q = queue.lock().unwrap();
+            q.push_back(val);
+            self.notify_waiters();
+            Ok(())
+        } else {
+            Err(SendError::Closed(val))
         }
-        q.push_back(val);
-        self.cond.notify_all();
-        Ok(())
+    }
+
+    /// Non-blocking send: returns Err(val) if channel capacity is exhausted or channel is closed.
+    pub fn try_send(&self, val: T) -> Result<(), T> {
+        if self.is_closed.load(Ordering::Acquire) {
+            return Err(val);
+        }
+        if let Some(ring) = &self.ring {
+            let res = ring.try_push(val);
+            if res.is_ok() {
+                self.notify_waiters();
+            }
+            res
+        } else if let Some(queue) = &self.unbounded {
+            let mut q = queue.lock().unwrap();
+            q.push_back(val);
+            self.notify_waiters();
+            Ok(())
+        } else {
+            Err(val)
+        }
+    }
+
+    /// Typed non-blocking send distinguishing full from closed.
+    pub fn try_send_checked(&self, val: T) -> Result<(), TrySendError<T>> {
+        if self.is_closed.load(Ordering::Acquire) {
+            return Err(TrySendError::Closed(val));
+        }
+        if let Some(ring) = &self.ring {
+            match ring.try_push(val) {
+                Ok(()) => {
+                    self.notify_waiters();
+                    Ok(())
+                }
+                Err(v) => Err(TrySendError::Full(v)),
+            }
+        } else if let Some(queue) = &self.unbounded {
+            let mut q = queue.lock().unwrap();
+            q.push_back(val);
+            self.notify_waiters();
+            Ok(())
+        } else {
+            Err(TrySendError::Closed(val))
+        }
     }
 
     /// Receive a value from the channel, waiting if empty.
+    /// Cooperatively yields the fiber when waiting before thread wait.
     pub fn recv(&self) -> T {
-        let mut q = self.queue.lock().unwrap();
-        while q.is_empty() {
-            q = self.cond.wait(q).unwrap();
+        if let Some(ring) = &self.ring {
+            let mut spins: u32 = 0;
+            loop {
+                if let Some(val) = ring.try_pop() {
+                    self.notify_waiters();
+                    return val;
+                }
+                if self.is_closed.load(Ordering::Acquire) && ring.is_empty() {
+                    panic!("Cannot receive on closed empty channel");
+                }
+                spins += 1;
+                if spins < 32 {
+                    std::hint::spin_loop();
+                } else if spins < 64 {
+                    GLOBAL_SCHEDULER.yield_now();
+                } else {
+                    let guard = self.notif_mutex.lock().unwrap();
+                    if ring.is_empty() && !self.is_closed.load(Ordering::Relaxed) {
+                        let _ = self.cond.wait_timeout(guard, Duration::from_micros(250));
+                    }
+                }
+            }
+        } else if let Some(queue) = &self.unbounded {
+            let mut q = queue.lock().unwrap();
+            while q.is_empty() {
+                if self.is_closed.load(Ordering::Acquire) && q.is_empty() {
+                    panic!("Cannot receive on closed empty channel");
+                }
+                q = self.cond.wait(q).unwrap();
+            }
+            let val = q.pop_front().unwrap();
+            self.notify_waiters();
+            val
+        } else {
+            panic!("Channel unintialized");
         }
-        let val = q.pop_front().unwrap();
-        self.cond.notify_all();
-        val
+    }
+
+    /// Receive a value returning Result with typed RecvError if closed and empty.
+    pub fn recv_checked(&self) -> Result<T, RecvError> {
+        if let Some(ring) = &self.ring {
+            let mut spins: u32 = 0;
+            loop {
+                if let Some(val) = ring.try_pop() {
+                    self.notify_waiters();
+                    return Ok(val);
+                }
+                if self.is_closed.load(Ordering::Acquire) && ring.is_empty() {
+                    return Err(RecvError::Closed);
+                }
+                spins += 1;
+                if spins < 32 {
+                    std::hint::spin_loop();
+                } else if spins < 64 {
+                    GLOBAL_SCHEDULER.yield_now();
+                } else {
+                    let guard = self.notif_mutex.lock().unwrap();
+                    if ring.is_empty() && !self.is_closed.load(Ordering::Relaxed) {
+                        let _ = self.cond.wait_timeout(guard, Duration::from_micros(250));
+                    }
+                }
+            }
+        } else if let Some(queue) = &self.unbounded {
+            let mut q = queue.lock().unwrap();
+            while q.is_empty() {
+                if self.is_closed.load(Ordering::Acquire) && q.is_empty() {
+                    return Err(RecvError::Closed);
+                }
+                q = self.cond.wait(q).unwrap();
+            }
+            let val = q.pop_front().unwrap();
+            self.notify_waiters();
+            Ok(val)
+        } else {
+            Err(RecvError::Closed)
+        }
     }
 
     /// Non-blocking receive: returns None immediately if empty.
     pub fn try_recv(&self) -> Option<T> {
-        let mut q = self.queue.lock().unwrap();
-        let val = q.pop_front();
-        if val.is_some() {
-            self.cond.notify_all();
+        if let Some(ring) = &self.ring {
+            let res = ring.try_pop();
+            if res.is_some() {
+                self.notify_waiters();
+            }
+            res
+        } else if let Some(queue) = &self.unbounded {
+            let mut q = queue.lock().unwrap();
+            let val = q.pop_front();
+            if val.is_some() {
+                self.notify_waiters();
+            }
+            val
+        } else {
+            None
         }
-        val
+    }
+
+    /// Typed non-blocking receive distinguishing empty from closed.
+    pub fn try_recv_checked(&self) -> Result<T, TryRecvError> {
+        if let Some(ring) = &self.ring {
+            if let Some(val) = ring.try_pop() {
+                self.notify_waiters();
+                Ok(val)
+            } else if self.is_closed.load(Ordering::Acquire) {
+                Err(TryRecvError::Closed)
+            } else {
+                Err(TryRecvError::Empty)
+            }
+        } else if let Some(queue) = &self.unbounded {
+            let mut q = queue.lock().unwrap();
+            if let Some(val) = q.pop_front() {
+                self.notify_waiters();
+                Ok(val)
+            } else if self.is_closed.load(Ordering::Acquire) {
+                Err(TryRecvError::Closed)
+            } else {
+                Err(TryRecvError::Empty)
+            }
+        } else {
+            Err(TryRecvError::Closed)
+        }
     }
 
     /// Timed receive: returns None if timeout expires before a value arrives.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<T> {
         let deadline = std::time::Instant::now() + timeout;
-        let mut q = self.queue.lock().unwrap();
-        while q.is_empty() {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return None;
+        if let Some(ring) = &self.ring {
+            let mut spins: u32 = 0;
+            loop {
+                if let Some(val) = ring.try_pop() {
+                    self.notify_waiters();
+                    return Some(val);
+                }
+                if self.is_closed.load(Ordering::Acquire) && ring.is_empty() {
+                    return None;
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return None;
+                }
+                spins += 1;
+                if spins < 32 {
+                    std::hint::spin_loop();
+                } else if spins < 64 {
+                    GLOBAL_SCHEDULER.yield_now();
+                } else {
+                    let remaining = deadline - now;
+                    let guard = self.notif_mutex.lock().unwrap();
+                    if ring.is_empty() && !self.is_closed.load(Ordering::Relaxed) {
+                        let _ = self
+                            .cond
+                            .wait_timeout(guard, remaining.min(Duration::from_millis(5)));
+                    }
+                }
             }
-            let remaining = deadline - now;
-            let (new_q, wait_res) = self.cond.wait_timeout(q, remaining).unwrap();
-            q = new_q;
-            if wait_res.timed_out() && q.is_empty() {
-                return None;
+        } else if let Some(queue) = &self.unbounded {
+            let mut q = queue.lock().unwrap();
+            while q.is_empty() {
+                if self.is_closed.load(Ordering::Acquire) {
+                    return None;
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return None;
+                }
+                let remaining = deadline - now;
+                let (new_q, wait_res) = self.cond.wait_timeout(q, remaining).unwrap();
+                q = new_q;
+                if wait_res.timed_out() && q.is_empty() {
+                    return None;
+                }
             }
+            let val = q.pop_front();
+            if val.is_some() {
+                self.notify_waiters();
+            }
+            val
+        } else {
+            None
         }
-        let val = q.pop_front();
-        if val.is_some() {
-            self.cond.notify_all();
+    }
+
+    /// Close the channel, disallowing further sends and waking all waiting receivers.
+    pub fn close(&self) {
+        self.is_closed.store(true, Ordering::Release);
+        self.notify_waiters();
+    }
+
+    /// Check if the channel is closed.
+    pub fn is_closed(&self) -> bool {
+        self.is_closed.load(Ordering::Acquire)
+    }
+
+    /// Number of elements currently queued in the channel.
+    pub fn len(&self) -> usize {
+        if let Some(ring) = &self.ring {
+            ring.len()
+        } else if let Some(queue) = &self.unbounded {
+            queue.lock().unwrap().len()
+        } else {
+            0
         }
-        val
+    }
+
+    /// Check if the channel is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
