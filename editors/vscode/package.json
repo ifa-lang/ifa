@@ -25,6 +25,26 @@
         "scopeName": "source.ifa",
         "path": "./syntaxes/ifa.tmLanguage.json"
       }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "ifa",
+        "scopes": {
+          "keyword": ["keyword.control.ifa"],
+          "type": ["entity.name.type.ifa"],
+          "struct": ["entity.name.type.struct.ifa"],
+          "enum": ["entity.name.type.enum.ifa"],
+          "function": ["entity.name.function.ifa"],
+          "method": ["entity.name.function.method.ifa"],
+          "parameter": ["variable.parameter.ifa"],
+          "variable": ["variable.other.ifa"],
+          "property": ["variable.other.property.ifa"],
+          "string": ["string.quoted.double.ifa"],
+          "number": ["constant.numeric.ifa"],
+          "operator": ["keyword.operator.ifa"],
+          "comment": ["comment.line.double-slash.ifa"]
+        }
+      }
     ]
   }
 }

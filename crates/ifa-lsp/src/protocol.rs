@@ -401,6 +401,191 @@ pub struct DocumentFormattingParams {
     pub text_document: TextDocumentIdentifier,
 }
 
+/// Parameters for Find References request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferenceContext {
+    #[serde(rename = "includeDeclaration")]
+    pub include_declaration: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferenceParams {
+    #[serde(rename = "textDocument")]
+    pub text_document: TextDocumentIdentifier,
+    pub position: Position,
+    pub context: ReferenceContext,
+}
+
+/// Parameters for Prepare Rename request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareRenameParams {
+    #[serde(rename = "textDocument")]
+    pub text_document: TextDocumentIdentifier,
+    pub position: Position,
+}
+
+/// Parameters for Rename request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameParams {
+    #[serde(rename = "textDocument")]
+    pub text_document: TextDocumentIdentifier,
+    pub position: Position,
+    #[serde(rename = "newName")]
+    pub new_name: String,
+}
+
+/// WorkspaceEdit represents changes to many resources managed in the workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceEdit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<std::collections::HashMap<String, Vec<TextEdit>>>,
+}
+
+/// Legend of token types and token modifiers supported by Semantic Tokens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticTokensLegend {
+    #[serde(rename = "tokenTypes")]
+    pub token_types: Vec<String>,
+    #[serde(rename = "tokenModifiers")]
+    pub token_modifiers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticTokensOptionsWithLegend {
+    pub legend: SemanticTokensLegend,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full: Option<bool>,
+}
+
+/// Parameters for SemanticTokens request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticTokensParams {
+    #[serde(rename = "textDocument")]
+    pub text_document: TextDocumentIdentifier,
+}
+
+/// SemanticTokens data response encoded as relative delta integers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SemanticTokens {
+    #[serde(rename = "resultId", skip_serializing_if = "Option::is_none")]
+    pub result_id: Option<String>,
+    pub data: Vec<u32>,
+}
+
+/// Parameters for Inlay Hints request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlayHintParams {
+    #[serde(rename = "textDocument")]
+    pub text_document: TextDocumentIdentifier,
+    pub range: Range,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u32)]
+pub enum InlayHintKind {
+    Type = 1,
+    Parameter = 2,
+}
+
+/// Inlay hint display item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlayHint {
+    pub position: Position,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<u32>,
+    #[serde(rename = "paddingLeft", skip_serializing_if = "Option::is_none")]
+    pub padding_left: Option<bool>,
+    #[serde(rename = "paddingRight", skip_serializing_if = "Option::is_none")]
+    pub padding_right: Option<bool>,
+}
+
+/// Parameters for CodeAction request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeActionContext {
+    pub diagnostics: Vec<Diagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub only: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeActionParams {
+    #[serde(rename = "textDocument")]
+    pub text_document: TextDocumentIdentifier,
+    pub range: Range,
+    pub context: CodeActionContext,
+}
+
+/// Code action response item (e.g. quickfix).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeAction {
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Vec<Diagnostic>>,
+    #[serde(rename = "isPreferred", skip_serializing_if = "Option::is_none")]
+    pub is_preferred: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit: Option<WorkspaceEdit>,
+}
+
+/// Parameters for Signature Help request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureHelpParams {
+    #[serde(rename = "textDocument")]
+    pub text_document: TextDocumentIdentifier,
+    pub position: Position,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParameterInformation {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<MarkupContent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureInformation {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<MarkupContent>,
+    pub parameters: Vec<ParameterInformation>,
+    #[serde(rename = "activeParameter", skip_serializing_if = "Option::is_none")]
+    pub active_parameter: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureHelp {
+    pub signatures: Vec<SignatureInformation>,
+    #[serde(rename = "activeSignature", skip_serializing_if = "Option::is_none")]
+    pub active_signature: Option<u32>,
+    #[serde(rename = "activeParameter", skip_serializing_if = "Option::is_none")]
+    pub active_parameter: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureHelpOptions {
+    #[serde(rename = "triggerCharacters")]
+    pub trigger_characters: Vec<String>,
+}
+
+/// Parameters for Workspace Symbol search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSymbolParams {
+    pub query: String,
+}
+
+/// Workspace symbol information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolInformation {
+    pub name: String,
+    pub kind: u32,
+    pub location: Location,
+    #[serde(rename = "containerName", skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+}
+
 /// Server capabilities declared during initialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerCapabilities {
@@ -412,10 +597,30 @@ pub struct ServerCapabilities {
     pub completion_provider: CompletionOptions,
     #[serde(rename = "definitionProvider")]
     pub definition_provider: bool,
+    #[serde(rename = "referencesProvider")]
+    pub references_provider: bool,
+    #[serde(rename = "renameProvider")]
+    pub rename_provider: bool,
     #[serde(rename = "documentSymbolProvider")]
     pub document_symbol_provider: bool,
+    #[serde(rename = "workspaceSymbolProvider")]
+    pub workspace_symbol_provider: bool,
     #[serde(rename = "documentFormattingProvider")]
     pub document_formatting_provider: bool,
+    #[serde(
+        rename = "semanticTokensProvider",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub semantic_tokens_provider: Option<SemanticTokensOptionsWithLegend>,
+    #[serde(rename = "inlayHintProvider", skip_serializing_if = "Option::is_none")]
+    pub inlay_hint_provider: Option<bool>,
+    #[serde(rename = "codeActionProvider", skip_serializing_if = "Option::is_none")]
+    pub code_action_provider: Option<bool>,
+    #[serde(
+        rename = "signatureHelpProvider",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub signature_help_provider: Option<SignatureHelpOptions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

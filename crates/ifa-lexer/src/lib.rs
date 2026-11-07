@@ -2,7 +2,7 @@ pub mod token;
 
 use ifa_span::{sym, BytePos, FileId, Span};
 use logos::Logos;
-use token::{RawToken, Token, TokenKind};
+pub use token::{RawToken, Token, TokenKind};
 
 pub struct Lexer<'a> {
     file_id: FileId,

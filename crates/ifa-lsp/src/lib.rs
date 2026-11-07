@@ -271,4 +271,421 @@ mod tests {
         let syms = resp_val["result"].as_array().unwrap();
         assert!(syms.len() >= 2);
     }
+
+    #[test]
+    fn test_lsp_references() {
+        let mut server = LanguageServer::new();
+        let code = r#"
+            pub fn compute(x: int) -> int {
+                return x * 2;
+            }
+
+            pub fn run() -> int {
+                let a = compute(5);
+                let b = compute(a);
+                return b;
+            }
+        "#;
+
+        let open_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/refs.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": code
+                }
+            }
+        })
+        .to_string();
+
+        server.handle_message(&open_notif);
+
+        // Find references to `compute`
+        let ref_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "textDocument/references",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/refs.ifa"
+                },
+                "position": {
+                    "line": 1,
+                    "character": 22
+                },
+                "context": {
+                    "includeDeclaration": true
+                }
+            }
+        })
+        .to_string();
+
+        let (resp, _) = server.handle_message(&ref_req);
+        assert!(resp.is_some());
+        let resp_val: serde_json::Value = serde_json::from_str(&resp.unwrap()).unwrap();
+        let locs = resp_val["result"].as_array().unwrap();
+        // Should find declaration + 2 calls = 3 locations
+        assert_eq!(locs.len(), 3);
+    }
+
+    #[test]
+    fn test_lsp_prepare_rename_and_rename() {
+        let mut server = LanguageServer::new();
+        let code = r#"
+            pub fn multiply(factor: int, val: int) -> int {
+                let factor_val = factor * val;
+                return factor_val;
+            }
+        "#;
+
+        let open_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/rename.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": code
+                }
+            }
+        })
+        .to_string();
+
+        server.handle_message(&open_notif);
+
+        // 1. Prepare rename on `multiply`
+        let prep_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "textDocument/prepareRename",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/rename.ifa"
+                },
+                "position": {
+                    "line": 1,
+                    "character": 22
+                }
+            }
+        })
+        .to_string();
+
+        let (resp_prep, _) = server.handle_message(&prep_req);
+        assert!(resp_prep.is_some());
+        let prep_val: serde_json::Value = serde_json::from_str(&resp_prep.unwrap()).unwrap();
+        assert!(!prep_val["result"].is_null());
+
+        // 2. Perform rename to `scale`
+        let rename_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "textDocument/rename",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/rename.ifa"
+                },
+                "position": {
+                    "line": 1,
+                    "character": 22
+                },
+                "newName": "scale"
+            }
+        })
+        .to_string();
+
+        let (resp_rename, _) = server.handle_message(&rename_req);
+        assert!(resp_rename.is_some());
+        let rename_val: serde_json::Value = serde_json::from_str(&resp_rename.unwrap()).unwrap();
+        let changes = &rename_val["result"]["changes"]["file:///workspace/rename.ifa"];
+        assert!(changes.is_array());
+        let edits = changes.as_array().unwrap();
+        assert!(!edits.is_empty());
+        assert_eq!(edits[0]["newText"], "scale");
+    }
+
+    #[test]
+    fn test_lsp_semantic_tokens() {
+        let mut server = LanguageServer::new();
+        let code = r#"
+            struct Config {
+                port: int,
+            }
+
+            pub fn serve(c: Config) -> int {
+                let active = true;
+                return c.port;
+            }
+        "#;
+
+        let open_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/sem.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": code
+                }
+            }
+        })
+        .to_string();
+
+        server.handle_message(&open_notif);
+
+        let sem_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "textDocument/semanticTokens/full",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/sem.ifa"
+                }
+            }
+        })
+        .to_string();
+
+        let (resp, _) = server.handle_message(&sem_req);
+        assert!(resp.is_some());
+        let resp_val: serde_json::Value = serde_json::from_str(&resp.unwrap()).unwrap();
+        let data = resp_val["result"]["data"].as_array().unwrap();
+        assert!(!data.is_empty());
+        // Delta-encoded array length must be multiple of 5
+        assert_eq!(data.len() % 5, 0);
+    }
+
+    #[test]
+    fn test_lsp_inlay_hints() {
+        let mut server = LanguageServer::new();
+        let code = r#"
+            pub fn add_two(x: int, y: int) -> int {
+                let sum = x + y;
+                return sum;
+            }
+
+            pub fn run() -> int {
+                return add_two(10, 20);
+            }
+        "#;
+
+        let open_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/inlay.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": code
+                }
+            }
+        })
+        .to_string();
+
+        server.handle_message(&open_notif);
+
+        let hint_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "textDocument/inlayHint",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/inlay.ifa"
+                },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 10, "character": 0 }
+                }
+            }
+        })
+        .to_string();
+
+        let (resp, _) = server.handle_message(&hint_req);
+        assert!(resp.is_some());
+        let resp_val: serde_json::Value = serde_json::from_str(&resp.unwrap()).unwrap();
+        let hints = resp_val["result"].as_array().unwrap();
+        assert!(!hints.is_empty());
+        let labels: Vec<&str> = hints.iter().filter_map(|h| h["label"].as_str()).collect();
+        // Should contain type inlay hint for sum and parameter hints for add_two(10, 20)
+        assert!(labels
+            .iter()
+            .any(|l| l.contains("int") || l.contains("x: ") || l.contains("y: ")));
+    }
+
+    #[test]
+    fn test_lsp_signature_help() {
+        let mut server = LanguageServer::new();
+        let code = r#"
+            pub fn process_order(id: int, amount: float, active: bool) -> bool {
+                return active;
+            }
+
+            pub fn main() -> () {
+                let res = process_order(101, 45.5, );
+            }
+        "#;
+
+        let open_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/sig.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": code
+                }
+            }
+        })
+        .to_string();
+
+        server.handle_message(&open_notif);
+
+        // Signature help right after comma: `process_order(101, 45.5, ` (line 6, character 50)
+        let sig_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "textDocument/signatureHelp",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/sig.ifa"
+                },
+                "position": {
+                    "line": 6,
+                    "character": 50
+                }
+            }
+        })
+        .to_string();
+
+        let (resp, _) = server.handle_message(&sig_req);
+        assert!(resp.is_some());
+        let resp_val: serde_json::Value = serde_json::from_str(&resp.unwrap()).unwrap();
+        let signatures = resp_val["result"]["signatures"].as_array().unwrap();
+        assert_eq!(signatures.len(), 1);
+        assert!(signatures[0]["label"]
+            .as_str()
+            .unwrap()
+            .contains("process_order"));
+        assert_eq!(resp_val["result"]["activeParameter"], 2);
+    }
+
+    #[test]
+    fn test_lsp_workspace_symbols() {
+        let mut server = LanguageServer::new();
+        let code1 = r#"
+            pub fn handle_deposit(account: int, amount: float) -> bool {
+                return true;
+            }
+        "#;
+        let code2 = r#"
+            struct DepositRecord {
+                tx_id: int,
+            }
+        "#;
+
+        let open1 = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/doc1.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": code1
+                }
+            }
+        })
+        .to_string();
+
+        let open2 = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/doc2.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": code2
+                }
+            }
+        })
+        .to_string();
+
+        server.handle_message(&open1);
+        server.handle_message(&open2);
+
+        let ws_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "workspace/symbol",
+            "params": {
+                "query": "deposit"
+            }
+        })
+        .to_string();
+
+        let (resp, _) = server.handle_message(&ws_req);
+        assert!(resp.is_some());
+        let resp_val: serde_json::Value = serde_json::from_str(&resp.unwrap()).unwrap();
+        let syms = resp_val["result"].as_array().unwrap();
+        assert!(syms.len() >= 2);
+        let names: Vec<&str> = syms.iter().filter_map(|s| s["name"].as_str()).collect();
+        assert!(names.contains(&"handle_deposit"));
+        assert!(names.contains(&"DepositRecord"));
+    }
+
+    #[test]
+    fn test_lsp_code_action_format() {
+        let mut server = LanguageServer::new();
+        let code = "pub fn foo() -> () {\nlet x = 1;\nreturn ();\n}\n";
+
+        let open_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/action.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": code
+                }
+            }
+        })
+        .to_string();
+
+        server.handle_message(&open_notif);
+
+        let action_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "textDocument/codeAction",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/action.ifa"
+                },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 3, "character": 0 }
+                },
+                "context": {
+                    "diagnostics": []
+                }
+            }
+        })
+        .to_string();
+
+        let (resp, _) = server.handle_message(&action_req);
+        assert!(resp.is_some());
+        let resp_val: serde_json::Value = serde_json::from_str(&resp.unwrap()).unwrap();
+        let actions = resp_val["result"].as_array().unwrap();
+        assert!(!actions.is_empty());
+        assert!(actions
+            .iter()
+            .any(|a| a["title"].as_str().unwrap().contains("Format")));
+    }
 }

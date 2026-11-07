@@ -1,5 +1,8 @@
 use crate::document::DocumentStore;
-use crate::handlers::{completion, definition, formatting, hover, symbols};
+use crate::handlers::{
+    code_actions, completion, definition, formatting, hover, inlay_hints, references, rename,
+    semantic_tokens, signature_help, symbols, workspace_symbols,
+};
 use crate::protocol::*;
 use std::io::{self, BufRead, Read, Write};
 
@@ -122,11 +125,23 @@ impl LanguageServer {
                     text_document_sync: 1, // Full sync
                     hover_provider: true,
                     completion_provider: CompletionOptions {
-                        trigger_characters: vec![".".to_string(), ":".to_string()],
+                        trigger_characters: vec![".".to_string(), ":".to_string(), "@".to_string()],
                     },
                     definition_provider: true,
+                    references_provider: true,
+                    rename_provider: true,
                     document_symbol_provider: true,
+                    workspace_symbol_provider: true,
                     document_formatting_provider: true,
+                    semantic_tokens_provider: Some(SemanticTokensOptionsWithLegend {
+                        legend: semantic_tokens::get_semantic_tokens_legend(),
+                        full: Some(true),
+                    }),
+                    inlay_hint_provider: Some(true),
+                    code_action_provider: Some(true),
+                    signature_help_provider: Some(SignatureHelpOptions {
+                        trigger_characters: vec!["(".to_string(), ",".to_string()],
+                    }),
                 };
                 let result = InitializeResult {
                     capabilities: caps,
@@ -238,6 +253,220 @@ impl LanguageServer {
                 )
             }
 
+            "textDocument/references" => {
+                let params: ReferenceParams =
+                    match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                        Some(p) => p,
+                        None => {
+                            return (
+                                Some(Response::err(
+                                    req.id,
+                                    INVALID_PARAMS,
+                                    "Invalid ReferenceParams",
+                                )),
+                                None,
+                            )
+                        }
+                    };
+                let doc = match self.documents.get(&params.text_document.uri) {
+                    Some(d) => d,
+                    None => {
+                        return (
+                            Some(Response::ok(req.id, serde_json::Value::Array(Vec::new()))),
+                            None,
+                        )
+                    }
+                };
+                let locs = references::handle_references(doc, params);
+                (
+                    Some(Response::ok(req.id, serde_json::to_value(locs).unwrap())),
+                    None,
+                )
+            }
+
+            "textDocument/prepareRename" => {
+                let params: PrepareRenameParams =
+                    match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                        Some(p) => p,
+                        None => {
+                            return (
+                                Some(Response::err(
+                                    req.id,
+                                    INVALID_PARAMS,
+                                    "Invalid PrepareRenameParams",
+                                )),
+                                None,
+                            )
+                        }
+                    };
+                let doc = match self.documents.get(&params.text_document.uri) {
+                    Some(d) => d,
+                    None => return (Some(Response::ok(req.id, serde_json::Value::Null)), None),
+                };
+                let range = rename::handle_prepare_rename(doc, params.position);
+                (
+                    Some(Response::ok(
+                        req.id,
+                        serde_json::to_value(range).unwrap_or(serde_json::Value::Null),
+                    )),
+                    None,
+                )
+            }
+
+            "textDocument/rename" => {
+                let params: RenameParams =
+                    match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                        Some(p) => p,
+                        None => {
+                            return (
+                                Some(Response::err(
+                                    req.id,
+                                    INVALID_PARAMS,
+                                    "Invalid RenameParams",
+                                )),
+                                None,
+                            )
+                        }
+                    };
+                let doc = match self.documents.get(&params.text_document.uri) {
+                    Some(d) => d,
+                    None => return (Some(Response::ok(req.id, serde_json::Value::Null)), None),
+                };
+                let edit = rename::handle_rename(doc, params);
+                (
+                    Some(Response::ok(
+                        req.id,
+                        serde_json::to_value(edit).unwrap_or(serde_json::Value::Null),
+                    )),
+                    None,
+                )
+            }
+
+            "textDocument/semanticTokens/full" => {
+                let params: SemanticTokensParams =
+                    match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                        Some(p) => p,
+                        None => {
+                            return (
+                                Some(Response::err(
+                                    req.id,
+                                    INVALID_PARAMS,
+                                    "Invalid SemanticTokensParams",
+                                )),
+                                None,
+                            )
+                        }
+                    };
+                let doc = match self.documents.get(&params.text_document.uri) {
+                    Some(d) => d,
+                    None => {
+                        return (
+                            Some(Response::ok(
+                                req.id,
+                                serde_json::to_value(SemanticTokens::default()).unwrap(),
+                            )),
+                            None,
+                        )
+                    }
+                };
+                let tokens = semantic_tokens::handle_semantic_tokens(doc);
+                (
+                    Some(Response::ok(req.id, serde_json::to_value(tokens).unwrap())),
+                    None,
+                )
+            }
+
+            "textDocument/inlayHint" => {
+                let params: InlayHintParams =
+                    match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                        Some(p) => p,
+                        None => {
+                            return (
+                                Some(Response::err(
+                                    req.id,
+                                    INVALID_PARAMS,
+                                    "Invalid InlayHintParams",
+                                )),
+                                None,
+                            )
+                        }
+                    };
+                let doc = match self.documents.get(&params.text_document.uri) {
+                    Some(d) => d,
+                    None => {
+                        return (
+                            Some(Response::ok(req.id, serde_json::Value::Array(Vec::new()))),
+                            None,
+                        )
+                    }
+                };
+                let hints = inlay_hints::handle_inlay_hints(doc, params.range);
+                (
+                    Some(Response::ok(req.id, serde_json::to_value(hints).unwrap())),
+                    None,
+                )
+            }
+
+            "textDocument/codeAction" => {
+                let params: CodeActionParams =
+                    match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                        Some(p) => p,
+                        None => {
+                            return (
+                                Some(Response::err(
+                                    req.id,
+                                    INVALID_PARAMS,
+                                    "Invalid CodeActionParams",
+                                )),
+                                None,
+                            )
+                        }
+                    };
+                let doc = match self.documents.get(&params.text_document.uri) {
+                    Some(d) => d,
+                    None => {
+                        return (
+                            Some(Response::ok(req.id, serde_json::Value::Array(Vec::new()))),
+                            None,
+                        )
+                    }
+                };
+                let actions = code_actions::handle_code_actions(doc, params);
+                (
+                    Some(Response::ok(req.id, serde_json::to_value(actions).unwrap())),
+                    None,
+                )
+            }
+
+            "textDocument/signatureHelp" => {
+                let params: SignatureHelpParams =
+                    match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                        Some(p) => p,
+                        None => {
+                            return (
+                                Some(Response::err(
+                                    req.id,
+                                    INVALID_PARAMS,
+                                    "Invalid SignatureHelpParams",
+                                )),
+                                None,
+                            )
+                        }
+                    };
+                let doc = match self.documents.get(&params.text_document.uri) {
+                    Some(d) => d,
+                    None => return (Some(Response::ok(req.id, serde_json::Value::Null)), None),
+                };
+                let sig = signature_help::handle_signature_help(doc, params.position);
+                (
+                    Some(Response::ok(
+                        req.id,
+                        serde_json::to_value(sig).unwrap_or(serde_json::Value::Null),
+                    )),
+                    None,
+                )
+            }
+
             "textDocument/documentSymbol" => {
                 let params: DocumentSymbolParams =
                     match req.params.and_then(|p| serde_json::from_value(p).ok()) {
@@ -263,6 +492,29 @@ impl LanguageServer {
                     }
                 };
                 let syms = symbols::handle_document_symbols(doc);
+                (
+                    Some(Response::ok(req.id, serde_json::to_value(syms).unwrap())),
+                    None,
+                )
+            }
+
+            "workspace/symbol" => {
+                let params: WorkspaceSymbolParams =
+                    match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                        Some(p) => p,
+                        None => {
+                            return (
+                                Some(Response::err(
+                                    req.id,
+                                    INVALID_PARAMS,
+                                    "Invalid WorkspaceSymbolParams",
+                                )),
+                                None,
+                            )
+                        }
+                    };
+                let syms =
+                    workspace_symbols::handle_workspace_symbols(&self.documents, &params.query);
                 (
                     Some(Response::ok(req.id, serde_json::to_value(syms).unwrap())),
                     None,

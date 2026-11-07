@@ -345,3 +345,95 @@ fn test_cli_benchmarks_and_contention() {
     assert!(multi_str.contains("IFA MULTITHREAD ALLOCATOR BENCHMARK"));
     assert!(multi_str.contains("Performance Comparison Ratios"));
 }
+
+#[test]
+fn test_cli_lsp_server_stdio() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::Stdio;
+
+    let ifa_bin = get_ifa_binary();
+    let mut child = Command::new(&ifa_bin)
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn `ifa lsp`");
+
+    let mut stdin = child.stdin.take().expect("Failed to open stdin");
+    let stdout = child.stdout.take().expect("Failed to open stdout");
+    let mut reader = BufReader::new(stdout);
+
+    // 1. Send initialize request
+    let init_body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let init_msg = format!("Content-Length: {}\r\n\r\n{}", init_body.len(), init_body);
+    stdin
+        .write_all(init_msg.as_bytes())
+        .expect("Failed to write initialize to LSP");
+    stdin.flush().unwrap();
+
+    // Read response header
+    let mut header = String::new();
+    let mut content_length = 0;
+    loop {
+        header.clear();
+        reader.read_line(&mut header).unwrap();
+        let trimmed = header.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
+            content_length = rest.trim().parse::<usize>().unwrap();
+        }
+    }
+    assert!(content_length > 0);
+
+    let mut body_bytes = vec![0u8; content_length];
+    reader.read_exact(&mut body_bytes).unwrap();
+    let body_str = String::from_utf8(body_bytes).unwrap();
+    let init_resp: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+    assert_eq!(init_resp["id"], 1);
+    let caps = &init_resp["result"]["capabilities"];
+    assert!(caps["hoverProvider"].as_bool().unwrap());
+    assert!(caps["definitionProvider"].as_bool().unwrap());
+    assert!(caps["referencesProvider"].as_bool().unwrap());
+    assert!(caps["renameProvider"].as_bool().unwrap());
+    assert!(caps["documentSymbolProvider"].as_bool().unwrap());
+    assert!(caps["workspaceSymbolProvider"].as_bool().unwrap());
+    assert!(caps["semanticTokensProvider"].is_object());
+    assert!(caps["inlayHintProvider"].as_bool().unwrap());
+    assert!(caps["codeActionProvider"].as_bool().unwrap());
+    assert!(caps["signatureHelpProvider"].is_object());
+
+    // 2. Send shutdown request
+    let shutdown_body = r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}"#;
+    let shutdown_msg = format!(
+        "Content-Length: {}\r\n\r\n{}",
+        shutdown_body.len(),
+        shutdown_body
+    );
+    stdin
+        .write_all(shutdown_msg.as_bytes())
+        .expect("Failed to write shutdown to LSP");
+    stdin.flush().unwrap();
+
+    // Read shutdown response
+    let mut sd_content_length = 0;
+    loop {
+        header.clear();
+        reader.read_line(&mut header).unwrap();
+        let trimmed = header.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
+            sd_content_length = rest.trim().parse::<usize>().unwrap();
+        }
+    }
+    let mut sd_body_bytes = vec![0u8; sd_content_length];
+    reader.read_exact(&mut sd_body_bytes).unwrap();
+
+    drop(stdin);
+    let status = child.wait().expect("Failed to wait on LSP server process");
+    assert!(status.success());
+}

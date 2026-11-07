@@ -247,4 +247,9 @@ impl DocumentStore {
     pub fn get_mut(&mut self, uri: &str) -> Option<&mut Document> {
         self.documents.get_mut(uri)
     }
+
+    /// Iterate over all currently tracked documents in the store.
+    pub fn iter(&self) -> impl Iterator<Item = &Document> {
+        self.documents.values()
+    }
 }
