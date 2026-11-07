@@ -199,6 +199,16 @@ impl<'a> FirPrinter<'a> {
                 }
                 write!(self.output, ")")
             }
+            ValueExpr::BlockingCallDirect { name, args } => {
+                write!(self.output, "blocking.call @{}(", name.as_str())?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(self.output, ", ")?;
+                    }
+                    write!(self.output, "{}", a)?;
+                }
+                write!(self.output, ")")
+            }
             ValueExpr::StructInit { name, fields } => {
                 write!(self.output, "struct @{}(", name.as_str())?;
                 for (i, f) in fields.iter().enumerate() {

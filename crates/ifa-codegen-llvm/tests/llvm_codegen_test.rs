@@ -2647,3 +2647,126 @@ fn test_llvm_wasm32_stackless_iterator_generator_lowering() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_blocking_ffi_isolation_and_thunk_lowering() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirParam, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+    use std::fs;
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    // 1. Declare external blocking C function: blocking_c_calc(a: i64, b: i64) -> i64
+    let ext_name = INTERNER.intern("blocking_c_calc");
+    let ext_params = vec![
+        FirParam {
+            name: INTERNER.intern("a"),
+            val: ValueId(1),
+            ty: FirType::Int(IntType::I64),
+            mode: ifa_fir::ParamMode::In,
+        },
+        FirParam {
+            name: INTERNER.intern("b"),
+            val: ValueId(2),
+            ty: FirType::Int(IntType::I64),
+            mode: ifa_fir::ParamMode::In,
+        },
+    ];
+    let mut ext_func = FirFunction::new(
+        ext_name,
+        ext_params,
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        Some("C".to_string()),
+        Span::DUMMY,
+    );
+    ext_func.is_blocking = true;
+    ext_func.blocks.clear();
+
+    // 2. Define caller function: execute_task() -> i64
+    let caller_name = INTERNER.intern("execute_task");
+    let mut caller_func = FirFunction::new(
+        caller_name,
+        vec![],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    caller_func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    let val_a = ValueId(10);
+    bb0.instructions.push(Instruction::new(
+        Some(val_a),
+        ValueExpr::Constant(ConstantValue::Int(42, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let val_b = ValueId(11);
+    bb0.instructions.push(Instruction::new(
+        Some(val_b),
+        ValueExpr::Constant(ConstantValue::Int(100, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    let res_val = ValueId(12);
+    bb0.instructions.push(Instruction::new(
+        Some(res_val),
+        ValueExpr::BlockingCallDirect {
+            name: ext_name,
+            args: vec![val_a, val_b],
+        },
+        Span::DUMMY,
+    ));
+    bb0.terminator = Some(Terminator::Return(Some(res_val)));
+    caller_func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("blocking_ffi_mod"),
+        functions: vec![ext_func, caller_func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    // 3. Validate pack struct, thunk and isolated call in LLVM IR
+    assert!(ir.contains("%struct.ifa_pack_blocking_c_calc = type { i64, i64, i64 }"));
+    assert!(ir.contains("define internal ptr @ifa_thunk_blocking_blocking_c_calc(ptr %ctx)"));
+    assert!(ir.contains("call i64 @blocking_c_calc("));
+    assert!(ir.contains("%pack_12 = alloca %struct.ifa_pack_blocking_c_calc, align 8"));
+    assert!(ir.contains("store i64 %v10, ptr %arg_slot_12_0, align 8"));
+    assert!(ir.contains("store i64 %v11, ptr %arg_slot_12_1, align 8"));
+    assert!(ir.contains(
+        "call ptr @ifa_rt_blocking_call(ptr @ifa_thunk_blocking_blocking_c_calc, ptr %pack_12)"
+    ));
+    assert!(ir.contains("%v12 = load i64, ptr %res_slot_12, align 8"));
+
+    // 4. Verify native compilation to valid object file
+    let temp_dir = std::env::temp_dir().join(format!("llvm_blocking_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("blocking_test.o");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation of blocking FFI module failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+    let _ = fs::remove_dir_all(&temp_dir);
+}

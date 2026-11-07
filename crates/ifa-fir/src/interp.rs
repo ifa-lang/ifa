@@ -1662,7 +1662,7 @@ impl<'a> FirInterpreter<'a> {
                 })
             }
 
-            ValueExpr::CallDirect { name, args } => {
+            ValueExpr::CallDirect { name, args } | ValueExpr::BlockingCallDirect { name, args } => {
                 let fn_name = INTERNER.resolve(name);
                 let mut evaluated_args = Vec::new();
                 for arg in args {

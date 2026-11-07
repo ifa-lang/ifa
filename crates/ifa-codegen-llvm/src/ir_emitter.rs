@@ -138,7 +138,6 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare ptr @ifa_rt_string_from_i64(i64)\n");
             out.push_str("declare ptr @ifa_rt_string_from_f64(double)\n");
             out.push_str("declare ptr @ifa_rt_string_from_bool(i1)\n");
-            out.push_str("declare ptr @ifa_rt_blocking_call(ptr, ptr)\n");
             out.push_str("declare i64 @ifa_rt_blocking_spawn(ptr, ptr, ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_bounds_check(i64, i64, ptr)\n");
             out.push_str("declare void @ifa_rt_slice_bounds_check(i64, i64, i64, ptr)\n");
@@ -181,7 +180,6 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare ptr @ifa_rt_string_from_i64(i64)\n");
             out.push_str("declare ptr @ifa_rt_string_from_f64(double)\n");
             out.push_str("declare ptr @ifa_rt_string_from_bool(i1)\n");
-            out.push_str("declare ptr @ifa_rt_blocking_call(ptr, ptr)\n");
             out.push_str("declare i64 @ifa_rt_blocking_spawn(ptr, ptr, ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_bounds_check(i64, i64, ptr)\n");
             out.push_str("declare void @ifa_rt_slice_bounds_check(i64, i64, i64, ptr)\n");
@@ -292,6 +290,9 @@ impl<'a> LlvmIrEmitter<'a> {
 
             out.push_str("define dso_local void @ifa_wasm_coro_destroy(ptr %hdl) {\n");
             out.push_str("entry:\n  call void @llvm.coro.destroy(ptr %hdl)\n  ret void\n}\n\n");
+
+            out.push_str("define linkonce_odr ptr @ifa_rt_blocking_call(ptr %thunk, ptr %ctx) alwaysinline {\n");
+            out.push_str("entry:\n  %res = call ptr %thunk(ptr %ctx)\n  ret ptr %res\n}\n\n");
         }
 
         // SIMD Vector Reduction Intrinsics
@@ -835,8 +836,146 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push('\n');
         }
 
+        // 3b. Scan and emit isolated blocking FFI pack structs and execution thunks
+        let mut blocking_targets: std::collections::BTreeMap<
+            ifa_span::Symbol,
+            (String, Vec<String>),
+        > = std::collections::BTreeMap::new();
+        for func in &module.functions {
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let ValueExpr::BlockingCallDirect { name, args } = &inst.expr {
+                        if !blocking_targets.contains_key(name) {
+                            let (ret_ty_str, param_types) = if let Some(target_fn) =
+                                module.functions.iter().find(|f| f.name == *name)
+                            {
+                                let ret_ty = fir_to_llvm_type(&target_fn.ret_ty)
+                                    .unwrap_or_else(|_| "i64".to_string());
+                                let params: Vec<String> = target_fn
+                                    .params
+                                    .iter()
+                                    .map(|p| match &p.ty {
+                                        ifa_fir::FirType::Array(..) => "ptr".to_string(),
+                                        _ => fir_to_llvm_type(&p.ty)
+                                            .unwrap_or_else(|_| "i64".to_string()),
+                                    })
+                                    .collect();
+                                (ret_ty, params)
+                            } else {
+                                ("i64".to_string(), vec!["i64".to_string(); args.len()])
+                            };
+                            blocking_targets.insert(*name, (ret_ty_str, param_types));
+                        }
+                    }
+                }
+            }
+        }
+
+        if !blocking_targets.is_empty() {
+            out.push_str("; Isolated Blocking FFI Pack Structs & Execution Thunks\n");
+            for (sym, (ret_ty_str, param_types)) in &blocking_targets {
+                let callee = INTERNER.resolve(sym);
+                // Declare target if external
+                if !module
+                    .functions
+                    .iter()
+                    .any(|f| f.name == *sym && !f.blocks.is_empty())
+                {
+                    out.push_str(&format!(
+                        "declare {} @{}({})\n",
+                        ret_ty_str,
+                        callee,
+                        param_types.join(", ")
+                    ));
+                }
+
+                // Pack struct
+                let mut pack_fields = param_types.clone();
+                if ret_ty_str != "void" {
+                    pack_fields.push(ret_ty_str.clone());
+                } else {
+                    pack_fields.push("i8".to_string());
+                }
+                out.push_str(&format!(
+                    "%struct.ifa_pack_{} = type {{ {} }}\n",
+                    callee,
+                    pack_fields.join(", ")
+                ));
+
+                // Execution thunk
+                out.push_str(&format!(
+                    "define internal ptr @ifa_thunk_blocking_{}(ptr %ctx) {{\nentry:\n",
+                    callee
+                ));
+                for (idx, p_ty) in param_types.iter().enumerate() {
+                    out.push_str(&format!(
+                        "  %arg_slot_{} = getelementptr inbounds %struct.ifa_pack_{}, ptr %ctx, i32 0, i32 {}\n",
+                        idx, callee, idx
+                    ));
+                    out.push_str(&format!(
+                        "  %arg_{} = load {}, ptr %arg_slot_{}, align 8\n",
+                        idx, p_ty, idx
+                    ));
+                }
+                let call_args: Vec<String> = param_types
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, p_ty)| format!("{} %arg_{}", p_ty, idx))
+                    .collect();
+                if ret_ty_str == "void" {
+                    out.push_str(&format!(
+                        "  call void @{}({})\n",
+                        callee,
+                        call_args.join(", ")
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  %res = call {} @{}({})\n",
+                        ret_ty_str,
+                        callee,
+                        call_args.join(", ")
+                    ));
+                    out.push_str(&format!(
+                        "  %res_slot = getelementptr inbounds %struct.ifa_pack_{}, ptr %ctx, i32 0, i32 {}\n",
+                        callee,
+                        param_types.len()
+                    ));
+                    out.push_str(&format!(
+                        "  store {} %res, ptr %res_slot, align 8\n",
+                        ret_ty_str
+                    ));
+                }
+                out.push_str("  ret ptr %ctx\n}\n\n");
+            }
+        }
+
+        // 3c. Emit declarations for external functions (with no blocks)
+        for func in &module.functions {
+            if func.blocks.is_empty() && !blocking_targets.contains_key(&func.name) {
+                let fn_name = INTERNER.resolve(&func.name);
+                let ret_ty_str = fir_to_llvm_type(&func.ret_ty)?;
+                let param_types: Vec<String> = func
+                    .params
+                    .iter()
+                    .map(|p| match &p.ty {
+                        ifa_fir::FirType::Array(..) => "ptr".to_string(),
+                        _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()),
+                    })
+                    .collect();
+                out.push_str(&format!(
+                    "declare {} @{}({})\n",
+                    ret_ty_str,
+                    fn_name,
+                    param_types.join(", ")
+                ));
+            }
+        }
+
         // 4. Emit function definitions
         for func in &module.functions {
+            if func.blocks.is_empty() {
+                continue;
+            }
             self.emit_function(func, module, &mut out)?;
             out.push('\n');
         }
@@ -1024,7 +1163,8 @@ impl<'a> LlvmIrEmitter<'a> {
                                 elements.len() as u32,
                             )))
                         }
-                        ValueExpr::CallDirect { name, .. } => {
+                        ValueExpr::CallDirect { name, .. }
+                        | ValueExpr::BlockingCallDirect { name, .. } => {
                             let callee = INTERNER.resolve(name);
                             if callee.starts_with("ifa_simd_") {
                                 if callee.ends_with("_f32")
@@ -1686,6 +1826,59 @@ impl<'a> LlvmIrEmitter<'a> {
                             args_str.join(", ")
                         ));
                     }
+                }
+            }
+            ValueExpr::BlockingCallDirect { name, args } => {
+                let callee = INTERNER.resolve(name);
+                let (ret_ty_str, param_types) =
+                    if let Some(target_fn) = module.functions.iter().find(|f| f.name == *name) {
+                        let ret_ty = fir_to_llvm_type(&target_fn.ret_ty)?;
+                        let params: Vec<String> = target_fn
+                            .params
+                            .iter()
+                            .map(|p| match &p.ty {
+                                ifa_fir::FirType::Array(..) => "ptr".to_string(),
+                                _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()),
+                            })
+                            .collect();
+                        (ret_ty, params)
+                    } else {
+                        ("i64".to_string(), vec!["i64".to_string(); args.len()])
+                    };
+
+                out.push_str(&format!(
+                    "  %pack_{} = alloca %struct.ifa_pack_{}, align 8\n",
+                    res_id, callee
+                ));
+                for (i, a) in args.iter().enumerate() {
+                    let p_ty = param_types
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| "i64".to_string());
+                    out.push_str(&format!(
+                        "  %arg_slot_{}_{} = getelementptr inbounds %struct.ifa_pack_{}, ptr %pack_{}, i32 0, i32 {}\n",
+                        res_id, i, callee, res_id, i
+                    ));
+                    out.push_str(&format!(
+                        "  store {} %v{}, ptr %arg_slot_{}_{}, align 8\n",
+                        p_ty, a.0, res_id, i
+                    ));
+                }
+                out.push_str(&format!(
+                    "  %pack_res_{} = call ptr @ifa_rt_blocking_call(ptr @ifa_thunk_blocking_{}, ptr %pack_{})\n",
+                    res_id, callee, res_id
+                ));
+                if ret_ty_str != "void" {
+                    out.push_str(&format!(
+                        "  %res_slot_{} = getelementptr inbounds %struct.ifa_pack_{}, ptr %pack_{}, i32 0, i32 {}\n",
+                        res_id, callee, res_id, param_types.len()
+                    ));
+                    out.push_str(&format!(
+                        "  %v{} = load {}, ptr %res_slot_{}, align 8\n",
+                        res_id, ret_ty_str, res_id
+                    ));
+                } else {
+                    out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
                 }
             }
             ValueExpr::Call { callee, args } => {
@@ -2689,6 +2882,48 @@ impl<'a> LlvmIrEmitter<'a> {
                         args_str.join(", ")
                     ));
                 }
+            }
+            ValueExpr::BlockingCallDirect { name, args } => {
+                let callee = INTERNER.resolve(name);
+                let (_, param_types) =
+                    if let Some(target_fn) = module.functions.iter().find(|f| f.name == *name) {
+                        let ret_ty = fir_to_llvm_type(&target_fn.ret_ty)?;
+                        let params: Vec<String> = target_fn
+                            .params
+                            .iter()
+                            .map(|p| match &p.ty {
+                                ifa_fir::FirType::Array(..) => "ptr".to_string(),
+                                _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()),
+                            })
+                            .collect();
+                        (ret_ty, params)
+                    } else {
+                        ("i64".to_string(), vec!["i64".to_string(); args.len()])
+                    };
+
+                let eff_id = format!("eff_pack_{}", callee);
+                out.push_str(&format!(
+                    "  %{} = alloca %struct.ifa_pack_{}, align 8\n",
+                    eff_id, callee
+                ));
+                for (i, a) in args.iter().enumerate() {
+                    let p_ty = param_types
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| "i64".to_string());
+                    out.push_str(&format!(
+                        "  %eff_arg_slot_{}_{} = getelementptr inbounds %struct.ifa_pack_{}, ptr %{}, i32 0, i32 {}\n",
+                        callee, i, callee, eff_id, i
+                    ));
+                    out.push_str(&format!(
+                        "  store {} %v{}, ptr %eff_arg_slot_{}_{}, align 8\n",
+                        p_ty, a.0, callee, i
+                    ));
+                }
+                out.push_str(&format!(
+                    "  call ptr @ifa_rt_blocking_call(ptr @ifa_thunk_blocking_{}, ptr %{})\n",
+                    callee, eff_id
+                ));
             }
             ValueExpr::Call { callee, args } => {
                 let args_str: Vec<String> = args

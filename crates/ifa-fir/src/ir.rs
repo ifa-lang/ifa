@@ -1,5 +1,5 @@
 use crate::types::FirType;
-use ifa_ast::ParamMode;
+pub use ifa_ast::ParamMode;
 use ifa_sema::types::{FloatType, IntType};
 use ifa_span::{Span, Symbol};
 use std::fmt;
@@ -176,6 +176,10 @@ pub enum ValueExpr {
         name: Symbol,
         args: Vec<ValueId>,
     },
+    BlockingCallDirect {
+        name: Symbol,
+        args: Vec<ValueId>,
+    },
     StructInit {
         name: Symbol,
         fields: Vec<ValueId>,
@@ -313,7 +317,9 @@ impl ValueExpr {
                 u.extend_from_slice(args);
                 u
             }
-            ValueExpr::CallDirect { args, .. } => args.clone(),
+            ValueExpr::CallDirect { args, .. } | ValueExpr::BlockingCallDirect { args, .. } => {
+                args.clone()
+            }
             ValueExpr::StructInit { fields, .. } => fields.clone(),
             ValueExpr::TupleInit(fields) => fields.clone(),
             ValueExpr::ArrayInit(elements) => elements.clone(),
@@ -551,6 +557,7 @@ pub struct FirFunction {
     pub is_pub: bool,
     pub is_comptime: bool,
     pub is_coroutine: bool,
+    pub is_blocking: bool,
     pub is_extern: Option<String>,
     pub span: Span,
     pub next_value_id: u32,
@@ -581,6 +588,7 @@ impl FirFunction {
             is_pub,
             is_comptime,
             is_coroutine: false,
+            is_blocking: false,
             is_extern,
             span,
             next_value_id: 0,

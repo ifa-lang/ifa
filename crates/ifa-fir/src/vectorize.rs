@@ -444,6 +444,9 @@ impl VectorizePass {
                                 return (false, false);
                             }
                         }
+                        ValueExpr::BlockingCallDirect { .. } => {
+                            return (false, false);
+                        }
                         ValueExpr::CallDirect { name, .. } => {
                             let callee = INTERNER.resolve(name);
                             if self.pure_functions.contains(name)

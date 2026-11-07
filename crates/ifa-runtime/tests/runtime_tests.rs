@@ -1013,3 +1013,42 @@ fn test_simd_vector_cacheline_alignments() {
     }
     ifa_rt_gen_free(ptr_avx512);
 }
+
+#[test]
+fn test_blocking_pool_cooperative_yield_and_ffi_isolation() {
+    use ifa_runtime::blocking::{ifa_rt_blocking_call, GLOBAL_BLOCKING_POOL};
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static TASK_STARTED: AtomicBool = AtomicBool::new(false);
+    static TASK_COMPLETED: AtomicBool = AtomicBool::new(false);
+
+    #[repr(C)]
+    struct AddPack {
+        a: i64,
+        b: i64,
+        res: i64,
+    }
+
+    extern "C" fn slow_add_thunk(ctx: *mut c_void) -> *mut c_void {
+        TASK_STARTED.store(true, Ordering::SeqCst);
+        let pack = unsafe { &mut *(ctx as *mut AddPack) };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        pack.res = pack.a + pack.b;
+        TASK_COMPLETED.store(true, Ordering::SeqCst);
+        ctx
+    }
+
+    let mut pack = AddPack {
+        a: 100,
+        b: 250,
+        res: 0,
+    };
+    assert!(GLOBAL_BLOCKING_POOL.capacity() >= 1);
+
+    let res_ptr = ifa_rt_blocking_call(slow_add_thunk, &mut pack as *mut AddPack as *mut c_void);
+    assert_eq!(res_ptr, &mut pack as *mut AddPack as *mut c_void);
+    assert!(TASK_STARTED.load(Ordering::SeqCst));
+    assert!(TASK_COMPLETED.load(Ordering::SeqCst));
+    assert_eq!(pack.res, 350);
+}

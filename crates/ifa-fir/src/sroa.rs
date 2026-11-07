@@ -197,7 +197,8 @@ impl SroaPass {
                             }
                         }
                     }
-                    ValueExpr::CallDirect { args, .. } => {
+                    ValueExpr::CallDirect { args, .. }
+                    | ValueExpr::BlockingCallDirect { args, .. } => {
                         for arg in args {
                             if alloca_info.contains_key(arg) {
                                 escaping.insert(*arg);
@@ -908,7 +909,7 @@ impl SroaPass {
                     replace(a);
                 }
             }
-            ValueExpr::CallDirect { args, .. } => {
+            ValueExpr::CallDirect { args, .. } | ValueExpr::BlockingCallDirect { args, .. } => {
                 for a in args {
                     replace(a);
                 }

@@ -158,6 +158,8 @@ impl<'a> FunctionLoweringContext<'a> {
             func_ast.is_extern.clone(),
             func_ast.span,
         );
+        func.is_blocking = func_ast.is_extern.as_deref() == Some("blocking")
+            || INTERNER.resolve(&name).starts_with("blocking_");
         func.next_value_id = next_val;
 
         let entry = func.entry_block;
@@ -213,6 +215,7 @@ impl<'a> FunctionLoweringContext<'a> {
             is_pub: false,
             is_comptime: false,
             is_coroutine: false,
+            is_blocking: false,
             is_extern: None,
             span,
             next_value_id,
@@ -2872,15 +2875,28 @@ impl<'a> FunctionLoweringContext<'a> {
                         fn_name
                     };
 
+                    let is_target_blocking =
+                        INTERNER.resolve(&target_fn_name).starts_with("blocking_");
                     let res = self.alloc_value();
-                    self.emit(
-                        Some(res),
-                        ValueExpr::CallDirect {
-                            name: target_fn_name,
-                            args: arg_vals,
-                        },
-                        span,
-                    );
+                    if is_target_blocking {
+                        self.emit(
+                            Some(res),
+                            ValueExpr::BlockingCallDirect {
+                                name: target_fn_name,
+                                args: arg_vals,
+                            },
+                            span,
+                        );
+                    } else {
+                        self.emit(
+                            Some(res),
+                            ValueExpr::CallDirect {
+                                name: target_fn_name,
+                                args: arg_vals,
+                            },
+                            span,
+                        );
+                    }
                     res
                 } else {
                     let callee_val = self.lower_expr(callee);
@@ -3133,15 +3149,28 @@ impl<'a> FunctionLoweringContext<'a> {
                     }
                     let target_fn_name = self.resolve_method_call_target(receiver, *method, span);
 
+                    let is_target_blocking =
+                        INTERNER.resolve(&target_fn_name).starts_with("blocking_");
                     let res = self.alloc_value();
-                    self.emit(
-                        Some(res),
-                        ValueExpr::CallDirect {
-                            name: target_fn_name,
-                            args: arg_vals,
-                        },
-                        span,
-                    );
+                    if is_target_blocking {
+                        self.emit(
+                            Some(res),
+                            ValueExpr::BlockingCallDirect {
+                                name: target_fn_name,
+                                args: arg_vals,
+                            },
+                            span,
+                        );
+                    } else {
+                        self.emit(
+                            Some(res),
+                            ValueExpr::CallDirect {
+                                name: target_fn_name,
+                                args: arg_vals,
+                            },
+                            span,
+                        );
+                    }
                     res
                 }
             }

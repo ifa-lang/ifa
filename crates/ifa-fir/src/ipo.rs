@@ -50,7 +50,9 @@ impl IpoCallGraph {
 
             for block in &func.blocks {
                 for inst in &block.instructions {
-                    if let ValueExpr::CallDirect { name, .. } = &inst.expr {
+                    if let ValueExpr::CallDirect { name, .. }
+                    | ValueExpr::BlockingCallDirect { name, .. } = &inst.expr
+                    {
                         callee_set.insert(*name);
                     }
                 }
@@ -286,6 +288,9 @@ impl IpoPass {
                             if !local_pointers.contains(ptr) {
                                 is_impure = true;
                             }
+                        }
+                        ValueExpr::BlockingCallDirect { .. } => {
+                            is_impure = true;
                         }
                         ValueExpr::CallDirect { name, .. } => {
                             let callee_str = INTERNER.resolve(name);

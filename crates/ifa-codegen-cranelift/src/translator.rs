@@ -385,7 +385,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 })
             }
 
-            ValueExpr::CallDirect { name, args } => {
+            ValueExpr::CallDirect { name, args } | ValueExpr::BlockingCallDirect { name, args } => {
                 let fn_name = INTERNER.resolve(name);
                 if let Some(&callee_id) = self.func_ids.get(&fn_name) {
                     let local_func = self

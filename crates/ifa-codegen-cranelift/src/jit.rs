@@ -249,7 +249,9 @@ impl JitEngine {
         for fir_func in &fir_module.functions {
             let fn_name = INTERNER.resolve(&fir_func.name);
             let sig = fir_signature_to_cranelift(fir_func, call_conv, ptr_type)?;
-            let linkage = if fir_func.is_pub {
+            let linkage = if fir_func.blocks.is_empty() {
+                Linkage::Import
+            } else if fir_func.is_pub {
                 Linkage::Export
             } else {
                 Linkage::Local
@@ -270,6 +272,9 @@ impl JitEngine {
 
         // 2. Translate and define each function
         for fir_func in &fir_module.functions {
+            if fir_func.blocks.is_empty() {
+                continue;
+            }
             let fn_name = INTERNER.resolve(&fir_func.name);
             let func_id = self.func_ids[&fn_name];
 
