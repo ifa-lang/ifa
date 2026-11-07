@@ -1434,10 +1434,13 @@ impl<'a> LlvmIrEmitter<'a> {
                     ));
                 }
             }
-            ValueExpr::GenAlloc { .. } => {
+            ValueExpr::GenAlloc { ty, arena } => {
+                let size = ty.byte_size().max(8);
+                let align = llvm_align_for_type(ty).max(8);
+                let arena_id = arena.unwrap_or(0);
                 out.push_str(&format!(
-                    "  %v{} = call ptr @ifa_rt_gen_alloc(i64 64, i64 8, i16 0)\n",
-                    res_id
+                    "  %v{} = call ptr @ifa_rt_gen_alloc(i64 {}, i64 {}, i16 {})\n",
+                    res_id, size, align, arena_id
                 ));
             }
             ValueExpr::GetField {
@@ -2448,10 +2451,22 @@ impl<'a> LlvmIrEmitter<'a> {
                 else_block,
                 ..
             } => {
-                out.push_str(&format!(
-                    "  br i1 %v{}, label %bb{}, label %bb{}\n",
-                    cond.0, then_block.0, else_block.0
-                ));
+                if let Some(hint) = vector_hint {
+                    let meta_id = match hint.vector_width {
+                        4 => 6,
+                        16 | 32 => 8,
+                        _ => 1,
+                    };
+                    out.push_str(&format!(
+                        "  br i1 %v{}, label %bb{}, label %bb{}, !llvm.loop !{}\n",
+                        cond.0, then_block.0, else_block.0, meta_id
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  br i1 %v{}, label %bb{}, label %bb{}\n",
+                        cond.0, then_block.0, else_block.0
+                    ));
+                }
             }
             Terminator::Fail(val) => {
                 let llvm_ty = fir_to_llvm_type(ret_ty)?;

@@ -11,8 +11,11 @@ pub enum ClosureAllocationKind {
     /// Environment does not escape its calling frame: allocated purely on stack
     /// or scalarized directly into SSA registers (zero heap allocation overhead).
     Stack,
-    /// Environment escapes its creating stack frame (e.g., returned or stored
-    /// in generational/heap structures): requires heap allocation.
+    /// Environment escapes local frame only into bounded callee invocations (e.g. higher-order iterators):
+    /// allocated in a pre-allocated request/scoped arena (O(1) bump allocation, zero fragmentation).
+    Arena(u16),
+    /// Environment escapes unboundedly (returned from caller, stored in global or spawned across threads):
+    /// requires heap allocation with generational safety.
     Heap,
 }
 
@@ -38,6 +41,8 @@ pub struct ClosureEscapeStats {
     pub total_closures: usize,
     /// Closures whose environments are guaranteed to reside on the stack or in registers.
     pub stack_allocated_closures: usize,
+    /// Closures whose environments are placed in pre-allocated scoped arenas.
+    pub arena_allocated_closures: usize,
     /// Closures whose environments escape and require heap storage.
     pub heap_allocated_closures: usize,
     /// Indirect closure calls devirtualized into direct SSA function calls (`CallDirect`).
@@ -52,6 +57,8 @@ pub struct ClosureEscapeStats {
     pub inlined_thunk_adapters: usize,
     /// Monomorphic higher-order function calls specialized for static callees.
     pub specialized_higher_order_calls: usize,
+    /// Environments successfully placed into pre-allocated memory arenas.
+    pub arena_placed_closures: usize,
 }
 
 /// Interprocedural closure escape analysis and capture optimizer.
@@ -82,23 +89,25 @@ impl ClosureOptPass {
         let mut closures = self.collect_closure_instances(module);
         self.stats.total_closures = closures.len();
 
-        // Step 2: Interprocedural Escape Analysis
+        // Step 2: Inline small higher-order helper functions at known closure call sites
+        self.inline_higher_order_call_sites(module, &closures);
+
+        // Step 3: Specialize monomorphic higher-order calls (multi-block or loops)
+        self.specialize_higher_order_calls(module, &mut closures);
+
+        // Step 4: Refresh closure instances and run Interprocedural Escape Analysis
+        let mut closures = self.collect_closure_instances(module);
         self.analyze_escapes(module, &mut closures);
 
         for c in &closures {
             match c.allocation {
                 ClosureAllocationKind::Stack => self.stats.stack_allocated_closures += 1,
+                ClosureAllocationKind::Arena(_) => self.stats.arena_allocated_closures += 1,
                 ClosureAllocationKind::Heap => self.stats.heap_allocated_closures += 1,
             }
         }
 
-        // Step 3: Inline small higher-order helper functions at known closure call sites
-        self.inline_higher_order_call_sites(module, &closures);
-
-        // Step 4: Specialize monomorphic higher-order calls (multi-block or loops)
-        self.specialize_higher_order_calls(module, &mut closures);
-
-        // Step 5: Devirtualize closure calls and forward captured fields in all functions
+        // Step 5: Devirtualize closure calls, forward captured fields, and optimize bounded arena placement
         let thunk_adapters = self.collect_thunk_adapters(module);
         for func in &mut module.functions {
             self.optimize_function(func, &closures, &thunk_adapters);
@@ -174,9 +183,8 @@ impl ClosureOptPass {
                 .iter()
                 .find(|f| f.name == closure.func_name)
             {
-                if Self::is_closure_escaping_in_func(func, closure.closure_val, &escaping_params) {
-                    closure.allocation = ClosureAllocationKind::Heap;
-                }
+                closure.allocation =
+                    Self::classify_closure_escape(func, closure.closure_val, &escaping_params);
             }
         }
     }
@@ -269,12 +277,13 @@ impl ClosureOptPass {
         false
     }
 
-    /// Checks if a closure value escapes from its creating function.
-    fn is_closure_escaping_in_func(
+    /// Classify whether a closure value remains strictly on stack, can be placed into a scoped arena (bounded call),
+    /// or escapes globally to the generational heap.
+    fn classify_closure_escape(
         func: &FirFunction,
         closure_val: ValueId,
         escaping_params: &HashSet<(Symbol, usize)>,
-    ) -> bool {
+    ) -> ClosureAllocationKind {
         let local_allocas: HashSet<ValueId> = func
             .blocks
             .iter()
@@ -311,6 +320,8 @@ impl ClosureOptPass {
             }
         }
 
+        let mut passed_to_bounded_call = false;
+
         while let Some(v) = worklist.pop() {
             if !visited.insert(v) {
                 continue;
@@ -319,8 +330,12 @@ impl ClosureOptPass {
             for block in &func.blocks {
                 if let Some(term) = &block.terminator {
                     match term {
-                        Terminator::Return(Some(ret_val)) if *ret_val == v => return true,
-                        Terminator::Fail(fail_val) if *fail_val == v => return true,
+                        Terminator::Return(Some(ret_val)) if *ret_val == v => {
+                            return ClosureAllocationKind::Heap;
+                        }
+                        Terminator::Fail(fail_val) if *fail_val == v => {
+                            return ClosureAllocationKind::Heap;
+                        }
                         _ => {}
                     }
                 }
@@ -329,25 +344,37 @@ impl ClosureOptPass {
                     match &inst.expr {
                         ValueExpr::Store { ptr, val } if *val == v => {
                             if !local_allocas.contains(ptr) {
-                                return true;
+                                return ClosureAllocationKind::Heap;
                             }
                         }
-                        ValueExpr::Spawn { args, .. } if args.contains(&v) => return true,
+                        ValueExpr::Spawn { args, .. } if args.contains(&v) => {
+                            return ClosureAllocationKind::Heap;
+                        }
                         ValueExpr::CallDirect { name, args } => {
                             for (idx, arg) in args.iter().enumerate() {
-                                if *arg == v && escaping_params.contains(&(*name, idx)) {
-                                    return true;
+                                if *arg == v {
+                                    if escaping_params.contains(&(*name, idx)) {
+                                        return ClosureAllocationKind::Heap;
+                                    } else {
+                                        passed_to_bounded_call = true;
+                                    }
                                 }
                             }
                         }
-                        ValueExpr::ArrayPush { val, .. } if *val == v => return true,
+                        ValueExpr::ArrayPush { val, .. } if *val == v => {
+                            return ClosureAllocationKind::Heap;
+                        }
                         _ => {}
                     }
                 }
             }
         }
 
-        false
+        if passed_to_bounded_call {
+            ClosureAllocationKind::Arena(1)
+        } else {
+            ClosureAllocationKind::Stack
+        }
     }
 
     /// Inlines small higher-order helper functions at call sites where a known closure is passed.
@@ -816,9 +843,32 @@ impl ClosureOptPass {
     ) {
         // Build map of closure SSA values to their lambda symbol and env SSA value
         let mut closure_map: HashMap<ValueId, (Symbol, ValueId)> = HashMap::new();
+        let mut arena_assigned_envs: HashMap<ValueId, u16> = HashMap::new();
         for c in closures {
             if c.func_name == func.name {
                 closure_map.insert(c.closure_val, (c.lambda_sym, c.env_val));
+                if let ClosureAllocationKind::Arena(arena_id) = c.allocation {
+                    arena_assigned_envs.insert(c.env_val, arena_id);
+                    arena_assigned_envs.insert(c.closure_val, arena_id);
+                }
+            }
+        }
+
+        // Apply arena placement for bounded closure environments
+        if !arena_assigned_envs.is_empty() {
+            for block in &mut func.blocks {
+                for inst in &mut block.instructions {
+                    if let Some(res) = inst.result {
+                        if let Some(&arena_id) = arena_assigned_envs.get(&res) {
+                            if let ValueExpr::GenAlloc { arena, .. } = &mut inst.expr {
+                                if arena.is_none() || *arena == Some(0) {
+                                    *arena = Some(arena_id);
+                                    self.stats.arena_placed_closures += 1;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 

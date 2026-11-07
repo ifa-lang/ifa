@@ -2015,3 +2015,89 @@ fn test_llvm_slice_fat_pointer_inter_function_passing_and_execution() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_vector_branchcond_and_arena_genalloc() {
+    use ifa_fir::*;
+    use ifa_span::Span;
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let mut func = FirFunction::new(
+        ifa_span::INTERNER.intern("test_arena_and_vec"),
+        vec![],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    // FirFunction::new already creates bb0 (entry), clear it or reuse it
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    bb0.instructions.push(Instruction::new(
+        Some(ValueId(1)),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(ifa_sema::types::IntType::I64),
+            arena: Some(42),
+        },
+        Span::DUMMY,
+    ));
+    bb0.terminator = Some(Terminator::Branch {
+        target: BlockId(1),
+        args: Vec::new(),
+    });
+    func.blocks.push(bb0);
+
+    let mut bb1 = BasicBlock::new(BlockId(1));
+    bb1.set_vector_hint(LoopVectorHint {
+        vector_width: 8,
+        interleave_count: 4,
+        unroll_enable: true,
+    });
+    bb1.instructions.push(Instruction::new(
+        Some(ValueId(2)),
+        ValueExpr::Constant(ConstantValue::Bool(true)),
+        Span::DUMMY,
+    ));
+    bb1.terminator = Some(Terminator::BranchCond {
+        cond: ValueId(2),
+        then_block: BlockId(1),
+        else_block: BlockId(2),
+        then_args: Vec::new(),
+        else_args: Vec::new(),
+    });
+    func.blocks.push(bb1);
+
+    let mut bb2 = BasicBlock::new(BlockId(2));
+    bb2.terminator = Some(Terminator::Return(None));
+    func.blocks.push(bb2);
+
+    let module = FirModule {
+        name: ifa_span::INTERNER.intern("arena_vec_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    // Verify arena allocation with correct arena_id 42 and footprint size 8
+    assert!(
+        ir.contains("call ptr @ifa_rt_gen_alloc(i64 8, i64 8, i16 42)"),
+        "LLVM IR must emit gen_alloc with size 8, align 8, arena 42: {}",
+        ir
+    );
+
+    // Verify BranchCond with vector_hint emits loop metadata
+    assert!(
+        ir.contains("br i1 %v2, label %bb1, label %bb2, !llvm.loop !1"),
+        "LLVM IR BranchCond must emit !llvm.loop !1: {}",
+        ir
+    );
+}

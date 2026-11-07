@@ -18,6 +18,8 @@ pub struct VectorizeStats {
     pub arrays_vectorized: usize,
     /// Number of scalar reduction loops identified and accelerated.
     pub reductions_vectorized: usize,
+    /// Number of array/slice transformation maps identified and accelerated.
+    pub maps_vectorized: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -70,7 +72,9 @@ impl VectorizePass {
 
             // 2. Scan for primitive array or slice operations within the loop
             let mut detected_elem_types: Vec<FirType> = Vec::new();
-            let mut has_reduction = false;
+            let mut read_elements = 0;
+            let mut write_elements = 0;
+            let mut has_reduction_op = false;
 
             for &b_id in &loop_info.blocks {
                 if let Some(block) = func.get_block(b_id) {
@@ -82,6 +86,7 @@ impl VectorizePass {
                                 {
                                     if Self::is_simd_primitive_type(&elem_ty) {
                                         detected_elem_types.push(elem_ty);
+                                        read_elements += 1;
                                     }
                                 }
                             }
@@ -91,6 +96,7 @@ impl VectorizePass {
                                 {
                                     if Self::is_simd_primitive_type(&elem_ty) {
                                         detected_elem_types.push(elem_ty);
+                                        write_elements += 1;
                                     }
                                 }
                             }
@@ -104,7 +110,7 @@ impl VectorizePass {
                                         | BinaryOp::BitOr
                                         | BinaryOp::BitXor
                                 ) {
-                                    has_reduction = true;
+                                    has_reduction_op = true;
                                 }
                             }
                             _ => {}
@@ -158,7 +164,9 @@ impl VectorizePass {
                     }
                     self.stats.loops_vectorized += 1;
                     self.stats.arrays_vectorized += detected_elem_types.len();
-                    if has_reduction {
+                    if write_elements > 0 {
+                        self.stats.maps_vectorized += 1;
+                    } else if read_elements > 0 && has_reduction_op {
                         self.stats.reductions_vectorized += 1;
                     }
                 }
@@ -304,6 +312,11 @@ impl VectorizePass {
                                 .get(val)
                                 .cloned()
                                 .unwrap_or(FirType::Int(IntType::I64)),
+                        },
+                        ValueExpr::CoWMakeUnique { val } => match value_types.get(val) {
+                            Some(FirType::Pointer(inner)) => (**inner).clone(),
+                            Some(other) => other.clone(),
+                            _ => FirType::Int(IntType::I64),
                         },
                         _ => FirType::Int(IntType::I64),
                     };

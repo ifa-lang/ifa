@@ -432,3 +432,54 @@ fn test_fir_closure_opt_stats_and_thunk_elimination() {
     let result = interp.execute_function("main", vec![]).unwrap();
     assert_eq!(result, FirValue::Int(125));
 }
+
+#[test]
+fn test_fir_closure_bounded_lifetime_arena_placement() {
+    let src = r#"
+        pub fn repeat_apply(f: fn(i64) -> i64, val: i64, count: i64) -> i64 {
+            let mut res: i64 = val;
+            let mut i: i64 = 0;
+            while i < count {
+                res = f(res);
+                i = i + 1;
+            }
+            return res;
+        }
+
+        pub fn main() -> i64 {
+            let offset: i64 = 5;
+            let adder = fn(x: i64) -> i64 {
+                return x + offset;
+            };
+            return repeat_apply(adder, 10, 3);
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("arena_closure_test.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+
+    let mut fir_module = ifa_fir::lower_program(&prog, &analysis.symbols);
+    let mut sroa = ifa_fir::SroaPass::new();
+    sroa.run_on_module(&mut fir_module);
+
+    let mut closure_pass = ifa_fir::ClosureOptPass::new();
+    closure_pass.run_on_module(&mut fir_module);
+
+    let stats = closure_pass.stats();
+    assert_eq!(stats.total_closures, 1);
+    assert_eq!(stats.heap_allocated_closures, 0);
+    assert!(
+        stats.arena_allocated_closures >= 1 || stats.stack_allocated_closures >= 1,
+        "Closure must be allocated in scoped arena or stack, avoiding heap"
+    );
+
+    let mut interp = FirInterpreter::new(&fir_module);
+    let result = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(result, FirValue::Int(25));
+}

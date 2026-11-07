@@ -122,6 +122,45 @@ impl FirType {
             FirType::String | FirType::Slice(_) | FirType::Struct(_, _) | FirType::Array(_, _)
         )
     }
+
+    /// Returns the concrete memory footprint size in bytes for this type.
+    pub fn byte_size(&self) -> usize {
+        match self {
+            FirType::Unit => 0,
+            FirType::Bool | FirType::Char => 1,
+            FirType::Int(i) => match i {
+                IntType::I8 | IntType::U8 => 1,
+                IntType::I16 | IntType::U16 => 2,
+                IntType::I32 | IntType::U32 => 4,
+                IntType::I64 | IntType::U64 | IntType::ISize | IntType::USize => 8,
+            },
+            FirType::Float(f) => match f {
+                FloatType::F32 => 4,
+                FloatType::F64 => 8,
+            },
+            FirType::Str | FirType::Slice(_) => 16,
+            FirType::String => 24,
+            FirType::Pointer(_) | FirType::Channel(_) => 8,
+            FirType::GenerationalRef(_) => 16,
+            FirType::Struct(_, fields) => {
+                let size: usize = fields.iter().map(|(_, ty)| ty.byte_size().max(8)).sum();
+                size.max(8)
+            }
+            FirType::Enum(_, variants) => {
+                let payload_max: usize = variants
+                    .iter()
+                    .filter_map(|(_, opt)| opt.as_ref().map(|t| t.byte_size()))
+                    .max()
+                    .unwrap_or(0);
+                payload_max + 8
+            }
+            FirType::Array(elem, len) => elem.byte_size() * (*len as usize),
+            FirType::Range { elem, .. } => elem.byte_size() * 2 + 8,
+            FirType::Optional(inner) => inner.byte_size() + 1,
+            FirType::ErrorUnion { ok, .. } => ok.byte_size() + 8,
+            FirType::Function { .. } => 16,
+        }
+    }
 }
 
 impl fmt::Display for FirType {
