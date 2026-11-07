@@ -133,6 +133,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 }
                 ConstantValue::Float(f, _) => Some(self.builder.ins().f64const(*f)),
                 ConstantValue::Unit => Some(self.builder.ins().iconst(types::I64, 0)),
+                ConstantValue::Null => Some(self.builder.ins().iconst(types::I64, 0)),
                 ConstantValue::Char(ch) => {
                     Some(self.builder.ins().iconst(types::I32, *ch as u32 as i64))
                 }

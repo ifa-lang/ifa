@@ -33,6 +33,7 @@ pub enum ConstantValue {
     Float(f64, FloatType),
     Char(char),
     String(Symbol),
+    Null,
 }
 
 impl fmt::Display for ConstantValue {
@@ -44,6 +45,7 @@ impl fmt::Display for ConstantValue {
             ConstantValue::Float(fl, ty) => write!(f, "{}_{}", fl, ty),
             ConstantValue::Char(c) => write!(f, "{:?}", c),
             ConstantValue::String(s) => write!(f, "{:?}", s.as_str()),
+            ConstantValue::Null => write!(f, "null"),
         }
     }
 }

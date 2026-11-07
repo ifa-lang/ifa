@@ -90,7 +90,8 @@ pub fn handle_semantic_tokens(doc: &Document) -> SemanticTokens {
             | TokenKind::Interface
             | TokenKind::Impl
             | TokenKind::True
-            | TokenKind::False => (0, 0),
+            | TokenKind::False
+            | TokenKind::Null => (0, 0),
 
             // Number literals
             TokenKind::IntLiteral(_) | TokenKind::FloatLiteral(_) => (10, 0),

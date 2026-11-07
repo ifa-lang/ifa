@@ -84,6 +84,8 @@ pub enum RawToken {
     True,
     #[token("false")]
     False,
+    #[token("null")]
+    Null,
 
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*")]
@@ -244,6 +246,7 @@ pub enum TokenKind {
     Impl,
     True,
     False,
+    Null,
 
     // Identifiers & Literals
     Ident(Symbol),
@@ -349,6 +352,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Impl => write!(f, "impl"),
             TokenKind::True => write!(f, "true"),
             TokenKind::False => write!(f, "false"),
+            TokenKind::Null => write!(f, "null"),
 
             TokenKind::Ident(s) => write!(f, "identifier '{}'", s),
             TokenKind::IntLiteral(s) => write!(f, "integer '{}'", s),

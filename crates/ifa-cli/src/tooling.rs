@@ -1,10 +1,7 @@
 use ifa_ast::{ExprKind, Item, Program, Stmt};
-use ifa_fir::{compile_to_fir, FirInterpreter, FirValue};
-use ifa_sema::SymbolTable;
 use ifa_span::{SourceMap, INTERNER};
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
 
 /// Initialize a new IFA package with kori.toml manifest and canonical src/main.ifa.
 pub fn init_project(name: &str) -> std::io::Result<()> {
@@ -196,73 +193,4 @@ fn is_pascal_case(s: &str) -> bool {
         Some(c) if c.is_ascii_uppercase() => !s.contains('_'),
         _ => false,
     }
-}
-
-/// Discover and execute test functions in an IFA program.
-pub fn run_tests(prog: &Program, symbols: &SymbolTable) -> (usize, usize, Vec<String>) {
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut logs = Vec::new();
-
-    let fir_module = match compile_to_fir(prog, symbols, true, true) {
-        Ok(m) => m,
-        Err(diags) => {
-            logs.push(format!(
-                "FIR compilation failed with {} errors",
-                diags.len()
-            ));
-            return (0, 1, logs);
-        }
-    };
-
-    let test_functions: Vec<String> = fir_module
-        .functions
-        .iter()
-        .map(|f| INTERNER.resolve(&f.name))
-        .filter(|name| name.starts_with("test_"))
-        .collect();
-
-    if test_functions.is_empty() {
-        logs.push("No test functions found (test functions must start with `test_`)".to_string());
-        return (0, 0, logs);
-    }
-
-    for test_fn in &test_functions {
-        let start = Instant::now();
-        let mut interp = FirInterpreter::new(&fir_module);
-        match interp.execute_function(test_fn, vec![]) {
-            Ok(val) => {
-                let duration = start.elapsed();
-                if val == FirValue::Unit || val == FirValue::Bool(true) {
-                    let status_msg = format!("test {} ... ok ({:.2?})", test_fn, duration);
-                    logs.push(status_msg);
-                    passed += 1;
-                } else if val == FirValue::Bool(false) {
-                    let status_msg = format!(
-                        "test {} ... FAILED (returned false) ({:.2?})",
-                        test_fn, duration
-                    );
-                    logs.push(status_msg);
-                    failed += 1;
-                } else {
-                    let status_msg = format!(
-                        "test {} ... ok (returned {}) ({:.2?})",
-                        test_fn, val, duration
-                    );
-                    logs.push(status_msg);
-                    passed += 1;
-                }
-            }
-            Err(e) => {
-                let duration = start.elapsed();
-                logs.push(format!(
-                    "test {} ... FAILED ({}) ({:.2?})",
-                    test_fn, e, duration
-                ));
-                failed += 1;
-            }
-        }
-    }
-
-    (passed, failed, logs)
 }

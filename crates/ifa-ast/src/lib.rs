@@ -255,6 +255,7 @@ pub enum Lit {
     String(Symbol),
     Char(char),
     Bool(bool),
+    Null,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

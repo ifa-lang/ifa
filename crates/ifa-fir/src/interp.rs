@@ -17,6 +17,7 @@ pub enum FirValue {
     Array(Vec<FirValue>),
     Tuple(Vec<FirValue>),
     Struct { name: Symbol, fields: Vec<FirValue> },
+    Null,
 }
 
 impl FirValue {
@@ -25,8 +26,17 @@ impl FirValue {
             FirValue::Bool(b) => *b,
             FirValue::Int(i) => *i != 0,
             FirValue::String(s) => !s.is_empty(),
-            FirValue::Unit => false,
+            FirValue::Unit | FirValue::Null => false,
+            FirValue::GenRef { slot, generation } => *slot != 0 || *generation != 0,
             _ => true,
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        match self {
+            FirValue::Null => true,
+            FirValue::GenRef { slot, generation } => *slot == 0 && *generation == 0,
+            _ => false,
         }
     }
 }
@@ -73,6 +83,7 @@ impl fmt::Display for FirValue {
                 }
                 write!(f, "}}")
             }
+            FirValue::Null => write!(f, "null"),
         }
     }
 }
@@ -460,6 +471,7 @@ impl<'a> FirInterpreter<'a> {
                 ConstantValue::Float(f, _) => FirValue::Float(*f),
                 ConstantValue::Char(ch) => FirValue::Int(*ch as u32 as i128),
                 ConstantValue::String(s) => FirValue::String(INTERNER.resolve(s)),
+                ConstantValue::Null => FirValue::Null,
             }),
 
             ValueExpr::Alloca { .. } => {
@@ -1153,7 +1165,57 @@ impl<'a> FirInterpreter<'a> {
                 } else if fn_name == "assert" {
                     if let Some(cond) = evaluated_args.first() {
                         if !cond.is_truthy() {
-                            return Err(InterpError::Panic("Assertion failed in program".into()));
+                            let msg = if evaluated_args.len() > 1 {
+                                match &evaluated_args[1] {
+                                    FirValue::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                }
+                            } else {
+                                "assertion failed".to_string()
+                            };
+                            return Err(InterpError::Panic(msg));
+                        }
+                    }
+                    Ok(FirValue::Unit)
+                } else if fn_name == "assert_eq" {
+                    if evaluated_args.len() >= 2 {
+                        let left = &evaluated_args[0];
+                        let right = &evaluated_args[1];
+                        if left != right {
+                            let extra = if evaluated_args.len() > 2 {
+                                match &evaluated_args[2] {
+                                    FirValue::String(s) => format!(": {}", s),
+                                    other => format!(": {}", other),
+                                }
+                            } else {
+                                String::new()
+                            };
+                            let msg = format!(
+                                "assertion failed: `(left == right)`\n  left: `{}`\n right: `{}`{}",
+                                left, right, extra
+                            );
+                            return Err(InterpError::Panic(msg));
+                        }
+                    }
+                    Ok(FirValue::Unit)
+                } else if fn_name == "assert_ne" {
+                    if evaluated_args.len() >= 2 {
+                        let left = &evaluated_args[0];
+                        let right = &evaluated_args[1];
+                        if left == right {
+                            let extra = if evaluated_args.len() > 2 {
+                                match &evaluated_args[2] {
+                                    FirValue::String(s) => format!(": {}", s),
+                                    other => format!(": {}", other),
+                                }
+                            } else {
+                                String::new()
+                            };
+                            let msg = format!(
+                                "assertion failed: `(left != right)`\n  both equal to `{}`{}",
+                                left, extra
+                            );
+                            return Err(InterpError::Panic(msg));
                         }
                     }
                     Ok(FirValue::Unit)
@@ -1453,6 +1515,15 @@ impl<'a> FirInterpreter<'a> {
                 _ => Err(InterpError::TypeMismatch(format!(
                     "Unsupported op {:?} on strings",
                     op
+                ))),
+            },
+            (FirValue::Null, FirValue::GenRef { slot, generation })
+            | (FirValue::GenRef { slot, generation }, FirValue::Null) => match op {
+                BinaryOp::Eq => Ok(FirValue::Bool(*slot == 0 && *generation == 0)),
+                BinaryOp::Ne => Ok(FirValue::Bool(*slot != 0 || *generation != 0)),
+                _ => Err(InterpError::TypeMismatch(format!(
+                    "Incompatible types for {:?}: {} and {}",
+                    op, lhs, rhs
                 ))),
             },
             _ => match op {

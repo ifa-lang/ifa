@@ -8,6 +8,7 @@ pub mod lockfile;
 pub mod manifest;
 pub mod packager;
 pub mod resolver;
+pub mod test_runner;
 
 pub use builder::{ArtifactKind, BuildOrchestrator, BuildReport, BuiltArtifact};
 pub use cache::BuildCache;
@@ -20,3 +21,4 @@ pub use manifest::{
 };
 pub use packager::{PackageIndexEntry, PackageReport, Packager, PublishReport};
 pub use resolver::{DependencyResolver, ResolvedPackage};
+pub use test_runner::{TestCaseResult, TestRunner, TestStatus, TestSuiteResult, TestSummary};

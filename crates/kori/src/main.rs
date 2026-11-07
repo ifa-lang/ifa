@@ -60,8 +60,18 @@ enum Commands {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Run automated unit tests in the package
-    Test,
+    /// Run automated unit and integration tests across the package
+    Test {
+        /// Optional test name filter pattern
+        #[arg(short, long)]
+        filter: Option<String>,
+        /// Path to kori.toml manifest file or project directory
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+        /// Execute tests natively via Cranelift JIT
+        #[arg(long)]
+        native: bool,
+    },
     /// Add a dependency to kori.toml
     Add {
         /// Dependency package name
@@ -158,7 +168,11 @@ fn main() -> ExitCode {
             let target_dir = resolve_project_dir(manifest_path, &current_dir);
             handle_run(&target_dir, release, args)
         }
-        Commands::Test => handle_test(&current_dir),
+        Commands::Test {
+            filter,
+            manifest_path,
+            native,
+        } => handle_test(&current_dir, filter, manifest_path, native),
         Commands::Add {
             name,
             path,
@@ -370,9 +384,30 @@ fn handle_run(current_dir: &Path, release: bool, args: Vec<String>) -> ExitCode 
     }
 }
 
-fn handle_test(current_dir: &Path) -> ExitCode {
-    println!("Running package tests in `{}`...", current_dir.display());
-    ExitCode::SUCCESS
+fn handle_test(
+    current_dir: &Path,
+    filter: Option<String>,
+    manifest_path: Option<PathBuf>,
+    native: bool,
+) -> ExitCode {
+    let target_dir = resolve_project_dir(manifest_path, current_dir);
+    let runner = kori::test_runner::TestRunner::new(&target_dir)
+        .with_filter(filter)
+        .with_native(native);
+
+    match runner.run() {
+        Ok(summary) => {
+            if summary.is_success() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn handle_add(

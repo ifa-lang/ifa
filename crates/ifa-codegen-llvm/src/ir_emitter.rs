@@ -361,6 +361,9 @@ impl<'a> LlvmIrEmitter<'a> {
                         ValueExpr::Constant(ConstantValue::Bool(_)) => ifa_fir::FirType::Bool,
                         ValueExpr::Constant(ConstantValue::Char(_)) => ifa_fir::FirType::Char,
                         ValueExpr::Constant(ConstantValue::String(_)) => ifa_fir::FirType::Str,
+                        ValueExpr::Constant(ConstantValue::Null) => {
+                            ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                        }
                         ValueExpr::Binary { op, lhs, .. } => match op {
                             BinaryOp::Eq
                             | BinaryOp::Ne
@@ -571,6 +574,9 @@ impl<'a> LlvmIrEmitter<'a> {
                         text.len() + 1,
                         global_id
                     ));
+                }
+                ConstantValue::Null => {
+                    out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
                 }
             },
             ValueExpr::Binary { op, lhs, rhs } => {

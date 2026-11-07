@@ -246,15 +246,20 @@ impl JitEngine {
 
     /// Execute the compiled `main` function and return its integer result.
     pub fn run_main(&self) -> Result<i64, CodegenError> {
+        self.run_function("main")
+    }
+
+    /// Execute any compiled parameterless function by name and return its integer result.
+    pub fn run_function(&self, name: &str) -> Result<i64, CodegenError> {
         let func_id = self
             .func_ids
-            .get("main")
+            .get(name)
             .copied()
-            .ok_or_else(|| CodegenError::FunctionNotFound("main".into()))?;
+            .ok_or_else(|| CodegenError::FunctionNotFound(name.into()))?;
 
         let code_ptr = self.module.get_finalized_function(func_id);
-        let main_fn: fn() -> i64 = unsafe { std::mem::transmute(code_ptr) };
-        let result = main_fn();
+        let target_fn: fn() -> i64 = unsafe { std::mem::transmute(code_ptr) };
+        let result = target_fn();
         Ok(result)
     }
 }

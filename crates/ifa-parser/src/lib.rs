@@ -1139,6 +1139,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::new(ExprKind::Lit(Lit::Bool(false)), cur.span))
             }
+            TokenKind::Null => {
+                self.advance();
+                Ok(Expr::new(ExprKind::Lit(Lit::Null), cur.span))
+            }
             TokenKind::OpenParen => {
                 let open = self.advance();
                 if self.match_token(&TokenKind::CloseParen) {

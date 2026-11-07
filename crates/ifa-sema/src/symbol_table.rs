@@ -836,6 +836,87 @@ impl SymbolTable {
             span: dummy,
         });
         self.modules.insert(math_name, math_mod);
+
+        // 9. Global builtin assertions
+        let cond_sym = INTERNER.intern("cond");
+        let assert_sym = INTERNER.intern("assert");
+        self.functions.insert(
+            assert_sym,
+            FunctionSymbol {
+                name: assert_sym,
+                is_pub: true,
+                is_strict: false,
+                is_comptime: false,
+                is_extern: None,
+                generics: Vec::new(),
+                params: vec![ParamSymbol {
+                    mode: ParamMode::In,
+                    name: cond_sym,
+                    ty: Type::Bool,
+                    span: dummy,
+                }],
+                ret_ty: Type::Unit,
+                span: dummy,
+            },
+        );
+        let actual_sym = INTERNER.intern("actual");
+        let expected_sym = INTERNER.intern("expected");
+        let assert_eq_sym = INTERNER.intern("assert_eq");
+        self.functions.insert(
+            assert_eq_sym,
+            FunctionSymbol {
+                name: assert_eq_sym,
+                is_pub: true,
+                is_strict: false,
+                is_comptime: false,
+                is_extern: None,
+                generics: Vec::new(),
+                params: vec![
+                    ParamSymbol {
+                        mode: ParamMode::In,
+                        name: actual_sym,
+                        ty: Type::Unknown,
+                        span: dummy,
+                    },
+                    ParamSymbol {
+                        mode: ParamMode::In,
+                        name: expected_sym,
+                        ty: Type::Unknown,
+                        span: dummy,
+                    },
+                ],
+                ret_ty: Type::Unit,
+                span: dummy,
+            },
+        );
+        let assert_ne_sym = INTERNER.intern("assert_ne");
+        self.functions.insert(
+            assert_ne_sym,
+            FunctionSymbol {
+                name: assert_ne_sym,
+                is_pub: true,
+                is_strict: false,
+                is_comptime: false,
+                is_extern: None,
+                generics: Vec::new(),
+                params: vec![
+                    ParamSymbol {
+                        mode: ParamMode::In,
+                        name: actual_sym,
+                        ty: Type::Unknown,
+                        span: dummy,
+                    },
+                    ParamSymbol {
+                        mode: ParamMode::In,
+                        name: expected_sym,
+                        ty: Type::Unknown,
+                        span: dummy,
+                    },
+                ],
+                ret_ty: Type::Unit,
+                span: dummy,
+            },
+        );
     }
 
     pub fn enter_scope(&mut self, is_loop: bool, is_function_root: bool) {

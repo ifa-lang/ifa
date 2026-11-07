@@ -235,6 +235,7 @@ impl<'a> FunctionLoweringContext<'a> {
                 Lit::Bool(_) => Some(FirType::Bool),
                 Lit::String(_) => Some(FirType::String),
                 Lit::Char(_) => Some(FirType::Int(IntType::U32)),
+                Lit::Null => Some(FirType::Int(IntType::I64)),
             },
             ExprKind::Unary {
                 op: UnaryOp::Ref,
@@ -899,13 +900,18 @@ impl<'a> FunctionLoweringContext<'a> {
                     Lit::Bool(b) => ConstantValue::Bool(*b),
                     Lit::Char(c) => ConstantValue::Char(*c),
                     Lit::String(s) => ConstantValue::String(*s),
+                    Lit::Null => ConstantValue::Null,
                 };
                 self.emit(Some(res), ValueExpr::Constant(c), span);
                 res
             }
 
             ExprKind::Ident(sym) => {
-                if let Some(&ptr) = self.var_allocas.get(sym) {
+                if sym.as_str() == "null" || sym.as_str() == "None" {
+                    let res = self.alloc_value();
+                    self.emit(Some(res), ValueExpr::Constant(ConstantValue::Null), span);
+                    res
+                } else if let Some(&ptr) = self.var_allocas.get(sym) {
                     let res = self.alloc_value();
                     self.emit(Some(res), ValueExpr::Load { ptr }, span);
                     res
@@ -936,6 +942,96 @@ impl<'a> FunctionLoweringContext<'a> {
                     self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), span);
                     res
                 }
+            }
+
+            ExprKind::Binary {
+                op: BinOp::Coalesce,
+                left,
+                right,
+            } => {
+                let lhs = self.lower_expr(left);
+                let val_ty = self
+                    .infer_expr_fir_type(right)
+                    .or_else(|| self.infer_expr_fir_type(left))
+                    .unwrap_or(FirType::Int(IntType::I64));
+
+                let res_ptr = self.alloc_value();
+                self.emit(
+                    Some(res_ptr),
+                    ValueExpr::Alloca {
+                        ty: val_ty,
+                        name: Some(
+                            INTERNER.intern(&format!("__coalesce_{}", self.func.next_value_id)),
+                        ),
+                    },
+                    span,
+                );
+
+                let is_null = self.alloc_value();
+                let null_const = self.alloc_value();
+                self.emit(
+                    Some(null_const),
+                    ValueExpr::Constant(ConstantValue::Null),
+                    span,
+                );
+                self.emit(
+                    Some(is_null),
+                    ValueExpr::Binary {
+                        op: BinaryOp::Eq,
+                        lhs,
+                        rhs: null_const,
+                    },
+                    span,
+                );
+
+                let fallback_block = self.alloc_block();
+                let ok_block = self.alloc_block();
+                let join_block = self.alloc_block();
+
+                self.set_terminator(Terminator::BranchCond {
+                    cond: is_null,
+                    then_block: fallback_block,
+                    then_args: Vec::new(),
+                    else_block: ok_block,
+                    else_args: Vec::new(),
+                });
+
+                // ok_block: store lhs
+                self.current_block = ok_block;
+                self.emit(
+                    None,
+                    ValueExpr::Store {
+                        ptr: res_ptr,
+                        val: lhs,
+                    },
+                    span,
+                );
+                self.set_terminator(Terminator::Branch {
+                    target: join_block,
+                    args: Vec::new(),
+                });
+
+                // fallback_block: evaluate rhs and store
+                self.current_block = fallback_block;
+                let rhs = self.lower_expr(right);
+                self.emit(
+                    None,
+                    ValueExpr::Store {
+                        ptr: res_ptr,
+                        val: rhs,
+                    },
+                    span,
+                );
+                self.set_terminator(Terminator::Branch {
+                    target: join_block,
+                    args: Vec::new(),
+                });
+
+                // join_block: load res
+                self.current_block = join_block;
+                let final_res = self.alloc_value();
+                self.emit(Some(final_res), ValueExpr::Load { ptr: res_ptr }, span);
+                final_res
             }
 
             ExprKind::Binary { op, left, right } => {
@@ -1849,6 +1945,7 @@ impl<'a> FunctionLoweringContext<'a> {
                                 Lit::Bool(b) => ConstantValue::Bool(*b),
                                 Lit::Char(c) => ConstantValue::Char(*c),
                                 Lit::String(s) => ConstantValue::String(*s),
+                                Lit::Null => ConstantValue::Null,
                             };
                             let lit_val = self.alloc_value();
                             self.emit(Some(lit_val), ValueExpr::Constant(lit_const), arm.span);

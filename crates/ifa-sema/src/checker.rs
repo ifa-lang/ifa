@@ -911,12 +911,23 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
                 Lit::Char(_) => Type::Char,
                 Lit::Bool(_) => Type::Bool,
+                Lit::Null => {
+                    if let Some(Type::Optional(inner)) = expected {
+                        Type::Optional(inner.clone())
+                    } else if let Some(Type::Ref(inner)) = expected {
+                        Type::Optional(Box::new(Type::Ref(inner.clone())))
+                    } else {
+                        Type::Optional(Box::new(Type::Unknown))
+                    }
+                }
             },
             ExprKind::Ident(sym) => {
                 let name = INTERNER.resolve(sym);
-                if name == "None" {
+                if name == "None" || name == "null" {
                     if let Some(Type::Optional(inner)) = expected {
                         Type::Optional(inner.clone())
+                    } else if let Some(Type::Ref(inner)) = expected {
+                        Type::Optional(Box::new(Type::Ref(inner.clone())))
                     } else {
                         Type::Optional(Box::new(Type::Unknown))
                     }
@@ -1615,6 +1626,7 @@ impl<'a> SemanticAnalyzer<'a> {
                     Lit::Bool(_) => Type::Bool,
                     Lit::Char(_) => Type::Char,
                     Lit::String(_) => Type::Str,
+                    Lit::Null => Type::Optional(Box::new(Type::Unknown)),
                 };
                 if !lit_ty.is_assignable_to(target_ty)
                     && !target_ty.is_assignable_to(&lit_ty)
@@ -2104,8 +2116,12 @@ impl<'a> SemanticAnalyzer<'a> {
         check_call_exclusivity(args, &param_modes, &self.symbols, &mut self.diagnostics);
 
         // Check argument count
-        if args.len() != f.params.len() {
-            let fn_name = INTERNER.resolve(&f.name);
+        let fn_name = INTERNER.resolve(&f.name);
+        let is_assert_call = (fn_name == "assert" && (args.len() == 1 || args.len() == 2))
+            || ((fn_name == "assert_eq" || fn_name == "assert_ne")
+                && (args.len() == 2 || args.len() == 3));
+
+        if args.len() != f.params.len() && !is_assert_call {
             self.diagnostics.push(
                 Diagnostic::error(format!(
                     "nombre d'arguments incorrect pour '{}' : attendu {}, trouvé {}",

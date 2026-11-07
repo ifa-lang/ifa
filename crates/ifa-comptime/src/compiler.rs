@@ -329,6 +329,10 @@ impl Compiler {
                     let idx = self.chunk.add_constant(Value::String(unescaped));
                     self.chunk.emit(OpCode::Const(idx), expr.span);
                 }
+                Lit::Null => {
+                    let idx = self.chunk.add_constant(Value::Option(None));
+                    self.chunk.emit(OpCode::Const(idx), expr.span);
+                }
             },
             ExprKind::Ident(sym) => {
                 if let Some(slot) = self.resolve_local(sym) {

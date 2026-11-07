@@ -71,6 +71,57 @@ pub extern "C" fn ifa_rt_panic_null_ref() -> ! {
     std::process::abort();
 }
 
+/// Assertion check: terminates with deterministic diagnostic if condition is false.
+#[no_mangle]
+pub extern "C" fn ifa_rt_assert(cond: bool, msg: *const u8) {
+    if !cond {
+        ifa_rt_panic_assert(msg);
+    }
+}
+
+/// Assert two 64-bit integers are equal; aborts with detailed values on mismatch.
+#[no_mangle]
+pub extern "C" fn ifa_rt_assert_eq_i64(actual: i64, expected: i64, msg: *const u8) {
+    if actual != expected {
+        eprintln!(
+            "\n[IFA ASSERTION FAILED: assert_eq]\n\
+             Expected : {}\n\
+             Actual   : {}\n",
+            expected, actual
+        );
+        ifa_rt_panic_assert(msg);
+    }
+}
+
+/// Assert two 64-bit integers are not equal; aborts on equality.
+#[no_mangle]
+pub extern "C" fn ifa_rt_assert_ne_i64(actual: i64, expected: i64, msg: *const u8) {
+    if actual == expected {
+        eprintln!(
+            "\n[IFA ASSERTION FAILED: assert_ne]\n\
+             Both values are equal: {}\n",
+            actual
+        );
+        ifa_rt_panic_assert(msg);
+    }
+}
+
+/// Intercept assertion failure with custom message.
+#[no_mangle]
+pub extern "C" fn ifa_rt_panic_assert(msg: *const u8) -> ! {
+    if !msg.is_null() {
+        let c_str = unsafe { std::ffi::CStr::from_ptr(msg as *const std::ffi::c_char) };
+        if let Ok(s) = c_str.to_str() {
+            eprintln!("\n[IFA RUNTIME ERROR: ASSERTION FAILED]\n{}\n", s);
+        } else {
+            eprintln!("\n[IFA RUNTIME ERROR: ASSERTION FAILED]\n");
+        }
+    } else {
+        eprintln!("\n[IFA RUNTIME ERROR: ASSERTION FAILED]\n");
+    }
+    std::process::abort();
+}
+
 /// Create a new scoped generational arena.
 #[no_mangle]
 pub extern "C" fn ifa_rt_arena_create(_capacity: usize) -> u16 {

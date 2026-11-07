@@ -15,7 +15,7 @@ use std::process::{Command, ExitCode};
 
 mod doc;
 mod tooling;
-use tooling::{format_source, init_project, lint_program, run_tests};
+use tooling::{format_source, init_project, lint_program};
 
 #[derive(ClapParser)]
 #[command(name = "ifa")]
@@ -46,10 +46,16 @@ enum Commands {
         /// Source file path (.ifa)
         file: PathBuf,
     },
-    /// Run unit tests defined in an IFA file
+    /// Run unit and integration tests for an IFA program or package
     Test {
-        /// Source file path (.ifa)
-        file: PathBuf,
+        /// Source file path (.ifa) or project directory (defaults to current directory)
+        path: Option<PathBuf>,
+        /// Optional test name filter pattern
+        #[arg(short, long)]
+        filter: Option<String>,
+        /// Execute tests natively via Cranelift JIT
+        #[arg(long)]
+        native: bool,
     },
     /// Generate canonical documentation (Markdown and HTML) for an IFA program or package
     Doc {
@@ -277,45 +283,28 @@ fn main() -> ExitCode {
             }
         }
 
-        Commands::Test { file } => {
-            let src = match fs::read_to_string(&file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: impossible de lire le fichier {:?}: {}", file, e);
-                    return ExitCode::FAILURE;
+        Commands::Test {
+            path,
+            filter,
+            native,
+        } => {
+            let target = path.unwrap_or_else(|| PathBuf::from("."));
+            let runner = kori::test_runner::TestRunner::new(&target)
+                .with_filter(filter)
+                .with_native(native);
+
+            match runner.run() {
+                Ok(summary) => {
+                    if summary.is_success() {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    }
                 }
-            };
-            let fid = source_map.add_file(file.to_string_lossy(), &src);
-            let tokens = tokenize(fid, &src);
-            let (prog, parse_diags) = parse(fid, tokens);
-
-            for diag in &parse_diags {
-                eprint!("{}", diag.render_to_string(&source_map));
-            }
-            if !parse_diags.is_empty() {
-                return ExitCode::FAILURE;
-            }
-
-            let analysis = analyze(&source_map, &prog);
-            for diag in &analysis.diagnostics {
-                eprint!("{}", diag.render_to_string(&source_map));
-            }
-            if analysis.has_errors() {
-                return ExitCode::FAILURE;
-            }
-
-            println!("\nRunning tests in {:?}:", file);
-            let (passed, failed, logs) = run_tests(&prog, &analysis.symbols);
-            for log in logs {
-                println!("  {}", log);
-            }
-
-            println!("\nTest result: {} passed; {} failed\n", passed, failed);
-
-            if failed > 0 {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    ExitCode::FAILURE
+                }
             }
         }
 

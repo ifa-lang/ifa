@@ -68,6 +68,7 @@ impl<'a> Lexer<'a> {
                     RawToken::Impl => TokenKind::Impl,
                     RawToken::True => TokenKind::True,
                     RawToken::False => TokenKind::False,
+                    RawToken::Null => TokenKind::Null,
 
                     RawToken::Ident => TokenKind::Ident(sym(slice)),
                     RawToken::IntLiteral => TokenKind::IntLiteral(sym(slice)),
