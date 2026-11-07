@@ -36,10 +36,16 @@ pub fn extract_escape_root(expr: &Expr) -> Option<(Symbol, Span)> {
 pub fn format_projection_expr(expr: &Expr) -> String {
     match &expr.kind {
         ExprKind::Ident(sym) => INTERNER.resolve(sym),
-        ExprKind::FieldAccess { receiver, field } => {
+        ExprKind::FieldAccess {
+            receiver,
+            field,
+            safe,
+        } => {
+            let op = if *safe { "?." } else { "." };
             format!(
-                "{}.{}",
+                "{}{}{}",
                 format_projection_expr(receiver),
+                op,
                 INTERNER.resolve(field)
             )
         }

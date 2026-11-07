@@ -1526,6 +1526,15 @@ impl<'a> FirInterpreter<'a> {
                     op, lhs, rhs
                 ))),
             },
+            (FirValue::Null, FirValue::Pointer(addr))
+            | (FirValue::Pointer(addr), FirValue::Null) => match op {
+                BinaryOp::Eq => Ok(FirValue::Bool(*addr == 0)),
+                BinaryOp::Ne => Ok(FirValue::Bool(*addr != 0)),
+                _ => Err(InterpError::TypeMismatch(format!(
+                    "Incompatible types for {:?}: {} and {}",
+                    op, lhs, rhs
+                ))),
+            },
             _ => match op {
                 BinaryOp::Eq => Ok(FirValue::Bool(lhs == rhs)),
                 BinaryOp::Ne => Ok(FirValue::Bool(lhs != rhs)),

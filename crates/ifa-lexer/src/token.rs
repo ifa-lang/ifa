@@ -115,6 +115,8 @@ pub enum RawToken {
     FatArrow,
     #[token("??")]
     QuestionQuestion,
+    #[token("?.")]
+    QuestionDot,
     #[token("::")]
     ColonColon,
     #[token("==")]
@@ -259,6 +261,7 @@ pub enum TokenKind {
     Arrow,
     FatArrow,
     QuestionQuestion,
+    QuestionDot,
     ColonColon,
     EqEq,
     NotEq,
@@ -363,6 +366,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Arrow => write!(f, "->"),
             TokenKind::FatArrow => write!(f, "=>"),
             TokenKind::QuestionQuestion => write!(f, "??"),
+            TokenKind::QuestionDot => write!(f, "?."),
             TokenKind::ColonColon => write!(f, "::"),
             TokenKind::EqEq => write!(f, "=="),
             TokenKind::NotEq => write!(f, "!="),

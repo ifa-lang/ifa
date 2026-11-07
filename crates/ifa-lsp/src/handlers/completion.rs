@@ -2,10 +2,23 @@ use crate::document::Document;
 use crate::protocol::{CompletionItem, CompletionItemKind, CompletionList, Position};
 use ifa_span::sym;
 
+fn extract_struct_from_ast_type(ty: &ifa_ast::Type) -> Option<ifa_span::Symbol> {
+    match &ty.kind {
+        ifa_ast::TypeKind::Named(s) => Some(*s),
+        ifa_ast::TypeKind::Generic(s, _) => Some(*s),
+        ifa_ast::TypeKind::Path(p) => p.last().copied(),
+        ifa_ast::TypeKind::Ref(inner)
+        | ifa_ast::TypeKind::Optional(inner)
+        | ifa_ast::TypeKind::Slice(inner)
+        | ifa_ast::TypeKind::Array(inner, _) => extract_struct_from_ast_type(inner),
+        _ => None,
+    }
+}
+
 pub fn handle_completion(doc: &Document, position: Position) -> CompletionList {
     let mut items = Vec::new();
 
-    // Check for dot access: receiver.field
+    // Check for dot access: receiver.field or receiver?.field
     if let Some(receiver) = doc.dot_access_receiver(position) {
         if let Some(analysis) = &doc.analysis {
             let receiver_sym = sym(&receiver);
@@ -13,9 +26,56 @@ pub fn handle_completion(doc: &Document, position: Position) -> CompletionList {
 
             for scope in &analysis.symbols.scopes {
                 if let Some(var) = scope.variables.get(&receiver_sym) {
-                    if let ifa_sema::types::Type::Struct { name, .. } = &var.ty {
+                    let mut cur_ty = &var.ty;
+                    while let ifa_sema::types::Type::Optional(inner)
+                    | ifa_sema::types::Type::Ref(inner) = cur_ty
+                    {
+                        cur_ty = inner;
+                    }
+                    if let ifa_sema::types::Type::Struct { name, .. } = cur_ty {
                         struct_name = Some(*name);
                         break;
+                    } else if let ifa_sema::types::Type::Generic { name, .. } = cur_ty {
+                        struct_name = Some(*name);
+                        break;
+                    }
+                }
+            }
+
+            // If not found in global scopes, inspect AST for local variables or parameters
+            if struct_name.is_none() {
+                if let Some(ast) = &doc.ast {
+                    for item in &ast.items {
+                        if let ifa_ast::Item::Function(f) = item {
+                            for p in &f.params {
+                                if p.name == receiver_sym {
+                                    if let Some(sn) = extract_struct_from_ast_type(&p.ty) {
+                                        struct_name = Some(sn);
+                                        break;
+                                    }
+                                }
+                            }
+                            if struct_name.is_some() {
+                                break;
+                            }
+                            if let Some(body) = &f.body {
+                                for stmt in &body.stmts {
+                                    if let ifa_ast::Stmt::Let { name, ty, .. } = stmt {
+                                        if *name == receiver_sym {
+                                            if let Some(t) = ty {
+                                                if let Some(sn) = extract_struct_from_ast_type(t) {
+                                                    struct_name = Some(sn);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if struct_name.is_some() {
+                                break;
+                            }
+                        }
                     }
                 }
             }

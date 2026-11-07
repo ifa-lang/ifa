@@ -1109,12 +1109,40 @@ impl<'a> SemanticAnalyzer<'a> {
                 receiver,
                 method,
                 args,
-            } => self.check_method_call_expr(receiver, *method, args, expr.span),
-            ExprKind::FieldAccess { receiver, field } => {
+                safe,
+            } => self.check_method_call_expr(receiver, *method, args, *safe, expr.span),
+            ExprKind::FieldAccess {
+                receiver,
+                field,
+                safe,
+            } => {
                 let rec_ty = self.infer_expr(receiver);
-                if let Some((name, fields)) = self.resolve_struct_fields(&rec_ty) {
+                let is_optional = matches!(rec_ty, Type::Optional(_));
+                if !*safe && is_optional {
+                    let f_name = INTERNER.resolve(field);
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "accès direct au champ '{}' impossible sur le type optionnel '{}' : utilisez '?.' pour une navigation sûre",
+                            f_name, rec_ty
+                        ))
+                        .with_code("E0007")
+                        .with_primary_label(
+                            expr.span,
+                            "accès risqué sur type optionnel, utilisez '?.'",
+                        )
+                        .with_secondary_label(receiver.span, format!("récepteur de type '{}'", rec_ty)),
+                    );
+                    Type::Unknown
+                } else if let Some((name, fields)) = self.resolve_struct_fields(&rec_ty) {
                     if let Some((_, fty)) = fields.iter().find(|(n, _)| n == field) {
-                        fty.clone()
+                        if *safe {
+                            match fty {
+                                Type::Optional(_) => fty.clone(),
+                                _ => Type::Optional(Box::new(fty.clone())),
+                            }
+                        } else {
+                            fty.clone()
+                        }
                     } else {
                         let f_name = INTERNER.resolve(field);
                         let s_name = INTERNER.resolve(&name);
@@ -1132,10 +1160,11 @@ impl<'a> SemanticAnalyzer<'a> {
                     Type::Unknown
                 } else {
                     let f_name = INTERNER.resolve(field);
+                    let op = if *safe { "?." } else { "." };
                     self.diagnostics.push(
                         Diagnostic::error(format!(
-                            "accès au champ '{}' impossible sur le type non composite '{}'",
-                            f_name, rec_ty
+                            "accès au champ '{}' avec '{}' impossible sur le type non composite '{}'",
+                            f_name, op, rec_ty
                         ))
                         .with_code("E0007")
                         .with_primary_label(receiver.span, format!("type {} non struct", rec_ty)),
@@ -1872,7 +1901,7 @@ impl<'a> SemanticAnalyzer<'a> {
                                 ),
                             );
                         }
-                        return self.check_function_call(&f, args, span);
+                        return self.check_function_call(&f, args, false, span);
                     }
                 }
             }
@@ -1909,7 +1938,7 @@ impl<'a> SemanticAnalyzer<'a> {
         };
 
         if let Some(f) = fn_match {
-            self.check_function_call(&f, args, span)
+            self.check_function_call(&f, args, false, span)
         } else {
             // Function or standard library function not yet in symbol table (e.g. io::println, http::Server::new)
             let param_modes = vec![ParamMode::In; args.len()];
@@ -2109,7 +2138,13 @@ impl<'a> SemanticAnalyzer<'a> {
         }
     }
 
-    fn check_function_call(&mut self, f: &FunctionSymbol, args: &[Arg], span: Span) -> Type {
+    fn check_function_call(
+        &mut self,
+        f: &FunctionSymbol,
+        args: &[Arg],
+        safe_first_arg: bool,
+        span: Span,
+    ) -> Type {
         let param_modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
 
         // Check Law of Exclusivity on arguments!
@@ -2144,7 +2179,17 @@ impl<'a> SemanticAnalyzer<'a> {
             for (idx, arg) in args.iter().enumerate() {
                 if let Some(param) = f.params.get(idx) {
                     let arg_ty = self.infer_expr(&arg.value);
-                    param.ty.unify_type_params(&arg_ty, &mut type_param_map);
+                    let effective_arg_ty = if idx == 0 && safe_first_arg {
+                        match &arg_ty {
+                            Type::Optional(inner) => inner.as_ref().clone(),
+                            other => other.clone(),
+                        }
+                    } else {
+                        arg_ty
+                    };
+                    param
+                        .ty
+                        .unify_type_params(&effective_arg_ty, &mut type_param_map);
                 }
             }
         }
@@ -2158,7 +2203,11 @@ impl<'a> SemanticAnalyzer<'a> {
                 };
 
                 let arg_ty = self.check_expr(&arg.value, Some(&expected_param_ty));
-                if !arg_ty.is_assignable_to(&expected_param_ty) {
+                let is_match = arg_ty.is_assignable_to(&expected_param_ty)
+                    || (idx == 0
+                        && safe_first_arg
+                        && matches!(&arg_ty, Type::Optional(inner) if inner.is_assignable_to(&expected_param_ty)));
+                if !is_match {
                     let fn_name = INTERNER.resolve(&f.name);
                     let p_name = INTERNER.resolve(&param.name);
                     self.diagnostics.push(
@@ -2280,17 +2329,53 @@ impl<'a> SemanticAnalyzer<'a> {
         receiver: &Expr,
         method: Symbol,
         args: &[Arg],
+        safe: bool,
         span: Span,
     ) -> Type {
         let rec_ty = self.infer_expr(receiver);
         let m_name = INTERNER.resolve(&method);
 
+        if !safe && matches!(rec_ty, Type::Optional(_)) {
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "appel direct de méthode '{}' impossible sur le type optionnel '{}' : utilisez '?.' pour un appel optionnel sécurisé",
+                    m_name, rec_ty
+                ))
+                .with_code("E0008")
+                .with_primary_label(span, "appel risqué sur type optionnel, utilisez '?.'")
+                .with_secondary_label(receiver.span, format!("récepteur de type '{}'", rec_ty)),
+            );
+            return Type::Unknown;
+        }
+
+        let effective_rec_ty = if safe {
+            match &rec_ty {
+                Type::Optional(inner) => inner.as_ref().clone(),
+                other => other.clone(),
+            }
+        } else {
+            rec_ty.clone()
+        };
+
+        let wrap_optional = |ret: Type| {
+            if safe {
+                match ret {
+                    Type::Unit => Type::Unit,
+                    Type::Optional(_) => ret,
+                    Type::Unknown => Type::Unknown,
+                    other => Type::Optional(Box::new(other)),
+                }
+            } else {
+                ret
+            }
+        };
+
         // Standard method handling (e.g. List.push, List.len, String.len, etc.)
         if m_name == "len" {
-            return Type::Int(IntType::I64);
+            return wrap_optional(Type::Int(IntType::I64));
         }
         if m_name == "is_empty" {
-            return Type::Bool;
+            return wrap_optional(Type::Bool);
         }
         if m_name == "send" {
             for arg in args {
@@ -2302,10 +2387,10 @@ impl<'a> SemanticAnalyzer<'a> {
             if let Type::Generic {
                 name,
                 args: gen_args,
-            } = &rec_ty
+            } = &effective_rec_ty
             {
                 if INTERNER.resolve(name) == "Channel" && !gen_args.is_empty() {
-                    return gen_args[0].clone();
+                    return wrap_optional(gen_args[0].clone());
                 }
             }
             return Type::Unknown;
@@ -2314,7 +2399,7 @@ impl<'a> SemanticAnalyzer<'a> {
             if let Type::Generic {
                 name,
                 args: gen_args,
-            } = &rec_ty
+            } = &effective_rec_ty
             {
                 if INTERNER.resolve(name) == "Channel" && !gen_args.is_empty() {
                     return Type::Optional(Box::new(gen_args[0].clone()));
@@ -2327,7 +2412,7 @@ impl<'a> SemanticAnalyzer<'a> {
         }
 
         // Bounded generic type parameter method resolution:
-        if let Type::TypeParam(p_name) = &rec_ty {
+        if let Type::TypeParam(p_name) = &effective_rec_ty {
             let mut trait_ret_ty = None;
             for gp in &self.current_func_generics {
                 if gp.name == *p_name {
@@ -2345,11 +2430,11 @@ impl<'a> SemanticAnalyzer<'a> {
                 for arg in args {
                     self.infer_expr(&arg.value);
                 }
-                return ret;
+                return wrap_optional(ret);
             }
         }
 
-        match &rec_ty {
+        match &effective_rec_ty {
             Type::Generic {
                 name,
                 args: gen_args,
@@ -2369,7 +2454,8 @@ impl<'a> SemanticAnalyzer<'a> {
                 let mut full_args = Vec::with_capacity(args.len() + 1);
                 full_args.push(Arg::positional(receiver.clone()));
                 full_args.extend_from_slice(args);
-                return self.check_function_call(&f, &full_args, span);
+                let ret = self.check_function_call(&f, &full_args, safe, span);
+                return wrap_optional(ret);
             }
         }
 

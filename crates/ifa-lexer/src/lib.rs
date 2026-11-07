@@ -89,6 +89,7 @@ impl<'a> Lexer<'a> {
                     RawToken::Arrow => TokenKind::Arrow,
                     RawToken::FatArrow => TokenKind::FatArrow,
                     RawToken::QuestionQuestion => TokenKind::QuestionQuestion,
+                    RawToken::QuestionDot => TokenKind::QuestionDot,
                     RawToken::ColonColon => TokenKind::ColonColon,
                     RawToken::EqEq => TokenKind::EqEq,
                     RawToken::NotEq => TokenKind::NotEq,
@@ -188,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_lex_operators() {
-        let src = "-> => ?? :: == != <= >= && ||";
+        let src = "-> => ?? ?. :: == != <= >= && ||";
         let tokens = tokenize(FileId(0), src);
         let kinds: Vec<_> = tokens.iter().map(|t| t.kind).collect();
 
@@ -198,6 +199,7 @@ mod tests {
                 TokenKind::Arrow,
                 TokenKind::FatArrow,
                 TokenKind::QuestionQuestion,
+                TokenKind::QuestionDot,
                 TokenKind::ColonColon,
                 TokenKind::EqEq,
                 TokenKind::NotEq,

@@ -355,38 +355,41 @@ fn eval_expression(
     v2_name: String,
     v2_val: i64
 ) -> i64 {
-    if expr.kind == 1 {
+    let k = expr?.kind ?? 0;
+    if k == 1 {
         // Integer Literal
-        return expr.val;
+        return expr?.val ?? 0;
     }
-    if expr.kind == 2 {
+    if k == 2 {
         // Variable resolution
-        if expr.name == param_name {
+        let name = expr?.name ?? "";
+        if name == param_name {
             return param_val;
         }
-        if expr.name == v1_name {
+        if name == v1_name {
             return v1_val;
         }
-        if expr.name == v2_name {
+        if name == v2_name {
             return v2_val;
         }
         return 0;
     }
-    if expr.kind == 3 {
+    if k == 3 {
         // Binary operation evaluated recursively
-        let left_val = eval_expression(expr.left, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
-        let right_val = eval_expression(expr.right, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
+        let left_val = eval_expression(expr?.left, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
+        let right_val = eval_expression(expr?.right, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
 
-        if expr.op == 1 {
+        let op = expr?.op ?? 0;
+        if op == 1 {
             return left_val + right_val;
         }
-        if expr.op == 2 {
+        if op == 2 {
             return left_val - right_val;
         }
-        if expr.op == 3 {
+        if op == 3 {
             return left_val * right_val;
         }
-        if expr.op == 4 {
+        if op == 4 {
             if right_val != 0 {
                 return left_val / right_val;
             }
@@ -593,28 +596,30 @@ fn emit_fir_expression(
     env2_reg: String,
     inout instructions: List<String>
 ) -> String {
-    if expr.kind == 1 {
+    let k = expr?.kind ?? 0;
+    if k == 1 {
         // Integer constant: %tN = const <val>
         let reg = "%t" + int_to_str(temp_id);
         temp_id = temp_id + 1;
-        let line = "    " + reg + " = const " + int_to_str(expr.val);
+        let line = "    " + reg + " = const " + int_to_str(expr?.val ?? 0);
         instructions.push(line);
         return reg;
     }
-    if expr.kind == 2 {
+    if k == 2 {
+        let name = expr?.name ?? "";
         // Variable lookup: check SSA environment mapping or use parameter register
-        if expr.name == env1_var && env1_reg != "" {
+        if name == env1_var && env1_reg != "" {
             return env1_reg;
         }
-        if expr.name == env2_var && env2_reg != "" {
+        if name == env2_var && env2_reg != "" {
             return env2_reg;
         }
-        return "%" + expr.name;
+        return "%" + name;
     }
-    if expr.kind == 3 {
+    if k == 3 {
         // Binary operation: recursively emit LHS and RHS operands
         let lhs_reg = emit_fir_expression(
-            expr.left,
+            expr?.left,
             inout temp_id,
             env1_var,
             env1_reg,
@@ -623,7 +628,7 @@ fn emit_fir_expression(
             inout instructions
         );
         let rhs_reg = emit_fir_expression(
-            expr.right,
+            expr?.right,
             inout temp_id,
             env1_var,
             env1_reg,
@@ -636,13 +641,14 @@ fn emit_fir_expression(
         temp_id = temp_id + 1;
 
         mut op_name = "add";
-        if expr.op == 2 {
+        let op = expr?.op ?? 0;
+        if op == 2 {
             op_name = "sub";
         }
-        if expr.op == 3 {
+        if op == 3 {
             op_name = "mul";
         }
-        if expr.op == 4 {
+        if op == 4 {
             op_name = "div";
         }
 

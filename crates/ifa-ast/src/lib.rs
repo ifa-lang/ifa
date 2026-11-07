@@ -370,10 +370,12 @@ pub enum ExprKind {
         receiver: Box<Expr>,
         method: Symbol,
         args: Vec<Arg>,
+        safe: bool,
     },
     FieldAccess {
         receiver: Box<Expr>,
         field: Symbol,
+        safe: bool,
     },
     Index {
         receiver: Box<Expr>,

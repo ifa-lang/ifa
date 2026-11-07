@@ -834,6 +834,28 @@ impl Parser {
 
     // --- Block & Statement Parsing ---
 
+    fn synchronize_block(&mut self) {
+        while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
+            if self.check(&TokenKind::Semicolon) {
+                self.advance();
+                return;
+            }
+            match self.current().kind {
+                TokenKind::Let
+                | TokenKind::Mut
+                | TokenKind::If
+                | TokenKind::While
+                | TokenKind::For
+                | TokenKind::Return
+                | TokenKind::Defer
+                | TokenKind::Fn => return,
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+    }
+
     pub fn parse_block(&mut self) -> Result<Block, Diagnostic> {
         let open = self.expect(TokenKind::OpenBrace)?;
         let mut stmts = Vec::new();
@@ -845,7 +867,13 @@ impl Parser {
                 break;
             }
 
-            let stmt = self.parse_stmt()?;
+            let stmt = match self.parse_stmt() {
+                Ok(s) => s,
+                Err(_) => {
+                    self.synchronize_block();
+                    continue;
+                }
+            };
             // Check if final expression of the block
             if let Stmt::Expr(e) = stmt {
                 if self.check(&TokenKind::CloseBrace) {
@@ -1068,6 +1096,7 @@ impl Parser {
             let prec = match cur.kind {
                 // Suffixes (100)
                 TokenKind::Dot
+                | TokenKind::QuestionDot
                 | TokenKind::OpenParen
                 | TokenKind::OpenBracket
                 | TokenKind::Question => 100,
@@ -1576,8 +1605,9 @@ impl Parser {
                     span,
                 ))
             }
-            // Method Call or Field Access: expr.field or expr.method(args)
-            TokenKind::Dot => {
+            // Method Call or Field Access: expr.field, expr?.field, expr.method(args), expr?.method(args)
+            TokenKind::Dot | TokenKind::QuestionDot => {
+                let is_safe = cur.kind == TokenKind::QuestionDot;
                 self.advance();
                 let member = match self.current().kind {
                     TokenKind::Ident(s) => {
@@ -1586,8 +1616,10 @@ impl Parser {
                     }
                     _ => {
                         let c = self.current();
-                        let diag = Diagnostic::error("nom de membre attendu après '.'")
-                            .with_primary_label(c.span, "identifiant attendu");
+                        let op_str = if is_safe { "?." } else { "." };
+                        let diag =
+                            Diagnostic::error(format!("nom de membre attendu après '{}'", op_str))
+                                .with_primary_label(c.span, "identifiant attendu");
                         self.diagnostics.push(diag.clone());
                         return Err(diag);
                     }
@@ -1606,6 +1638,7 @@ impl Parser {
                             receiver: Box::new(left),
                             method: member,
                             args,
+                            safe: is_safe,
                         },
                         span,
                     ))
@@ -1616,6 +1649,7 @@ impl Parser {
                         ExprKind::FieldAccess {
                             receiver: Box::new(left),
                             field: member,
+                            safe: is_safe,
                         },
                         span,
                     ))
@@ -1844,6 +1878,72 @@ mod tests {
                 assert!(arms[2].is_default);
             } else {
                 panic!("expected ExprKind::Select");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_safe_navigation_operator() {
+        let src = r#"
+            fn test_safe_nav(node: ?ref Node) {
+                let v = node?.val;
+                let child = node?.next?.child;
+                let res = node?.compute(10);
+            }
+        "#;
+        let fid = FileId(0);
+        let tokens = tokenize(fid, src);
+        let (prog, diags) = parse(fid, tokens);
+
+        assert!(diags.is_empty(), "Diagnostics: {:?}", diags);
+        assert_eq!(prog.items.len(), 1);
+        if let Item::Function(f) = &prog.items[0] {
+            let body = f.body.as_ref().unwrap();
+            assert_eq!(body.stmts.len(), 3);
+            if let Stmt::Let {
+                init: Some(init_expr),
+                ..
+            } = &body.stmts[0]
+            {
+                assert!(matches!(
+                    init_expr.kind,
+                    ExprKind::FieldAccess { safe: true, .. }
+                ));
+            } else {
+                panic!("expected let with safe FieldAccess");
+            }
+            if let Stmt::Let {
+                init: Some(init_expr),
+                ..
+            } = &body.stmts[1]
+            {
+                if let ExprKind::FieldAccess {
+                    safe: true,
+                    receiver,
+                    ..
+                } = &init_expr.kind
+                {
+                    assert!(matches!(
+                        receiver.kind,
+                        ExprKind::FieldAccess { safe: true, .. }
+                    ));
+                } else {
+                    panic!("expected nested safe FieldAccess");
+                }
+            } else {
+                panic!("expected let with chained FieldAccess");
+            }
+            if let Stmt::Let {
+                init: Some(init_expr),
+                ..
+            } = &body.stmts[2]
+            {
+                assert!(matches!(
+                    init_expr.kind,
+                    ExprKind::MethodCall { safe: true, .. }
+                ));
+            } else {
+                panic!("expected let with safe MethodCall");
             }
         }
     }

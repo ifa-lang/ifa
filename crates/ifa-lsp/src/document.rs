@@ -183,7 +183,12 @@ impl Document {
 
         idx -= 1; // skip '.'
 
-        // Skip whitespace backwards before '.'
+        // Skip optional '?' for safe navigation '?.'
+        if idx > 0 && bytes[idx - 1] == b'?' {
+            idx -= 1;
+        }
+
+        // Skip whitespace backwards before '.' or '?.'
         while idx > 0 && (bytes[idx - 1] == b' ' || bytes[idx - 1] == b'\t') {
             idx -= 1;
         }

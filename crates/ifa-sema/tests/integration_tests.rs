@@ -574,6 +574,52 @@ fn test_optional_coalesce_operator() {
 }
 
 #[test]
+fn test_optional_safe_navigation_operator() {
+    let code = r#"
+        struct Node {
+            val: i64,
+            next: ?ref Node,
+        }
+
+        pub fn get_val(n: ref Node) -> i64 {
+            return n.val;
+        }
+
+        pub fn main() {
+            let opt_node: ?ref Node = null;
+            let v: ?i64 = opt_node?.val;
+            let next_v: ?i64 = opt_node?.next?.val;
+            let method_res: ?i64 = opt_node?.get_val();
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Safe navigation operator '?.' should succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_optional_direct_access_rejected() {
+    let code = r#"
+        struct Node {
+            val: i64,
+        }
+
+        pub fn main() {
+            let opt_node: ?ref Node = null;
+            let v: i64 = opt_node.val;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Direct member access '.' on optional reference should fail"
+    );
+}
+
+#[test]
 fn test_lambda_type_checking() {
     let code = r#"
         pub fn main() {

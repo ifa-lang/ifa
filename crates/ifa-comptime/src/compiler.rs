@@ -174,7 +174,9 @@ impl Compiler {
                         ));
                     }
                 }
-                ExprKind::FieldAccess { receiver, field } => {
+                ExprKind::FieldAccess {
+                    receiver, field, ..
+                } => {
                     if let ExprKind::Ident(target_sym) = &receiver.kind {
                         if let Some(slot) = self.resolve_local(target_sym) {
                             self.chunk.emit(OpCode::LoadLocal(slot), receiver.span);
@@ -447,7 +449,9 @@ impl Compiler {
                 self.compile_expr(index)?;
                 self.chunk.emit(OpCode::GetIndex, expr.span);
             }
-            ExprKind::FieldAccess { receiver, field } => {
+            ExprKind::FieldAccess {
+                receiver, field, ..
+            } => {
                 self.compile_expr(receiver)?;
                 self.chunk.emit(OpCode::GetField(*field), expr.span);
             }

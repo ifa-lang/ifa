@@ -6,7 +6,7 @@ use ifa_ast::{
 use ifa_sema::types::{FloatType, IntType};
 use ifa_sema::SymbolTable;
 use ifa_span::{Span, Symbol, INTERNER};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 fn comptime_val_to_constant(val: &ifa_comptime::Value) -> Option<ConstantValue> {
     match val {
@@ -43,6 +43,8 @@ struct FunctionLoweringContext<'a> {
     module_structs: &'a [FirStruct],
     module_enums: &'a [FirEnum],
     defer_stack: Vec<Block>,
+    known_null_vars: HashSet<Symbol>,
+    known_non_null_vars: HashSet<Symbol>,
 }
 
 impl<'a> FunctionLoweringContext<'a> {
@@ -123,6 +125,8 @@ impl<'a> FunctionLoweringContext<'a> {
             module_structs,
             module_enums,
             defer_stack: Vec::new(),
+            known_null_vars: HashSet::new(),
+            known_non_null_vars: HashSet::new(),
         }
     }
 
@@ -209,7 +213,11 @@ impl<'a> FunctionLoweringContext<'a> {
                 }
                 None
             }
-            ExprKind::FieldAccess { receiver, field } => {
+            ExprKind::FieldAccess {
+                receiver,
+                field,
+                safe,
+            } => {
                 let rec_ty = self.infer_expr_fir_type(receiver)?;
                 let mut current = &rec_ty;
                 while let FirType::GenerationalRef(inner)
@@ -224,7 +232,15 @@ impl<'a> FunctionLoweringContext<'a> {
                 };
                 if let Some(st) = self.symbols.lookup_struct(&st_name) {
                     if let Some(f) = st.fields.iter().find(|f| f.name == *field) {
-                        return Some(FirType::from_sema_type(&f.ty));
+                        let f_ty = FirType::from_sema_type(&f.ty);
+                        return if *safe {
+                            match f_ty {
+                                FirType::Optional(_) => Some(f_ty),
+                                other => Some(FirType::Optional(Box::new(other))),
+                            }
+                        } else {
+                            Some(f_ty)
+                        };
                     }
                 }
                 None
@@ -339,6 +355,84 @@ impl<'a> FunctionLoweringContext<'a> {
             }
         }
         0
+    }
+
+    fn is_expr_null(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Lit(Lit::Null) => true,
+            ExprKind::Ident(sym) => {
+                INTERNER.resolve(sym) == "null" || self.known_null_vars.contains(sym)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_expr_non_null(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Lit(lit) => !matches!(lit, Lit::Null),
+            ExprKind::StructInit { .. }
+            | ExprKind::Array(_)
+            | ExprKind::ArrayRepeat(..)
+            | ExprKind::Tuple(_) => true,
+            ExprKind::Unary {
+                op: UnaryOp::Ref, ..
+            } => true,
+            ExprKind::Ident(sym) => self.known_non_null_vars.contains(sym),
+            _ => false,
+        }
+    }
+
+    fn eval_static_bool(&self, expr: &Expr) -> Option<bool> {
+        if let Some(ifa_comptime::Value::Bool(b)) =
+            self.symbols.comptime_expr_values.get(&expr.span)
+        {
+            return Some(*b);
+        }
+
+        match &expr.kind {
+            ExprKind::Lit(Lit::Bool(b)) => Some(*b),
+            ExprKind::Lit(Lit::Null) => Some(false),
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                expr: inner,
+            } => self.eval_static_bool(inner).map(|b| !b),
+            ExprKind::Binary { op, left, right } => match op {
+                BinOp::Eq => {
+                    if self.is_expr_null(left) && self.is_expr_null(right) {
+                        Some(true)
+                    } else if (self.is_expr_null(left) && self.is_expr_non_null(right))
+                        || (self.is_expr_non_null(left) && self.is_expr_null(right))
+                    {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                BinOp::NotEq => {
+                    if self.is_expr_null(left) && self.is_expr_null(right) {
+                        Some(false)
+                    } else if (self.is_expr_null(left) && self.is_expr_non_null(right))
+                        || (self.is_expr_non_null(left) && self.is_expr_null(right))
+                    {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                }
+                BinOp::And => match (self.eval_static_bool(left), self.eval_static_bool(right)) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                },
+                BinOp::Or => match (self.eval_static_bool(left), self.eval_static_bool(right)) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn lower(mut self, body: &ifa_ast::Block) -> FirFunction {
@@ -458,6 +552,16 @@ impl<'a> FunctionLoweringContext<'a> {
                     self.emit(None, ValueExpr::Store { ptr, val }, *span);
                 }
 
+                if let Some(init_expr) = init {
+                    if self.is_expr_null(init_expr) {
+                        self.known_null_vars.insert(*name);
+                        self.known_non_null_vars.remove(name);
+                    } else if self.is_expr_non_null(init_expr) {
+                        self.known_non_null_vars.insert(*name);
+                        self.known_null_vars.remove(name);
+                    }
+                }
+
                 self.var_allocas.insert(*name, ptr);
                 self.var_types.insert(*name, ty);
             }
@@ -466,13 +570,28 @@ impl<'a> FunctionLoweringContext<'a> {
                 target, val, span, ..
             } => {
                 let val_id = self.lower_expr(val);
+
+                if let ExprKind::Ident(target_sym) = &target.kind {
+                    if self.is_expr_null(val) {
+                        self.known_null_vars.insert(*target_sym);
+                        self.known_non_null_vars.remove(target_sym);
+                    } else if self.is_expr_non_null(val) {
+                        self.known_non_null_vars.insert(*target_sym);
+                        self.known_null_vars.remove(target_sym);
+                    } else {
+                        self.known_null_vars.remove(target_sym);
+                        self.known_non_null_vars.remove(target_sym);
+                    }
+                }
                 match &target.kind {
                     ExprKind::Ident(sym) => {
                         if let Some(&ptr) = self.var_allocas.get(sym) {
                             self.emit(None, ValueExpr::Store { ptr, val: val_id }, *span);
                         }
                     }
-                    ExprKind::FieldAccess { receiver, field } => {
+                    ExprKind::FieldAccess {
+                        receiver, field, ..
+                    } => {
                         let field_idx = self.find_field_index(receiver, *field);
                         let base_id = match &receiver.kind {
                             ExprKind::Ident(sym) => self
@@ -1035,6 +1154,11 @@ impl<'a> FunctionLoweringContext<'a> {
             }
 
             ExprKind::Binary { op, left, right } => {
+                if let Some(b) = self.eval_static_bool(expr) {
+                    let res = self.alloc_value();
+                    self.emit(Some(res), ValueExpr::Constant(ConstantValue::Bool(b)), span);
+                    return res;
+                }
                 let lhs = self.lower_expr(left);
                 let rhs = self.lower_expr(right);
                 let fir_op = match op {
@@ -1351,8 +1475,145 @@ impl<'a> FunctionLoweringContext<'a> {
                 receiver,
                 method,
                 args,
+                safe,
             } => {
                 let m_name = INTERNER.resolve(method);
+                if *safe {
+                    let lhs = self.lower_expr(receiver);
+                    let ret_ty = self
+                        .infer_expr_fir_type(expr)
+                        .unwrap_or(FirType::Optional(Box::new(FirType::Int(IntType::I64))));
+
+                    let res_ptr = self.alloc_value();
+                    self.emit(
+                        Some(res_ptr),
+                        ValueExpr::Alloca {
+                            ty: ret_ty.clone(),
+                            name: Some(
+                                INTERNER.intern(&format!("__safecall_{}", self.func.next_value_id)),
+                            ),
+                        },
+                        span,
+                    );
+
+                    let is_null = self.alloc_value();
+                    let null_const = self.alloc_value();
+                    self.emit(
+                        Some(null_const),
+                        ValueExpr::Constant(ConstantValue::Null),
+                        span,
+                    );
+                    self.emit(
+                        Some(is_null),
+                        ValueExpr::Binary {
+                            op: BinaryOp::Eq,
+                            lhs,
+                            rhs: null_const,
+                        },
+                        span,
+                    );
+
+                    let null_block = self.alloc_block();
+                    let call_block = self.alloc_block();
+                    let join_block = self.alloc_block();
+
+                    self.set_terminator(Terminator::BranchCond {
+                        cond: is_null,
+                        then_block: null_block,
+                        then_args: Vec::new(),
+                        else_block: call_block,
+                        else_args: Vec::new(),
+                    });
+
+                    // null_block: store null (or unit)
+                    self.current_block = null_block;
+                    let null_val = self.alloc_value();
+                    let null_c = if ret_ty == FirType::Unit {
+                        ConstantValue::Unit
+                    } else {
+                        ConstantValue::Null
+                    };
+                    self.emit(Some(null_val), ValueExpr::Constant(null_c), span);
+                    self.emit(
+                        None,
+                        ValueExpr::Store {
+                            ptr: res_ptr,
+                            val: null_val,
+                        },
+                        span,
+                    );
+                    self.set_terminator(Terminator::Branch {
+                        target: join_block,
+                        args: Vec::new(),
+                    });
+
+                    // call_block: evaluate arguments and invoke method
+                    self.current_block = call_block;
+                    let call_res = if m_name == "len" {
+                        let r = self.alloc_value();
+                        self.emit(Some(r), ValueExpr::ArrayLen { array: lhs }, span);
+                        r
+                    } else {
+                        let mut arg_vals = vec![lhs];
+                        for a in args {
+                            arg_vals.push(self.lower_expr(&a.value));
+                        }
+                        let target_fn_name = if let Some(fn_sym) =
+                            self.symbols.lookup_function(method)
+                        {
+                            if !fn_sym.generics.is_empty() {
+                                if let Some(call_args) = self.symbols.call_instantiations.get(&span)
+                                {
+                                    let concrete_args: Vec<_> = call_args
+                                        .iter()
+                                        .map(|t| t.substitute(&self.type_subst))
+                                        .collect();
+                                    crate::types::mangle_instantiation_symbol(
+                                        &INTERNER.resolve(method),
+                                        &concrete_args,
+                                    )
+                                } else {
+                                    *method
+                                }
+                            } else {
+                                *method
+                            }
+                        } else {
+                            *method
+                        };
+
+                        let r = self.alloc_value();
+                        self.emit(
+                            Some(r),
+                            ValueExpr::CallDirect {
+                                name: target_fn_name,
+                                args: arg_vals,
+                            },
+                            span,
+                        );
+                        r
+                    };
+
+                    self.emit(
+                        None,
+                        ValueExpr::Store {
+                            ptr: res_ptr,
+                            val: call_res,
+                        },
+                        span,
+                    );
+                    self.set_terminator(Terminator::Branch {
+                        target: join_block,
+                        args: Vec::new(),
+                    });
+
+                    // join_block
+                    self.current_block = join_block;
+                    let final_res = self.alloc_value();
+                    self.emit(Some(final_res), ValueExpr::Load { ptr: res_ptr }, span);
+                    return final_res;
+                }
+
                 if m_name == "push" && !args.is_empty() {
                     let val_to_push = self.lower_expr(&args[0].value);
                     let res = self.alloc_value();
@@ -1361,6 +1622,7 @@ impl<'a> FunctionLoweringContext<'a> {
                         ExprKind::FieldAccess {
                             receiver: inner_rec,
                             field: field_sym,
+                            ..
                         } => {
                             let field_idx = self.find_field_index(inner_rec, *field_sym);
                             let base_id = match &inner_rec.kind {
@@ -1454,7 +1716,131 @@ impl<'a> FunctionLoweringContext<'a> {
                 }
             }
 
-            ExprKind::FieldAccess { receiver, field } => {
+            ExprKind::FieldAccess {
+                receiver,
+                field,
+                safe,
+            } => {
+                if *safe {
+                    let lhs = self.lower_expr(receiver);
+                    let val_ty = self
+                        .infer_expr_fir_type(expr)
+                        .unwrap_or(FirType::Optional(Box::new(FirType::Int(IntType::I64))));
+
+                    let res_ptr = self.alloc_value();
+                    self.emit(
+                        Some(res_ptr),
+                        ValueExpr::Alloca {
+                            ty: val_ty,
+                            name: Some(
+                                INTERNER.intern(&format!("__safenav_{}", self.func.next_value_id)),
+                            ),
+                        },
+                        span,
+                    );
+
+                    let is_null = self.alloc_value();
+                    let null_const = self.alloc_value();
+                    self.emit(
+                        Some(null_const),
+                        ValueExpr::Constant(ConstantValue::Null),
+                        span,
+                    );
+                    self.emit(
+                        Some(is_null),
+                        ValueExpr::Binary {
+                            op: BinaryOp::Eq,
+                            lhs,
+                            rhs: null_const,
+                        },
+                        span,
+                    );
+
+                    let null_block = self.alloc_block();
+                    let access_block = self.alloc_block();
+                    let join_block = self.alloc_block();
+
+                    self.set_terminator(Terminator::BranchCond {
+                        cond: is_null,
+                        then_block: null_block,
+                        then_args: Vec::new(),
+                        else_block: access_block,
+                        else_args: Vec::new(),
+                    });
+
+                    // null_block: store null
+                    self.current_block = null_block;
+                    let null_val = self.alloc_value();
+                    self.emit(
+                        Some(null_val),
+                        ValueExpr::Constant(ConstantValue::Null),
+                        span,
+                    );
+                    self.emit(
+                        None,
+                        ValueExpr::Store {
+                            ptr: res_ptr,
+                            val: null_val,
+                        },
+                        span,
+                    );
+                    self.set_terminator(Terminator::Branch {
+                        target: join_block,
+                        args: Vec::new(),
+                    });
+
+                    // access_block: deref/getfield
+                    self.current_block = access_block;
+                    let checked_base = if let ExprKind::Unary {
+                        op: UnaryOp::Ref, ..
+                    } = &receiver.kind
+                    {
+                        self.emit(
+                            None,
+                            ValueExpr::GenCheck {
+                                ref_val: lhs,
+                                redundant: false,
+                            },
+                            span,
+                        );
+                        let deref_res = self.alloc_value();
+                        self.emit(Some(deref_res), ValueExpr::GenDeref { ref_val: lhs }, span);
+                        deref_res
+                    } else {
+                        lhs
+                    };
+
+                    let field_idx = self.find_field_index(receiver, *field);
+                    let access_res = self.alloc_value();
+                    self.emit(
+                        Some(access_res),
+                        ValueExpr::GetField {
+                            base: checked_base,
+                            field_idx,
+                            field_name: *field,
+                        },
+                        span,
+                    );
+                    self.emit(
+                        None,
+                        ValueExpr::Store {
+                            ptr: res_ptr,
+                            val: access_res,
+                        },
+                        span,
+                    );
+                    self.set_terminator(Terminator::Branch {
+                        target: join_block,
+                        args: Vec::new(),
+                    });
+
+                    // join_block
+                    self.current_block = join_block;
+                    let final_res = self.alloc_value();
+                    self.emit(Some(final_res), ValueExpr::Load { ptr: res_ptr }, span);
+                    return final_res;
+                }
+
                 let base_val = self.lower_expr(receiver);
                 // Si le récepteur est une référence ref, émettre GenCheck et GenDeref
                 let checked_base = if let ExprKind::Unary {
@@ -1508,6 +1894,33 @@ impl<'a> FunctionLoweringContext<'a> {
                 then_branch,
                 else_branch,
             } => {
+                if let Some(st_cond) = self.eval_static_bool(cond) {
+                    if st_cond {
+                        for s in &then_branch.stmts {
+                            self.lower_stmt(s);
+                        }
+                        return then_branch
+                            .expr
+                            .as_ref()
+                            .map(|e| self.lower_expr(e))
+                            .unwrap_or_else(|| {
+                                let res = self.alloc_value();
+                                self.emit(
+                                    Some(res),
+                                    ValueExpr::Constant(ConstantValue::Unit),
+                                    span,
+                                );
+                                res
+                            });
+                    } else if let Some(else_expr) = else_branch {
+                        return self.lower_expr(else_expr);
+                    } else {
+                        let res = self.alloc_value();
+                        self.emit(Some(res), ValueExpr::Constant(ConstantValue::Unit), span);
+                        return res;
+                    }
+                }
+
                 let cond_val = self.lower_expr(cond);
                 let then_block = self.alloc_block();
                 let else_block = self.alloc_block();

@@ -132,6 +132,62 @@ mod tests {
     }
 
     #[test]
+    fn test_lsp_safe_navigation_completion() {
+        let mut server = LanguageServer::new();
+        let code = r#"
+            struct Node {
+                val: i64,
+                next: ?ref Node,
+            }
+
+            pub fn main() -> () {
+                let n: ?ref Node = null;
+                n?.
+            }
+        "#;
+
+        let open_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/node.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": code
+                }
+            }
+        })
+        .to_string();
+
+        server.handle_message(&open_notif);
+
+        let completion_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/node.ifa"
+                },
+                "position": {
+                    "line": 8,
+                    "character": 19
+                }
+            }
+        })
+        .to_string();
+
+        let (resp, _) = server.handle_message(&completion_req);
+        assert!(resp.is_some());
+        let resp_val: serde_json::Value = serde_json::from_str(&resp.unwrap()).unwrap();
+        let items = resp_val["result"]["items"].as_array().unwrap();
+        let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+        assert!(labels.contains(&"val"));
+        assert!(labels.contains(&"next"));
+    }
+
+    #[test]
     fn test_lsp_colon_colon_namespace_completion() {
         let mut server = LanguageServer::new();
         let code = r#"

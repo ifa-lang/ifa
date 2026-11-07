@@ -103,6 +103,7 @@ pub fn handle_semantic_tokens(doc: &Document) -> SemanticTokens {
             TokenKind::Arrow
             | TokenKind::FatArrow
             | TokenKind::QuestionQuestion
+            | TokenKind::QuestionDot
             | TokenKind::ColonColon
             | TokenKind::EqEq
             | TokenKind::NotEq
