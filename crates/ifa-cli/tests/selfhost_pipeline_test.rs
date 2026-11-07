@@ -64,7 +64,8 @@ fn test_selfhost_compiler_full_pipeline() {
     assert!(test_stdout.contains("test test_selfhost_function_parser_and_eval ... ok"));
     assert!(test_stdout.contains("test test_selfhost_fir_codegen_expression ... ok"));
     assert!(test_stdout.contains("test test_selfhost_fir_codegen_function ... ok"));
-    assert!(test_stdout.contains("Test result: 8 passed; 0 failed"));
+    assert!(test_stdout.contains("test test_selfhost_polymorphic_method ... ok"));
+    assert!(test_stdout.contains("Test result: 9 passed; 0 failed"));
 
     // 3. Complete execution via SSA FIR interpreter
     let run_output = Command::new(&ifa_bin)
@@ -126,6 +127,11 @@ fn test_selfhost_compiler_full_pipeline() {
         run_stdout
     );
     assert!(run_stdout.contains("ret %t5"), "stdout was: {}", run_stdout);
+    assert!(
+        run_stdout.contains("Wrapped & method-unwrapped AST result: 42"),
+        "stdout was: {}",
+        run_stdout
+    );
 
     // 4. Canonical documentation generation
     let temp_doc_dir = std::env::temp_dir().join("ifa_selfhost_doc_test");

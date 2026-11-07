@@ -18,6 +18,7 @@ pub struct SemanticAnalyzer<'a> {
     pub diagnostics: Vec<Diagnostic>,
     pub current_func_ret_ty: Option<Type>,
     pub current_func_is_strict: bool,
+    pub current_func_generics: Vec<Symbol>,
     pub expr_types: HashMap<Span, Type>,
     pub moved_vars: HashMap<Symbol, Span>,
     pub comptime_vm: ifa_comptime::ComptimeVM,
@@ -31,6 +32,7 @@ impl<'a> SemanticAnalyzer<'a> {
             diagnostics: Vec::new(),
             current_func_ret_ty: None,
             current_func_is_strict: false,
+            current_func_generics: Vec::new(),
             expr_types: HashMap::new(),
             moved_vars: HashMap::new(),
             comptime_vm: ifa_comptime::ComptimeVM::new(),
@@ -171,7 +173,12 @@ impl<'a> SemanticAnalyzer<'a> {
                 Item::Function(f) => {
                     let mut params = Vec::new();
                     for p in &f.params {
-                        let ty = match Type::from_ast(&p.ty, &known_structs, &known_enums) {
+                        let ty = match Type::from_ast_with_generics(
+                            &p.ty,
+                            &known_structs,
+                            &known_enums,
+                            &f.generics,
+                        ) {
                             Ok(t) => t,
                             Err(d) => {
                                 self.diagnostics.push(d);
@@ -187,7 +194,12 @@ impl<'a> SemanticAnalyzer<'a> {
                     }
 
                     let ret_ty = if let Some(ret) = &f.ret_ty {
-                        match Type::from_ast(ret, &known_structs, &known_enums) {
+                        match Type::from_ast_with_generics(
+                            ret,
+                            &known_structs,
+                            &known_enums,
+                            &f.generics,
+                        ) {
                             Ok(t) => t,
                             Err(d) => {
                                 self.diagnostics.push(d);
@@ -204,6 +216,7 @@ impl<'a> SemanticAnalyzer<'a> {
                         is_strict: f.is_strict,
                         is_comptime: f.is_comptime,
                         is_extern: f.is_extern.clone(),
+                        generics: f.generics.clone(),
                         params,
                         ret_ty,
                         span: f.span,
@@ -298,6 +311,7 @@ impl<'a> SemanticAnalyzer<'a> {
         let prev_ret = self.current_func_ret_ty.take();
         let prev_strict = self.current_func_is_strict;
         let prev_moved = std::mem::take(&mut self.moved_vars);
+        let prev_generics = std::mem::replace(&mut self.current_func_generics, f.generics.clone());
         self.current_func_ret_ty = Some(ret_ty.clone());
         self.current_func_is_strict = f.is_strict;
 
@@ -330,6 +344,7 @@ impl<'a> SemanticAnalyzer<'a> {
         self.current_func_ret_ty = prev_ret;
         self.current_func_is_strict = prev_strict;
         self.moved_vars = prev_moved;
+        self.current_func_generics = prev_generics;
     }
 
     fn check_block(&mut self, block: &Block, expected_ret: Option<&Type>) -> Type {
@@ -370,7 +385,12 @@ impl<'a> SemanticAnalyzer<'a> {
                 let declared_ty = if let Some(ast_ty) = annotated_ty {
                     let known_structs = self.get_known_struct_types();
                     let known_enums = self.get_known_enum_types();
-                    match Type::from_ast(ast_ty, &known_structs, &known_enums) {
+                    match Type::from_ast_with_generics(
+                        ast_ty,
+                        &known_structs,
+                        &known_enums,
+                        &self.current_func_generics,
+                    ) {
                         Ok(t) => Some(t),
                         Err(d) => {
                             self.diagnostics.push(d);
@@ -1248,87 +1268,7 @@ impl<'a> SemanticAnalyzer<'a> {
         };
 
         if let Some(f) = fn_match {
-            let param_modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
-
-            // Check Law of Exclusivity on arguments!
-            check_call_exclusivity(args, &param_modes, &self.symbols, &mut self.diagnostics);
-
-            // Check argument count and types
-            if args.len() != f.params.len() {
-                let fn_name = INTERNER.resolve(&f.name);
-                self.diagnostics.push(
-                    Diagnostic::error(format!(
-                        "nombre d'arguments incorrect pour '{}' : attendu {}, trouvé {}",
-                        fn_name,
-                        f.params.len(),
-                        args.len()
-                    ))
-                    .with_code("E0009")
-                    .with_primary_label(span, format!("appel avec {} argument(s)", args.len()))
-                    .with_secondary_label(
-                        f.span,
-                        format!("'{}' définie avec {} paramètre(s)", fn_name, f.params.len()),
-                    ),
-                );
-            }
-
-            for (idx, arg) in args.iter().enumerate() {
-                if let Some(param) = f.params.get(idx) {
-                    let arg_ty = self.check_expr(&arg.value, Some(&param.ty));
-                    if !arg_ty.is_assignable_to(&param.ty) {
-                        let fn_name = INTERNER.resolve(&f.name);
-                        let p_name = INTERNER.resolve(&param.name);
-                        self.diagnostics.push(
-                            Diagnostic::error(format!(
-                                "type incorrect pour le paramètre '{}' de '{}' : attendu {}, trouvé {}",
-                                p_name, fn_name, param.ty, arg_ty
-                            ))
-                            .with_code("E0001")
-                            .with_primary_label(arg.value.span, format!("argument de type {}", arg_ty))
-                            .with_secondary_label(param.span, format!("paramètre attend {}", param.ty)),
-                        );
-                    }
-
-                    if param.mode == ParamMode::Comptime
-                        && self.comptime_vm.eval_expr(&arg.value).is_err()
-                    {
-                        let p_name = INTERNER.resolve(&param.name);
-                        let fn_name = INTERNER.resolve(&f.name);
-                        self.diagnostics.push(
-                            Diagnostic::error(format!(
-                                "l'argument pour le paramètre comptime '{}' de '{}' doit être une constante évaluable à la compilation",
-                                p_name, fn_name
-                            ))
-                            .with_code("E0041")
-                            .with_primary_label(arg.value.span, "expression constante attendue"),
-                        );
-                    }
-                }
-            }
-
-            for (idx, arg) in args.iter().enumerate() {
-                let is_explicit_sink = matches!(
-                    &arg.value.kind,
-                    ExprKind::Unary {
-                        op: UnaryOp::Sink,
-                        ..
-                    }
-                );
-                let is_param_sink = f
-                    .params
-                    .get(idx)
-                    .map(|p| p.mode == ParamMode::Sink)
-                    .unwrap_or(false);
-                if is_explicit_sink || is_param_sink {
-                    if let Some((root_sym, _)) =
-                        crate::exclusivity::extract_root_variable(&arg.value)
-                    {
-                        self.moved_vars.insert(root_sym, arg.value.span);
-                    }
-                }
-            }
-
-            f.ret_ty
+            self.check_function_call(&f, args, span)
         } else {
             // Function or standard library function not yet in symbol table (e.g. io::println, http::Server::new)
             let param_modes = vec![ParamMode::In; args.len()];
@@ -1481,12 +1421,118 @@ impl<'a> SemanticAnalyzer<'a> {
         }
     }
 
+    fn check_function_call(&mut self, f: &FunctionSymbol, args: &[Arg], span: Span) -> Type {
+        let param_modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
+
+        // Check Law of Exclusivity on arguments!
+        check_call_exclusivity(args, &param_modes, &self.symbols, &mut self.diagnostics);
+
+        // Check argument count
+        if args.len() != f.params.len() {
+            let fn_name = INTERNER.resolve(&f.name);
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "nombre d'arguments incorrect pour '{}' : attendu {}, trouvé {}",
+                    fn_name,
+                    f.params.len(),
+                    args.len()
+                ))
+                .with_code("E0009")
+                .with_primary_label(span, format!("appel avec {} argument(s)", args.len()))
+                .with_secondary_label(
+                    f.span,
+                    format!("'{}' définie avec {} paramètre(s)", fn_name, f.params.len()),
+                ),
+            );
+        }
+
+        // Generic type parameters bidirectional inference
+        let mut type_param_map: HashMap<Symbol, Type> = HashMap::new();
+        if !f.generics.is_empty() {
+            for (idx, arg) in args.iter().enumerate() {
+                if let Some(param) = f.params.get(idx) {
+                    let arg_ty = self.infer_expr(&arg.value);
+                    param.ty.unify_type_params(&arg_ty, &mut type_param_map);
+                }
+            }
+        }
+
+        for (idx, arg) in args.iter().enumerate() {
+            if let Some(param) = f.params.get(idx) {
+                let expected_param_ty = if type_param_map.is_empty() {
+                    param.ty.clone()
+                } else {
+                    param.ty.substitute(&type_param_map)
+                };
+
+                let arg_ty = self.check_expr(&arg.value, Some(&expected_param_ty));
+                if !arg_ty.is_assignable_to(&expected_param_ty) {
+                    let fn_name = INTERNER.resolve(&f.name);
+                    let p_name = INTERNER.resolve(&param.name);
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "type incorrect pour le paramètre '{}' de '{}' : attendu {}, trouvé {}",
+                            p_name, fn_name, expected_param_ty, arg_ty
+                        ))
+                        .with_code("E0001")
+                        .with_primary_label(arg.value.span, format!("argument de type {}", arg_ty))
+                        .with_secondary_label(
+                            param.span,
+                            format!("paramètre attend {}", expected_param_ty),
+                        ),
+                    );
+                }
+
+                if param.mode == ParamMode::Comptime
+                    && self.comptime_vm.eval_expr(&arg.value).is_err()
+                {
+                    let p_name = INTERNER.resolve(&param.name);
+                    let fn_name = INTERNER.resolve(&f.name);
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "l'argument pour le paramètre comptime '{}' de '{}' doit être une constante évaluable à la compilation",
+                            p_name, fn_name
+                        ))
+                        .with_code("E0041")
+                        .with_primary_label(arg.value.span, "expression constante attendue"),
+                    );
+                }
+            }
+        }
+
+        for (idx, arg) in args.iter().enumerate() {
+            let is_explicit_sink = matches!(
+                &arg.value.kind,
+                ExprKind::Unary {
+                    op: UnaryOp::Sink,
+                    ..
+                }
+            );
+            let is_param_sink = f
+                .params
+                .get(idx)
+                .map(|p| p.mode == ParamMode::Sink)
+                .unwrap_or(false);
+            if is_explicit_sink || is_param_sink {
+                if let Some((root_sym, _)) = crate::exclusivity::extract_root_variable(&arg.value) {
+                    self.moved_vars.insert(root_sym, arg.value.span);
+                }
+            }
+        }
+
+        if type_param_map.is_empty() {
+            f.ret_ty.clone()
+        } else {
+            f.ret_ty.substitute(&type_param_map)
+        }
+    }
+
     fn check_method_call_expr(
         &mut self,
         receiver: &Expr,
         method: Symbol,
         args: &[Arg],
-        _span: Span,
+        span: Span,
     ) -> Type {
         let rec_ty = self.infer_expr(receiver);
         let m_name = INTERNER.resolve(&method);
@@ -1512,8 +1558,32 @@ impl<'a> SemanticAnalyzer<'a> {
             _ => {}
         }
 
-        for arg in args {
-            self.infer_expr(&arg.value);
+        // Polymorphic methods and UFCS (Uniform Function Call Syntax):
+        // If a function with `method` name exists taking receiver as first parameter:
+        if let Some(f) = self.symbols.lookup_function(&method).cloned() {
+            if !f.params.is_empty() {
+                let mut full_args = Vec::with_capacity(args.len() + 1);
+                full_args.push(Arg::positional(receiver.clone()));
+                full_args.extend_from_slice(args);
+                return self.check_function_call(&f, &full_args, span);
+            }
+        }
+
+        if !matches!(rec_ty, Type::Unknown) {
+            let m_name_str = INTERNER.resolve(&method);
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "méthode '{}' introuvable sur le type '{}'",
+                    m_name_str, rec_ty
+                ))
+                .with_code("E0008")
+                .with_primary_label(span, format!("méthode '{}' inconnue", m_name_str))
+                .with_secondary_label(receiver.span, format!("récepteur de type '{}'", rec_ty)),
+            );
+        } else {
+            for arg in args {
+                self.infer_expr(&arg.value);
+            }
         }
 
         Type::Unknown

@@ -229,6 +229,10 @@ impl<'a> FunctionLoweringContext<'a> {
                     _ => None,
                 }
             }
+            ExprKind::MethodCall { method, .. } => self
+                .symbols
+                .lookup_function(method)
+                .map(|func| FirType::from_sema_type(&func.ret_ty)),
             _ => None,
         }
     }

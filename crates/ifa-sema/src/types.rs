@@ -275,6 +275,13 @@ impl Type {
             return src_inner.is_assignable_to(target_inner);
         }
 
+        // Ref(T) can coerce to T for projection / read-only access
+        if let Type::Ref(src_inner) = self {
+            if src_inner.is_assignable_to(target) {
+                return true;
+            }
+        }
+
         // Str and String compatibility for string parameters
         if (matches!(self, Type::Str) && matches!(target, Type::String))
             || (matches!(self, Type::String) && matches!(target, Type::Str))
@@ -371,11 +378,23 @@ impl Type {
     /// Unifies any generic type parameters in `self` against concrete types in `concrete`.
     pub fn unify_type_params(&self, concrete: &Type, mapping: &mut HashMap<Symbol, Type>) {
         match (self, concrete) {
-            (Type::TypeParam(sym), c) => {
-                mapping.entry(*sym).or_insert_with(|| c.resolve_defaults());
-            }
+            (Type::TypeParam(sym), c) => match mapping.get(sym) {
+                None => {
+                    mapping.insert(*sym, c.resolve_defaults());
+                }
+                Some(Type::Unknown) if !matches!(c, Type::Unknown) => {
+                    mapping.insert(*sym, c.resolve_defaults());
+                }
+                _ => {}
+            },
             (Type::Ref(inner), Type::Ref(c_inner)) => {
                 inner.unify_type_params(c_inner, mapping);
+            }
+            (Type::Ref(inner), c) => {
+                inner.unify_type_params(c, mapping);
+            }
+            (p, Type::Ref(c_inner)) if !matches!(p, Type::Ref(_)) => {
+                p.unify_type_params(c_inner, mapping);
             }
             (Type::Optional(inner), Type::Optional(c_inner)) => {
                 inner.unify_type_params(c_inner, mapping);

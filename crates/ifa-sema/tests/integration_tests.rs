@@ -670,3 +670,112 @@ fn test_generic_struct_with_generational_ref() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_generic_function_free_and_method_call() {
+    let code = r#"
+        struct Box<T> {
+            val: T,
+        }
+
+        fn unbox<T>(b: Box<T>) -> T {
+            return b.val;
+        }
+
+        pub fn main() {
+            let b1 = Box(val: 42);
+            let v1: i64 = unbox(b1);
+            let v2: i64 = b1.unbox();
+
+            let b2 = Box(val: "hello");
+            let s1: str = unbox(b2);
+            let s2: str = b2.unbox();
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Generic function unbox<T> and method call b.unbox() should typecheck cleanly: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_generic_function_multi_param_swap() {
+    let code = r#"
+        struct Pair<T, U> {
+            first: T,
+            second: U,
+        }
+
+        fn make_pair<T, U>(first: T, second: U) -> Pair<T, U> {
+            return Pair(first: first, second: second);
+        }
+
+        fn swap<T, U>(p: Pair<T, U>) -> Pair<U, T> {
+            return Pair(first: p.second, second: p.first);
+        }
+
+        pub fn main() {
+            let p = make_pair(123, true);
+            let swapped = p.swap();
+            let first_val: bool = swapped.first;
+            let second_val: i64 = swapped.second;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Generic swap<T, U> and method syntax p.swap() should typecheck cleanly: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_generic_function_arg_mismatch_rejected() {
+    let code = r#"
+        fn compare_same<T>(a: T, b: T) -> bool {
+            return true;
+        }
+
+        pub fn main() {
+            let res = compare_same(42, "not an integer");
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Generic function with conflicting type arguments must be rejected"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0001")),
+        "Expected E0001 diagnostic for argument type mismatch"
+    );
+}
+
+#[test]
+fn test_unknown_method_call_rejected() {
+    let code = r#"
+        struct Simple {
+            val: i64,
+        }
+
+        pub fn main() {
+            let s = Simple(val: 10);
+            s.non_existent_method();
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Calling unknown method must produce semantic diagnostic"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0008")),
+        "Expected E0008 diagnostic for unknown method"
+    );
+}

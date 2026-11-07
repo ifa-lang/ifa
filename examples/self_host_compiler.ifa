@@ -776,6 +776,32 @@ pub fn test_selfhost_fir_codegen_function() -> bool {
     return true;
 }
 
+// Generic container demonstrating polymorphic methods in self-hosting IFA compiler
+struct CompilerResult<T> {
+    success: bool,
+    payload: T
+}
+
+fn wrap_result<T>(val: T) -> CompilerResult<T> {
+    return CompilerResult(success: true, payload: val);
+}
+
+fn unwrap<T>(res: CompilerResult<T>) -> T {
+    return res.payload;
+}
+
+// Unit test 9: Polymorphic method dispatch on generic result container
+pub fn test_selfhost_polymorphic_method() -> bool {
+    let res = wrap_result(42);
+    let unwrapped = res.unwrap();
+    if unwrapped != 42 {
+        return false;
+    }
+    let res_str = wrap_result("ifa_ok");
+    let unwrapped_str = res_str.unwrap();
+    return unwrapped_str == "ifa_ok";
+}
+
 pub fn main() {
     println("=== IFA Self-Hosting Compiler Testbench ===");
 
@@ -818,6 +844,11 @@ pub fn main() {
         println(fir2[fj]);
         fj = fj + 1;
     }
+
+    // 6. Generic Polymorphic Method Validation
+    let res1 = wrap_result(evaluated1);
+    let unwrapped1 = res1.unwrap();
+    println("Wrapped & method-unwrapped AST result:", unwrapped1);
 
     println("Self-hosting AST and generational reference validation: SUCCESS (42)");
 }

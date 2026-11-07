@@ -31,6 +31,7 @@ pub struct FunctionSymbol {
     pub is_strict: bool,
     pub is_comptime: bool,
     pub is_extern: Option<String>,
+    pub generics: Vec<Symbol>,
     pub params: Vec<ParamSymbol>,
     pub ret_ty: Type,
     pub span: Span,
