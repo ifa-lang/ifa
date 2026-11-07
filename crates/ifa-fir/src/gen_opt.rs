@@ -60,6 +60,21 @@ impl GenerationalOptPass {
         self.stats
     }
 
+    /// Run post-IPO optimization to eliminate and hoist generational checks introduced by inlining.
+    pub fn run_post_ipo(&mut self, module: &mut FirModule) -> GenOptStats {
+        let before_elim = self.stats.eliminated_checks;
+        let before_hoist = self.stats.hoisted_checks;
+        let before_total = self.stats.total_checks;
+
+        self.run_on_module(module);
+
+        GenOptStats {
+            total_checks: self.stats.total_checks - before_total,
+            eliminated_checks: self.stats.eliminated_checks - before_elim,
+            hoisted_checks: self.stats.hoisted_checks - before_hoist,
+        }
+    }
+
     /// Run the optimization on an entire module.
     pub fn run_on_module(&mut self, module: &mut FirModule) {
         for func in &mut module.functions {
@@ -122,6 +137,79 @@ impl GenerationalOptPass {
                     if let (Some(res), Some(&stored_val)) = (inst.result, single_store_val.get(ptr))
                     {
                         global_aliases.insert(res, stored_val);
+                    }
+                }
+            }
+        }
+
+        // Augment global_aliases with invariant block parameter inputs
+        for block in &func.blocks {
+            if !block.params.is_empty() {
+                if let Some(preds) = cfg.predecessors.get(&block.id) {
+                    if !preds.is_empty() {
+                        for (param_idx, (p_val, _)) in block.params.iter().enumerate() {
+                            let mut common_arg: Option<ValueId> = None;
+                            let mut all_same = true;
+                            for &pred_id in preds {
+                                if let Some(pred_b) = func.get_block(pred_id) {
+                                    if let Some(term) = &pred_b.terminator {
+                                        let args = match term {
+                                            Terminator::Branch { target, args }
+                                                if *target == block.id =>
+                                            {
+                                                Some(args.clone())
+                                            }
+                                            Terminator::BranchCond {
+                                                then_block,
+                                                then_args,
+                                                else_block,
+                                                else_args,
+                                                ..
+                                            } => {
+                                                if *then_block == block.id {
+                                                    Some(then_args.clone())
+                                                } else if *else_block == block.id {
+                                                    Some(else_args.clone())
+                                                } else {
+                                                    None
+                                                }
+                                            }
+                                            _ => None,
+                                        };
+                                        if let Some(args_vec) = args {
+                                            if let Some(&arg) = args_vec.get(param_idx) {
+                                                let canon_arg = canonical_ref(arg, &global_aliases);
+                                                match common_arg {
+                                                    None => common_arg = Some(canon_arg),
+                                                    Some(prev) if prev == canon_arg => {}
+                                                    _ => {
+                                                        all_same = false;
+                                                        break;
+                                                    }
+                                                }
+                                            } else {
+                                                all_same = false;
+                                                break;
+                                            }
+                                        } else {
+                                            all_same = false;
+                                            break;
+                                        }
+                                    } else {
+                                        all_same = false;
+                                        break;
+                                    }
+                                } else {
+                                    all_same = false;
+                                    break;
+                                }
+                            }
+                            if all_same {
+                                if let Some(v) = common_arg {
+                                    global_aliases.insert(*p_val, v);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -329,28 +417,30 @@ impl GenerationalOptPass {
             }
         };
 
+        let natural_loops = Self::find_natural_loops(cfg, dom_tree);
+        let mut loop_by_header: HashMap<BlockId, &NaturalLoop> = HashMap::new();
+        for l in &natural_loops {
+            loop_by_header.entry(l.header).or_insert(l);
+        }
+
         for &block_id in &dom_tree.rpo_blocks {
             let mut available: HashSet<ValueId> = HashSet::new();
 
             if is_strict {
                 // In strict mode, function guarantees zero dynamic generational checks
             } else if block_id != func.entry_block {
-                // 1. Inherit verified references from immediate dominator if no frees intervene
-                if let Some(idom) = dom_tree.immediate_dominator(block_id) {
-                    if let Some(dom_checks) = verified_at_exit.get(&idom) {
-                        let no_free = !freeing_blocks.iter().any(|&fb| {
-                            fb != idom
-                                && dom_tree.dominates(idom, fb)
-                                && dom_tree.dominates(fb, block_id)
-                        });
-                        if no_free {
-                            available.extend(dom_checks.iter().copied());
+                if let Some(loop_info) = loop_by_header.get(&block_id) {
+                    // 1a. Loop header: If no block in the loop frees memory, checks from the preheader remain valid across iterations
+                    let loop_has_free = loop_info.blocks.iter().any(|b| freeing_blocks.contains(b));
+                    if !loop_has_free {
+                        if let Some(preheader) = loop_info.preheader {
+                            if let Some(pre_checks) = verified_at_exit.get(&preheader) {
+                                available.extend(pre_checks.iter().copied());
+                            }
                         }
                     }
-                }
-
-                // 2. Confluent dataflow intersection across all predecessors
-                if let Some(preds) = cfg.predecessors.get(&block_id) {
+                } else if let Some(preds) = cfg.predecessors.get(&block_id) {
+                    // 1b. Non-loop-header block: Confluent dataflow intersection across all predecessors
                     if !preds.is_empty() {
                         let processed_preds: Vec<BlockId> = preds
                             .iter()
@@ -371,11 +461,22 @@ impl GenerationalOptPass {
                             if let Some(c) = common {
                                 available.extend(c);
                             }
+                        } else if let Some(idom) = dom_tree.immediate_dominator(block_id) {
+                            if let Some(dom_checks) = verified_at_exit.get(&idom) {
+                                let no_free = !freeing_blocks.iter().any(|&fb| {
+                                    fb != idom
+                                        && dom_tree.dominates(idom, fb)
+                                        && dom_tree.dominates(fb, block_id)
+                                });
+                                if no_free {
+                                    available.extend(dom_checks.iter().copied());
+                                }
+                            }
                         }
                     }
                 }
 
-                // 3. SSA Block Parameters / Phi Promotion Resolution (SROA Stability)
+                // 2. SSA Block Parameters / Phi Promotion Resolution (SROA Stability)
                 if let Some(block) = func.get_block(block_id) {
                     if !block.params.is_empty() {
                         if let Some(preds) = cfg.predecessors.get(&block_id) {
@@ -386,9 +487,13 @@ impl GenerationalOptPass {
                                         if let Some(term) = &pred_block.terminator {
                                             if let Some(args) = get_branch_args(term, block_id) {
                                                 if let Some(&arg_val) = args.get(param_idx) {
+                                                    let arg_canon = canonical_ref(arg_val, aliases);
                                                     let is_verified_in_pred = verified_at_exit
                                                         .get(&pred_id)
-                                                        .is_some_and(|set| set.contains(&arg_val));
+                                                        .is_some_and(|set| {
+                                                            set.contains(&arg_val)
+                                                                || set.contains(&arg_canon)
+                                                        });
                                                     if !is_verified_in_pred {
                                                         all_preds_verified = false;
                                                         break;
@@ -413,13 +518,14 @@ impl GenerationalOptPass {
 
                                 if all_preds_verified {
                                     available.insert(*param_val);
+                                    available.insert(canonical_ref(*param_val, aliases));
                                 }
                             }
                         }
                     }
                 }
 
-                // 4. Direct lexical dominance: created in dominating block with no intervening frees
+                // 3. Direct lexical dominance: created in dominating block with no intervening frees
                 for (&ref_val, &def_block) in ref_defs {
                     if dom_tree.dominates(def_block, block_id) {
                         let no_free = !freeing_blocks.iter().any(|&fb| {
@@ -557,6 +663,16 @@ impl GenerationalOptPass {
                 preheader,
             });
         }
+
+        // Deterministic hierarchical ordering:
+        // Outermost loops first (largest block count), with header BlockId as deterministic tie-breaker.
+        // This ensures that loop-invariant checks are hoisted directly to their highest enclosing loop preheader.
+        loops.sort_by(|a, b| {
+            b.blocks
+                .len()
+                .cmp(&a.blocks.len())
+                .then_with(|| a.header.0.cmp(&b.header.0))
+        });
 
         loops
     }

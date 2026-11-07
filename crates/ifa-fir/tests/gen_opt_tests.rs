@@ -501,3 +501,206 @@ fn test_nested_loops_and_deep_alias_check_elimination_over_90_percent() {
         .unwrap();
     assert_eq!(res, FirValue::Int(515));
 }
+
+#[test]
+fn test_post_ipo_pure_helper_inlined_in_loop_hoisting() {
+    let src = r#"
+        struct Cell {
+            val: i64,
+        }
+
+        pub fn read_cell(c: ref Cell) -> i64 {
+            return c.val;
+        }
+
+        pub fn caller_loop(c: ref Cell, n: i64) -> i64 {
+            mut acc = 0;
+            mut i = 0;
+            while i < n {
+                acc = acc + read_cell(c);
+                i = i + 1;
+            }
+            return acc;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("post_ipo_loop_gce.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    // compile_to_fir runs the full optimization pipeline (including IPO and post-IPO GCE)
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let caller_fn = module
+        .functions
+        .iter()
+        .find(|f| ifa_span::INTERNER.resolve(&f.name) == "caller_loop")
+        .expect("caller_loop function must exist");
+
+    let formatted = format_function(caller_fn);
+    // In caller_loop, read_cell must have been inlined, and the inlined GenCheck hoisted to preheader
+    assert!(
+        formatted.contains("gen.check"),
+        "Hoisted gen.check must exist in caller_loop preheader:\n{}",
+        formatted
+    );
+    assert!(
+        formatted.contains("[eliminated]"),
+        "Inlined gen.check inside loop body must be marked [eliminated]:\n{}",
+        formatted
+    );
+
+    let mut interp = FirInterpreter::new(&module);
+    let cell_obj = FirValue::Struct {
+        name: ifa_span::INTERNER.intern("Cell"),
+        fields: vec![FirValue::Int(42)],
+    };
+    let res = interp
+        .execute_function("caller_loop", vec![cell_obj, FirValue::Int(5)])
+        .unwrap();
+    assert_eq!(res, FirValue::Int(210));
+}
+
+#[test]
+fn test_post_ipo_caller_pre_checked_dominance_elimination() {
+    let src = r#"
+        struct Cell {
+            val: i64,
+        }
+
+        pub fn read_cell(c: ref Cell) -> i64 {
+            return c.val;
+        }
+
+        pub fn caller_pre_checked(c: ref Cell, n: i64) -> i64 {
+            let first = c.val;
+            mut acc = first;
+            mut i = 0;
+            while i < n {
+                acc = acc + read_cell(c);
+                i = i + 1;
+            }
+            return acc;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("post_ipo_pre_checked.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let caller_fn = module
+        .functions
+        .iter()
+        .find(|f| ifa_span::INTERNER.resolve(&f.name) == "caller_pre_checked")
+        .expect("caller_pre_checked function must exist");
+
+    let formatted = format_function(caller_fn);
+    assert!(
+        formatted.contains("[eliminated]"),
+        "Inlined call check must be eliminated via dominance from prior check:\n{}",
+        formatted
+    );
+
+    let mut interp = FirInterpreter::new(&module);
+    let cell_obj = FirValue::Struct {
+        name: ifa_span::INTERNER.intern("Cell"),
+        fields: vec![FirValue::Int(50)],
+    };
+    // first = 50. Loop runs 3 times: + 50 each time. Result: 200.
+    let res = interp
+        .execute_function("caller_pre_checked", vec![cell_obj, FirValue::Int(3)])
+        .unwrap();
+    assert_eq!(res, FirValue::Int(200));
+}
+
+#[test]
+fn test_deeply_nested_triple_loop_licm_hierarchical_hoisting() {
+    let src = r#"
+        struct Cube {
+            density: i64,
+        }
+
+        pub fn scan_volume(cube: ref Cube, x_dim: i64, y_dim: i64, z_dim: i64) -> i64 {
+            mut mass = 0;
+            mut x = 0;
+            while x < x_dim {
+                mut y = 0;
+                while y < y_dim {
+                    mut z = 0;
+                    while z < z_dim {
+                        mass = mass + cube.density + cube.density;
+                        z = z + 1;
+                    }
+                    y = y + 1;
+                }
+                x = x + 1;
+            }
+            return mass;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("triple_loop_licm.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = compile_to_fir(&prog, &analysis.symbols, true, false).unwrap();
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_module(&mut module);
+
+    let stats = gce.stats();
+    assert!(
+        stats.hoisted_checks >= 1,
+        "Invariant check must be hoisted out of 3-level loop hierarchy"
+    );
+    assert!(
+        stats.elimination_rate() >= 66.0,
+        "Elimination rate should be high in 3-level nested loops, got {:.2}%",
+        stats.elimination_rate()
+    );
+
+    let mut interp = FirInterpreter::new(&module);
+    let cube_obj = FirValue::Struct {
+        name: ifa_span::INTERNER.intern("Cube"),
+        fields: vec![FirValue::Int(3)],
+    };
+    // 2 * 3 * 4 iterations = 24. Each iteration adds 3 + 3 = 6. 24 * 6 = 144.
+    let res = interp
+        .execute_function(
+            "scan_volume",
+            vec![
+                cube_obj,
+                FirValue::Int(2),
+                FirValue::Int(3),
+                FirValue::Int(4),
+            ],
+        )
+        .unwrap();
+    assert_eq!(res, FirValue::Int(144));
+}

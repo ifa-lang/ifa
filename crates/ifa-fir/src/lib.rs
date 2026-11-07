@@ -98,6 +98,11 @@ pub fn compile_to_fir_with_opts(
         let mut sroa_pass3 = SroaPass::new();
         sroa_pass3.run_on_module(&mut module);
 
+        if opt_gen {
+            let mut post_ipo_gen_pass = GenerationalOptPass::new();
+            post_ipo_gen_pass.run_on_module(&mut module);
+        }
+
         let mut bce_pass2 = BcePass::new();
         bce_pass2.run_on_module(&mut module);
 
