@@ -1,0 +1,67 @@
+// Exemple de propagation inter-procédurale de l'analyse sensible au chemin (AccessPath)
+// et de détection de pureté IPO pour les fonctions récursives en IFA.
+
+struct AccountBalance {
+    liquid: i64,
+    escrow: i64,
+}
+
+struct LedgerEntry {
+    sender_balance: AccountBalance,
+    receiver_balance: AccountBalance,
+    transaction_id: i64,
+}
+
+// Calcule récursivement un hachage d'intégrité déterministe (fonction pure récursive)
+pub fn compute_checksum(seed: i64, depth: i64) -> i64 {
+    if depth <= 0 {
+        return seed;
+    }
+    return compute_checksum((seed * 31 + depth) % 1000000007, depth - 1);
+}
+
+// Modifie exclusivement le solde liquide de l'émetteur
+pub fn debit_liquid(inout bal: AccountBalance, amount: i64) {
+    bal.liquid = bal.liquid - amount;
+}
+
+// Modifie exclusivement le solde sous séquestre du récepteur
+pub fn credit_escrow(inout bal: AccountBalance, amount: i64) {
+    bal.escrow = bal.escrow + amount;
+}
+
+// Grâce à l'analyse inter-procédurale sensible au chemin, le compilateur sait que
+// `debit_liquid` n'accède qu'au champ `.liquid` du premier compte, et `credit_escrow`
+// n'accède qu'au champ `.escrow` du second compte.
+pub fn transfer_split(inout b1: AccountBalance, inout b2: AccountBalance, amount: i64) {
+    debit_liquid(inout b1, amount);
+    credit_escrow(inout b2, amount);
+}
+
+pub fn main() {
+    mut ledger = LedgerEntry {
+        sender_balance: AccountBalance {
+            liquid: 10000,
+            escrow: 500,
+        },
+        receiver_balance: AccountBalance {
+            liquid: 2000,
+            escrow: 0,
+        },
+        transaction_id: 101,
+    };
+
+    // 1. Appel d'une fonction récursive pure avec mémoïsation / élimination d'appels redondants
+    let hash1 = compute_checksum(ledger.transaction_id, 4);
+    let hash2 = compute_checksum(ledger.transaction_id, 4);
+    let total_checksum = hash1 + hash2;
+
+    // 2. Mutation simultanée de deux sous-champs prouvés disjoints de l'entrée de journal
+    transfer_split(inout ledger.sender_balance, inout ledger.receiver_balance, 1500);
+
+    // 3. Emprunt simultané prouvé disjoint au sein du même compte
+    debit_liquid(inout ledger.sender_balance, 200);
+    credit_escrow(inout ledger.sender_balance, 200);
+
+    println("Transaction validée avec succès");
+}

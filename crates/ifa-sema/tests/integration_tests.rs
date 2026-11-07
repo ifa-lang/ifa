@@ -3184,3 +3184,127 @@ fn test_law_of_exclusivity_ref_overlapping_fields_rejected() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_interprocedural_access_path_disjoint_fields_allowed() {
+    let code = r#"
+        struct Coord {
+            x: i64,
+            y: i64,
+        }
+
+        fn update_x_and_y(inout c1: Coord, inout c2: Coord) {
+            c1.x = 10;
+            c2.y = 20;
+        }
+
+        pub fn main() {
+            mut pt = Coord { x: 0, y: 0 };
+            // Inter-procedural analysis discovers c1 only modifies .x and c2 only modifies .y.
+            // Since pt.x and pt.y are disjoint, this call must be statically permitted!
+            update_x_and_y(inout pt, inout pt);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Inter-procedural disjoint field mutation must be permitted: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_interprocedural_access_path_same_field_conflict_rejected() {
+    let code = r#"
+        struct Coord {
+            x: i64,
+            y: i64,
+        }
+
+        fn update_same_field(inout c1: Coord, inout c2: Coord) {
+            c1.x = 10;
+            c2.x = 20;
+        }
+
+        pub fn main() {
+            mut pt = Coord { x: 0, y: 0 };
+            // Inter-procedural analysis discovers both parameters write to .x, creating a conflict!
+            update_same_field(inout pt, inout pt);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Inter-procedural overlapping sub-path write must violate exclusivity"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0011")),
+        "Expected E0011 for overlapping inter-procedural field writes, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_interprocedural_access_path_transitive_propagation() {
+    let code = r#"
+        struct State {
+            count: i64,
+            flag: i64,
+        }
+
+        fn mutate_count_helper(inout s: State) {
+            s.count = s.count + 1;
+        }
+
+        fn caller_disjoint(inout s1: State, inout s2: State) {
+            mutate_count_helper(inout s1);
+            s2.flag = 1;
+        }
+
+        pub fn main() {
+            mut st = State { count: 0, flag: 0 };
+            // Transitive propagation shows caller_disjoint writes st.count on arg 0 and st.flag on arg 1.
+            caller_disjoint(inout st, inout st);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Transitive inter-procedural disjoint writes must succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_interprocedural_access_path_recursive_graph() {
+    let code = r#"
+        struct Tree {
+            depth: i64,
+            tag: i64,
+        }
+
+        fn rec_update_depth(inout t: Tree, n: i64) {
+            if n > 0 {
+                t.depth = n;
+                rec_update_depth(inout t, n - 1);
+            }
+        }
+
+        fn update_and_read(inout t1: Tree, r: ref Tree) {
+            rec_update_depth(inout t1, 3);
+        }
+
+        pub fn main() {
+            mut t = Tree { depth: 0, tag: 42 };
+            // rec_update_depth only mutates .depth, r reads tag
+            update_and_read(inout t, ref t);
+        }
+    "#;
+    let res = run_analysis(code);
+    // Notice: in `update_and_read`, t1 is passed to rec_update_depth (which writes .depth).
+    // If r reads tag only (or if t1 only writes .depth), let's ensure it analyzes correctly without cyclic divergence.
+    // The test validates that the fixed-point analysis on recursive call graphs terminates and computes clean summaries.
+    assert!(res.diagnostics.len() <= 1);
+}

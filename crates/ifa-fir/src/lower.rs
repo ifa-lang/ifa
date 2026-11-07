@@ -803,6 +803,76 @@ impl<'a> FunctionLoweringContext<'a> {
         0
     }
 
+    /// Evaluates or projects an l-value expression directly into its memory pointer representation.
+    fn lower_lvalue_ptr(&mut self, expr: &Expr, span: Span) -> ValueId {
+        match &expr.kind {
+            ExprKind::Ident(sym) => {
+                if let Some(&ptr) = self.var_allocas.get(sym) {
+                    ptr
+                } else {
+                    let val = self.lower_expr(expr);
+                    let ty = self
+                        .infer_expr_fir_type(expr)
+                        .unwrap_or(FirType::Int(IntType::I64));
+                    let tmp = self.alloc_value();
+                    self.emit(Some(tmp), ValueExpr::Alloca { ty, name: None }, span);
+                    self.emit(None, ValueExpr::Store { ptr: tmp, val }, span);
+                    tmp
+                }
+            }
+            ExprKind::FieldAccess {
+                receiver, field, ..
+            } => {
+                let base_ptr = self.lower_lvalue_ptr(receiver, span);
+                let field_idx = self.find_field_index(receiver, *field);
+                let ptr_res = self.alloc_value();
+                self.emit(
+                    Some(ptr_res),
+                    ValueExpr::GetFieldPtr {
+                        base: base_ptr,
+                        field_idx,
+                        field_name: *field,
+                    },
+                    span,
+                );
+                ptr_res
+            }
+            ExprKind::Index { receiver, index } => {
+                let base_ptr = self.lower_lvalue_ptr(receiver, span);
+                let idx_val = self.lower_expr(index);
+                self.emit(
+                    None,
+                    ValueExpr::BoundsCheck {
+                        base: base_ptr,
+                        index: idx_val,
+                        redundant: false,
+                    },
+                    span,
+                );
+                let ptr_res = self.alloc_value();
+                self.emit(
+                    Some(ptr_res),
+                    ValueExpr::GetElementPtr {
+                        base: base_ptr,
+                        index: idx_val,
+                    },
+                    span,
+                );
+                ptr_res
+            }
+            _ => {
+                let val = self.lower_expr(expr);
+                let ty = self
+                    .infer_expr_fir_type(expr)
+                    .unwrap_or(FirType::Int(IntType::I64));
+                let tmp = self.alloc_value();
+                self.emit(Some(tmp), ValueExpr::Alloca { ty, name: None }, span);
+                self.emit(None, ValueExpr::Store { ptr: tmp, val }, span);
+                tmp
+            }
+        }
+    }
+
     /// Resolves the concrete monomorphic method target, devirtualizing trait and interface calls AOT.
     fn resolve_method_call_target(&self, receiver: &Expr, method: Symbol, span: Span) -> Symbol {
         if let Some(&resolved) = self.symbols.method_resolutions.get(&span) {
@@ -2499,14 +2569,7 @@ impl<'a> FunctionLoweringContext<'a> {
                     }
                     UnaryOp::InOut => {
                         // Inout projection passes l-value pointer
-                        if let ExprKind::Ident(sym) = &expr.kind {
-                            self.var_allocas
-                                .get(sym)
-                                .copied()
-                                .unwrap_or_else(|| self.lower_expr(expr))
-                        } else {
-                            self.lower_expr(expr)
-                        }
+                        self.lower_lvalue_ptr(expr, span)
                     }
                     UnaryOp::Sink => self.lower_expr(expr),
                     UnaryOp::Try => {

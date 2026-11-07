@@ -897,3 +897,48 @@ fn test_fir_sub_slice_range_indexing() {
     let res = interp.execute_function("slice_sum", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(90));
 }
+
+#[test]
+fn test_fir_nested_inout_subfield_lvalue_projection_interp() {
+    let src = r#"
+        struct Vec2 {
+            x: i64,
+            y: i64,
+        }
+
+        struct Player {
+            pos: Vec2,
+            score: i64,
+        }
+
+        fn shift_x(inout v: Vec2, delta: i64) {
+            v.x = v.x + delta;
+        }
+
+        pub fn test_main() -> i64 {
+            mut p = Player {
+                pos: Vec2 { x: 10, y: 20 },
+                score: 100,
+            };
+            shift_x(inout p.pos, 5);
+            return p.pos.x + p.score;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("inout_lvalue_test.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, parse_diags) = ifa_parser::parse(fid, tokens);
+    assert!(parse_diags.is_empty(), "Parse diags: {:?}", parse_diags);
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("test_main", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(115));
+}

@@ -1137,6 +1137,50 @@ impl<'a> FirInterpreter<'a> {
                             ))
                         }
                     }
+                    FirValue::FieldPointer { base_addr, path } => {
+                        let target = self
+                            .stack_memory
+                            .get_mut(base_addr)
+                            .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                        let sub_struct = navigate_value_mut(target, path)?;
+                        match sub_struct {
+                            FirValue::Struct { fields, .. } => {
+                                if let Some(slot) = fields.get_mut(*field_idx) {
+                                    *slot = val_to_set;
+                                    Ok(FirValue::Unit)
+                                } else {
+                                    Err(InterpError::Panic(format!(
+                                        "Field index {} out of bounds",
+                                        field_idx
+                                    )))
+                                }
+                            }
+                            _ => Err(InterpError::TypeMismatch("Target must be a struct".into())),
+                        }
+                    }
+                    FirValue::HeapFieldPointer {
+                        slot,
+                        generation,
+                        path,
+                    } => {
+                        self.heap.check(*slot, *generation)?;
+                        let target = self.heap.deref_mut(*slot)?;
+                        let sub_struct = navigate_value_mut(target, path)?;
+                        match sub_struct {
+                            FirValue::Struct { fields, .. } => {
+                                if let Some(slot_item) = fields.get_mut(*field_idx) {
+                                    *slot_item = val_to_set;
+                                    Ok(FirValue::Unit)
+                                } else {
+                                    Err(InterpError::Panic(format!(
+                                        "Field index {} out of bounds",
+                                        field_idx
+                                    )))
+                                }
+                            }
+                            _ => Err(InterpError::TypeMismatch("Target must be a struct".into())),
+                        }
+                    }
                     _ => Err(InterpError::TypeMismatch(
                         "SetField requires pointer or generational reference".into(),
                     )),

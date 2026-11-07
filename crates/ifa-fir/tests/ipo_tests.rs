@@ -182,3 +182,209 @@ fn test_ipo_impure_call_prevents_loop_vectorization() {
         formatted
     );
 }
+
+#[test]
+fn test_ipo_recursive_pure_graph_fibonacci() {
+    let src = r#"
+        pub fn fib(n: i64) -> i64 {
+            if n <= 1 {
+                return n;
+            }
+            return fib(n - 1) + fib(n - 2);
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("fib_test.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module =
+        compile_to_fir_with_opts(&prog, &analysis.symbols, true, true, true, false).unwrap();
+    let mut ipo_pass = IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    let stats = ipo_pass.stats();
+    assert_eq!(
+        stats.pure_functions, 1,
+        "fib must be proven pure inter-procedurally"
+    );
+    assert_eq!(
+        stats.recursive_functions_detected, 1,
+        "fib must be identified as self-recursive"
+    );
+    assert_eq!(
+        stats.pure_calls_inlined_in_loops, 0,
+        "Recursive function must not be inlined into loops"
+    );
+}
+
+#[test]
+fn test_ipo_mutually_recursive_functions_purity() {
+    let src = r#"
+        pub fn is_even(n: i64) -> bool {
+            if n == 0 {
+                return true;
+            }
+            return is_odd(n - 1);
+        }
+
+        pub fn is_odd(n: i64) -> bool {
+            if n == 0 {
+                return false;
+            }
+            return is_even(n - 1);
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("mutual_rec.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module =
+        compile_to_fir_with_opts(&prog, &analysis.symbols, true, true, true, false).unwrap();
+    let mut ipo_pass = IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    let stats = ipo_pass.stats();
+    assert_eq!(
+        stats.pure_functions, 2,
+        "Both mutually recursive functions must be proven pure"
+    );
+    assert_eq!(
+        stats.recursive_functions_detected, 2,
+        "Both must be detected in recursive SCC cycle"
+    );
+}
+
+#[test]
+fn test_ipo_recursive_with_io_marked_impure() {
+    let src = r#"
+        pub fn rec_with_log(n: i64) -> i64 {
+            if n <= 0 {
+                println("base");
+                return 0;
+            }
+            return rec_with_log(n - 1) + 1;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("impure_rec.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module =
+        compile_to_fir_with_opts(&prog, &analysis.symbols, true, true, true, false).unwrap();
+    let mut ipo_pass = IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    let stats = ipo_pass.stats();
+    assert_eq!(
+        stats.pure_functions, 0,
+        "Recursive function with I/O in any branch must be marked impure"
+    );
+    assert_eq!(
+        stats.recursive_functions_detected, 1,
+        "Must still detect recursive structure"
+    );
+}
+
+#[test]
+fn test_ipo_pure_call_cse_elimination() {
+    let src = r#"
+        pub fn compute_hash(val: i64) -> i64 {
+            return val * 31 + 7;
+        }
+
+        pub fn caller_with_redundant_calls(x: i64) -> i64 {
+            let a = compute_hash(x);
+            let b = compute_hash(x);
+            return a + b;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("cse_test.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module =
+        compile_to_fir_with_opts(&prog, &analysis.symbols, true, true, true, false).unwrap();
+    let mut ipo_pass = IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    let stats = ipo_pass.stats();
+    assert!(stats.pure_functions >= 2, "Both functions are pure");
+    assert!(
+        stats.pure_calls_cse_eliminated >= 1,
+        "Redundant pure call compute_hash(x) must be eliminated via CSE: {:?}",
+        stats
+    );
+}
+
+#[test]
+fn test_ipo_local_stack_alloca_mutation_is_pure() {
+    let src = r#"
+        struct LocalPoint {
+            x: f32,
+            y: f32,
+        }
+
+        pub fn build_and_sum(a: f32, b: f32) -> f32 {
+            mut pt = LocalPoint { x: a, y: b };
+            pt.x = pt.x * 2.0;
+            return pt.x + pt.y;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("local_stack.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module =
+        compile_to_fir_with_opts(&prog, &analysis.symbols, true, true, true, false).unwrap();
+    let mut ipo_pass = IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    let stats = ipo_pass.stats();
+    let pt_fn_sym = INTERNER.intern("build_and_sum");
+    let pure_funcs = IpoPass::compute_pure_functions(&module);
+    assert!(
+        pure_funcs.contains(&pt_fn_sym),
+        "build_and_sum mutates only local stack alloca fields and must be proven pure! Stats: {:?}",
+        stats
+    );
+}

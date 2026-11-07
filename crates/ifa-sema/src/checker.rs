@@ -1,7 +1,7 @@
 use crate::escape::EscapeAnalyzer;
 use crate::exclusivity::{
-    check_assignment_target_with_active, check_call_exclusivity_with_active, extract_access_path,
-    BorrowKind, BorrowRecord,
+    check_assignment_target_with_active, check_call_exclusivity_interproc, extract_access_path,
+    BorrowKind, BorrowRecord, InterproceduralAccessMap,
 };
 use crate::symbol_table::{
     CapturedVariable, ConstSymbol, EnumSymbol, FieldSymbol, FunctionSymbol, ParamSymbol,
@@ -109,6 +109,7 @@ pub struct SemanticAnalyzer<'a> {
     pub expr_types: HashMap<Span, Type>,
     pub moved_vars: HashMap<Symbol, Span>,
     pub active_borrows: Vec<BorrowRecord>,
+    pub interproc_access: InterproceduralAccessMap,
     pub comptime_vm: ifa_comptime::ComptimeVM,
 }
 
@@ -128,6 +129,7 @@ impl<'a> SemanticAnalyzer<'a> {
             expr_types: HashMap::new(),
             moved_vars: HashMap::new(),
             active_borrows: Vec::new(),
+            interproc_access: InterproceduralAccessMap::default(),
             comptime_vm: ifa_comptime::ComptimeVM::new(),
         }
     }
@@ -141,6 +143,9 @@ impl<'a> SemanticAnalyzer<'a> {
 
         // Phase 2: Collect function and constant signatures
         self.collect_signatures(program);
+
+        // Phase 2.5: Compute inter-procedural access path summaries
+        self.interproc_access = InterproceduralAccessMap::compute_module_summaries(program);
 
         // Phase 3: Check bodies and expressions
         self.check_program_bodies(program);
@@ -3919,10 +3924,12 @@ impl<'a> SemanticAnalyzer<'a> {
 
             if let Some((sig_params, sig_ret)) = fn_sig {
                 let param_modes: Vec<ParamMode> = sig_params.iter().map(|(m, _)| *m).collect();
-                check_call_exclusivity_with_active(
+                check_call_exclusivity_interproc(
+                    None,
                     args,
                     &param_modes,
                     &self.active_borrows,
+                    Some(&self.interproc_access),
                     &self.symbols,
                     &mut self.diagnostics,
                 );
@@ -3982,10 +3989,12 @@ impl<'a> SemanticAnalyzer<'a> {
         } else {
             // Function or standard library function not yet in symbol table (e.g. io::println, http::Server::new)
             let param_modes = vec![ParamMode::In; args.len()];
-            check_call_exclusivity_with_active(
+            check_call_exclusivity_interproc(
+                None,
                 args,
                 &param_modes,
                 &self.active_borrows,
+                Some(&self.interproc_access),
                 &self.symbols,
                 &mut self.diagnostics,
             );
@@ -4193,11 +4202,13 @@ impl<'a> SemanticAnalyzer<'a> {
     ) -> Type {
         let param_modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
 
-        // Check Law of Exclusivity on arguments!
-        check_call_exclusivity_with_active(
+        // Check Law of Exclusivity on arguments with inter-procedural path-sensitive analysis!
+        check_call_exclusivity_interproc(
+            Some(f.name),
             args,
             &param_modes,
             &self.active_borrows,
+            Some(&self.interproc_access),
             &self.symbols,
             &mut self.diagnostics,
         );
