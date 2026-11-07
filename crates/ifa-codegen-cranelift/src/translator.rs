@@ -630,6 +630,8 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 None
             }
 
+            ValueExpr::BoundsCheck { .. } | ValueExpr::SliceBoundsCheck { .. } => None,
+
             ValueExpr::Yield => {
                 if let Some(func_id) = self.func_ids.get("ifa_rt_fiber_yield") {
                     let local_func = self

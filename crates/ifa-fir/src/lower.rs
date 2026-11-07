@@ -1398,6 +1398,15 @@ impl<'a> FunctionLoweringContext<'a> {
                         let idx_id = self.lower_expr(index);
                         self.emit(
                             None,
+                            ValueExpr::BoundsCheck {
+                                base: base_id,
+                                index: idx_id,
+                                redundant: false,
+                            },
+                            *span,
+                        );
+                        self.emit(
+                            None,
                             ValueExpr::SetElement {
                                 base: base_id,
                                 index: idx_id,
@@ -2068,6 +2077,16 @@ impl<'a> FunctionLoweringContext<'a> {
                     continue_block: step_block,
                     break_block: exit_block,
                 });
+
+                self.emit(
+                    None,
+                    ValueExpr::BoundsCheck {
+                        base: iter_val,
+                        index: cur_idx,
+                        redundant: false,
+                    },
+                    *span,
+                );
 
                 let elem_val = self.alloc_value();
                 self.emit(
@@ -3233,6 +3252,16 @@ impl<'a> FunctionLoweringContext<'a> {
                         },
                         span,
                     );
+                    self.emit(
+                        None,
+                        ValueExpr::SliceBoundsCheck {
+                            base,
+                            start: start_val,
+                            end: end_val,
+                            redundant: false,
+                        },
+                        span,
+                    );
                     let res = self.alloc_value();
                     self.emit(
                         Some(res),
@@ -3247,6 +3276,15 @@ impl<'a> FunctionLoweringContext<'a> {
                     res
                 } else {
                     let idx = self.lower_expr(index);
+                    self.emit(
+                        None,
+                        ValueExpr::BoundsCheck {
+                            base,
+                            index: idx,
+                            redundant: false,
+                        },
+                        span,
+                    );
                     let res = self.alloc_value();
                     self.emit(Some(res), ValueExpr::GetElement { base, index: idx }, span);
                     res
@@ -5277,6 +5315,15 @@ impl<'a> FunctionLoweringContext<'a> {
                         p.span(),
                     );
 
+                    self.emit(
+                        None,
+                        ValueExpr::BoundsCheck {
+                            base: target_val,
+                            index: idx_val,
+                            redundant: false,
+                        },
+                        p.span(),
+                    );
                     let elem_val = self.alloc_value();
                     self.emit(
                         Some(elem_val),
@@ -5452,6 +5499,15 @@ impl<'a> FunctionLoweringContext<'a> {
                         }
                     };
 
+                    self.emit(
+                        None,
+                        ValueExpr::BoundsCheck {
+                            base: target_val,
+                            index: idx_val,
+                            redundant: false,
+                        },
+                        s.span(),
+                    );
                     let elem_val = self.alloc_value();
                     self.emit(
                         Some(elem_val),

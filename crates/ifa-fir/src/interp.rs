@@ -1902,6 +1902,98 @@ impl<'a> FirInterpreter<'a> {
                 }
                 Ok(FirValue::Unit)
             }
+            ValueExpr::BoundsCheck {
+                base,
+                index,
+                redundant,
+            } => {
+                if !*redundant {
+                    let base_val = env.get(base).ok_or(InterpError::UndefinedValue(*base))?;
+                    let idx_val = env.get(index).ok_or(InterpError::UndefinedValue(*index))?;
+                    let idx = match idx_val {
+                        FirValue::Int(i) => *i,
+                        _ => {
+                            return Err(InterpError::TypeMismatch(
+                                "Index must be an integer".into(),
+                            ))
+                        }
+                    };
+                    let len = match base_val {
+                        FirValue::Array(elements) => elements.len() as i128,
+                        FirValue::String(s) => s.len() as i128,
+                        FirValue::Pointer(addr) => {
+                            if let Some(target) = self.stack_memory.get(addr) {
+                                match target {
+                                    FirValue::Array(elements) => elements.len() as i128,
+                                    FirValue::String(s) => s.len() as i128,
+                                    _ => 0,
+                                }
+                            } else {
+                                0
+                            }
+                        }
+                        _ => 0,
+                    };
+                    if len > 0 && (idx < 0 || idx >= len) {
+                        return Err(InterpError::Panic(format!(
+                            "Out of bounds check failure: index {} with length {}",
+                            idx, len
+                        )));
+                    }
+                }
+                Ok(FirValue::Unit)
+            }
+            ValueExpr::SliceBoundsCheck {
+                base,
+                start,
+                end,
+                redundant,
+            } => {
+                if !*redundant {
+                    let base_val = env.get(base).ok_or(InterpError::UndefinedValue(*base))?;
+                    let start_val = env.get(start).ok_or(InterpError::UndefinedValue(*start))?;
+                    let end_val = env.get(end).ok_or(InterpError::UndefinedValue(*end))?;
+                    let s_idx = match start_val {
+                        FirValue::Int(i) => *i,
+                        _ => {
+                            return Err(InterpError::TypeMismatch(
+                                "Slice start must be an integer".into(),
+                            ))
+                        }
+                    };
+                    let e_idx = match end_val {
+                        FirValue::Int(i) => *i,
+                        _ => {
+                            return Err(InterpError::TypeMismatch(
+                                "Slice end must be an integer".into(),
+                            ))
+                        }
+                    };
+                    let len = match base_val {
+                        FirValue::Array(elements) => elements.len() as i128,
+                        FirValue::String(s) => s.len() as i128,
+                        FirValue::Pointer(addr) => {
+                            if let Some(target) = self.stack_memory.get(addr) {
+                                match target {
+                                    FirValue::Array(elements) => elements.len() as i128,
+                                    FirValue::String(s) => s.len() as i128,
+                                    _ => 0,
+                                }
+                            } else {
+                                0
+                            }
+                        }
+                        _ => 0,
+                    };
+                    if s_idx < 0 || s_idx > e_idx || (len > 0 && e_idx > len) {
+                        return Err(InterpError::Panic(format!(
+                            "Out of bounds slice check failure: range [{}..{}] exceeds length {}",
+                            s_idx, e_idx, len
+                        )));
+                    }
+                }
+                Ok(FirValue::Unit)
+            }
             ValueExpr::GenDeref { ref_val } => {
                 let v = env
                     .get(ref_val)

@@ -1,3 +1,4 @@
+pub mod bce;
 pub mod cfg;
 pub mod closure_opt;
 pub mod cow;
@@ -14,6 +15,7 @@ pub mod types;
 pub mod vectorize;
 pub mod verify;
 
+pub use bce::{BcePass, BceStats};
 pub use cfg::ControlFlowGraph;
 pub use closure_opt::{ClosureAllocationKind, ClosureEscapeStats, ClosureOptPass};
 pub use cow::{CowPass, SharingState};
@@ -83,6 +85,9 @@ pub fn compile_to_fir_with_opts(
         let mut gen_pass = GenerationalOptPass::new();
         gen_pass.run_on_module(&mut module);
     }
+
+    let mut bce_pass = BcePass::new();
+    bce_pass.run_on_module(&mut module);
 
     if opt_vectorize {
         let mut vec_pass = VectorizePass::new();

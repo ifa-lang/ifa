@@ -290,3 +290,70 @@ fn test_llvm_array_out_of_bounds_aborts_safely() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_bce_eliminates_checks_in_pure_loop() {
+    let src = r#"
+        pub fn sum_fixed() -> i64 {
+            let arr: [i64; 4] = [10, 20, 30, 40];
+            let mut acc: i64 = 0;
+            for x in arr {
+                acc = acc + x;
+            }
+            return acc;
+        }
+
+        pub fn main() -> i64 {
+            return sum_fixed();
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let file_id = sm.add_file("loop_bce_llvm.ifa".to_string(), src);
+    let tokens = tokenize(file_id, src);
+    let (prog, diags) = parse(file_id, tokens);
+    assert!(diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).expect("FIR failed");
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let llvm_ir = emitter
+        .emit_module(&fir_module)
+        .expect("LLVM emission failed");
+
+    // In a pure for-loop over fixed array, all bounds checks are eliminated by BCE!
+    assert!(
+        !llvm_ir.contains("call void @ifa_rt_bounds_check"),
+        "LLVM IR must NOT contain bounds check calls inside eliminated loop:\n{}",
+        llvm_ir
+    );
+
+    // Verify native compilation and execution
+    let temp_dir = std::env::temp_dir().join(format!("ifa_loop_bce_exec_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("loop_bce.o");
+    let bin_path = temp_dir.join("loop_bce_exec");
+
+    let compiler = ifa_codegen_llvm::LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&fir_module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+
+    let link_res = ifa_codegen_llvm::LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    // sum = 10 + 20 + 30 + 40 = 100
+    assert_eq!(output.status.code(), Some(100));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

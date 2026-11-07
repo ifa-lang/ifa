@@ -166,6 +166,24 @@ impl SroaPass {
                             escaping.insert(*val);
                         }
                     }
+                    ValueExpr::BoundsCheck { base: _, index, .. } => {
+                        if alloca_info.contains_key(index) {
+                            escaping.insert(*index);
+                        }
+                    }
+                    ValueExpr::SliceBoundsCheck {
+                        base: _,
+                        start,
+                        end,
+                        ..
+                    } => {
+                        if alloca_info.contains_key(start) {
+                            escaping.insert(*start);
+                        }
+                        if alloca_info.contains_key(end) {
+                            escaping.insert(*end);
+                        }
+                    }
                     // Escaping operations: taking generational reference, passing to calls, returning, etc.
                     ValueExpr::GenRef { ptr } | ValueExpr::GenFree { ptr } => {
                         if alloca_info.contains_key(ptr) {
@@ -371,7 +389,10 @@ impl SroaPass {
                                     }
                                 }
                             }
-                            ValueExpr::GetElement { base: p, index } if is_array && *p == ptr => {
+                            ValueExpr::GetElement { base: p, index }
+                            | ValueExpr::BoundsCheck { base: p, index, .. }
+                                if is_array && *p == ptr =>
+                            {
                                 match const_ints.get(index) {
                                     Some(&k) if k < field_types.len() => {}
                                     _ => {
@@ -397,14 +418,17 @@ impl SroaPass {
                     continue;
                 }
 
-                // Verify that loaded aggregate values are ONLY used as base in GetField (struct) or GetElement (array)
+                // Verify that loaded aggregate values are ONLY used as base in GetField (struct) or GetElement / BoundsCheck (array)
                 for block in &func.blocks {
                     for inst in &block.instructions {
                         for u in inst.expr.uses() {
                             if loaded_values.contains(&u) {
                                 if is_array {
                                     match &inst.expr {
-                                        ValueExpr::GetElement { base, index } if *base == u => {
+                                        ValueExpr::GetElement { base, index }
+                                        | ValueExpr::BoundsCheck { base, index, .. }
+                                            if *base == u =>
+                                        {
                                             match const_ints.get(index) {
                                                 Some(&k) if k < field_types.len() => {}
                                                 _ => {
@@ -626,6 +650,18 @@ impl SroaPass {
                                 }
                             }
                         }
+                    }
+                }
+
+                // If checking bounds on a decomposed aggregate array (already proven safe):
+                if let ValueExpr::BoundsCheck { base, .. } = &inst.expr {
+                    if struct_to_fields.contains_key(base)
+                        || struct_loads
+                            .get(base)
+                            .is_some_and(|p| struct_to_fields.contains_key(p))
+                    {
+                        self.stats.eliminated_dead_insts += 1;
+                        continue;
                     }
                 }
 
@@ -942,6 +978,17 @@ impl SroaPass {
                 replace(base);
             }
             ValueExpr::SliceSub { base, start, end } => {
+                replace(base);
+                replace(start);
+                replace(end);
+            }
+            ValueExpr::BoundsCheck { base, index, .. } => {
+                replace(base);
+                replace(index);
+            }
+            ValueExpr::SliceBoundsCheck {
+                base, start, end, ..
+            } => {
                 replace(base);
                 replace(start);
                 replace(end);

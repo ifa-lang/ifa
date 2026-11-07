@@ -227,6 +227,37 @@ impl<'a> FirPrinter<'a> {
             ValueExpr::SliceSub { base, start, end } => {
                 write!(self.output, "slicesub {}, {}, {}", base, start, end)
             }
+            ValueExpr::BoundsCheck {
+                base,
+                index,
+                redundant,
+            } => {
+                if *redundant {
+                    write!(self.output, "bounds.check {}, {} [eliminated]", base, index)
+                } else {
+                    write!(self.output, "bounds.check {}, {}", base, index)
+                }
+            }
+            ValueExpr::SliceBoundsCheck {
+                base,
+                start,
+                end,
+                redundant,
+            } => {
+                if *redundant {
+                    write!(
+                        self.output,
+                        "slice.bounds.check {}, {}..{} [eliminated]",
+                        base, start, end
+                    )
+                } else {
+                    write!(
+                        self.output,
+                        "slice.bounds.check {}, {}..{}",
+                        base, start, end
+                    )
+                }
+            }
             ValueExpr::StructPushField {
                 base,
                 field_idx,
