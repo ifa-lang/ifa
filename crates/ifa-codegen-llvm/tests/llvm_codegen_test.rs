@@ -5344,6 +5344,11 @@ pub fn main() -> i64 {
 #[test]
 fn test_llvm_aot_for_loop_inout_array_and_tuple_destructuring() {
     let src = r#"
+struct Point {
+    x: i64,
+    y: i64,
+}
+
 pub fn main() -> i64 {
     mut nums: [i64; 4] = [2, 4, 6, 8];
     for inout n in nums {
@@ -5362,7 +5367,16 @@ pub fn main() -> i64 {
     let (x1, y1) = pairs[1];
     let sum2 = x0 + y0 + x1 + y1; // 36
 
-    if sum1 == 10 && sum2 == 36 {
+    mut points: [Point; 2] = [Point { x: 1, y: 2 }, Point { x: 3, y: 4 }];
+    for Point { inout x, inout y } in points {
+        x = x * 10;
+        y = y * 2;
+    }
+    let p0 = points[0];
+    let p1 = points[1];
+    let sum3 = p0.x + p0.y + p1.x + p1.y; // 52
+
+    if sum1 == 10 && sum2 == 36 && sum3 == 52 {
         return 42;
     }
     return 1;

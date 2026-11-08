@@ -2053,3 +2053,49 @@ pub fn main() -> i64 {
         "Inout tuple destructuring must mutate tuple fields in place (11 + 4 + 13 + 8 = 36)"
     );
 }
+
+#[test]
+fn test_jit_for_loop_inout_struct_destructuring() {
+    let src = r#"
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+pub fn main() -> i64 {
+    mut points: [Point; 2] = [Point { x: 1, y: 2 }, Point { x: 3, y: 4 }];
+    for Point { inout x, inout y } in points {
+        x = x * 10;
+        y = y * 2;
+    }
+    let p0 = points[0];
+    let p1 = points[1];
+    return p0.x + p0.y + p1.x + p1.y;
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("for_inout_struct.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR with for-loop inout struct destructuring to Cranelift JIT");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 52,
+        "Inout struct destructuring must mutate struct fields in place (10 + 4 + 30 + 8 = 52)"
+    );
+}
