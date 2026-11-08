@@ -41,6 +41,10 @@ impl FirVerifier {
 
     /// Verify a single FIR function.
     pub fn verify_function(func: &FirFunction) -> Result<(), Vec<FirVerifyError>> {
+        if func.blocks.is_empty() {
+            return Ok(());
+        }
+
         let mut errors = Vec::new();
 
         // 1. Check all blocks have valid terminators

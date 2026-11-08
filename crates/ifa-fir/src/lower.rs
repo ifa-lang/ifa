@@ -5824,6 +5824,19 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
                     module.functions.extend(lifted_funcs);
                     module.structs.extend(lifted_structs);
                 }
+            } else if func_ast.is_extern.is_some() && lowered_fn_names.insert(*fn_name) {
+                let ctx = FunctionLoweringContext::new(
+                    func_ast,
+                    symbols,
+                    &constants,
+                    Some(*fn_name),
+                    HashMap::new(),
+                    &module.structs,
+                    &module.enums,
+                );
+                let mut fir_func = ctx.func;
+                fir_func.blocks.clear();
+                module.functions.push(fir_func);
             }
         }
     }

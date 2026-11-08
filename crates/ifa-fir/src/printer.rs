@@ -50,6 +50,9 @@ impl<'a> FirPrinter<'a> {
 
     pub fn print_function(&mut self, func: &FirFunction) -> fmt::Result {
         self.indent();
+        if let Some(abi) = &func.is_extern {
+            write!(self.output, "extern \"{}\" ", abi)?;
+        }
         if func.is_strict {
             write!(self.output, "strict ")?;
         }
@@ -65,6 +68,10 @@ impl<'a> FirPrinter<'a> {
                 write!(self.output, "{} ", p.mode)?;
             }
             write!(self.output, "{}: {}", p.val, p.ty)?;
+        }
+        if func.blocks.is_empty() {
+            writeln!(self.output, ") -> {};", func.ret_ty)?;
+            return Ok(());
         }
         writeln!(self.output, ") -> {} {{", func.ret_ty)?;
 

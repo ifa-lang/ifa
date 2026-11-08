@@ -39,15 +39,30 @@ impl SroaPass {
         self.stats
     }
 
-    /// Run SROA and allocation elimination on an entire FIR module.
+    /// Run SROA and allocation elimination on an entire FIR module leveraging whole-module inter-procedural memory analysis.
     pub fn run_on_module(&mut self, module: &mut FirModule) {
+        let call_graph = crate::ipo::IpoCallGraph::build(module);
+        let mem_map = crate::ipo::InterproceduralMemoryMap::compute(module, &call_graph);
         for func in &mut module.functions {
-            self.run_on_function(func);
+            self.run_on_function_with_mem_map(func, Some(&mem_map));
         }
     }
 
     /// Run SROA and allocation elimination on a single FIR function.
     pub fn run_on_function(&mut self, func: &mut FirFunction) {
+        self.run_on_function_with_mem_map(func, None);
+    }
+
+    /// Run SROA and allocation elimination on a single FIR function with optional inter-procedural memory access summary.
+    pub fn run_on_function_with_mem_map(
+        &mut self,
+        func: &mut FirFunction,
+        mem_map: Option<&crate::ipo::InterproceduralMemoryMap>,
+    ) {
+        if func.blocks.is_empty() {
+            return;
+        }
+
         // Step 1: Collect all local Alloca instructions
         let mut alloca_info: HashMap<ValueId, (FirType, Option<Symbol>, Span, BlockId)> =
             HashMap::new();
@@ -62,7 +77,7 @@ impl SroaPass {
 
         if !alloca_info.is_empty() {
             // Step 2: Escape analysis across all instructions and terminators
-            let escaping = Self::analyze_escapes(func, &alloca_info);
+            let escaping = self.analyze_escapes_with_mem(func, &alloca_info, mem_map);
             let non_escaping: HashSet<ValueId> = alloca_info
                 .keys()
                 .copied()
@@ -83,7 +98,8 @@ impl SroaPass {
                 }
 
                 // Re-analyze non-escaping allocas now that aggregates are decomposed
-                let escaping_after_sroa = Self::analyze_escapes(func, &alloca_info);
+                let escaping_after_sroa =
+                    self.analyze_escapes_with_mem(func, &alloca_info, mem_map);
                 let candidates: HashSet<ValueId> = alloca_info
                     .keys()
                     .copied()
@@ -91,7 +107,7 @@ impl SroaPass {
                     .collect();
 
                 // Step 4: Promote non-escaping allocations to SSA values (Store-to-Load forwarding)
-                self.promote_allocations_to_registers(func, &candidates);
+                self.promote_allocations_to_registers_with_mem(func, &candidates, mem_map);
             }
         }
 
@@ -104,9 +120,20 @@ impl SroaPass {
     }
 
     /// Identifies all ValueIds that escape their local stack frame.
-    fn analyze_escapes(
+    pub fn analyze_escapes(
         func: &FirFunction,
         alloca_info: &HashMap<ValueId, (FirType, Option<Symbol>, Span, BlockId)>,
+    ) -> HashSet<ValueId> {
+        let mut pass = Self::new();
+        pass.analyze_escapes_with_mem(func, alloca_info, None)
+    }
+
+    /// Identifies all ValueIds that escape their local stack frame using optional inter-procedural memory analysis.
+    fn analyze_escapes_with_mem(
+        &mut self,
+        func: &FirFunction,
+        alloca_info: &HashMap<ValueId, (FirType, Option<Symbol>, Span, BlockId)>,
+        _mem_map: Option<&crate::ipo::InterproceduralMemoryMap>,
     ) -> HashSet<ValueId> {
         let mut escaping = HashSet::new();
 
@@ -681,10 +708,21 @@ impl SroaPass {
     }
 
     /// Promotes non-escaping stack allocations into SSA values via dominance and store-to-load forwarding.
-    fn promote_allocations_to_registers(
+    pub fn promote_allocations_to_registers(
         &mut self,
         func: &mut FirFunction,
         candidates: &HashSet<ValueId>,
+    ) {
+        self.promote_allocations_to_registers_with_mem(func, candidates, None);
+    }
+
+    /// Promotes non-escaping stack allocations into SSA values via dominance and store-to-load forwarding
+    /// using optional whole-module inter-procedural memory effect summaries.
+    fn promote_allocations_to_registers_with_mem(
+        &mut self,
+        func: &mut FirFunction,
+        candidates: &HashSet<ValueId>,
+        mem_map: Option<&crate::ipo::InterproceduralMemoryMap>,
     ) {
         if candidates.is_empty() {
             return;
@@ -784,6 +822,30 @@ impl SroaPass {
                                     dead_loads.insert(res);
                                     self.stats.promoted_loads += 1;
                                 }
+                            }
+                            ValueExpr::CallDirect { name, args } => {
+                                if let Some(map) = mem_map {
+                                    if let Some(callee_sum) = map.summaries.get(name) {
+                                        for (idx, arg) in args.iter().enumerate() {
+                                            if arg == &ptr
+                                                && callee_sum
+                                                    .params
+                                                    .get(idx)
+                                                    .map(|p| p.written)
+                                                    .unwrap_or(true)
+                                            {
+                                                current_val = None;
+                                            }
+                                        }
+                                    } else if args.contains(&ptr) {
+                                        current_val = None;
+                                    }
+                                } else if args.contains(&ptr) {
+                                    current_val = None;
+                                }
+                            }
+                            ValueExpr::BlockingCallDirect { args, .. } if args.contains(&ptr) => {
+                                current_val = None;
                             }
                             _ => {}
                         }

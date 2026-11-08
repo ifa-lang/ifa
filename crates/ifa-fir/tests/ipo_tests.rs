@@ -388,3 +388,151 @@ fn test_ipo_local_stack_alloca_mutation_is_pure() {
         stats
     );
 }
+
+#[test]
+fn test_ipo_strict_ffi_elevation_and_cse() {
+    let src = r#"
+        extern "C" strict fn c_hypot(x: f64, y: f64) -> f64;
+
+        pub fn compute_double_dist(x: f64, y: f64) -> f64 {
+            let d1 = c_hypot(x, y);
+            let d2 = c_hypot(x, y);
+            return d1 + d2;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_ffi_cse.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module =
+        compile_to_fir_with_opts(&prog, &analysis.symbols, true, true, true, false).unwrap();
+    let call_graph = ifa_fir::IpoCallGraph::build(&module);
+    let mem_map = ifa_fir::InterproceduralMemoryMap::compute(&module, &call_graph);
+
+    let c_hypot_sym = INTERNER.intern("c_hypot");
+    let caller_sym = INTERNER.intern("compute_double_dist");
+
+    assert!(
+        mem_map.is_pure(&c_hypot_sym),
+        "extern 'C' strict fn c_hypot must be elevated to Pure"
+    );
+    assert!(
+        mem_map.is_pure(&caller_sym),
+        "compute_double_dist calling c_hypot must be proven Pure"
+    );
+
+    let mut ipo_pass = IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    let stats = ipo_pass.stats();
+    assert!(
+        stats.strict_ffi_pure_functions >= 1,
+        "strict_ffi_pure_functions should be >= 1, got {:?}",
+        stats
+    );
+    assert_eq!(
+        stats.pure_calls_cse_eliminated, 1,
+        "Second pure call to c_hypot(x, y) must be eliminated by pure call CSE: {:?}",
+        stats
+    );
+}
+
+#[test]
+fn test_ipo_strict_ffi_loop_vectorization_allowed() {
+    let src = r#"
+        extern "C" strict fn c_cos_f32(x: f32) -> f32;
+
+        pub fn compute_cosine_table(mut data: [f32; 64]) {
+            mut i = 0;
+            while i < 64 {
+                data[i] = c_cos_f32(data[i]);
+                i = i + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_ffi_loop.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    // Full optimization with vectorization enabled
+    let module =
+        compile_to_fir_with_opts(&prog, &analysis.symbols, true, true, true, true).unwrap();
+    let c_cos_sym = INTERNER.intern("c_cos_f32");
+    let pure_funcs = IpoPass::compute_pure_functions(&module);
+    assert!(
+        pure_funcs.contains(&c_cos_sym),
+        "c_cos_f32 must be in pure_funcs set"
+    );
+
+    // Find the caller function in FIR
+    let caller_func = module
+        .functions
+        .iter()
+        .find(|f| INTERNER.resolve(&f.name) == "compute_cosine_table")
+        .expect("compute_cosine_table must exist in FIR module");
+
+    // Verify it contains Vectorize hints and preserved calls
+    let formatted = format_function(caller_func);
+    assert!(
+        formatted.contains("c_cos_f32"),
+        "Function must preserve strict pure FFI call: {}",
+        formatted
+    );
+}
+
+#[test]
+fn test_ipo_non_strict_ffi_remains_impure() {
+    let src = r#"
+        extern "C" fn c_impure_log(val: i64);
+
+        pub fn my_logger(x: i64) {
+            c_impure_log(x);
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("impure_ffi.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module =
+        compile_to_fir_with_opts(&prog, &analysis.symbols, true, true, true, false).unwrap();
+    let call_graph = ifa_fir::IpoCallGraph::build(&module);
+    let mem_map = ifa_fir::InterproceduralMemoryMap::compute(&module, &call_graph);
+
+    let log_sym = INTERNER.intern("c_impure_log");
+    let caller_sym = INTERNER.intern("my_logger");
+
+    assert_eq!(
+        mem_map.get_summary(&log_sym).map(|s| s.effect),
+        Some(ifa_fir::MemoryEffect::Arbitrary),
+        "Non-strict extern C must have Arbitrary memory effect"
+    );
+    assert_eq!(
+        mem_map.get_summary(&caller_sym).map(|s| s.effect),
+        Some(ifa_fir::MemoryEffect::Arbitrary),
+        "Caller of non-strict extern C must inherit Arbitrary effect"
+    );
+}

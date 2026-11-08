@@ -962,11 +962,27 @@ impl<'a> LlvmIrEmitter<'a> {
                         _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()),
                     })
                     .collect();
+                let strict_attr = if func.is_strict {
+                    let has_pointers = func.params.iter().any(|p| {
+                        matches!(
+                            p.ty,
+                            ifa_fir::FirType::Pointer(..) | ifa_fir::FirType::Array(..)
+                        )
+                    });
+                    if has_pointers {
+                        " #3"
+                    } else {
+                        " #0"
+                    }
+                } else {
+                    ""
+                };
                 out.push_str(&format!(
-                    "declare {} @{}({})\n",
+                    "declare {} @{}({}){}\n",
                     ret_ty_str,
                     fn_name,
-                    param_types.join(", ")
+                    param_types.join(", "),
+                    strict_attr
                 ));
             }
         }
@@ -988,6 +1004,10 @@ impl<'a> LlvmIrEmitter<'a> {
         ));
         out.push_str(&format!(
             "attributes #1 = {{ \"target-cpu\"=\"{}\" \"target-features\"=\"{}\" \"no-trapping-math\"=\"true\" }}\n",
+            self.target.cpu, self.target.features
+        ));
+        out.push_str(&format!(
+            "attributes #3 = {{ mustprogress nofree nosync nounwind willreturn memory(read) \"target-cpu\"=\"{}\" \"target-features\"=\"{}\" \"no-trapping-math\"=\"true\" }}\n",
             self.target.cpu, self.target.features
         ));
         if self.target.arch == TargetArch::Wasm32Wasi {

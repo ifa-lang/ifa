@@ -13,6 +13,10 @@ pub struct IpoStats {
     pub functions_analyzed: usize,
     /// Number of functions proven pure inter-procedurally.
     pub pure_functions: usize,
+    /// Number of functions proven read-only (observational, no writes).
+    pub readonly_functions: usize,
+    /// Number of strict external FFI functions elevated to pure.
+    pub strict_ffi_pure_functions: usize,
     /// Number of functions participating in direct or mutual recursion.
     pub recursive_functions_detected: usize,
     /// Number of pure helper function calls inlined inside natural loops.
@@ -156,9 +160,513 @@ impl<'a> TarjanContext<'a> {
     }
 }
 
+/// Memory effect classification for a function across the whole module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryEffect {
+    /// Function performs zero non-local memory accesses and zero observable side-effects.
+    Pure,
+    /// Function reads memory (global constants or immutable arguments) but performs zero writes.
+    ReadOnly,
+    /// Function only writes through specific formal arguments (no global state mutations).
+    ArgWrite,
+    /// Arbitrary side-effects (heap allocation, I/O, concurrency, or unanalyzed external calls).
+    Arbitrary,
+}
+
+/// Detailed memory access effects for a function parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ParamMemorySummary {
+    /// True if the parameter pointer escapes the function frame (stored in escaping alloca,
+    /// returned, passed to spawn, or sent across a channel).
+    pub escapes: bool,
+    /// True if the pointee memory is modified via Store.
+    pub written: bool,
+    /// True if the pointee memory is read via Load.
+    pub read: bool,
+}
+
+/// Whole-function inter-procedural memory summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionMemorySummary {
+    pub name: Symbol,
+    pub effect: MemoryEffect,
+    pub params: Vec<ParamMemorySummary>,
+}
+
+/// Whole-module repository of inter-procedural memory summaries.
+#[derive(Debug, Clone, Default)]
+pub struct InterproceduralMemoryMap {
+    pub summaries: HashMap<Symbol, FunctionMemorySummary>,
+    pub strict_ffi_pures: usize,
+}
+
+impl InterproceduralMemoryMap {
+    /// Retrieve the inter-procedural memory summary for a function symbol.
+    pub fn get_summary(&self, sym: &Symbol) -> Option<&FunctionMemorySummary> {
+        self.summaries.get(sym)
+    }
+
+    /// Check if a function is proven pure.
+    pub fn is_pure(&self, sym: &Symbol) -> bool {
+        self.summaries
+            .get(sym)
+            .is_some_and(|s| s.effect == MemoryEffect::Pure)
+    }
+
+    /// Check if a function is proven read-only (observational, no writes).
+    pub fn is_readonly(&self, sym: &Symbol) -> bool {
+        self.summaries
+            .get(sym)
+            .is_some_and(|s| s.effect == MemoryEffect::ReadOnly)
+    }
+
+    /// Return the set of all symbols proven pure.
+    pub fn pure_function_symbols(&self) -> HashSet<Symbol> {
+        self.summaries
+            .iter()
+            .filter(|(_, s)| s.effect == MemoryEffect::Pure)
+            .map(|(sym, _)| *sym)
+            .collect()
+    }
+
+    /// Compute whole-module inter-procedural memory summaries and purity using call graph.
+    pub fn compute(module: &FirModule, call_graph: &IpoCallGraph) -> Self {
+        let mut summaries: HashMap<Symbol, FunctionMemorySummary> = HashMap::new();
+        let mut strict_ffi_pures = 0;
+
+        // Tracks per-function intra-procedural raw information
+        struct FuncLocalInfo {
+            has_impure_primitives: bool,
+            writes_global: bool,
+            reads_non_local: bool,
+            call_sites: Vec<(Symbol, Vec<ValueId>)>,
+            param_derived: Vec<HashSet<ValueId>>,
+            param_escapes: Vec<bool>,
+            param_written: Vec<bool>,
+            param_read: Vec<bool>,
+        }
+
+        let mut local_infos: HashMap<Symbol, FuncLocalInfo> = HashMap::new();
+
+        for func in &module.functions {
+            let name_str = INTERNER.resolve(&func.name);
+            let param_count = func.params.len();
+
+            if func.blocks.is_empty() || func.is_extern.is_some() {
+                // External function declaration (FFI)
+                let is_intrinsic = IpoPass::is_known_pure_intrinsic(&name_str);
+                let is_side_effect = IpoPass::is_known_side_effect_function(&name_str);
+
+                if is_intrinsic {
+                    summaries.insert(
+                        func.name,
+                        FunctionMemorySummary {
+                            name: func.name,
+                            effect: MemoryEffect::Pure,
+                            params: vec![ParamMemorySummary::default(); param_count],
+                        },
+                    );
+                } else if func.is_strict && !is_side_effect {
+                    let has_mut_params = func.params.iter().any(|p| {
+                        p.mode == ifa_ast::ParamMode::InOut
+                            || p.mode == ifa_ast::ParamMode::Mut
+                            || p.mode == ifa_ast::ParamMode::Sink
+                    });
+
+                    if !has_mut_params {
+                        let has_pointers = func.params.iter().any(|p| {
+                            matches!(
+                                p.ty,
+                                crate::types::FirType::Pointer(..)
+                                    | crate::types::FirType::Array(..)
+                            )
+                        });
+
+                        let effect = if has_pointers {
+                            MemoryEffect::ReadOnly
+                        } else {
+                            strict_ffi_pures += 1;
+                            MemoryEffect::Pure
+                        };
+
+                        let params = func
+                            .params
+                            .iter()
+                            .map(|p| {
+                                let is_ptr = matches!(
+                                    p.ty,
+                                    crate::types::FirType::Pointer(..)
+                                        | crate::types::FirType::Array(..)
+                                );
+                                ParamMemorySummary {
+                                    escapes: false,
+                                    written: false,
+                                    read: is_ptr,
+                                }
+                            })
+                            .collect();
+
+                        summaries.insert(
+                            func.name,
+                            FunctionMemorySummary {
+                                name: func.name,
+                                effect,
+                                params,
+                            },
+                        );
+                    } else {
+                        let params = func
+                            .params
+                            .iter()
+                            .map(|p| {
+                                let is_mut = p.mode == ifa_ast::ParamMode::InOut
+                                    || p.mode == ifa_ast::ParamMode::Mut;
+                                ParamMemorySummary {
+                                    escapes: false,
+                                    written: is_mut,
+                                    read: true,
+                                }
+                            })
+                            .collect();
+
+                        summaries.insert(
+                            func.name,
+                            FunctionMemorySummary {
+                                name: func.name,
+                                effect: MemoryEffect::ArgWrite,
+                                params,
+                            },
+                        );
+                    }
+                } else {
+                    // Non-strict or unknown external call: conservative arbitrary side-effects
+                    summaries.insert(
+                        func.name,
+                        FunctionMemorySummary {
+                            name: func.name,
+                            effect: MemoryEffect::Arbitrary,
+                            params: vec![
+                                ParamMemorySummary {
+                                    escapes: true,
+                                    written: true,
+                                    read: true,
+                                };
+                                param_count
+                            ],
+                        },
+                    );
+                }
+            } else {
+                // Function with body: compute intra-procedural aliases and effects
+                let mut local_alloca_ptrs = HashSet::new();
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let Some(res) = inst.result {
+                            if matches!(inst.expr, ValueExpr::Alloca { .. }) {
+                                local_alloca_ptrs.insert(res);
+                            }
+                        }
+                    }
+                }
+
+                // Propagate local alloca pointer projections
+                let mut changed = true;
+                while changed {
+                    changed = false;
+                    for block in &func.blocks {
+                        for inst in &block.instructions {
+                            if let Some(res) = inst.result {
+                                if !local_alloca_ptrs.contains(&res) {
+                                    match &inst.expr {
+                                        ValueExpr::GetFieldPtr { base, .. }
+                                        | ValueExpr::GetElementPtr { base, .. }
+                                            if local_alloca_ptrs.contains(base) =>
+                                        {
+                                            local_alloca_ptrs.insert(res);
+                                            changed = true;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Compute parameter projection sets
+                let mut param_derived: Vec<HashSet<ValueId>> = Vec::with_capacity(param_count);
+                for p in &func.params {
+                    let mut s = HashSet::new();
+                    s.insert(p.val);
+                    param_derived.push(s);
+                }
+
+                let mut p_changed = true;
+                while p_changed {
+                    p_changed = false;
+                    for block in &func.blocks {
+                        for inst in &block.instructions {
+                            if let Some(res) = inst.result {
+                                match &inst.expr {
+                                    ValueExpr::GetFieldPtr { base, .. }
+                                    | ValueExpr::GetElementPtr { base, .. } => {
+                                        for set in &mut param_derived {
+                                            if set.contains(base) && set.insert(res) {
+                                                p_changed = true;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut param_escapes = vec![false; param_count];
+                let mut param_written = vec![false; param_count];
+                let mut param_read = vec![false; param_count];
+                let mut has_impure_primitives = false;
+                let mut writes_global = false;
+                let mut reads_non_local = false;
+                let mut call_sites = Vec::new();
+
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        match &inst.expr {
+                            ValueExpr::Yield
+                            | ValueExpr::YieldValue { .. }
+                            | ValueExpr::Spawn { .. }
+                            | ValueExpr::ChanCreate { .. }
+                            | ValueExpr::ChanSend { .. }
+                            | ValueExpr::ChanRecv { .. }
+                            | ValueExpr::ChanTryRecv { .. }
+                            | ValueExpr::ChanClose { .. }
+                            | ValueExpr::ChanSelect { .. }
+                            | ValueExpr::GenFree { .. }
+                            | ValueExpr::CoWClone { .. }
+                            | ValueExpr::BlockingCallDirect { .. } => {
+                                has_impure_primitives = true;
+                                for (idx, set) in param_derived.iter().enumerate() {
+                                    for u in inst.expr.uses() {
+                                        if set.contains(&u) {
+                                            param_escapes[idx] = true;
+                                        }
+                                    }
+                                }
+                            }
+                            ValueExpr::Store { ptr, val } => {
+                                let mut is_param_store = false;
+                                for (idx, set) in param_derived.iter().enumerate() {
+                                    if set.contains(ptr) {
+                                        param_written[idx] = true;
+                                        is_param_store = true;
+                                    }
+                                    if set.contains(val) && !local_alloca_ptrs.contains(ptr) {
+                                        param_escapes[idx] = true;
+                                    }
+                                }
+                                if !is_param_store && !local_alloca_ptrs.contains(ptr) {
+                                    writes_global = true;
+                                }
+                            }
+                            ValueExpr::Load { ptr } => {
+                                let mut is_local_alloca = local_alloca_ptrs.contains(ptr);
+                                for (idx, set) in param_derived.iter().enumerate() {
+                                    if set.contains(ptr) {
+                                        param_read[idx] = true;
+                                        is_local_alloca = true;
+                                    }
+                                }
+                                if !is_local_alloca {
+                                    reads_non_local = true;
+                                }
+                            }
+                            ValueExpr::CallDirect { name, args } => {
+                                let callee_name = INTERNER.resolve(name);
+                                if IpoPass::is_known_side_effect_function(&callee_name) {
+                                    has_impure_primitives = true;
+                                }
+                                call_sites.push((*name, args.clone()));
+                            }
+                            ValueExpr::Call { .. } => {
+                                // Dynamic indirect call
+                                has_impure_primitives = true;
+                                for (idx, set) in param_derived.iter().enumerate() {
+                                    for u in inst.expr.uses() {
+                                        if set.contains(&u) {
+                                            param_escapes[idx] = true;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if let Some(Terminator::Return(Some(ret_val))) = &block.terminator {
+                        for (idx, set) in param_derived.iter().enumerate() {
+                            if set.contains(ret_val) {
+                                param_escapes[idx] = true;
+                            }
+                        }
+                    }
+                }
+
+                local_infos.insert(
+                    func.name,
+                    FuncLocalInfo {
+                        has_impure_primitives,
+                        writes_global,
+                        reads_non_local,
+                        call_sites,
+                        param_derived,
+                        param_escapes,
+                        param_written,
+                        param_read,
+                    },
+                );
+            }
+        }
+
+        // Initialize summaries for functions with bodies (optimistically Pure, updated via fixed-point)
+        for func in &module.functions {
+            summaries.entry(func.name).or_insert_with(|| {
+                let info = &local_infos[&func.name];
+                let mut initial_params = Vec::with_capacity(func.params.len());
+                for i in 0..func.params.len() {
+                    initial_params.push(ParamMemorySummary {
+                        escapes: info.param_escapes[i],
+                        written: info.param_written[i],
+                        read: info.param_read[i],
+                    });
+                }
+                FunctionMemorySummary {
+                    name: func.name,
+                    effect: MemoryEffect::Pure,
+                    params: initial_params,
+                }
+            });
+        }
+
+        // Fixed-point inter-procedural propagation across call sites
+        let mut fp_changed = true;
+        let mut iterations = 0;
+        while fp_changed && iterations < 32 {
+            fp_changed = false;
+            iterations += 1;
+
+            for func in &module.functions {
+                if let Some(info) = local_infos.get(&func.name) {
+                    for (callee_sym, args) in &info.call_sites {
+                        if let Some(callee_summary) = summaries.get(callee_sym).cloned() {
+                            for (arg_idx, &arg_val) in args.iter().enumerate() {
+                                if let Some(callee_param) = callee_summary.params.get(arg_idx) {
+                                    for (p_idx, set) in info.param_derived.iter().enumerate() {
+                                        if set.contains(&arg_val) {
+                                            let current_sum =
+                                                summaries.get_mut(&func.name).unwrap();
+                                            if callee_param.escapes
+                                                && !current_sum.params[p_idx].escapes
+                                            {
+                                                current_sum.params[p_idx].escapes = true;
+                                                fp_changed = true;
+                                            }
+                                            if callee_param.written
+                                                && !current_sum.params[p_idx].written
+                                            {
+                                                current_sum.params[p_idx].written = true;
+                                                fp_changed = true;
+                                            }
+                                            if callee_param.read && !current_sum.params[p_idx].read
+                                            {
+                                                current_sum.params[p_idx].read = true;
+                                                fp_changed = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Final whole-function memory effect resolution
+        // Propagate impurity across recursive SCC components first:
+        for scc in &call_graph.sccs {
+            let scc_impure = scc.iter().any(|f| {
+                if let Some(info) = local_infos.get(f) {
+                    info.has_impure_primitives || info.writes_global
+                } else if let Some(sum) = summaries.get(f) {
+                    sum.effect == MemoryEffect::Arbitrary
+                } else {
+                    true
+                }
+            });
+            if scc_impure {
+                for f in scc {
+                    if let Some(sum) = summaries.get_mut(f) {
+                        sum.effect = MemoryEffect::Arbitrary;
+                    }
+                }
+            }
+        }
+
+        // Propagate effects topologically / iteratively
+        let mut effect_changed = true;
+        let mut eff_iters = 0;
+        while effect_changed && eff_iters < 32 {
+            effect_changed = false;
+            eff_iters += 1;
+
+            for func in &module.functions {
+                if let Some(info) = local_infos.get(&func.name) {
+                    let mut max_effect = if info.has_impure_primitives || info.writes_global {
+                        MemoryEffect::Arbitrary
+                    } else if info.param_written.iter().any(|&w| w) {
+                        MemoryEffect::ArgWrite
+                    } else if info.param_read.iter().any(|&r| r) || info.reads_non_local {
+                        MemoryEffect::ReadOnly
+                    } else {
+                        MemoryEffect::Pure
+                    };
+
+                    for (callee_sym, _) in &info.call_sites {
+                        if let Some(callee_sum) = summaries.get(callee_sym) {
+                            match callee_sum.effect {
+                                MemoryEffect::Arbitrary => max_effect = MemoryEffect::Arbitrary,
+                                MemoryEffect::ArgWrite if max_effect != MemoryEffect::Arbitrary => {
+                                    max_effect = MemoryEffect::ArgWrite;
+                                }
+                                MemoryEffect::ReadOnly if max_effect == MemoryEffect::Pure => {
+                                    max_effect = MemoryEffect::ReadOnly;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    let cur_sum = summaries.get_mut(&func.name).unwrap();
+                    if cur_sum.effect != max_effect {
+                        cur_sum.effect = max_effect;
+                        effect_changed = true;
+                    }
+                }
+            }
+        }
+
+        Self {
+            summaries,
+            strict_ffi_pures,
+        }
+    }
+}
+
 /// Inter-Procedural Optimization (IPO) pass for SSA FIR.
 ///
-/// Computes whole-module inter-procedural purity via call graph fixed-point analysis,
+/// Computes whole-module inter-procedural purity and memory effects via call graph fixed-point analysis,
 /// handles mutually and self-recursive call graphs, performs inter-procedural pure call CSE,
 /// and inlines small non-recursive pure helper functions directly into vectorizable loops.
 pub struct IpoPass {
@@ -192,8 +700,16 @@ impl IpoPass {
         let call_graph = IpoCallGraph::build(module);
         self.stats.recursive_functions_detected = call_graph.recursive_functions.len();
 
-        // 2. Compute inter-procedural purity across all module functions
-        let pure_functions = Self::compute_pure_functions_with_graph(module, &call_graph);
+        // 2. Compute whole-module inter-procedural memory access map and purity
+        let mem_map = InterproceduralMemoryMap::compute(module, &call_graph);
+        self.stats.readonly_functions = mem_map
+            .summaries
+            .values()
+            .filter(|s| s.effect == MemoryEffect::ReadOnly)
+            .count();
+        self.stats.strict_ffi_pure_functions = mem_map.strict_ffi_pures;
+
+        let pure_functions = mem_map.pure_function_symbols();
         self.stats.pure_functions = pure_functions.len();
 
         // 3. Eliminate redundant pure function calls within basic blocks (Pure Call CSE)
@@ -210,138 +726,12 @@ impl IpoPass {
     }
 
     /// Analyzes module functions and computes the set of provably pure symbols using the precomputed call graph.
-    ///
-    /// A function is pure if:
-    /// - It contains no I/O, panic, dynamic free, or concurrency primitives (yield, spawn, channels).
-    /// - It does not mutate memory through non-local pointers (local stack allocas and derived GEPs are pure).
-    /// - All functions it invokes directly are themselves proven pure (or pure intrinsics).
-    /// - Mutually recursive cycles (SCCs) are proven pure as a whole if every constituent function has no side-effects.
     pub fn compute_pure_functions_with_graph(
         module: &FirModule,
         call_graph: &IpoCallGraph,
     ) -> HashSet<Symbol> {
-        let mut directly_impure: HashSet<Symbol> = HashSet::new();
-
-        for func in &module.functions {
-            let mut is_impure = false;
-
-            if func.is_extern.is_some() {
-                let name_str = INTERNER.resolve(&func.name);
-                if !Self::is_known_pure_intrinsic(&name_str) {
-                    is_impure = true;
-                }
-            }
-
-            // Compute the transitive set of pointers originating strictly from local stack allocas
-            let mut local_pointers = HashSet::new();
-            for block in &func.blocks {
-                for inst in &block.instructions {
-                    if let Some(res) = inst.result {
-                        if matches!(inst.expr, ValueExpr::Alloca { .. }) {
-                            local_pointers.insert(res);
-                        }
-                    }
-                }
-            }
-
-            let mut pt_changed = true;
-            while pt_changed {
-                pt_changed = false;
-                for block in &func.blocks {
-                    for inst in &block.instructions {
-                        if let Some(res) = inst.result {
-                            if !local_pointers.contains(&res) {
-                                match &inst.expr {
-                                    ValueExpr::GetFieldPtr { base, .. }
-                                    | ValueExpr::GetElementPtr { base, .. }
-                                        if local_pointers.contains(base) =>
-                                    {
-                                        local_pointers.insert(res);
-                                        pt_changed = true;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            for block in &func.blocks {
-                for inst in &block.instructions {
-                    match &inst.expr {
-                        ValueExpr::Yield
-                        | ValueExpr::YieldValue { .. }
-                        | ValueExpr::Spawn { .. }
-                        | ValueExpr::ChanCreate { .. }
-                        | ValueExpr::ChanSend { .. }
-                        | ValueExpr::ChanRecv { .. }
-                        | ValueExpr::ChanTryRecv { .. }
-                        | ValueExpr::ChanClose { .. }
-                        | ValueExpr::ChanSelect { .. }
-                        | ValueExpr::GenFree { .. }
-                        | ValueExpr::CoWClone { .. } => {
-                            is_impure = true;
-                        }
-                        ValueExpr::Store { ptr, .. } => {
-                            // Storing into locally-allocated stack frame does not escape or create external side-effects
-                            if !local_pointers.contains(ptr) {
-                                is_impure = true;
-                            }
-                        }
-                        ValueExpr::BlockingCallDirect { .. } => {
-                            is_impure = true;
-                        }
-                        ValueExpr::CallDirect { name, .. } => {
-                            let callee_str = INTERNER.resolve(name);
-                            if Self::is_known_side_effect_function(&callee_str) {
-                                is_impure = true;
-                            }
-                        }
-                        ValueExpr::Call { .. } => {
-                            // Dynamic indirect function call: conservatively mark impure
-                            is_impure = true;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            if is_impure {
-                directly_impure.insert(func.name);
-            }
-        }
-
-        // Propagate impurity across recursive SCC components:
-        // If any member of an SCC is directly impure, all functions in that cycle are impure.
-        for scc in &call_graph.sccs {
-            if scc.iter().any(|f| directly_impure.contains(f)) {
-                directly_impure.extend(scc.iter().copied());
-            }
-        }
-
-        // Fixed-point worklist propagation across callers
-        let mut impure_set = directly_impure;
-        let mut worklist: Vec<Symbol> = impure_set.iter().copied().collect();
-
-        while let Some(impure_func) = worklist.pop() {
-            if let Some(caller_list) = call_graph.callers.get(&impure_func) {
-                for &caller in caller_list {
-                    if impure_set.insert(caller) {
-                        worklist.push(caller);
-                    }
-                }
-            }
-        }
-
-        let mut pure_functions = HashSet::new();
-        for func in &module.functions {
-            if !impure_set.contains(&func.name) {
-                pure_functions.insert(func.name);
-            }
-        }
-
-        pure_functions
+        let mem_map = InterproceduralMemoryMap::compute(module, call_graph);
+        mem_map.pure_function_symbols()
     }
 
     /// Check if a function identifier corresponds to a known pure runtime or math intrinsic.

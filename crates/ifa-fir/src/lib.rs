@@ -23,7 +23,10 @@ pub use cow::{CowPass, SharingState};
 pub use dominance::DominanceTree;
 pub use gen_opt::{GenOptStats, GenerationalOptPass, NaturalLoop};
 pub use interp::{FirInterpreter, FirValue, GenHeader, GenHeap, InterpError};
-pub use ipo::{IpoPass, IpoStats};
+pub use ipo::{
+    FunctionMemorySummary, InterproceduralMemoryMap, IpoCallGraph, IpoPass, IpoStats, MemoryEffect,
+    ParamMemorySummary,
+};
 pub use ir::*;
 pub use layout_opt::{CacheLayoutPass, CacheLayoutStats, CACHE_LINE_SIZE};
 pub use lower::lower_program;
