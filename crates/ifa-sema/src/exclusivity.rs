@@ -58,6 +58,31 @@ impl SliceBound {
             _ => None,
         }
     }
+
+    /// Substitutes symbolic variables using an instantiated binding map.
+    pub fn substitute(&self, map: &HashMap<Symbol, SliceBound>) -> SliceBound {
+        match self {
+            SliceBound::Symbolic(s) => {
+                if let Some(target) = map.get(s) {
+                    target.clone()
+                } else {
+                    self.clone()
+                }
+            }
+            SliceBound::Offset(s, off) => {
+                if let Some(target) = map.get(s) {
+                    match target {
+                        SliceBound::Const(c) => SliceBound::Const(c + off),
+                        SliceBound::Symbolic(sym) => SliceBound::Offset(*sym, *off),
+                        SliceBound::Offset(sym, off2) => SliceBound::Offset(*sym, off2 + off),
+                    }
+                } else {
+                    self.clone()
+                }
+            }
+            SliceBound::Const(_) => self.clone(),
+        }
+    }
 }
 
 /// A segment in a structured memory access path.
@@ -85,6 +110,59 @@ pub enum PathSegment {
         suffix_len: usize,
     },
     Method(Symbol),
+}
+
+impl PathSegment {
+    /// Substitutes symbolic indices and slice bounds using instantiated bindings.
+    pub fn substitute(
+        &self,
+        bound_map: &HashMap<Symbol, SliceBound>,
+        seg_map: &HashMap<Symbol, PathSegment>,
+    ) -> PathSegment {
+        match self {
+            PathSegment::IndexSymbolic(sym) => {
+                if let Some(seg) = seg_map.get(sym) {
+                    seg.clone()
+                } else if let Some(bound) = bound_map.get(sym) {
+                    match bound {
+                        SliceBound::Const(c) => PathSegment::IndexConst(*c),
+                        SliceBound::Symbolic(s) => PathSegment::IndexSymbolic(*s),
+                        SliceBound::Offset(s, off) => PathSegment::IndexOffset(*s, *off),
+                    }
+                } else {
+                    self.clone()
+                }
+            }
+            PathSegment::IndexOffset(sym, off) => {
+                if let Some(bound) = bound_map.get(sym) {
+                    match bound {
+                        SliceBound::Const(c) => PathSegment::IndexConst(c + off),
+                        SliceBound::Symbolic(s) => PathSegment::IndexOffset(*s, *off),
+                        SliceBound::Offset(s, off2) => PathSegment::IndexOffset(*s, off2 + off),
+                    }
+                } else {
+                    self.clone()
+                }
+            }
+            PathSegment::SliceRange {
+                start,
+                end,
+                step,
+                inclusive,
+            } => {
+                let s = start.as_ref().map(|b| b.substitute(bound_map));
+                let e = end.as_ref().map(|b| b.substitute(bound_map));
+                let st = step.as_ref().map(|b| b.substitute(bound_map));
+                PathSegment::SliceRange {
+                    start: s,
+                    end: e,
+                    step: st,
+                    inclusive: *inclusive,
+                }
+            }
+            _ => self.clone(),
+        }
+    }
 }
 
 /// Helper computing greatest common divisor for strided congruence analysis.
@@ -151,6 +229,75 @@ fn are_slice_ranges_disjoint(
                         if diff.abs() % gcd != 0 {
                             return true;
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // 0c. Shared symbolic stride with distinct constant offsets:
+    // e.g. [0..N:stride] vs [1..N:stride] (distinct channels across identical symbolic stride in streaming pipelines)
+    if let (Some(SliceBound::Symbolic(sym1)), Some(SliceBound::Symbolic(sym2))) = (step1, step2) {
+        if sym1 == sym2 {
+            let s1_c = start1.and_then(|b| b.as_const()).unwrap_or(0);
+            let s2_c = start2.and_then(|b| b.as_const()).unwrap_or(0);
+            if s1_c != s2_c {
+                return true;
+            }
+            if let (Some(b1), Some(b2)) = (start1, start2) {
+                if let (SliceBound::Offset(sym_a, off1), SliceBound::Offset(sym_b, off2)) = (b1, b2)
+                {
+                    if sym_a == sym_b && off1 != off2 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // 0d. Strided Range vs Contiguous Finite Sub-Range:
+    // e.g. [0..1024:4] vs [1..3] (indices 1, 2 have mod 4 != 0)
+    if let Some(st1) = step1.and_then(|b| b.as_const()) {
+        if st1 > 1 && step2.is_none() {
+            let s1 = start1.and_then(|b| b.as_const()).unwrap_or(0);
+            if let (Some(s2), Some(e2)) = (
+                start2.and_then(|b| b.as_const()),
+                end2.and_then(|b| b.as_const()),
+            ) {
+                let max2 = if inc2 { e2 } else { e2 - 1 };
+                if s2 <= max2 && (max2 - s2) <= 128 {
+                    let mut all_disjoint = true;
+                    for k in s2..=max2 {
+                        if (k - s1).abs() % st1 == 0 {
+                            all_disjoint = false;
+                            break;
+                        }
+                    }
+                    if all_disjoint {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(st2) = step2.and_then(|b| b.as_const()) {
+        if st2 > 1 && step1.is_none() {
+            let s2 = start2.and_then(|b| b.as_const()).unwrap_or(0);
+            if let (Some(s1), Some(e1)) = (
+                start1.and_then(|b| b.as_const()),
+                end1.and_then(|b| b.as_const()),
+            ) {
+                let max1 = if inc1 { e1 } else { e1 - 1 };
+                if s1 <= max1 && (max1 - s1) <= 128 {
+                    let mut all_disjoint = true;
+                    for k in s1..=max1 {
+                        if (k - s2).abs() % st2 == 0 {
+                            all_disjoint = false;
+                            break;
+                        }
+                    }
+                    if all_disjoint {
+                        return true;
                     }
                 }
             }
@@ -427,6 +574,36 @@ pub fn segments_alias_kind(seg1: &[PathSegment], seg2: &[PathSegment]) -> PathAl
                 if *k <= *suffix_len =>
             {
                 return PathAliasKind::Disjoint; // suffix index strictly succeeds rest sub-slice
+            }
+            (
+                PathSegment::SliceRange { end, inclusive, .. },
+                PathSegment::SlicePatternRest { prefix_len, .. },
+            )
+            | (
+                PathSegment::SlicePatternRest { prefix_len, .. },
+                PathSegment::SliceRange { end, inclusive, .. },
+            ) => {
+                if let Some(e) = end.as_ref().and_then(|b| b.as_const()) {
+                    let max_idx = if *inclusive { e } else { e - 1 };
+                    if max_idx < *prefix_len as i64 {
+                        return PathAliasKind::Disjoint; // slice range strictly precedes rest sub-slice
+                    }
+                }
+            }
+            (
+                PathSegment::SliceConst { end, inclusive, .. },
+                PathSegment::SlicePatternRest { prefix_len, .. },
+            )
+            | (
+                PathSegment::SlicePatternRest { prefix_len, .. },
+                PathSegment::SliceConst { end, inclusive, .. },
+            ) => {
+                if let Some(e) = end {
+                    let max_idx = if *inclusive { *e } else { *e - 1 };
+                    if max_idx < *prefix_len as i64 {
+                        return PathAliasKind::Disjoint; // constant slice strictly precedes rest sub-slice
+                    }
+                }
             }
             (PathSegment::IndexOffset(s1, o1), PathSegment::IndexOffset(s2, o2))
                 if s1 == s2 && o1 != o2 =>
@@ -863,6 +1040,7 @@ pub struct CallPropagationEdge {
 /// Whole-function inter-procedural access summary for all formal parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FunctionAccessSummary {
+    pub param_names: Vec<Symbol>,
     pub params: Vec<ParamAccessSummary>,
 }
 
@@ -1023,18 +1201,22 @@ impl InterproceduralAccessMap {
         call_edges: &mut Vec<CallPropagationEdge>,
     ) {
         let mut param_indices = HashMap::new();
+        let mut param_names = Vec::with_capacity(func.params.len());
         let mut initial_summary = FunctionAccessSummary {
+            param_names: Vec::with_capacity(func.params.len()),
             params: Vec::with_capacity(func.params.len()),
         };
 
         for (idx, p) in func.params.iter().enumerate() {
             param_indices.insert(p.name, idx);
+            param_names.push(p.name);
             let mut p_sum = ParamAccessSummary::default();
             if p.mode == ParamMode::Sink {
                 p_sum.is_sink = true;
             }
             initial_summary.params.push(p_sum);
         }
+        initial_summary.param_names = param_names;
 
         let mangled_sym = target_sym.map(|st| {
             INTERNER.intern(&format!(
@@ -1654,6 +1836,62 @@ pub fn check_call_exclusivity_interproc(
     let mut borrows: Vec<BorrowRecord> = active_borrows.to_vec();
     let callee_summary = callee_name.and_then(|sym| interproc.and_then(|m| m.get_summary(&sym)));
 
+    let mut bound_map: HashMap<Symbol, SliceBound> = HashMap::new();
+    let mut seg_map: HashMap<Symbol, PathSegment> = HashMap::new();
+    if let Some(summary) = callee_summary {
+        for (p_idx, p_name) in summary.param_names.iter().enumerate() {
+            if let Some(arg) = args.get(p_idx) {
+                match &arg.value.kind {
+                    ExprKind::Lit(ifa_ast::Lit::Int(c_sym)) => {
+                        if let Ok(c) = INTERNER.resolve(c_sym).parse::<i64>() {
+                            bound_map.insert(*p_name, SliceBound::Const(c));
+                            seg_map.insert(*p_name, PathSegment::IndexConst(c));
+                        }
+                    }
+                    ExprKind::Ident(id_sym) => {
+                        bound_map.insert(*p_name, SliceBound::Symbolic(*id_sym));
+                        seg_map.insert(*p_name, PathSegment::IndexSymbolic(*id_sym));
+                    }
+                    ExprKind::Range {
+                        start,
+                        end,
+                        step,
+                        inclusive,
+                    } => {
+                        let s_bound = start.as_deref().and_then(extract_slice_bound);
+                        let e_bound = end.as_deref().and_then(extract_slice_bound);
+                        let st_bound = step.as_deref().and_then(extract_slice_bound);
+                        seg_map.insert(
+                            *p_name,
+                            PathSegment::SliceRange {
+                                start: s_bound,
+                                end: e_bound,
+                                step: st_bound,
+                                inclusive: *inclusive,
+                            },
+                        );
+                    }
+                    _ => {
+                        if let Some(b) = extract_slice_bound(&arg.value) {
+                            bound_map.insert(*p_name, b.clone());
+                            match b {
+                                SliceBound::Const(c) => {
+                                    seg_map.insert(*p_name, PathSegment::IndexConst(c));
+                                }
+                                SliceBound::Symbolic(s) => {
+                                    seg_map.insert(*p_name, PathSegment::IndexSymbolic(s));
+                                }
+                                SliceBound::Offset(s, off) => {
+                                    seg_map.insert(*p_name, PathSegment::IndexOffset(s, off));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for (idx, arg) in args.iter().enumerate() {
         let is_explicit_inout = matches!(
             &arg.value.kind,
@@ -1688,7 +1926,12 @@ pub fn check_call_exclusivity_interproc(
                 if let Some(p_sum) = param_summary {
                     if !p_sum.writes.is_empty() && !p_sum.writes.iter().any(|w| w.is_empty()) {
                         for sub in &p_sum.writes {
-                            effective_borrows.push((path.append_relative(sub), BorrowKind::InOut));
+                            let inst_sub: Vec<PathSegment> = sub
+                                .iter()
+                                .map(|s| s.substitute(&bound_map, &seg_map))
+                                .collect();
+                            effective_borrows
+                                .push((path.append_relative(&inst_sub), BorrowKind::InOut));
                         }
                     } else {
                         effective_borrows.push((path.clone(), BorrowKind::InOut));
@@ -1701,7 +1944,12 @@ pub fn check_call_exclusivity_interproc(
                 if let Some(p_sum) = param_summary {
                     if !p_sum.reads.is_empty() && !p_sum.reads.iter().any(|r| r.is_empty()) {
                         for sub in &p_sum.reads {
-                            effective_borrows.push((path.append_relative(sub), BorrowKind::In));
+                            let inst_sub: Vec<PathSegment> = sub
+                                .iter()
+                                .map(|s| s.substitute(&bound_map, &seg_map))
+                                .collect();
+                            effective_borrows
+                                .push((path.append_relative(&inst_sub), BorrowKind::In));
                         }
                     } else {
                         effective_borrows.push((path.clone(), BorrowKind::In));

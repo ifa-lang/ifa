@@ -477,4 +477,111 @@ mod tests {
             res.diagnostics
         );
     }
+
+    #[test]
+    fn test_exclusivity_interproc_multidim_strided_disjoint_allowed() {
+        let code = r#"
+            fn process_two_channels_2d(inout ch_even: [i64], inout ch_odd: [i64]) {
+                ch_even[0] = 10;
+                ch_odd[0] = 20;
+            }
+
+            pub fn main() {
+                mut matrix = [
+                    [1, 2, 3, 4],
+                    [5, 6, 7, 8],
+                ];
+                process_two_channels_2d(inout matrix[0][0..4:2], inout matrix[0][1..4:2]);
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(
+            !res.has_errors(),
+            "Expected disjoint multidimensional strided slices to succeed, got errors: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_exclusivity_interproc_tile_pipeline_disjoint_allowed() {
+        let code = r#"
+            fn write_tile(inout grid: [[i64]], row: i64, col: i64) {
+                grid[row][col] = 42;
+            }
+
+            fn pipeline_dual(inout a: i64, inout b: i64) {
+                a += 1;
+                b += 2;
+            }
+
+            pub fn main() {
+                mut grid = [
+                    [1, 2],
+                    [3, 4],
+                ];
+                pipeline_dual(inout grid[0][0], inout grid[0][1]);
+                pipeline_dual(inout grid[0][0], inout grid[1][0]);
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(
+            !res.has_errors(),
+            "Expected disjoint multidimensional coordinates to succeed: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_exclusivity_interproc_multidim_overlap_rejected() {
+        let code = r#"
+            fn process_two_channels_2d(inout ch_even: [i64], inout ch_all: [i64]) {
+                ch_even[0] = 10;
+                ch_all[0] = 20;
+            }
+
+            pub fn main() {
+                mut matrix = [
+                    [1, 2, 3, 4],
+                    [5, 6, 7, 8],
+                ];
+                process_two_channels_2d(inout matrix[0][0..4:2], inout matrix[0][0..4]);
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(
+            res.has_errors(),
+            "Expected overlapping strided vs full slice to be rejected"
+        );
+        let has_exclusivity_err = res
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0011"));
+        assert!(
+            has_exclusivity_err,
+            "Expected E0011 diagnostic code for overlapping slice ranges, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_exclusivity_shared_symbolic_stride_distinct_channels_allowed() {
+        let code = r#"
+            fn process_stereo(inout left: [i64], inout right: [i64]) {
+                left[0] = 100;
+                right[0] = 200;
+            }
+
+            pub fn main() {
+                mut stream = [1, 2, 3, 4, 5, 6, 7, 8];
+                let channels: i64 = 2;
+                process_stereo(inout stream[0..8:channels], inout stream[1..8:channels]);
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(
+            !res.has_errors(),
+            "Expected shared symbolic stride with distinct channels to succeed, got errors: {:?}",
+            res.diagnostics
+        );
+    }
 }
