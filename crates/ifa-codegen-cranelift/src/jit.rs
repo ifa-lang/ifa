@@ -115,6 +115,17 @@ impl JitEngine {
             "ifa_rt_string_from_bool",
             ifa_rt_string_from_bool as *const u8,
         );
+        builder.symbol("ifa_rt_coro_create", ifa_rt_coro_create as *const u8);
+        builder.symbol(
+            "ifa_rt_coro_create_custom",
+            ifa_rt_coro_create_custom as *const u8,
+        );
+        builder.symbol("ifa_rt_coro_resume", ifa_rt_coro_resume as *const u8);
+        builder.symbol("ifa_rt_coro_spawn", ifa_rt_coro_spawn as *const u8);
+        builder.symbol("ifa_rt_coro_is_done", ifa_rt_coro_is_done as *const u8);
+        builder.symbol("ifa_rt_coro_status", ifa_rt_coro_status as *const u8);
+        builder.symbol("ifa_rt_coro_frame", ifa_rt_coro_frame as *const u8);
+        builder.symbol("ifa_rt_coro_destroy", ifa_rt_coro_destroy as *const u8);
 
         let module = JITModule::new(builder);
 
@@ -405,6 +416,75 @@ impl JitEngine {
         self.func_ids
             .insert("ifa_rt_string_from_bool".into(), str_bool_id);
 
+        // Register stackless coroutine intrinsics
+        let mut coro_create_sig = Signature::new(call_conv);
+        coro_create_sig.params.push(AbiParam::new(ptr_type));
+        coro_create_sig.params.push(AbiParam::new(ptr_type));
+        coro_create_sig.params.push(AbiParam::new(ptr_type));
+        coro_create_sig.returns.push(AbiParam::new(ptr_type));
+        let coro_create_id = self
+            .module
+            .declare_function("ifa_rt_coro_create", Linkage::Import, &coro_create_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_coro_create".into(), coro_create_id);
+
+        let mut coro_frame_sig = Signature::new(call_conv);
+        coro_frame_sig.params.push(AbiParam::new(ptr_type));
+        coro_frame_sig.returns.push(AbiParam::new(ptr_type));
+        let coro_frame_id = self
+            .module
+            .declare_function("ifa_rt_coro_frame", Linkage::Import, &coro_frame_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_coro_frame".into(), coro_frame_id);
+
+        let mut coro_resume_sig = Signature::new(call_conv);
+        coro_resume_sig.params.push(AbiParam::new(ptr_type));
+        coro_resume_sig.returns.push(AbiParam::new(types::I32));
+        let coro_resume_id = self
+            .module
+            .declare_function("ifa_rt_coro_resume", Linkage::Import, &coro_resume_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_coro_resume".into(), coro_resume_id);
+
+        let mut coro_spawn_sig = Signature::new(call_conv);
+        coro_spawn_sig.params.push(AbiParam::new(ptr_type));
+        coro_spawn_sig.returns.push(AbiParam::new(types::I64));
+        let coro_spawn_id = self
+            .module
+            .declare_function("ifa_rt_coro_spawn", Linkage::Import, &coro_spawn_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_coro_spawn".into(), coro_spawn_id);
+
+        let mut coro_is_done_sig = Signature::new(call_conv);
+        coro_is_done_sig.params.push(AbiParam::new(ptr_type));
+        coro_is_done_sig.returns.push(AbiParam::new(types::I32));
+        let coro_is_done_id = self
+            .module
+            .declare_function("ifa_rt_coro_is_done", Linkage::Import, &coro_is_done_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_coro_is_done".into(), coro_is_done_id);
+
+        let mut coro_destroy_sig = Signature::new(call_conv);
+        coro_destroy_sig.params.push(AbiParam::new(ptr_type));
+        let coro_destroy_id = self
+            .module
+            .declare_function("ifa_rt_coro_destroy", Linkage::Import, &coro_destroy_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_coro_destroy".into(), coro_destroy_id);
+
+        let coro_funcs: std::collections::HashSet<ifa_span::Symbol> = fir_module
+            .functions
+            .iter()
+            .filter(|f| f.is_coroutine())
+            .map(|f| f.name)
+            .collect();
+
         // 1. Declare all functions first to enable mutual recursion and forward calls
         for fir_func in &fir_module.functions {
             let fn_name = INTERNER.resolve(&fir_func.name);
@@ -420,7 +500,19 @@ impl JitEngine {
                 .module
                 .declare_function(&fn_name, linkage, &sig)
                 .map_err(|e| CodegenError::Module(e.to_string()))?;
-            self.func_ids.insert(fn_name, func_id);
+            self.func_ids.insert(fn_name.clone(), func_id);
+
+            if fir_func.is_coroutine() && !fir_func.blocks.is_empty() {
+                let resume_name = format!("{}$resume", fn_name);
+                let mut resume_sig = Signature::new(call_conv);
+                resume_sig.params.push(AbiParam::new(ptr_type));
+                resume_sig.returns.push(AbiParam::new(types::I32));
+                let resume_func_id = self
+                    .module
+                    .declare_function(&resume_name, Linkage::Local, &resume_sig)
+                    .map_err(|e| CodegenError::Module(e.to_string()))?;
+                self.func_ids.insert(resume_name, resume_func_id);
+            }
         }
 
         let struct_defs: HashMap<ifa_span::Symbol, Vec<(ifa_span::Symbol, ifa_fir::FirType)>> =
@@ -436,36 +528,106 @@ impl JitEngine {
                 continue;
             }
             let fn_name = INTERNER.resolve(&fir_func.name);
-            let func_id = self.func_ids[&fn_name];
 
-            let sig = fir_signature_to_cranelift(fir_func, call_conv, ptr_type)?;
-            self.ctx.func.signature = sig;
+            if fir_func.is_coroutine() {
+                // A) Define coroutine resume function
+                let resume_name = format!("{}$resume", fn_name);
+                let resume_id = self.func_ids[&resume_name];
+                let mut resume_sig = Signature::new(call_conv);
+                resume_sig.params.push(AbiParam::new(ptr_type));
+                resume_sig.returns.push(AbiParam::new(types::I32));
+                self.ctx.func.signature = resume_sig;
 
-            {
-                let builder = cranelift_frontend::FunctionBuilder::new(
-                    &mut self.ctx.func,
-                    &mut self.builder_context,
-                );
-                let translator = FunctionTranslator::new(
-                    builder,
-                    &mut self.module,
-                    &self.func_ids,
-                    ptr_type,
-                    &struct_defs,
-                );
-                translator.translate(fir_func)?;
+                {
+                    let builder = cranelift_frontend::FunctionBuilder::new(
+                        &mut self.ctx.func,
+                        &mut self.builder_context,
+                    );
+                    let translator = FunctionTranslator::new(
+                        builder,
+                        &mut self.module,
+                        &self.func_ids,
+                        ptr_type,
+                        &struct_defs,
+                        &coro_funcs,
+                    );
+                    translator.translate_coroutine_resume(fir_func)?;
+                }
+
+                self.module
+                    .define_function(resume_id, &mut self.ctx)
+                    .map_err(|e| {
+                        CodegenError::Module(format!(
+                            "Failed to define coroutine resume `{}`: {}\nFunction IR:\n{}",
+                            resume_name, e, self.ctx.func
+                        ))
+                    })?;
+
+                self.module.clear_context(&mut self.ctx);
+
+                // B) Define coroutine factory instantiator function
+                let func_id = self.func_ids[&fn_name];
+                let sig = fir_signature_to_cranelift(fir_func, call_conv, ptr_type)?;
+                self.ctx.func.signature = sig;
+
+                {
+                    let builder = cranelift_frontend::FunctionBuilder::new(
+                        &mut self.ctx.func,
+                        &mut self.builder_context,
+                    );
+                    let translator = FunctionTranslator::new(
+                        builder,
+                        &mut self.module,
+                        &self.func_ids,
+                        ptr_type,
+                        &struct_defs,
+                        &coro_funcs,
+                    );
+                    translator.translate_coroutine_factory(fir_func, &resume_name)?;
+                }
+
+                self.module
+                    .define_function(func_id, &mut self.ctx)
+                    .map_err(|e| {
+                        CodegenError::Module(format!(
+                            "Failed to define coroutine factory `{}`: {}\nFunction IR:\n{}",
+                            fn_name, e, self.ctx.func
+                        ))
+                    })?;
+
+                self.module.clear_context(&mut self.ctx);
+            } else {
+                let func_id = self.func_ids[&fn_name];
+                let sig = fir_signature_to_cranelift(fir_func, call_conv, ptr_type)?;
+                self.ctx.func.signature = sig;
+
+                {
+                    let builder = cranelift_frontend::FunctionBuilder::new(
+                        &mut self.ctx.func,
+                        &mut self.builder_context,
+                    );
+                    let translator = FunctionTranslator::new(
+                        builder,
+                        &mut self.module,
+                        &self.func_ids,
+                        ptr_type,
+                        &struct_defs,
+                        &coro_funcs,
+                    );
+                    translator.translate(fir_func)?;
+                }
+
+                self.module
+                    .define_function(func_id, &mut self.ctx)
+                    .map_err(|e| {
+                        CodegenError::Module(format!(
+                            "Failed to define function `{}`: {}\nFunction IR:\n{}",
+                            fn_name, e, self.ctx.func
+                        ))
+                    })?;
+
+                self.module.clear_context(&mut self.ctx);
             }
-
-            self.module
-                .define_function(func_id, &mut self.ctx)
-                .map_err(|e| {
-                    CodegenError::Module(format!(
-                        "Failed to define function `{}`: {}\nFunction IR:\n{}",
-                        fn_name, e, self.ctx.func
-                    ))
-                })?;
-
-            self.module.clear_context(&mut self.ctx);
         }
 
         self.module

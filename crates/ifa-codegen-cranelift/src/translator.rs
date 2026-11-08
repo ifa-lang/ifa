@@ -13,7 +13,7 @@ use ifa_fir::{
 };
 use ifa_sema::types::IntType;
 use ifa_span::{Symbol, INTERNER};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Translates a single FIR function into Cranelift IR using FunctionBuilder.
 pub struct FunctionTranslator<'a, M: Module> {
@@ -22,6 +22,7 @@ pub struct FunctionTranslator<'a, M: Module> {
     func_ids: &'a HashMap<String, FuncId>,
     ptr_type: types::Type,
     struct_defs: &'a HashMap<Symbol, Vec<(Symbol, FirType)>>,
+    coro_funcs: &'a HashSet<Symbol>,
     block_map: HashMap<BlockId, ClBlock>,
     value_map: HashMap<ValueId, ClValue>,
     pointer_types: HashMap<ValueId, types::Type>,
@@ -35,6 +36,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         func_ids: &'a HashMap<String, FuncId>,
         ptr_type: types::Type,
         struct_defs: &'a HashMap<Symbol, Vec<(Symbol, FirType)>>,
+        coro_funcs: &'a HashSet<Symbol>,
     ) -> Self {
         Self {
             builder,
@@ -42,6 +44,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             func_ids,
             ptr_type,
             struct_defs,
+            coro_funcs,
             block_map: HashMap::new(),
             value_map: HashMap::new(),
             pointer_types: HashMap::new(),
@@ -129,6 +132,356 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             }
         }
 
+        self.builder.seal_all_blocks();
+        let target_config = self.module.target_config();
+        self.builder.finalize(target_config);
+        Ok(())
+    }
+
+    /// Translate a coroutine resume state machine into Cranelift IR.
+    pub fn translate_coroutine_resume(
+        mut self,
+        fir_func: &FirFunction,
+    ) -> Result<(), CodegenError> {
+        // 1. Entry block receiving the frame pointer
+        let entry_cl_block = self.builder.create_block();
+        self.builder
+            .append_block_params_for_function_params(entry_cl_block);
+        self.builder.switch_to_block(entry_cl_block);
+        let frame = self.builder.block_params(entry_cl_block)[0];
+
+        // 2. Identify total yield suspension points
+        let mut yield_count = 0usize;
+        for block in &fir_func.blocks {
+            for inst in &block.instructions {
+                if matches!(inst.expr, ValueExpr::Yield | ValueExpr::YieldValue { .. }) {
+                    yield_count += 1;
+                }
+            }
+        }
+
+        // Create Cranelift basic blocks for all FIR basic blocks
+        for block in &fir_func.blocks {
+            let cl_block = self.builder.create_block();
+            self.block_map.insert(block.id, cl_block);
+        }
+
+        let first_body_block = self.block_map[&fir_func.entry_block];
+        let completed_block = self.builder.create_block();
+
+        // Resumption blocks for each suspension state k (1..=yield_count)
+        let mut resumption_blocks = HashMap::new();
+        for k in 1..=yield_count {
+            let res_block = self.builder.create_block();
+            resumption_blocks.insert(k, res_block);
+        }
+
+        // 3. Dispatch based on current state loaded from frame at offset 0
+        let state = self
+            .builder
+            .ins()
+            .load(types::I32, MemFlagsData::trusted(), frame, 0);
+
+        if yield_count == 0 {
+            self.builder.ins().jump(first_body_block, &[]);
+        } else {
+            let is_state_0 = self.builder.ins().icmp_imm_s(IntCC::Equal, state, 0);
+            let mut current_dispatch = self.builder.create_block();
+            self.builder
+                .ins()
+                .brif(is_state_0, first_body_block, &[], current_dispatch, &[]);
+
+            for k in 1..=yield_count {
+                self.builder.switch_to_block(current_dispatch);
+                let is_k = self.builder.ins().icmp_imm_s(IntCC::Equal, state, k as i64);
+                let target_res = resumption_blocks[&k];
+                if k < yield_count {
+                    let next_dispatch = self.builder.create_block();
+                    self.builder
+                        .ins()
+                        .brif(is_k, target_res, &[], next_dispatch, &[]);
+                    current_dispatch = next_dispatch;
+                } else {
+                    self.builder
+                        .ins()
+                        .brif(is_k, target_res, &[], completed_block, &[]);
+                }
+            }
+        }
+
+        // Completed block: returns 1 (CoroStatus::Completed)
+        self.builder.switch_to_block(completed_block);
+        let status_completed = self.builder.ins().iconst(types::I32, 1);
+        self.builder.ins().return_(&[status_completed]);
+
+        // 4. In first_body_block, load parameters from frame (offset 16 + 8 * i)
+        self.builder.switch_to_block(first_body_block);
+        for (i, param) in fir_func.params.iter().enumerate() {
+            let offset = (16 + 8 * i) as i32;
+            let expected_cl_ty =
+                fir_type_to_cranelift(&param.ty, self.ptr_type).unwrap_or(self.ptr_type);
+            let raw_val =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), frame, offset);
+            let val = if expected_cl_ty == types::I64 || expected_cl_ty == self.ptr_type {
+                raw_val
+            } else if expected_cl_ty.bits() < 64 {
+                self.builder.ins().ireduce(expected_cl_ty, raw_val)
+            } else {
+                raw_val
+            };
+            self.value_map.insert(param.val, val);
+        }
+
+        // 5. Translate instructions in RPO
+        let cfg = ifa_fir::ControlFlowGraph::build(fir_func);
+        let rpo_order = cfg.reverse_post_order();
+        let mut ordered_blocks: Vec<&ifa_fir::BasicBlock> =
+            Vec::with_capacity(fir_func.blocks.len());
+        let mut visited = std::collections::HashSet::new();
+        for block_id in rpo_order {
+            if let Some(b) = fir_func.get_block(block_id) {
+                ordered_blocks.push(b);
+                visited.insert(block_id);
+            }
+        }
+        for b in &fir_func.blocks {
+            if !visited.contains(&b.id) {
+                ordered_blocks.push(b);
+            }
+        }
+
+        let mut current_yield_idx = 0usize;
+
+        for block in ordered_blocks {
+            let cl_block = self.block_map[&block.id];
+            if block.id != fir_func.entry_block {
+                self.builder.switch_to_block(cl_block);
+            }
+
+            for inst in &block.instructions {
+                match &inst.expr {
+                    ValueExpr::Yield | ValueExpr::YieldValue { .. } => {
+                        current_yield_idx += 1;
+                        let k = current_yield_idx;
+
+                        // Store yielded value into frame + 8 if YieldValue
+                        if let ValueExpr::YieldValue { val } = &inst.expr {
+                            if let Some(&v) = self.value_map.get(val) {
+                                let v_ty = self.builder.func.dfg.value_type(v);
+                                let v_i64 = if v_ty == types::I64 || v_ty == self.ptr_type {
+                                    v
+                                } else if v_ty.bits() < 64 {
+                                    self.builder.ins().sextend(types::I64, v)
+                                } else {
+                                    v
+                                };
+                                self.builder
+                                    .ins()
+                                    .store(MemFlagsData::trusted(), v_i64, frame, 8);
+                            }
+                        }
+
+                        // Save all active SSA values in value_map into frame
+                        let mut saved_keys: Vec<(ValueId, types::Type, i32)> = Vec::new();
+                        for (&v_id, &v_val) in &self.value_map {
+                            let slot_offset =
+                                (16 + 8 * (fir_func.params.len() + v_id.0 as usize)) as i32;
+                            let v_ty = self.builder.func.dfg.value_type(v_val);
+                            let v_i64 = if v_ty == types::I64 || v_ty == self.ptr_type {
+                                v_val
+                            } else if v_ty == types::F64 {
+                                self.builder.ins().bitcast(
+                                    types::I64,
+                                    MemFlagsData::trusted(),
+                                    v_val,
+                                )
+                            } else if v_ty.bits() < 64 {
+                                self.builder.ins().sextend(types::I64, v_val)
+                            } else {
+                                v_val
+                            };
+                            self.builder.ins().store(
+                                MemFlagsData::trusted(),
+                                v_i64,
+                                frame,
+                                slot_offset,
+                            );
+                            saved_keys.push((v_id, v_ty, slot_offset));
+                        }
+
+                        // Store next state: k
+                        let next_state_val = self.builder.ins().iconst(types::I32, k as i64);
+                        self.builder
+                            .ins()
+                            .store(MemFlagsData::trusted(), next_state_val, frame, 0);
+
+                        // Return 0 (CoroStatus::Suspended)
+                        let status_susp = self.builder.ins().iconst(types::I32, 0);
+                        self.builder.ins().return_(&[status_susp]);
+
+                        // Switch to resumption block for state k
+                        let res_block = resumption_blocks[&k];
+                        self.builder.switch_to_block(res_block);
+
+                        // Reload saved SSA values
+                        for (v_id, orig_ty, slot_offset) in saved_keys {
+                            let raw_reloaded = self.builder.ins().load(
+                                types::I64,
+                                MemFlagsData::trusted(),
+                                frame,
+                                slot_offset,
+                            );
+                            let reloaded = if orig_ty == types::I64 || orig_ty == self.ptr_type {
+                                raw_reloaded
+                            } else if orig_ty == types::F64 {
+                                self.builder.ins().bitcast(
+                                    types::F64,
+                                    MemFlagsData::trusted(),
+                                    raw_reloaded,
+                                )
+                            } else if orig_ty.bits() < 64 {
+                                self.builder.ins().ireduce(orig_ty, raw_reloaded)
+                            } else {
+                                raw_reloaded
+                            };
+                            self.value_map.insert(v_id, reloaded);
+                        }
+                    }
+                    _ => {
+                        let res = self.translate_expr(inst.result, &inst.expr)?;
+                        if let Some(val_id) = inst.result {
+                            let cl_val =
+                                res.unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
+                            self.value_map.insert(val_id, cl_val);
+                        }
+                    }
+                }
+            }
+
+            // Terminator translation for coroutine resume
+            if let Some(term) = &block.terminator {
+                match term {
+                    Terminator::Return(opt_val) => {
+                        if let Some(v_id) = opt_val {
+                            if let Some(&v) = self.value_map.get(v_id) {
+                                let v_ty = self.builder.func.dfg.value_type(v);
+                                let v_i64 = if v_ty == types::I64 || v_ty == self.ptr_type {
+                                    v
+                                } else if v_ty.bits() < 64 {
+                                    self.builder.ins().sextend(types::I64, v)
+                                } else {
+                                    v
+                                };
+                                self.builder
+                                    .ins()
+                                    .store(MemFlagsData::trusted(), v_i64, frame, 8);
+                            }
+                        }
+                        // Set state to -1 (Completed)
+                        let done_state = self.builder.ins().iconst(types::I32, -1);
+                        self.builder
+                            .ins()
+                            .store(MemFlagsData::trusted(), done_state, frame, 0);
+                        // Return 1 (CoroStatus::Completed)
+                        let status_done = self.builder.ins().iconst(types::I32, 1);
+                        self.builder.ins().return_(&[status_done]);
+                    }
+                    _ => {
+                        self.translate_terminator(term)?;
+                    }
+                }
+            } else {
+                let done_state = self.builder.ins().iconst(types::I32, -1);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), done_state, frame, 0);
+                let status_done = self.builder.ins().iconst(types::I32, 1);
+                self.builder.ins().return_(&[status_done]);
+            }
+        }
+
+        self.builder.seal_all_blocks();
+        let target_config = self.module.target_config();
+        self.builder.finalize(target_config);
+        Ok(())
+    }
+
+    /// Translate a coroutine factory instantiator function into Cranelift IR.
+    pub fn translate_coroutine_factory(
+        mut self,
+        fir_func: &FirFunction,
+        resume_fn_name: &str,
+    ) -> Result<(), CodegenError> {
+        let entry_cl_block = self.builder.create_block();
+        self.builder
+            .append_block_params_for_function_params(entry_cl_block);
+        self.builder.switch_to_block(entry_cl_block);
+
+        let mut param_vals = Vec::new();
+        for (i, _) in fir_func.params.iter().enumerate() {
+            let val = self.builder.block_params(entry_cl_block)[i];
+            param_vals.push(val);
+        }
+
+        let frame_size = 16 + 8 * (fir_func.params.len() + fir_func.next_value_id as usize + 4);
+        let frame_size_val = self.builder.ins().iconst(self.ptr_type, frame_size as i64);
+
+        let resume_id = *self.func_ids.get(resume_fn_name).ok_or_else(|| {
+            CodegenError::Codegen(format!("Missing resume func {}", resume_fn_name))
+        })?;
+        let resume_local = self
+            .module
+            .declare_func_in_func(resume_id, self.builder.func);
+        let resume_addr = self.builder.ins().func_addr(self.ptr_type, resume_local);
+
+        let null_destroy = self.builder.ins().iconst(self.ptr_type, 0);
+
+        let coro_create_id = *self
+            .func_ids
+            .get("ifa_rt_coro_create")
+            .ok_or_else(|| CodegenError::Codegen("Missing ifa_rt_coro_create".into()))?;
+        let coro_create_local = self
+            .module
+            .declare_func_in_func(coro_create_id, self.builder.func);
+        let call_create = self.builder.ins().call(
+            coro_create_local,
+            &[frame_size_val, resume_addr, null_destroy],
+        );
+        let coro_hdl = self.builder.inst_results(call_create)[0];
+
+        let coro_frame_id = *self
+            .func_ids
+            .get("ifa_rt_coro_frame")
+            .ok_or_else(|| CodegenError::Codegen("Missing ifa_rt_coro_frame".into()))?;
+        let coro_frame_local = self
+            .module
+            .declare_func_in_func(coro_frame_id, self.builder.func);
+        let call_frame = self.builder.ins().call(coro_frame_local, &[coro_hdl]);
+        let frame = self.builder.inst_results(call_frame)[0];
+
+        let zero_state = self.builder.ins().iconst(types::I32, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), zero_state, frame, 0);
+
+        for (i, &p_val) in param_vals.iter().enumerate() {
+            let offset = (16 + 8 * i) as i32;
+            let p_ty = self.builder.func.dfg.value_type(p_val);
+            let val_to_store = if p_ty == types::I64 || p_ty == self.ptr_type {
+                p_val
+            } else if p_ty.bits() < 64 {
+                self.builder.ins().sextend(types::I64, p_val)
+            } else {
+                p_val
+            };
+            self.builder
+                .ins()
+                .store(MemFlagsData::trusted(), val_to_store, frame, offset);
+        }
+
+        self.builder.ins().return_(&[coro_hdl]);
         self.builder.seal_all_blocks();
         let target_config = self.module.target_config();
         self.builder.finalize(target_config);
@@ -1066,7 +1419,51 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             | ValueExpr::StructPushField { .. }
             | ValueExpr::CoWCheckShared { .. } => Some(self.builder.ins().iconst(types::I64, 0)),
 
-            ValueExpr::Spawn { .. } => Some(self.builder.ins().iconst(types::I64, 1)),
+            ValueExpr::Spawn { target, args } => {
+                let target_name = INTERNER.resolve(target);
+                let is_coro = self.coro_funcs.contains(target);
+                if let Some(&callee_id) = self.func_ids.get(&target_name) {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(callee_id, self.builder.func);
+                    let sig_ref = self.builder.func.dfg.ext_funcs[local_func].signature;
+                    let expected_params = self.builder.func.dfg.signatures[sig_ref].params.clone();
+                    let mut arg_vals = Vec::with_capacity(args.len());
+                    for (i, a) in args.iter().enumerate() {
+                        let mut v = self.value_map[a];
+                        if let Some(param) = expected_params.get(i) {
+                            let cur_ty = self.builder.func.dfg.value_type(v);
+                            let exp_ty = param.value_type;
+                            if cur_ty != exp_ty {
+                                if cur_ty.bits() > exp_ty.bits() {
+                                    v = self.builder.ins().ireduce(exp_ty, v);
+                                } else if cur_ty.bits() < exp_ty.bits() {
+                                    v = self.builder.ins().sextend(exp_ty, v);
+                                }
+                            }
+                        }
+                        arg_vals.push(v);
+                    }
+                    let call = self.builder.ins().call(local_func, &arg_vals);
+                    let results = self.builder.inst_results(call);
+                    let ret_val = results.first().copied();
+                    if is_coro {
+                        if let Some(coro_hdl) = ret_val {
+                            if let Some(&coro_spawn_id) = self.func_ids.get("ifa_rt_coro_spawn") {
+                                let local_spawn = self
+                                    .module
+                                    .declare_func_in_func(coro_spawn_id, self.builder.func);
+                                let call_spawn = self.builder.ins().call(local_spawn, &[coro_hdl]);
+                                let fid = self.builder.inst_results(call_spawn).first().copied();
+                                return Ok(fid);
+                            }
+                        }
+                    }
+                    ret_val
+                } else {
+                    Some(self.builder.ins().iconst(types::I64, 1))
+                }
+            }
 
             ValueExpr::Call { callee, args } => {
                 if let Some(&callee_val) = self.value_map.get(callee) {
@@ -1267,9 +1664,16 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                         BlockArg::from(val)
                     })
                     .collect();
+                let cond_ty = self.builder.func.dfg.value_type(c);
+                let c_cond = if cond_ty.is_int() {
+                    let zero = self.builder.ins().iconst(cond_ty, 0);
+                    self.builder.ins().icmp(IntCC::NotEqual, c, zero)
+                } else {
+                    c
+                };
                 self.builder
                     .ins()
-                    .brif(c, then_cl, &then_cl_args, else_cl, &else_cl_args);
+                    .brif(c_cond, then_cl, &then_cl_args, else_cl, &else_cl_args);
             }
             Terminator::Switch {
                 val,

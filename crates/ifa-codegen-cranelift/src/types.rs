@@ -63,7 +63,10 @@ pub fn fir_signature_to_cranelift(
 
     // Map return type
     let fn_name = ifa_span::INTERNER.resolve(&func.name);
-    if let Some(ret_type) = fir_type_to_cranelift(&func.ret_ty, ptr_type) {
+    if func.is_coroutine() {
+        // Stackless coroutines return a raw coroutine handle pointer (*mut IfaCoroutine)
+        sig.returns.push(AbiParam::new(ptr_type));
+    } else if let Some(ret_type) = fir_type_to_cranelift(&func.ret_ty, ptr_type) {
         sig.returns.push(AbiParam::new(ret_type));
     } else if fn_name == "main" {
         // Native host ABI requires main to return an integer exit status

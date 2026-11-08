@@ -1786,11 +1786,7 @@ impl<'a> LlvmIrEmitter<'a> {
                             } else if let Some(target_fn) =
                                 module.functions.iter().find(|f| f.name == *name)
                             {
-                                if target_fn.is_coroutine() {
-                                    ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Unit))
-                                } else {
-                                    target_fn.ret_ty.clone()
-                                }
+                                target_fn.ret_ty.clone()
                             } else {
                                 ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                             }
@@ -1981,7 +1977,7 @@ impl<'a> LlvmIrEmitter<'a> {
             if is_coro && b_idx == 0 {
                 out.push_str("  %coro.yield_slot = alloca i64, align 8\n");
                 out.push_str(
-                    "  %coro.id = call token @llvm.coro.id(i32 0, ptr %coro.yield_slot, ptr null, ptr null)\n",
+                    "  %coro.id = call token @llvm.coro.id(i32 8, ptr %coro.yield_slot, ptr null, ptr null)\n",
                 );
                 if self.target.arch == TargetArch::Wasm32Wasi {
                     out.push_str("  %coro.size.32 = call i32 @llvm.coro.size.i32()\n");
@@ -2065,6 +2061,7 @@ impl<'a> LlvmIrEmitter<'a> {
                 self.emit_terminator(
                     term,
                     &func.ret_ty,
+                    &value_types,
                     is_main_unit,
                     is_coro,
                     block.vector_hint.as_ref(),
@@ -4753,10 +4750,12 @@ impl<'a> LlvmIrEmitter<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_terminator(
         &self,
         term: &Terminator,
         ret_ty: &ifa_fir::FirType,
+        value_types: &HashMap<ifa_fir::ValueId, ifa_fir::FirType>,
         is_main_unit: bool,
         is_coro: bool,
         vector_hint: Option<&ifa_fir::LoopVectorHint>,
@@ -4808,7 +4807,47 @@ impl<'a> LlvmIrEmitter<'a> {
                 if llvm_ty == "void" {
                     out.push_str("  ret void\n");
                 } else if let Some(val) = val_opt {
-                    out.push_str(&format!("  ret {} %v{}\n", llvm_ty, val.0));
+                    let val_fir_ty = value_types.get(val);
+                    let val_llvm_ty = val_fir_ty
+                        .and_then(|t| fir_to_llvm_type(t).ok())
+                        .unwrap_or_else(|| llvm_ty.clone());
+                    if val_llvm_ty == llvm_ty {
+                        out.push_str(&format!("  ret {} %v{}\n", llvm_ty, val.0));
+                    } else if val_llvm_ty == "i64"
+                        && (llvm_ty == "i32" || llvm_ty == "i16" || llvm_ty == "i8")
+                    {
+                        let cast_id = format!("ret_trunc_{}", val.0);
+                        out.push_str(&format!(
+                            "  %{} = trunc i64 %v{} to {}\n",
+                            cast_id, val.0, llvm_ty
+                        ));
+                        out.push_str(&format!("  ret {} %{}\n", llvm_ty, cast_id));
+                    } else if (val_llvm_ty == "i32" || val_llvm_ty == "i16" || val_llvm_ty == "i8")
+                        && llvm_ty == "i64"
+                    {
+                        let cast_id = format!("ret_zext_{}", val.0);
+                        out.push_str(&format!(
+                            "  %{} = zext {} %v{} to i64\n",
+                            cast_id, val_llvm_ty, val.0
+                        ));
+                        out.push_str(&format!("  ret i64 %{}\n", cast_id));
+                    } else if val_llvm_ty == "ptr" && llvm_ty == "i64" {
+                        let cast_id = format!("ret_ptrtoint_{}", val.0);
+                        out.push_str(&format!(
+                            "  %{} = ptrtoint ptr %v{} to i64\n",
+                            cast_id, val.0
+                        ));
+                        out.push_str(&format!("  ret i64 %{}\n", cast_id));
+                    } else if val_llvm_ty == "i64" && llvm_ty == "ptr" {
+                        let cast_id = format!("ret_inttoptr_{}", val.0);
+                        out.push_str(&format!(
+                            "  %{} = inttoptr i64 %v{} to ptr\n",
+                            cast_id, val.0
+                        ));
+                        out.push_str(&format!("  ret ptr %{}\n", cast_id));
+                    } else {
+                        out.push_str(&format!("  ret {} %v{}\n", llvm_ty, val.0));
+                    }
                 } else {
                     out.push_str("  ret void\n");
                 }
@@ -4996,14 +5035,56 @@ impl<'a> LlvmIrEmitter<'a> {
                             _ => 1,
                         }
                     };
+                    let cond_fir_ty = value_types.get(cond);
+                    let cond_llvm_ty = cond_fir_ty
+                        .and_then(|t| fir_to_llvm_type(t).ok())
+                        .unwrap_or_else(|| "i1".to_string());
+                    let cond_expr = if cond_llvm_ty == "i1" {
+                        format!("%v{}", cond.0)
+                    } else if cond_llvm_ty == "ptr" {
+                        let cast_id = format!("br_cond_cast_{}", cond.0);
+                        out.push_str(&format!(
+                            "  %{} = icmp ne ptr %v{}, null\n",
+                            cast_id, cond.0
+                        ));
+                        format!("%{}", cast_id)
+                    } else {
+                        let cast_id = format!("br_cond_cast_{}", cond.0);
+                        out.push_str(&format!(
+                            "  %{} = icmp ne {} %v{}, 0\n",
+                            cast_id, cond_llvm_ty, cond.0
+                        ));
+                        format!("%{}", cast_id)
+                    };
                     out.push_str(&format!(
-                        "  br i1 %v{}, label %bb{}, label %bb{}, !llvm.loop !{}\n",
-                        cond.0, then_block.0, else_block.0, meta_id
+                        "  br i1 {}, label %bb{}, label %bb{}, !llvm.loop !{}\n",
+                        cond_expr, then_block.0, else_block.0, meta_id
                     ));
                 } else {
+                    let cond_fir_ty = value_types.get(cond);
+                    let cond_llvm_ty = cond_fir_ty
+                        .and_then(|t| fir_to_llvm_type(t).ok())
+                        .unwrap_or_else(|| "i1".to_string());
+                    let cond_expr = if cond_llvm_ty == "i1" {
+                        format!("%v{}", cond.0)
+                    } else if cond_llvm_ty == "ptr" {
+                        let cast_id = format!("br_cond_cast_{}", cond.0);
+                        out.push_str(&format!(
+                            "  %{} = icmp ne ptr %v{}, null\n",
+                            cast_id, cond.0
+                        ));
+                        format!("%{}", cast_id)
+                    } else {
+                        let cast_id = format!("br_cond_cast_{}", cond.0);
+                        out.push_str(&format!(
+                            "  %{} = icmp ne {} %v{}, 0\n",
+                            cast_id, cond_llvm_ty, cond.0
+                        ));
+                        format!("%{}", cast_id)
+                    };
                     out.push_str(&format!(
-                        "  br i1 %v{}, label %bb{}, label %bb{}\n",
-                        cond.0, then_block.0, else_block.0
+                        "  br i1 {}, label %bb{}, label %bb{}\n",
+                        cond_expr, then_block.0, else_block.0
                     ));
                 }
             }

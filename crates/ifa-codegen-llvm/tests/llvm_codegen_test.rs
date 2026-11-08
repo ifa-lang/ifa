@@ -2674,7 +2674,7 @@ fn test_llvm_coroutine_iterator_generator_lowering() {
     // 1. Verify standard LLVM coroutine attributes and intrinsic bindings
     assert!(ir.contains("define dso_local ptr @range_generator() presplitcoroutine"));
     assert!(
-        ir.contains("call token @llvm.coro.id(i32 0, ptr %coro.yield_slot, ptr null, ptr null)")
+        ir.contains("call token @llvm.coro.id(i32 8, ptr %coro.yield_slot, ptr null, ptr null)")
     );
     assert!(ir.contains("call ptr @llvm.coro.begin("));
     assert!(ir.contains("store i64 %v1, ptr %coro.yield_slot, align 8"));
