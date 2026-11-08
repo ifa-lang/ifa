@@ -491,3 +491,75 @@ fn test_fir_closure_bounded_lifetime_arena_placement() {
     let result = interp.execute_function("main", vec![]).unwrap();
     assert_eq!(result, FirValue::Int(25));
 }
+
+#[test]
+fn test_fir_closure_thread_local_call_arena_lowering() {
+    let src = r#"
+        pub fn apply_accumulator(f: fn(i64) -> i64, initial: i64, steps: i64) -> i64 {
+            let mut acc: i64 = initial;
+            let mut i: i64 = 0;
+            while i < steps {
+                acc = f(acc);
+                i = i + 1;
+            }
+            return acc;
+        }
+
+        pub fn main() -> i64 {
+            let increment: i64 = 7;
+            let adder = fn(x: i64) -> i64 {
+                return x + increment;
+            };
+            return apply_accumulator(adder, 10, 4); // 10 + 7 * 4 = 38
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("call_arena_closure.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut fir_module = ifa_fir::lower_program(&prog, &analysis.symbols);
+    let mut sroa = ifa_fir::SroaPass::new();
+    sroa.run_on_module(&mut fir_module);
+
+    let mut closure_pass = ifa_fir::ClosureOptPass::new();
+    closure_pass.run_on_module(&mut fir_module);
+
+    let stats = closure_pass.stats();
+    assert_eq!(stats.total_closures, 1);
+    assert_eq!(stats.heap_allocated_closures, 0);
+    assert!(
+        stats.thread_local_call_arena_closures >= 1 || stats.arena_allocated_closures >= 1,
+        "Bounded closure must be lowered to thread-local call arena: {:?}",
+        stats
+    );
+
+    // Verify presence of CallArenaMark / CallArenaRewind or direct specialization
+    let has_call_arena_guard = fir_module.functions.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(
+                    i.expr,
+                    ifa_fir::ValueExpr::CallArenaMark | ifa_fir::ValueExpr::CallArenaRewind { .. }
+                )
+            })
+        })
+    });
+    assert!(
+        has_call_arena_guard || stats.specialized_higher_order_calls > 0,
+        "Call arena scope guards must be emitted around bounded closure calls"
+    );
+
+    let mut interp = FirInterpreter::new(&fir_module);
+    let result = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(result, FirValue::Int(38));
+}

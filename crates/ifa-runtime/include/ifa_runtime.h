@@ -24,6 +24,7 @@ extern "C" {
 #define IFA_FLAG_PINNED       0x0002
 #define IFA_FLAG_READONLY     0x0004
 #define IFA_FLAG_ARENA_SCOPED 0x0008
+#define IFA_ARENA_THREAD_LOCAL_CALL 0xFFF0
 
 /**
  * 64-bit Generational Header placed directly before each allocated payload.
@@ -107,6 +108,26 @@ void ifa_rt_arena_destroy(uint16_t arena_id);
  * Allocate memory directly inside a scoped generational arena.
  */
 void* ifa_rt_arena_alloc(uint16_t arena_id, size_t size, size_t align);
+
+/**
+ * Allocate memory inside the fast thread-local call arena for bounded closure environments.
+ */
+void* ifa_rt_call_arena_alloc(size_t size, size_t align);
+
+/**
+ * Mark the active thread's call arena bump position to establish a rewind point.
+ */
+size_t ifa_rt_call_arena_mark(void);
+
+/**
+ * Rewind the active thread's call arena bump position, resetting allocations above mark.
+ */
+void ifa_rt_call_arena_rewind(size_t mark);
+
+/**
+ * Reset the active thread's call arena completely.
+ */
+void ifa_rt_call_arena_reset(void);
 
 /* --- Zero-Copy Slices & Buffers API --- */
 

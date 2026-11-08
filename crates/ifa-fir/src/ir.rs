@@ -246,6 +246,15 @@ pub enum ValueExpr {
         ref_val: ValueId,
     },
 
+    // Thread-Local Call Arena Primitives (Bounded Closures & Call Scopes)
+    CallArenaAlloc {
+        ty: FirType,
+    },
+    CallArenaMark,
+    CallArenaRewind {
+        mark: ValueId,
+    },
+
     // Concurrency / Fibers Primitives
     Yield,
     YieldValue {
@@ -339,6 +348,8 @@ impl ValueExpr {
             ValueExpr::GenRef { ptr } => vec![*ptr],
             ValueExpr::GenCheck { ref_val, .. } => vec![*ref_val],
             ValueExpr::GenDeref { ref_val } => vec![*ref_val],
+            ValueExpr::CallArenaAlloc { .. } | ValueExpr::CallArenaMark => Vec::new(),
+            ValueExpr::CallArenaRewind { mark } => vec![*mark],
             ValueExpr::Spawn { args, .. } => args.clone(),
             ValueExpr::ChanCreate { capacity, .. } => capacity.iter().copied().collect(),
             ValueExpr::ChanSend { chan, val } => vec![*chan, *val],

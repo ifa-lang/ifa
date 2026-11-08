@@ -329,6 +329,11 @@ impl<'a> FirPrinter<'a> {
                 }
             }
             ValueExpr::GenDeref { ref_val } => write!(self.output, "gen.deref {}", ref_val),
+            ValueExpr::CallArenaAlloc { ty } => write!(self.output, "call_arena.alloc {}", ty),
+            ValueExpr::CallArenaMark => write!(self.output, "call_arena.mark"),
+            ValueExpr::CallArenaRewind { mark } => {
+                write!(self.output, "call_arena.rewind {}", mark)
+            }
             ValueExpr::Yield => write!(self.output, "yield"),
             ValueExpr::YieldValue { val } => write!(self.output, "yield {}", val),
             ValueExpr::Spawn { target, args } => {

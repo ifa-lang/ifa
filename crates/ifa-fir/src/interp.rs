@@ -2083,6 +2083,13 @@ impl<'a> FirInterpreter<'a> {
                 }
             }
 
+            ValueExpr::CallArenaAlloc { .. } => {
+                let (slot, generation) = self.heap.alloc(FirValue::Unit);
+                Ok(FirValue::GenRef { slot, generation })
+            }
+            ValueExpr::CallArenaMark => Ok(FirValue::Int(0)),
+            ValueExpr::CallArenaRewind { .. } => Ok(FirValue::Unit),
+
             ValueExpr::Yield => Ok(FirValue::Unit),
             ValueExpr::YieldValue { val } => Ok(env.get(val).cloned().unwrap_or(FirValue::Unit)),
             ValueExpr::Spawn { .. } => Ok(FirValue::Unit),

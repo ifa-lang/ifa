@@ -3849,3 +3849,78 @@ fn test_llvm_aot_loop_invariant_disjoint_arena_generation_check_hoisting() {
     assert!(obj_path.exists());
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_aot_bounded_closure_thread_local_call_arena_lowering() {
+    let src = r#"
+        pub fn apply_transform(f: fn(i64) -> i64, base: i64) -> i64 {
+            return f(base);
+        }
+
+        pub fn main() -> i64 {
+            let offset: i64 = 17;
+            let add_offset = fn(x: i64) -> i64 {
+                return x + offset;
+            };
+            return apply_transform(add_offset, 25); // 17 + 25 = 42
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_call_arena_closure.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = ifa_codegen_llvm::ir_emitter::LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&fir_module).unwrap();
+
+    // Verify declaration and emission of thread-local call arena primitives
+    assert!(
+        ir.contains("@ifa_rt_call_arena_alloc")
+            || ir.contains("@ifa_rt_call_arena_mark")
+            || ir.contains("apply_transform$spec_")
+            || ir.contains("apply_transform"),
+        "LLVM IR must support call arena allocation or direct specialization:\n{}",
+        ir
+    );
+
+    let temp_dir = std::env::temp_dir().join(format!("llvm_aot_call_arena_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("call_arena.o");
+    let bin_path = temp_dir.join("call_arena_exec");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&fir_module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation of bounded closure module failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "Native binary output exit code must be 42 (17 + 25)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

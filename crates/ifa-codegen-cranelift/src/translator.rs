@@ -598,6 +598,34 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 }
             }
 
+            ValueExpr::CallArenaAlloc { ty } => {
+                let size = crate::types::fir_type_byte_size(ty).max(8);
+                let size_val = self.builder.ins().iconst(self.ptr_type, size as i64);
+                let align_val = self.builder.ins().iconst(self.ptr_type, 8);
+                let arena_val = self
+                    .builder
+                    .ins()
+                    .iconst(types::I32, ifa_fir::ARENA_THREAD_LOCAL_CALL as i64);
+
+                if let Some(func_id) = self.func_ids.get("ifa_rt_gen_alloc") {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    let call = self
+                        .builder
+                        .ins()
+                        .call(local_func, &[size_val, align_val, arena_val]);
+                    let results = self.builder.inst_results(call);
+                    results.first().copied()
+                } else {
+                    Some(self.builder.ins().iconst(self.ptr_type, 0))
+                }
+            }
+
+            ValueExpr::CallArenaMark => Some(self.builder.ins().iconst(types::I64, 0)),
+
+            ValueExpr::CallArenaRewind { .. } => Some(self.builder.ins().iconst(types::I64, 0)),
+
             ValueExpr::GenFree { ptr } => {
                 let p = self.value_map[ptr];
                 if let Some(func_id) = self.func_ids.get("ifa_rt_gen_free") {

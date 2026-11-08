@@ -22,7 +22,9 @@ pub mod verify;
 pub use arena_opt::{ArenaFusionPass, ArenaFusionStats};
 pub use bce::{BcePass, BceStats};
 pub use cfg::ControlFlowGraph;
-pub use closure_opt::{ClosureAllocationKind, ClosureEscapeStats, ClosureOptPass};
+pub use closure_opt::{
+    ClosureAllocationKind, ClosureEscapeStats, ClosureOptPass, ARENA_THREAD_LOCAL_CALL,
+};
 pub use cow::{CowPass, SharingState};
 pub use dominance::DominanceTree;
 pub use gen_opt::{GenOptStats, GenerationalOptPass, NaturalLoop};

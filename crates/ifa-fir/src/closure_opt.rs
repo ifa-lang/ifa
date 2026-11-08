@@ -5,6 +5,9 @@ use crate::types::FirType;
 use ifa_span::{Symbol, INTERNER};
 use std::collections::{HashMap, HashSet};
 
+/// Reserved 16-bit identifier for thread-local call arenas.
+pub const ARENA_THREAD_LOCAL_CALL: u16 = 0xFFF0;
+
 /// Memory allocation classification for a closure's captured environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClosureAllocationKind {
@@ -12,7 +15,7 @@ pub enum ClosureAllocationKind {
     /// or scalarized directly into SSA registers (zero heap allocation overhead).
     Stack,
     /// Environment escapes local frame only into bounded callee invocations (e.g. higher-order iterators):
-    /// allocated in a pre-allocated request/scoped arena (O(1) bump allocation, zero fragmentation).
+    /// allocated in a pre-allocated request/scoped arena or thread-local call arena (O(1) bump allocation, zero fragmentation).
     Arena(u16),
     /// Environment escapes unboundedly (returned from caller, stored in global or spawned across threads):
     /// requires heap allocation with generational safety.
@@ -59,6 +62,8 @@ pub struct ClosureEscapeStats {
     pub specialized_higher_order_calls: usize,
     /// Environments successfully placed into pre-allocated memory arenas.
     pub arena_placed_closures: usize,
+    /// Bounded closure environments lowered directly into thread-local call arena blocks.
+    pub thread_local_call_arena_closures: usize,
 }
 
 /// Interprocedural closure escape analysis and capture optimizer.
@@ -102,6 +107,10 @@ impl ClosureOptPass {
         for c in &closures {
             match c.allocation {
                 ClosureAllocationKind::Stack => self.stats.stack_allocated_closures += 1,
+                ClosureAllocationKind::Arena(ARENA_THREAD_LOCAL_CALL) => {
+                    self.stats.arena_allocated_closures += 1;
+                    self.stats.thread_local_call_arena_closures += 1;
+                }
                 ClosureAllocationKind::Arena(_) => self.stats.arena_allocated_closures += 1,
                 ClosureAllocationKind::Heap => self.stats.heap_allocated_closures += 1,
             }
@@ -371,7 +380,7 @@ impl ClosureOptPass {
         }
 
         if passed_to_bounded_call {
-            ClosureAllocationKind::Arena(1)
+            ClosureAllocationKind::Arena(ARENA_THREAD_LOCAL_CALL)
         } else {
             ClosureAllocationKind::Stack
         }
@@ -1005,6 +1014,53 @@ impl ClosureOptPass {
                 if let Some(term) = &mut block.terminator {
                     SroaPass::substitute_terminator_operands(term, &substitutions);
                 }
+            }
+        }
+
+        // Wrap higher-order bounded call sites with thread-local call arena mark/rewind scope guards
+        let call_arena_closures: HashSet<ValueId> = closures
+            .iter()
+            .filter(|c| {
+                c.func_name == func.name
+                    && c.allocation == ClosureAllocationKind::Arena(ARENA_THREAD_LOCAL_CALL)
+            })
+            .flat_map(|c| [c.closure_val, c.env_val])
+            .collect();
+
+        if !call_arena_closures.is_empty() {
+            for block in &mut func.blocks {
+                let mut new_insts = Vec::with_capacity(block.instructions.len() * 2);
+                for inst in block.instructions.drain(..) {
+                    let has_call_arena_arg = match &inst.expr {
+                        ValueExpr::CallDirect { args, .. } | ValueExpr::Call { args, .. } => {
+                            args.iter().any(|a| {
+                                let resolved = substitutions.get(a).copied().unwrap_or(*a);
+                                call_arena_closures.contains(&resolved)
+                            })
+                        }
+                        _ => false,
+                    };
+
+                    if has_call_arena_arg {
+                        let mark_val = ValueId(func.next_value_id);
+                        func.next_value_id += 1;
+                        new_insts.push(Instruction::new(
+                            Some(mark_val),
+                            ValueExpr::CallArenaMark,
+                            inst.span,
+                        ));
+                        new_insts.push(inst.clone());
+                        new_insts.push(Instruction::new(
+                            None,
+                            ValueExpr::CallArenaRewind { mark: mark_val },
+                            inst.span,
+                        ));
+                        self.stats.arena_placed_closures += 1;
+                    } else {
+                        new_insts.push(inst);
+                    }
+                }
+                block.instructions = new_insts;
             }
         }
     }

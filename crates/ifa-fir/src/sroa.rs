@@ -1003,6 +1003,8 @@ impl SroaPass {
             ValueExpr::GenRef { ptr } => replace(ptr),
             ValueExpr::GenCheck { ref_val, .. } => replace(ref_val),
             ValueExpr::GenDeref { ref_val } => replace(ref_val),
+            ValueExpr::CallArenaAlloc { .. } | ValueExpr::CallArenaMark => {}
+            ValueExpr::CallArenaRewind { mark } => replace(mark),
             ValueExpr::Spawn { args, .. } => {
                 for a in args {
                     replace(a);

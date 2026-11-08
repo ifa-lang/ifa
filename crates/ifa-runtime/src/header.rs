@@ -13,6 +13,9 @@ pub const FLAG_ARENA_SCOPED: u16 = 0x0008;
 pub const FLAG_QUARANTINED: u16 = 0x0010;
 pub const FLAG_EPOCH_1: u16 = 0x0020;
 
+/// Reserved 16-bit identifier for thread-local call arenas.
+pub const ARENA_THREAD_LOCAL_CALL: u16 = 0xFFF0;
+
 /// Result of marking a generational memory slot as freed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EpochTransition {

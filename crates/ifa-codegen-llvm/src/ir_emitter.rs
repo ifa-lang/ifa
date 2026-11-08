@@ -109,6 +109,10 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare void @ifa_rt_print_i64(i64)\n");
             out.push_str("declare ptr @ifa_rt_gen_alloc(i64, i64, i16)\n");
             out.push_str("declare void @ifa_rt_gen_free(ptr)\n");
+            out.push_str("declare ptr @ifa_rt_call_arena_alloc(i64, i64)\n");
+            out.push_str("declare i64 @ifa_rt_call_arena_mark()\n");
+            out.push_str("declare void @ifa_rt_call_arena_rewind(i64)\n");
+            out.push_str("declare void @ifa_rt_call_arena_reset()\n");
             out.push_str("declare void @ifa_rt_fiber_yield()\n");
             out.push_str("declare i64 @ifa_rt_fiber_spawn(ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_fiber_join(i64)\n");
@@ -165,6 +169,10 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare void @ifa_rt_print_i64(i64)\n");
             out.push_str("declare ptr @ifa_rt_gen_alloc(i64, i64, i16)\n");
             out.push_str("declare void @ifa_rt_gen_free(ptr)\n");
+            out.push_str("declare ptr @ifa_rt_call_arena_alloc(i64, i64)\n");
+            out.push_str("declare i64 @ifa_rt_call_arena_mark()\n");
+            out.push_str("declare void @ifa_rt_call_arena_rewind(i64)\n");
+            out.push_str("declare void @ifa_rt_call_arena_reset()\n");
             out.push_str("declare void @ifa_rt_fiber_yield()\n");
             out.push_str("declare i64 @ifa_rt_fiber_spawn(ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_fiber_join(i64)\n");
@@ -1340,6 +1348,16 @@ impl<'a> LlvmIrEmitter<'a> {
                                 ifa_sema::types::IntType::I64,
                             ))),
                         },
+                        ValueExpr::CallArenaAlloc { ty } => {
+                            ifa_fir::FirType::Pointer(Box::new(ty.clone()))
+                        }
+                        ValueExpr::CallArenaMark => {
+                            ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                        }
+                        ValueExpr::CallArenaRewind { .. } => ifa_fir::FirType::Unit,
+                        ValueExpr::GenAlloc { ty, .. } => {
+                            ifa_fir::FirType::Pointer(Box::new(ty.clone()))
+                        }
                         ValueExpr::GetFieldPtr {
                             base, field_idx, ..
                         } => match value_types.get(base) {
@@ -2112,10 +2130,38 @@ impl<'a> LlvmIrEmitter<'a> {
                 let size = ty.byte_size().max(8);
                 let align = llvm_align_for_type(ty).max(8);
                 let arena_id = arena.unwrap_or(0);
+                if arena_id == ifa_fir::ARENA_THREAD_LOCAL_CALL {
+                    out.push_str(&format!(
+                        "  %v{} = call ptr @ifa_rt_call_arena_alloc(i64 {}, i64 {})\n",
+                        res_id, size, align
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  %v{} = call ptr @ifa_rt_gen_alloc(i64 {}, i64 {}, i16 {})\n",
+                        res_id, size, align, arena_id
+                    ));
+                }
+            }
+            ValueExpr::CallArenaAlloc { ty } => {
+                let size = ty.byte_size().max(8);
+                let align = llvm_align_for_type(ty).max(8);
                 out.push_str(&format!(
-                    "  %v{} = call ptr @ifa_rt_gen_alloc(i64 {}, i64 {}, i16 {})\n",
-                    res_id, size, align, arena_id
+                    "  %v{} = call ptr @ifa_rt_call_arena_alloc(i64 {}, i64 {})\n",
+                    res_id, size, align
                 ));
+            }
+            ValueExpr::CallArenaMark => {
+                out.push_str(&format!(
+                    "  %v{} = call i64 @ifa_rt_call_arena_mark()\n",
+                    res_id
+                ));
+            }
+            ValueExpr::CallArenaRewind { mark } => {
+                out.push_str(&format!(
+                    "  call void @ifa_rt_call_arena_rewind(i64 %v{})\n",
+                    mark.0
+                ));
+                out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
             }
             ValueExpr::GetField {
                 base, field_idx, ..
@@ -3281,6 +3327,12 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             ValueExpr::GenFree { ptr } => {
                 out.push_str(&format!("  call void @ifa_rt_gen_free(ptr %v{})\n", ptr.0));
+            }
+            ValueExpr::CallArenaRewind { mark } => {
+                out.push_str(&format!(
+                    "  call void @ifa_rt_call_arena_rewind(i64 %v{})\n",
+                    mark.0
+                ));
             }
             ValueExpr::GenCheck { ref_val, redundant } => {
                 if !*redundant {

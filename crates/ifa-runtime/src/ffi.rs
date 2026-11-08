@@ -291,6 +291,30 @@ pub extern "C" fn ifa_rt_arena_alloc(arena_id: u16, size: usize, align: usize) -
     GLOBAL_ALLOCATOR.alloc(size, align.max(8), arena_id)
 }
 
+/// Allocate memory in the fast thread-local call arena for bounded closure environments.
+#[no_mangle]
+pub extern "C" fn ifa_rt_call_arena_alloc(size: usize, align: usize) -> *mut u8 {
+    crate::allocator::call_arena_alloc(size, align)
+}
+
+/// Mark the active thread's call arena bump position to establish a rewind point.
+#[no_mangle]
+pub extern "C" fn ifa_rt_call_arena_mark() -> usize {
+    crate::allocator::call_arena_mark()
+}
+
+/// Rewind the active thread's call arena bump position, invalidating allocations above the mark.
+#[no_mangle]
+pub extern "C" fn ifa_rt_call_arena_rewind(mark: usize) {
+    crate::allocator::call_arena_rewind(mark);
+}
+
+/// Reset the active thread's call arena completely.
+#[no_mangle]
+pub extern "C" fn ifa_rt_call_arena_reset() {
+    crate::allocator::call_arena_reset();
+}
+
 /// Spawn a new colorless fiber running an `extern "C"` function pointer with argument.
 #[no_mangle]
 pub extern "C" fn ifa_rt_fiber_spawn(entry: extern "C-unwind" fn(*mut u8), arg: *mut u8) -> u64 {

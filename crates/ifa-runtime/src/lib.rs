@@ -14,7 +14,9 @@ pub mod string;
 pub mod wasi;
 
 pub use allocator::{
-    EpochGuard, EpochManager, EpochStats, GenArena, GlobalGenAllocator, GLOBAL_ALLOCATOR,
+    call_arena_alloc, call_arena_mark, call_arena_reset, call_arena_rewind, EpochGuard,
+    EpochManager, EpochStats, GenArena, GlobalGenAllocator, ThreadLocalCallArena,
+    CALL_ARENA_INITIAL_CAPACITY, GLOBAL_ALLOCATOR,
 };
 pub use benchmarks::{
     profile_allocator_engine, run_allocator_multithread_suite, run_generational_benchmark_suite,
@@ -34,8 +36,8 @@ pub use fiber::{
     TrySendError, GLOBAL_SCHEDULER,
 };
 pub use header::{
-    EpochTransition, GenHeader, GenRef, FLAG_ACTIVE, FLAG_ARENA_SCOPED, FLAG_EPOCH_1, FLAG_FREE,
-    FLAG_PINNED, FLAG_QUARANTINED, FLAG_READONLY,
+    EpochTransition, GenHeader, GenRef, ARENA_THREAD_LOCAL_CALL, FLAG_ACTIVE, FLAG_ARENA_SCOPED,
+    FLAG_EPOCH_1, FLAG_FREE, FLAG_PINNED, FLAG_QUARANTINED, FLAG_READONLY,
 };
 pub use panic::{
     catch_panic, clear_last_panic, dispatch_panic, get_last_panic, get_last_panic_raw_ptr,

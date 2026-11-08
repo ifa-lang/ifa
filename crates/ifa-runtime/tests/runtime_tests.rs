@@ -1185,3 +1185,42 @@ fn test_blocking_pool_cooperative_yield_and_ffi_isolation() {
     assert!(TASK_COMPLETED.load(Ordering::SeqCst));
     assert_eq!(pack.res, 350);
 }
+
+#[test]
+fn test_thread_local_call_arena_alloc_and_rewind() {
+    use ifa_runtime::ffi::{
+        ifa_rt_call_arena_alloc, ifa_rt_call_arena_mark, ifa_rt_call_arena_reset,
+        ifa_rt_call_arena_rewind, ifa_rt_gen_check,
+    };
+    use ifa_runtime::header::{GenHeader, ARENA_THREAD_LOCAL_CALL};
+
+    ifa_rt_call_arena_reset();
+
+    let mark_initial = ifa_rt_call_arena_mark();
+    let ptr1 = ifa_rt_call_arena_alloc(64, 8);
+    assert!(!ptr1.is_null());
+
+    unsafe {
+        let header = (ptr1 as *const GenHeader).sub(1);
+        assert_eq!((*header).arena_id, ARENA_THREAD_LOCAL_CALL);
+        assert_eq!((*header).generation_counter, 1);
+    }
+    ifa_rt_gen_check(ptr1, 1);
+
+    let mark_after_ptr1 = ifa_rt_call_arena_mark();
+    let ptr2 = ifa_rt_call_arena_alloc(128, 16);
+    assert!(!ptr2.is_null());
+    assert_ne!(ptr1, ptr2);
+    ifa_rt_gen_check(ptr2, 1);
+
+    // Rewind back to ptr1 mark
+    ifa_rt_call_arena_rewind(mark_after_ptr1);
+
+    // Allocating again should reuse the memory space rewound
+    let ptr3 = ifa_rt_call_arena_alloc(128, 16);
+    assert_eq!(ptr2, ptr3);
+
+    // Reset completely
+    ifa_rt_call_arena_reset();
+    assert_eq!(ifa_rt_call_arena_mark(), mark_initial);
+}
