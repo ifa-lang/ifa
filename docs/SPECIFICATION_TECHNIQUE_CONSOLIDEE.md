@@ -215,6 +215,22 @@ Le générateur de liaisons WebAssembly (`ifa-wasm`) assure l'interopérabilité
 3. **Inspection Mémoire Directe dans le Sandbox Processus Web OS** :
    La classe `WebOsProcess` expose des primitives d'accès direct à la mémoire linéaire WebAssembly (`getMemoryBuffer()`, `getMemoryView(offset, length)` et `getSliceView(offset, length, type)`) permettant une isolation sécurisée et une supervision fine des processus Web OS sans copie superflue.
 
+### 5.5. Vectorisation FIR des Convolutions 2D/3D Multi-Arènes Fusionnées et Élision Générationnelle
+
+Le pipeline d'optimisation vectorielle FIR (`ifa-fir::vectorize`) et le générateur de code LLVM (`ifa-codegen-llvm`) intègrent une passe de spécialisation des opérations de convolution multidimensionnelle :
+
+1. **Convolutions Multi-Arènes 2D/3D Fusionnées** :
+   - Détection des stencils et tenseurs convolutifs accédant à des arènes mémoires disjointes (entrée, poids/filtres, biais, sortie) avec calcul d'indices stridés (pas d'échantillonnage 2D/3D).
+   - Fusion élémentaire immédiate des opérations de biais (`+ bias`), de mise à l'échelle et d'activations non-linéaires (ReLU, Clamp, `fmax`) directement au sein de la boucle de convolution sans allocation intermédiaire sur le tas.
+   - Émission des métadonnées de boucle LLVM dédiées `!73` à `!76` (largeur vectorielle 8, 4, 16, 2 avec décalage `unroll-and-jam` 8x, parallélisme mémoire et absence d'aliasing).
+
+2. **Élision Statique des Contrôles de Génération dans les Boucles Imbriquées** :
+   - Tous les contrôles `GenCheck` portant sur des tranches et références opérant dans des boucles imbriquées sans opération `GenFree` concurrente sont statiquement marqués comme redondants (`redundant = true`).
+   - Le backend Cranelift JIT et le backend LLVM n'émettent aucun appel de vérification d'époque à l'exécution pour ces références, permettant une exécution SIMD pure sans interruption de pipeline CPU.
+
+3. **Ordonnancement Topologique Intra-Bloc des Instructions SSA** :
+   - La fonction `schedule_block_instructions_topologically` rétablit de manière déterministe l'ordre topologique des instructions au sein de chaque bloc basique suite aux hissage d'instructions (LICM) ou substitutions IPO, éliminant tout risque d'utilisation avant définition au sein du même bloc.
+
 ---
 
 ## 6. Outillage Développeur et Commandes CLI

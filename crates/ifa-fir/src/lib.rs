@@ -144,6 +144,10 @@ pub fn compile_to_fir_with_opts(
         vec_pass.run_on_module(&mut module);
     }
 
+    for func in &mut module.functions {
+        crate::cfg::schedule_function_instructions(func);
+    }
+
     if let Err(errors) = FirVerifier::verify_module(&module) {
         return Err(errors.iter().map(|e| e.to_diagnostic()).collect());
     }

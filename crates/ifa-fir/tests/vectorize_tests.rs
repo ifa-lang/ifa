@@ -1947,3 +1947,229 @@ fn test_vectorize_multidim_strided_projections_vectorized_and_bce() {
     assert!(hint.unroll_and_jam, "Hint must enable unroll_and_jam");
     assert!(hint.disjoint_slices, "Hint must mark disjoint_slices");
 }
+
+#[test]
+fn test_vectorize_pass_multi_arena_fused_conv2d_bias_activation() {
+    let src = r#"
+        pub strict fn conv2d_fused_bias_kernel(
+            inout out: Slice<f32>,
+            img: Slice<f32>,
+            weights: Slice<f32>,
+            bias: Slice<f32>,
+            h_out: i64,
+            w_out: i64,
+            stride_y: i64,
+            stride_x: i64,
+            img_width: i64
+        ) {
+            let mut y: i64 = 0;
+            while y < h_out {
+                let mut x: i64 = 0;
+                while x < w_out {
+                    let in_idx = (y * stride_y) * img_width + (x * stride_x);
+                    let out_idx = y * w_out + x;
+                    let conv_val = img[in_idx] * weights[0] + bias[0];
+                    out[out_idx] = out[out_idx] + conv_val;
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("conv2d_fused.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut func = module.functions[0].clone();
+
+    // Insert generational checks within the loop body to verify nested gen_check elision
+    let inner_header_block = func
+        .blocks
+        .iter()
+        .find(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(
+                    i.expr,
+                    ValueExpr::Binary {
+                        op: BinaryOp::Mul,
+                        ..
+                    }
+                )
+            })
+        })
+        .map(|b| b.id)
+        .unwrap();
+
+    let p_img = func.params[1].val;
+    let p_weights = func.params[2].val;
+
+    if let Some(b) = func.get_block_mut(inner_header_block) {
+        b.instructions.insert(
+            0,
+            Instruction::new(
+                None,
+                ValueExpr::GenCheck {
+                    ref_val: p_img,
+                    redundant: false,
+                },
+                Span::DUMMY,
+            ),
+        );
+        b.instructions.insert(
+            1,
+            Instruction::new(
+                None,
+                ValueExpr::GenCheck {
+                    ref_val: p_weights,
+                    redundant: false,
+                },
+                Span::DUMMY,
+            ),
+        );
+    }
+
+    let mut pass = VectorizePass::new();
+    pass.run_on_function(&mut func);
+    let stats = pass.stats();
+
+    assert!(
+        stats.multi_arena_conv2d_vectorized >= 1,
+        "Multi-arena 2D convolution must be recognized: {:?}",
+        stats
+    );
+    assert!(
+        stats.fused_convolutions_vectorized >= 1,
+        "Fused convolution with bias addition must be recognized: {:?}",
+        stats
+    );
+    assert!(
+        stats.nested_gen_checks_eliminated >= 2,
+        "Generational checks in nested convolution loops must be eliminated: {:?}",
+        stats
+    );
+
+    // Verify all GenChecks in the loop body have been marked redundant
+    let blk = func.get_block(inner_header_block).unwrap();
+    for inst in &blk.instructions {
+        if let ValueExpr::GenCheck { redundant, .. } = &inst.expr {
+            assert!(
+                *redundant,
+                "GenCheck in convolution body must be marked redundant"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_vectorize_pass_multi_arena_fused_conv3d_volumetric_gen_elision() {
+    let src = r#"
+        pub strict fn conv3d_fused_volumetric(
+            inout out: Slice<f32>,
+            volume: Slice<f32>,
+            filter: Slice<f32>,
+            bias: Slice<f32>,
+            d_out: i64,
+            h_out: i64,
+            w_out: i64,
+            stride_z: i64,
+            stride_y: i64,
+            stride_x: i64,
+            plane_pitch: i64,
+            row_pitch: i64
+        ) {
+            let mut z: i64 = 0;
+            while z < d_out {
+                let mut y: i64 = 0;
+                while y < h_out {
+                    let mut x: i64 = 0;
+                    while x < w_out {
+                        let in_idx = (z * stride_z) * plane_pitch + (y * stride_y) * row_pitch + (x * stride_x);
+                        let out_idx = (z * h_out + y) * w_out + x;
+                        let product = volume[in_idx] * filter[0];
+                        out[out_idx] = out[out_idx] + product + bias[0];
+                        x = x + 1;
+                    }
+                    y = y + 1;
+                }
+                z = z + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("conv3d_fused.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut func = module.functions[0].clone();
+
+    // Insert generation checks in volumetric loop
+    let inner_block_id = func
+        .blocks
+        .iter()
+        .find(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(
+                    i.expr,
+                    ValueExpr::Binary {
+                        op: BinaryOp::Mul,
+                        ..
+                    }
+                )
+            })
+        })
+        .map(|b| b.id)
+        .unwrap();
+
+    let p_vol = func.params[1].val;
+
+    if let Some(b) = func.get_block_mut(inner_block_id) {
+        b.instructions.insert(
+            0,
+            Instruction::new(
+                None,
+                ValueExpr::GenCheck {
+                    ref_val: p_vol,
+                    redundant: false,
+                },
+                Span::DUMMY,
+            ),
+        );
+    }
+
+    let mut pass = VectorizePass::new();
+    pass.run_on_function(&mut func);
+    let stats = pass.stats();
+
+    assert!(
+        stats.multi_arena_conv3d_vectorized >= 1,
+        "Multi-arena 3D convolution must be recognized: {:?}",
+        stats
+    );
+    assert!(
+        stats.fused_convolutions_vectorized >= 1,
+        "Fused 3D convolution must be recognized: {:?}",
+        stats
+    );
+    assert!(
+        stats.nested_gen_checks_eliminated >= 1,
+        "Generational checks in nested 3D loops must be eliminated: {:?}",
+        stats
+    );
+}

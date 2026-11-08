@@ -166,6 +166,18 @@ impl<'a> FirPrinter<'a> {
                 self.indent();
                 writeln!(self.output, "// [zero_copy: true]")?;
             }
+            if hint.is_multi_arena_conv {
+                self.indent();
+                writeln!(self.output, "// [multi_arena_conv: true]")?;
+            }
+            if hint.conv_has_bias {
+                self.indent();
+                writeln!(self.output, "// [conv_bias: true]")?;
+            }
+            if hint.conv_has_activation {
+                self.indent();
+                writeln!(self.output, "// [conv_activation: true]")?;
+            }
         }
         for inst in &block.instructions {
             self.indent();

@@ -560,6 +560,9 @@ pub struct LoopVectorHint {
     pub is_elementwise_fused: bool,
     pub adaptive_tile_size: Option<u32>,
     pub multi_arena_operands: u32,
+    pub is_multi_arena_conv: bool,
+    pub conv_has_bias: bool,
+    pub conv_has_activation: bool,
 }
 
 impl LoopVectorHint {
@@ -597,7 +600,38 @@ impl LoopVectorHint {
             is_elementwise_fused: false,
             adaptive_tile_size: None,
             multi_arena_operands: 0,
+            is_multi_arena_conv: false,
+            conv_has_bias: false,
+            conv_has_activation: false,
         }
+    }
+
+    /// Mark the loop as a multi-arena fused convolution kernel with optional bias and activation.
+    pub fn with_multi_arena_conv(
+        mut self,
+        is_3d: bool,
+        has_bias: bool,
+        has_activation: bool,
+    ) -> Self {
+        self.is_multi_arena_conv = true;
+        self.is_convolution = true;
+        if is_3d {
+            self.is_strided_conv3d = true;
+        } else {
+            self.is_strided_conv2d = true;
+        }
+        self.conv_has_bias = has_bias;
+        self.conv_has_activation = has_activation;
+        self.is_elementwise_fused = has_bias || has_activation;
+        self.unroll_and_jam = true;
+        self.disjoint_slices = true;
+        self
+    }
+
+    /// Attach 2D or 3D convolution stride factors.
+    pub fn with_conv_strides(mut self, strides: (u32, u32, u32)) -> Self {
+        self.conv_strides = Some(strides);
+        self
     }
 
     /// Mark the loop as operating over zero-copy multidimensional strided projections.

@@ -49,6 +49,8 @@ pub struct LoopOptStats {
     pub elementwise_fusions: usize,
     /// Number of loops with adaptively computed cache tile sizes.
     pub adaptive_tiles_computed: usize,
+    /// Number of multi-arena convolution loop nests specialized and vectorized.
+    pub multi_arena_conv_nests_optimized: usize,
 }
 
 impl LoopOptStats {
@@ -62,6 +64,7 @@ impl LoopOptStats {
             + self.multi_arena_kernels_specialized
             + self.elementwise_fusions
             + self.adaptive_tiles_computed
+            + self.multi_arena_conv_nests_optimized
     }
 }
 
@@ -217,12 +220,18 @@ impl LoopOptPass {
                     }
 
                     if (has_matrix_access || natural_loops.len() >= 2) && has_math_operation {
-                        // Multi-arena matrix / tensor kernel detected
+                        // Multi-arena matrix / tensor / convolution kernel detected
                         let is_multi_arena = accessed_bases.len() >= 2
                             || local_arena
                             || func.is_strict
                             || func.params.len() >= 2;
                         let operand_count = accessed_bases.len().max(2) as u32;
+
+                        // Detect 2D/3D convolution pattern (strided indexing or loop nesting level)
+                        let is_conv3d = natural_loops.len() >= 3;
+                        let is_conv2d =
+                            !is_conv3d && (has_matrix_access || natural_loops.len() >= 2);
+                        let is_conv = is_conv2d || is_conv3d;
 
                         // Compute adaptive cache tile size based on L1 cache capacity (32KB) and element size
                         let l1_cache_bytes: usize = 32 * 1024;
@@ -272,6 +281,14 @@ impl LoopOptPass {
                                 hint.is_multi_arena_matrix = is_multi_arena;
                                 hint.multi_arena_operands = operand_count;
                                 hint.is_elementwise_fused = has_bias_or_activation;
+                                if is_conv {
+                                    hint.is_convolution = true;
+                                    hint.is_multi_arena_conv = is_multi_arena;
+                                    hint.is_strided_conv2d = is_conv2d && !is_conv3d;
+                                    hint.is_strided_conv3d = is_conv3d;
+                                    hint.conv_has_bias = has_bias_or_activation;
+                                    hint.conv_has_activation = has_bias_or_activation;
+                                }
                                 outer_block.set_vector_hint(hint);
 
                                 self.stats.matrix_kernels_tiled += 1;
@@ -282,6 +299,9 @@ impl LoopOptPass {
                                 }
                                 if has_bias_or_activation {
                                     self.stats.elementwise_fusions += 1;
+                                }
+                                if is_conv && is_multi_arena {
+                                    self.stats.multi_arena_conv_nests_optimized += 1;
                                 }
                             }
                         }
@@ -298,6 +318,14 @@ impl LoopOptPass {
                                 hint.is_multi_arena_matrix = is_multi_arena;
                                 hint.multi_arena_operands = operand_count;
                                 hint.is_elementwise_fused = has_bias_or_activation;
+                                if is_conv {
+                                    hint.is_convolution = true;
+                                    hint.is_multi_arena_conv = is_multi_arena;
+                                    hint.is_strided_conv2d = is_conv2d && !is_conv3d;
+                                    hint.is_strided_conv3d = is_conv3d;
+                                    hint.conv_has_bias = has_bias_or_activation;
+                                    hint.conv_has_activation = has_bias_or_activation;
+                                }
                                 inner_block.set_vector_hint(hint);
                             }
                         }

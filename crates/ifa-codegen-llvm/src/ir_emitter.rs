@@ -1630,6 +1630,11 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("!70 = distinct !{!70, !2, !7, !4, !5, !12, !13, !24, !37, !39}\n");
         out.push_str("!71 = distinct !{!71, !2, !9, !4, !5, !12, !13, !24, !37, !39}\n");
         out.push_str("!72 = distinct !{!72, !2, !11, !4, !5, !12, !13, !24, !37, !39}\n");
+        // Specialized multi-arena 2D/3D fused convolution hints (unroll-and-jam 8x, parallel accesses, noalias, vector width)
+        out.push_str("!73 = distinct !{!73, !2, !3, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!74 = distinct !{!74, !2, !7, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!75 = distinct !{!75, !2, !9, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!76 = distinct !{!76, !2, !11, !4, !5, !12, !13, !24, !37, !39}\n");
 
         Ok(out)
     }
@@ -5202,7 +5207,17 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             Terminator::Branch { target, .. } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = if hint.is_strided_multidim {
+                    let meta_id = if hint.is_multi_arena_conv
+                        || ((hint.is_strided_conv2d || hint.is_strided_conv3d)
+                            && (hint.is_elementwise_fused || hint.is_multi_arena_matrix))
+                    {
+                        match hint.vector_width {
+                            2 => 76,
+                            4 => 74,
+                            16 | 32 => 75,
+                            _ => 73,
+                        }
+                    } else if hint.is_strided_multidim {
                         match hint.vector_width {
                             2 => 68,
                             4 => 66,
@@ -5321,7 +5336,17 @@ impl<'a> LlvmIrEmitter<'a> {
                 ..
             } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = if hint.is_strided_multidim {
+                    let meta_id = if hint.is_multi_arena_conv
+                        || ((hint.is_strided_conv2d || hint.is_strided_conv3d)
+                            && (hint.is_elementwise_fused || hint.is_multi_arena_matrix))
+                    {
+                        match hint.vector_width {
+                            2 => 76,
+                            4 => 74,
+                            16 | 32 => 75,
+                            _ => 73,
+                        }
+                    } else if hint.is_strided_multidim {
                         match hint.vector_width {
                             2 => 68,
                             4 => 66,

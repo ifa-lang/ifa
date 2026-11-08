@@ -375,3 +375,72 @@ fn test_multi_arena_matrix_kernel_adaptive_cache_tiling_and_elementwise_fusion()
     // (4 * 4) * (2 * 3) = 16 * 6 = 96
     assert_eq!(res, FirValue::Int(96));
 }
+
+#[test]
+fn test_multi_arena_convolution_nest_specialization_and_hints() {
+    let src = r#"
+        pub strict fn conv2d_pipeline_nest(
+            inout out: Slice<f32>,
+            img: Slice<f32>,
+            weights: Slice<f32>,
+            h_out: i64,
+            w_out: i64,
+            stride: i64
+        ) {
+            mut y = 0;
+            while y < h_out {
+                mut x = 0;
+                while x < w_out {
+                    let in_idx = (y * stride) * w_out + (x * stride);
+                    let out_idx = y * w_out + x;
+                    out[out_idx] = out[out_idx] + img[in_idx] * weights[0] + 1.0;
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("conv2d_nest.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = lower_program(&prog, &analysis.symbols);
+    let mut loop_opt = LoopOptPass::new();
+    loop_opt.run_on_module(&mut module);
+    let stats = loop_opt.stats();
+
+    assert!(
+        stats.multi_arena_conv_nests_optimized >= 1,
+        "Multi-arena convolution nest must be optimized: {:?}",
+        stats
+    );
+
+    let func = module
+        .functions
+        .iter()
+        .find(|f| ifa_span::INTERNER.resolve(&f.name) == "conv2d_pipeline_nest")
+        .expect("conv2d_pipeline_nest must exist");
+
+    let header_hint = func
+        .blocks
+        .iter()
+        .find_map(|b| b.vector_hint.filter(|h| h.is_multi_arena_conv));
+    assert!(
+        header_hint.is_some(),
+        "Loop nest must have multi-arena conv vector hint"
+    );
+    let h = header_hint.unwrap();
+    assert!(h.is_strided_conv2d, "Must be tagged strided 2D convolution");
+    assert!(h.conv_has_bias, "Must detect bias addition");
+    assert!(h.disjoint_slices, "Must have disjoint slices enabled");
+}

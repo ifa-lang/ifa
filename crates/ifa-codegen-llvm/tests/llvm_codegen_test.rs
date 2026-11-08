@@ -5843,3 +5843,101 @@ fn test_multi_arena_matrix_kernel_elementwise_fused_llvm_emission() {
     assert!(obj_path.exists());
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_multi_arena_fused_convolution_metadata_and_loop_elision() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BasicBlock, BlockId, FirFunction, FirModule, FirType, Instruction, LoopVectorHint,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_span::{Span, INTERNER};
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let fn_name = INTERNER.intern("fused_conv2d_multi_arena_test");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Unit,
+        true,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let b0 = BlockId(0);
+    let b1 = BlockId(1);
+    let mut bb0 = BasicBlock::new(b0);
+    bb0.terminator = Some(Terminator::Branch {
+        target: b1,
+        args: vec![],
+    });
+
+    let mut bb1 = BasicBlock::new(b1);
+    // Multi-arena fused 2D convolution with 8 lanes, bias and activation
+    let hint = LoopVectorHint::new(8, 8, true).with_multi_arena_conv(false, true, true);
+    bb1.set_vector_hint(hint);
+
+    // Add an elided GenCheck (redundant: true)
+    bb1.instructions.push(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: ValueId(1),
+            redundant: true,
+        },
+        Span::DUMMY,
+    ));
+
+    bb1.terminator = Some(Terminator::Branch {
+        target: b1,
+        args: vec![],
+    });
+
+    func.blocks.push(bb0);
+    func.blocks.push(bb1);
+
+    let module = FirModule {
+        name: INTERNER.intern("test_llvm_multi_arena_conv_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    assert!(
+        ir.contains("!llvm.loop !73"),
+        "Must attach metadata !73 for 8-lane multi-arena fused convolution:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("!73 = distinct !{!73, !2, !3, !4, !5, !12, !13, !24, !37, !39}"),
+        "Must declare metadata !73"
+    );
+    assert!(
+        !ir.contains("call void @ifa_rt_gen_check"),
+        "Elided generational checks must never emit runtime check calls:\n{}",
+        ir
+    );
+
+    let temp_dir = std::env::temp_dir().join(format!("llvm_multi_conv_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("multi_conv.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        res.is_ok(),
+        "Compilation to object must succeed: {:?}",
+        res.err()
+    );
+    assert!(obj_path.exists());
+    let _ = fs::remove_dir_all(&temp_dir);
+}

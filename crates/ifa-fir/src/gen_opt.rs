@@ -1574,11 +1574,14 @@ impl GenerationalOptPass {
                             {
                                 let r_canon = canonical_ref(*r, cx.aliases);
                                 let r_root = find_allocation_root(*r, cx.inst_defs, cx.aliases);
+                                let r_canon_root = canonical_ref(r_root, cx.aliases);
                                 let matches_check = *r == ref_val
                                     || *r == canon
                                     || r_canon == canon
                                     || r_root == canon
-                                    || r_root == ref_val;
+                                    || r_root == ref_val
+                                    || r_canon_root == canon
+                                    || r_canon_root == ref_val;
 
                                 if matches_check && !*redundant {
                                     *redundant = true;
@@ -1628,6 +1631,10 @@ impl GenerationalOptPass {
                     let canon_root = canonical_ref(root, cx.aliases);
 
                     if is_strict
+                        || block.vector_hint.is_some_and(|h| {
+                            (h.is_multi_arena_conv || h.is_multi_arena_matrix || h.disjoint_slices)
+                                && cx.free_operations.is_empty()
+                        })
                         || dataflow.is_available_at(block.id, inst_idx, *ref_val, cx.aliases)
                         || dataflow.is_available_at(block.id, inst_idx, root, cx.aliases)
                         || dataflow.is_available_at(block.id, inst_idx, canon_root, cx.aliases)

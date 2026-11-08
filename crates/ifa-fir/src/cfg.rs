@@ -105,3 +105,100 @@ impl ControlFlowGraph {
         post_order
     }
 }
+
+/// Topologically schedules instructions within a basic block according to intra-block SSA data dependencies.
+/// Ensures that every instruction defining a SSA value strictly precedes all instructions using it within the same block.
+pub fn schedule_block_instructions_topologically(block: &mut crate::ir::BasicBlock) {
+    if block.instructions.len() <= 1 {
+        return;
+    }
+
+    let n = block.instructions.len();
+    let mut def_to_inst: HashMap<crate::ir::ValueId, usize> = HashMap::new();
+    for (idx, inst) in block.instructions.iter().enumerate() {
+        if let Some(res) = inst.result {
+            def_to_inst.insert(res, idx);
+        }
+    }
+
+    // intra_block_deps[i] = list of instruction indices in the same block that depend on instruction i's result
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut in_degree: Vec<usize> = vec![0; n];
+
+    for (idx, inst) in block.instructions.iter().enumerate() {
+        for used in inst.expr.uses() {
+            if let Some(&producer_idx) = def_to_inst.get(&used) {
+                if producer_idx != idx {
+                    dependents[producer_idx].push(idx);
+                    in_degree[idx] += 1;
+                }
+            }
+        }
+    }
+
+    // If already in topological order, skip re-allocation
+    let mut already_sorted = true;
+    for (producer_idx, deps) in dependents.iter().enumerate() {
+        for &consumer_idx in deps {
+            if producer_idx >= consumer_idx {
+                already_sorted = false;
+                break;
+            }
+        }
+        if !already_sorted {
+            break;
+        }
+    }
+    if already_sorted {
+        return;
+    }
+
+    // Stable topological sort using double-ended queue prioritizing smaller original index
+    let mut available: VecDeque<usize> = VecDeque::new();
+    for (idx, &degree) in in_degree.iter().enumerate() {
+        if degree == 0 {
+            available.push_back(idx);
+        }
+    }
+
+    let mut scheduled_indices = Vec::with_capacity(n);
+    while let Some(idx) = available.pop_front() {
+        scheduled_indices.push(idx);
+        for &dep in &dependents[idx] {
+            in_degree[dep] -= 1;
+            if in_degree[dep] == 0 {
+                let insert_pos = available.binary_search(&dep).unwrap_or_else(|pos| pos);
+                available.insert(insert_pos, dep);
+            }
+        }
+    }
+
+    // If there were any unvisited instructions (e.g. cycle safeguard), append them
+    if scheduled_indices.len() < n {
+        for idx in 0..n {
+            if !scheduled_indices.contains(&idx) {
+                scheduled_indices.push(idx);
+            }
+        }
+    }
+
+    // Reconstruct instructions array according to scheduled indices
+    let old_instructions = std::mem::take(&mut block.instructions);
+    let mut new_instructions = Vec::with_capacity(n);
+    let mut old_indexed: Vec<Option<crate::ir::Instruction>> =
+        old_instructions.into_iter().map(Some).collect();
+    for idx in scheduled_indices {
+        if let Some(inst) = old_indexed[idx].take() {
+            new_instructions.push(inst);
+        }
+    }
+
+    block.instructions = new_instructions;
+}
+
+/// Topologically schedules instructions across all blocks in a FIR function.
+pub fn schedule_function_instructions(func: &mut FirFunction) {
+    for block in &mut func.blocks {
+        schedule_block_instructions_topologically(block);
+    }
+}

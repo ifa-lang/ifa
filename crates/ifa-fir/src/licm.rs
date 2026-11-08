@@ -1504,5 +1504,7 @@ impl LicmPass {
                 break;
             }
         }
+
+        crate::cfg::schedule_function_instructions(func);
     }
 }

@@ -86,6 +86,14 @@ pub struct VectorizeStats {
     pub multidim_strided_projections_vectorized: usize,
     /// Number of strided slice bounds checks statically eliminated.
     pub strided_bounds_eliminated: usize,
+    /// Number of multi-arena 2D convolution loops specialized and vectorized.
+    pub multi_arena_conv2d_vectorized: usize,
+    /// Number of multi-arena 3D convolution loops specialized and vectorized.
+    pub multi_arena_conv3d_vectorized: usize,
+    /// Number of elementwise fused convolutions (bias, scaling, activation) vectorized.
+    pub fused_convolutions_vectorized: usize,
+    /// Number of generational checks statically eliminated within nested convolution loops.
+    pub nested_gen_checks_eliminated: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -703,6 +711,117 @@ impl VectorizePass {
                     None
                 });
 
+                let is_multi_arena_matrix = existing_hint
+                    .map(|h| h.is_multi_arena_matrix)
+                    .unwrap_or(false);
+                let mut is_multi_arena_conv = existing_hint
+                    .map(|h| h.is_multi_arena_conv)
+                    .unwrap_or(false);
+                let mut is_elementwise_fused = existing_hint
+                    .map(|h| h.is_elementwise_fused)
+                    .unwrap_or(false);
+                let mut conv_has_bias = existing_hint.map(|h| h.conv_has_bias).unwrap_or(false);
+                let mut conv_has_activation = existing_hint
+                    .map(|h| h.conv_has_activation)
+                    .unwrap_or(false);
+                let adaptive_tile_size = existing_hint.and_then(|h| h.adaptive_tile_size);
+                let mut multi_arena_operands =
+                    existing_hint.map(|h| h.multi_arena_operands).unwrap_or(0);
+
+                // Inspect instructions inside loop for fused bias addition, scaling, and non-linear activations
+                let mut has_bias = conv_has_bias;
+                let mut has_activation = conv_has_activation;
+                let mut add_sub_ops = 0;
+
+                for &b_id in &loop_info.blocks {
+                    if let Some(block) = func.get_block(b_id) {
+                        for inst in &block.instructions {
+                            match &inst.expr {
+                                ValueExpr::Binary { op, .. } => {
+                                    if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+                                        add_sub_ops += 1;
+                                    }
+                                }
+                                ValueExpr::CallDirect { name, .. } => {
+                                    let cname = INTERNER.resolve(name);
+                                    if cname == "max"
+                                        || cname == "fmax"
+                                        || cname.contains("relu")
+                                        || cname.contains("clamp")
+                                        || cname.contains("min")
+                                        || cname.contains("fmin")
+                                    {
+                                        has_activation = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if add_sub_ops >= 2 {
+                    has_bias = true;
+                }
+
+                let operand_count = distinct_roots
+                    .len()
+                    .max(slice_read_bases.len() + slice_write_bases.len())
+                    .max(elem_reads.len() + elem_writes.len())
+                    .max(2) as u32;
+                let is_multi_arena = operand_count >= 2
+                    || local_arena
+                    || func.is_strict
+                    || distinct_roots.len() >= 2
+                    || is_multi_arena_matrix;
+
+                if is_strided_conv2d || is_strided_conv3d || is_convolution {
+                    if is_multi_arena {
+                        is_multi_arena_conv = true;
+                        multi_arena_operands = operand_count;
+                        disjoint_slices = true;
+                        unroll_and_jam = true;
+                        if is_strided_conv3d {
+                            self.stats.multi_arena_conv3d_vectorized += 1;
+                        } else {
+                            self.stats.multi_arena_conv2d_vectorized += 1;
+                        }
+                    }
+                    if has_bias || has_activation || is_fused {
+                        is_elementwise_fused = true;
+                        conv_has_bias = has_bias;
+                        conv_has_activation = has_activation;
+                        self.stats.fused_convolutions_vectorized += 1;
+                    }
+                }
+
+                // Elide generational checks in nested loops for multi-arena convolutions, matrix kernels, or provably disjoint slices
+                if is_zero_copy
+                    || is_multi_arena_conv
+                    || is_multi_arena_matrix
+                    || is_strided_conv2d
+                    || is_strided_conv3d
+                    || is_strided_multidim
+                    || disjoint_slices
+                {
+                    let mut gen_eliminated = 0;
+                    for &b_id in &loop_info.blocks {
+                        if let Some(block) = func.get_block_mut(b_id) {
+                            for inst in &mut block.instructions {
+                                if let ValueExpr::GenCheck { redundant, .. } = &mut inst.expr {
+                                    if !*redundant {
+                                        *redundant = true;
+                                        gen_eliminated += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if gen_eliminated > 0 {
+                        self.stats.nested_gen_checks_eliminated += gen_eliminated;
+                        had_eliminated_bounds = true;
+                    }
+                }
+
                 if is_strided_multidim {
                     self.stats.multidim_strided_projections_vectorized += 1;
                     self.stats.multidim_projections_vectorized += 1;
@@ -754,40 +873,42 @@ impl VectorizePass {
                     }
                 }
 
-                let effective_interleave = if is_strided_conv3d || is_strided_multidim {
-                    8
-                } else if is_strided_conv2d || (is_strided_loop && !is_tripartite && !is_bipartite)
-                {
-                    match primary_ty {
-                        FirType::Float(FloatType::F32)
-                        | FirType::Int(IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8) => {
-                            8
+                let effective_interleave =
+                    if is_multi_arena_conv || is_strided_conv3d || is_strided_multidim {
+                        8
+                    } else if is_strided_conv2d
+                        || (is_strided_loop && !is_tripartite && !is_bipartite)
+                    {
+                        match primary_ty {
+                            FirType::Float(FloatType::F32)
+                            | FirType::Int(
+                                IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8,
+                            ) => 8,
+                            _ => 4,
                         }
-                        _ => 4,
-                    }
-                } else if is_tripartite {
-                    8
-                } else if is_bipartite {
-                    match primary_ty {
-                        FirType::Float(FloatType::F32)
-                        | FirType::Int(IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8) => {
-                            8
+                    } else if is_tripartite {
+                        8
+                    } else if is_bipartite {
+                        match primary_ty {
+                            FirType::Float(FloatType::F32)
+                            | FirType::Int(
+                                IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8,
+                            ) => 8,
+                            _ => 4,
                         }
-                        _ => 4,
-                    }
-                } else if let Some(w) = sliding_window_size {
-                    w.min(8)
-                } else if local_arena && contiguous_reduction {
-                    match primary_ty {
-                        FirType::Float(FloatType::F32)
-                        | FirType::Int(IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8) => {
-                            8
+                    } else if let Some(w) = sliding_window_size {
+                        w.min(8)
+                    } else if local_arena && contiguous_reduction {
+                        match primary_ty {
+                            FirType::Float(FloatType::F32)
+                            | FirType::Int(
+                                IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8,
+                            ) => 8,
+                            _ => 4,
                         }
-                        _ => 4,
-                    }
-                } else {
-                    4
-                };
+                    } else {
+                        4
+                    };
 
                 let hint = LoopVectorHint {
                     vector_width,
@@ -821,10 +942,13 @@ impl VectorizePass {
                     is_strided_loop,
                     loop_stride,
                     is_strided_multidim,
-                    is_multi_arena_matrix: false,
-                    is_elementwise_fused: false,
-                    adaptive_tile_size: None,
-                    multi_arena_operands: 0,
+                    is_multi_arena_matrix,
+                    is_elementwise_fused,
+                    adaptive_tile_size,
+                    multi_arena_operands,
+                    is_multi_arena_conv,
+                    conv_has_bias,
+                    conv_has_activation,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)
