@@ -220,7 +220,8 @@ pub struct FiberScheduler {
     completed_fibers: Arc<Mutex<HashMap<FiberId, FiberState>>>,
     waiting_io_fibers: Arc<Mutex<HashMap<u64, IoWaitEntry>>>,
     completed_io_results: Arc<Mutex<HashMap<u64, i64>>>,
-    notifier: Arc<Condvar>,
+    work_notifier: Arc<Condvar>,
+    completion_notifier: Arc<Condvar>,
     next_fiber_id: AtomicU64,
     is_running: Arc<AtomicBool>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -245,7 +246,8 @@ impl FiberScheduler {
         let completed_fibers = Arc::new(Mutex::new(HashMap::new()));
         let waiting_io_fibers = Arc::new(Mutex::new(HashMap::new()));
         let completed_io_results = Arc::new(Mutex::new(HashMap::new()));
-        let notifier = Arc::new(Condvar::new());
+        let work_notifier = Arc::new(Condvar::new());
+        let completion_notifier = Arc::new(Condvar::new());
         let is_running = Arc::new(AtomicBool::new(true));
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -258,7 +260,8 @@ impl FiberScheduler {
                 let completed = Arc::clone(&completed_fibers);
                 let waiting_io = Arc::clone(&waiting_io_fibers);
                 let completed_io = Arc::clone(&completed_io_results);
-                let notif = Arc::clone(&notifier);
+                let work_notif = Arc::clone(&work_notifier);
+                let comp_notif = Arc::clone(&completion_notifier);
                 let is_run = Arc::clone(&is_running);
 
                 let handle = thread::spawn(move || loop {
@@ -281,8 +284,9 @@ impl FiberScheduler {
                                 !wm.is_empty() || !cr.is_empty()
                             };
                             if has_io {
-                                let (new_lock, _) =
-                                    notif.wait_timeout(lock, Duration::from_millis(2)).unwrap();
+                                let (new_lock, _) = work_notif
+                                    .wait_timeout(lock, Duration::from_millis(2))
+                                    .unwrap();
                                 lock = new_lock;
                             } else {
                                 spins += 1;
@@ -291,7 +295,7 @@ impl FiberScheduler {
                                     std::hint::spin_loop();
                                     lock = queue.lock().unwrap();
                                 } else {
-                                    lock = notif.wait(lock).unwrap();
+                                    lock = work_notif.wait(lock).unwrap();
                                     spins = 0;
                                 }
                             }
@@ -311,13 +315,13 @@ impl FiberScheduler {
                                 }
                                 let mut comp = completed.lock().unwrap();
                                 comp.insert(fiber.id, FiberState::Completed);
-                                notif.notify_all();
+                                comp_notif.notify_all();
                             }
                             FiberStepResult::Suspended => {
                                 let mut q = queue.lock().unwrap();
                                 fiber.state = FiberState::Ready;
                                 q.push_back(fiber);
-                                notif.notify_one();
+                                work_notif.notify_one();
                             }
                             FiberStepResult::WaitingIo(token, slot) => {
                                 let early_res = {
@@ -335,7 +339,7 @@ impl FiberScheduler {
                                     let mut q = queue.lock().unwrap();
                                     fiber.state = FiberState::Ready;
                                     q.push_back(fiber);
-                                    notif.notify_one();
+                                    work_notif.notify_one();
                                 } else {
                                     let mut wm = waiting_io.lock().unwrap();
                                     wm.insert(
@@ -360,7 +364,8 @@ impl FiberScheduler {
             completed_fibers,
             waiting_io_fibers,
             completed_io_results,
-            notifier,
+            work_notifier,
+            completion_notifier,
             next_fiber_id: AtomicU64::new(1),
             is_running,
             #[cfg(not(target_arch = "wasm32"))]
@@ -385,7 +390,7 @@ impl FiberScheduler {
             let mut queue = self.ready_queue.lock().unwrap();
             queue.push_back(fiber);
         }
-        self.notifier.notify_one();
+        self.work_notifier.notify_one();
 
         id
     }
@@ -408,7 +413,7 @@ impl FiberScheduler {
             let mut queue = self.ready_queue.lock().unwrap();
             queue.push_back(fiber);
         }
-        self.notifier.notify_one();
+        self.work_notifier.notify_one();
 
         (id, arena_id)
     }
@@ -430,7 +435,7 @@ impl FiberScheduler {
             let mut queue = self.ready_queue.lock().unwrap();
             queue.push_back(fiber);
         }
-        self.notifier.notify_one();
+        self.work_notifier.notify_one();
 
         id
     }
@@ -449,7 +454,7 @@ impl FiberScheduler {
             let mut queue = self.ready_queue.lock().unwrap();
             queue.push_back(fiber);
         }
-        self.notifier.notify_one();
+        self.work_notifier.notify_one();
 
         id
     }
@@ -469,7 +474,7 @@ impl FiberScheduler {
             let mut queue = self.ready_queue.lock().unwrap();
             queue.push_back(fiber);
         }
-        self.notifier.notify_one();
+        self.work_notifier.notify_one();
 
         (id, arena_id)
     }
@@ -512,7 +517,7 @@ impl FiberScheduler {
                 let mut q = self.ready_queue.lock().unwrap();
                 q.push_back(entry.fiber);
             }
-            self.notifier.notify_one();
+            self.work_notifier.notify_one();
             true
         } else {
             let mut cr = self.completed_io_results.lock().unwrap();
@@ -552,7 +557,7 @@ impl FiberScheduler {
             fiber.state = FiberState::Ready;
             let mut q = self.ready_queue.lock().unwrap();
             q.push_back(fiber);
-            self.notifier.notify_one();
+            self.work_notifier.notify_one();
         } else {
             fiber.state = FiberState::WaitingIo(token);
             let mut wm = self.waiting_io_fibers.lock().unwrap();
@@ -579,14 +584,14 @@ impl FiberScheduler {
                     }
                     let mut comp = self.completed_fibers.lock().unwrap();
                     comp.insert(fiber.id, FiberState::Completed);
-                    self.notifier.notify_all();
+                    self.completion_notifier.notify_all();
                     return true;
                 }
                 FiberStepResult::Suspended => {
                     let mut queue = self.ready_queue.lock().unwrap();
                     fiber.state = FiberState::Ready;
                     queue.push_back(fiber);
-                    self.notifier.notify_one();
+                    self.work_notifier.notify_one();
                     return true;
                 }
                 FiberStepResult::WaitingIo(token, slot) => {
@@ -605,7 +610,7 @@ impl FiberScheduler {
                         let mut queue = self.ready_queue.lock().unwrap();
                         fiber.state = FiberState::Ready;
                         queue.push_back(fiber);
-                        self.notifier.notify_one();
+                        self.work_notifier.notify_one();
                         return true;
                     }
                     let mut wm = self.waiting_io_fibers.lock().unwrap();
@@ -655,18 +660,19 @@ impl FiberScheduler {
                 let has_io = self.has_pending_io();
                 drop(completed);
                 let _ = crate::reactor::GLOBAL_REACTOR.poll_and_wake();
+                let _ = self.step();
                 completed = self.completed_fibers.lock().unwrap();
                 if completed.contains_key(&fiber_id) {
                     break;
                 }
                 if has_io {
                     let (new_c, _) = self
-                        .notifier
+                        .completion_notifier
                         .wait_timeout(completed, Duration::from_millis(2))
                         .unwrap();
                     completed = new_c;
                 } else {
-                    completed = self.notifier.wait(completed).unwrap();
+                    completed = self.completion_notifier.wait(completed).unwrap();
                 }
             }
         }
@@ -701,6 +707,7 @@ impl FiberScheduler {
                 let has_io = self.has_pending_io();
                 drop(completed);
                 let _ = crate::reactor::GLOBAL_REACTOR.poll_and_wake();
+                let _ = self.step();
                 completed = self.completed_fibers.lock().unwrap();
                 if completed.contains_key(&fiber_id) {
                     return true;
@@ -711,7 +718,7 @@ impl FiberScheduler {
                     remaining.min(Duration::from_millis(10))
                 };
                 let (new_completed, _) = self
-                    .notifier
+                    .completion_notifier
                     .wait_timeout(completed, wait_duration)
                     .unwrap();
                 completed = new_completed;
@@ -749,7 +756,8 @@ impl FiberScheduler {
             let mut queue = self.ready_queue.lock().unwrap();
             queue.clear();
         }
-        self.notifier.notify_all();
+        self.work_notifier.notify_all();
+        self.completion_notifier.notify_all();
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut workers = self.workers.lock().unwrap();
