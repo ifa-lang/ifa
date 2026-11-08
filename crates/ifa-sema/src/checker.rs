@@ -1,7 +1,7 @@
 use crate::escape::EscapeAnalyzer;
 use crate::exclusivity::{
     check_assignment_target_with_active, check_call_exclusivity_interproc, extract_access_path,
-    BorrowKind, BorrowRecord, InterproceduralAccessMap,
+    AccessPath, BorrowKind, BorrowRecord, InterproceduralAccessMap,
 };
 use crate::symbol_table::{
     CapturedVariable, ConstSymbol, EnumSymbol, FieldSymbol, FunctionSymbol, ParamSymbol,
@@ -1386,7 +1386,30 @@ impl<'a> SemanticAnalyzer<'a> {
                 else_block,
                 span: _,
             } => {
+                self.check_pattern_binding_duplicates(pattern);
+
+                let bound_vars = pattern.bound_variables();
+                let mut pending_borrows = Vec::new();
+                for (sym, span) in &bound_vars {
+                    let var_name = INTERNER.resolve(sym);
+                    let path = AccessPath {
+                        root: *sym,
+                        segments: Vec::new(),
+                        display: var_name,
+                    };
+                    pending_borrows.push(BorrowRecord {
+                        path,
+                        kind: BorrowKind::PendingAssign,
+                        span: *span,
+                    });
+                }
+                let num_pending = pending_borrows.len();
+                self.active_borrows.extend(pending_borrows);
+
                 let val_ty = self.infer_expr(val);
+
+                self.active_borrows
+                    .truncate(self.active_borrows.len() - num_pending);
 
                 if let Some(else_blk) = else_block {
                     self.symbols.enter_scope(false, false);
@@ -1587,7 +1610,32 @@ impl<'a> SemanticAnalyzer<'a> {
                         );
                     }
                 }
+
+                let has_inout = !pattern.inout_bindings().is_empty();
+                let has_ref = !pattern.ref_bindings().is_empty();
+                let borrow_kind_opt = if has_inout {
+                    Some(BorrowKind::InOut)
+                } else if has_ref {
+                    Some(BorrowKind::In)
+                } else {
+                    None
+                };
+                let while_borrow = borrow_kind_opt.and_then(|k| {
+                    crate::exclusivity::extract_access_path(expr).map(|path| BorrowRecord {
+                        path,
+                        kind: k,
+                        span: pattern.span(),
+                    })
+                });
+                if let Some(b) = &while_borrow {
+                    self.active_borrows.push(b.clone());
+                }
+
                 self.check_block(body, None);
+
+                if while_borrow.is_some() {
+                    self.active_borrows.pop();
+                }
                 self.symbols.exit_scope();
             }
             Stmt::For {
@@ -2232,7 +2280,32 @@ impl<'a> SemanticAnalyzer<'a> {
                         );
                     }
                 }
+
+                let has_inout = !pattern.inout_bindings().is_empty();
+                let has_ref = !pattern.ref_bindings().is_empty();
+                let borrow_kind_opt = if has_inout {
+                    Some(BorrowKind::InOut)
+                } else if has_ref {
+                    Some(BorrowKind::In)
+                } else {
+                    None
+                };
+                let if_borrow = borrow_kind_opt.and_then(|k| {
+                    crate::exclusivity::extract_access_path(cond_expr).map(|path| BorrowRecord {
+                        path,
+                        kind: k,
+                        span: pattern.span(),
+                    })
+                });
+                if let Some(b) = &if_borrow {
+                    self.active_borrows.push(b.clone());
+                }
+
                 let then_ty = self.check_block(then_branch, expected);
+
+                if if_borrow.is_some() {
+                    self.active_borrows.pop();
+                }
                 self.symbols.exit_scope();
 
                 if let Some(el) = else_branch {
@@ -2749,7 +2822,33 @@ impl<'a> SemanticAnalyzer<'a> {
                                 );
                             }
                         }
+                        let has_inout = !arm.pattern.inout_bindings().is_empty();
+                        let has_ref = !arm.pattern.ref_bindings().is_empty();
+                        let borrow_kind_opt = if has_inout {
+                            Some(BorrowKind::InOut)
+                        } else if has_ref {
+                            Some(BorrowKind::In)
+                        } else {
+                            None
+                        };
+                        let arm_borrow = borrow_kind_opt.and_then(|k| {
+                            crate::exclusivity::extract_access_path(target_expr).map(|path| {
+                                BorrowRecord {
+                                    path,
+                                    kind: k,
+                                    span: arm.pattern.span(),
+                                }
+                            })
+                        });
+                        if let Some(b) = &arm_borrow {
+                            self.active_borrows.push(b.clone());
+                        }
+
                         let arm_ty = self.check_expr(&arm.body, expected);
+
+                        if arm_borrow.is_some() {
+                            self.active_borrows.pop();
+                        }
                         self.symbols.exit_scope();
                         arm_types.push(arm_ty);
                     }
@@ -2878,6 +2977,58 @@ impl<'a> SemanticAnalyzer<'a> {
                 name: sym, span, ..
             } => {
                 let var_name = INTERNER.resolve(sym);
+
+                let target_path = AccessPath {
+                    root: *sym,
+                    segments: Vec::new(),
+                    display: var_name.clone(),
+                };
+                if let Some(conflict) = self
+                    .active_borrows
+                    .iter()
+                    .find(|b| b.path.overlaps(&target_path))
+                {
+                    let (code, mode, help_msg) = match conflict.kind {
+                        BorrowKind::In => (
+                            "E0012",
+                            "en lecture ('in')",
+                            "Terminez la portée de l'emprunt actif (ex: boucle d'itération) avant de modifier la variable.",
+                        ),
+                        BorrowKind::InOut => (
+                            "E0011",
+                            "en écriture exclusive ('inout')",
+                            "Une variable ne peut faire l'objet que d'une seule mutation ou emprunt 'inout' exclusif à la fois.",
+                        ),
+                        BorrowKind::Sink => (
+                            "E0017",
+                            "transférée ('sink')",
+                            "Une variable transférée ne peut plus être modifiée ni accédée.",
+                        ),
+                        BorrowKind::PendingAssign => (
+                            "E0011",
+                            "en cours d'assignation",
+                            "Une variable ne peut faire l'objet que d'une seule assignation exclusive à la fois.",
+                        ),
+                    };
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "loi d'exclusivité violée : la variable '{}' ne peut pas être modifiée car elle fait déjà l'objet d'un emprunt actif {}",
+                            target_path.display, mode
+                        ))
+                        .with_code(code)
+                        .with_primary_label(
+                            *span,
+                            format!("mutation interdite sur '{}' pendant un emprunt actif", target_path.display),
+                        )
+                        .with_secondary_label(
+                            conflict.span,
+                            format!("emprunt actif {} ici", mode),
+                        )
+                        .with_help(help_msg),
+                    );
+                    return;
+                }
+
                 if let Some(var) = self.symbols.lookup_variable(sym).cloned() {
                     if !var.is_mut && var.is_initialized {
                         self.diagnostics.push(

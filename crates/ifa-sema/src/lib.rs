@@ -396,4 +396,85 @@ mod tests {
             res.diagnostics
         );
     }
+
+    #[test]
+    fn test_exclusivity_destructuring_assignment_duplicate_target_rejected() {
+        let code = r#"
+            pub fn main() {
+                mut x: i64 = 10;
+                (x, x) = (1, 2);
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(
+            res.has_errors(),
+            "Expected duplicate binding rejection in destructuring assignment"
+        );
+        let has_dup_err = res
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0048"));
+        assert!(
+            has_dup_err,
+            "Expected E0048 diagnostic code, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_exclusivity_destructuring_assignment_with_inout_collision_rejected() {
+        let code = r#"
+            fn mutate(inout v: i64) -> (i64, i64) {
+                v += 1;
+                return (v, 42);
+            }
+
+            pub fn main() {
+                mut x: i64 = 10;
+                mut y: i64 = 20;
+                (x, y) = mutate(inout x);
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(
+            res.has_errors(),
+            "Expected exclusivity collision on pending assignment target"
+        );
+        let has_exclusivity_err = res
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0011"));
+        assert!(
+            has_exclusivity_err,
+            "Expected E0011 diagnostic code for pending assignment overlap, got: {:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_exclusivity_for_loop_destructuring_assignment_conflict_rejected() {
+        let code = r#"
+            pub fn main() {
+                mut items = [1, 2, 3];
+                mut other: i64 = 0;
+                for item in inout items {
+                    (items, other) = ([4, 5, 6], 10);
+                }
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(
+            res.has_errors(),
+            "Expected active borrow conflict in destructuring assignment"
+        );
+        let has_exclusivity_err = res
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0011"));
+        assert!(
+            has_exclusivity_err,
+            "Expected E0011 diagnostic code, got: {:?}",
+            res.diagnostics
+        );
+    }
 }

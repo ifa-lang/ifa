@@ -489,6 +489,53 @@ impl Pattern {
         }
     }
 
+    /// Extract all variables bound specifically with `inout` mode in this pattern.
+    pub fn inout_bindings(&self) -> Vec<(Symbol, Span)> {
+        let mut inouts = Vec::new();
+        self.collect_inout_bindings(&mut inouts);
+        inouts
+    }
+
+    fn collect_inout_bindings(&self, inouts: &mut Vec<(Symbol, Span)>) {
+        match self {
+            Pattern::Binding {
+                mode: BindingMode::InOut,
+                name,
+                span,
+            } => inouts.push((*name, *span)),
+            Pattern::Tuple(elems, _) | Pattern::Or(elems, _) => {
+                for e in elems {
+                    e.collect_inout_bindings(inouts);
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                for f in fields {
+                    f.pattern.collect_inout_bindings(inouts);
+                }
+            }
+            Pattern::Slice {
+                prefix,
+                rest,
+                suffix,
+                ..
+            } => {
+                for p in prefix {
+                    p.collect_inout_bindings(inouts);
+                }
+                if let Some(Some(r)) = rest {
+                    r.collect_inout_bindings(inouts);
+                }
+                for s in suffix {
+                    s.collect_inout_bindings(inouts);
+                }
+            }
+            Pattern::Variant { inner: Some(p), .. } => {
+                p.collect_inout_bindings(inouts);
+            }
+            _ => {}
+        }
+    }
+
     fn collect_bound_variables(&self, vars: &mut Vec<(Symbol, Span)>) {
         match self {
             Pattern::Ident(sym, span) => vars.push((*sym, *span)),
