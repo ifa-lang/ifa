@@ -1458,6 +1458,11 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("!26 = distinct !{!26, !2, !7, !4, !5, !12, !13, !24}\n");
         out.push_str("!27 = distinct !{!27, !2, !9, !4, !5, !12, !13, !24}\n");
         out.push_str("!28 = distinct !{!28, !2, !11, !4, !5, !12, !13, !24}\n");
+        // Specialized bare-metal convolution and sliding window vectorization hints (unrolled window, parallel accesses)
+        out.push_str("!29 = distinct !{!29, !2, !3, !4, !5, !12, !13, !24}\n");
+        out.push_str("!30 = distinct !{!30, !2, !7, !4, !5, !12, !13, !24}\n");
+        out.push_str("!31 = distinct !{!31, !2, !9, !4, !5, !12, !13, !24}\n");
+        out.push_str("!32 = distinct !{!32, !2, !11, !4, !5, !12, !13, !24}\n");
 
         Ok(out)
     }
@@ -4410,6 +4415,13 @@ impl<'a> LlvmIrEmitter<'a> {
                             16 | 32 => 27,
                             _ => 23,
                         }
+                    } else if hint.is_convolution || hint.sliding_window_size.is_some() {
+                        match hint.vector_width {
+                            2 => 32,
+                            4 => 30,
+                            16 | 32 => 31,
+                            _ => 29,
+                        }
                     } else if hint.predicate_enable
                         || hint.predicated_scatter_gather
                         || hint.is_strict
@@ -4458,6 +4470,13 @@ impl<'a> LlvmIrEmitter<'a> {
                             4 => 26,
                             16 | 32 => 27,
                             _ => 23,
+                        }
+                    } else if hint.is_convolution || hint.sliding_window_size.is_some() {
+                        match hint.vector_width {
+                            2 => 32,
+                            4 => 30,
+                            16 | 32 => 31,
+                            _ => 29,
                         }
                     } else if hint.predicate_enable
                         || hint.predicated_scatter_gather

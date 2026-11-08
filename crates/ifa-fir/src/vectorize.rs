@@ -60,6 +60,10 @@ pub struct VectorizeStats {
     pub arena_slice_filters_specialized: usize,
     /// Number of loops vectorized with predicated scatter/gather or masked operations.
     pub predicated_scatter_gather_loops: usize,
+    /// Number of sliding window loops vectorized.
+    pub sliding_window_loops_vectorized: usize,
+    /// Number of bare-metal convolution loops vectorized.
+    pub convolutions_vectorized: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -362,7 +366,11 @@ impl VectorizePass {
                 }
 
                 // Recognize scalar dot product reductions (fmul + fadd / mul + add with multiple reads)
-                if has_mul && has_add && (read_elements >= 2 || slice_elements >= 2) {
+                if has_mul
+                    && has_add
+                    && write_elements == 0
+                    && (read_elements >= 2 || slice_elements >= 2)
+                {
                     detected_reduction = Some(crate::ir::ReductionKind::Dot);
                 }
 
@@ -409,9 +417,28 @@ impl VectorizePass {
                     4
                 };
 
+                let existing_hint = func.get_block(loop_info.header).and_then(|b| b.vector_hint);
+                let sliding_window_size = existing_hint.and_then(|h| h.sliding_window_size);
+                let is_convolution = existing_hint.map(|h| h.is_convolution).unwrap_or(false)
+                    || (existing_hint.and_then(|h| h.sliding_window_size).is_some()
+                        && detected_reduction == Some(crate::ir::ReductionKind::Dot));
+
+                if sliding_window_size.is_some() {
+                    self.stats.sliding_window_loops_vectorized += 1;
+                }
+                if is_convolution {
+                    self.stats.convolutions_vectorized += 1;
+                }
+
+                let effective_interleave = if let Some(w) = sliding_window_size {
+                    w.min(8)
+                } else {
+                    interleave_count
+                };
+
                 let hint = LoopVectorHint {
                     vector_width,
-                    interleave_count,
+                    interleave_count: effective_interleave,
                     unroll_enable: true,
                     reduction_kind: if is_reduction {
                         detected_reduction
@@ -424,6 +451,8 @@ impl VectorizePass {
                     local_arena,
                     contiguous_reduction,
                     predicated_scatter_gather,
+                    sliding_window_size,
+                    is_convolution,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)

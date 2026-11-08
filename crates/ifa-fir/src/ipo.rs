@@ -3,6 +3,8 @@ use crate::dominance::DominanceTree;
 use crate::gen_opt::GenerationalOptPass;
 use crate::ir::*;
 use crate::sroa::SroaPass;
+use crate::FirType;
+use ifa_sema::types::IntType;
 use ifa_span::{Symbol, INTERNER};
 use std::collections::{HashMap, HashSet};
 
@@ -35,6 +37,14 @@ pub struct IpoStats {
     pub coroutines_specialized_sync: usize,
     /// Number of direct call sites retargeted to specialized synchronous coroutine variants.
     pub direct_coroutine_calls_specialized: usize,
+    /// Number of constant parameters propagated across inter-procedural call sites.
+    pub interprocedural_constants_propagated: usize,
+    /// Number of sliding window loops specialized via symbolic constant propagation.
+    pub sliding_windows_specialized: usize,
+    /// Number of bare-metal convolution loops optimized with unrolled kernel bounds.
+    pub convolutions_vectorized: usize,
+    /// Number of redundant sliding window bounds checks statically eliminated.
+    pub sliding_window_bounds_eliminated: usize,
 }
 
 /// Call graph structure capturing caller-callee relationships, recursive cycles,
@@ -768,6 +778,9 @@ impl IpoPass {
 
         // 6. Inter-procedural colorless coroutine specialization for direct synchronous callers
         self.specialize_colorless_coroutines(module);
+
+        // 7. Inter-procedural symbolic constant propagation for sliding windows and bare-metal convolutions
+        self.propagate_interprocedural_constants_and_specialize_convolutions(module);
     }
 
     /// Analyzes the entire FIR module and computes the set of provably pure function symbols.
@@ -1140,6 +1153,510 @@ impl IpoPass {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Inter-procedural symbolic constant propagation for sliding windows and bare-metal convolutions.
+    pub fn propagate_interprocedural_constants_and_specialize_convolutions(
+        &mut self,
+        module: &mut FirModule,
+    ) {
+        // 1. Collect all known local constants across each function
+        let mut func_const_maps: HashMap<Symbol, HashMap<ValueId, (i64, IntType)>> = HashMap::new();
+        for func in &module.functions {
+            let cmap = Self::extract_function_constants(func);
+            func_const_maps.insert(func.name, cmap);
+        }
+
+        // 2. Collect call-site argument constant samples across the module
+        let mut callee_param_samples: HashMap<Symbol, HashMap<usize, HashSet<i64>>> =
+            HashMap::new();
+        let mut callee_param_types: HashMap<Symbol, HashMap<usize, IntType>> = HashMap::new();
+        let mut callee_has_dynamic: HashMap<Symbol, HashSet<usize>> = HashMap::new();
+
+        for func in &module.functions {
+            let cmap = &func_const_maps[&func.name];
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    let (callee_sym, call_args) = match &inst.expr {
+                        ValueExpr::CallDirect { name, args }
+                        | ValueExpr::BlockingCallDirect { name, args } => (*name, args.as_slice()),
+                        _ => continue,
+                    };
+
+                    for (idx, &arg_val) in call_args.iter().enumerate() {
+                        if let Some(&(c_val, c_ty)) = cmap.get(&arg_val) {
+                            callee_param_samples
+                                .entry(callee_sym)
+                                .or_default()
+                                .entry(idx)
+                                .or_default()
+                                .insert(c_val);
+                            callee_param_types
+                                .entry(callee_sym)
+                                .or_default()
+                                .entry(idx)
+                                .or_insert(c_ty);
+                        } else {
+                            callee_has_dynamic
+                                .entry(callee_sym)
+                                .or_default()
+                                .insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Identify monomorphic constant parameters
+        let mut monomorphic_constants: HashMap<Symbol, Vec<(usize, i64, IntType)>> = HashMap::new();
+        for (callee_sym, param_map) in &callee_param_samples {
+            let Some(callee_func) = module.functions.iter().find(|f| f.name == *callee_sym) else {
+                continue;
+            };
+            let cfg = ControlFlowGraph::build(callee_func);
+            let dom_tree = DominanceTree::build(&cfg);
+            if GenerationalOptPass::find_natural_loops(&cfg, &dom_tree).is_empty() {
+                continue;
+            }
+
+            for (&param_idx, samples) in param_map {
+                let Some(param) = callee_func.params.get(param_idx) else {
+                    continue;
+                };
+                if param.mode != ParamMode::In || !matches!(param.ty, FirType::Int(_)) {
+                    continue;
+                }
+                let has_dyn = callee_has_dynamic
+                    .get(callee_sym)
+                    .is_some_and(|dyns| dyns.contains(&param_idx));
+                if samples.len() == 1 && !has_dyn {
+                    let const_val = *samples.iter().next().unwrap();
+                    let const_ty = callee_param_types[callee_sym][&param_idx];
+                    monomorphic_constants
+                        .entry(*callee_sym)
+                        .or_default()
+                        .push((param_idx, const_val, const_ty));
+                }
+            }
+        }
+
+        let mut propagated_window_sizes: HashMap<Symbol, u32> = HashMap::new();
+
+        // 4. Apply monomorphic constants in-place
+        for func in &mut module.functions {
+            if let Some(const_params) = monomorphic_constants.get(&func.name).cloned() {
+                for &(_, c_val, _) in &const_params {
+                    if (1..=256).contains(&c_val) {
+                        propagated_window_sizes.insert(func.name, c_val as u32);
+                    }
+                }
+                let count = Self::propagate_constants_into_function(func, &const_params);
+                self.stats.interprocedural_constants_propagated += count;
+                Self::fold_function_constants(func);
+            }
+        }
+
+        // 5. Polymorphic constant specialization for sliding window & convolution parameters
+        let mut specialized_clones: Vec<FirFunction> = Vec::new();
+        let mut site_retargets: HashMap<(Symbol, usize, i64), Symbol> = HashMap::new();
+
+        for (&callee_sym, param_map) in &callee_param_samples {
+            if monomorphic_constants.contains_key(&callee_sym) {
+                continue;
+            }
+
+            let Some(orig_func) = module.functions.iter().find(|f| f.name == callee_sym) else {
+                continue;
+            };
+            let cfg = ControlFlowGraph::build(orig_func);
+            let dom_tree = DominanceTree::build(&cfg);
+            if GenerationalOptPass::find_natural_loops(&cfg, &dom_tree).is_empty() {
+                continue;
+            }
+
+            for (&param_idx, samples) in param_map {
+                let Some(param) = orig_func.params.get(param_idx) else {
+                    continue;
+                };
+                if param.mode != ParamMode::In || !matches!(param.ty, FirType::Int(_)) {
+                    continue;
+                }
+                if samples.len() > 1 && samples.iter().all(|&w| (1..=256).contains(&w)) {
+                    // Stencil/window size parameter with distinct values: specialize clones
+                    for &c_val in samples {
+                        let const_ty = callee_param_types[&callee_sym][&param_idx];
+                        let base_name = INTERNER.resolve(&callee_sym);
+                        let spec_name = INTERNER.intern(&format!("{}_w{}", base_name, c_val));
+                        propagated_window_sizes.insert(spec_name, c_val as u32);
+
+                        let mut spec_func = orig_func.clone();
+                        spec_func.name = spec_name;
+
+                        let const_params = vec![(param_idx, c_val, const_ty)];
+                        let count =
+                            Self::propagate_constants_into_function(&mut spec_func, &const_params);
+                        self.stats.interprocedural_constants_propagated += count;
+                        Self::fold_function_constants(&mut spec_func);
+
+                        let cmap = Self::extract_function_constants(&spec_func);
+                        self.specialize_sliding_windows_and_convolutions(
+                            &mut spec_func,
+                            &cmap,
+                            Some(c_val as u32),
+                        );
+
+                        specialized_clones.push(spec_func);
+                        site_retargets.insert((callee_sym, param_idx, c_val), spec_name);
+                    }
+                }
+            }
+        }
+
+        // Add specialized functions into module
+        module.functions.extend(specialized_clones);
+
+        // Retarget call sites matching specialized constants
+        if !site_retargets.is_empty() {
+            for func in &mut module.functions {
+                let cmap = Self::extract_function_constants(func);
+                for block in &mut func.blocks {
+                    for inst in &mut block.instructions {
+                        if let ValueExpr::CallDirect { name, args }
+                        | ValueExpr::BlockingCallDirect { name, args } = &mut inst.expr
+                        {
+                            for (idx, &arg_val) in args.iter().enumerate() {
+                                if let Some(&(c_val, _)) = cmap.get(&arg_val) {
+                                    if let Some(&new_callee) =
+                                        site_retargets.get(&(*name, idx, c_val))
+                                    {
+                                        *name = new_callee;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. Specialize sliding window and bare-metal convolutions for all functions
+        for func in &mut module.functions {
+            let cmap = Self::extract_function_constants(func);
+            let prop_w = propagated_window_sizes.get(&func.name).copied();
+            self.specialize_sliding_windows_and_convolutions(func, &cmap, prop_w);
+        }
+    }
+
+    /// Extracts proven compile-time integer constants within a function.
+    fn extract_function_constants(func: &FirFunction) -> HashMap<ValueId, (i64, IntType)> {
+        let mut consts: HashMap<ValueId, (i64, IntType)> = HashMap::new();
+
+        for _ in 0..4 {
+            let mut changed = false;
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let (Some(res), ValueExpr::Constant(ConstantValue::Int(val, ty))) =
+                        (inst.result, &inst.expr)
+                    {
+                        if consts.insert(res, (*val as i64, *ty)).is_none() {
+                            changed = true;
+                        }
+                    } else if let (Some(res), ValueExpr::Binary { op, lhs, rhs }) =
+                        (inst.result, &inst.expr)
+                    {
+                        if let (Some(&(l, ty)), Some(&(r, _))) = (consts.get(lhs), consts.get(rhs))
+                        {
+                            let computed = match op {
+                                BinaryOp::Add => Some(l.wrapping_add(r)),
+                                BinaryOp::Sub => Some(l.wrapping_sub(r)),
+                                BinaryOp::Mul => Some(l.wrapping_mul(r)),
+                                BinaryOp::Div if r != 0 => Some(l.wrapping_div(r)),
+                                BinaryOp::Rem if r != 0 => Some(l.wrapping_rem(r)),
+                                BinaryOp::BitAnd => Some(l & r),
+                                BinaryOp::BitOr => Some(l | r),
+                                BinaryOp::BitXor => Some(l ^ r),
+                                BinaryOp::Shl => Some(l.wrapping_shl((r as u32).min(63))),
+                                BinaryOp::Shr => Some(l.wrapping_shr((r as u32).min(63))),
+                                _ => None,
+                            };
+                            if let Some(comp_val) = computed {
+                                if consts.insert(res, (comp_val, ty)).is_none() {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        consts
+    }
+
+    /// Propagates constant parameters into a function's entry block and substitutes all occurrences.
+    fn propagate_constants_into_function(
+        func: &mut FirFunction,
+        const_params: &[(usize, i64, IntType)],
+    ) -> usize {
+        let mut propagated = 0;
+        let mut substitutions: HashMap<ValueId, ValueId> = HashMap::new();
+        let mut new_const_insts = Vec::new();
+
+        for &(p_idx, c_val, c_ty) in const_params {
+            if let Some(param) = func.params.get(p_idx) {
+                let orig_val = param.val;
+                let new_val = func.alloc_value();
+                substitutions.insert(orig_val, new_val);
+                new_const_insts.push(Instruction::new(
+                    Some(new_val),
+                    ValueExpr::Constant(ConstantValue::Int(c_val as i128, c_ty)),
+                    func.span,
+                ));
+                propagated += 1;
+            }
+        }
+
+        if !substitutions.is_empty() {
+            if let Some(entry_bb) = func.get_block_mut(func.entry_block) {
+                for (i, inst) in new_const_insts.into_iter().enumerate() {
+                    entry_bb.instructions.insert(i, inst);
+                }
+            }
+
+            for block in &mut func.blocks {
+                for inst in &mut block.instructions {
+                    SroaPass::substitute_instruction_operands(inst, &substitutions);
+                }
+                if let Some(term) = &mut block.terminator {
+                    SroaPass::substitute_terminator_operands(term, &substitutions);
+                }
+            }
+        }
+
+        propagated
+    }
+
+    /// Intra-procedural constant folding for newly propagated constants and conditional branches.
+    fn fold_function_constants(func: &mut FirFunction) {
+        let mut consts: HashMap<ValueId, (i64, IntType)> = HashMap::new();
+        let mut bool_consts: HashMap<ValueId, bool> = HashMap::new();
+
+        for _ in 0..4 {
+            let mut changed = false;
+            for block in &mut func.blocks {
+                for inst in &mut block.instructions {
+                    if let (Some(res), ValueExpr::Constant(ConstantValue::Int(val, ty))) =
+                        (inst.result, &inst.expr)
+                    {
+                        if consts.insert(res, (*val as i64, *ty)).is_none() {
+                            changed = true;
+                        }
+                    } else if let (Some(res), ValueExpr::Constant(ConstantValue::Bool(b))) =
+                        (inst.result, &inst.expr)
+                    {
+                        if bool_consts.insert(res, *b).is_none() {
+                            changed = true;
+                        }
+                    } else if let (Some(res), ValueExpr::Binary { op, lhs, rhs }) =
+                        (inst.result, &mut inst.expr)
+                    {
+                        if let (Some(&(l, ty)), Some(&(r, _))) = (consts.get(lhs), consts.get(rhs))
+                        {
+                            let (comp_int, comp_bool) = match op {
+                                BinaryOp::Add => (Some(l.wrapping_add(r)), None),
+                                BinaryOp::Sub => (Some(l.wrapping_sub(r)), None),
+                                BinaryOp::Mul => (Some(l.wrapping_mul(r)), None),
+                                BinaryOp::Div if r != 0 => (Some(l.wrapping_div(r)), None),
+                                BinaryOp::Rem if r != 0 => (Some(l.wrapping_rem(r)), None),
+                                BinaryOp::BitAnd => (Some(l & r), None),
+                                BinaryOp::BitOr => (Some(l | r), None),
+                                BinaryOp::BitXor => (Some(l ^ r), None),
+                                BinaryOp::Shl => (Some(l.wrapping_shl((r as u32).min(63))), None),
+                                BinaryOp::Shr => (Some(l.wrapping_shr((r as u32).min(63))), None),
+                                BinaryOp::Lt => (None, Some(l < r)),
+                                BinaryOp::Le => (None, Some(l <= r)),
+                                BinaryOp::Gt => (None, Some(l > r)),
+                                BinaryOp::Ge => (None, Some(l >= r)),
+                                BinaryOp::Eq => (None, Some(l == r)),
+                                BinaryOp::Ne => (None, Some(l != r)),
+                                _ => (None, None),
+                            };
+                            if let Some(c_int) = comp_int {
+                                inst.expr =
+                                    ValueExpr::Constant(ConstantValue::Int(c_int as i128, ty));
+                                if consts.insert(res, (c_int, ty)).is_none() {
+                                    changed = true;
+                                }
+                            } else if let Some(c_bool) = comp_bool {
+                                inst.expr = ValueExpr::Constant(ConstantValue::Bool(c_bool));
+                                if bool_consts.insert(res, c_bool).is_none() {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /// Analyzes natural loops for sliding window stencils and convolutions, eliminating redundant
+    /// bounds checks and attaching specialized LoopVectorHint annotations.
+    fn specialize_sliding_windows_and_convolutions(
+        &mut self,
+        func: &mut FirFunction,
+        known_consts: &HashMap<ValueId, (i64, IntType)>,
+        propagated_window: Option<u32>,
+    ) {
+        let cfg = ControlFlowGraph::build(func);
+        let dom_tree = DominanceTree::build(&cfg);
+        let natural_loops = GenerationalOptPass::find_natural_loops(&cfg, &dom_tree);
+
+        let mut index_additions: HashMap<ValueId, (ValueId, ValueId)> = HashMap::new();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let (
+                    Some(res),
+                    ValueExpr::Binary {
+                        op: BinaryOp::Add,
+                        lhs,
+                        rhs,
+                    },
+                ) = (inst.result, &inst.expr)
+                {
+                    index_additions.insert(res, (*lhs, *rhs));
+                }
+            }
+        }
+
+        for loop_info in &natural_loops {
+            // Verify loop purity (no blocking I/O, external impure calls, or coroutine operations)
+            let has_side_effects = loop_info.blocks.iter().any(|&b_id| {
+                if let Some(block) = func.get_block(b_id) {
+                    block.instructions.iter().any(|inst| match &inst.expr {
+                        ValueExpr::CallDirect { name, .. } => {
+                            let callee = INTERNER.resolve(name);
+                            !Self::is_known_pure_intrinsic(&callee)
+                        }
+                        ValueExpr::Call { .. }
+                        | ValueExpr::Yield
+                        | ValueExpr::YieldValue { .. }
+                        | ValueExpr::Spawn { .. } => true,
+                        _ => false,
+                    })
+                } else {
+                    false
+                }
+            });
+            if has_side_effects {
+                continue;
+            }
+
+            let Some(w) = propagated_window else {
+                continue;
+            };
+            let mut stencil_indices: HashSet<ValueId> = HashSet::new();
+
+            for &b_id in &loop_info.blocks {
+                if let Some(block) = func.get_block(b_id) {
+                    for inst in &block.instructions {
+                        if let Some(res) = inst.result {
+                            if let Some(&(lhs, rhs)) = index_additions.get(&res) {
+                                stencil_indices.insert(res);
+                                stencil_indices.insert(lhs);
+                                stencil_indices.insert(rhs);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut has_mul = false;
+            let mut has_add = false;
+            let mut bounds_eliminated = 0;
+
+            for &b_id in &loop_info.blocks {
+                if let Some(block) = func.get_block_mut(b_id) {
+                    for inst in &mut block.instructions {
+                        match &mut inst.expr {
+                            ValueExpr::BoundsCheck {
+                                redundant, index, ..
+                            } => {
+                                if (stencil_indices.contains(index)
+                                    || known_consts.contains_key(index)
+                                    || propagated_window.is_some())
+                                    && !*redundant
+                                {
+                                    *redundant = true;
+                                    bounds_eliminated += 1;
+                                }
+                            }
+                            ValueExpr::SliceBoundsCheck {
+                                redundant,
+                                start,
+                                end,
+                                ..
+                            } => {
+                                if (stencil_indices.contains(start)
+                                    || stencil_indices.contains(end)
+                                    || known_consts.contains_key(start)
+                                    || known_consts.contains_key(end)
+                                    || propagated_window.is_some())
+                                    && !*redundant
+                                {
+                                    *redundant = true;
+                                    bounds_eliminated += 1;
+                                }
+                            }
+                            ValueExpr::Binary { op, .. } => {
+                                if *op == BinaryOp::Mul {
+                                    has_mul = true;
+                                } else if *op == BinaryOp::Add {
+                                    has_add = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            let is_convolution = has_mul && has_add;
+
+            if bounds_eliminated > 0 {
+                self.stats.sliding_window_bounds_eliminated += bounds_eliminated;
+            }
+
+            let unroll_count = w.min(8);
+
+            let hint = LoopVectorHint::new(8, unroll_count, true)
+                .with_sliding_window(w)
+                .with_convolution(is_convolution)
+                .with_reduction(if is_convolution {
+                    ReductionKind::Dot
+                } else {
+                    ReductionKind::Sum
+                })
+                .with_contiguous_reduction(true)
+                .with_predicate_enable(true)
+                .with_disjoint_slices(true);
+
+            if let Some(header_bb) = func.get_block_mut(loop_info.header) {
+                header_bb.set_vector_hint(hint);
+            }
+
+            self.stats.sliding_windows_specialized += 1;
+            if is_convolution {
+                self.stats.convolutions_vectorized += 1;
             }
         }
     }

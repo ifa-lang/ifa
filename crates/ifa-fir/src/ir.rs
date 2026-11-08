@@ -482,7 +482,7 @@ pub enum ReductionKind {
     CountIf,
 }
 
-/// Optimization hint for loop vectorization (SIMD lane width, interleave, unroll directives, reduction kind, disjoint slices guarantee, tail-folding predication, strict determinism, contiguous arena reductions, and predicated scatter/gather filters).
+/// Optimization hint for loop vectorization (SIMD lane width, interleave, unroll directives, reduction kind, disjoint slices guarantee, tail-folding predication, strict determinism, contiguous arena reductions, sliding window convolutions, and predicated scatter/gather filters).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LoopVectorHint {
     pub vector_width: u32,
@@ -495,6 +495,8 @@ pub struct LoopVectorHint {
     pub local_arena: bool,
     pub contiguous_reduction: bool,
     pub predicated_scatter_gather: bool,
+    pub sliding_window_size: Option<u32>,
+    pub is_convolution: bool,
 }
 
 impl LoopVectorHint {
@@ -511,6 +513,8 @@ impl LoopVectorHint {
             local_arena: false,
             contiguous_reduction: false,
             predicated_scatter_gather: false,
+            sliding_window_size: None,
+            is_convolution: false,
         }
     }
 
@@ -553,6 +557,18 @@ impl LoopVectorHint {
     /// Mark the loop as employing predicated SIMD scatter/gather or conditional projection.
     pub fn with_predicated_scatter_gather(mut self, predicated: bool) -> Self {
         self.predicated_scatter_gather = predicated;
+        self
+    }
+
+    /// Mark the loop with a known static sliding window size (for stencil/filter unrolling).
+    pub fn with_sliding_window(mut self, window_size: u32) -> Self {
+        self.sliding_window_size = Some(window_size);
+        self
+    }
+
+    /// Mark the loop as executing a bare-metal convolution or sliding stencil kernel.
+    pub fn with_convolution(mut self, is_convolution: bool) -> Self {
+        self.is_convolution = is_convolution;
         self
     }
 }

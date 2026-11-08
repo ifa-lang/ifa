@@ -748,3 +748,489 @@ fn test_ipo_colorless_coroutine_cloned_variant_specialization() {
         });
     assert_eq!(called_target, Some(sync_clone_name));
 }
+
+#[test]
+fn test_interprocedural_symbolic_constant_propagation_sliding_window() {
+    use ifa_fir::types::FirType;
+    use ifa_fir::{
+        BasicBlock, BinaryOp, BlockId, ConstantValue, FirFunction, FirModule, FirParam,
+        Instruction, Terminator, ValueExpr,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::Span;
+
+    let callee_name = INTERNER.intern("convolve_1d_baremetal");
+    let caller_name = INTERNER.intern("caller_pipeline");
+
+    let f32_slice = FirType::Slice(Box::new(FirType::Float(ifa_sema::types::FloatType::F32)));
+    let i64_ty = FirType::Int(IntType::I64);
+
+    // callee: convolve_1d_baremetal(sig: [f32], kern: [f32], window_size: i64) -> f32
+    let mut f_callee = FirFunction::new(
+        callee_name,
+        Vec::new(),
+        FirType::Float(ifa_sema::types::FloatType::F32),
+        false,
+        true, // strict bare-metal mode
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let p_sig = f_callee.alloc_value();
+    let p_kern = f_callee.alloc_value();
+    let p_w = f_callee.alloc_value();
+
+    f_callee.params.push(FirParam {
+        name: INTERNER.intern("sig"),
+        ty: f32_slice.clone(),
+        val: p_sig,
+        mode: ifa_ast::ParamMode::In,
+    });
+    f_callee.params.push(FirParam {
+        name: INTERNER.intern("kern"),
+        ty: f32_slice.clone(),
+        val: p_kern,
+        mode: ifa_ast::ParamMode::In,
+    });
+    f_callee.params.push(FirParam {
+        name: INTERNER.intern("window_size"),
+        ty: i64_ty.clone(),
+        val: p_w,
+        mode: ifa_ast::ParamMode::In,
+    });
+
+    let bb_entry = f_callee.entry_block;
+    let bb_header = BlockId(1);
+    let bb_body = BlockId(2);
+    let bb_exit = BlockId(3);
+
+    f_callee.blocks.push(BasicBlock::new(bb_header));
+    f_callee.blocks.push(BasicBlock::new(bb_body));
+    f_callee.blocks.push(BasicBlock::new(bb_exit));
+
+    // Entry jumps to loop header
+    let v_k_init = f_callee.alloc_value();
+    let v_acc_init = f_callee.alloc_value();
+    let entry_mut = f_callee.get_block_mut(bb_entry).unwrap();
+    entry_mut.push_instruction(Instruction::new(
+        Some(v_k_init),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    entry_mut.push_instruction(Instruction::new(
+        Some(v_acc_init),
+        ValueExpr::Constant(ConstantValue::Float(0.0, ifa_sema::types::FloatType::F32)),
+        Span::DUMMY,
+    ));
+    entry_mut.set_terminator(Terminator::Branch {
+        target: bb_header,
+        args: vec![],
+    });
+
+    // Header: check k < window_size
+    let v_cond = f_callee.alloc_value();
+    let header_mut = f_callee.get_block_mut(bb_header).unwrap();
+    header_mut.push_instruction(Instruction::new(
+        Some(v_cond),
+        ValueExpr::Binary {
+            op: BinaryOp::Lt,
+            lhs: v_k_init,
+            rhs: p_w,
+        },
+        Span::DUMMY,
+    ));
+    header_mut.set_terminator(Terminator::BranchCond {
+        cond: v_cond,
+        then_block: bb_body,
+        then_args: vec![],
+        else_block: bb_exit,
+        else_args: vec![],
+    });
+
+    // Body: index = i + k, bounds_check on index, read sig[index] and kern[k], multiply and add
+    let v_idx = f_callee.alloc_value();
+    let v_sig_val = f_callee.alloc_value();
+    let v_kern_val = f_callee.alloc_value();
+    let v_prod = f_callee.alloc_value();
+    let v_acc_next = f_callee.alloc_value();
+    let body_mut = f_callee.get_block_mut(bb_body).unwrap();
+    body_mut.push_instruction(Instruction::new(
+        Some(v_idx),
+        ValueExpr::Binary {
+            op: BinaryOp::Add,
+            lhs: v_k_init,
+            rhs: v_k_init,
+        },
+        Span::DUMMY,
+    ));
+    body_mut.push_instruction(Instruction::new(
+        None,
+        ValueExpr::BoundsCheck {
+            base: p_sig,
+            index: v_idx,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_mut.push_instruction(Instruction::new(
+        Some(v_sig_val),
+        ValueExpr::GetElement {
+            base: p_sig,
+            index: v_idx,
+        },
+        Span::DUMMY,
+    ));
+    body_mut.push_instruction(Instruction::new(
+        Some(v_kern_val),
+        ValueExpr::GetElement {
+            base: p_kern,
+            index: v_k_init,
+        },
+        Span::DUMMY,
+    ));
+    body_mut.push_instruction(Instruction::new(
+        Some(v_prod),
+        ValueExpr::Binary {
+            op: BinaryOp::Mul,
+            lhs: v_sig_val,
+            rhs: v_kern_val,
+        },
+        Span::DUMMY,
+    ));
+    body_mut.push_instruction(Instruction::new(
+        Some(v_acc_next),
+        ValueExpr::Binary {
+            op: BinaryOp::Add,
+            lhs: v_acc_init,
+            rhs: v_prod,
+        },
+        Span::DUMMY,
+    ));
+    // Latch jumps back to header
+    body_mut.set_terminator(Terminator::Branch {
+        target: bb_header,
+        args: vec![],
+    });
+
+    // Exit returns acc
+    let exit_mut = f_callee.get_block_mut(bb_exit).unwrap();
+    exit_mut.set_terminator(Terminator::Return(Some(v_acc_init)));
+
+    // Caller: calls convolve_1d_baremetal(sig, kern, 3)
+    let mut f_caller = FirFunction::new(
+        caller_name,
+        Vec::new(),
+        FirType::Float(ifa_sema::types::FloatType::F32),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let c_e = f_caller.entry_block;
+    let v_c_sig = f_caller.alloc_value();
+    let v_c_kern = f_caller.alloc_value();
+    let v_c_w = f_caller.alloc_value();
+    let v_res = f_caller.alloc_value();
+    let c_entry = f_caller.get_block_mut(c_e).unwrap();
+    c_entry.push_instruction(Instruction::new(
+        Some(v_c_w),
+        ValueExpr::Constant(ConstantValue::Int(3, IntType::I64)),
+        Span::DUMMY,
+    ));
+    c_entry.push_instruction(Instruction::new(
+        Some(v_res),
+        ValueExpr::CallDirect {
+            name: callee_name,
+            args: vec![v_c_sig, v_c_kern, v_c_w],
+        },
+        Span::DUMMY,
+    ));
+    c_entry.set_terminator(Terminator::Return(Some(v_res)));
+
+    let mut module = FirModule {
+        name: INTERNER.intern("test_conv_mod"),
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+        functions: vec![f_callee, f_caller],
+    };
+
+    let mut ipo_pass = IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    let stats = ipo_pass.stats();
+    assert!(
+        stats.interprocedural_constants_propagated >= 1,
+        "window_size = 3 must be propagated inter-procedurally: {:?}",
+        stats
+    );
+    assert!(
+        stats.sliding_windows_specialized >= 1,
+        "Sliding window must be specialized: {:?}",
+        stats
+    );
+    assert!(
+        stats.convolutions_vectorized >= 1,
+        "Convolution loop must be vectorized: {:?}",
+        stats
+    );
+    assert!(
+        stats.sliding_window_bounds_eliminated >= 1,
+        "Redundant BoundsCheck in convolution stencil must be eliminated: {:?}",
+        stats
+    );
+
+    // Verify optimized callee function
+    let opt_callee = module
+        .functions
+        .iter()
+        .find(|f| f.name == callee_name)
+        .unwrap();
+
+    // Check that entry block has a Constant instruction with value 3
+    let has_const_3 = opt_callee.blocks[0].instructions.iter().any(|i| {
+        matches!(
+            i.expr,
+            ValueExpr::Constant(ConstantValue::Int(3, IntType::I64))
+        )
+    });
+    assert!(
+        has_const_3,
+        "Entry block must contain propagated constant 3"
+    );
+
+    // Check that body has redundant = true on BoundsCheck
+    let bounds_check_redundant = opt_callee.blocks.iter().any(|b| {
+        b.instructions.iter().any(|i| {
+            matches!(
+                i.expr,
+                ValueExpr::BoundsCheck {
+                    redundant: true,
+                    ..
+                }
+            )
+        })
+    });
+    assert!(
+        bounds_check_redundant,
+        "BoundsCheck in convolution loop must be redundant"
+    );
+
+    // Check that loop header has LoopVectorHint with sliding_window_size: Some(3)
+    let header_hint = opt_callee
+        .blocks
+        .iter()
+        .find_map(|b| b.vector_hint)
+        .expect("LoopVectorHint must be present");
+
+    assert_eq!(header_hint.sliding_window_size, Some(3));
+    assert!(header_hint.is_convolution);
+    assert!(header_hint.unroll_enable);
+    assert!(header_hint.contiguous_reduction);
+    assert!(header_hint.disjoint_slices);
+}
+
+#[test]
+fn test_polymorphic_sliding_window_specialization() {
+    use ifa_fir::types::FirType;
+    use ifa_fir::{
+        BasicBlock, BinaryOp, BlockId, ConstantValue, FirFunction, FirModule, FirParam,
+        Instruction, Terminator, ValueExpr,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::Span;
+
+    let callee_name = INTERNER.intern("sliding_filter");
+    let caller1_name = INTERNER.intern("pipeline_fast");
+    let caller2_name = INTERNER.intern("pipeline_deep");
+
+    let f32_slice = FirType::Slice(Box::new(FirType::Float(ifa_sema::types::FloatType::F32)));
+    let i64_ty = FirType::Int(IntType::I64);
+
+    let mut f_callee = FirFunction::new(
+        callee_name,
+        Vec::new(),
+        FirType::Float(ifa_sema::types::FloatType::F32),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let p_sig = f_callee.alloc_value();
+    let p_w = f_callee.alloc_value();
+    f_callee.params.push(FirParam {
+        name: INTERNER.intern("sig"),
+        ty: f32_slice.clone(),
+        val: p_sig,
+        mode: ifa_ast::ParamMode::In,
+    });
+    f_callee.params.push(FirParam {
+        name: INTERNER.intern("window_size"),
+        ty: i64_ty.clone(),
+        val: p_w,
+        mode: ifa_ast::ParamMode::In,
+    });
+
+    let bb_entry = f_callee.entry_block;
+    let bb_loop = BlockId(1);
+    let bb_exit = BlockId(2);
+    f_callee.blocks.push(BasicBlock::new(bb_loop));
+    f_callee.blocks.push(BasicBlock::new(bb_exit));
+
+    let entry_mut = f_callee.get_block_mut(bb_entry).unwrap();
+    entry_mut.set_terminator(Terminator::Branch {
+        target: bb_loop,
+        args: vec![],
+    });
+
+    let v_k = f_callee.alloc_value();
+    let v_cond = f_callee.alloc_value();
+    let loop_mut = f_callee.get_block_mut(bb_loop).unwrap();
+    loop_mut.push_instruction(Instruction::new(
+        Some(v_k),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    loop_mut.push_instruction(Instruction::new(
+        Some(v_cond),
+        ValueExpr::Binary {
+            op: BinaryOp::Lt,
+            lhs: v_k,
+            rhs: p_w,
+        },
+        Span::DUMMY,
+    ));
+    loop_mut.set_terminator(Terminator::BranchCond {
+        cond: v_cond,
+        then_block: bb_loop,
+        then_args: vec![],
+        else_block: bb_exit,
+        else_args: vec![],
+    });
+
+    let exit_mut = f_callee.get_block_mut(bb_exit).unwrap();
+    exit_mut.set_terminator(Terminator::Return(None));
+
+    // Caller 1 calls with window_size = 3
+    let mut f_caller1 = FirFunction::new(
+        caller1_name,
+        Vec::new(),
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let c1_e = f_caller1.entry_block;
+    let v_w3 = f_caller1.alloc_value();
+    let c1_bb = f_caller1.get_block_mut(c1_e).unwrap();
+    c1_bb.push_instruction(Instruction::new(
+        Some(v_w3),
+        ValueExpr::Constant(ConstantValue::Int(3, IntType::I64)),
+        Span::DUMMY,
+    ));
+    c1_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::CallDirect {
+            name: callee_name,
+            args: vec![v_w3, v_w3],
+        },
+        Span::DUMMY,
+    ));
+    c1_bb.set_terminator(Terminator::Return(None));
+
+    // Caller 2 calls with window_size = 5
+    let mut f_caller2 = FirFunction::new(
+        caller2_name,
+        Vec::new(),
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let c2_e = f_caller2.entry_block;
+    let v_w5 = f_caller2.alloc_value();
+    let c2_bb = f_caller2.get_block_mut(c2_e).unwrap();
+    c2_bb.push_instruction(Instruction::new(
+        Some(v_w5),
+        ValueExpr::Constant(ConstantValue::Int(5, IntType::I64)),
+        Span::DUMMY,
+    ));
+    c2_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::CallDirect {
+            name: callee_name,
+            args: vec![v_w5, v_w5],
+        },
+        Span::DUMMY,
+    ));
+    c2_bb.set_terminator(Terminator::Return(None));
+
+    let mut module = FirModule {
+        name: INTERNER.intern("test_poly_window_mod"),
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+        functions: vec![f_callee, f_caller1, f_caller2],
+    };
+
+    let mut ipo_pass = IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    // Verify that specialized clones sliding_filter_w3 and sliding_filter_w5 were created
+    let w3_sym = INTERNER.intern("sliding_filter_w3");
+    let w5_sym = INTERNER.intern("sliding_filter_w5");
+
+    assert!(
+        module.functions.iter().any(|f| f.name == w3_sym),
+        "Specialized clone sliding_filter_w3 must exist"
+    );
+    assert!(
+        module.functions.iter().any(|f| f.name == w5_sym),
+        "Specialized clone sliding_filter_w5 must exist"
+    );
+
+    // Verify retargeting in caller 1
+    let c1 = module
+        .functions
+        .iter()
+        .find(|f| f.name == caller1_name)
+        .unwrap();
+    let c1_target = c1.blocks[0].instructions.iter().find_map(|i| {
+        if let ValueExpr::CallDirect { name, .. } = &i.expr {
+            Some(*name)
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        c1_target,
+        Some(w3_sym),
+        "Caller 1 must be retargeted to sliding_filter_w3"
+    );
+
+    // Verify retargeting in caller 2
+    let c2 = module
+        .functions
+        .iter()
+        .find(|f| f.name == caller2_name)
+        .unwrap();
+    let c2_target = c2.blocks[0].instructions.iter().find_map(|i| {
+        if let ValueExpr::CallDirect { name, .. } = &i.expr {
+            Some(*name)
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        c2_target,
+        Some(w5_sym),
+        "Caller 2 must be retargeted to sliding_filter_w5"
+    );
+}

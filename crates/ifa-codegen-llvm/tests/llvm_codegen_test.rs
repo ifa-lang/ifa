@@ -4241,3 +4241,96 @@ fn test_native_multidimensional_disjoint_slice_partition_execution() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_baremetal_convolution_and_sliding_window_metadata_emission() {
+    use ifa_fir::*;
+    use ifa_span::Span;
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let mut func = FirFunction::new(
+        ifa_span::INTERNER.intern("baremetal_conv_kernel"),
+        Vec::new(),
+        FirType::Unit,
+        false,
+        true, // strict bare-metal mode
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    bb0.terminator = Some(Terminator::Branch {
+        target: BlockId(1),
+        args: Vec::new(),
+    });
+    func.blocks.push(bb0);
+
+    let mut bb1 = BasicBlock::new(BlockId(1));
+    let hint = LoopVectorHint::new(8, 3, true)
+        .with_sliding_window(3)
+        .with_convolution(true);
+    bb1.set_vector_hint(hint);
+    bb1.instructions.push(Instruction::new(
+        Some(ValueId(2)),
+        ValueExpr::Constant(ConstantValue::Bool(true)),
+        Span::DUMMY,
+    ));
+    bb1.terminator = Some(Terminator::BranchCond {
+        cond: ValueId(2),
+        then_block: BlockId(1),
+        else_block: BlockId(2),
+        then_args: Vec::new(),
+        else_args: Vec::new(),
+    });
+    func.blocks.push(bb1);
+
+    let mut bb2 = BasicBlock::new(BlockId(2));
+    bb2.terminator = Some(Terminator::Return(None));
+    func.blocks.push(bb2);
+
+    let module = FirModule {
+        name: ifa_span::INTERNER.intern("conv_meta_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let llvm_ir = emitter
+        .emit_module(&module)
+        .expect("LLVM IR emission failed");
+
+    assert!(
+        llvm_ir.contains("!llvm.loop !29"),
+        "Loop branch must reference convolution metadata !29:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("!29 = distinct !{!29, !2, !3, !4, !5, !12, !13, !24}"),
+        "Metadata table must contain !29 convolution vectorization node:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("!24 = !{!\"llvm.loop.parallel_accesses\", !25}"),
+        "Parallel accesses group must be attached for disjoint convolution stencil"
+    );
+
+    // Verify native object compilation succeeds with LLVM toolchain
+    let temp_dir = std::env::temp_dir().join(format!("ifa_conv_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("conv.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation to object with convolution metadata failed: {:?}",
+        compile_res.err()
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
