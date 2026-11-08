@@ -1,7 +1,7 @@
 use ifa_ast::ParamMode;
 use ifa_fir::{
-    compile_to_fir, ArenaFusionPass, FirFunction, FirInterpreter, FirParam, FirType, FirValue,
-    GenerationalOptPass, Instruction, Terminator, ValueExpr, ValueId,
+    compile_to_fir, ArenaFusionPass, FirFunction, FirInterpreter, FirModule, FirParam, FirStruct,
+    FirType, FirValue, GenerationalOptPass, Instruction, Terminator, ValueExpr, ValueId,
 };
 use ifa_sema::types::IntType;
 use ifa_span::{Span, INTERNER};
@@ -730,5 +730,308 @@ fn test_zero_copy_streaming_pipeline_arena_coalescing() {
     assert_eq!(
         assigned_arenas[1], assigned_arenas[2],
         "All streaming allocations must share unified arena"
+    );
+}
+
+#[test]
+fn test_interprocedural_nested_streaming_pipeline_arena_fusion() {
+    let chunk_ty = FirType::Struct(
+        INTERNER.intern("StreamChunk"),
+        vec![
+            (INTERNER.intern("len"), FirType::Int(IntType::I64)),
+            (INTERNER.intern("cap"), FirType::Int(IntType::I64)),
+        ],
+    );
+
+    let packet_ty = FirType::Struct(
+        INTERNER.intern("StreamPacket"),
+        vec![
+            (
+                INTERNER.intern("chunk"),
+                FirType::GenerationalRef(Box::new(chunk_ty.clone())),
+            ),
+            (INTERNER.intern("id"), FirType::Int(IntType::I64)),
+        ],
+    );
+
+    // Stage 1: produce_chunk() -> allocates chunk with arena 42
+    let mut f_produce = FirFunction::new(
+        INTERNER.intern("produce_chunk"),
+        Vec::new(),
+        FirType::GenerationalRef(Box::new(chunk_ty.clone())),
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let e1 = f_produce.entry_block;
+    let v_chunk = f_produce.alloc_value();
+    let bb1 = f_produce.get_block_mut(e1).unwrap();
+    bb1.push_instruction(Instruction::new(
+        Some(v_chunk),
+        ValueExpr::GenAlloc {
+            ty: chunk_ty.clone(),
+            arena: Some(42),
+        },
+        Span::DUMMY,
+    ));
+    bb1.set_terminator(Terminator::Return(Some(v_chunk)));
+
+    // Stage 2: wrap_packet(c: ref StreamChunk) -> allocates StreamPacket with arena None, and sets packet.chunk = c
+    let mut f_wrap = FirFunction::new(
+        INTERNER.intern("wrap_packet"),
+        Vec::new(),
+        FirType::GenerationalRef(Box::new(packet_ty.clone())),
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let p_c = f_wrap.alloc_value();
+    f_wrap.params.push(FirParam {
+        name: INTERNER.intern("c"),
+        ty: FirType::GenerationalRef(Box::new(chunk_ty.clone())),
+        val: p_c,
+        mode: ParamMode::In,
+    });
+    let e2 = f_wrap.entry_block;
+    let v_pkt = f_wrap.alloc_value();
+    let bb2 = f_wrap.get_block_mut(e2).unwrap();
+    bb2.push_instruction(Instruction::new(
+        Some(v_pkt),
+        ValueExpr::GenAlloc {
+            ty: packet_ty.clone(),
+            arena: None,
+        },
+        Span::DUMMY,
+    ));
+    bb2.push_instruction(Instruction::new(
+        None,
+        ValueExpr::SetField {
+            base: v_pkt,
+            field_idx: 0,
+            val: p_c,
+        },
+        Span::DUMMY,
+    ));
+    bb2.set_terminator(Terminator::Return(Some(v_pkt)));
+
+    // Pipeline driver: main_pipeline() calls produce_chunk(), then calls wrap_packet(chunk)
+    let mut f_driver = FirFunction::new(
+        INTERNER.intern("main_pipeline"),
+        Vec::new(),
+        FirType::GenerationalRef(Box::new(packet_ty.clone())),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let e3 = f_driver.entry_block;
+    let v_c = f_driver.alloc_value();
+    let v_p = f_driver.alloc_value();
+    let bb3 = f_driver.get_block_mut(e3).unwrap();
+    bb3.push_instruction(Instruction::new(
+        Some(v_c),
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("produce_chunk"),
+            args: Vec::new(),
+        },
+        Span::DUMMY,
+    ));
+    bb3.push_instruction(Instruction::new(
+        Some(v_p),
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("wrap_packet"),
+            args: vec![v_c],
+        },
+        Span::DUMMY,
+    ));
+    bb3.set_terminator(Terminator::Return(Some(v_p)));
+
+    let mut module = FirModule {
+        name: INTERNER.intern("streaming_pipeline_mod"),
+        structs: vec![
+            FirStruct {
+                name: INTERNER.intern("StreamChunk"),
+                fields: vec![
+                    (INTERNER.intern("len"), FirType::Int(IntType::I64)),
+                    (INTERNER.intern("cap"), FirType::Int(IntType::I64)),
+                ],
+                is_pub: true,
+                span: Span::DUMMY,
+            },
+            FirStruct {
+                name: INTERNER.intern("StreamPacket"),
+                fields: vec![
+                    (
+                        INTERNER.intern("chunk"),
+                        FirType::GenerationalRef(Box::new(chunk_ty.clone())),
+                    ),
+                    (INTERNER.intern("id"), FirType::Int(IntType::I64)),
+                ],
+                is_pub: true,
+                span: Span::DUMMY,
+            },
+        ],
+        enums: Vec::new(),
+        constants: Vec::new(),
+        functions: vec![f_produce, f_wrap, f_driver],
+    };
+
+    let mut pass = ArenaFusionPass::new();
+    let stats = pass.run_on_module(&mut module);
+
+    assert!(
+        stats.interprocedural_fusions >= 1,
+        "Interprocedural arena fusion must occur across call boundaries: {:?}",
+        stats
+    );
+
+    // Verify wrap_packet's GenAlloc was rewritten to arena 42!
+    let wrap_fn = module
+        .functions
+        .iter()
+        .find(|f| INTERNER.resolve(&f.name) == "wrap_packet")
+        .unwrap();
+
+    let mut wrap_arena = None;
+    for inst in &wrap_fn.blocks[0].instructions {
+        if let ValueExpr::GenAlloc { arena, .. } = inst.expr {
+            wrap_arena = arena;
+        }
+    }
+
+    assert_eq!(
+        wrap_arena,
+        Some(42),
+        "wrap_packet must adopt caller's incoming chunk arena 42"
+    );
+}
+
+#[test]
+fn test_interprocedural_streaming_access_barrier_elimination() {
+    let chunk_ty = FirType::Struct(
+        INTERNER.intern("StreamBuffer"),
+        vec![(INTERNER.intern("size"), FirType::Int(IntType::I64))],
+    );
+
+    // consume(b: ref StreamBuffer) -> accesses b.size with GenCheck
+    let mut f_consume = FirFunction::new(
+        INTERNER.intern("consume_buffer"),
+        Vec::new(),
+        FirType::Int(IntType::I64),
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let p_b = f_consume.alloc_value();
+    f_consume.params.push(FirParam {
+        name: INTERNER.intern("b"),
+        ty: FirType::GenerationalRef(Box::new(chunk_ty.clone())),
+        val: p_b,
+        mode: ParamMode::In,
+    });
+    let e1 = f_consume.entry_block;
+    let v_field = f_consume.alloc_value();
+    let bb1 = f_consume.get_block_mut(e1).unwrap();
+    // GenCheck on parameter b
+    bb1.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: p_b,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    bb1.push_instruction(Instruction::new(
+        Some(v_field),
+        ValueExpr::GetField {
+            base: p_b,
+            field_idx: 0,
+            field_name: INTERNER.intern("size"),
+        },
+        Span::DUMMY,
+    ));
+    bb1.set_terminator(Terminator::Return(Some(v_field)));
+
+    // caller: allocates StreamBuffer in arena 5, so it is safe, then calls consume_buffer
+    let mut f_caller = FirFunction::new(
+        INTERNER.intern("caller_pipeline"),
+        Vec::new(),
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let e2 = f_caller.entry_block;
+    let v_buf = f_caller.alloc_value();
+    let v_res = f_caller.alloc_value();
+    let bb2 = f_caller.get_block_mut(e2).unwrap();
+    bb2.push_instruction(Instruction::new(
+        Some(v_buf),
+        ValueExpr::GenAlloc {
+            ty: chunk_ty.clone(),
+            arena: Some(5),
+        },
+        Span::DUMMY,
+    ));
+    bb2.push_instruction(Instruction::new(
+        Some(v_res),
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("consume_buffer"),
+            args: vec![v_buf],
+        },
+        Span::DUMMY,
+    ));
+    bb2.set_terminator(Terminator::Return(Some(v_res)));
+
+    let mut module = FirModule {
+        name: INTERNER.intern("test_barrier_mod"),
+        structs: vec![FirStruct {
+            name: INTERNER.intern("StreamBuffer"),
+            fields: vec![(INTERNER.intern("size"), FirType::Int(IntType::I64))],
+            is_pub: true,
+            span: Span::DUMMY,
+        }],
+        enums: Vec::new(),
+        constants: Vec::new(),
+        functions: vec![f_consume, f_caller],
+    };
+
+    let mut pass = ArenaFusionPass::new();
+    let stats = pass.run_on_module(&mut module);
+
+    assert!(
+        stats.interprocedural_barriers_eliminated >= 1,
+        "Interprocedural access barrier on verified parameter must be eliminated: {:?}",
+        stats
+    );
+
+    let consume_fn = module
+        .functions
+        .iter()
+        .find(|f| INTERNER.resolve(&f.name) == "consume_buffer")
+        .unwrap();
+
+    let check_redundant = consume_fn.blocks[0].instructions.iter().any(|inst| {
+        matches!(
+            inst.expr,
+            ValueExpr::GenCheck {
+                redundant: true,
+                ..
+            }
+        )
+    });
+
+    assert!(
+        check_redundant,
+        "consume_buffer's GenCheck must be marked redundant across call boundary"
     );
 }

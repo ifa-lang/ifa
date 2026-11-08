@@ -49,6 +49,19 @@ pub struct ArenaFusionStats {
     pub streaming_arenas_fused: usize,
     /// Total zero-copy streaming pipelines optimized with zero-heap arena locality.
     pub zero_copy_pipelines_optimized: usize,
+    /// Total interprocedural arena fusions propagated across call boundaries.
+    pub interprocedural_fusions: usize,
+    /// Total interprocedural redundant access barriers eliminated across call boundaries.
+    pub interprocedural_barriers_eliminated: usize,
+}
+
+/// Context for interprocedural analysis and propagation across call sites.
+#[derive(Debug, Clone, Copy)]
+pub struct InterprocContext<'a> {
+    pub param_arenas: &'a HashMap<usize, u16>,
+    pub call_return_arenas: &'a HashMap<ValueId, u16>,
+    pub verified_params: &'a HashSet<ValueId>,
+    pub is_initial_pass: bool,
 }
 
 /// Disjoint-set forest (Union-Find) for merging allocation arenas.
@@ -117,12 +130,28 @@ impl ArenaFusionPass {
         let recursive_structs = Self::identify_recursive_structs(module);
         self.stats.recursive_structs_analyzed = recursive_structs.len();
 
-        let struct_map: HashMap<Symbol, &FirStruct> =
-            module.structs.iter().map(|s| (s.name, s)).collect();
+        let struct_map: HashMap<Symbol, FirStruct> = module
+            .structs
+            .iter()
+            .cloned()
+            .map(|s| (s.name, s))
+            .collect();
+
+        let empty_param_arenas = HashMap::new();
+        let empty_call_return_arenas = HashMap::new();
+        let empty_verified_params = HashSet::new();
+        let initial_ctx = InterprocContext {
+            param_arenas: &empty_param_arenas,
+            call_return_arenas: &empty_call_return_arenas,
+            verified_params: &empty_verified_params,
+            is_initial_pass: true,
+        };
 
         for func in &mut module.functions {
-            self.optimize_function(func, &recursive_structs, &struct_map);
+            self.optimize_function(func, &recursive_structs, &struct_map, &initial_ctx);
         }
+
+        self.propagate_interprocedural_arenas(module, &recursive_structs, &struct_map);
 
         self.stats
     }
@@ -191,6 +220,11 @@ impl ArenaFusionPass {
                     || s.contains("Queue")
                     || s.contains("Frame")
                     || s.contains("Pipeline")
+                    || s.contains("Ring")
+                    || s.contains("Channel")
+                    || s.contains("Batch")
+                    || s.contains("Window")
+                    || s.contains("Message")
             }
             FirType::GenerationalRef(inner) | FirType::Pointer(inner) => {
                 Self::is_streaming_or_buffer_type(inner)
@@ -204,19 +238,47 @@ impl ArenaFusionPass {
         &mut self,
         func: &mut FirFunction,
         recursive_structs: &HashSet<Symbol>,
-        struct_map: &HashMap<Symbol, &FirStruct>,
+        struct_map: &HashMap<Symbol, FirStruct>,
+        ctx: &InterprocContext,
     ) {
         // Step 1: Generational Arena Merging (Recursive Structs & Zero-Copy Streaming Pipelines)
-        self.merge_arenas(func, recursive_structs);
+        self.merge_arenas(
+            func,
+            recursive_structs,
+            ctx.param_arenas,
+            ctx.call_return_arenas,
+            ctx.is_initial_pass,
+        );
 
         // Step 2: Static Access Barrier Elimination for Recursive & Streaming Structures
-        self.eliminate_access_barriers(func, recursive_structs, struct_map);
+        self.eliminate_access_barriers(func, recursive_structs, struct_map, ctx.verified_params);
     }
 
     /// Coalesces allocations of recursive structures and streaming pipelines into unified generational arenas.
-    fn merge_arenas(&mut self, func: &mut FirFunction, recursive_structs: &HashSet<Symbol>) {
+    fn merge_arenas(
+        &mut self,
+        func: &mut FirFunction,
+        recursive_structs: &HashSet<Symbol>,
+        param_arenas: &HashMap<usize, u16>,
+        call_return_arenas: &HashMap<ValueId, u16>,
+        is_initial_pass: bool,
+    ) {
         // 1. Collect all GenAlloc instructions with their ValueId, type, and existing arena
         let mut alloc_infos: HashMap<ValueId, (FirType, Option<u16>)> = HashMap::new();
+        let mut param_vals: HashSet<ValueId> = HashSet::new();
+
+        for (&param_idx, &p_arena) in param_arenas {
+            if let Some(p) = func.params.get(param_idx) {
+                alloc_infos.insert(p.val, (p.ty.clone(), Some(p_arena)));
+                param_vals.insert(p.val);
+            }
+        }
+
+        for (&call_res, &ret_arena) in call_return_arenas {
+            alloc_infos.insert(call_res, (FirType::Unit, Some(ret_arena)));
+            param_vals.insert(call_res);
+        }
+
         for block in &func.blocks {
             for inst in &block.instructions {
                 if let (Some(res), ValueExpr::GenAlloc { ty, arena }) = (inst.result, &inst.expr) {
@@ -327,7 +389,12 @@ impl ArenaFusionPass {
         for members in groups.values() {
             let mut existing_arenas = HashSet::new();
             let mut is_streaming_group = false;
+            let mut has_interprocedural_param = false;
+
             for m in members {
+                if param_vals.contains(m) {
+                    has_interprocedural_param = true;
+                }
                 if let Some((ty, a_opt)) = alloc_infos.get(m) {
                     if let Some(a) = a_opt {
                         if *a > 0 {
@@ -355,10 +422,17 @@ impl ArenaFusionPass {
                 fused_assignments.insert(*m, unified_arena);
             }
 
-            self.stats.allocations_fused += members.len();
-            if is_streaming_group {
-                self.stats.streaming_arenas_fused += 1;
-                self.stats.zero_copy_pipelines_optimized += 1;
+            let local_member_count = members.iter().filter(|m| !param_vals.contains(m)).count();
+            if is_initial_pass {
+                self.stats.allocations_fused += local_member_count;
+                if is_streaming_group && local_member_count > 0 {
+                    self.stats.streaming_arenas_fused += 1;
+                    self.stats.zero_copy_pipelines_optimized += 1;
+                }
+            }
+
+            if has_interprocedural_param && local_member_count > 0 {
+                self.stats.interprocedural_fusions += 1;
             }
         }
 
@@ -382,7 +456,8 @@ impl ArenaFusionPass {
         &mut self,
         func: &mut FirFunction,
         recursive_structs: &HashSet<Symbol>,
-        struct_map: &HashMap<Symbol, &FirStruct>,
+        struct_map: &HashMap<Symbol, FirStruct>,
+        verified_params: &HashSet<ValueId>,
     ) {
         let cfg = ControlFlowGraph::build(func);
         let dom_tree = DominanceTree::build(&cfg);
@@ -462,6 +537,11 @@ impl ArenaFusionPass {
             // Fresh allocations and parameters proven safe
             if block_id == func.entry_block {
                 for p in &func.params {
+                    if verified_params.contains(&p.val) {
+                        verified.insert(p.val);
+                        verified.insert(Self::resolve_alias(p.val, &aliases));
+                        self.stats.interprocedural_barriers_eliminated += 1;
+                    }
                     if let FirType::GenerationalRef(inner) = &p.ty {
                         if let Some(st_name) = Self::extract_struct_name(inner) {
                             if recursive_structs.contains(&st_name) {
@@ -555,7 +635,7 @@ impl ArenaFusionPass {
         field_idx: usize,
         func: &FirFunction,
         recursive_structs: &HashSet<Symbol>,
-        struct_map: &HashMap<Symbol, &FirStruct>,
+        struct_map: &HashMap<Symbol, FirStruct>,
     ) -> bool {
         // Look up root's type from function parameters or local allocas
         for p in &func.params {
@@ -596,6 +676,187 @@ impl ArenaFusionPass {
 
         // Conservative fallback: assume true if index > 0 on recursive struct projection
         true
+    }
+
+    /// Propagates generational arena assignments and access verification across interprocedural call boundaries.
+    fn propagate_interprocedural_arenas(
+        &mut self,
+        module: &mut FirModule,
+        recursive_structs: &HashSet<Symbol>,
+        struct_map: &HashMap<Symbol, FirStruct>,
+    ) {
+        for _ in 0..4 {
+            let mut callee_param_arenas: HashMap<Symbol, HashMap<usize, u16>> = HashMap::new();
+            let mut callee_param_verified: HashMap<Symbol, HashMap<usize, bool>> = HashMap::new();
+            let mut callee_return_arenas: HashMap<Symbol, u16> = HashMap::new();
+
+            // 1. Analyze each function's return arena
+            for func in &module.functions {
+                let mut return_arena: Option<u16> = None;
+                for block in &func.blocks {
+                    if let Some(Terminator::Return(Some(ret_val))) = &block.terminator {
+                        for inst in &block.instructions {
+                            if inst.result == Some(*ret_val) {
+                                if let ValueExpr::GenAlloc { arena: Some(a), .. } = inst.expr {
+                                    return_arena = Some(a);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(ra) = return_arena {
+                    callee_return_arenas.insert(func.name, ra);
+                }
+            }
+
+            // 2. Collect call site information across all functions
+            for func in &module.functions {
+                let mut val_to_arena: HashMap<ValueId, u16> = HashMap::new();
+                let mut aliases: HashMap<ValueId, ValueId> = HashMap::new();
+                let mut verified_at_call: HashSet<ValueId> = HashSet::new();
+
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let (Some(res), ValueExpr::GenAlloc { arena: Some(a), .. }) =
+                            (inst.result, &inst.expr)
+                        {
+                            val_to_arena.insert(res, *a);
+                            verified_at_call.insert(res);
+                        }
+                        if let (Some(res), ValueExpr::GenRef { ptr, .. }) =
+                            (inst.result, &inst.expr)
+                        {
+                            aliases.insert(res, *ptr);
+                            if let Some(&a) = val_to_arena.get(ptr) {
+                                val_to_arena.insert(res, a);
+                            }
+                            verified_at_call.insert(res);
+                        }
+                        if let (Some(res), ValueExpr::Load { ptr }) = (inst.result, &inst.expr) {
+                            if let Some(&a) = val_to_arena.get(ptr) {
+                                val_to_arena.insert(res, a);
+                            }
+                            if let Some(&root) = aliases.get(ptr) {
+                                aliases.insert(res, root);
+                            }
+                        }
+                        if let ValueExpr::Store { ptr, val } = &inst.expr {
+                            aliases.insert(*ptr, *val);
+                            if let Some(&a) = val_to_arena.get(val) {
+                                val_to_arena.insert(*ptr, a);
+                            }
+                        }
+                        if let ValueExpr::GenCheck { ref_val, .. } = &inst.expr {
+                            verified_at_call.insert(*ref_val);
+                        }
+                        if let (
+                            Some(res),
+                            ValueExpr::CallDirect {
+                                name: callee_name, ..
+                            },
+                        ) = (inst.result, &inst.expr)
+                        {
+                            if let Some(&ret_a) = callee_return_arenas.get(callee_name) {
+                                val_to_arena.insert(res, ret_a);
+                                verified_at_call.insert(res);
+                            }
+                        }
+
+                        let callee_sym = match &inst.expr {
+                            ValueExpr::CallDirect { name: callee, .. } => Some(*callee),
+                            _ => None,
+                        };
+                        let call_args = match &inst.expr {
+                            ValueExpr::CallDirect { args, .. } | ValueExpr::Call { args, .. } => {
+                                args.as_slice()
+                            }
+                            _ => &[],
+                        };
+
+                        if let Some(target) = callee_sym {
+                            for (idx, &arg) in call_args.iter().enumerate() {
+                                let canon_arg = Self::resolve_alias(arg, &aliases);
+                                if let Some(&arg_arena) = val_to_arena
+                                    .get(&arg)
+                                    .or_else(|| val_to_arena.get(&canon_arg))
+                                {
+                                    let param_map = callee_param_arenas.entry(target).or_default();
+                                    param_map
+                                        .entry(idx)
+                                        .and_modify(|existing| {
+                                            *existing = (*existing).min(arg_arena)
+                                        })
+                                        .or_insert(arg_arena);
+                                }
+                                let is_ver = verified_at_call.contains(&arg)
+                                    || verified_at_call.contains(&canon_arg);
+                                let ver_map = callee_param_verified.entry(target).or_default();
+                                ver_map
+                                    .entry(idx)
+                                    .and_modify(|v| *v = *v && is_ver)
+                                    .or_insert(is_ver);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Re-optimize each function with acquired interprocedural context
+            let before_fusions = self.stats.interprocedural_fusions;
+            for func in &mut module.functions {
+                let incoming_param_arenas = callee_param_arenas
+                    .get(&func.name)
+                    .cloned()
+                    .unwrap_or_default();
+                let incoming_verified_params: HashSet<ValueId> =
+                    if let Some(v_map) = callee_param_verified.get(&func.name) {
+                        v_map
+                            .iter()
+                            .filter(|(_, &is_ver)| is_ver)
+                            .filter_map(|(&idx, _)| func.params.get(idx).map(|p| p.val))
+                            .collect()
+                    } else {
+                        HashSet::new()
+                    };
+
+                let mut call_res_arenas: HashMap<ValueId, u16> = HashMap::new();
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let (
+                            Some(res),
+                            ValueExpr::CallDirect {
+                                name: callee_name, ..
+                            },
+                        ) = (inst.result, &inst.expr)
+                        {
+                            if let Some(&ret_arena) = callee_return_arenas.get(callee_name) {
+                                call_res_arenas.insert(res, ret_arena);
+                            }
+                        }
+                    }
+                }
+
+                if incoming_param_arenas.is_empty()
+                    && call_res_arenas.is_empty()
+                    && incoming_verified_params.is_empty()
+                {
+                    continue;
+                }
+
+                let ctx = InterprocContext {
+                    param_arenas: &incoming_param_arenas,
+                    call_return_arenas: &call_res_arenas,
+                    verified_params: &incoming_verified_params,
+                    is_initial_pass: false,
+                };
+
+                self.optimize_function(func, recursive_structs, struct_map, &ctx);
+            }
+
+            if self.stats.interprocedural_fusions == before_fusions {
+                break;
+            }
+        }
     }
 }
 
