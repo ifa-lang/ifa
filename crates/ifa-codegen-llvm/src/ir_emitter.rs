@@ -1463,6 +1463,14 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("!30 = distinct !{!30, !2, !7, !4, !5, !12, !13, !24}\n");
         out.push_str("!31 = distinct !{!31, !2, !9, !4, !5, !12, !13, !24}\n");
         out.push_str("!32 = distinct !{!32, !2, !11, !4, !5, !12, !13, !24}\n");
+        // Specialized matrix and tensor kernel hints with LLVM unroll-and-jam, parallel accesses, and tiling
+        out.push_str("!33 = distinct !{!33, !2, !3, !4, !5, !12, !13, !24, !37, !38}\n");
+        out.push_str("!34 = distinct !{!34, !2, !7, !4, !5, !12, !13, !24, !37, !38}\n");
+        out.push_str("!35 = distinct !{!35, !2, !9, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!36 = distinct !{!36, !2, !11, !4, !5, !12, !13, !24, !37, !38}\n");
+        out.push_str("!37 = !{!\"llvm.loop.unroll_and_jam.enable\"}\n");
+        out.push_str("!38 = !{!\"llvm.loop.unroll_and_jam.count\", i32 4}\n");
+        out.push_str("!39 = !{!\"llvm.loop.unroll_and_jam.count\", i32 8}\n");
 
         Ok(out)
     }
@@ -4399,7 +4407,14 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             Terminator::Branch { target, .. } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = if hint.local_arena
+                    let meta_id = if hint.is_matrix_kernel || hint.is_tiled || hint.unroll_and_jam {
+                        match hint.vector_width {
+                            2 => 36,
+                            4 => 34,
+                            16 | 32 => 35,
+                            _ => 33,
+                        }
+                    } else if hint.local_arena
                         && (hint.contiguous_reduction || hint.predicated_scatter_gather)
                     {
                         match hint.vector_width {
@@ -4455,7 +4470,14 @@ impl<'a> LlvmIrEmitter<'a> {
                 ..
             } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = if hint.local_arena
+                    let meta_id = if hint.is_matrix_kernel || hint.is_tiled || hint.unroll_and_jam {
+                        match hint.vector_width {
+                            2 => 36,
+                            4 => 34,
+                            16 | 32 => 35,
+                            _ => 33,
+                        }
+                    } else if hint.local_arena
                         && (hint.contiguous_reduction || hint.predicated_scatter_gather)
                     {
                         match hint.vector_width {

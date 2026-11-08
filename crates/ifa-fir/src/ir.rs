@@ -482,7 +482,7 @@ pub enum ReductionKind {
     CountIf,
 }
 
-/// Optimization hint for loop vectorization (SIMD lane width, interleave, unroll directives, reduction kind, disjoint slices guarantee, tail-folding predication, strict determinism, contiguous arena reductions, sliding window convolutions, and predicated scatter/gather filters).
+/// Optimization hint for loop vectorization (SIMD lane width, interleave, unroll directives, reduction kind, disjoint slices guarantee, tail-folding predication, strict determinism, contiguous arena reductions, sliding window convolutions, predicated scatter/gather filters, matrix/tensor tiling, and loop fusion).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LoopVectorHint {
     pub vector_width: u32,
@@ -497,6 +497,11 @@ pub struct LoopVectorHint {
     pub predicated_scatter_gather: bool,
     pub sliding_window_size: Option<u32>,
     pub is_convolution: bool,
+    pub is_matrix_kernel: bool,
+    pub is_tiled: bool,
+    pub tile_size: Option<u32>,
+    pub unroll_and_jam: bool,
+    pub is_fused: bool,
 }
 
 impl LoopVectorHint {
@@ -515,6 +520,11 @@ impl LoopVectorHint {
             predicated_scatter_gather: false,
             sliding_window_size: None,
             is_convolution: false,
+            is_matrix_kernel: false,
+            is_tiled: false,
+            tile_size: None,
+            unroll_and_jam: false,
+            is_fused: false,
         }
     }
 
@@ -569,6 +579,32 @@ impl LoopVectorHint {
     /// Mark the loop as executing a bare-metal convolution or sliding stencil kernel.
     pub fn with_convolution(mut self, is_convolution: bool) -> Self {
         self.is_convolution = is_convolution;
+        self
+    }
+
+    /// Mark the loop as executing a multi-dimensional matrix or tensor kernel.
+    pub fn with_matrix_kernel(mut self, is_matrix: bool) -> Self {
+        self.is_matrix_kernel = is_matrix;
+        self
+    }
+
+    /// Mark the loop as tiled with a specific tile size (e.g. 16, 32, or 64).
+    pub fn with_tiling(mut self, tile_size: u32) -> Self {
+        self.is_tiled = true;
+        self.tile_size = Some(tile_size);
+        self.unroll_and_jam = true;
+        self
+    }
+
+    /// Enable or disable LLVM unroll-and-jam for nested loop tiling.
+    pub fn with_unroll_and_jam(mut self, unroll_and_jam: bool) -> Self {
+        self.unroll_and_jam = unroll_and_jam;
+        self
+    }
+
+    /// Mark the loop as resulting from loop fusion across adjacent pipeline stages.
+    pub fn with_fused(mut self, is_fused: bool) -> Self {
+        self.is_fused = is_fused;
         self
     }
 }

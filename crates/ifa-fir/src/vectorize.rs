@@ -436,6 +436,12 @@ impl VectorizePass {
                     interleave_count
                 };
 
+                let is_matrix_kernel = existing_hint.map(|h| h.is_matrix_kernel).unwrap_or(false);
+                let is_tiled = existing_hint.map(|h| h.is_tiled).unwrap_or(false);
+                let tile_size = existing_hint.and_then(|h| h.tile_size);
+                let unroll_and_jam = existing_hint.map(|h| h.unroll_and_jam).unwrap_or(false);
+                let is_fused = existing_hint.map(|h| h.is_fused).unwrap_or(false);
+
                 let hint = LoopVectorHint {
                     vector_width,
                     interleave_count: effective_interleave,
@@ -453,6 +459,11 @@ impl VectorizePass {
                     predicated_scatter_gather,
                     sliding_window_size,
                     is_convolution,
+                    is_matrix_kernel,
+                    is_tiled,
+                    tile_size,
+                    unroll_and_jam,
+                    is_fused,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)

@@ -4334,3 +4334,100 @@ fn test_llvm_baremetal_convolution_and_sliding_window_metadata_emission() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_matrix_kernel_tiling_unroll_and_jam_metadata_and_compilation() {
+    use ifa_fir::*;
+    use ifa_span::Span;
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let mut func = FirFunction::new(
+        ifa_span::INTERNER.intern("matrix_tiled_kernel"),
+        Vec::new(),
+        FirType::Unit,
+        false,
+        true, // strict bare-metal mode
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    bb0.terminator = Some(Terminator::Branch {
+        target: BlockId(1),
+        args: Vec::new(),
+    });
+    func.blocks.push(bb0);
+
+    let mut bb1 = BasicBlock::new(BlockId(1));
+    let hint = LoopVectorHint::new(8, 4, true)
+        .with_matrix_kernel(true)
+        .with_tiling(16);
+    bb1.set_vector_hint(hint);
+    bb1.instructions.push(Instruction::new(
+        Some(ValueId(2)),
+        ValueExpr::Constant(ConstantValue::Bool(true)),
+        Span::DUMMY,
+    ));
+    bb1.terminator = Some(Terminator::BranchCond {
+        cond: ValueId(2),
+        then_block: BlockId(1),
+        else_block: BlockId(2),
+        then_args: Vec::new(),
+        else_args: Vec::new(),
+    });
+    func.blocks.push(bb1);
+
+    let mut bb2 = BasicBlock::new(BlockId(2));
+    bb2.terminator = Some(Terminator::Return(None));
+    func.blocks.push(bb2);
+
+    let module = FirModule {
+        name: ifa_span::INTERNER.intern("matrix_tile_meta_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let llvm_ir = emitter
+        .emit_module(&module)
+        .expect("LLVM IR emission failed");
+
+    assert!(
+        llvm_ir.contains("!llvm.loop !33"),
+        "Loop branch must reference matrix tiling metadata !33:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("!33 = distinct !{!33, !2, !3, !4, !5, !12, !13, !24, !37, !38}"),
+        "Metadata table must contain !33 matrix tiling node:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("!37 = !{!\"llvm.loop.unroll_and_jam.enable\"}"),
+        "Unroll and jam enable metadata must be attached for matrix tiling"
+    );
+    assert!(
+        llvm_ir.contains("!38 = !{!\"llvm.loop.unroll_and_jam.count\", i32 4}"),
+        "Unroll and jam count metadata must be attached for matrix tiling"
+    );
+
+    // Verify native object compilation succeeds with LLVM toolchain
+    let temp_dir = std::env::temp_dir().join(format!("ifa_tile_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("matrix_tiled.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation to object with matrix tiling metadata failed: {:?}",
+        compile_res.err()
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
