@@ -294,3 +294,125 @@ pub fn main() {
     let _ = fs::remove_file(temp_ok);
     let _ = fs::remove_file(temp_overlap);
 }
+
+#[test]
+fn test_multi_parameter_where_clauses_execution_end_to_end() {
+    let ifa_bin = get_ifa_binary();
+    let temp_file =
+        std::env::temp_dir().join(format!("test_multi_param_where_{}.ifa", std::process::id()));
+
+    let source = r#"
+trait Display {
+    fn display(self) -> String;
+}
+
+trait Serializable {
+    fn serialize(self) -> String;
+}
+
+trait Summarize {
+    fn summary(self) -> String;
+}
+
+struct Article {
+    title: String,
+}
+
+impl Display for Article {
+    fn display(a: Article) -> String {
+        return a.title;
+    }
+}
+
+impl Serializable for Article {
+    fn serialize(a: Article) -> String {
+        return a.title;
+    }
+}
+
+struct Tag {
+    label: String,
+}
+
+impl Summarize for Tag {
+    fn summary(t: Tag) -> String {
+        return t.label;
+    }
+}
+
+struct Envelope<T, U>
+where T: Display + Serializable, U: Summarize {
+    content: T,
+    meta: U,
+}
+
+impl<T, U> Envelope<T, U>
+where T: Display + Serializable, U: Summarize {
+    fn format_both(env: Envelope<T, U>) -> String {
+        let c_str = env.content.display();
+        let m_str = env.meta.summary();
+        return c_str;
+    }
+}
+
+fn render_envelope<A, B>(env: Envelope<A, B>) -> String
+where A: Display + Serializable, B: Summarize {
+    return env.format_both();
+}
+
+pub fn main() {
+    let art = Article(title: "Deterministic Compilation with Where Clauses");
+    let tg = Tag(label: "IFA-v0.1");
+
+    let env = Envelope(content: art, meta: tg);
+
+    // Direct devirtualized method call on struct with where clause
+    let d = env.format_both();
+    println("Direct formatted:", d);
+
+    // Monomorphized function call with multi-parameter where clause
+    let r = render_envelope(env);
+    println("Rendered envelope:", r);
+}
+"#;
+
+    fs::write(&temp_file, source).expect("Failed to write test file");
+
+    let check_status = Command::new(&ifa_bin)
+        .arg("check")
+        .arg(&temp_file)
+        .status()
+        .expect("Failed to execute `ifa check`");
+    assert!(
+        check_status.success(),
+        "ifa check failed on multi-parameter where clause"
+    );
+
+    let run_output = Command::new(&ifa_bin)
+        .arg("run")
+        .arg(&temp_file)
+        .output()
+        .expect("Failed to execute `ifa run`");
+
+    let run_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        run_output.status.success(),
+        "ifa run failed with code {:?}\nstdout: {}\nstderr: {}",
+        run_output.status.code(),
+        run_stdout,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    assert!(
+        run_stdout.contains("Direct formatted: Deterministic Compilation with Where Clauses"),
+        "stdout was: {}",
+        run_stdout
+    );
+    assert!(
+        run_stdout.contains("Rendered envelope: Deterministic Compilation with Where Clauses"),
+        "stdout was: {}",
+        run_stdout
+    );
+
+    let _ = fs::remove_file(temp_file);
+}

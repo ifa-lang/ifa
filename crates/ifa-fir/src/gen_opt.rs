@@ -1,8 +1,21 @@
 use crate::cfg::ControlFlowGraph;
 use crate::dominance::DominanceTree;
 use crate::ir::*;
-use ifa_span::Span;
+use ifa_span::{Span, Symbol};
 use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Representation of an interprocedural call-site (caller, block, instruction index, argument values).
+type CallSite = (Symbol, BlockId, usize, Vec<ValueId>);
+
+/// Analysis context bundled for dominance-based generational check elimination.
+struct DominanceContext<'a> {
+    cfg: &'a ControlFlowGraph,
+    dom_tree: &'a DominanceTree,
+    freeing_blocks: &'a HashSet<BlockId>,
+    ref_defs: &'a HashMap<ValueId, BlockId>,
+    aliases: &'a HashMap<ValueId, ValueId>,
+    callee_has_free: &'a HashMap<Symbol, bool>,
+}
 
 /// Statistics collected by the generational check elimination (GCE) pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -10,6 +23,7 @@ pub struct GenOptStats {
     pub total_checks: usize,
     pub eliminated_checks: usize,
     pub hoisted_checks: usize,
+    pub interprocedural_eliminated_checks: usize,
 }
 
 impl GenOptStats {
@@ -47,12 +61,21 @@ fn canonical_ref(mut val: ValueId, aliases: &HashMap<ValueId, ValueId>) -> Value
 /// and hoisting loop-invariant checks out of loops (Section 9.3).
 pub struct GenerationalOptPass {
     stats: GenOptStats,
+    safe_params: HashSet<(Symbol, usize)>,
 }
 
 impl GenerationalOptPass {
     pub fn new() -> Self {
         Self {
             stats: GenOptStats::default(),
+            safe_params: HashSet::new(),
+        }
+    }
+
+    pub fn with_safe_params(safe_params: HashSet<(Symbol, usize)>) -> Self {
+        Self {
+            stats: GenOptStats::default(),
+            safe_params,
         }
     }
 
@@ -65,6 +88,7 @@ impl GenerationalOptPass {
         let before_elim = self.stats.eliminated_checks;
         let before_hoist = self.stats.hoisted_checks;
         let before_total = self.stats.total_checks;
+        let before_interprocedural = self.stats.interprocedural_eliminated_checks;
 
         self.run_on_module(module);
 
@@ -72,18 +96,304 @@ impl GenerationalOptPass {
             total_checks: self.stats.total_checks - before_total,
             eliminated_checks: self.stats.eliminated_checks - before_elim,
             hoisted_checks: self.stats.hoisted_checks - before_hoist,
+            interprocedural_eliminated_checks: self.stats.interprocedural_eliminated_checks
+                - before_interprocedural,
         }
     }
 
-    /// Run the optimization on an entire module.
+    /// Inter-procedurally computes parameters that are guaranteed to receive valid (already checked
+    /// or locally allocated) references across all call-sites in the module.
+    pub fn compute_interprocedural_safe_params(module: &FirModule) -> HashSet<(Symbol, usize)> {
+        let mut safe_params: HashSet<(Symbol, usize)> = HashSet::new();
+
+        // Structural per-function analysis
+        struct FuncAnalysis {
+            alloca_values: HashSet<ValueId>,
+            freeing_blocks: HashSet<BlockId>,
+            dom_tree: DominanceTree,
+            global_aliases: HashMap<ValueId, ValueId>,
+            checks_by_block: HashMap<BlockId, HashSet<ValueId>>,
+            gen_creations: HashMap<ValueId, BlockId>,
+        }
+
+        let mut func_analyses: HashMap<Symbol, FuncAnalysis> = HashMap::new();
+        for func in &module.functions {
+            let cfg = ControlFlowGraph::build(func);
+            let dom_tree = DominanceTree::build(&cfg);
+
+            let mut freeing_blocks = HashSet::new();
+            let mut alloca_values = HashSet::new();
+            let mut gen_creations = HashMap::new();
+            let mut checks_by_block: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
+
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    match &inst.expr {
+                        ValueExpr::GenFree { .. } => {
+                            freeing_blocks.insert(block.id);
+                        }
+                        ValueExpr::Alloca { .. } => {
+                            if let Some(res) = inst.result {
+                                alloca_values.insert(res);
+                            }
+                        }
+                        ValueExpr::GenRef { .. } | ValueExpr::GenAlloc { .. } => {
+                            if let Some(res) = inst.result {
+                                gen_creations.insert(res, block.id);
+                            }
+                        }
+                        ValueExpr::GenCheck { ref_val, .. } => {
+                            checks_by_block
+                                .entry(block.id)
+                                .or_default()
+                                .insert(*ref_val);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let mut store_counts: HashMap<ValueId, usize> = HashMap::new();
+            let mut single_store_val: HashMap<ValueId, ValueId> = HashMap::new();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let ValueExpr::Store { ptr, val } = &inst.expr {
+                        *store_counts.entry(*ptr).or_default() += 1;
+                        single_store_val.insert(*ptr, *val);
+                    }
+                }
+            }
+            single_store_val.retain(|ptr, _| store_counts.get(ptr) == Some(&1));
+
+            let mut global_aliases = HashMap::new();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let ValueExpr::Load { ptr } = &inst.expr {
+                        if let (Some(res), Some(&stored_val)) =
+                            (inst.result, single_store_val.get(ptr))
+                        {
+                            global_aliases.insert(res, stored_val);
+                        }
+                    }
+                }
+            }
+
+            func_analyses.insert(
+                func.name,
+                FuncAnalysis {
+                    alloca_values,
+                    freeing_blocks,
+                    dom_tree,
+                    global_aliases,
+                    checks_by_block,
+                    gen_creations,
+                },
+            );
+        }
+
+        let mut changed = true;
+        let mut iter = 0;
+        while changed && iter < 16 {
+            changed = false;
+            iter += 1;
+
+            let mut call_sites_by_target: HashMap<Symbol, Vec<CallSite>> = HashMap::new();
+            for func in &module.functions {
+                for block in &func.blocks {
+                    for (inst_idx, inst) in block.instructions.iter().enumerate() {
+                        if let ValueExpr::CallDirect { name, args }
+                        | ValueExpr::BlockingCallDirect { name, args } = &inst.expr
+                        {
+                            call_sites_by_target.entry(*name).or_default().push((
+                                func.name,
+                                block.id,
+                                inst_idx,
+                                args.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            for func in &module.functions {
+                let target_name = func.name;
+                if let Some(call_sites) = call_sites_by_target.get(&target_name) {
+                    if call_sites.is_empty() {
+                        continue;
+                    }
+
+                    for p_idx in 0..func.params.len() {
+                        if safe_params.contains(&(target_name, p_idx)) {
+                            continue;
+                        }
+
+                        let all_callers_safe =
+                            call_sites
+                                .iter()
+                                .all(|(caller_name, block_id, inst_idx, args)| {
+                                    if let Some(&arg_val) = args.get(p_idx) {
+                                        if let Some(analysis) = func_analyses.get(caller_name) {
+                                            let canon =
+                                                canonical_ref(arg_val, &analysis.global_aliases);
+
+                                            // 1. Stack alloca
+                                            if analysis.alloca_values.contains(&arg_val)
+                                                || analysis.alloca_values.contains(&canon)
+                                            {
+                                                return true;
+                                            }
+
+                                            // 2. Caller's own parameter is safe
+                                            if let Some(caller_fn) = module
+                                                .functions
+                                                .iter()
+                                                .find(|f| f.name == *caller_name)
+                                            {
+                                                for (c_idx, c_p) in
+                                                    caller_fn.params.iter().enumerate()
+                                                {
+                                                    if (c_p.val == arg_val || c_p.val == canon)
+                                                        && safe_params
+                                                            .contains(&(*caller_name, c_idx))
+                                                    {
+                                                        return true;
+                                                    }
+                                                }
+                                            }
+
+                                            // 3. Dominating GenRef / GenAlloc without intervening GenFree
+                                            let is_fresh_ref = analysis
+                                                .gen_creations
+                                                .get(&arg_val)
+                                                .or_else(|| analysis.gen_creations.get(&canon));
+                                            if let Some(&def_b) = is_fresh_ref {
+                                                let no_free =
+                                                    !analysis.freeing_blocks.iter().any(|&fb| {
+                                                        analysis.dom_tree.dominates(def_b, fb)
+                                                            && analysis
+                                                                .dom_tree
+                                                                .dominates(fb, *block_id)
+                                                    });
+                                                if no_free
+                                                    && analysis.dom_tree.dominates(def_b, *block_id)
+                                                {
+                                                    return true;
+                                                }
+                                            }
+
+                                            // 4. Dominating GenCheck
+                                            let mut check_dominates = false;
+                                            for (&chk_b, chk_vals) in &analysis.checks_by_block {
+                                                if chk_vals.contains(&arg_val)
+                                                    || chk_vals.contains(&canon)
+                                                {
+                                                    if chk_b == *block_id {
+                                                        if let Some(caller_fn) = module
+                                                            .functions
+                                                            .iter()
+                                                            .find(|f| f.name == *caller_name)
+                                                        {
+                                                            if let Some(b) =
+                                                                caller_fn.get_block(*block_id)
+                                                            {
+                                                                for inst in b
+                                                                    .instructions
+                                                                    .iter()
+                                                                    .take(*inst_idx)
+                                                                {
+                                                                    if let ValueExpr::GenCheck {
+                                                                        ref_val,
+                                                                        ..
+                                                                    } = &inst.expr
+                                                                    {
+                                                                        if *ref_val == arg_val
+                                                                            || *ref_val == canon
+                                                                            || canonical_ref(
+                                                                                *ref_val,
+                                                                                &analysis
+                                                                                    .global_aliases,
+                                                                            ) == canon
+                                                                        {
+                                                                            check_dominates = true;
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    } else if analysis
+                                                        .dom_tree
+                                                        .dominates(chk_b, *block_id)
+                                                    {
+                                                        let no_free = !analysis
+                                                            .freeing_blocks
+                                                            .iter()
+                                                            .any(|&fb| {
+                                                                analysis
+                                                                    .dom_tree
+                                                                    .dominates(chk_b, fb)
+                                                                    && analysis
+                                                                        .dom_tree
+                                                                        .dominates(fb, *block_id)
+                                                            });
+                                                        if no_free {
+                                                            check_dominates = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if check_dominates {
+                                                return true;
+                                            }
+                                        }
+                                    }
+                                    false
+                                });
+
+                        if all_callers_safe {
+                            safe_params.insert((target_name, p_idx));
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        safe_params
+    }
+
+    /// Run the optimization on an entire module with whole-program interprocedural constraint propagation.
     pub fn run_on_module(&mut self, module: &mut FirModule) {
+        let interprocedural_safe = Self::compute_interprocedural_safe_params(module);
+        self.safe_params.extend(interprocedural_safe);
+
+        let mut callee_has_free = HashMap::new();
+        for f in &module.functions {
+            let has_free = f.blocks.iter().any(|b| {
+                b.instructions
+                    .iter()
+                    .any(|i| matches!(i.expr, ValueExpr::GenFree { .. }))
+            });
+            callee_has_free.insert(f.name, has_free);
+        }
+
         for func in &mut module.functions {
-            self.run_on_function(func);
+            self.run_on_function_internal(func, &callee_has_free);
         }
     }
 
-    /// Run the full GCE pass (Loop-Invariant Hoisting + Dominance Elimination) on a function.
+    /// Run the full GCE pass on a function.
     pub fn run_on_function(&mut self, func: &mut FirFunction) {
+        let callee_has_free = HashMap::new();
+        self.run_on_function_internal(func, &callee_has_free);
+    }
+
+    fn run_on_function_internal(
+        &mut self,
+        func: &mut FirFunction,
+        callee_has_free: &HashMap<Symbol, bool>,
+    ) {
         let cfg = ControlFlowGraph::build(func);
         let dom_tree = DominanceTree::build(&cfg);
 
@@ -233,14 +543,15 @@ impl GenerationalOptPass {
         }
 
         // 3. Dominance-based and Dataflow Elimination (Section 9.3 Rules 1 & 3)
-        self.run_dominance_elimination(
-            func,
-            &cfg,
-            &dom_tree,
-            &freeing_blocks,
-            &gen_ref_creations,
-            &global_aliases,
-        );
+        let cx = DominanceContext {
+            cfg: &cfg,
+            dom_tree: &dom_tree,
+            freeing_blocks: &freeing_blocks,
+            ref_defs: &gen_ref_creations,
+            aliases: &global_aliases,
+            callee_has_free,
+        };
+        self.run_dominance_elimination(func, &cx);
     }
 
     /// Identifies natural loops and hoists invariant `GenCheck` instructions into loop preheaders.
@@ -365,15 +676,7 @@ impl GenerationalOptPass {
     }
 
     /// Performs dominance-based and dataflow elimination in Reverse Post-Order.
-    fn run_dominance_elimination(
-        &mut self,
-        func: &mut FirFunction,
-        cfg: &ControlFlowGraph,
-        dom_tree: &DominanceTree,
-        freeing_blocks: &HashSet<BlockId>,
-        ref_defs: &HashMap<ValueId, BlockId>,
-        aliases: &HashMap<ValueId, ValueId>,
-    ) {
+    fn run_dominance_elimination(&mut self, func: &mut FirFunction, cx: &DominanceContext<'_>) {
         let is_strict = func.is_strict;
         let mut verified_at_exit: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
 
@@ -417,21 +720,32 @@ impl GenerationalOptPass {
             }
         };
 
-        let natural_loops = Self::find_natural_loops(cfg, dom_tree);
+        let natural_loops = Self::find_natural_loops(cx.cfg, cx.dom_tree);
         let mut loop_by_header: HashMap<BlockId, &NaturalLoop> = HashMap::new();
         for l in &natural_loops {
             loop_by_header.entry(l.header).or_insert(l);
         }
 
-        for &block_id in &dom_tree.rpo_blocks {
+        for &block_id in &cx.dom_tree.rpo_blocks {
             let mut available: HashSet<ValueId> = HashSet::new();
 
             if is_strict {
                 // In strict mode, function guarantees zero dynamic generational checks
+            } else if block_id == func.entry_block {
+                // Inter-procedural propagation: formal parameters proven safe across all call-sites
+                for (p_idx, p) in func.params.iter().enumerate() {
+                    if self.safe_params.contains(&(func.name, p_idx)) {
+                        available.insert(p.val);
+                        available.insert(canonical_ref(p.val, cx.aliases));
+                    }
+                }
             } else if block_id != func.entry_block {
                 if let Some(loop_info) = loop_by_header.get(&block_id) {
                     // 1a. Loop header: If no block in the loop frees memory, checks from the preheader remain valid across iterations
-                    let loop_has_free = loop_info.blocks.iter().any(|b| freeing_blocks.contains(b));
+                    let loop_has_free = loop_info
+                        .blocks
+                        .iter()
+                        .any(|b| cx.freeing_blocks.contains(b));
                     if !loop_has_free {
                         if let Some(preheader) = loop_info.preheader {
                             if let Some(pre_checks) = verified_at_exit.get(&preheader) {
@@ -439,7 +753,7 @@ impl GenerationalOptPass {
                             }
                         }
                     }
-                } else if let Some(preds) = cfg.predecessors.get(&block_id) {
+                } else if let Some(preds) = cx.cfg.predecessors.get(&block_id) {
                     // 1b. Non-loop-header block: Confluent dataflow intersection across all predecessors
                     if !preds.is_empty() {
                         let processed_preds: Vec<BlockId> = preds
@@ -461,12 +775,12 @@ impl GenerationalOptPass {
                             if let Some(c) = common {
                                 available.extend(c);
                             }
-                        } else if let Some(idom) = dom_tree.immediate_dominator(block_id) {
+                        } else if let Some(idom) = cx.dom_tree.immediate_dominator(block_id) {
                             if let Some(dom_checks) = verified_at_exit.get(&idom) {
-                                let no_free = !freeing_blocks.iter().any(|&fb| {
+                                let no_free = !cx.freeing_blocks.iter().any(|&fb| {
                                     fb != idom
-                                        && dom_tree.dominates(idom, fb)
-                                        && dom_tree.dominates(fb, block_id)
+                                        && cx.dom_tree.dominates(idom, fb)
+                                        && cx.dom_tree.dominates(fb, block_id)
                                 });
                                 if no_free {
                                     available.extend(dom_checks.iter().copied());
@@ -479,7 +793,7 @@ impl GenerationalOptPass {
                 // 2. SSA Block Parameters / Phi Promotion Resolution (SROA Stability)
                 if let Some(block) = func.get_block(block_id) {
                     if !block.params.is_empty() {
-                        if let Some(preds) = cfg.predecessors.get(&block_id) {
+                        if let Some(preds) = cx.cfg.predecessors.get(&block_id) {
                             for (param_idx, (param_val, _)) in block.params.iter().enumerate() {
                                 let mut all_preds_verified = !preds.is_empty();
                                 for &pred_id in preds {
@@ -487,7 +801,8 @@ impl GenerationalOptPass {
                                         if let Some(term) = &pred_block.terminator {
                                             if let Some(args) = get_branch_args(term, block_id) {
                                                 if let Some(&arg_val) = args.get(param_idx) {
-                                                    let arg_canon = canonical_ref(arg_val, aliases);
+                                                    let arg_canon =
+                                                        canonical_ref(arg_val, cx.aliases);
                                                     let is_verified_in_pred = verified_at_exit
                                                         .get(&pred_id)
                                                         .is_some_and(|set| {
@@ -518,7 +833,7 @@ impl GenerationalOptPass {
 
                                 if all_preds_verified {
                                     available.insert(*param_val);
-                                    available.insert(canonical_ref(*param_val, aliases));
+                                    available.insert(canonical_ref(*param_val, cx.aliases));
                                 }
                             }
                         }
@@ -526,14 +841,15 @@ impl GenerationalOptPass {
                 }
 
                 // 3. Direct lexical dominance: created in dominating block with no intervening frees
-                for (&ref_val, &def_block) in ref_defs {
-                    if dom_tree.dominates(def_block, block_id) {
-                        let no_free = !freeing_blocks.iter().any(|&fb| {
-                            dom_tree.dominates(def_block, fb) && dom_tree.dominates(fb, block_id)
+                for (&ref_val, &def_block) in cx.ref_defs {
+                    if cx.dom_tree.dominates(def_block, block_id) {
+                        let no_free = !cx.freeing_blocks.iter().any(|&fb| {
+                            cx.dom_tree.dominates(def_block, fb)
+                                && cx.dom_tree.dominates(fb, block_id)
                         });
                         if no_free {
                             available.insert(ref_val);
-                            available.insert(canonical_ref(ref_val, aliases));
+                            available.insert(canonical_ref(ref_val, cx.aliases));
                         }
                     }
                 }
@@ -553,12 +869,12 @@ impl GenerationalOptPass {
                                 let stored = ptr_aliases
                                     .get(ptr)
                                     .copied()
-                                    .or_else(|| aliases.get(&res).copied());
+                                    .or_else(|| cx.aliases.get(&res).copied());
                                 if let Some(val) = stored {
-                                    let canon = canonical_ref(val, aliases);
+                                    let canon = canonical_ref(val, cx.aliases);
                                     if available.contains(&val) || available.contains(&canon) {
                                         available.insert(res);
-                                        available.insert(canonical_ref(res, aliases));
+                                        available.insert(canonical_ref(res, cx.aliases));
                                     }
                                 }
                             }
@@ -566,18 +882,32 @@ impl GenerationalOptPass {
                         ValueExpr::GenRef { .. } | ValueExpr::GenAlloc { .. } => {
                             if let Some(res) = inst.result {
                                 available.insert(res);
-                                available.insert(canonical_ref(res, aliases));
+                                available.insert(canonical_ref(res, cx.aliases));
                             }
                         }
                         ValueExpr::GenFree { ptr } => {
-                            let canon = canonical_ref(*ptr, aliases);
+                            let canon = canonical_ref(*ptr, cx.aliases);
                             available.remove(ptr);
                             available.remove(&canon);
                             ptr_aliases.remove(ptr);
                         }
+                        ValueExpr::CallDirect { name, args }
+                        | ValueExpr::BlockingCallDirect { name, args } => {
+                            let callee_frees =
+                                cx.callee_has_free.get(name).copied().unwrap_or(true);
+                            if !callee_frees {
+                                for (arg_idx, &arg_val) in args.iter().enumerate() {
+                                    if self.safe_params.contains(&(*name, arg_idx)) {
+                                        let canon = canonical_ref(arg_val, cx.aliases);
+                                        available.insert(arg_val);
+                                        available.insert(canon);
+                                    }
+                                }
+                            }
+                        }
                         ValueExpr::GenCheck { ref_val, redundant } => {
                             self.stats.total_checks += 1;
-                            let canon = canonical_ref(*ref_val, aliases);
+                            let canon = canonical_ref(*ref_val, cx.aliases);
 
                             if *redundant {
                                 // Already eliminated by LICM hoisting
@@ -589,6 +919,7 @@ impl GenerationalOptPass {
                             {
                                 *redundant = true;
                                 self.stats.eliminated_checks += 1;
+                                self.stats.interprocedural_eliminated_checks += 1;
                                 available.insert(*ref_val);
                                 available.insert(canon);
                             } else {

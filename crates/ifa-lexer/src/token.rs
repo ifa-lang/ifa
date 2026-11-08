@@ -80,6 +80,8 @@ pub enum RawToken {
     Interface,
     #[token("impl")]
     Impl,
+    #[token("where")]
+    Where,
     #[token("true")]
     True,
     #[token("false")]
@@ -250,6 +252,7 @@ pub enum TokenKind {
     Trait,
     Interface,
     Impl,
+    Where,
     True,
     False,
     Null,
@@ -359,6 +362,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Trait => write!(f, "trait"),
             TokenKind::Interface => write!(f, "interface"),
             TokenKind::Impl => write!(f, "impl"),
+            TokenKind::Where => write!(f, "where"),
             TokenKind::True => write!(f, "true"),
             TokenKind::False => write!(f, "false"),
             TokenKind::Null => write!(f, "null"),

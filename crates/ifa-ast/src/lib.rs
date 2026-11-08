@@ -69,6 +69,13 @@ impl GenericParam {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct WherePredicate {
+    pub target: Symbol,
+    pub bounds: Vec<Symbol>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     pub is_pub: bool,
     pub is_strict: bool,
@@ -76,6 +83,7 @@ pub struct Function {
     pub is_extern: Option<String>,
     pub name: Symbol,
     pub generics: Vec<GenericParam>,
+    pub where_clauses: Vec<WherePredicate>,
     pub params: Vec<Param>,
     pub ret_ty: Option<Type>,
     pub body: Option<Block>,
@@ -95,6 +103,7 @@ pub struct Struct {
     pub is_pub: bool,
     pub name: Symbol,
     pub generics: Vec<GenericParam>,
+    pub where_clauses: Vec<WherePredicate>,
     pub fields: Vec<StructField>,
     pub span: Span,
 }
@@ -149,6 +158,7 @@ pub struct Trait {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Impl {
     pub generics: Vec<GenericParam>,
+    pub where_clauses: Vec<WherePredicate>,
     pub trait_name: Option<Symbol>,
     pub target_ty: Type,
     pub methods: Vec<Function>,

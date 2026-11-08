@@ -100,6 +100,14 @@ fn test_loop_invariant_generational_check_hoisting() {
         "Invariant check should be hoisted into loop preheader, hoisted: {}",
         stats.hoisted_checks
     );
+    for f in &module.functions {
+        println!(
+            "FN {}:\n{}",
+            ifa_span::INTERNER.resolve(&f.name),
+            format_function(f)
+        );
+    }
+    println!("STATS: {:?}", gce.stats());
     assert!(
         stats.eliminated_checks >= 1,
         "Check inside loop should be eliminated, eliminated: {}",
@@ -703,4 +711,57 @@ fn test_deeply_nested_triple_loop_licm_hierarchical_hoisting() {
         )
         .unwrap();
     assert_eq!(res, FirValue::Int(144));
+}
+
+#[test]
+fn test_interprocedural_generic_monomorphic_receiver_check_elimination() {
+    let src = r#"
+        struct Container<T> {
+            item: T,
+        }
+
+        impl<T> Container<T> {
+            pub fn read_val(c: ref Container<T>) -> T {
+                return c.item;
+            }
+        }
+
+        pub fn process_container(n: i64) -> i64 {
+            let c = Container(item: n);
+            let r = ref c;
+            let first = r.read_val();
+            let second = r.read_val();
+            return first + second;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("generic_receiver_ipo.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = compile_to_fir(&prog, &analysis.symbols, true, false).unwrap();
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_module(&mut module);
+
+    let stats = gce.stats();
+    assert!(
+        stats.eliminated_checks >= 1,
+        "Expected at least 1 eliminated check across monomorphic receivers, got {}",
+        stats.eliminated_checks
+    );
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp
+        .execute_function("process_container", vec![FirValue::Int(21)])
+        .unwrap();
+    assert_eq!(res, FirValue::Int(42));
 }

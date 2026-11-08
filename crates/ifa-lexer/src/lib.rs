@@ -66,6 +66,7 @@ impl<'a> Lexer<'a> {
                     RawToken::Trait => TokenKind::Trait,
                     RawToken::Interface => TokenKind::Interface,
                     RawToken::Impl => TokenKind::Impl,
+                    RawToken::Where => TokenKind::Where,
                     RawToken::True => TokenKind::True,
                     RawToken::False => TokenKind::False,
                     RawToken::Null => TokenKind::Null,

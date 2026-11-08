@@ -566,9 +566,17 @@ impl<'a> FunctionLoweringContext<'a> {
                     FirType::Struct(name, _) => *name,
                     _ => return None,
                 };
-                if let Some(st) = self.symbols.lookup_struct(&st_name) {
+                let st_name_str = INTERNER.resolve(&st_name);
+                let base_st_name = st_name_str.split("__").next().unwrap_or(&st_name_str);
+                let base_st_sym = INTERNER.intern(base_st_name);
+                let st_opt = self
+                    .symbols
+                    .lookup_struct(&st_name)
+                    .or_else(|| self.symbols.lookup_struct(&base_st_sym));
+                if let Some(st) = st_opt {
                     if let Some(f) = st.fields.iter().find(|f| f.name == *field) {
-                        let f_ty = FirType::from_sema_type(&f.ty);
+                        let substituted = f.ty.substitute(&self.type_subst);
+                        let f_ty = FirType::from_sema_type(&substituted);
                         return if *safe {
                             match f_ty {
                                 FirType::Optional(_) => Some(f_ty),
@@ -878,10 +886,6 @@ impl<'a> FunctionLoweringContext<'a> {
 
     /// Resolves the concrete monomorphic method target, devirtualizing trait and interface calls AOT.
     fn resolve_method_call_target(&self, receiver: &Expr, method: Symbol, span: Span) -> Symbol {
-        if let Some(&resolved) = self.symbols.method_resolutions.get(&span) {
-            return resolved;
-        }
-
         // Monomorphic Devirtualization: Check concrete receiver FIR type
         let rec_fir_ty = self.infer_expr_fir_type(receiver);
         let mut rec_struct_name = None;
@@ -912,6 +916,10 @@ impl<'a> FunctionLoweringContext<'a> {
             {
                 return specialized;
             }
+        }
+
+        if let Some(&resolved) = self.symbols.method_resolutions.get(&span) {
+            return resolved;
         }
 
         if let Some(fn_sym) = self.symbols.lookup_function(&method) {
@@ -5972,8 +5980,18 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
         if let Some(func_ast) = all_functions.get(&orig_name) {
             if let Some(body) = &func_ast.body {
                 let mut type_subst = HashMap::new();
-                for (g, concrete) in func_ast.generics.iter().zip(type_args.iter()) {
-                    type_subst.insert(g.name, concrete.clone());
+                if func_ast.generics.is_empty() {
+                    if let Some((st_name, _)) = impl_method_struct_map.get(&orig_name) {
+                        if let Some(st) = symbols.lookup_struct(st_name) {
+                            for (g, concrete) in st.generics.iter().zip(type_args.iter()) {
+                                type_subst.insert(g.name, concrete.clone());
+                            }
+                        }
+                    }
+                } else {
+                    for (g, concrete) in func_ast.generics.iter().zip(type_args.iter()) {
+                        type_subst.insert(g.name, concrete.clone());
+                    }
                 }
                 let ctx = FunctionLoweringContext::new(
                     func_ast,

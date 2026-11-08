@@ -89,6 +89,7 @@ pub fn handle_semantic_tokens(doc: &Document) -> SemanticTokens {
             | TokenKind::Trait
             | TokenKind::Interface
             | TokenKind::Impl
+            | TokenKind::Where
             | TokenKind::True
             | TokenKind::False
             | TokenKind::Null => (0, 0),

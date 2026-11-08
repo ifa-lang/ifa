@@ -3484,3 +3484,178 @@ fn test_generic_struct_nested_access_path_exclusivity() {
         err_res.diagnostics
     );
 }
+
+#[test]
+fn test_multi_parameter_where_clause_valid() {
+    let code = r#"
+        trait Display {
+            fn display(self) -> String;
+        }
+
+        trait Serializable {
+            fn serialize(self) -> String;
+        }
+
+        trait Cloneable {
+            fn duplicate(self) -> i64;
+        }
+
+        struct Item {
+            name: String,
+        }
+
+        impl Display for Item {
+            fn display(i: Item) -> String {
+                return i.name;
+            }
+        }
+
+        impl Serializable for Item {
+            fn serialize(i: Item) -> String {
+                return i.name;
+            }
+        }
+
+        struct Number {
+            val: i64,
+        }
+
+        impl Cloneable for Number {
+            fn duplicate(n: Number) -> i64 {
+                return n.val;
+            }
+        }
+
+        // Multi-parameter where clause with compound trait bounds: `where T: Display + Serializable, U: Cloneable`
+        fn format_pair<T, U>(a: T, b: U) -> String
+        where T: Display + Serializable, U: Cloneable {
+            let s1 = a.display();
+            let s2 = a.serialize();
+            let d = b.duplicate();
+            return s1;
+        }
+
+        pub fn main() {
+            let it = Item(name: "IFA");
+            let num = Number(val: 42);
+            let res = format_pair(it, num);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Valid multi-parameter where clause must pass semantic analysis: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_multi_parameter_where_clause_trait_bound_violation_rejected_with_e0030() {
+    let code = r#"
+        trait Display {
+            fn display(self) -> String;
+        }
+
+        trait Serializable {
+            fn serialize(self) -> String;
+        }
+
+        trait Cloneable {
+            fn duplicate(self) -> i64;
+        }
+
+        struct Item {
+            name: String,
+        }
+
+        // Item implements Display, but NOT Serializable!
+        impl Display for Item {
+            fn display(i: Item) -> String {
+                return i.name;
+            }
+        }
+
+        struct Number {
+            val: i64,
+        }
+
+        impl Cloneable for Number {
+            fn duplicate(n: Number) -> i64 {
+                return n.val;
+            }
+        }
+
+        fn format_pair<T, U>(a: T, b: U) -> String
+        where T: Display + Serializable, U: Cloneable {
+            return a.display();
+        }
+
+        pub fn main() {
+            let it = Item(name: "IFA");
+            let num = Number(val: 42);
+            // Item does not satisfy Serializable bound in where clause! Must trigger E0030.
+            let res = format_pair(it, num);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Violating where clause bound must trigger semantic diagnostic"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0030")),
+        "Expected E0030 diagnostic for where clause bound violation, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_where_clause_on_generic_struct_and_impl() {
+    let code = r#"
+        trait Printable {
+            fn print(self) -> String;
+        }
+
+        trait Display {
+            fn display(self) -> String;
+        }
+
+        struct Doc {
+            title: String,
+        }
+
+        impl Display for Doc {
+            fn display(d: Doc) -> String {
+                return d.title;
+            }
+        }
+
+        // Where clause on struct
+        struct Wrapper<T>
+        where T: Display {
+            inner: T,
+        }
+
+        // Where clause on impl
+        impl<T> Printable for Wrapper<T>
+        where T: Display {
+            fn print(w: Wrapper<T>) -> String {
+                return w.inner.display();
+            }
+        }
+
+        pub fn main() {
+            let doc = Doc(title: "Architecture");
+            let wrap = Wrapper(inner: doc);
+            let p = wrap.print();
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Where clause on struct and impl must pass semantic analysis: {:?}",
+        res.diagnostics
+    );
+}

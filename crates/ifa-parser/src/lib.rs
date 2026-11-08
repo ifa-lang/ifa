@@ -224,7 +224,7 @@ impl Parser {
         };
 
         // Generics <T, U> or <T: Trait1 + Trait2>
-        let generics = self.parse_generic_params()?;
+        let mut generics = self.parse_generic_params()?;
 
         // Parameters (inout a: T, sink b: U)
         self.expect(TokenKind::OpenParen)?;
@@ -288,6 +288,9 @@ impl Parser {
             None
         };
 
+        // Explicit multi-parameter where clause: `where T: Display + Serializable, U: Clone`
+        let where_clauses = self.parse_where_clause(&mut generics)?;
+
         // Body or semicolon (for extern/signatures)
         let (body, end_pos) = if self.check(&TokenKind::OpenBrace) {
             let b = self.parse_block()?;
@@ -305,6 +308,7 @@ impl Parser {
             is_extern,
             name: name_tok,
             generics,
+            where_clauses,
             params,
             ret_ty,
             body,
@@ -329,7 +333,10 @@ impl Parser {
         };
 
         // Optional generics <T, U> or <T: Trait1 + Trait2>
-        let generics = self.parse_generic_params()?;
+        let mut generics = self.parse_generic_params()?;
+
+        // Explicit multi-parameter where clause: `where T: Display, U: Clone`
+        let where_clauses = self.parse_where_clause(&mut generics)?;
 
         self.expect(TokenKind::OpenBrace)?;
         let mut fields = Vec::new();
@@ -367,6 +374,7 @@ impl Parser {
             is_pub,
             name,
             generics,
+            where_clauses,
             fields,
             span: Span::new(self.file_id, struct_tok.span.start, close.span.end),
         })
@@ -575,6 +583,98 @@ impl Parser {
         Ok(generics)
     }
 
+    /// Parses explicit multi-parameter where clauses:
+    /// `where T: Display + Serializable, U: Clone`
+    /// Synchronizes parsed bounds into the `generics` list and returns explicit `WherePredicate` records.
+    fn parse_where_clause(
+        &mut self,
+        generics: &mut Vec<GenericParam>,
+    ) -> Result<Vec<ifa_ast::WherePredicate>, Diagnostic> {
+        if !self.match_token(&TokenKind::Where) {
+            return Ok(Vec::new());
+        }
+
+        let mut predicates = Vec::new();
+        while !self.check(&TokenKind::OpenBrace)
+            && !self.check(&TokenKind::Semicolon)
+            && !self.check(&TokenKind::Eof)
+        {
+            let start = self.current().span.start;
+            let target = match self.current().kind {
+                TokenKind::Ident(s) => {
+                    self.advance();
+                    s
+                }
+                _ => {
+                    let cur = self.current();
+                    let diag = Diagnostic::error(
+                        "nom de paramètre générique attendu dans la clause where",
+                    )
+                    .with_primary_label(cur.span, "identifiant attendu");
+                    self.diagnostics.push(diag.clone());
+                    return Err(diag);
+                }
+            };
+
+            self.expect(TokenKind::Colon)?;
+            let mut bounds = Vec::new();
+            let mut end = self.current().span.end;
+
+            while !self.check(&TokenKind::Comma)
+                && !self.check(&TokenKind::OpenBrace)
+                && !self.check(&TokenKind::Semicolon)
+                && !self.check(&TokenKind::Eof)
+            {
+                match self.current().kind {
+                    TokenKind::Ident(b) => {
+                        let b_tok = self.advance();
+                        bounds.push(b);
+                        end = b_tok.span.end;
+                    }
+                    _ => {
+                        let cur = self.current();
+                        let diag = Diagnostic::error(
+                            "nom de trait attendu pour la contrainte dans la clause where",
+                        )
+                        .with_primary_label(cur.span, "identifiant de trait attendu");
+                        self.diagnostics.push(diag.clone());
+                        return Err(diag);
+                    }
+                }
+                if !self.match_token(&TokenKind::Plus) {
+                    break;
+                }
+            }
+
+            // Synchronize bounds into existing GenericParam, or append if omitted from <...>
+            if let Some(gp) = generics.iter_mut().find(|g| g.name == target) {
+                for b in &bounds {
+                    if !gp.bounds.contains(b) {
+                        gp.bounds.push(*b);
+                    }
+                }
+            } else {
+                generics.push(GenericParam {
+                    name: target,
+                    bounds: bounds.clone(),
+                    span: Span::new(self.file_id, start, end),
+                });
+            }
+
+            predicates.push(ifa_ast::WherePredicate {
+                target,
+                bounds,
+                span: Span::new(self.file_id, start, end),
+            });
+
+            if !self.match_token(&TokenKind::Comma) {
+                break;
+            }
+        }
+
+        Ok(predicates)
+    }
+
     fn parse_trait(&mut self, is_pub: bool) -> Result<Trait, Diagnostic> {
         let kw_tok = self.advance(); // consume 'trait' or 'interface'
         let name = match self.current().kind {
@@ -751,6 +851,9 @@ impl Parser {
             }
         }
 
+        // Explicit multi-parameter where clause: `where T: Display, U: Clone`
+        let where_clauses = self.parse_where_clause(&mut generics)?;
+
         self.expect(TokenKind::OpenBrace)?;
         let mut methods = Vec::new();
         while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
@@ -761,6 +864,7 @@ impl Parser {
 
         Ok(Impl {
             generics,
+            where_clauses,
             trait_name,
             target_ty,
             methods,
