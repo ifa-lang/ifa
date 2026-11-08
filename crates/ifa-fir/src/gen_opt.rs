@@ -7,14 +7,65 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// Representation of an interprocedural call-site (caller, block, instruction index, argument values).
 type CallSite = (Symbol, BlockId, usize, Vec<ValueId>);
 
+/// Describes an explicit or interprocedural memory freeing operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreeOperation {
+    pub block: BlockId,
+    pub ptr: ValueId,
+    pub arena: Option<u16>,
+}
+
+impl FreeOperation {
+    /// Determines whether this freeing operation could potentially invalidate `ref_val`.
+    ///
+    /// If both `self.arena` and `ref_arena` are known, non-zero, and distinct (`a1 != a2`),
+    /// the memory allocations reside in strictly disjoint arenas, so this free can never
+    /// affect or invalidate `ref_val`.
+    pub fn interferes_with_ref(
+        &self,
+        ref_val: ValueId,
+        ref_arena: Option<u16>,
+        aliases: &HashMap<ValueId, ValueId>,
+    ) -> bool {
+        let canon_ref = canonical_ref(ref_val, aliases);
+        let canon_free = canonical_ref(self.ptr, aliases);
+
+        // If they resolve to the exact same canonical root value, interference is guaranteed
+        if canon_ref == canon_free {
+            return true;
+        }
+
+        // Memory arena isolation: distinct non-zero arenas can never alias or interfere
+        if let (Some(a_ref), Some(a_free)) = (ref_arena, self.arena) {
+            if a_ref > 0 && a_free > 0 && a_ref != a_free {
+                return false;
+            }
+        }
+
+        // Conservatively assume interference
+        true
+    }
+}
+
 /// Analysis context bundled for dominance-based generational check elimination.
 struct DominanceContext<'a> {
     cfg: &'a ControlFlowGraph,
     dom_tree: &'a DominanceTree,
-    freeing_blocks: &'a HashSet<BlockId>,
+    free_operations: &'a [FreeOperation],
+    val_arenas: &'a HashMap<ValueId, u16>,
     ref_defs: &'a HashMap<ValueId, BlockId>,
     aliases: &'a HashMap<ValueId, ValueId>,
     callee_has_free: &'a HashMap<Symbol, bool>,
+}
+
+/// Analysis context bundled for loop-invariant generational check hoisting.
+struct LoopHoistContext<'a> {
+    cfg: &'a ControlFlowGraph,
+    dom_tree: &'a DominanceTree,
+    free_operations: &'a [FreeOperation],
+    val_arenas: &'a HashMap<ValueId, u16>,
+    ref_defs: &'a HashMap<ValueId, BlockId>,
+    aliases: &'a HashMap<ValueId, ValueId>,
 }
 
 /// Statistics collected by the generational check elimination (GCE) pass.
@@ -100,6 +151,122 @@ impl GenerationalOptPass {
             safe_params,
             safe_env_captures,
         }
+    }
+
+    /// Computes mapping from FIR values to their known generational arena IDs (if non-zero).
+    pub fn compute_val_arenas(
+        func: &FirFunction,
+        global_aliases: &HashMap<ValueId, ValueId>,
+    ) -> HashMap<ValueId, u16> {
+        let mut val_arenas: HashMap<ValueId, u16> = HashMap::new();
+
+        // 1. Initial direct seed from GenAlloc instructions
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let (
+                    Some(res),
+                    ValueExpr::GenAlloc {
+                        arena: Some(a_id), ..
+                    },
+                ) = (inst.result, &inst.expr)
+                {
+                    if *a_id > 0 {
+                        val_arenas.insert(res, *a_id);
+                    }
+                }
+            }
+        }
+
+        // 2. Fixed-point propagation across references, field projections, dereferences, loads, and stores
+        let mut changed = true;
+        let mut iter = 0;
+        while changed && iter < 10 {
+            changed = false;
+            iter += 1;
+
+            // Alias synchronisation
+            for (&val, &canon) in global_aliases {
+                if let Some(&a) = val_arenas.get(&canon) {
+                    if val_arenas.insert(val, a).is_none() {
+                        changed = true;
+                    }
+                } else if let Some(&a) = val_arenas.get(&val) {
+                    if val_arenas.insert(canon, a).is_none() {
+                        changed = true;
+                    }
+                }
+            }
+
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    let res_opt = inst.result;
+                    match &inst.expr {
+                        ValueExpr::GenRef { ptr } => {
+                            let canon_ptr = canonical_ref(*ptr, global_aliases);
+                            if let Some(&a) =
+                                val_arenas.get(ptr).or_else(|| val_arenas.get(&canon_ptr))
+                            {
+                                if let Some(res) = res_opt {
+                                    if val_arenas.insert(res, a).is_none() {
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                        ValueExpr::GetField { base, .. }
+                        | ValueExpr::GetFieldPtr { base, .. }
+                        | ValueExpr::GenDeref { ref_val: base }
+                        | ValueExpr::SliceSub { base, .. }
+                        | ValueExpr::GetElement { base, .. }
+                        | ValueExpr::GetElementPtr { base, .. } => {
+                            let canon_base = canonical_ref(*base, global_aliases);
+                            if let Some(&a) =
+                                val_arenas.get(base).or_else(|| val_arenas.get(&canon_base))
+                            {
+                                if let Some(res) = res_opt {
+                                    if val_arenas.insert(res, a).is_none() {
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                        ValueExpr::Store { ptr, val } => {
+                            let canon_ptr = canonical_ref(*ptr, global_aliases);
+                            let canon_val = canonical_ref(*val, global_aliases);
+                            let a_opt = val_arenas
+                                .get(val)
+                                .or_else(|| val_arenas.get(&canon_val))
+                                .or_else(|| val_arenas.get(ptr))
+                                .or_else(|| val_arenas.get(&canon_ptr))
+                                .copied();
+                            if let Some(a) = a_opt {
+                                if val_arenas.insert(*ptr, a).is_none() {
+                                    changed = true;
+                                }
+                                if val_arenas.insert(*val, a).is_none() {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        ValueExpr::Load { ptr } => {
+                            let canon_ptr = canonical_ref(*ptr, global_aliases);
+                            if let Some(&a) =
+                                val_arenas.get(ptr).or_else(|| val_arenas.get(&canon_ptr))
+                            {
+                                if let Some(res) = res_opt {
+                                    if val_arenas.insert(res, a).is_none() {
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        val_arenas
     }
 
     pub fn stats(&self) -> GenOptStats {
@@ -638,9 +805,7 @@ impl GenerationalOptPass {
         let cfg = ControlFlowGraph::build(func);
         let dom_tree = DominanceTree::build(&cfg);
 
-        // 1. Identify which blocks contain freeing or invalidating operations
-        let mut freeing_blocks: HashSet<BlockId> = HashSet::new();
-        // Track where each value was created/defined: val -> creating BlockId
+        // 1. Identify where each value was created/defined: val -> creating BlockId
         let mut ref_creation_block: HashMap<ValueId, BlockId> = HashMap::new();
         // Specifically track where GenRef/GenAlloc occurred
         let mut gen_ref_creations: HashMap<ValueId, BlockId> = HashMap::new();
@@ -653,9 +818,6 @@ impl GenerationalOptPass {
                 ref_creation_block.insert(*p_val, block.id);
             }
             for inst in &block.instructions {
-                if matches!(&inst.expr, ValueExpr::GenFree { .. }) {
-                    freeing_blocks.insert(block.id);
-                }
                 if let Some(res) = inst.result {
                     ref_creation_block.insert(res, block.id);
                     if matches!(
@@ -766,18 +928,54 @@ impl GenerationalOptPass {
             }
         }
 
+        // Compute memory arena mappings for values and tracking of explicit free operations
+        let val_arenas = Self::compute_val_arenas(func, &global_aliases);
+
+        let mut free_operations: Vec<FreeOperation> = Vec::new();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match &inst.expr {
+                    ValueExpr::GenFree { ptr } => {
+                        let canon_ptr = canonical_ref(*ptr, &global_aliases);
+                        let free_arena = val_arenas
+                            .get(ptr)
+                            .or_else(|| val_arenas.get(&canon_ptr))
+                            .copied();
+                        free_operations.push(FreeOperation {
+                            block: block.id,
+                            ptr: *ptr,
+                            arena: free_arena,
+                        });
+                    }
+                    ValueExpr::CallDirect { name, .. }
+                    | ValueExpr::BlockingCallDirect { name, .. }
+                        if callee_has_free.get(name) == Some(&true) =>
+                    {
+                        free_operations.push(FreeOperation {
+                            block: block.id,
+                            ptr: ValueId(0),
+                            arena: None,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // 2. Loop-Invariant Check Hoisting (LICM for Generational Checks - Section 9.3 Rule 2)
         // Repeat until fixed point (up to 5 passes) for nested loops
+        let loop_cx = LoopHoistContext {
+            cfg: &cfg,
+            dom_tree: &dom_tree,
+            free_operations: &free_operations,
+            val_arenas: &val_arenas,
+            ref_defs: &ref_creation_block,
+            aliases: &global_aliases,
+        };
+
         for _ in 0..5 {
             let before_hoisted = self.stats.hoisted_checks;
-            self.hoist_loop_invariant_checks(
-                func,
-                &cfg,
-                &dom_tree,
-                &freeing_blocks,
-                &ref_creation_block,
-                &global_aliases,
-            );
+            self.hoist_loop_invariant_checks(func, &loop_cx);
             if self.stats.hoisted_checks == before_hoisted {
                 break;
             }
@@ -787,7 +985,8 @@ impl GenerationalOptPass {
         let cx = DominanceContext {
             cfg: &cfg,
             dom_tree: &dom_tree,
-            freeing_blocks: &freeing_blocks,
+            free_operations: &free_operations,
+            val_arenas: &val_arenas,
             ref_defs: &gen_ref_creations,
             aliases: &global_aliases,
             callee_has_free,
@@ -795,32 +994,20 @@ impl GenerationalOptPass {
         self.run_dominance_elimination(func, &cx);
     }
 
-    /// Identifies natural loops and hoists invariant `GenCheck` instructions into loop preheaders.
-    fn hoist_loop_invariant_checks(
-        &mut self,
-        func: &mut FirFunction,
-        cfg: &ControlFlowGraph,
-        dom_tree: &DominanceTree,
-        freeing_blocks: &HashSet<BlockId>,
-        ref_defs: &HashMap<ValueId, BlockId>,
-        aliases: &HashMap<ValueId, ValueId>,
-    ) {
-        let loops = Self::find_natural_loops(cfg, dom_tree);
+    /// Identifies natural loops and hoists invariant `GenCheck` instructions into loop preheaders
+    /// taking into account memory arena disjointness.
+    fn hoist_loop_invariant_checks(&mut self, func: &mut FirFunction, cx: &LoopHoistContext<'_>) {
+        let loops = Self::find_natural_loops(cx.cfg, cx.dom_tree);
         let param_values: HashSet<ValueId> = func.params.iter().map(|p| p.val).collect();
 
         for loop_info in loops {
-            // Rule 2 condition: if any block in the loop frees memory, checks cannot be hoisted safely
-            let loop_has_free = loop_info.blocks.iter().any(|b| freeing_blocks.contains(b));
-            if loop_has_free {
-                continue;
-            }
-
             let preheader_id = match loop_info.preheader {
                 Some(p) => p,
                 None => continue,
             };
 
-            // Collect all invariant references checked inside the loop
+            // Collect all invariant references checked inside the loop whose arena is disjoint
+            // from any freeing operation inside the loop
             let mut candidate_checks: Vec<(ValueId, ValueId, Span)> = Vec::new();
 
             for &b_id in &loop_info.blocks {
@@ -828,16 +1015,16 @@ impl GenerationalOptPass {
                     for inst in &block.instructions {
                         if let ValueExpr::GenCheck { ref_val, redundant } = &inst.expr {
                             if !*redundant {
-                                let canon = canonical_ref(*ref_val, aliases);
+                                let canon = canonical_ref(*ref_val, cx.aliases);
                                 let is_param =
                                     param_values.contains(ref_val) || param_values.contains(&canon);
                                 let is_defined_outside =
-                                    ref_defs.get(ref_val).is_some_and(|&def_b| {
+                                    cx.ref_defs.get(ref_val).is_some_and(|&def_b| {
                                         !loop_info.blocks.contains(&def_b)
-                                            && dom_tree.dominates(def_b, preheader_id)
-                                    }) || ref_defs.get(&canon).is_some_and(|&def_b| {
+                                            && cx.dom_tree.dominates(def_b, preheader_id)
+                                    }) || cx.ref_defs.get(&canon).is_some_and(|&def_b| {
                                         !loop_info.blocks.contains(&def_b)
-                                            && dom_tree.dominates(def_b, preheader_id)
+                                            && cx.dom_tree.dominates(def_b, preheader_id)
                                     });
 
                                 if (is_param || is_defined_outside)
@@ -845,7 +1032,24 @@ impl GenerationalOptPass {
                                         .iter()
                                         .any(|(v, c, _)| *v == *ref_val || *c == canon)
                                 {
-                                    candidate_checks.push((*ref_val, canon, inst.span));
+                                    // Verify that no freeing operation inside the loop interferes with ref_val
+                                    let ref_arena = cx
+                                        .val_arenas
+                                        .get(ref_val)
+                                        .or_else(|| cx.val_arenas.get(&canon))
+                                        .copied();
+
+                                    let has_interfering_free =
+                                        cx.free_operations.iter().any(|op| {
+                                            loop_info.blocks.contains(&op.block)
+                                                && op.interferes_with_ref(
+                                                    *ref_val, ref_arena, cx.aliases,
+                                                )
+                                        });
+
+                                    if !has_interfering_free {
+                                        candidate_checks.push((*ref_val, canon, inst.span));
+                                    }
                                 }
                             }
                         }
@@ -862,7 +1066,7 @@ impl GenerationalOptPass {
                 let already_checked_in_preheader = func.get_block(preheader_id).is_some_and(|pb| {
                     pb.instructions.iter().any(|inst| match &inst.expr {
                         ValueExpr::GenCheck { ref_val: r, .. } => {
-                            *r == ref_val || *r == canon || canonical_ref(*r, aliases) == canon
+                            *r == ref_val || *r == canon || canonical_ref(*r, cx.aliases) == canon
                         }
                         _ => false,
                     })
@@ -871,9 +1075,10 @@ impl GenerationalOptPass {
                 if !already_checked_in_preheader {
                     if let Some(pb) = func.get_block_mut(preheader_id) {
                         let hoist_val = if param_values.contains(&canon)
-                            || ref_defs
+                            || cx
+                                .ref_defs
                                 .get(&canon)
-                                .is_some_and(|&d| dom_tree.dominates(d, preheader_id))
+                                .is_some_and(|&d| cx.dom_tree.dominates(d, preheader_id))
                         {
                             canon
                         } else {
@@ -902,7 +1107,7 @@ impl GenerationalOptPass {
                             {
                                 if (*r == ref_val
                                     || *r == canon
-                                    || canonical_ref(*r, aliases) == canon)
+                                    || canonical_ref(*r, cx.aliases) == canon)
                                     && !*redundant
                                 {
                                     *redundant = true;
@@ -1005,15 +1210,27 @@ impl GenerationalOptPass {
                 }
             } else if block_id != func.entry_block {
                 if let Some(loop_info) = loop_by_header.get(&block_id) {
-                    // 1a. Loop header: If no block in the loop frees memory, checks from the preheader remain valid across iterations
-                    let loop_has_free = loop_info
-                        .blocks
-                        .iter()
-                        .any(|b| cx.freeing_blocks.contains(b));
-                    if !loop_has_free {
-                        if let Some(preheader) = loop_info.preheader {
-                            if let Some(pre_checks) = verified_at_exit.get(&preheader) {
-                                available.extend(pre_checks.iter().copied());
+                    // 1a. Loop header: Checks from the preheader remain valid across iterations
+                    // if no block in the loop performs an interfering free on that reference.
+                    if let Some(preheader) = loop_info.preheader {
+                        if let Some(pre_checks) = verified_at_exit.get(&preheader) {
+                            for &chk_val in pre_checks {
+                                let canon = canonical_ref(chk_val, cx.aliases);
+                                let ref_arena = cx
+                                    .val_arenas
+                                    .get(&chk_val)
+                                    .or_else(|| cx.val_arenas.get(&canon))
+                                    .copied();
+
+                                let has_interfering_free = cx.free_operations.iter().any(|op| {
+                                    loop_info.blocks.contains(&op.block)
+                                        && op.interferes_with_ref(chk_val, ref_arena, cx.aliases)
+                                });
+
+                                if !has_interfering_free {
+                                    available.insert(chk_val);
+                                    available.insert(canon);
+                                }
                             }
                         }
                     }
@@ -1041,13 +1258,25 @@ impl GenerationalOptPass {
                             }
                         } else if let Some(idom) = cx.dom_tree.immediate_dominator(block_id) {
                             if let Some(dom_checks) = verified_at_exit.get(&idom) {
-                                let no_free = !cx.freeing_blocks.iter().any(|&fb| {
-                                    fb != idom
-                                        && cx.dom_tree.dominates(idom, fb)
-                                        && cx.dom_tree.dominates(fb, block_id)
-                                });
-                                if no_free {
-                                    available.extend(dom_checks.iter().copied());
+                                for &val in dom_checks {
+                                    let canon = canonical_ref(val, cx.aliases);
+                                    let ref_arena = cx
+                                        .val_arenas
+                                        .get(&val)
+                                        .or_else(|| cx.val_arenas.get(&canon))
+                                        .copied();
+
+                                    let no_free = !cx.free_operations.iter().any(|op| {
+                                        op.block != idom
+                                            && cx.dom_tree.dominates(idom, op.block)
+                                            && cx.dom_tree.dominates(op.block, block_id)
+                                            && op.interferes_with_ref(val, ref_arena, cx.aliases)
+                                    });
+
+                                    if no_free {
+                                        available.insert(val);
+                                        available.insert(canon);
+                                    }
                                 }
                             }
                         }
@@ -1107,13 +1336,21 @@ impl GenerationalOptPass {
                 // 3. Direct lexical dominance: created in dominating block with no intervening frees
                 for (&ref_val, &def_block) in cx.ref_defs {
                     if cx.dom_tree.dominates(def_block, block_id) {
-                        let no_free = !cx.freeing_blocks.iter().any(|&fb| {
-                            cx.dom_tree.dominates(def_block, fb)
-                                && cx.dom_tree.dominates(fb, block_id)
+                        let canon = canonical_ref(ref_val, cx.aliases);
+                        let ref_arena = cx
+                            .val_arenas
+                            .get(&ref_val)
+                            .or_else(|| cx.val_arenas.get(&canon))
+                            .copied();
+
+                        let no_free = !cx.free_operations.iter().any(|op| {
+                            cx.dom_tree.dominates(def_block, op.block)
+                                && cx.dom_tree.dominates(op.block, block_id)
+                                && op.interferes_with_ref(ref_val, ref_arena, cx.aliases)
                         });
                         if no_free {
                             available.insert(ref_val);
-                            available.insert(canonical_ref(ref_val, cx.aliases));
+                            available.insert(canon);
                         }
                     }
                 }
@@ -1182,8 +1419,28 @@ impl GenerationalOptPass {
                         }
                         ValueExpr::GenFree { ptr } => {
                             let canon = canonical_ref(*ptr, cx.aliases);
-                            available.remove(ptr);
-                            available.remove(&canon);
+                            let free_arena = cx
+                                .val_arenas
+                                .get(ptr)
+                                .or_else(|| cx.val_arenas.get(&canon))
+                                .copied();
+
+                            let free_op = FreeOperation {
+                                block: block_id,
+                                ptr: *ptr,
+                                arena: free_arena,
+                            };
+
+                            available.retain(|&val| {
+                                let val_canon = canonical_ref(val, cx.aliases);
+                                let val_arena = cx
+                                    .val_arenas
+                                    .get(&val)
+                                    .or_else(|| cx.val_arenas.get(&val_canon))
+                                    .copied();
+                                !free_op.interferes_with_ref(val, val_arena, cx.aliases)
+                            });
+
                             ptr_aliases.remove(ptr);
                         }
                         ValueExpr::CallDirect { name, args }

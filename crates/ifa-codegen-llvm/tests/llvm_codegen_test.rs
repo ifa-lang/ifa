@@ -3687,3 +3687,165 @@ fn test_llvm_channel_select_wait_table_non_coro_and_default() {
     );
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_aot_loop_invariant_disjoint_arena_generation_check_hoisting() {
+    use ifa_fir::{
+        BlockId, FirFunction, FirModule, FirParam, GenerationalOptPass, Instruction, ParamMode,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_span::{Span, INTERNER};
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let fn_name = INTERNER.intern("aot_disjoint_loop");
+    let param_r = FirParam {
+        name: INTERNER.intern("ref_param"),
+        val: ValueId(0),
+        ty: FirType::GenerationalRef(Box::new(FirType::Int(IntType::I64))),
+        mode: ParamMode::In,
+    };
+
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![param_r],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    // Block 0: entry / loop preheader
+    let b_entry = BlockId(0);
+    let b_header = func.alloc_block(); // BlockId(1)
+    let b_body = func.alloc_block(); // BlockId(2)
+    let b_exit = func.alloc_block(); // BlockId(3)
+
+    // Preheader allocates v_ref_a on Arena 10
+    let v_ref_a = func.alloc_value();
+    let entry_bb = func.get_block_mut(b_entry).unwrap();
+    entry_bb.push_instruction(Instruction::new(
+        Some(v_ref_a),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(10),
+        },
+        Span::DUMMY,
+    ));
+    entry_bb.set_terminator(Terminator::Branch {
+        target: b_header,
+        args: Vec::new(),
+    });
+
+    // Block 1: loop header
+    let v_cond = func.alloc_value();
+    let header_bb = func.get_block_mut(b_header).unwrap();
+    header_bb.push_instruction(Instruction::new(
+        Some(v_cond),
+        ValueExpr::Constant(ifa_fir::ConstantValue::Bool(true)),
+        Span::DUMMY,
+    ));
+    header_bb.set_terminator(Terminator::BranchCond {
+        cond: v_cond,
+        then_block: b_body,
+        then_args: Vec::new(),
+        else_block: b_exit,
+        else_args: Vec::new(),
+    });
+
+    // Block 2: loop body with GenAlloc + GenFree on disjoint Arena 20, and GenCheck on Arena 10
+    let v_temp_b = func.alloc_value();
+    let body_bb = func.get_block_mut(b_body).unwrap();
+    body_bb.push_instruction(Instruction::new(
+        Some(v_temp_b),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(20),
+        },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenFree { ptr: v_temp_b },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: v_ref_a,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_bb.set_terminator(Terminator::Branch {
+        target: b_header,
+        args: Vec::new(),
+    });
+
+    // Block 3: exit
+    let exit_bb = func.get_block_mut(b_exit).unwrap();
+    exit_bb.set_terminator(Terminator::Return(Some(v_ref_a)));
+
+    // Run Generational Check Elimination Pass
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_function(&mut func);
+
+    let stats = gce.stats();
+    assert_eq!(
+        stats.hoisted_checks, 1,
+        "Generational check on disjoint Arena 10 must be hoisted out of loop into preheader"
+    );
+
+    let module = FirModule {
+        name: INTERNER.intern("disjoint_aot_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    // 1. Verify that GenAlloc in Arena 10 and Arena 20 are emitted with their respective arena IDs
+    assert!(
+        ir.contains("call ptr @ifa_rt_gen_alloc(i64 8, i64 8, i16 10)"),
+        "Must emit allocation in Arena 10:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("call ptr @ifa_rt_gen_alloc(i64 8, i64 8, i16 20)"),
+        "Must emit allocation in Arena 20:\n{}",
+        ir
+    );
+
+    // 2. Verify that in the loop body (b2), NO redundant gen_check is emitted
+    // Extract loop body block lines between 'b2:' and 'b3:' or terminator branch
+    if let Some(b2_idx) = ir.find("b2:") {
+        let after_b2 = &ir[b2_idx..];
+        let b2_end = after_b2.find("br label %b1").unwrap_or(after_b2.len());
+        let b2_body = &after_b2[..b2_end];
+        assert!(
+            !b2_body.contains("@ifa_rt_gen_check"),
+            "Loop body must NOT contain dynamic @ifa_rt_gen_check call after invariant hoisting:\n{}",
+            b2_body
+        );
+    }
+
+    // 3. Verify native clang compilation succeeds to object file
+    let temp_dir = std::env::temp_dir().join(format!("llvm_aot_arena_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("aot_arena.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation of disjoint arena hoisted module failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+    let _ = fs::remove_dir_all(&temp_dir);
+}

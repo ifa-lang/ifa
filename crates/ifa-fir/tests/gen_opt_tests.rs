@@ -816,3 +816,382 @@ fn test_interprocedural_closure_capture_generational_check_elimination() {
     // first = 10 + 5 = 15; second = 10 + 15 = 25; sum = 40.
     assert_eq!(res, FirValue::Int(40));
 }
+
+#[test]
+fn test_loop_invariant_check_hoisting_with_disjoint_arena_free() {
+    use ifa_ast::ParamMode;
+    use ifa_fir::types::FirType;
+    use ifa_fir::{BlockId, FirFunction, FirParam, Instruction, Terminator, ValueExpr, ValueId};
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("disjoint_arena_loop");
+    let param = FirParam {
+        name: INTERNER.intern("r"),
+        val: ValueId(0),
+        ty: FirType::GenerationalRef(Box::new(FirType::Int(IntType::I64))),
+        mode: ParamMode::In,
+    };
+
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![param],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    // Block 0: entry / preheader
+    let b_entry = BlockId(0);
+    let b_header = func.alloc_block(); // BlockId(1)
+    let b_body = func.alloc_block(); // BlockId(2)
+    let b_exit = func.alloc_block(); // BlockId(3)
+
+    let v_ref_a = func.alloc_value(); // Allocation in Arena 10
+    let entry_bb = func.get_block_mut(b_entry).unwrap();
+    entry_bb.push_instruction(Instruction::new(
+        Some(v_ref_a),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(10),
+        },
+        Span::DUMMY,
+    ));
+    entry_bb.set_terminator(Terminator::Branch {
+        target: b_header,
+        args: Vec::new(),
+    });
+
+    // Block 1: header
+    let v_cond = func.alloc_value();
+    let header_bb = func.get_block_mut(b_header).unwrap();
+    header_bb.set_terminator(Terminator::BranchCond {
+        cond: v_cond,
+        then_block: b_body,
+        then_args: Vec::new(),
+        else_block: b_exit,
+        else_args: Vec::new(),
+    });
+
+    // Block 2: body with GenAlloc + GenFree on disjoint Arena 20, and GenCheck on Arena 10 (v_ref_a)
+    let v_buf_b = func.alloc_value();
+    let body_bb = func.get_block_mut(b_body).unwrap();
+    body_bb.push_instruction(Instruction::new(
+        Some(v_buf_b),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(20),
+        },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenFree { ptr: v_buf_b },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: v_ref_a,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_bb.set_terminator(Terminator::Branch {
+        target: b_header,
+        args: Vec::new(),
+    });
+
+    // Block 3: exit
+    let exit_bb = func.get_block_mut(b_exit).unwrap();
+    exit_bb.set_terminator(Terminator::Return(Some(v_ref_a)));
+
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_function(&mut func);
+
+    // Because Arena 10 and Arena 20 are disjoint, GenFree in Arena 20 cannot invalidate v_ref_a.
+    // The check on v_ref_a must be hoisted into preheader b_entry!
+    let stats = gce.stats();
+    assert_eq!(
+        stats.hoisted_checks, 1,
+        "Invariant check on disjoint arena 10 must be hoisted into loop preheader, got: {}",
+        stats.hoisted_checks
+    );
+    assert_eq!(
+        stats.eliminated_checks, 2,
+        "Check inside loop body and redundant preheader check must be eliminated, got: {}",
+        stats.eliminated_checks
+    );
+
+    // Verify preheader has the hoisted check
+    let preheader = func.get_block(b_entry).unwrap();
+    let hoisted_found = preheader.instructions.iter().any(|inst| match &inst.expr {
+        ValueExpr::GenCheck { ref_val, .. } => *ref_val == v_ref_a,
+        _ => false,
+    });
+    assert!(
+        hoisted_found,
+        "Preheader must contain hoisted GenCheck for v_ref_a"
+    );
+
+    // Verify loop body check is marked redundant
+    let loop_body = func.get_block(b_body).unwrap();
+    let loop_check_redundant = loop_body.instructions.iter().any(|inst| match &inst.expr {
+        ValueExpr::GenCheck { ref_val, redundant } => *ref_val == v_ref_a && *redundant,
+        _ => false,
+    });
+    assert!(
+        loop_check_redundant,
+        "Loop body GenCheck for v_ref_a must be marked redundant"
+    );
+}
+
+#[test]
+fn test_loop_with_mixed_arenas_selective_hoisting() {
+    use ifa_ast::ParamMode;
+    use ifa_fir::types::FirType;
+    use ifa_fir::{BlockId, FirFunction, FirParam, Instruction, Terminator, ValueExpr, ValueId};
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("mixed_arenas_loop");
+    let param = FirParam {
+        name: INTERNER.intern("r"),
+        val: ValueId(0),
+        ty: FirType::GenerationalRef(Box::new(FirType::Int(IntType::I64))),
+        mode: ParamMode::In,
+    };
+
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![param],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let b_entry = BlockId(0);
+    let b_header = func.alloc_block();
+    let b_body = func.alloc_block();
+    let b_exit = func.alloc_block();
+
+    // In entry: ref_a in Arena 10, ref_c in Arena 20
+    let v_ref_a = func.alloc_value();
+    let v_ref_c = func.alloc_value();
+
+    let entry_bb = func.get_block_mut(b_entry).unwrap();
+    entry_bb.push_instruction(Instruction::new(
+        Some(v_ref_a),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(10),
+        },
+        Span::DUMMY,
+    ));
+    entry_bb.push_instruction(Instruction::new(
+        Some(v_ref_c),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(20),
+        },
+        Span::DUMMY,
+    ));
+    entry_bb.set_terminator(Terminator::Branch {
+        target: b_header,
+        args: Vec::new(),
+    });
+
+    let v_cond = func.alloc_value();
+    let header_bb = func.get_block_mut(b_header).unwrap();
+    header_bb.set_terminator(Terminator::BranchCond {
+        cond: v_cond,
+        then_block: b_body,
+        then_args: Vec::new(),
+        else_block: b_exit,
+        else_args: Vec::new(),
+    });
+
+    // In body: GenAlloc & GenFree on Arena 20.
+    // Check ref_a (Arena 10 - disjoint from free!) -> CAN be hoisted.
+    // Check ref_c (Arena 20 - same arena as free!) -> CANNOT be hoisted.
+    let v_temp_b = func.alloc_value();
+    let body_bb = func.get_block_mut(b_body).unwrap();
+    body_bb.push_instruction(Instruction::new(
+        Some(v_temp_b),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(20),
+        },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenFree { ptr: v_temp_b },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: v_ref_a,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: v_ref_c,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_bb.set_terminator(Terminator::Branch {
+        target: b_header,
+        args: Vec::new(),
+    });
+
+    let exit_bb = func.get_block_mut(b_exit).unwrap();
+    exit_bb.set_terminator(Terminator::Return(Some(v_ref_a)));
+
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_function(&mut func);
+
+    let stats = gce.stats();
+    assert_eq!(
+        stats.hoisted_checks, 1,
+        "Only disjoint Arena 10 check must be hoisted, hoisted: {}",
+        stats.hoisted_checks
+    );
+    assert_eq!(
+        stats.eliminated_checks, 2,
+        "Disjoint Arena 10 check in body and hoisted preheader check must be eliminated, eliminated: {}",
+        stats.eliminated_checks
+    );
+
+    // Verify v_ref_a check is marked redundant in loop body
+    let loop_body = func.get_block(b_body).unwrap();
+    let mut ref_a_redundant = false;
+    let mut ref_c_redundant = false;
+    for inst in &loop_body.instructions {
+        if let ValueExpr::GenCheck { ref_val, redundant } = &inst.expr {
+            if *ref_val == v_ref_a {
+                ref_a_redundant = *redundant;
+            } else if *ref_val == v_ref_c {
+                ref_c_redundant = *redundant;
+            }
+        }
+    }
+    assert!(
+        ref_a_redundant,
+        "Check on disjoint v_ref_a must be marked redundant"
+    );
+    assert!(
+        !ref_c_redundant,
+        "Check on interfering v_ref_c must NOT be marked redundant"
+    );
+}
+
+#[test]
+fn test_disjoint_arena_free_does_not_break_dominance() {
+    use ifa_fir::types::FirType;
+    use ifa_fir::{BlockId, FirFunction, Instruction, Terminator, ValueExpr};
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("dominance_with_disjoint_free");
+    let mut func = FirFunction::new(
+        fn_name,
+        Vec::new(),
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let b0 = BlockId(0);
+    let b1 = func.alloc_block();
+    let b2 = func.alloc_block();
+
+    // Block 0: Alloc v_ref_a in Arena 10, GenCheck v_ref_a
+    let v_ref_a = func.alloc_value();
+    let bb0 = func.get_block_mut(b0).unwrap();
+    bb0.push_instruction(Instruction::new(
+        Some(v_ref_a),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(10),
+        },
+        Span::DUMMY,
+    ));
+    bb0.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: v_ref_a,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    bb0.set_terminator(Terminator::Branch {
+        target: b1,
+        args: Vec::new(),
+    });
+
+    // Block 1: GenAlloc v_temp in Arena 20, GenFree v_temp
+    let v_temp = func.alloc_value();
+    let bb1 = func.get_block_mut(b1).unwrap();
+    bb1.push_instruction(Instruction::new(
+        Some(v_temp),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(20),
+        },
+        Span::DUMMY,
+    ));
+    bb1.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenFree { ptr: v_temp },
+        Span::DUMMY,
+    ));
+    bb1.set_terminator(Terminator::Branch {
+        target: b2,
+        args: Vec::new(),
+    });
+
+    // Block 2: GenCheck v_ref_a
+    let bb2 = func.get_block_mut(b2).unwrap();
+    bb2.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: v_ref_a,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    bb2.set_terminator(Terminator::Return(Some(v_ref_a)));
+
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_function(&mut func);
+
+    // GenFree in b1 was on Arena 20, which is disjoint from Arena 10.
+    // Therefore, the check on v_ref_a in b2 must be recognized as redundant via dominance!
+    let stats = gce.stats();
+    assert_eq!(
+        stats.eliminated_checks, 2,
+        "Dominance check must eliminate check in b0 and b2 across disjoint arena free"
+    );
+
+    let bb2_final = func.get_block(b2).unwrap();
+    let check_elim = bb2_final.instructions.iter().any(|inst| match &inst.expr {
+        ValueExpr::GenCheck { ref_val, redundant } => *ref_val == v_ref_a && *redundant,
+        _ => false,
+    });
+    assert!(check_elim, "GenCheck in b2 must be marked redundant");
+}
