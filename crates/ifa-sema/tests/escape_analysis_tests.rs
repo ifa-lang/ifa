@@ -1260,3 +1260,210 @@ pub strict fn process_struct() -> () {
         analysis.diagnostics
     );
 }
+
+#[test]
+fn test_strict_fn_closure_capturing_local_arena_allowed() {
+    let src = r#"
+struct Arena {
+    capacity: i64,
+}
+
+pub strict fn compute_with_local_arena() -> i64 {
+    let arena_buf = Arena(capacity: 1024)
+    let transform = fn(x: i64) -> i64 {
+        x + arena_buf.capacity
+    }
+    return transform(42)
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_arena_closure_allowed.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Closure capturing local arena evaluated locally must succeed in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_strict_fn_closure_capturing_local_arena_and_scalar_allowed() {
+    let src = r#"
+struct Arena {
+    capacity: i64,
+}
+
+pub strict fn process_arena_with_scalar() -> i64 {
+    let arena_ctx = Arena(capacity: 2048)
+    let multiplier: i64 = 3
+    let mul = fn(x: i64) -> i64 {
+        (x * multiplier) + arena_ctx.capacity
+    }
+    return mul(10)
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_arena_closure_scalar.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Closure capturing local arena and scalar variable must succeed in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_strict_fn_closure_capturing_local_arena_return_variable_escape_rejected() {
+    let src = r#"
+struct Arena {
+    capacity: i64,
+}
+
+pub strict fn leak_arena_closure() -> fn(i64) -> i64 {
+    let arena_ctx = Arena(capacity: 4096)
+    let f = fn(x: i64) -> i64 {
+        x + arena_ctx.capacity
+    }
+    return f
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_arena_closure_ret_escape.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Returning a closure capturing a local arena in strict fn must be rejected"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0020")),
+        "Expected E0020 for returning arena closure in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_strict_fn_closure_capturing_local_arena_direct_return_escape_rejected() {
+    let src = r#"
+struct Arena {
+    capacity: i64,
+}
+
+pub strict fn leak_arena_closure_direct() -> fn(i64) -> i64 {
+    let arena_ctx = Arena(capacity: 4096)
+    return fn(x: i64) -> i64 {
+        x + arena_ctx.capacity
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_arena_closure_direct_ret.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Directly returning a lambda capturing a local arena in strict fn must be rejected"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0020")),
+        "Expected E0020 for directly returning arena closure in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_strict_fn_closure_capturing_local_arena_spawn_escape_rejected() {
+    let src = r#"
+struct Arena {
+    capacity: i64,
+}
+
+fn worker(f: fn(i64) -> i64) -> () {
+    let _ = f(10)
+}
+
+pub fn spawn_arena_closure() -> () {
+    let arena_ctx = Arena(capacity: 1024)
+    let local_f = fn(x: i64) -> i64 {
+        x + arena_ctx.capacity
+    }
+    spawn worker(local_f)
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_arena_closure_spawn.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Passing a closure capturing a local arena into spawn must be rejected"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0026")),
+        "Expected E0026 for arena closure escape in spawn: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_strict_fn_closure_capturing_local_arena_with_stack_array_rejected() {
+    let src = r#"
+struct Arena {
+    capacity: i64,
+}
+
+pub strict fn closure_with_stack_arr() -> i64 {
+    let arena_ctx = Arena(capacity: 1024)
+    let stack_buf = [1, 2, 3, 4]
+    let f = fn(idx: i64) -> i64 {
+        stack_buf[idx] + arena_ctx.capacity
+    }
+    return f(0)
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_arena_stack_arr.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Closure capturing local stack array along with arena in strict fn must be rejected"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0020")),
+        "Expected E0020 for closure capturing local stack array in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}

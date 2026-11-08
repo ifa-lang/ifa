@@ -1,4 +1,4 @@
-use crate::escape::EscapeAnalyzer;
+use crate::escape::{is_arena_symbol, is_arena_type, EscapeAnalyzer};
 use crate::exclusivity::{
     check_assignment_target_with_active, check_call_exclusivity_interproc, extract_access_path,
     AccessPath, BorrowKind, BorrowRecord, InterproceduralAccessMap,
@@ -2590,21 +2590,48 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
 
                 if self.current_func_is_strict && !captures.is_empty() {
-                    let cap_names: Vec<String> =
-                        captures.iter().map(|c| INTERNER.resolve(&c.name)).collect();
-                    self.diagnostics.push(
-                        Diagnostic::error(format!(
-                            "violation du mode strict : la clôture capture les variables locales ('{}') provoquant une promotion implicite vers le tas interdite dans une fonction 'strict fn'",
-                            cap_names.join(", ")
-                        ))
-                        .with_code("E0020")
-                        .with_primary_label(
-                            expr.span,
-                            "capture d'environnement local provoquant une promotion implicite sur le tas",
-                        )
-                        .with_note("Le mode strict impose une exécution zéro-heap déterministe. Les clôtures avec capture d'environnement dynamique sont interdites.")
-                        .with_help("Utilisez des fonctions pures sans capture ou transmettez explicitement les paramètres."),
-                    );
+                    let has_arena = captures
+                        .iter()
+                        .any(|c| is_arena_symbol(&c.name, &self.symbols) || is_arena_type(&c.ty));
+                    if !has_arena {
+                        let cap_names: Vec<String> =
+                            captures.iter().map(|c| INTERNER.resolve(&c.name)).collect();
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "violation du mode strict : la clôture capture les variables locales ('{}') provoquant une promotion implicite vers le tas interdite dans une fonction 'strict fn'",
+                                cap_names.join(", ")
+                            ))
+                            .with_code("E0020")
+                            .with_primary_label(
+                                expr.span,
+                                "capture d'environnement local provoquant une promotion implicite sur le tas",
+                            )
+                            .with_note("Le mode strict impose une exécution zéro-heap déterministe. Les clôtures avec capture d'environnement dynamique sont interdites.")
+                            .with_help("Utilisez des fonctions pures sans capture ou opérez dans une 'Arena' pré-allouée."),
+                        );
+                    } else {
+                        // Arena is captured: verify remaining captured variables are zero-heap compliant
+                        for c in &captures {
+                            let is_c_arena =
+                                is_arena_symbol(&c.name, &self.symbols) || is_arena_type(&c.ty);
+                            if !is_c_arena && (c.ty.is_cow_candidate() || c.ty.is_ref()) {
+                                let c_name = INTERNER.resolve(&c.name);
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "violation du mode strict : la clôture capture la variable locale complexe '{}' en dehors de l'arène locale",
+                                        c_name
+                                    ))
+                                    .with_code("E0020")
+                                    .with_primary_label(
+                                        c.span,
+                                        format!("capture de la structure '{}' risquant une promotion sur le tas", c_name),
+                                    )
+                                    .with_note("En mode strict zéro-heap, toutes les captures composées doivent résider dans l'arène pré-allouée ou être des scalaires directs.")
+                                    .with_help("Allouez cette structure dans l'arène pré-allouée ou transmettez-la par paramètre."),
+                                );
+                            }
+                        }
+                    }
                 }
                 self.symbols.lambda_captures.insert(expr.span, captures);
 

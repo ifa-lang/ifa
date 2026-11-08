@@ -1837,25 +1837,99 @@ impl<'a> LlvmIrEmitter<'a> {
                         ValueExpr::GenAlloc { ty, .. } => {
                             ifa_fir::FirType::Pointer(Box::new(ty.clone()))
                         }
+                        ValueExpr::GetField {
+                            base, field_idx, ..
+                        } => match value_types.get(base) {
+                            Some(ifa_fir::FirType::Struct(s_name, fields)) => {
+                                if *field_idx < fields.len() {
+                                    fields[*field_idx].1.clone()
+                                } else if let Some(st_def) =
+                                    module.structs.iter().find(|s| s.name == *s_name)
+                                {
+                                    if *field_idx < st_def.fields.len() {
+                                        st_def.fields[*field_idx].1.clone()
+                                    } else {
+                                        ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                                    }
+                                } else {
+                                    ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                                }
+                            }
+                            Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
+                                ifa_fir::FirType::Struct(s_name, fields) => {
+                                    if *field_idx < fields.len() {
+                                        fields[*field_idx].1.clone()
+                                    } else if let Some(st_def) =
+                                        module.structs.iter().find(|s| s.name == *s_name)
+                                    {
+                                        if *field_idx < st_def.fields.len() {
+                                            st_def.fields[*field_idx].1.clone()
+                                        } else {
+                                            ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                                        }
+                                    } else {
+                                        ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                                    }
+                                }
+                                _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
+                            },
+                            _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
+                        },
                         ValueExpr::GetFieldPtr {
                             base, field_idx, ..
                         } => match value_types.get(base) {
                             Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
-                                ifa_fir::FirType::Struct(_, fields)
-                                    if *field_idx < fields.len() =>
-                                {
-                                    ifa_fir::FirType::Pointer(Box::new(
-                                        fields[*field_idx].1.clone(),
-                                    ))
+                                ifa_fir::FirType::Struct(s_name, fields) => {
+                                    if *field_idx < fields.len() {
+                                        ifa_fir::FirType::Pointer(Box::new(
+                                            fields[*field_idx].1.clone(),
+                                        ))
+                                    } else if let Some(st_def) =
+                                        module.structs.iter().find(|s| s.name == *s_name)
+                                    {
+                                        if *field_idx < st_def.fields.len() {
+                                            ifa_fir::FirType::Pointer(Box::new(
+                                                st_def.fields[*field_idx].1.clone(),
+                                            ))
+                                        } else {
+                                            ifa_fir::FirType::Pointer(Box::new(
+                                                ifa_fir::FirType::Int(
+                                                    ifa_sema::types::IntType::I64,
+                                                ),
+                                            ))
+                                        }
+                                    } else {
+                                        ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Int(
+                                            ifa_sema::types::IntType::I64,
+                                        )))
+                                    }
                                 }
                                 _ => ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Int(
                                     ifa_sema::types::IntType::I64,
                                 ))),
                             },
-                            Some(ifa_fir::FirType::Struct(_, fields))
-                                if *field_idx < fields.len() =>
-                            {
-                                ifa_fir::FirType::Pointer(Box::new(fields[*field_idx].1.clone()))
+                            Some(ifa_fir::FirType::Struct(s_name, fields)) => {
+                                if *field_idx < fields.len() {
+                                    ifa_fir::FirType::Pointer(Box::new(
+                                        fields[*field_idx].1.clone(),
+                                    ))
+                                } else if let Some(st_def) =
+                                    module.structs.iter().find(|s| s.name == *s_name)
+                                {
+                                    if *field_idx < st_def.fields.len() {
+                                        ifa_fir::FirType::Pointer(Box::new(
+                                            st_def.fields[*field_idx].1.clone(),
+                                        ))
+                                    } else {
+                                        ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Int(
+                                            ifa_sema::types::IntType::I64,
+                                        )))
+                                    }
+                                } else {
+                                    ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Int(
+                                        ifa_sema::types::IntType::I64,
+                                    )))
+                                }
                             }
                             _ => ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Int(
                                 ifa_sema::types::IntType::I64,
@@ -2737,6 +2811,41 @@ impl<'a> LlvmIrEmitter<'a> {
                         "  %v{} = extractvalue %struct.{} %v{}, {}\n",
                         res_id, s_name, base.0, field_idx
                     ));
+                } else if let Some(ifa_fir::FirType::Pointer(inner)) = base_ty {
+                    if let ifa_fir::FirType::Struct(s_sym, fields) = &**inner {
+                        let field_ty_str = if *field_idx < fields.len() {
+                            fir_to_llvm_type(&fields[*field_idx].1)
+                                .unwrap_or_else(|_| "i64".to_string())
+                        } else if let Some(st_def) =
+                            module.structs.iter().find(|s| s.name == *s_sym)
+                        {
+                            if *field_idx < st_def.fields.len() {
+                                fir_to_llvm_type(&st_def.fields[*field_idx].1)
+                                    .unwrap_or_else(|_| "i64".to_string())
+                            } else {
+                                "i64".to_string()
+                            }
+                        } else {
+                            "i64".to_string()
+                        };
+                        out.push_str(&format!(
+                            "  %gep_{} = getelementptr inbounds %struct.{}, ptr %v{}, i32 0, i32 {}\n",
+                            res_id,
+                            INTERNER.resolve(s_sym),
+                            base.0,
+                            field_idx
+                        ));
+                        out.push_str(&format!(
+                            "  %v{} = load {}, ptr %gep_{}\n",
+                            res_id, field_ty_str, res_id
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  %gep_{} = getelementptr inbounds i64, ptr %v{}, i32 {}\n",
+                            res_id, base.0, field_idx
+                        ));
+                        out.push_str(&format!("  %v{} = load i64, ptr %gep_{}\n", res_id, res_id));
+                    }
                 } else {
                     out.push_str(&format!(
                         "  %gep_{} = getelementptr inbounds i64, ptr %v{}, i32 {}\n",
@@ -2748,10 +2857,36 @@ impl<'a> LlvmIrEmitter<'a> {
             ValueExpr::GetFieldPtr {
                 base, field_idx, ..
             } => {
-                out.push_str(&format!(
-                    "  %v{} = getelementptr inbounds i64, ptr %v{}, i32 {}\n",
-                    res_id, base.0, field_idx
-                ));
+                let base_ty = value_types.get(base);
+                if let Some(ifa_fir::FirType::Pointer(inner)) = base_ty {
+                    if let ifa_fir::FirType::Struct(s_sym, _) = &**inner {
+                        out.push_str(&format!(
+                            "  %v{} = getelementptr inbounds %struct.{}, ptr %v{}, i32 0, i32 {}\n",
+                            res_id,
+                            INTERNER.resolve(s_sym),
+                            base.0,
+                            field_idx
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  %v{} = getelementptr inbounds i64, ptr %v{}, i32 {}\n",
+                            res_id, base.0, field_idx
+                        ));
+                    }
+                } else if let Some(ifa_fir::FirType::Struct(s_sym, _)) = base_ty {
+                    out.push_str(&format!(
+                        "  %v{} = getelementptr inbounds %struct.{}, ptr %v{}, i32 0, i32 {}\n",
+                        res_id,
+                        INTERNER.resolve(s_sym),
+                        base.0,
+                        field_idx
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  %v{} = getelementptr inbounds i64, ptr %v{}, i32 {}\n",
+                        res_id, base.0, field_idx
+                    ));
+                }
             }
             ValueExpr::GetElementPtr { base, index } => {
                 let base_ty = value_types.get(base);

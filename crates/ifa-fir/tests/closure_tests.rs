@@ -563,3 +563,55 @@ fn test_fir_closure_thread_local_call_arena_lowering() {
     let result = interp.execute_function("main", vec![]).unwrap();
     assert_eq!(result, FirValue::Int(38));
 }
+
+#[test]
+fn test_strict_fn_closure_capturing_local_arena_fir_lowering_and_zero_heap() {
+    let src = r#"
+        struct Arena {
+            capacity: i64,
+        }
+
+        pub strict fn compute_with_local_arena() -> i64 {
+            let arena_buf = Arena(capacity: 50);
+            let multiplier: i64 = 4;
+            let transform = fn(x: i64) -> i64 {
+                return (x * multiplier) + arena_buf.capacity;
+            };
+            return transform(10);
+        }
+
+        pub fn main() -> i64 {
+            return compute_with_local_arena();
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_arena_closure_fir.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut fir_module = ifa_fir::lower_program(&prog, &analysis.symbols);
+    let mut sroa = ifa_fir::SroaPass::new();
+    sroa.run_on_module(&mut fir_module);
+
+    let mut closure_pass = ifa_fir::ClosureOptPass::new();
+    closure_pass.run_on_module(&mut fir_module);
+
+    let stats = closure_pass.stats();
+    assert_eq!(
+        stats.heap_allocated_closures, 0,
+        "Closure in strict fn must NOT be allocated on heap"
+    );
+
+    let mut interp = FirInterpreter::new(&fir_module);
+    let result = interp.execute_function("main", vec![]).unwrap();
+    assert_eq!(result, FirValue::Int(90));
+}

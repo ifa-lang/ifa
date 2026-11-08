@@ -144,6 +144,36 @@ pub fn is_arena_expr(expr: &Expr) -> bool {
     }
 }
 
+/// Determines if a type corresponds to a memory Arena or an arena reference.
+pub fn is_arena_type(ty: &Type) -> bool {
+    match ty {
+        Type::Struct { name, .. } => {
+            let n = INTERNER.resolve(name);
+            n == "Arena" || n.contains("Arena") || n.contains("arena")
+        }
+        Type::Ref(inner) => is_arena_type(inner),
+        Type::Generic { name, .. } => {
+            let n = INTERNER.resolve(name);
+            n == "Arena" || n.contains("Arena") || n.contains("arena")
+        }
+        _ => false,
+    }
+}
+
+/// Determines if a variable or symbol represents an Arena.
+pub fn is_arena_symbol(sym: &Symbol, symbols: &SymbolTable) -> bool {
+    let name = INTERNER.resolve(sym);
+    if name.to_lowercase().contains("arena") {
+        return true;
+    }
+    if let Some(var) = symbols.lookup_variable(sym) {
+        if is_arena_type(&var.ty) {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscapeStatus {
     Local,
@@ -200,6 +230,8 @@ pub struct EscapeAnalyzer<'a> {
     pub ref_dependencies: HashMap<Symbol, Vec<Symbol>>,
     pub shared_values: HashMap<Symbol, HashSet<Symbol>>,
     pub stack_arrays: HashMap<Symbol, Span>,
+    pub arena_capturing_closures: HashMap<Symbol, Symbol>,
+    pub arena_lambda_spans: HashMap<Span, Symbol>,
     pub spawn_depth: usize,
     pub spawn_counter: usize,
     pub current_spawn_id: Option<usize>,
@@ -217,6 +249,8 @@ impl<'a> EscapeAnalyzer<'a> {
             ref_dependencies: HashMap::new(),
             shared_values: HashMap::new(),
             stack_arrays: HashMap::new(),
+            arena_capturing_closures: HashMap::new(),
+            arena_lambda_spans: HashMap::new(),
             spawn_depth: 0,
             spawn_counter: 0,
             current_spawn_id: None,
@@ -833,6 +867,17 @@ impl<'a> EscapeAnalyzer<'a> {
                         self.detect_and_handle_cycles();
                     }
                     self.check_expr(expr);
+                    if let Some(&arena_sym) = self.arena_lambda_spans.get(&expr.span) {
+                        for (bound_sym, _) in &bound {
+                            self.arena_capturing_closures.insert(*bound_sym, arena_sym);
+                        }
+                    } else if let ExprKind::Ident(src_sym) = &expr.kind {
+                        if let Some(&arena_sym) = self.arena_capturing_closures.get(src_sym) {
+                            for (bound_sym, _) in &bound {
+                                self.arena_capturing_closures.insert(*bound_sym, arena_sym);
+                            }
+                        }
+                    }
                 }
                 if let Some(eb) = else_block {
                     for s in &eb.stmts {
@@ -936,6 +981,16 @@ impl<'a> EscapeAnalyzer<'a> {
                 } = &val.kind
                 {
                     self.handle_ref_assignment(target, ref_target, val.span);
+                }
+
+                if let ExprKind::Ident(target_sym) = &target.kind {
+                    if let Some(&arena_sym) = self.arena_lambda_spans.get(&val.span) {
+                        self.arena_capturing_closures.insert(*target_sym, arena_sym);
+                    } else if let ExprKind::Ident(val_sym) = &val.kind {
+                        if let Some(&arena_sym) = self.arena_capturing_closures.get(val_sym) {
+                            self.arena_capturing_closures.insert(*target_sym, arena_sym);
+                        }
+                    }
                 }
             }
             Stmt::AssignPattern {
@@ -1340,17 +1395,101 @@ impl<'a> EscapeAnalyzer<'a> {
                 }
             }
             ExprKind::Lambda { params, body, .. } => {
-                if self.current_func_is_strict {
-                    let p_names: Vec<Symbol> = params.iter().map(|p| p.name).collect();
-                    let captures = crate::checker::collect_lambda_free_variables(
-                        body,
-                        &p_names,
-                        self.symbols.current_depth(),
-                        self.symbols,
-                    );
-                    if !captures.is_empty() {
-                        let cap_names: Vec<String> =
-                            captures.iter().map(|c| INTERNER.resolve(&c.name)).collect();
+                let mut declared = HashSet::new();
+                for p in params {
+                    declared.insert(p.name);
+                }
+                let mut free_symbols = HashSet::new();
+                collect_free_identifiers_in_block(body, &mut declared, &mut free_symbols);
+
+                let arena_cap = free_symbols.iter().find(|sym| {
+                    self.var_info
+                        .get(sym)
+                        .map(|i| i.alloc_kind == AllocKind::ArenaScoped)
+                        .unwrap_or(false)
+                        || is_arena_symbol(sym, self.symbols)
+                });
+
+                if let Some(&arena_sym) = arena_cap {
+                    let arena_name = INTERNER.resolve(&arena_sym);
+                    self.arena_lambda_spans.insert(expr.span, arena_sym);
+
+                    if self.current_func_is_strict {
+                        // Strict zero-heap verification for remaining captures
+                        for sym in &free_symbols {
+                            if *sym != arena_sym {
+                                let is_c_arena = self
+                                    .var_info
+                                    .get(sym)
+                                    .map(|i| i.alloc_kind == AllocKind::ArenaScoped)
+                                    .unwrap_or(false)
+                                    || is_arena_symbol(sym, self.symbols);
+
+                                if !is_c_arena {
+                                    let c_name = INTERNER.resolve(sym);
+                                    if self.stack_arrays.contains_key(sym) {
+                                        self.diagnostics.push(
+                                            Diagnostic::error(format!(
+                                                "violation du mode strict : la clôture capture le tableau de pile locale '{}' en dehors de l'arène locale '{}'",
+                                                c_name, arena_name
+                                            ))
+                                            .with_code("E0020")
+                                            .with_primary_label(
+                                                expr.span,
+                                                format!("capture du tableau de pile '{}' sans allocation dans l'arène locale", c_name),
+                                            )
+                                            .with_note("En mode strict zéro-heap, les structures de données capturées doivent être allouées dans l'arène pré-allouée.")
+                                            .with_help("Allouez le tableau dans l'arène pré-allouée ou transmettez-le par tranche 'Slice' en paramètre."),
+                                        );
+                                    } else if let Some(info) = self.var_info.get(sym) {
+                                        if info.is_compound {
+                                            self.diagnostics.push(
+                                                Diagnostic::error(format!(
+                                                    "violation du mode strict : la clôture capture la variable locale complexe '{}' en dehors de l'arène locale '{}'",
+                                                    c_name, arena_name
+                                                ))
+                                                .with_code("E0020")
+                                                .with_primary_label(
+                                                    expr.span,
+                                                    format!("capture de la structure '{}' risquant une promotion sur le tas", c_name),
+                                                )
+                                                .with_note("En mode strict zéro-heap, toutes les captures composées doivent résider dans l'arène pré-allouée ou être des scalaires directs.")
+                                                .with_help("Allouez cette structure dans l'arène pré-allouée ou passez-la par référence explicite en paramètre."),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if self.spawn_depth > 0 {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "évasion d'arène interdite : clôture capturant l'arène locale '{}' au sein d'une fibre 'spawn'",
+                                arena_name
+                            ))
+                            .with_code("E0026")
+                            .with_primary_label(
+                                expr.span,
+                                format!("clôture liée à l'arène locale '{}' dans spawn", arena_name),
+                            )
+                            .with_note("Les arènes mémoire pré-allouées sont strictement isolées par fibre/thread dans l'ordonnanceur M:N pour garantir la localité de cache et l'absence de contention.")
+                            .with_help("Exécutez la clôture de manière synchrone sur le thread courant ou transférez les données par un 'Channel'."),
+                        );
+                    }
+                } else if self.current_func_is_strict {
+                    // Check if non-arena local variables are captured
+                    let captured_locals: Vec<Symbol> = free_symbols
+                        .iter()
+                        .filter(|sym| self.var_info.contains_key(sym))
+                        .copied()
+                        .collect();
+                    if !captured_locals.is_empty() {
+                        let cap_names: Vec<String> = captured_locals
+                            .iter()
+                            .map(|c| INTERNER.resolve(c))
+                            .collect();
                         self.diagnostics.push(
                             Diagnostic::error(format!(
                                 "violation du mode strict : la clôture capture des variables locales ('{}') provoquant une promotion implicite vers le tas interdite dans une fonction 'strict fn'",
@@ -1362,7 +1501,7 @@ impl<'a> EscapeAnalyzer<'a> {
                                 "capture d'environnement local provoquant une promotion implicite sur le tas",
                             )
                             .with_note("Le mode strict impose une exécution zéro-heap déterministe. Les clôtures avec capture d'environnement dynamique sont interdites.")
-                            .with_help("Utilisez des fonctions pures sans capture ou transmettez explicitement les paramètres."),
+                            .with_help("Utilisez des fonctions pures sans capture ou opérez dans une 'Arena' pré-allouée."),
                         );
                     }
                 }
@@ -1426,6 +1565,27 @@ impl<'a> EscapeAnalyzer<'a> {
                 }
             }
             ExprKind::Ident(sym) if self.spawn_depth > 0 => {
+                if let Some(&arena_sym) = self.arena_capturing_closures.get(sym) {
+                    let closure_name = INTERNER.resolve(sym);
+                    let arena_name = INTERNER.resolve(&arena_sym);
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "évasion d'arène interdite : la clôture '{}' capturant l'arène locale '{}' ne peut pas être transmise au sein d'une fibre 'spawn'",
+                            closure_name, arena_name
+                        ))
+                        .with_code("E0026")
+                        .with_primary_label(
+                            expr.span,
+                            format!("transmission interdite de la clôture '{}' liée à une arène locale dans spawn", closure_name),
+                        )
+                        .with_secondary_label(
+                            self.var_info.get(&arena_sym).map(|i| i.defined_span).unwrap_or(expr.span),
+                            format!("'{}' appartient à l'arène privée du thread parent", arena_name),
+                        )
+                        .with_note("Les arènes mémoire pré-allouées sont strictement isolées par fibre/thread dans l'ordonnanceur M:N pour garantir la localité de cache et l'absence de contention.")
+                        .with_help("Exécutez la clôture de manière synchrone sur le thread courant ou transférez les données par un 'Channel'."),
+                    );
+                }
                 if let Some(info) = self.var_info.get(sym) {
                     if info.alloc_kind == AllocKind::ArenaScoped {
                         let var_name = INTERNER.resolve(sym);
@@ -1607,8 +1767,47 @@ impl<'a> EscapeAnalyzer<'a> {
     fn check_return_expr(&mut self, expr: &Expr) {
         self.check_expr(expr);
 
-        // Strict Mode: Check for illegal heap promotion or escape of a slice pointing to a local stack array
+        // Strict Mode: Check for illegal heap promotion, arena closure escape, or slice escape
         if self.current_func_is_strict {
+            // 1. Direct return of lambda capturing local arena
+            if let Some(&arena_sym) = self.arena_lambda_spans.get(&expr.span) {
+                let arena_name = INTERNER.resolve(&arena_sym);
+                self.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "violation du mode strict : tentative d'évasion d'une clôture capturant l'arène locale '{}' hors du cadre de pile de la fonction",
+                        arena_name
+                    ))
+                    .with_code("E0020")
+                    .with_primary_label(
+                        expr.span,
+                        format!("retour d'une clôture liée à l'arène locale '{}' expirant avec la fonction", arena_name),
+                    )
+                    .with_note("Les arènes locales et leurs clôtures associées sont détruites à la fin du cadre de fonction pour garantir le déterminisme zéro-heap.")
+                    .with_help("Exécutez la clôture localement ou allouez le résultat dans une arène transmise par le contexte appelant."),
+                );
+            }
+
+            // 2. Return of variable holding a closure capturing local arena
+            if let ExprKind::Ident(sym) = &expr.kind {
+                if let Some(&arena_sym) = self.arena_capturing_closures.get(sym) {
+                    let closure_name = INTERNER.resolve(sym);
+                    let arena_name = INTERNER.resolve(&arena_sym);
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "violation du mode strict : tentative d'évasion de la clôture '{}' capturant l'arène locale '{}' hors du cadre de pile de la fonction",
+                            closure_name, arena_name
+                        ))
+                        .with_code("E0020")
+                        .with_primary_label(
+                            expr.span,
+                            format!("retour de la clôture '{}' liée à l'arène locale '{}' expirant avec la fonction", closure_name, arena_name),
+                        )
+                        .with_note("Les arènes locales et leurs clôtures associées sont détruites à la fin du cadre de fonction pour garantir le déterminisme zéro-heap.")
+                        .with_help("Exécutez la clôture localement ou transmettez l'arène depuis l'appelant."),
+                    );
+                }
+            }
+
             if let Some((root_sym, _)) = extract_escape_root(expr) {
                 if let Some(arr_span) = self.stack_arrays.get(&root_sym) {
                     let is_slice_or_proj = matches!(
@@ -1846,5 +2045,257 @@ impl<'a> EscapeAnalyzer<'a> {
                 }
             }
         }
+    }
+}
+
+/// Recursively collect all free identifiers in an AST block that are not locally declared within it.
+fn collect_free_identifiers_in_block(
+    block: &ifa_ast::Block,
+    declared: &mut HashSet<Symbol>,
+    free: &mut HashSet<Symbol>,
+) {
+    let mut scope_declared = declared.clone();
+    for stmt in &block.stmts {
+        collect_free_identifiers_in_stmt(stmt, &mut scope_declared, free);
+    }
+    if let Some(e) = &block.expr {
+        collect_free_identifiers_in_expr(e, &scope_declared, free);
+    }
+}
+
+fn collect_free_identifiers_in_stmt(
+    stmt: &Stmt,
+    declared: &mut HashSet<Symbol>,
+    free: &mut HashSet<Symbol>,
+) {
+    match stmt {
+        Stmt::Let {
+            pattern,
+            init,
+            else_block,
+            ..
+        } => {
+            if let Some(e) = init {
+                collect_free_identifiers_in_expr(e, declared, free);
+            }
+            if let Some(eb) = else_block {
+                collect_free_identifiers_in_block(eb, declared, free);
+            }
+            for (sym, _) in pattern.bound_variables() {
+                declared.insert(sym);
+            }
+        }
+        Stmt::Assign { target, val, .. } => {
+            collect_free_identifiers_in_expr(target, declared, free);
+            collect_free_identifiers_in_expr(val, declared, free);
+        }
+        Stmt::AssignPattern {
+            pattern,
+            val,
+            else_block,
+            ..
+        } => {
+            collect_free_identifiers_in_expr(val, declared, free);
+            if let Some(eb) = else_block {
+                collect_free_identifiers_in_block(eb, declared, free);
+            }
+            for (sym, _) in pattern.bound_variables() {
+                declared.insert(sym);
+            }
+        }
+        Stmt::Expr(e) | Stmt::Fail(e, _) => collect_free_identifiers_in_expr(e, declared, free),
+        Stmt::Return(e, _) => {
+            if let Some(expr) = e {
+                collect_free_identifiers_in_expr(expr, declared, free);
+            }
+        }
+        Stmt::Defer(b, _) | Stmt::Loop(b, _) => {
+            collect_free_identifiers_in_block(b, declared, free)
+        }
+        Stmt::While { cond, body, .. } => {
+            collect_free_identifiers_in_expr(cond, declared, free);
+            collect_free_identifiers_in_block(body, declared, free);
+        }
+        Stmt::WhileLet {
+            pattern,
+            expr,
+            guard,
+            body,
+            ..
+        } => {
+            collect_free_identifiers_in_expr(expr, declared, free);
+            let mut loop_declared = declared.clone();
+            for (sym, _) in pattern.bound_variables() {
+                loop_declared.insert(sym);
+            }
+            if let Some(g) = guard {
+                collect_free_identifiers_in_expr(g, &loop_declared, free);
+            }
+            collect_free_identifiers_in_block(body, &mut loop_declared, free);
+        }
+        Stmt::For {
+            pattern,
+            iterable,
+            body,
+            ..
+        } => {
+            collect_free_identifiers_in_expr(iterable, declared, free);
+            let mut loop_declared = declared.clone();
+            for (sym, _) in pattern.bound_variables() {
+                loop_declared.insert(sym);
+            }
+            collect_free_identifiers_in_block(body, &mut loop_declared, free);
+        }
+        Stmt::Break(_) | Stmt::Continue(_) => {}
+    }
+}
+
+fn collect_free_identifiers_in_expr(
+    expr: &Expr,
+    declared: &HashSet<Symbol>,
+    free: &mut HashSet<Symbol>,
+) {
+    match &expr.kind {
+        ExprKind::Ident(sym) => {
+            if !declared.contains(sym) {
+                free.insert(*sym);
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_free_identifiers_in_expr(left, declared, free);
+            collect_free_identifiers_in_expr(right, declared, free);
+        }
+        ExprKind::Unary { expr: inner, .. } => {
+            collect_free_identifiers_in_expr(inner, declared, free);
+        }
+        ExprKind::Call { callee, args } => {
+            collect_free_identifiers_in_expr(callee, declared, free);
+            for a in args {
+                collect_free_identifiers_in_expr(&a.value, declared, free);
+            }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            collect_free_identifiers_in_expr(receiver, declared, free);
+            for a in args {
+                collect_free_identifiers_in_expr(&a.value, declared, free);
+            }
+        }
+        ExprKind::FieldAccess { receiver, .. } => {
+            collect_free_identifiers_in_expr(receiver, declared, free);
+        }
+        ExprKind::Index { receiver, index } => {
+            collect_free_identifiers_in_expr(receiver, declared, free);
+            collect_free_identifiers_in_expr(index, declared, free);
+        }
+        ExprKind::Array(items) | ExprKind::Tuple(items) => {
+            for item in items {
+                collect_free_identifiers_in_expr(item, declared, free);
+            }
+        }
+        ExprKind::ArrayRepeat(val, count) => {
+            collect_free_identifiers_in_expr(val, declared, free);
+            collect_free_identifiers_in_expr(count, declared, free);
+        }
+        ExprKind::Record(fields) | ExprKind::StructInit { fields, .. } => {
+            for (_, val) in fields {
+                collect_free_identifiers_in_expr(val, declared, free);
+            }
+        }
+        ExprKind::Block(b) => {
+            collect_free_identifiers_in_block(b, &mut declared.clone(), free);
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_free_identifiers_in_expr(cond, declared, free);
+            collect_free_identifiers_in_block(then_branch, &mut declared.clone(), free);
+            if let Some(eb) = else_branch {
+                collect_free_identifiers_in_expr(eb, declared, free);
+            }
+        }
+        ExprKind::IfLet {
+            pattern,
+            expr,
+            guard,
+            then_branch,
+            else_branch,
+        } => {
+            collect_free_identifiers_in_expr(expr, declared, free);
+            let mut if_decl = declared.clone();
+            for (sym, _) in pattern.bound_variables() {
+                if_decl.insert(sym);
+            }
+            if let Some(g) = guard {
+                collect_free_identifiers_in_expr(g, &if_decl, free);
+            }
+            collect_free_identifiers_in_block(then_branch, &mut if_decl, free);
+            if let Some(eb) = else_branch {
+                collect_free_identifiers_in_expr(eb, declared, free);
+            }
+        }
+        ExprKind::Match { expr: target, arms } => {
+            collect_free_identifiers_in_expr(target, declared, free);
+            for arm in arms {
+                let mut arm_decl = declared.clone();
+                for (sym, _) in arm.pattern.bound_variables() {
+                    arm_decl.insert(sym);
+                }
+                if let Some(g) = &arm.guard {
+                    collect_free_identifiers_in_expr(g, &arm_decl, free);
+                }
+                collect_free_identifiers_in_expr(&arm.body, &arm_decl, free);
+            }
+        }
+        ExprKind::Select { arms } => {
+            for arm in arms {
+                if let Some(ch) = &arm.channel {
+                    collect_free_identifiers_in_expr(ch, declared, free);
+                }
+                collect_free_identifiers_in_expr(&arm.body, declared, free);
+            }
+        }
+        ExprKind::Spawn(e) | ExprKind::Comptime(e) => {
+            collect_free_identifiers_in_expr(e, declared, free);
+        }
+        ExprKind::Catch {
+            expr: inner,
+            err_var,
+            body,
+        } => {
+            collect_free_identifiers_in_expr(inner, declared, free);
+            let mut catch_decl = declared.clone();
+            if let Some(ev) = err_var {
+                catch_decl.insert(*ev);
+            }
+            collect_free_identifiers_in_block(body, &mut catch_decl, free);
+        }
+        ExprKind::Lambda { params, body, .. } => {
+            let mut lambda_decl = declared.clone();
+            for p in params {
+                lambda_decl.insert(p.name);
+            }
+            collect_free_identifiers_in_block(body, &mut lambda_decl, free);
+        }
+        ExprKind::InterpolatedString(parts) => {
+            for part in parts {
+                collect_free_identifiers_in_expr(part, declared, free);
+            }
+        }
+        ExprKind::Range {
+            start, end, step, ..
+        } => {
+            if let Some(s) = start {
+                collect_free_identifiers_in_expr(s, declared, free);
+            }
+            if let Some(e) = end {
+                collect_free_identifiers_in_expr(e, declared, free);
+            }
+            if let Some(st) = step {
+                collect_free_identifiers_in_expr(st, declared, free);
+            }
+        }
+        ExprKind::Lit(_) | ExprKind::Path(_) | ExprKind::Unit => {}
     }
 }

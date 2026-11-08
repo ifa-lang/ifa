@@ -9,8 +9,8 @@ pub mod types;
 
 pub use checker::SemanticAnalyzer;
 pub use escape::{
-    extract_escape_root, format_projection_expr, AllocKind, ContainedRef, EscapeAnalyzer,
-    EscapeStatus, VarEscapeInfo, VarOrigin,
+    extract_escape_root, format_projection_expr, is_arena_expr, is_arena_symbol, is_arena_type,
+    AllocKind, ContainedRef, EscapeAnalyzer, EscapeStatus, VarEscapeInfo, VarOrigin,
 };
 pub use exclusivity::{check_call_exclusivity, AccessPath, PathAliasKind, PathSegment};
 pub use symbol_table::{
