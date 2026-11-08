@@ -261,3 +261,98 @@ pub fn main() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_binary_module_metadata_incremental_cache() {
+    use kori::module_metadata::{ModuleMetadata, IFAM_MAGIC};
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("kori_incremental_meta_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(temp_dir.join("src/algo")).unwrap();
+
+    let manifest = r#"
+[package]
+name = "cached-meta-app"
+version = "0.1.0"
+edition = "2026"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
+license = "MIT"
+description = "Incremental binary metadata cache test"
+
+[targets]
+bin = [
+    { name = "cached_app", path = "src/main.ifa" }
+]
+
+[profiles.dev]
+backend = "cranelift"
+opt_level = 0
+debug_assertions = true
+lto = "none"
+strip_symbols = false
+gen_checks = true
+"#;
+    fs::write(temp_dir.join("kori.toml"), manifest).unwrap();
+
+    let sort_src = r#"
+pub fn compute_sum(a: i64, b: i64) -> i64 {
+    return a + b;
+}
+"#;
+    fs::write(temp_dir.join("src/algo/sort.ifa"), sort_src).unwrap();
+
+    let main_src = r#"
+import algo::sort;
+
+pub fn main() {
+    let s = sort::compute_sum(10, 20);
+}
+"#;
+    fs::write(temp_dir.join("src/main.ifa"), main_src).unwrap();
+
+    // 1. First build: must compile submodule and populate .kori-cache/modules with IFAM metadata
+    let orchestrator = BuildOrchestrator::new(temp_dir.clone()).unwrap();
+    let report1 = orchestrator.build(false, None, false).unwrap();
+    assert_eq!(report1.artifacts.len(), 1);
+
+    let cache_modules_dir = temp_dir.join("target/.kori-cache/modules");
+    assert!(
+        cache_modules_dir.exists(),
+        "Binary module cache directory must exist"
+    );
+
+    let meta_files: Vec<_> = fs::read_dir(&cache_modules_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ifameta"))
+        .collect();
+    assert!(
+        !meta_files.is_empty(),
+        "At least one .ifameta binary file must be created"
+    );
+
+    let meta_path = &meta_files[0].path();
+    let meta_bytes = fs::read(meta_path).unwrap();
+    assert_eq!(
+        &meta_bytes[0..4],
+        &IFAM_MAGIC,
+        "Binary metadata header must match IFAM"
+    );
+
+    let deserialized = ModuleMetadata::deserialize_from_binary(&meta_bytes)
+        .expect("Should deserialize cached binary metadata successfully");
+    assert!(
+        deserialized
+            .functions
+            .iter()
+            .any(|f| f.name == "compute_sum"),
+        "Exported function compute_sum must be recorded in binary metadata"
+    );
+
+    // 2. Second build: must load submodule metadata from cache without errors
+    let report2 = orchestrator.build(false, None, false).unwrap();
+    assert_eq!(report2.artifacts.len(), 1);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

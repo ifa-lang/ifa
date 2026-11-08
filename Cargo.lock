@@ -618,6 +618,7 @@ version = "0.1.0"
 dependencies = [
  "ifa-ast",
  "ifa-diagnostics",
+ "ifa-fir",
  "ifa-lexer",
  "ifa-parser",
  "ifa-sema",

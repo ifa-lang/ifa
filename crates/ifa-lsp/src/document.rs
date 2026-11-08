@@ -1,3 +1,4 @@
+use crate::analysis_ext::EnhancedAnalysis;
 use crate::protocol::{Diagnostic, DiagnosticSeverity, Position, Range};
 use ifa_ast::Program;
 use ifa_diagnostics::Severity;
@@ -16,6 +17,7 @@ pub struct Document {
     pub line_starts: Vec<usize>,
     pub ast: Option<Program>,
     pub analysis: Option<AnalysisResult>,
+    pub enhanced: Option<EnhancedAnalysis>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -28,6 +30,7 @@ impl Document {
             line_starts: Vec::new(),
             ast: None,
             analysis: None,
+            enhanced: None,
             diagnostics: Vec::new(),
         };
         doc.update_text(text);
@@ -133,8 +136,10 @@ impl Document {
             });
         }
 
+        let enhanced = EnhancedAnalysis::compute(&program, &analysis_res.symbols);
         self.ast = Some(program);
         self.analysis = Some(analysis_res);
+        self.enhanced = Some(enhanced);
         self.diagnostics = lsp_diags;
     }
 

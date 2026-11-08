@@ -1,3 +1,4 @@
+pub mod analysis_ext;
 pub mod document;
 pub mod handlers;
 pub mod protocol;
@@ -878,5 +879,164 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| a["title"].as_str().unwrap().contains("Format")));
+    }
+
+    #[test]
+    fn test_lsp_disjoint_borrows_inlay_hints_and_hover() {
+        let mut server = LanguageServer::new();
+        let code = r#"
+            struct Pair {
+                a: int,
+                b: int,
+            }
+
+            fn mutate_both(inout x: int, inout y: int) -> () {
+                x = x + 1;
+                y = y + 2;
+                return ();
+            }
+
+            pub fn test_runner() -> () {
+                let mut p = Pair(a: 10, b: 20);
+                mutate_both(inout p.a, inout p.b);
+                return ();
+            }
+        "#;
+
+        let open_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/disjoint.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": code
+                }
+            }
+        })
+        .to_string();
+
+        server.handle_message(&open_notif);
+
+        // 1. Inlay hints request: must report disjoint borrow label
+        let hints_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 14,
+            "method": "textDocument/inlayHint",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/disjoint.ifa"
+                },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 16, "character": 0 }
+                }
+            }
+        })
+        .to_string();
+
+        let (resp, _) = server.handle_message(&hints_req);
+        assert!(resp.is_some());
+        let resp_val: serde_json::Value = serde_json::from_str(&resp.unwrap()).unwrap();
+        let hints = resp_val["result"].as_array().unwrap();
+
+        let labels: Vec<&str> = hints.iter().filter_map(|h| h["label"].as_str()).collect();
+        assert!(
+            labels.iter().any(|l| l.contains("disjoint: p.a ⟂ p.b")),
+            "Inlay hints must include disjoint borrow indication for p.a: {:?}",
+            labels
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("disjoint: p.b ⟂ p.a")),
+            "Inlay hints must include disjoint borrow indication for p.b: {:?}",
+            labels
+        );
+
+        // 2. Hover request over p.a: must display path-sensitive exclusivity markdown
+        let hover_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 15,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/disjoint.ifa"
+                },
+                "position": { "line": 14, "character": 35 } // position of p.a
+            }
+        })
+        .to_string();
+
+        let (resp_hover, _) = server.handle_message(&hover_req);
+        assert!(resp_hover.is_some());
+        let hover_val: serde_json::Value = serde_json::from_str(&resp_hover.unwrap()).unwrap();
+        assert!(hover_val["result"].is_object(), "Hover must return content");
+        let content_str = hover_val["result"]["contents"]["value"].as_str().unwrap();
+        assert!(
+            content_str.contains("Exclusivité d'Accès Sensible au Chemin (IFA E0011)")
+                || content_str.contains("p.a"),
+            "Hover must detail path exclusivity analysis: {}",
+            content_str
+        );
+    }
+
+    #[test]
+    fn test_lsp_generational_barrier_inlay_hints() {
+        let mut server = LanguageServer::new();
+        let code = r#"
+            struct Node {
+                val: int,
+            }
+
+            pub fn inspect_node(r: ref Node) -> int {
+                let a = r.val;
+                let b = r.val;
+                return a + b;
+            }
+        "#;
+
+        let open_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/gen_ref.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": code
+                }
+            }
+        })
+        .to_string();
+
+        server.handle_message(&open_notif);
+
+        let hints_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 16,
+            "method": "textDocument/inlayHint",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/gen_ref.ifa"
+                },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 10, "character": 0 }
+                }
+            }
+        })
+        .to_string();
+
+        let (resp, _) = server.handle_message(&hints_req);
+        assert!(resp.is_some());
+        let resp_val: serde_json::Value = serde_json::from_str(&resp.unwrap()).unwrap();
+        let hints = resp_val["result"].as_array().unwrap();
+
+        let labels: Vec<&str> = hints.iter().filter_map(|h| h["label"].as_str()).collect();
+        assert!(
+            labels.iter().any(|l| l.contains("[gen:")),
+            "Inlay hints must present generational barrier status hints: {:?}",
+            labels
+        );
     }
 }

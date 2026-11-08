@@ -1,5 +1,6 @@
 use crate::error::KoriError;
 use crate::manifest::ProfileConfig;
+use crate::module_metadata::ModuleMetadata;
 use crate::resolver::ResolvedPackage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,6 +19,7 @@ pub struct CacheEntry {
 /// Deterministic build cache manager preventing redundant recompilations.
 pub struct BuildCache {
     cache_dir: PathBuf,
+    modules_dir: PathBuf,
     index_file: PathBuf,
     entries: HashMap<String, CacheEntry>,
 }
@@ -26,7 +28,8 @@ impl BuildCache {
     /// Initialize the build cache within the specified target directory.
     pub fn new(target_dir: &Path) -> Result<Self, KoriError> {
         let cache_dir = target_dir.join(".kori-cache");
-        fs::create_dir_all(&cache_dir)?;
+        let modules_dir = cache_dir.join("modules");
+        fs::create_dir_all(&modules_dir)?;
         let index_file = cache_dir.join("index.json");
 
         let entries = if index_file.exists() {
@@ -38,6 +41,7 @@ impl BuildCache {
 
         Ok(Self {
             cache_dir,
+            modules_dir,
             index_file,
             entries,
         })
@@ -45,6 +49,59 @@ impl BuildCache {
 
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    pub fn modules_dir(&self) -> &Path {
+        &self.modules_dir
+    }
+
+    /// Compute cryptographic fingerprint for a file on disk.
+    pub fn compute_file_fingerprint(path: &Path) -> Result<String, KoriError> {
+        let bytes = fs::read(path).map_err(|e| {
+            KoriError::Codegen(format!("Failed to read file for fingerprinting: {}", e))
+        })?;
+        let hash = blake3::hash(&bytes);
+        Ok(hash.to_hex().to_string())
+    }
+
+    /// Retrieve cached binary module metadata if present and matching fingerprint.
+    pub fn get_module_metadata(
+        &self,
+        module_key: &str,
+        current_fingerprint: &str,
+    ) -> Option<ModuleMetadata> {
+        let sanitized_key = module_key.replace("::", "_").replace('/', "_");
+        let meta_file = self
+            .modules_dir
+            .join(format!("{}_{}.ifameta", sanitized_key, current_fingerprint));
+
+        if meta_file.is_file() {
+            if let Ok(bytes) = fs::read(&meta_file) {
+                if let Ok(metadata) = ModuleMetadata::deserialize_from_binary(&bytes) {
+                    if metadata.fingerprint == current_fingerprint {
+                        return Some(metadata);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Store compiled binary module metadata into cache directory with `IFAM` format.
+    pub fn store_module_metadata(
+        &self,
+        module_key: &str,
+        metadata: &ModuleMetadata,
+    ) -> Result<PathBuf, KoriError> {
+        let sanitized_key = module_key.replace("::", "_").replace('/', "_");
+        let meta_file = self.modules_dir.join(format!(
+            "{}_{}.ifameta",
+            sanitized_key, metadata.fingerprint
+        ));
+
+        let binary_data = metadata.serialize_to_binary()?;
+        fs::write(&meta_file, binary_data)?;
+        Ok(meta_file)
     }
 
     /// Compute cryptographic fingerprint for a package target under a specific profile.

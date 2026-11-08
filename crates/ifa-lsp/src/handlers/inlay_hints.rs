@@ -259,5 +259,38 @@ pub fn handle_inlay_hints(doc: &Document, _range: Range) -> Vec<InlayHint> {
         visitor.visit_program(ast);
     }
 
+    // Interactive Inlay Hints for proven disjoint borrows & generational barriers
+    if let Some(enhanced) = &doc.enhanced {
+        // 1. Disjoint borrow paths
+        for borrow in &enhanced.disjoint_borrows {
+            let position = doc.offset_to_position(borrow.span.end.0 as usize);
+            let sibling_str = borrow.sibling_paths.join(", ");
+            visitor.hints.push(InlayHint {
+                position,
+                label: format!(" [disjoint: {} ⟂ {}]", borrow.path_display, sibling_str),
+                kind: Some(InlayHintKind::Type as u32),
+                padding_left: Some(true),
+                padding_right: Some(false),
+            });
+        }
+
+        // 2. Generational reference access barriers (static elimination vs dynamic check)
+        for barrier in &enhanced.gen_barriers {
+            let position = doc.offset_to_position(barrier.span.start.0 as usize);
+            let label = if barrier.eliminated {
+                " [gen: static (0-cost)]".to_string()
+            } else {
+                " [gen: dynamic check]".to_string()
+            };
+            visitor.hints.push(InlayHint {
+                position,
+                label,
+                kind: Some(InlayHintKind::Type as u32),
+                padding_left: Some(true),
+                padding_right: Some(false),
+            });
+        }
+    }
+
     visitor.hints
 }

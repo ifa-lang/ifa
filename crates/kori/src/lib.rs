@@ -6,6 +6,7 @@ pub mod error;
 pub mod ffi_gen;
 pub mod lockfile;
 pub mod manifest;
+pub mod module_metadata;
 pub mod packager;
 pub mod resolver;
 pub mod test_runner;
@@ -19,6 +20,7 @@ pub use manifest::{
     BackendKind, BinTarget, CrateType, DependencySpec, LibTarget, Manifest, PackageMetadata,
     ProfileConfig, ProfilesConfig,
 };
+pub use module_metadata::{ModuleMetadata, IFAM_MAGIC, IFAM_VERSION};
 pub use packager::{PackageIndexEntry, PackageReport, Packager, PublishReport};
 pub use resolver::{DependencyResolver, ResolvedPackage};
 pub use test_runner::{TestCaseResult, TestRunner, TestStatus, TestSuiteResult, TestSummary};

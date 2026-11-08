@@ -16,3 +16,4 @@ ifa-lexer.workspace = true
 ifa-ast.workspace = true
 ifa-parser.workspace = true
 ifa-sema.workspace = true
+ifa-fir.workspace = true

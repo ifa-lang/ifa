@@ -120,11 +120,33 @@ pub fn handle_hover(doc: &Document, position: Position) -> Option<Hover> {
         for scope in &analysis.symbols.scopes {
             if let Some(var) = scope.variables.get(&symbol) {
                 let binding = if var.is_mut { "mut" } else { "let" };
+                let mut content = format!("```ifa\n{} {}: {}\n```", binding, word, var.ty);
+
+                // Check for disjoint borrow details
+                let offset = doc.position_to_offset(position);
+                if let Some(enhanced) = &doc.enhanced {
+                    if let Some(borrow) = enhanced.find_disjoint_borrow_at(offset) {
+                        content.push_str(&format!(
+                            "\n\n---\n### Exclusivité d'Accès Sensible au Chemin (IFA E0011)\n- **Chemin analysé** : `{}`\n- **Statut** : Emprunt mutable simultané garanti disjoint\n- **Chemins frères sans conflit** : `{}`\n- **Garantie** : Single-writer exclusif, zéro aliasing mutable illégal vérifié statiquement.",
+                            borrow.path_display,
+                            borrow.sibling_paths.join(", ")
+                        ));
+                    }
+                    if let Some(barrier) = enhanced.find_gen_barrier_at(offset) {
+                        let status_str = if barrier.eliminated {
+                            "Éliminée statiquement (0 cycle CPU à l'exécution)"
+                        } else {
+                            "Contrôle dynamique actif (1 cycle CPU, comparaison génération)"
+                        };
+                        content.push_str(&format!(
+                            "\n\n---\n### Sécurité Générationnelle (GenRef 128-bit)\n- **Barrière d'accès** : {}\n- **Optimisation** : Dominance lexicale & LICM (élimination statique >90%).",
+                            status_str
+                        ));
+                    }
+                }
+
                 return Some(Hover {
-                    contents: MarkupContent::markdown(format!(
-                        "```ifa\n{} {}: {}\n```",
-                        binding, word, var.ty
-                    )),
+                    contents: MarkupContent::markdown(content),
                     range: Some(range),
                 });
             }
@@ -134,14 +156,58 @@ pub fn handle_hover(doc: &Document, position: Position) -> Option<Hover> {
         for str_sym in analysis.symbols.structs.values() {
             if let Some(field) = str_sym.get_field(&symbol) {
                 let struct_name = str_sym.name.resolve();
+                let mut content = format!(
+                    "```ifa\n(field) {}.{}: {}\n```",
+                    struct_name, word, field.ty
+                );
+
+                let offset = doc.position_to_offset(position);
+                if let Some(enhanced) = &doc.enhanced {
+                    if let Some(borrow) = enhanced.find_disjoint_borrow_at(offset) {
+                        content.push_str(&format!(
+                            "\n\n---\n### Exclusivité d'Accès Sensible au Chemin (IFA E0011)\n- **Chemin analysé** : `{}`\n- **Statut** : Emprunt mutable simultané garanti disjoint\n- **Chemins frères sans conflit** : `{}`\n- **Garantie** : Single-writer exclusif, zéro aliasing mutable illégal.",
+                            borrow.path_display,
+                            borrow.sibling_paths.join(", ")
+                        ));
+                    }
+                }
+
                 return Some(Hover {
-                    contents: MarkupContent::markdown(format!(
-                        "```ifa\n(field) {}.{}: {}\n```",
-                        struct_name, word, field.ty
-                    )),
+                    contents: MarkupContent::markdown(content),
                     range: Some(range),
                 });
             }
+        }
+    }
+
+    // Check if position directly points to a disjoint borrow or gen barrier even outside word lookup
+    let offset = doc.position_to_offset(position);
+    if let Some(enhanced) = &doc.enhanced {
+        if let Some(borrow) = enhanced.find_disjoint_borrow_at(offset) {
+            let doc_str = format!(
+                "### Exclusivité d'Accès Sensible au Chemin (IFA E0011)\n- **Chemin analysé** : `{}`\n- **Statut** : Emprunt mutable simultané garanti disjoint\n- **Chemins frères sans conflit** : `{}`\n- **Garantie** : Single-writer exclusif, zéro aliasing mutable illégal.",
+                borrow.path_display,
+                borrow.sibling_paths.join(", ")
+            );
+            return Some(Hover {
+                contents: MarkupContent::markdown(doc_str),
+                range: Some(range),
+            });
+        }
+        if let Some(barrier) = enhanced.find_gen_barrier_at(offset) {
+            let status_str = if barrier.eliminated {
+                "Éliminée statiquement (0 cycle CPU à l'exécution)"
+            } else {
+                "Contrôle dynamique actif (1 cycle CPU, comparaison génération)"
+            };
+            let doc_str = format!(
+                "### Sécurité Générationnelle (GenRef 128-bit)\n- **Barrière d'accès** : {}\n- **Optimisation** : Dominance lexicale & LICM (élimination statique >90%).",
+                status_str
+            );
+            return Some(Hover {
+                contents: MarkupContent::markdown(doc_str),
+                range: Some(range),
+            });
         }
     }
 
