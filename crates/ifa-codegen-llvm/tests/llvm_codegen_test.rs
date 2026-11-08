@@ -2939,3 +2939,99 @@ pub extern "C" strict fn sum_tail(n: i64, acc: i64) -> i64 {
     assert!(obj_path.exists());
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_inlined_generational_check_with_quarantine_and_liveness() {
+    let src = r#"
+        struct Data {
+            value: i64,
+        }
+
+        fn read_val(d: ref Data) -> i64 {
+            return d.value;
+        }
+
+        pub fn main() -> i64 {
+            let d = Data(value: 84);
+            return read_val(ref d);
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("gen_check_test.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module_unopt = compile_to_fir(&prog, &analysis.symbols, false, false).unwrap();
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&module_unopt).unwrap();
+
+    // 1. Validate inlined generation check definition with liveness and quarantine validation
+    assert!(
+        ir.contains("define linkonce_odr void @ifa_rt_gen_check(ptr %ptr, i32 %remembered_gen) alwaysinline"),
+        "LLVM IR must declare inlined @ifa_rt_gen_check:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("%flags_ptr = getelementptr inbounds i8, ptr %ptr, i64 -4"),
+        "Must access allocation flags at header offset -4:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("%is_active = icmp eq i16 %act_bit, 1"),
+        "Must validate FLAG_ACTIVE:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("%not_quar = icmp eq i16 %quar_bit, 0"),
+        "Must validate absence of FLAG_QUARANTINED:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("!0 = !{!\"branch_weights\", i32 1048576, i32 1}"),
+        "Must contain branch weight metadata for zero-overhead branch prediction:\n{}",
+        ir
+    );
+
+    // 2. Compile optimized module to native object and verify valid execution
+    let module_opt = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let temp_dir = std::env::temp_dir().join(format!("llvm_gen_check_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("gen_check.o");
+    let bin_path = temp_dir.join("gen_check_bin");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&module_opt, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(
+        link_res.is_ok(),
+        "Native linking failed: {:?}",
+        link_res.err()
+    );
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(84),
+        "Expected exit code 84 from valid reference dereference"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

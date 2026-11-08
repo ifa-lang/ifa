@@ -708,12 +708,23 @@ impl<'a> LlvmIrEmitter<'a> {
         }
 
         // Fast-path 1-cycle CPU inlined generation check (alwaysinline with branch weights)
-        out.push_str("; Inlined 1-cycle CPU generation check\n");
+        // Validates: generation_counter == remembered_gen, FLAG_ACTIVE is set, and FLAG_QUARANTINED is not set.
+        out.push_str(
+            "; Inlined 1-cycle CPU generation check with quarantine & liveness validation\n",
+        );
         out.push_str("define linkonce_odr void @ifa_rt_gen_check(ptr %ptr, i32 %remembered_gen) alwaysinline {\n");
         out.push_str("entry:\n");
         out.push_str("  %hdr_ptr = getelementptr inbounds i8, ptr %ptr, i64 -8\n");
         out.push_str("  %actual_gen = load i32, ptr %hdr_ptr, align 4\n");
-        out.push_str("  %match = icmp eq i32 %actual_gen, %remembered_gen\n");
+        out.push_str("  %flags_ptr = getelementptr inbounds i8, ptr %ptr, i64 -4\n");
+        out.push_str("  %flags = load i16, ptr %flags_ptr, align 2\n");
+        out.push_str("  %gen_match = icmp eq i32 %actual_gen, %remembered_gen\n");
+        out.push_str("  %act_bit = and i16 %flags, 1\n");
+        out.push_str("  %is_active = icmp eq i16 %act_bit, 1\n");
+        out.push_str("  %quar_bit = and i16 %flags, 16\n");
+        out.push_str("  %not_quar = icmp eq i16 %quar_bit, 0\n");
+        out.push_str("  %state_ok = and i1 %is_active, %not_quar\n");
+        out.push_str("  %match = and i1 %gen_match, %state_ok\n");
         out.push_str("  br i1 %match, label %ok, label %uaf, !prof !0\n\n");
         out.push_str("ok:\n");
         out.push_str("  ret void\n\n");
