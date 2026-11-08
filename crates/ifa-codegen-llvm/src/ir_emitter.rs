@@ -147,6 +147,9 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_blocking_spawn(ptr, ptr, ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_bounds_check(i64, i64, ptr)\n");
             out.push_str("declare void @ifa_rt_slice_bounds_check(i64, i64, i64, ptr)\n");
+            out.push_str(
+                "declare void @ifa_rt_slice_strided_bounds_check(i64, i64, i64, i64, ptr)\n",
+            );
             out.push_str("declare i1 @ifa_rt_buffer_verify_bounds(ptr, i64, i64, i64)\n");
             out.push_str("declare void @ifa_rt_panic_out_of_bounds(i64, i64)\n");
             out.push_str(
@@ -207,6 +210,9 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_blocking_spawn(ptr, ptr, ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_bounds_check(i64, i64, ptr)\n");
             out.push_str("declare void @ifa_rt_slice_bounds_check(i64, i64, i64, ptr)\n");
+            out.push_str(
+                "declare void @ifa_rt_slice_strided_bounds_check(i64, i64, i64, i64, ptr)\n",
+            );
             out.push_str("declare i1 @ifa_rt_buffer_verify_bounds(ptr, i64, i64, i64)\n");
             out.push_str("declare void @ifa_rt_panic_out_of_bounds(i64, i64)\n");
             out.push_str(
@@ -896,6 +902,69 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi double [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
         out.push_str("tail_step:\n  %tp1 = getelementptr inbounds double, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds double, ptr %src2, i64 %ti\n  %tv1 = load double, ptr %tp1, align 8\n  %tv2 = load double, ptr %tp2, align 8\n  %tprod = fmul double %tv1, %tv2\n  %next_s_acc = fadd double %s_acc, %tprod\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
         out.push_str("done:\n  ret double %s_acc\n}\n\n");
+
+        // 5b. Strided Slice Reductions & Dot Products (Downsampling, Channel Projections, Zero-Heap)
+        out.push_str("; IFA Standard Library SIMD Strided Slice Reductions\n");
+
+        out.push_str("define linkonce_odr float @ifa_simd_strided_slice_sum_f32(ptr %src, i64 %len, i64 %stride) alwaysinline {\n");
+        out.push_str("entry:\n  %is_contig = icmp eq i64 %stride, 1\n  br i1 %is_contig, label %contig_fast, label %strided_init\n");
+        out.push_str("contig_fast:\n  %c_res = call float @ifa_simd_arena_slice_sum_f32(ptr %src, i64 %len)\n  ret float %c_res\n");
+        out.push_str("strided_init:\n  %unroll_len = and i64 %len, -4\n  br label %unroll_loop\n");
+        out.push_str("unroll_loop:\n  %i = phi i64 [ 0, %strided_init ], [ %next_i, %unroll_step ]\n  %acc = phi float [ 0.0, %strided_init ], [ %next_acc, %unroll_step ]\n  %has_unroll = icmp ult i64 %i, %unroll_len\n  br i1 %has_unroll, label %unroll_step, label %tail_loop\n");
+        out.push_str("unroll_step:\n  %idx0 = mul i64 %i, %stride\n  %i1 = add i64 %i, 1\n  %idx1 = mul i64 %i1, %stride\n  %i2 = add i64 %i, 2\n  %idx2 = mul i64 %i2, %stride\n  %i3 = add i64 %i, 3\n  %idx3 = mul i64 %i3, %stride\n  %p0 = getelementptr inbounds float, ptr %src, i64 %idx0\n  %p1 = getelementptr inbounds float, ptr %src, i64 %idx1\n  %p2 = getelementptr inbounds float, ptr %src, i64 %idx2\n  %p3 = getelementptr inbounds float, ptr %src, i64 %idx3\n  %v0 = load float, ptr %p0, align 4\n  %v1 = load float, ptr %p1, align 4\n  %v2 = load float, ptr %p2, align 4\n  %v3 = load float, ptr %p3, align 4\n  %s01 = fadd float %v0, %v1\n  %s23 = fadd float %v2, %v3\n  %s03 = fadd float %s01, %s23\n  %next_acc = fadd float %acc, %s03\n  %next_i = add i64 %i, 4\n  br label %unroll_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %unroll_len, %unroll_loop ], [ %next_ti, %tail_step ]\n  %t_acc = phi float [ %acc, %unroll_loop ], [ %next_t_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %t_idx = mul i64 %ti, %stride\n  %tp = getelementptr inbounds float, ptr %src, i64 %t_idx\n  %tv = load float, ptr %tp, align 4\n  %next_t_acc = fadd float %t_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret float %t_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr double @ifa_simd_strided_slice_sum_f64(ptr %src, i64 %len, i64 %stride) alwaysinline {\n");
+        out.push_str("entry:\n  %is_contig = icmp eq i64 %stride, 1\n  br i1 %is_contig, label %contig_fast, label %strided_init\n");
+        out.push_str("contig_fast:\n  %c_res = call double @ifa_simd_arena_slice_sum_f64(ptr %src, i64 %len)\n  ret double %c_res\n");
+        out.push_str("strided_init:\n  %unroll_len = and i64 %len, -4\n  br label %unroll_loop\n");
+        out.push_str("unroll_loop:\n  %i = phi i64 [ 0, %strided_init ], [ %next_i, %unroll_step ]\n  %acc = phi double [ 0.0, %strided_init ], [ %next_acc, %unroll_step ]\n  %has_unroll = icmp ult i64 %i, %unroll_len\n  br i1 %has_unroll, label %unroll_step, label %tail_loop\n");
+        out.push_str("unroll_step:\n  %idx0 = mul i64 %i, %stride\n  %i1 = add i64 %i, 1\n  %idx1 = mul i64 %i1, %stride\n  %i2 = add i64 %i, 2\n  %idx2 = mul i64 %i2, %stride\n  %i3 = add i64 %i, 3\n  %idx3 = mul i64 %i3, %stride\n  %p0 = getelementptr inbounds double, ptr %src, i64 %idx0\n  %p1 = getelementptr inbounds double, ptr %src, i64 %idx1\n  %p2 = getelementptr inbounds double, ptr %src, i64 %idx2\n  %p3 = getelementptr inbounds double, ptr %src, i64 %idx3\n  %v0 = load double, ptr %p0, align 8\n  %v1 = load double, ptr %p1, align 8\n  %v2 = load double, ptr %p2, align 8\n  %v3 = load double, ptr %p3, align 8\n  %s01 = fadd double %v0, %v1\n  %s23 = fadd double %v2, %v3\n  %s03 = fadd double %s01, %s23\n  %next_acc = fadd double %acc, %s03\n  %next_i = add i64 %i, 4\n  br label %unroll_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %unroll_len, %unroll_loop ], [ %next_ti, %tail_step ]\n  %t_acc = phi double [ %acc, %unroll_loop ], [ %next_t_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %t_idx = mul i64 %ti, %stride\n  %tp = getelementptr inbounds double, ptr %src, i64 %t_idx\n  %tv = load double, ptr %tp, align 8\n  %next_t_acc = fadd double %t_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret double %t_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr i32 @ifa_simd_strided_slice_sum_i32(ptr %src, i64 %len, i64 %stride) alwaysinline {\n");
+        out.push_str("entry:\n  %is_contig = icmp eq i64 %stride, 1\n  br i1 %is_contig, label %contig_fast, label %strided_init\n");
+        out.push_str("contig_fast:\n  %c_res = call i32 @ifa_simd_arena_slice_sum_i32(ptr %src, i64 %len)\n  ret i32 %c_res\n");
+        out.push_str("strided_init:\n  %unroll_len = and i64 %len, -4\n  br label %unroll_loop\n");
+        out.push_str("unroll_loop:\n  %i = phi i64 [ 0, %strided_init ], [ %next_i, %unroll_step ]\n  %acc = phi i32 [ 0, %strided_init ], [ %next_acc, %unroll_step ]\n  %has_unroll = icmp ult i64 %i, %unroll_len\n  br i1 %has_unroll, label %unroll_step, label %tail_loop\n");
+        out.push_str("unroll_step:\n  %idx0 = mul i64 %i, %stride\n  %i1 = add i64 %i, 1\n  %idx1 = mul i64 %i1, %stride\n  %i2 = add i64 %i, 2\n  %idx2 = mul i64 %i2, %stride\n  %i3 = add i64 %i, 3\n  %idx3 = mul i64 %i3, %stride\n  %p0 = getelementptr inbounds i32, ptr %src, i64 %idx0\n  %p1 = getelementptr inbounds i32, ptr %src, i64 %idx1\n  %p2 = getelementptr inbounds i32, ptr %src, i64 %idx2\n  %p3 = getelementptr inbounds i32, ptr %src, i64 %idx3\n  %v0 = load i32, ptr %p0, align 4\n  %v1 = load i32, ptr %p1, align 4\n  %v2 = load i32, ptr %p2, align 4\n  %v3 = load i32, ptr %p3, align 4\n  %s01 = add i32 %v0, %v1\n  %s23 = add i32 %v2, %v3\n  %s03 = add i32 %s01, %s23\n  %next_acc = add i32 %acc, %s03\n  %next_i = add i64 %i, 4\n  br label %unroll_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %unroll_len, %unroll_loop ], [ %next_ti, %tail_step ]\n  %t_acc = phi i32 [ %acc, %unroll_loop ], [ %next_t_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %t_idx = mul i64 %ti, %stride\n  %tp = getelementptr inbounds i32, ptr %src, i64 %t_idx\n  %tv = load i32, ptr %tp, align 4\n  %next_t_acc = add i32 %t_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i32 %t_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr i64 @ifa_simd_strided_slice_sum_i64(ptr %src, i64 %len, i64 %stride) alwaysinline {\n");
+        out.push_str("entry:\n  %is_contig = icmp eq i64 %stride, 1\n  br i1 %is_contig, label %contig_fast, label %strided_init\n");
+        out.push_str("contig_fast:\n  %c_res = call i64 @ifa_simd_arena_slice_sum_i64(ptr %src, i64 %len)\n  ret i64 %c_res\n");
+        out.push_str("strided_init:\n  %unroll_len = and i64 %len, -4\n  br label %unroll_loop\n");
+        out.push_str("unroll_loop:\n  %i = phi i64 [ 0, %strided_init ], [ %next_i, %unroll_step ]\n  %acc = phi i64 [ 0, %strided_init ], [ %next_acc, %unroll_step ]\n  %has_unroll = icmp ult i64 %i, %unroll_len\n  br i1 %has_unroll, label %unroll_step, label %tail_loop\n");
+        out.push_str("unroll_step:\n  %idx0 = mul i64 %i, %stride\n  %i1 = add i64 %i, 1\n  %idx1 = mul i64 %i1, %stride\n  %i2 = add i64 %i, 2\n  %idx2 = mul i64 %i2, %stride\n  %i3 = add i64 %i, 3\n  %idx3 = mul i64 %i3, %stride\n  %p0 = getelementptr inbounds i64, ptr %src, i64 %idx0\n  %p1 = getelementptr inbounds i64, ptr %src, i64 %idx1\n  %p2 = getelementptr inbounds i64, ptr %src, i64 %idx2\n  %p3 = getelementptr inbounds i64, ptr %src, i64 %idx3\n  %v0 = load i64, ptr %p0, align 8\n  %v1 = load i64, ptr %p1, align 8\n  %v2 = load i64, ptr %p2, align 8\n  %v3 = load i64, ptr %p3, align 8\n  %s01 = add i64 %v0, %v1\n  %s23 = add i64 %v2, %v3\n  %s03 = add i64 %s01, %s23\n  %next_acc = add i64 %acc, %s03\n  %next_i = add i64 %i, 4\n  br label %unroll_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %unroll_len, %unroll_loop ], [ %next_ti, %tail_step ]\n  %t_acc = phi i64 [ %acc, %unroll_loop ], [ %next_t_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %t_idx = mul i64 %ti, %stride\n  %tp = getelementptr inbounds i64, ptr %src, i64 %t_idx\n  %tv = load i64, ptr %tp, align 8\n  %next_t_acc = add i64 %t_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i64 %t_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr float @ifa_simd_strided_slice_dot_f32(ptr %src1, ptr %src2, i64 %len, i64 %stride) alwaysinline {\n");
+        out.push_str("entry:\n  %is_contig = icmp eq i64 %stride, 1\n  br i1 %is_contig, label %contig_fast, label %strided_init\n");
+        out.push_str("contig_fast:\n  %c_res = call float @ifa_simd_arena_slice_dot_f32(ptr %src1, ptr %src2, i64 %len)\n  ret float %c_res\n");
+        out.push_str("strided_init:\n  %unroll_len = and i64 %len, -4\n  br label %unroll_loop\n");
+        out.push_str("unroll_loop:\n  %i = phi i64 [ 0, %strided_init ], [ %next_i, %unroll_step ]\n  %acc = phi float [ 0.0, %strided_init ], [ %next_acc, %unroll_step ]\n  %has_unroll = icmp ult i64 %i, %unroll_len\n  br i1 %has_unroll, label %unroll_step, label %tail_loop\n");
+        out.push_str("unroll_step:\n  %idx0 = mul i64 %i, %stride\n  %i1 = add i64 %i, 1\n  %idx1 = mul i64 %i1, %stride\n  %i2 = add i64 %i, 2\n  %idx2 = mul i64 %i2, %stride\n  %i3 = add i64 %i, 3\n  %idx3 = mul i64 %i3, %stride\n  %p1_0 = getelementptr inbounds float, ptr %src1, i64 %idx0\n  %p2_0 = getelementptr inbounds float, ptr %src2, i64 %idx0\n  %p1_1 = getelementptr inbounds float, ptr %src1, i64 %idx1\n  %p2_1 = getelementptr inbounds float, ptr %src2, i64 %idx1\n  %p1_2 = getelementptr inbounds float, ptr %src1, i64 %idx2\n  %p2_2 = getelementptr inbounds float, ptr %src2, i64 %idx2\n  %p1_3 = getelementptr inbounds float, ptr %src1, i64 %idx3\n  %p2_3 = getelementptr inbounds float, ptr %src2, i64 %idx3\n  %v1_0 = load float, ptr %p1_0, align 4\n  %v2_0 = load float, ptr %p2_0, align 4\n  %v1_1 = load float, ptr %p1_1, align 4\n  %v2_1 = load float, ptr %p2_1, align 4\n  %v1_2 = load float, ptr %p1_2, align 4\n  %v2_2 = load float, ptr %p2_2, align 4\n  %v1_3 = load float, ptr %p1_3, align 4\n  %v2_3 = load float, ptr %p2_3, align 4\n  %prod0 = fmul float %v1_0, %v2_0\n  %prod1 = fmul float %v1_1, %v2_1\n  %prod2 = fmul float %v1_2, %v2_2\n  %prod3 = fmul float %v1_3, %v2_3\n  %s01 = fadd float %prod0, %prod1\n  %s23 = fadd float %prod2, %prod3\n  %s03 = fadd float %s01, %s23\n  %next_acc = fadd float %acc, %s03\n  %next_i = add i64 %i, 4\n  br label %unroll_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %unroll_len, %unroll_loop ], [ %next_ti, %tail_step ]\n  %t_acc = phi float [ %acc, %unroll_loop ], [ %next_t_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %t_idx = mul i64 %ti, %stride\n  %tp1 = getelementptr inbounds float, ptr %src1, i64 %t_idx\n  %tp2 = getelementptr inbounds float, ptr %src2, i64 %t_idx\n  %tv1 = load float, ptr %tp1, align 4\n  %tv2 = load float, ptr %tp2, align 4\n  %tprod = fmul float %tv1, %tv2\n  %next_t_acc = fadd float %t_acc, %tprod\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret float %t_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr double @ifa_simd_strided_slice_dot_f64(ptr %src1, ptr %src2, i64 %len, i64 %stride) alwaysinline {\n");
+        out.push_str("entry:\n  %is_contig = icmp eq i64 %stride, 1\n  br i1 %is_contig, label %contig_fast, label %strided_init\n");
+        out.push_str("contig_fast:\n  %c_res = call double @ifa_simd_arena_slice_dot_f64(ptr %src1, ptr %src2, i64 %len)\n  ret double %c_res\n");
+        out.push_str("strided_init:\n  %unroll_len = and i64 %len, -4\n  br label %unroll_loop\n");
+        out.push_str("unroll_loop:\n  %i = phi i64 [ 0, %strided_init ], [ %next_i, %unroll_step ]\n  %acc = phi double [ 0.0, %strided_init ], [ %next_acc, %unroll_step ]\n  %has_unroll = icmp ult i64 %i, %unroll_len\n  br i1 %has_unroll, label %unroll_step, label %tail_loop\n");
+        out.push_str("unroll_step:\n  %idx0 = mul i64 %i, %stride\n  %i1 = add i64 %i, 1\n  %idx1 = mul i64 %i1, %stride\n  %i2 = add i64 %i, 2\n  %idx2 = mul i64 %i2, %stride\n  %i3 = add i64 %i, 3\n  %idx3 = mul i64 %i3, %stride\n  %p1_0 = getelementptr inbounds double, ptr %src1, i64 %idx0\n  %p2_0 = getelementptr inbounds double, ptr %src2, i64 %idx0\n  %p1_1 = getelementptr inbounds double, ptr %src1, i64 %idx1\n  %p2_1 = getelementptr inbounds double, ptr %src2, i64 %idx1\n  %p1_2 = getelementptr inbounds double, ptr %src1, i64 %idx2\n  %p2_2 = getelementptr inbounds double, ptr %src2, i64 %idx2\n  %p1_3 = getelementptr inbounds double, ptr %src1, i64 %idx3\n  %p2_3 = getelementptr inbounds double, ptr %src2, i64 %idx3\n  %v1_0 = load double, ptr %p1_0, align 8\n  %v2_0 = load double, ptr %p2_0, align 8\n  %v1_1 = load double, ptr %p1_1, align 8\n  %v2_1 = load double, ptr %p2_1, align 8\n  %v1_2 = load double, ptr %p1_2, align 8\n  %v2_2 = load double, ptr %p2_2, align 8\n  %v1_3 = load double, ptr %p1_3, align 8\n  %v2_3 = load double, ptr %p2_3, align 8\n  %prod0 = fmul double %v1_0, %v2_0\n  %prod1 = fmul double %v1_1, %v2_1\n  %prod2 = fmul double %v1_2, %v2_2\n  %prod3 = fmul double %v1_3, %v2_3\n  %s01 = fadd double %prod0, %prod1\n  %s23 = fadd double %prod2, %prod3\n  %s03 = fadd double %s01, %s23\n  %next_acc = fadd double %acc, %s03\n  %next_i = add i64 %i, 4\n  br label %unroll_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %unroll_len, %unroll_loop ], [ %next_ti, %tail_step ]\n  %t_acc = phi double [ %acc, %unroll_loop ], [ %next_t_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %t_idx = mul i64 %ti, %stride\n  %tp1 = getelementptr inbounds double, ptr %src1, i64 %t_idx\n  %tp2 = getelementptr inbounds double, ptr %src2, i64 %t_idx\n  %tv1 = load double, ptr %tp1, align 8\n  %tv2 = load double, ptr %tp2, align 8\n  %tprod = fmul double %tv1, %tv2\n  %next_t_acc = fadd double %t_acc, %tprod\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret double %t_acc\n}\n\n");
 
         // 6. Arena Slice Count-If Reductions (Conditional Counting Zero-Heap)
         out.push_str("; IFA Standard Library SIMD Contiguous Arena Slice Count-If Reductions\n");
@@ -4051,6 +4120,56 @@ impl<'a> LlvmIrEmitter<'a> {
                     out.push_str(&format!(
                         "  call void @ifa_rt_slice_bounds_check(i64 %v{}, i64 %v{}, i64 {}, ptr null)\n",
                         start.0, end.0, len_operand
+                    ));
+                }
+            }
+            ValueExpr::SliceStridedBoundsCheck {
+                base,
+                start,
+                end,
+                stride,
+                redundant,
+            } => {
+                if !*redundant {
+                    let chk_id = *eff_idx;
+                    *eff_idx += 1;
+                    let base_ty = value_types.get(base);
+                    let len_operand = match base_ty {
+                        Some(ifa_fir::FirType::Slice(_)) => {
+                            out.push_str(&format!(
+                                "  %bce_strided_len_{} = extractvalue {{ ptr, i64 }} %v{}, 1\n",
+                                chk_id, base.0
+                            ));
+                            format!("%bce_strided_len_{}", chk_id)
+                        }
+                        Some(ifa_fir::FirType::Pointer(inner))
+                            if matches!(&**inner, ifa_fir::FirType::Slice(_)) =>
+                        {
+                            out.push_str(&format!(
+                                "  %bce_strided_ld_{} = load {{ ptr, i64 }}, ptr %v{}, align 8\n",
+                                chk_id, base.0
+                            ));
+                            out.push_str(&format!(
+                                "  %bce_strided_len_{} = extractvalue {{ ptr, i64 }} %bce_strided_ld_{}, 1\n",
+                                chk_id, chk_id
+                            ));
+                            format!("%bce_strided_len_{}", chk_id)
+                        }
+                        Some(ifa_fir::FirType::Array(_, count)) => count.to_string(),
+                        Some(ifa_fir::FirType::Pointer(inner))
+                            if matches!(&**inner, ifa_fir::FirType::Array(..)) =>
+                        {
+                            if let ifa_fir::FirType::Array(_, count) = &**inner {
+                                count.to_string()
+                            } else {
+                                "0".to_string()
+                            }
+                        }
+                        _ => "0".to_string(),
+                    };
+                    out.push_str(&format!(
+                        "  call void @ifa_rt_slice_strided_bounds_check(i64 %v{}, i64 %v{}, i64 %v{}, i64 {}, ptr null)\n",
+                        start.0, end.0, stride.0, len_operand
                     ));
                 }
             }

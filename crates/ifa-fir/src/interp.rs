@@ -1609,7 +1609,75 @@ impl<'a> FirInterpreter<'a> {
                 }
             }
 
-            ValueExpr::SliceStridedBoundsCheck { .. } => Ok(FirValue::Unit),
+            ValueExpr::SliceStridedBoundsCheck {
+                base,
+                start,
+                end,
+                stride,
+                redundant,
+            } => {
+                if !*redundant {
+                    let base_val = env.get(base).ok_or(InterpError::UndefinedValue(*base))?;
+                    let start_val = env.get(start).ok_or(InterpError::UndefinedValue(*start))?;
+                    let end_val = env.get(end).ok_or(InterpError::UndefinedValue(*end))?;
+                    let stride_val = env
+                        .get(stride)
+                        .ok_or(InterpError::UndefinedValue(*stride))?;
+                    let s_idx = match start_val {
+                        FirValue::Int(i) => *i,
+                        _ => {
+                            return Err(InterpError::TypeMismatch(
+                                "Strided slice start must be an integer".into(),
+                            ))
+                        }
+                    };
+                    let e_idx = match end_val {
+                        FirValue::Int(i) => *i,
+                        _ => {
+                            return Err(InterpError::TypeMismatch(
+                                "Strided slice end must be an integer".into(),
+                            ))
+                        }
+                    };
+                    let st_idx = match stride_val {
+                        FirValue::Int(i) => *i,
+                        _ => {
+                            return Err(InterpError::TypeMismatch(
+                                "Strided slice stride must be an integer".into(),
+                            ))
+                        }
+                    };
+                    if st_idx <= 0 {
+                        return Err(InterpError::Panic(format!(
+                            "Invalid slice stride: step {} must be strictly positive",
+                            st_idx
+                        )));
+                    }
+                    let len = match base_val {
+                        FirValue::Array(elements) => elements.len() as i128,
+                        FirValue::String(s) => s.len() as i128,
+                        FirValue::Pointer(addr) => {
+                            if let Some(target) = self.stack_memory.get(addr) {
+                                match target {
+                                    FirValue::Array(elements) => elements.len() as i128,
+                                    FirValue::String(s) => s.len() as i128,
+                                    _ => 0,
+                                }
+                            } else {
+                                0
+                            }
+                        }
+                        _ => 0,
+                    };
+                    if s_idx < 0 || s_idx > e_idx || (len > 0 && e_idx > len) {
+                        return Err(InterpError::Panic(format!(
+                            "Out of bounds strided slice check failure: range [{}..{}:{}] exceeds length {}",
+                            s_idx, e_idx, st_idx, len
+                        )));
+                    }
+                }
+                Ok(FirValue::Unit)
+            }
 
             ValueExpr::StructPushField {
                 base,

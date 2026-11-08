@@ -682,7 +682,9 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 None
             }
 
-            ValueExpr::BoundsCheck { .. } | ValueExpr::SliceBoundsCheck { .. } => None,
+            ValueExpr::BoundsCheck { .. }
+            | ValueExpr::SliceBoundsCheck { .. }
+            | ValueExpr::SliceStridedBoundsCheck { .. } => None,
 
             ValueExpr::Yield | ValueExpr::YieldValue { .. } => {
                 if let Some(func_id) = self.func_ids.get("ifa_rt_fiber_yield") {
@@ -1054,7 +1056,6 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let sub_addr = self.builder.ins().iadd(base_addr, offset);
                 Some(sub_addr)
             }
-            ValueExpr::SliceStridedBoundsCheck { .. } => None,
 
             ValueExpr::FormatString(parts) => {
                 if parts.is_empty() {

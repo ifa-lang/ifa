@@ -4636,3 +4636,149 @@ fn test_llvm_strided_zero_copy_conv2d_and_conv3d_metadata_emission() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_strided_bounds_check_and_simd_reductions_llvm() {
+    use ifa_fir::*;
+    use ifa_span::Span;
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let mut func = FirFunction::new(
+        ifa_span::INTERNER.intern("test_strided_pipeline"),
+        Vec::new(),
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    let v_base = ValueId(0);
+    let v_start = ValueId(1);
+    let v_end = ValueId(2);
+    let v_stride = ValueId(3);
+    let v_slice = ValueId(4);
+
+    bb0.instructions.push(Instruction::new(
+        Some(v_base),
+        ValueExpr::Constant(ConstantValue::Int(100, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(v_start),
+        ValueExpr::Constant(ConstantValue::Int(0, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(v_end),
+        ValueExpr::Constant(ConstantValue::Int(32, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(v_stride),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    // Effectful Strided Bounds Check
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::SliceStridedBoundsCheck {
+            base: v_base,
+            start: v_start,
+            end: v_end,
+            stride: v_stride,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+
+    // Strided Slice Extraction
+    bb0.instructions.push(Instruction::new(
+        Some(v_slice),
+        ValueExpr::SliceStrided {
+            base: v_base,
+            start: v_start,
+            end: v_end,
+            stride: v_stride,
+        },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(None));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: ifa_span::INTERNER.intern("strided_pipeline_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let llvm_ir = emitter
+        .emit_module(&module)
+        .expect("LLVM IR emission for strided bounds check failed");
+
+    assert!(
+        llvm_ir
+            .contains("declare void @ifa_rt_slice_strided_bounds_check(i64, i64, i64, i64, ptr)"),
+        "LLVM IR must declare @ifa_rt_slice_strided_bounds_check:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("call void @ifa_rt_slice_strided_bounds_check(i64 %v1, i64 %v2, i64 %v3"),
+        "LLVM IR must emit call to @ifa_rt_slice_strided_bounds_check with operands:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("define linkonce_odr float @ifa_simd_strided_slice_sum_f32"),
+        "LLVM IR must define @ifa_simd_strided_slice_sum_f32:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("define linkonce_odr double @ifa_simd_strided_slice_sum_f64"),
+        "LLVM IR must define @ifa_simd_strided_slice_sum_f64:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("define linkonce_odr i32 @ifa_simd_strided_slice_sum_i32"),
+        "LLVM IR must define @ifa_simd_strided_slice_sum_i32:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("define linkonce_odr i64 @ifa_simd_strided_slice_sum_i64"),
+        "LLVM IR must define @ifa_simd_strided_slice_sum_i64:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("define linkonce_odr float @ifa_simd_strided_slice_dot_f32"),
+        "LLVM IR must define @ifa_simd_strided_slice_dot_f32:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("define linkonce_odr double @ifa_simd_strided_slice_dot_f64"),
+        "LLVM IR must define @ifa_simd_strided_slice_dot_f64:\n{}",
+        llvm_ir
+    );
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("ifa_strided_pipe_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("strided_pipeline.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation to object with strided bounds checks failed: {:?}",
+        compile_res.err()
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

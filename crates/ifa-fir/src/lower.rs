@@ -3566,6 +3566,17 @@ impl<'a> FunctionLoweringContext<'a> {
                             },
                             span,
                         );
+                        self.emit(
+                            None,
+                            ValueExpr::SliceStridedBoundsCheck {
+                                base,
+                                start: start_val,
+                                end: end_val,
+                                stride: stride_val,
+                                redundant: false,
+                            },
+                            span,
+                        );
                         let one_c = self.alloc_value();
                         self.emit(
                             Some(one_c),
@@ -3589,17 +3600,6 @@ impl<'a> FunctionLoweringContext<'a> {
                                 op: BinaryOp::Div,
                                 lhs: span_adj,
                                 rhs: stride_val,
-                            },
-                            span,
-                        );
-                        self.emit(
-                            None,
-                            ValueExpr::SliceStridedBoundsCheck {
-                                base,
-                                start: start_val,
-                                end: end_val,
-                                stride: stride_val,
-                                redundant: false,
                             },
                             span,
                         );

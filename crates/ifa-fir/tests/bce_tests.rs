@@ -285,3 +285,100 @@ fn test_strided_for_loop_lowering_and_interpretation() {
     // 0 + 2 + 4 + 6 + 8 = 20
     assert_eq!(res, FirValue::Int(20));
 }
+
+#[test]
+fn test_strided_bounds_check_interpreter_verification() {
+    let src = r#"
+        pub fn slice_strided_access(arr: [i64; 10], s: i64, e: i64, step: i64) -> i64 {
+            let sub = arr[s..e:step];
+            return sub[0];
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strided_check.ifa".to_string(), src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = ifa_fir::lower_program(&prog, &analysis.symbols);
+
+    // 1. Valid execution: arr[0..10:2] -> sub[0] = arr[0] = 42
+    let mut interp = FirInterpreter::new(&module);
+    let sample_arr = FirValue::Array(vec![
+        FirValue::Int(42),
+        FirValue::Int(1),
+        FirValue::Int(2),
+        FirValue::Int(3),
+        FirValue::Int(4),
+        FirValue::Int(5),
+        FirValue::Int(6),
+        FirValue::Int(7),
+        FirValue::Int(8),
+        FirValue::Int(9),
+    ]);
+    let ok_res = interp.execute_function(
+        "slice_strided_access",
+        vec![
+            sample_arr.clone(),
+            FirValue::Int(0),
+            FirValue::Int(10),
+            FirValue::Int(2),
+        ],
+    );
+    assert!(
+        ok_res.is_ok(),
+        "Valid strided slice must succeed: {:?}",
+        ok_res
+    );
+    assert_eq!(ok_res.unwrap(), FirValue::Int(42));
+
+    // 2. Out of bounds execution: end = 15 > 10 -> InterpError::Panic
+    let oob_res = interp.execute_function(
+        "slice_strided_access",
+        vec![
+            sample_arr.clone(),
+            FirValue::Int(0),
+            FirValue::Int(15),
+            FirValue::Int(2),
+        ],
+    );
+    assert!(
+        oob_res.is_err(),
+        "End > len must trigger InterpError::Panic"
+    );
+    match oob_res.unwrap_err() {
+        ifa_fir::interp::InterpError::Panic(msg) => {
+            assert!(msg.contains("Out of bounds strided slice check failure"));
+        }
+        other => panic!("Expected InterpError::Panic, got {:?}", other),
+    }
+
+    // 3. Invalid stride: step = 0 -> InterpError::Panic
+    let zero_step_res = interp.execute_function(
+        "slice_strided_access",
+        vec![
+            sample_arr,
+            FirValue::Int(0),
+            FirValue::Int(10),
+            FirValue::Int(0),
+        ],
+    );
+    assert!(
+        zero_step_res.is_err(),
+        "Step 0 must trigger InterpError::Panic"
+    );
+    match zero_step_res.unwrap_err() {
+        ifa_fir::interp::InterpError::Panic(msg) => {
+            assert!(msg.contains("Invalid slice stride"));
+        }
+        other => panic!("Expected InterpError::Panic, got {:?}", other),
+    }
+}

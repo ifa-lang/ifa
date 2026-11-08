@@ -1569,6 +1569,32 @@ pub extern "C-unwind" fn ifa_rt_slice_bounds_check(
     }
 }
 
+/// Verify that a strided sub-slice range `[start..end:stride]` is strictly within bounds `[0..len]`.
+#[no_mangle]
+pub extern "C-unwind" fn ifa_rt_slice_strided_bounds_check(
+    start: usize,
+    end: usize,
+    stride: usize,
+    len: usize,
+    msg: *const u8,
+) {
+    if stride == 0 {
+        if !msg.is_null() {
+            ifa_rt_panic_assert(msg);
+        } else {
+            let err_msg = b"strided slice step must be strictly greater than zero\0";
+            ifa_rt_panic_assert(err_msg.as_ptr());
+        }
+    }
+    if start > end || end > len {
+        if !msg.is_null() {
+            ifa_rt_panic_assert(msg);
+        } else {
+            ifa_rt_panic_out_of_bounds(end, len);
+        }
+    }
+}
+
 /// Validate external buffer pointer alignment, non-null status, and minimum byte length.
 #[no_mangle]
 pub extern "C" fn ifa_rt_buffer_verify_bounds(

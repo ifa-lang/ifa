@@ -394,6 +394,11 @@ void ifa_rt_bounds_check(size_t index, size_t len, const char* msg);
 void ifa_rt_slice_bounds_check(size_t start, size_t end, size_t len, const char* msg);
 
 /**
+ * Verify that a strided sub-slice range [start..end:stride] is strictly within bounds [0..len].
+ */
+void ifa_rt_slice_strided_bounds_check(size_t start, size_t end, size_t stride, size_t len, const char* msg);
+
+/**
  * Validate external buffer pointer alignment, non-null status, and minimum byte length.
  */
 int ifa_rt_buffer_verify_bounds(const void* ptr, size_t len, size_t required_min, size_t align);

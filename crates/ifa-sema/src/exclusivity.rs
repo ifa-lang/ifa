@@ -1449,13 +1449,14 @@ pub fn extract_access_path(expr: &Expr) -> Option<AccessPath> {
                             end: e_const,
                             inclusive: *inclusive,
                         });
+                    } else {
+                        parent.segments.push(PathSegment::SliceRange {
+                            start: s_bound,
+                            end: e_bound,
+                            step: step_bound,
+                            inclusive: *inclusive,
+                        });
                     }
-                    parent.segments.push(PathSegment::SliceRange {
-                        start: s_bound,
-                        end: e_bound,
-                        step: step_bound,
-                        inclusive: *inclusive,
-                    });
                 }
                 _ => {
                     parent.display.push_str("[*]");

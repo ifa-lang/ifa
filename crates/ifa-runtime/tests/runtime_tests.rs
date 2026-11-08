@@ -1351,3 +1351,47 @@ fn test_thread_local_call_arena_multistage_pipeline_block_reuse_and_consolidatio
     call_arena_shrink_to_fit(stats.capacity);
     assert_eq!(call_arena_capacity(), stats.capacity);
 }
+
+#[test]
+fn test_slice_and_strided_bounds_check_ffi() {
+    use ifa_runtime::ffi::{
+        ifa_rt_catch_panic, ifa_rt_clear_last_panic, ifa_rt_slice_bounds_check,
+        ifa_rt_slice_strided_bounds_check,
+    };
+    use ifa_runtime::panic::IfaPanicKind;
+
+    // Valid standard slice range checks
+    ifa_rt_slice_bounds_check(0, 10, 10, std::ptr::null());
+    ifa_rt_slice_bounds_check(2, 7, 10, std::ptr::null());
+    ifa_rt_slice_bounds_check(5, 5, 10, std::ptr::null());
+
+    // Valid strided slice range checks
+    ifa_rt_slice_strided_bounds_check(0, 10, 1, 10, std::ptr::null());
+    ifa_rt_slice_strided_bounds_check(0, 10, 2, 10, std::ptr::null());
+    ifa_rt_slice_strided_bounds_check(1, 9, 3, 10, std::ptr::null());
+    ifa_rt_slice_strided_bounds_check(4, 4, 2, 10, std::ptr::null());
+
+    // Invalid stride == 0 triggers assertion failure intercepted via ifa_rt_catch_panic
+    extern "C-unwind" fn trigger_zero_stride(_: *mut u8) {
+        ifa_rt_slice_strided_bounds_check(0, 10, 0, 10, std::ptr::null());
+    }
+    let res_stride = ifa_rt_catch_panic(trigger_zero_stride, std::ptr::null_mut());
+    assert_eq!(res_stride, IfaPanicKind::AssertionFailed as i32);
+    ifa_rt_clear_last_panic();
+
+    // Invalid range: start > end triggers OutOfBounds panic
+    extern "C-unwind" fn trigger_inverted(_: *mut u8) {
+        ifa_rt_slice_strided_bounds_check(8, 4, 1, 10, std::ptr::null());
+    }
+    let res_inv = ifa_rt_catch_panic(trigger_inverted, std::ptr::null_mut());
+    assert_eq!(res_inv, IfaPanicKind::OutOfBounds as i32);
+    ifa_rt_clear_last_panic();
+
+    // Invalid range: end > len triggers OutOfBounds panic
+    extern "C-unwind" fn trigger_oob(_: *mut u8) {
+        ifa_rt_slice_strided_bounds_check(0, 15, 2, 10, std::ptr::null());
+    }
+    let res_oob = ifa_rt_catch_panic(trigger_oob, std::ptr::null_mut());
+    assert_eq!(res_oob, IfaPanicKind::OutOfBounds as i32);
+    ifa_rt_clear_last_panic();
+}
