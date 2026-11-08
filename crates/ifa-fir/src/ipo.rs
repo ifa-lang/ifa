@@ -25,6 +25,12 @@ pub struct IpoStats {
     pub pure_calls_cse_eliminated: usize,
     /// Number of loops transformed by pure function inlining.
     pub loops_transformed: usize,
+    /// Number of direct tail-recursive calls eliminated and transformed into iterative loops.
+    pub tail_calls_eliminated: usize,
+    /// Number of functions successfully transformed via tail-call elimination.
+    pub tail_call_functions_transformed: usize,
+    /// Number of mutual tail-recursive calls inlined between pure functions.
+    pub mutual_tail_calls_inlined: usize,
 }
 
 /// Call graph structure capturing caller-callee relationships, recursive cycles,
@@ -717,6 +723,14 @@ impl IpoPass {
 
         // 4. Inline non-recursive pure leaf helpers inside natural loops for SIMD vectorization
         self.inline_pure_calls_in_loops(module, &pure_functions, &call_graph);
+
+        // 5. Tail-Call Optimization (TCO) for self-recursive and mutually recursive pure functions
+        let mut tco_pass = crate::tco::TcoPass::new();
+        tco_pass.run_on_module_with_purity(module, &pure_functions, &call_graph);
+        let tco_stats = tco_pass.stats();
+        self.stats.tail_calls_eliminated = tco_stats.tail_calls_eliminated;
+        self.stats.tail_call_functions_transformed = tco_stats.functions_transformed;
+        self.stats.mutual_tail_calls_inlined = tco_stats.mutual_tail_calls_inlined;
     }
 
     /// Analyzes the entire FIR module and computes the set of provably pure function symbols.

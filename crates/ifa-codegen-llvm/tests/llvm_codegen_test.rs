@@ -2770,3 +2770,62 @@ fn test_llvm_blocking_ffi_isolation_and_thunk_lowering() {
     assert!(obj_path.exists());
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_tail_call_optimization_emission() {
+    let src = r#"
+pub extern "C" strict fn sum_tail(n: i64, acc: i64) -> i64 {
+    if n <= 0 {
+        return acc
+    }
+    return sum_tail(n - 1, acc + n)
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("tco_llvm.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    // Compile with IPO/TCO enabled
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&module).unwrap();
+
+    // 1. Validate that the self-recursive call was eliminated from LLVM IR
+    assert!(
+        !ir.contains("call i64 @sum_tail("),
+        "Recursive call @sum_tail must be replaced with a loop in LLVM IR:\n{}",
+        ir
+    );
+
+    // 2. Validate that PHI nodes for SSA loop parameters are present
+    assert!(
+        ir.contains("phi i64"),
+        "LLVM IR must contain phi nodes for iterative loop parameters:\n{}",
+        ir
+    );
+
+    // 3. Verify native compilation to valid object file
+    let temp_dir = std::env::temp_dir().join(format!("llvm_tco_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("tco_test.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation of TCO module failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+    let _ = fs::remove_dir_all(&temp_dir);
+}
