@@ -4318,3 +4318,89 @@ fn test_disjoint_composite_fields_under_while_loop_allowed() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_assignment_overlapping_inout_borrow_rejected_with_e0011() {
+    let code = r#"
+        fn mutate(inout v: i64) -> i64 {
+            v = v + 10;
+            return v;
+        }
+
+        pub fn main() {
+            mut x: i64 = 5;
+            // Overlapping: x is mutated via inout inside RHS while being target of assignment
+            x = mutate(inout x);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Assignment target overlapping inout borrow must be rejected: {:?}",
+        res.diagnostics
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0011")),
+        "Expected E0011 exclusivity error, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_assignment_disjoint_field_inout_borrow_allowed() {
+    let code = r#"
+        struct Pair {
+            a: i64,
+            b: i64,
+        }
+
+        fn increment(inout v: i64) -> i64 {
+            v = v + 1;
+            return v * 2;
+        }
+
+        pub fn main() {
+            mut p = Pair { a: 10, b: 20 };
+            // Provably disjoint fields: p.a is target, p.b is passed inout
+            p.a = increment(inout p.b);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Assignment to disjoint field during inout call must succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_for_inout_iteration_rejects_concurrent_mutation_with_e0011() {
+    let code = r#"
+        fn clear_slice(inout s: Slice<i64>) {
+            // clear
+        }
+
+        pub fn main(mut s: Slice<i64>) {
+            // InOut active borrow on s across the loop
+            for x in inout s {
+                // Illegal concurrent inout mutation on the iterable slice
+                clear_slice(inout s);
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Concurrent inout mutation on inout-iterated slice must trigger E0011: {:?}",
+        res.diagnostics
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0011")),
+        "Expected E0011 for concurrent inout mutation on iterable, got: {:?}",
+        res.diagnostics
+    );
+}

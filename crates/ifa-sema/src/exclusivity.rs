@@ -1292,6 +1292,7 @@ pub enum BorrowKind {
     In,
     InOut,
     Sink,
+    PendingAssign,
 }
 
 #[derive(Debug, Clone)]
@@ -1553,6 +1554,44 @@ pub fn check_call_exclusivity_interproc(
                             );
                         }
                         (BorrowKind::In, BorrowKind::In) => {}
+                        (BorrowKind::InOut, BorrowKind::PendingAssign) => {
+                            diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "loi d'exclusivité violée : l'emprunt 'inout' sur '{}' chevauche la cible d'assignation '{}'",
+                                    eff_path.display, existing.path.display
+                                ))
+                                .with_code("E0011")
+                                .with_primary_label(
+                                    arg.value.span,
+                                    "mutation exclusive ('inout') interdite vers une variable cible d'assignation",
+                                )
+                                .with_secondary_label(
+                                    existing.span,
+                                    "cible d'assignation ici",
+                                )
+                                .with_help("Une variable ne peut faire l'objet que d'une seule mutation ou réassignation exclusive à la fois."),
+                            );
+                        }
+                        (BorrowKind::Sink, BorrowKind::PendingAssign) => {
+                            diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "loi d'exclusivité violée : l'argument 'sink' sur '{}' chevauche la cible d'assignation '{}'",
+                                    eff_path.display, existing.path.display
+                                ))
+                                .with_code("E0017")
+                                .with_primary_label(
+                                    arg.value.span,
+                                    "transfert de propriété ('sink') interdit vers une variable cible d'assignation",
+                                )
+                                .with_secondary_label(
+                                    existing.span,
+                                    "cible d'assignation ici",
+                                )
+                                .with_help("Une variable ne peut pas être simultanément transférée et réassignée."),
+                            );
+                        }
+                        (BorrowKind::In, BorrowKind::PendingAssign) => {}
+                        (BorrowKind::PendingAssign, _) => {}
                     }
                 } else {
                     borrows.push(BorrowRecord {
@@ -1622,17 +1661,34 @@ pub fn check_assignment_target_with_active(
             .iter()
             .find(|b| b.path.overlaps(&target_path))
         {
-            let mode = match conflict.kind {
-                BorrowKind::In => "en lecture ('in')",
-                BorrowKind::InOut => "en écriture exclusive ('inout')",
-                BorrowKind::Sink => "transférée ('sink')",
+            let (code, mode, help_msg) = match conflict.kind {
+                BorrowKind::In => (
+                    "E0012",
+                    "en lecture ('in')",
+                    "Terminez la portée de l'emprunt actif (ex: boucle d'itération) avant de modifier la variable.",
+                ),
+                BorrowKind::InOut => (
+                    "E0011",
+                    "en écriture exclusive ('inout')",
+                    "Une variable ne peut faire l'objet que d'une seule mutation ou emprunt 'inout' exclusif à la fois.",
+                ),
+                BorrowKind::Sink => (
+                    "E0017",
+                    "transférée ('sink')",
+                    "Une variable transférée ne peut plus être modifiée ni accédée.",
+                ),
+                BorrowKind::PendingAssign => (
+                    "E0011",
+                    "en cours d'assignation",
+                    "Une variable ne peut faire l'objet que d'une seule assignation exclusive à la fois.",
+                ),
             };
             diagnostics.push(
                 Diagnostic::error(format!(
-                    "loi d'exclusivité violée : la variable '{}' ne peut pas être modifiée car elle fait l'objet d'un emprunt actif {}",
+                    "loi d'exclusivité violée : la variable '{}' ne peut pas être modifiée car elle fait déjà l'objet d'un emprunt actif {}",
                     target_path.display, mode
                 ))
-                .with_code("E0012")
+                .with_code(code)
                 .with_primary_label(
                     target.span,
                     format!("mutation interdite sur '{}' pendant un emprunt actif", target_path.display),
@@ -1641,7 +1697,7 @@ pub fn check_assignment_target_with_active(
                     conflict.span,
                     format!("emprunt actif {} ici", mode),
                 )
-                .with_help("Terminez la portée de l'emprunt actif (ex: boucle d'itération) avant de modifier la variable."),
+                .with_help(help_msg),
             );
             return;
         }

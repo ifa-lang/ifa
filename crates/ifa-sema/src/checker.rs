@@ -1343,7 +1343,22 @@ impl<'a> SemanticAnalyzer<'a> {
                     None
                 };
                 let target_ty = declared_target_ty.unwrap_or_else(|| self.infer_expr(target));
+
+                // Guard target against overlapping inout/sink borrows during evaluation of assignment value
+                let target_borrow = extract_access_path(target).map(|path| BorrowRecord {
+                    path,
+                    kind: BorrowKind::PendingAssign,
+                    span: target.span,
+                });
+                if let Some(b) = &target_borrow {
+                    self.active_borrows.push(b.clone());
+                }
+
                 let val_ty = self.check_expr(val, Some(&target_ty));
+
+                if target_borrow.is_some() {
+                    self.active_borrows.pop();
+                }
 
                 if !val_ty.is_assignable_to(&target_ty) {
                     self.diagnostics.push(
@@ -1608,9 +1623,21 @@ impl<'a> SemanticAnalyzer<'a> {
                 self.symbols.enter_scope(true, false);
                 self.check_pattern(pattern, &elem_ty);
 
+                let is_inout_iterable = matches!(
+                    &iterable.kind,
+                    ExprKind::Unary {
+                        op: UnaryOp::InOut,
+                        ..
+                    }
+                );
+                let borrow_kind = if is_inout_iterable {
+                    BorrowKind::InOut
+                } else {
+                    BorrowKind::In
+                };
                 let iter_borrow = extract_access_path(iterable).map(|path| BorrowRecord {
                     path,
-                    kind: BorrowKind::In,
+                    kind: borrow_kind,
                     span: iterable.span,
                 });
                 if let Some(b) = &iter_borrow {
