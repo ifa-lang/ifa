@@ -1578,6 +1578,11 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("!58 = distinct !{!58, !2, !7, !4, !5, !12, !13, !24, !37, !38}\n");
         out.push_str("!59 = distinct !{!59, !2, !9, !4, !5, !12, !13, !24, !37, !39}\n");
         out.push_str("!60 = distinct !{!60, !2, !11, !4, !5, !12, !13, !24, !37, !38}\n");
+        // Specialized 1D general strided loop vectorization hints (interleave 4/8, parallel accesses, noalias, vector width)
+        out.push_str("!61 = distinct !{!61, !2, !3, !4, !5, !12, !13, !24}\n");
+        out.push_str("!62 = distinct !{!62, !2, !7, !4, !5, !12, !13, !24}\n");
+        out.push_str("!63 = distinct !{!63, !2, !9, !4, !5, !12, !13, !24}\n");
+        out.push_str("!64 = distinct !{!64, !2, !11, !4, !5, !12, !13, !24}\n");
 
         Ok(out)
     }
@@ -4868,6 +4873,13 @@ impl<'a> LlvmIrEmitter<'a> {
                             16 | 32 => 59,
                             _ => 57,
                         }
+                    } else if hint.is_strided_loop || hint.loop_stride.is_some() {
+                        match hint.vector_width {
+                            2 => 64,
+                            4 => 62,
+                            16 | 32 => 63,
+                            _ => 61,
+                        }
                     } else if hint.is_tripartite_matrix_reduction {
                         match hint.vector_width {
                             2 => 52,
@@ -4965,6 +4977,13 @@ impl<'a> LlvmIrEmitter<'a> {
                             4 => 58,
                             16 | 32 => 59,
                             _ => 57,
+                        }
+                    } else if hint.is_strided_loop || hint.loop_stride.is_some() {
+                        match hint.vector_width {
+                            2 => 64,
+                            4 => 62,
+                            16 | 32 => 63,
+                            _ => 61,
                         }
                     } else if hint.is_tripartite_matrix_reduction {
                         match hint.vector_width {

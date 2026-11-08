@@ -1536,8 +1536,8 @@ fn test_vectorize_strided_slices_non_aliasing_interleaved() {
             ParamMode::InOut,
         )],
         FirType::Unit,
-        false,
         true,
+        false,
         false,
         None,
         Span::DUMMY,
@@ -1598,4 +1598,164 @@ fn test_vectorize_strided_slices_non_aliasing_interleaved() {
         VectorizePass::are_slice_bases_disjoint(&func, v_even_slice, v_odd_slice),
         "Even and odd strided slices on the same base must be provably disjoint"
     );
+}
+
+#[test]
+fn test_strided_loop_vectorization_directive_and_bounds_elimination() {
+    use ifa_fir::{BasicBlock, BinaryOp, BlockId};
+
+    let mut func = FirFunction::new(
+        INTERNER.intern("test_strided_loop"),
+        vec![FirParam::new(
+            INTERNER.intern("arr"),
+            ValueId(0),
+            FirType::Slice(Box::new(FirType::Int(IntType::I64))),
+            ParamMode::InOut,
+        )],
+        FirType::Unit,
+        true,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    // Block 0: Entry
+    let b0 = BlockId(0);
+    let b1 = BlockId(1); // Loop header / body
+    let b2 = BlockId(2); // Loop latch
+    let b3 = BlockId(3); // Exit
+
+    func.blocks.clear();
+    let mut bb0 = BasicBlock::new(b0);
+    let mut bb1 = BasicBlock::new(b1);
+    let mut bb2 = BasicBlock::new(b2);
+    let mut bb3 = BasicBlock::new(b3);
+
+    let v_start = ValueId(1);
+    let v_end = ValueId(2);
+    let v_stride = ValueId(3);
+    let v_strided_slice = ValueId(4);
+
+    bb0.push_instruction(Instruction::new(
+        Some(v_start),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.push_instruction(Instruction::new(
+        Some(v_end),
+        ValueExpr::Constant(ConstantValue::Int(100, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.push_instruction(Instruction::new(
+        Some(v_stride),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.push_instruction(Instruction::new(
+        Some(v_strided_slice),
+        ValueExpr::SliceStrided {
+            base: ValueId(0),
+            start: v_start,
+            end: v_end,
+            stride: v_stride,
+        },
+        Span::DUMMY,
+    ));
+    bb0.set_terminator(Terminator::Branch {
+        target: b1,
+        args: vec![v_start],
+    });
+
+    // Block 1: Header / Body
+    let v_i = ValueId(5);
+    bb1.push_param(v_i, FirType::Int(IntType::I64));
+    let v_cond = ValueId(6);
+    bb1.push_instruction(Instruction::new(
+        Some(v_cond),
+        ValueExpr::Binary {
+            op: BinaryOp::Lt,
+            lhs: v_i,
+            rhs: v_end,
+        },
+        Span::DUMMY,
+    ));
+    bb1.set_terminator(Terminator::BranchCond {
+        cond: v_cond,
+        then_block: b2,
+        then_args: vec![],
+        else_block: b3,
+        else_args: vec![],
+    });
+
+    // Block 2: Latch
+    let v_bounds_tok = ValueId(7);
+    bb2.push_instruction(Instruction::new(
+        Some(v_bounds_tok),
+        ValueExpr::SliceStridedBoundsCheck {
+            base: v_strided_slice,
+            start: v_start,
+            end: v_end,
+            stride: v_stride,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    let v_elem = ValueId(8);
+    bb2.push_instruction(Instruction::new(
+        Some(v_elem),
+        ValueExpr::GetElement {
+            base: v_strided_slice,
+            index: v_i,
+        },
+        Span::DUMMY,
+    ));
+    let v_c1 = ValueId(9);
+    bb2.push_instruction(Instruction::new(
+        Some(v_c1),
+        ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let v_next_i = ValueId(10);
+    bb2.push_instruction(Instruction::new(
+        Some(v_next_i),
+        ValueExpr::Binary {
+            op: BinaryOp::Add,
+            lhs: v_i,
+            rhs: v_c1,
+        },
+        Span::DUMMY,
+    ));
+    bb2.set_terminator(Terminator::Branch {
+        target: b1,
+        args: vec![v_next_i],
+    });
+
+    // Block 3: Exit
+    bb3.set_terminator(Terminator::Return(None));
+
+    func.blocks.push(bb0);
+    func.blocks.push(bb1);
+    func.blocks.push(bb2);
+    func.blocks.push(bb3);
+
+    let mut pass = VectorizePass::new();
+    pass.run_on_function(&mut func);
+    let stats = pass.stats();
+
+    assert!(
+        stats.strided_loops_vectorized >= 1,
+        "Strided loop must be vectorized: {:?}",
+        stats
+    );
+    assert!(
+        stats.strided_bounds_eliminated >= 1,
+        "Strided bounds check must be statically eliminated: {:?}",
+        stats
+    );
+
+    let latch_b = func.get_block(b2).unwrap();
+    let hint = latch_b.vector_hint.expect("Latch must have vector hint");
+    assert!(hint.is_strided_loop, "Vector hint must mark strided loop");
+    assert_eq!(hint.loop_stride, Some(2), "Stride must be detected as 2");
 }

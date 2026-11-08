@@ -27,6 +27,8 @@ pub struct FunctionTranslator<'a, M: Module> {
     value_map: HashMap<ValueId, ClValue>,
     pointer_types: HashMap<ValueId, types::Type>,
     pointer_fir_types: HashMap<ValueId, FirType>,
+    constant_ints: HashMap<ValueId, i64>,
+    strided_slices: HashMap<ValueId, i64>,
 }
 
 impl<'a, M: Module> FunctionTranslator<'a, M> {
@@ -49,6 +51,8 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             value_map: HashMap::new(),
             pointer_types: HashMap::new(),
             pointer_fir_types: HashMap::new(),
+            constant_ints: HashMap::new(),
+            strided_slices: HashMap::new(),
         }
     }
 
@@ -555,6 +559,9 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                         IntType::I32 | IntType::U32 => types::I32,
                         IntType::I64 | IntType::U64 | IntType::ISize | IntType::USize => types::I64,
                     };
+                    if let Some(r) = result {
+                        self.constant_ints.insert(r, *i as i64);
+                    }
                     Some(self.builder.ins().iconst(cl_ty, *i as i64))
                 }
                 ConstantValue::Bool(b) => {
@@ -1152,7 +1159,13 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             ValueExpr::GetElement { base, index } => {
                 let p = self.value_map[base];
                 let idx = self.value_map[index];
-                let offset = self.builder.ins().imul_imm_s(idx, 8);
+                let elem_scale = self.strided_slices.get(base).copied().unwrap_or(1) * 8;
+                let offset = if elem_scale > 0 && (elem_scale as u64).is_power_of_two() {
+                    let shift = elem_scale.trailing_zeros() as i64;
+                    self.builder.ins().ishl_imm_u(idx, shift)
+                } else {
+                    self.builder.ins().imul_imm_s(idx, elem_scale)
+                };
                 let addr = self.builder.ins().iadd(p, offset);
                 Some(
                     self.builder
@@ -1165,7 +1178,13 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let p = self.value_map[base];
                 let idx = self.value_map[index];
                 let v = self.value_map[val];
-                let offset = self.builder.ins().imul_imm_s(idx, 8);
+                let elem_scale = self.strided_slices.get(base).copied().unwrap_or(1) * 8;
+                let offset = if elem_scale > 0 && (elem_scale as u64).is_power_of_two() {
+                    let shift = elem_scale.trailing_zeros() as i64;
+                    self.builder.ins().ishl_imm_u(idx, shift)
+                } else {
+                    self.builder.ins().imul_imm_s(idx, elem_scale)
+                };
                 let addr = self.builder.ins().iadd(p, offset);
                 self.builder
                     .ins()
@@ -1594,13 +1613,30 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 Some(payload)
             }
 
-            ValueExpr::SliceSub { base, start, .. }
-            | ValueExpr::SliceStrided { base, start, .. } => {
+            ValueExpr::SliceSub { base, start, .. } => {
                 let base_addr = self.value_map[base];
                 let start_idx = self.value_map[start];
                 let elem_size = self.builder.ins().iconst(self.ptr_type, 8);
                 let offset = self.builder.ins().imul(start_idx, elem_size);
                 let sub_addr = self.builder.ins().iadd(base_addr, offset);
+                Some(sub_addr)
+            }
+
+            ValueExpr::SliceStrided {
+                base,
+                start,
+                stride,
+                ..
+            } => {
+                let base_addr = self.value_map[base];
+                let start_idx = self.value_map[start];
+                let elem_size = self.builder.ins().iconst(self.ptr_type, 8);
+                let offset = self.builder.ins().imul(start_idx, elem_size);
+                let sub_addr = self.builder.ins().iadd(base_addr, offset);
+                if let Some(res_val) = result {
+                    let st = self.constant_ints.get(stride).copied().unwrap_or(1);
+                    self.strided_slices.insert(res_val, st);
+                }
                 Some(sub_addr)
             }
 

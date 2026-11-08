@@ -553,6 +553,8 @@ pub struct LoopVectorHint {
     pub is_strided_conv3d: bool,
     pub conv_strides: Option<(u32, u32, u32)>,
     pub is_zero_copy: bool,
+    pub is_strided_loop: bool,
+    pub loop_stride: Option<i64>,
 }
 
 impl LoopVectorHint {
@@ -583,6 +585,8 @@ impl LoopVectorHint {
             is_strided_conv3d: false,
             conv_strides: None,
             is_zero_copy: false,
+            is_strided_loop: false,
+            loop_stride: None,
         }
     }
 
@@ -705,6 +709,13 @@ impl LoopVectorHint {
     /// Mark the convolution/slice accesses as operating strictly zero-copy on direct buffers.
     pub fn with_zero_copy(mut self, zero_copy: bool) -> Self {
         self.is_zero_copy = zero_copy;
+        self
+    }
+
+    /// Mark the loop as a general strided loop with induction or slice access step.
+    pub fn with_strided_loop(mut self, stride: i64) -> Self {
+        self.is_strided_loop = true;
+        self.loop_stride = Some(stride);
         self
     }
 }

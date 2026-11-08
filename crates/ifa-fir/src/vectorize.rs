@@ -80,6 +80,8 @@ pub struct VectorizeStats {
     pub strided_conv3d_vectorized: usize,
     /// Number of zero-copy strided convolutions specialized without intermediate copies.
     pub zero_copy_convolutions_specialized: usize,
+    /// Number of general strided loops successfully vectorized with SIMD directives.
+    pub strided_loops_vectorized: usize,
     /// Number of strided slice bounds checks statically eliminated.
     pub strided_bounds_eliminated: usize,
 }
@@ -686,9 +688,41 @@ impl VectorizePass {
                     }
                 }
 
+                // General 1D strided loops (e.g. decimation, slice stepping, linear strided accesses)
+                let is_strided_loop = has_strided_access || is_strided_conv2d || is_strided_conv3d;
+                let loop_stride = conv_strides.map(|s| s.0 as i64).or(if has_strided_access {
+                    Some(2)
+                } else {
+                    None
+                });
+
+                if is_strided_loop && !is_strided_conv2d && !is_strided_conv3d {
+                    self.stats.strided_loops_vectorized += 1;
+                    let mut strided_eliminated = 0;
+                    for &b_id in &loop_info.blocks {
+                        if let Some(block) = func.get_block_mut(b_id) {
+                            for inst in &mut block.instructions {
+                                if let ValueExpr::SliceStridedBoundsCheck { redundant, .. } =
+                                    &mut inst.expr
+                                {
+                                    if !*redundant {
+                                        *redundant = true;
+                                        strided_eliminated += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if strided_eliminated > 0 {
+                        self.stats.strided_bounds_eliminated += strided_eliminated;
+                        had_eliminated_bounds = true;
+                    }
+                }
+
                 let effective_interleave = if is_strided_conv3d {
                     8
-                } else if is_strided_conv2d {
+                } else if is_strided_conv2d || (is_strided_loop && !is_tripartite && !is_bipartite)
+                {
                     match primary_ty {
                         FirType::Float(FloatType::F32)
                         | FirType::Int(IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8) => {
@@ -749,6 +783,8 @@ impl VectorizePass {
                     is_strided_conv3d,
                     conv_strides,
                     is_zero_copy,
+                    is_strided_loop,
+                    loop_stride,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)

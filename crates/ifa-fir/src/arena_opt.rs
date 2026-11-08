@@ -65,6 +65,8 @@ pub struct ArenaFusionStats {
     pub coroutine_sync_barriers_eliminated: usize,
     /// Total disjoint arena references proven preserved and valid across coroutine yield points.
     pub disjoint_arena_references_preserved: usize,
+    /// Total nested call arena frames fused into outer caller scopes.
+    pub nested_call_arenas_fused: usize,
 }
 
 impl ArenaFusionStats {
@@ -82,6 +84,7 @@ impl ArenaFusionStats {
             + self.multidim_projections_fused
             + self.coroutine_sync_barriers_eliminated
             + self.disjoint_arena_references_preserved
+            + self.nested_call_arenas_fused
     }
 }
 
@@ -805,6 +808,7 @@ impl ArenaFusionPass {
             let mut callee_param_arenas: HashMap<Symbol, HashMap<usize, u16>> = HashMap::new();
             let mut callee_param_verified: HashMap<Symbol, HashMap<usize, bool>> = HashMap::new();
             let mut callee_return_arenas: HashMap<Symbol, u16> = HashMap::new();
+            let mut callees_under_call_arena: HashSet<Symbol> = HashSet::new();
 
             // 1. Analyze each function's return arena
             for func in &module.functions {
@@ -830,9 +834,19 @@ impl ArenaFusionPass {
                 let mut val_to_arena: HashMap<ValueId, u16> = HashMap::new();
                 let mut aliases: HashMap<ValueId, ValueId> = HashMap::new();
                 let mut verified_at_call: HashSet<ValueId> = HashSet::new();
+                let mut in_call_arena_scope = false;
 
                 for block in &func.blocks {
                     for inst in &block.instructions {
+                        match &inst.expr {
+                            ValueExpr::CallArenaMark => {
+                                in_call_arena_scope = true;
+                            }
+                            ValueExpr::CallArenaRewind { .. } => {
+                                in_call_arena_scope = false;
+                            }
+                            _ => {}
+                        }
                         if let (Some(res), ValueExpr::GenAlloc { arena: Some(a), .. }) =
                             (inst.result, &inst.expr)
                         {
@@ -872,6 +886,9 @@ impl ArenaFusionPass {
                             },
                         ) = (inst.result, &inst.expr)
                         {
+                            if in_call_arena_scope {
+                                callees_under_call_arena.insert(*callee_name);
+                            }
                             if let Some(&ret_a) = callee_return_arenas.get(callee_name) {
                                 val_to_arena.insert(res, ret_a);
                                 verified_at_call.insert(res);
@@ -879,7 +896,12 @@ impl ArenaFusionPass {
                         }
 
                         let callee_sym = match &inst.expr {
-                            ValueExpr::CallDirect { name: callee, .. } => Some(*callee),
+                            ValueExpr::CallDirect { name: callee, .. } => {
+                                if in_call_arena_scope {
+                                    callees_under_call_arena.insert(*callee);
+                                }
+                                Some(*callee)
+                            }
                             _ => None,
                         };
                         let call_args = match &inst.expr {
@@ -952,6 +974,39 @@ impl ArenaFusionPass {
                     }
                 }
 
+                if callees_under_call_arena.contains(&func.name) {
+                    let mut has_call_arena_scope = false;
+                    for block in &func.blocks {
+                        if block
+                            .instructions
+                            .iter()
+                            .any(|i| matches!(i.expr, ValueExpr::CallArenaMark))
+                        {
+                            has_call_arena_scope = true;
+                            break;
+                        }
+                    }
+                    if has_call_arena_scope {
+                        let mut eliminated_marks = HashSet::new();
+                        for block in &mut func.blocks {
+                            block.instructions.retain(|i| match &i.expr {
+                                ValueExpr::CallArenaMark => {
+                                    if let Some(res) = i.result {
+                                        eliminated_marks.insert(res);
+                                    }
+                                    false
+                                }
+                                ValueExpr::CallArenaRewind { mark } => {
+                                    !eliminated_marks.contains(mark)
+                                }
+                                _ => true,
+                            });
+                        }
+                        self.stats.nested_call_arenas_fused += 1;
+                        self.stats.call_arena_scopes_coalesced += 1;
+                    }
+                }
+
                 if incoming_param_arenas.is_empty()
                     && call_res_arenas.is_empty()
                     && incoming_verified_params.is_empty()
@@ -977,22 +1032,92 @@ impl ArenaFusionPass {
 
     /// Coalesces intermediate call arena allocations (`CallArenaAlloc`) and consolidates redundant `CallArenaMark` / `CallArenaRewind` scopes.
     fn optimize_call_arenas_in_pipeline(&mut self, func: &mut FirFunction) {
-        // Phase 1: Mark & Rewind scope consolidation
+        // Phase 1: Sequential Mark & Rewind scope consolidation and Nested Scope Fusion
         let mut mark_replacements: HashMap<ValueId, ValueId> = HashMap::new();
         let mut redundant_mark_insts: HashSet<ValueId> = HashSet::new();
+        let mut redundant_rewind_marks: HashSet<ValueId> = HashSet::new();
 
+        // Phase 1: Nested Call Arena Scopes Fusion & Hierarchical Scope Consolidation
+        // Detects inner call arena scopes [mark_inner .. rewind_inner] enveloped by an outer scope
+        // [mark_outer .. rewind_outer], fusing the nested frame directly into the parent arena.
         for block in &func.blocks {
+            let mut active_mark_stack: Vec<ValueId> = Vec::new();
+            let mut mark_allocations: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+
+            // Track uses of values within and after instructions
+            let mut val_last_use_idx: HashMap<ValueId, usize> = HashMap::new();
+            for (idx, inst) in block.instructions.iter().enumerate() {
+                for u in inst.expr.uses() {
+                    val_last_use_idx.insert(u, idx);
+                }
+            }
+            if let Some(term) = &block.terminator {
+                for u in term.uses() {
+                    // Mark as escaping to terminator / block exit
+                    val_last_use_idx.insert(u, block.instructions.len() + 1);
+                }
+            }
+
+            let block_rewind_marks: HashSet<ValueId> = block
+                .instructions
+                .iter()
+                .filter_map(|i| match i.expr {
+                    ValueExpr::CallArenaRewind { mark } => Some(mark),
+                    _ => None,
+                })
+                .collect();
+
+            for inst in &block.instructions {
+                match &inst.expr {
+                    ValueExpr::CallArenaMark => {
+                        if let Some(res) = inst.result {
+                            active_mark_stack.push(res);
+                        }
+                    }
+                    ValueExpr::CallArenaAlloc { .. } => {
+                        if let Some(res) = inst.result {
+                            if let Some(&top_mark) = active_mark_stack.last() {
+                                mark_allocations.entry(top_mark).or_default().push(res);
+                            }
+                        }
+                    }
+                    ValueExpr::CallArenaRewind { mark } => {
+                        let actual_mark = mark_replacements.get(mark).copied().unwrap_or(*mark);
+                        if let Some(pos) = active_mark_stack.iter().rposition(|&m| m == actual_mark)
+                        {
+                            if pos > 0 {
+                                // Nested scope inside active_mark_stack[pos - 1]
+                                let parent_mark = active_mark_stack[pos - 1];
+                                mark_replacements.insert(actual_mark, parent_mark);
+                                redundant_mark_insts.insert(actual_mark);
+                                if block_rewind_marks.contains(&parent_mark) {
+                                    // True nested scope: parent has its own outer rewind, so eliminate inner rewind
+                                    redundant_rewind_marks.insert(actual_mark);
+                                    self.stats.nested_call_arenas_fused += 1;
+                                }
+                                self.stats.call_arena_scopes_coalesced += 1;
+                            }
+                            active_mark_stack.remove(pos);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Coalesce remaining redundant marks that have no intervening allocations and no matching rewind
             let mut last_mark: Option<ValueId> = None;
             for inst in &block.instructions {
                 match &inst.expr {
                     ValueExpr::CallArenaMark => {
                         if let Some(res) = inst.result {
-                            if let Some(prev) = last_mark {
-                                mark_replacements.insert(res, prev);
-                                redundant_mark_insts.insert(res);
-                                self.stats.call_arena_scopes_coalesced += 1;
-                            } else {
-                                last_mark = Some(res);
+                            if !redundant_mark_insts.contains(&res) {
+                                if let Some(prev) = last_mark {
+                                    mark_replacements.insert(res, prev);
+                                    redundant_mark_insts.insert(res);
+                                    self.stats.call_arena_scopes_coalesced += 1;
+                                } else {
+                                    last_mark = Some(res);
+                                }
                             }
                         }
                     }
@@ -1004,15 +1129,24 @@ impl ArenaFusionPass {
             }
         }
 
-        // Apply mark replacements on rewinds and remove redundant mark instructions
-        if !mark_replacements.is_empty() {
+        // Apply mark replacements on rewinds and remove redundant mark and rewind instructions
+        if !mark_replacements.is_empty() || !redundant_rewind_marks.is_empty() {
             for block in &mut func.blocks {
                 block.instructions.retain(|i| {
                     if let Some(r) = i.result {
-                        !redundant_mark_insts.contains(&r)
-                    } else {
-                        true
+                        if redundant_mark_insts.contains(&r) {
+                            return false;
+                        }
                     }
+                    if let ValueExpr::CallArenaRewind { mark } = &i.expr {
+                        let canon = mark_replacements.get(mark).copied().unwrap_or(*mark);
+                        if redundant_rewind_marks.contains(mark)
+                            || redundant_rewind_marks.contains(&canon)
+                        {
+                            return false;
+                        }
+                    }
+                    true
                 });
                 for inst in &mut block.instructions {
                     if let ValueExpr::CallArenaRewind { mark } = &mut inst.expr {

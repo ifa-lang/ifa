@@ -1360,3 +1360,116 @@ fn test_multidim_strided_projections_folding() {
         panic!("Expected SliceStrided instruction: {:?}", folded_slice);
     }
 }
+
+#[test]
+fn test_nested_call_arena_fusion_eliminates_inner_rewind() {
+    use ifa_fir::ConstantValue;
+
+    let mut func = FirFunction::new(
+        INTERNER.intern("test_nested_call_arenas"),
+        Vec::new(),
+        FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let entry = func.entry_block;
+    let bb = func.get_block_mut(entry).unwrap();
+
+    let v_mark_outer = ValueId(1);
+    let v_mark_inner = ValueId(2);
+    let v_alloc_inner = ValueId(3);
+    let v_c42 = ValueId(4);
+
+    // 1. Outer call arena scope
+    bb.push_instruction(Instruction::new(
+        Some(v_mark_outer),
+        ValueExpr::CallArenaMark,
+        Span::DUMMY,
+    ));
+
+    // 2. Nested inner call arena scope (e.g. from an inlined sub-call)
+    bb.push_instruction(Instruction::new(
+        Some(v_mark_inner),
+        ValueExpr::CallArenaMark,
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(v_alloc_inner),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Int(IntType::I64),
+        },
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(v_c42),
+        ValueExpr::Constant(ConstantValue::Int(42, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::Store {
+            ptr: v_alloc_inner,
+            val: v_c42,
+        },
+        Span::DUMMY,
+    ));
+
+    // 3. Inner rewind (which would prematurely invalidate v_alloc_inner if not fused)
+    bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::CallArenaRewind { mark: v_mark_inner },
+        Span::DUMMY,
+    ));
+
+    // 4. Outer rewind at end of caller scope
+    bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::CallArenaRewind { mark: v_mark_outer },
+        Span::DUMMY,
+    ));
+
+    // Return the allocated buffer from inner scope
+    bb.set_terminator(Terminator::Return(Some(v_alloc_inner)));
+
+    let mut module = FirModule {
+        name: INTERNER.intern("nested_call_arena_mod"),
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+        functions: vec![func],
+    };
+
+    let mut pass = ArenaFusionPass::new();
+    let stats = pass.run_on_module(&mut module);
+
+    assert_eq!(
+        stats.nested_call_arenas_fused, 1,
+        "Nested call arena scope must be fused into outer scope: {:?}",
+        stats
+    );
+
+    let opt_fn = &module.functions[0];
+    let remaining_marks = opt_fn.blocks[0]
+        .instructions
+        .iter()
+        .filter(|i| matches!(&i.expr, ValueExpr::CallArenaMark))
+        .count();
+    let remaining_rewinds = opt_fn.blocks[0]
+        .instructions
+        .iter()
+        .filter(|i| matches!(&i.expr, ValueExpr::CallArenaRewind { .. }))
+        .count();
+
+    assert_eq!(
+        remaining_marks, 1,
+        "Only outer CallArenaMark must remain after nested fusion"
+    );
+    assert_eq!(
+        remaining_rewinds, 1,
+        "Only outer CallArenaRewind must remain after nested fusion"
+    );
+}

@@ -5159,3 +5159,108 @@ fn test_llvm_codegen_channel_try_send_nonblocking() {
     );
     assert!(ir.contains("declare i32 @ifa_rt_channel_try_send(ptr, ptr)"));
 }
+
+#[test]
+fn test_llvm_strided_loop_vectorization_metadata_and_compilation() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirParam, FirType, Instruction,
+        LoopVectorHint, ParamMode, Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let fn_name = INTERNER.intern("test_llvm_strided_loop");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![FirParam::new(
+            INTERNER.intern("arr"),
+            ValueId(0),
+            FirType::Slice(Box::new(FirType::Int(IntType::I64))),
+            ParamMode::InOut,
+        )],
+        FirType::Unit,
+        true,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let b0 = BlockId(0);
+    let b1 = BlockId(1);
+    let mut bb0 = BasicBlock::new(b0);
+    let mut bb1 = BasicBlock::new(b1);
+
+    let v_stride = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(v_stride),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.terminator = Some(Terminator::Branch {
+        target: b1,
+        args: vec![],
+    });
+
+    let v_zero = ValueId(2);
+    bb1.instructions.push(Instruction::new(
+        Some(v_zero),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    // Vector hint for 4-lane strided loop (i64, vector_width=4, loop_stride=2)
+    let hint = LoopVectorHint::new(4, 4, true).with_strided_loop(2);
+    bb1.set_vector_hint(hint);
+    bb1.terminator = Some(Terminator::Branch {
+        target: b1,
+        args: vec![],
+    });
+
+    func.blocks.push(bb0);
+    func.blocks.push(bb1);
+
+    let module = FirModule {
+        name: INTERNER.intern("strided_loop_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    // Verify 1D strided vectorization metadata !62 is declared
+    assert!(
+        ir.contains("!62 = distinct !{!62, !2, !7, !4, !5, !12, !13, !24}"),
+        "LLVM IR must define !62 strided vectorization node:\n{}",
+        ir
+    );
+    // Verify branch attaches !llvm.loop !62
+    assert!(
+        ir.contains("br label %bb1, !llvm.loop !62"),
+        "Loop branch must attach !llvm.loop !62 metadata:\n{}",
+        ir
+    );
+
+    // Verify compilation to native object succeeds
+    let temp_dir = std::env::temp_dir();
+    let obj_path = temp_dir.join("test_strided_loop.o");
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "LLVM object compilation with strided vectorization hints failed: {:?}",
+        compile_res.err()
+    );
+    if obj_path.exists() {
+        let _ = std::fs::remove_file(obj_path);
+    }
+}
