@@ -20,8 +20,44 @@ pub struct EpochStats {
     pub epoch_transitions: usize,
     /// Total number of slots permanently quarantined due to secondary generation overflow.
     pub quarantined_slots: usize,
+    /// Total number of saturated slab pages automatically quarantined.
+    pub quarantined_slabs: usize,
+    /// Total number of active slab pages currently serving allocations.
+    pub active_slabs: usize,
     /// Current active epoch pins held by concurrent readers/fibers.
     pub active_pins: usize,
+}
+
+/// Lifecycle status of an individual slab page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlabStatus {
+    /// Slab actively serves allocations.
+    Active,
+    /// Slab contains quarantined slots, but has not reached the saturation threshold.
+    PartiallyQuarantined,
+    /// Slab reached the saturation threshold and is automatically quarantined from the active pool.
+    QuarantinedSaturated,
+}
+
+/// Detailed saturation and quarantine metrics for a specific size-class pool.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlabPoolSaturationStats {
+    /// Size class payload capacity in bytes.
+    pub size_class: usize,
+    /// Count of actively allocated and operational slab pages.
+    pub active_pages: usize,
+    /// Count of slab pages retired to automatic quarantine due to saturation.
+    pub quarantined_pages: usize,
+    /// Total slot capacity across all operational pages.
+    pub total_active_capacity: usize,
+    /// Total slot capacity across all quarantined saturated pages.
+    pub total_quarantined_capacity: usize,
+    /// Current number of quarantined slots in this size class.
+    pub quarantined_slots: usize,
+    /// Current number of actively allocated slots in this size class.
+    pub active_slots: usize,
+    /// Saturation ratio of quarantined slots across all slabs in this pool (0.0 to 1.0).
+    pub saturation_ratio: f64,
 }
 
 /// Thread-safe concurrent epoch coordinator and lifetime analyzer.
@@ -29,6 +65,7 @@ pub struct EpochManager {
     global_epoch: AtomicU64,
     epoch_transitions: AtomicUsize,
     quarantined_slots: AtomicUsize,
+    quarantined_slabs: AtomicUsize,
     active_pins: AtomicUsize,
 }
 
@@ -38,6 +75,7 @@ impl EpochManager {
             global_epoch: AtomicU64::new(1),
             epoch_transitions: AtomicUsize::new(0),
             quarantined_slots: AtomicUsize::new(0),
+            quarantined_slabs: AtomicUsize::new(0),
             active_pins: AtomicUsize::new(0),
         }
     }
@@ -64,6 +102,16 @@ impl EpochManager {
         self.quarantined_slots.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record automatic quarantine of saturated slab pages.
+    pub fn record_slab_quarantine(&self, count: usize) {
+        self.quarantined_slabs.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Retrieve total count of quarantined saturated slab pages.
+    pub fn quarantined_slabs(&self) -> usize {
+        self.quarantined_slabs.load(Ordering::Relaxed)
+    }
+
     /// Pin the current execution context into the current epoch.
     pub fn pin(&self) -> EpochGuard<'_> {
         self.active_pins.fetch_add(1, Ordering::SeqCst);
@@ -80,6 +128,8 @@ impl EpochManager {
             global_epoch: self.current_epoch(),
             epoch_transitions: self.epoch_transitions.load(Ordering::Relaxed),
             quarantined_slots: self.quarantined_slots.load(Ordering::Relaxed),
+            quarantined_slabs: self.quarantined_slabs.load(Ordering::Relaxed),
+            active_slabs: 0,
             active_pins: self.active_pins.load(Ordering::Relaxed),
         }
     }
@@ -109,19 +159,26 @@ struct FreeNode {
     next: *mut FreeNode,
 }
 
+/// Default capacity of slots per slab page (64 slots).
+pub const DEFAULT_PAGE_CAPACITY: usize = 64;
+
 /// A slab page containing multiple fixed-size slots.
-struct SlabPage {
+pub struct SlabPage {
+    pub page_id: usize,
     memory: *mut u8,
     layout: Layout,
     slot_size_with_header: usize,
-    capacity: usize,
+    pub capacity: usize,
+    pub active_slots: usize,
+    pub quarantined_slots: usize,
+    pub status: SlabStatus,
 }
 
 unsafe impl Send for SlabPage {}
 unsafe impl Sync for SlabPage {}
 
 impl SlabPage {
-    fn new(slot_payload_size: usize, capacity: usize) -> Self {
+    pub fn new(slot_payload_size: usize, capacity: usize, page_id: usize) -> Self {
         let header_size = std::mem::size_of::<GenHeader>();
         let slot_size = header_size + slot_payload_size;
         // Align each slot to 8 bytes minimum
@@ -135,11 +192,54 @@ impl SlabPage {
         }
 
         Self {
+            page_id,
             memory,
             layout,
             slot_size_with_header: slot_size,
             capacity,
+            active_slots: 0,
+            quarantined_slots: 0,
+            status: SlabStatus::Active,
         }
+    }
+
+    /// Check if a memory address falls within this slab page boundaries.
+    #[inline(always)]
+    pub fn contains(&self, ptr: *const u8) -> bool {
+        let addr = ptr as usize;
+        let start = self.memory as usize;
+        let end = start + self.layout.size();
+        addr >= start && addr < end
+    }
+
+    /// Check whether all slots of this slab page have been quarantined.
+    #[inline(always)]
+    pub fn is_fully_quarantined(&self) -> bool {
+        self.quarantined_slots >= self.capacity
+    }
+
+    /// Saturation ratio of quarantined slots within this slab page (0.0 to 1.0).
+    #[inline(always)]
+    pub fn quarantine_ratio(&self) -> f64 {
+        if self.capacity == 0 {
+            0.0
+        } else {
+            self.quarantined_slots as f64 / self.capacity as f64
+        }
+    }
+
+    /// Check whether this slab page has reached or exceeded a saturation threshold.
+    #[inline(always)]
+    pub fn is_saturated(&self, threshold_ratio: f64) -> bool {
+        self.quarantine_ratio() >= threshold_ratio
+            && (self.active_slots == 0 || self.quarantined_slots >= self.capacity)
+    }
+
+    /// Available unallocated and non-quarantined slots in this slab page.
+    #[inline(always)]
+    pub fn available_slots(&self) -> usize {
+        self.capacity
+            .saturating_sub(self.quarantined_slots + self.active_slots)
     }
 }
 
@@ -152,25 +252,35 @@ impl Drop for SlabPage {
 }
 
 /// A class pool handling slots of a specific payload size.
-struct SizeClassPool {
-    slot_payload_size: usize,
+pub struct SizeClassPool {
+    pub slot_payload_size: usize,
+    pub page_capacity: usize,
+    next_page_id: usize,
     free_head: *mut FreeNode,
-    pages: Vec<SlabPage>,
+    pub pages: Vec<SlabPage>,
+    pub quarantined_pages: Vec<SlabPage>,
 }
 
 unsafe impl Send for SizeClassPool {}
 unsafe impl Sync for SizeClassPool {}
 
 impl SizeClassPool {
-    fn new(slot_payload_size: usize) -> Self {
+    pub fn new(slot_payload_size: usize) -> Self {
+        Self::with_capacity(slot_payload_size, DEFAULT_PAGE_CAPACITY)
+    }
+
+    pub fn with_capacity(slot_payload_size: usize, page_capacity: usize) -> Self {
         Self {
             slot_payload_size,
+            page_capacity,
+            next_page_id: 1,
             free_head: std::ptr::null_mut(),
             pages: Vec::new(),
+            quarantined_pages: Vec::new(),
         }
     }
 
-    fn allocate(&mut self, arena_id: u16, class_idx: usize) -> *mut u8 {
+    pub fn allocate(&mut self, arena_id: u16, class_idx: usize) -> *mut u8 {
         if self.free_head.is_null() {
             self.grow();
         }
@@ -189,11 +299,24 @@ impl SizeClassPool {
                 allocation_flags: FLAG_ACTIVE | class_flag | preserved_epoch,
                 arena_id,
             };
+
+            for page in &mut self.pages {
+                if page.contains(payload_ptr) {
+                    page.active_slots += 1;
+                    break;
+                }
+            }
+
             payload_ptr
         }
     }
 
-    fn allocate_batch(&mut self, arena_id: u16, class_idx: usize, count: usize) -> Vec<*mut u8> {
+    pub fn allocate_batch(
+        &mut self,
+        arena_id: u16,
+        class_idx: usize,
+        count: usize,
+    ) -> Vec<*mut u8> {
         let mut slots = Vec::with_capacity(count);
         for _ in 0..count {
             slots.push(self.allocate(arena_id, class_idx));
@@ -201,12 +324,21 @@ impl SizeClassPool {
         slots
     }
 
-    fn recycle(&mut self, payload_ptr: *mut u8) {
+    pub fn recycle(&mut self, payload_ptr: *mut u8) {
         unsafe {
             let header = (payload_ptr as *mut GenHeader).sub(1);
             if (*header).is_quarantined() {
-                // Permanently retired slot; do not recycle
+                // Permanently retired slot; register quarantine and evaluate slab saturation
+                self.on_slot_quarantined(payload_ptr);
                 return;
+            }
+            for page in &mut self.pages {
+                if page.contains(payload_ptr) {
+                    if page.active_slots > 0 {
+                        page.active_slots -= 1;
+                    }
+                    break;
+                }
             }
             let node = payload_ptr as *mut FreeNode;
             (*node).next = self.free_head;
@@ -214,15 +346,120 @@ impl SizeClassPool {
         }
     }
 
-    fn recycle_batch(&mut self, slots: &[*mut u8]) {
+    pub fn recycle_batch(&mut self, slots: &[*mut u8]) {
         for &slot in slots {
             self.recycle(slot);
         }
     }
 
+    /// Register a quarantined slot within this size-class pool.
+    /// If the owning slab page reaches 100% saturation (or all capacity is quarantined),
+    /// the slab page is automatically quarantined and removed from the active operational list.
+    pub fn on_slot_quarantined(&mut self, ptr: *mut u8) -> Option<usize> {
+        let mut saturated_idx = None;
+        for (idx, page) in self.pages.iter_mut().enumerate() {
+            if page.contains(ptr) {
+                if page.active_slots > 0 {
+                    page.active_slots -= 1;
+                }
+                page.quarantined_slots += 1;
+                if page.quarantined_slots >= page.capacity {
+                    page.status = SlabStatus::QuarantinedSaturated;
+                    saturated_idx = Some(idx);
+                } else {
+                    page.status = SlabStatus::PartiallyQuarantined;
+                }
+                break;
+            }
+        }
+
+        if let Some(idx) = saturated_idx {
+            let page = self.pages.remove(idx);
+            self.purge_free_nodes_for_page(&page);
+            self.quarantined_pages.push(page);
+            Some(1)
+        } else {
+            None
+        }
+    }
+
+    /// Purge any intrusive free nodes referencing the quarantined slab page.
+    fn purge_free_nodes_for_page(&mut self, page: &SlabPage) {
+        let mut prev_next_ptr: *mut *mut FreeNode = &mut self.free_head;
+        unsafe {
+            while !(*prev_next_ptr).is_null() {
+                let current_node = *prev_next_ptr;
+                let payload_ptr = current_node as *mut u8;
+                if page.contains(payload_ptr) {
+                    *prev_next_ptr = (*current_node).next;
+                } else {
+                    prev_next_ptr = &mut (*current_node).next;
+                }
+            }
+        }
+    }
+
+    /// Automatically quarantine any slab pages that meet or exceed the saturation threshold.
+    pub fn auto_quarantine_saturated_slabs(&mut self, threshold_ratio: f64) -> usize {
+        let mut quarantined_count = 0;
+        let mut i = 0;
+        while i < self.pages.len() {
+            let is_saturated = self.pages[i].is_saturated(threshold_ratio);
+            if is_saturated {
+                let mut page = self.pages.remove(i);
+                page.status = SlabStatus::QuarantinedSaturated;
+                self.purge_free_nodes_for_page(&page);
+                self.quarantined_pages.push(page);
+                quarantined_count += 1;
+            } else {
+                i += 1;
+            }
+        }
+        quarantined_count
+    }
+
+    /// Calculate aggregate saturation and quarantine metrics for this pool.
+    pub fn saturation_stats(&self) -> SlabPoolSaturationStats {
+        let mut total_active_cap = 0;
+        let mut active_slots = 0;
+        let mut active_quarantined_slots = 0;
+        for page in &self.pages {
+            total_active_cap += page.capacity;
+            active_slots += page.active_slots;
+            active_quarantined_slots += page.quarantined_slots;
+        }
+
+        let mut total_quarantined_cap = 0;
+        let mut retired_quarantined_slots = 0;
+        for page in &self.quarantined_pages {
+            total_quarantined_cap += page.capacity;
+            retired_quarantined_slots += page.quarantined_slots;
+        }
+
+        let total_quarantined = active_quarantined_slots + retired_quarantined_slots;
+        let total_capacity = total_active_cap + total_quarantined_cap;
+        let saturation_ratio = if total_capacity == 0 {
+            0.0
+        } else {
+            total_quarantined as f64 / total_capacity as f64
+        };
+
+        SlabPoolSaturationStats {
+            size_class: self.slot_payload_size,
+            active_pages: self.pages.len(),
+            quarantined_pages: self.quarantined_pages.len(),
+            total_active_capacity: total_active_cap,
+            total_quarantined_capacity: total_quarantined_cap,
+            quarantined_slots: total_quarantined,
+            active_slots,
+            saturation_ratio,
+        }
+    }
+
     fn grow(&mut self) {
-        const DEFAULT_PAGE_CAPACITY: usize = 64;
-        let page = SlabPage::new(self.slot_payload_size, DEFAULT_PAGE_CAPACITY);
+        let page_id = self.next_page_id;
+        self.next_page_id += 1;
+        let page = SlabPage::new(self.slot_payload_size, self.page_capacity, page_id);
         let header_size = std::mem::size_of::<GenHeader>();
         let slot_size = page.slot_size_with_header;
 
@@ -294,18 +531,20 @@ impl GenArena {
             unsafe {
                 let header = (ptr as *mut GenHeader).sub(1);
                 if (*header).is_active() {
-                    let _ = (*header).mark_freed();
+                    let transition = (*header).mark_freed();
+                    if transition == crate::header::EpochTransition::Quarantined {
+                        allocator.register_quarantined_slot(ptr, header);
+                    }
                 }
             }
         }
         self.allocated_ptrs.clear();
-        let _ = allocator;
     }
 }
 
 /// Core global generational allocator.
 pub struct GlobalGenAllocatorInner {
-    pools: Vec<SizeClassPool>,
+    pub pools: Vec<SizeClassPool>,
     arenas: HashMap<u16, GenArena>,
     large_allocations: HashMap<usize, (usize, Layout, u32)>,
 }
@@ -424,6 +663,7 @@ impl GlobalGenAllocatorInner {
     pub(crate) unsafe fn recycle_raw(&mut self, ptr: *mut u8, header: *mut GenHeader) {
         if (*header).is_quarantined() {
             // Permanently quarantined due to 32-bit generation overflow; do not return to pool
+            self.register_quarantined_slot(ptr, header);
             return;
         }
 
@@ -449,6 +689,38 @@ impl GlobalGenAllocatorInner {
                 }
             }
         }
+    }
+
+    /// Register a quarantined slot across pools, evaluating slab saturation.
+    pub(crate) unsafe fn register_quarantined_slot(
+        &mut self,
+        ptr: *mut u8,
+        header: *mut GenHeader,
+    ) -> Option<usize> {
+        let class_code = (*header).size_class_id();
+        if class_code >= 1 && class_code <= self.pools.len() {
+            return self.pools[class_code - 1].on_slot_quarantined(ptr);
+        }
+        for pool in &mut self.pools {
+            if let Some(res) = pool.on_slot_quarantined(ptr) {
+                return Some(res);
+            }
+        }
+        None
+    }
+
+    /// Retrieve saturation statistics across all size classes.
+    pub fn slab_saturation_stats(&self) -> Vec<SlabPoolSaturationStats> {
+        self.pools.iter().map(|p| p.saturation_stats()).collect()
+    }
+
+    /// Automatically quarantine saturated slabs across all size classes.
+    pub fn auto_quarantine_saturated_slabs(&mut self, threshold_ratio: f64) -> usize {
+        let mut total = 0;
+        for pool in &mut self.pools {
+            total += pool.auto_quarantine_saturated_slabs(threshold_ratio);
+        }
+        total
     }
 
     /// Allocates memory directly with strict vector alignment (AVX-512 64B, AVX2 32B, NEON 16B).
@@ -768,7 +1040,41 @@ impl GlobalGenAllocator {
 
     /// Retrieve current epoch statistics from the concurrent epoch manager.
     pub fn epoch_stats(&self) -> EpochStats {
-        self.epoch_manager.stats()
+        let (active_slabs, quarantined_slabs) = {
+            let inner = self.inner.lock().unwrap();
+            let mut active = 0;
+            let mut quarantined = 0;
+            for pool in &inner.pools {
+                active += pool.pages.len();
+                quarantined += pool.quarantined_pages.len();
+            }
+            (active, quarantined)
+        };
+        let mut stats = self.epoch_manager.stats();
+        stats.active_slabs = active_slabs;
+        stats.quarantined_slabs = quarantined_slabs.max(stats.quarantined_slabs);
+        stats
+    }
+
+    /// Retrieve detailed saturation and quarantine metrics across all slab size classes.
+    pub fn slab_saturation_stats(&self) -> Vec<SlabPoolSaturationStats> {
+        let inner = self.inner.lock().unwrap();
+        inner.slab_saturation_stats()
+    }
+
+    /// Automatically evaluate and quarantine saturated slabs meeting or exceeding the given threshold ratio.
+    pub fn auto_quarantine_saturated_slabs(&self, threshold_ratio: f64) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let quarantined = inner.auto_quarantine_saturated_slabs(threshold_ratio);
+        if quarantined > 0 {
+            self.epoch_manager.record_slab_quarantine(quarantined);
+        }
+        quarantined
+    }
+
+    /// Number of saturated slab pages permanently placed in quarantine.
+    pub fn quarantined_slabs_count(&self) -> usize {
+        self.epoch_stats().quarantined_slabs
     }
 
     /// Pin the active thread or fiber in the current epoch.
@@ -857,6 +1163,10 @@ impl GlobalGenAllocator {
                 }
                 crate::header::EpochTransition::Quarantined => {
                     self.epoch_manager.record_quarantine();
+                    let mut inner = self.inner.lock().unwrap();
+                    if let Some(slabs_quarantined) = inner.register_quarantined_slot(ptr, header) {
+                        self.epoch_manager.record_slab_quarantine(slabs_quarantined);
+                    }
                     // Permanently quarantined due to 32-bit generation overflow; do not re-add to cache or pool
                     return;
                 }

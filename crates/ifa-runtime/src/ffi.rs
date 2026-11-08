@@ -90,6 +90,29 @@ pub extern "C" fn ifa_rt_epoch_transitions_count() -> usize {
     GLOBAL_ALLOCATOR.epoch_stats().epoch_transitions
 }
 
+/// Number of saturated slab pages permanently placed in quarantine.
+#[no_mangle]
+pub extern "C" fn ifa_rt_epoch_quarantined_slabs_count() -> usize {
+    GLOBAL_ALLOCATOR.quarantined_slabs_count()
+}
+
+/// Returns the saturation ratio (quarantined slots / total capacity) for a specific size class index.
+#[no_mangle]
+pub extern "C" fn ifa_rt_slab_saturation_ratio(class_idx: usize) -> f64 {
+    let stats = GLOBAL_ALLOCATOR.slab_saturation_stats();
+    if class_idx < stats.len() {
+        stats[class_idx].saturation_ratio
+    } else {
+        0.0
+    }
+}
+
+/// Triggers automatic quarantine of slabs meeting or exceeding the specified saturation threshold.
+#[no_mangle]
+pub extern "C" fn ifa_rt_auto_quarantine_saturated_slabs(threshold: f64) -> usize {
+    GLOBAL_ALLOCATOR.auto_quarantine_saturated_slabs(threshold)
+}
+
 /// Intercept and abort program on detected epoch mismatch wrap-around.
 #[no_mangle]
 pub extern "C-unwind" fn ifa_rt_panic_epoch_mismatch(

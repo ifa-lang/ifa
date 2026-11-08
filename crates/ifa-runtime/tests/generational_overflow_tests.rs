@@ -2,7 +2,12 @@
 //! epoch transitions (FLAG_EPOCH_1), and permanent slot quarantine (FLAG_QUARANTINED).
 
 use ifa_runtime::allocator::{
-    call_arena_alloc, call_arena_stats, ThreadLocalCallArena, GLOBAL_ALLOCATOR,
+    call_arena_alloc, call_arena_stats, SizeClassPool, SlabStatus, ThreadLocalCallArena,
+    GLOBAL_ALLOCATOR,
+};
+use ifa_runtime::ffi::{
+    ifa_rt_auto_quarantine_saturated_slabs, ifa_rt_epoch_quarantined_slabs_count,
+    ifa_rt_slab_saturation_ratio,
 };
 use ifa_runtime::header::{GenHeader, GenRef, FLAG_EPOCH_1, FLAG_QUARANTINED};
 
@@ -205,4 +210,158 @@ fn test_large_vector_allocation_quarantine_safety() {
         assert!(!fat_ref.is_valid());
         assert_eq!(fat_ref.deref_checked(), None);
     }
+}
+
+#[test]
+fn test_saturated_slab_automatic_quarantine_policy() {
+    // 1. Initialize dedicated size-class pool with a small capacity of 4 slots
+    let mut pool = SizeClassPool::with_capacity(32, 4);
+    assert_eq!(pool.pages.len(), 0);
+    assert_eq!(pool.quarantined_pages.len(), 0);
+
+    // 2. Allocate 4 slots to fill the slab page completely
+    let slot0 = pool.allocate(0, 1);
+    let slot1 = pool.allocate(0, 1);
+    let slot2 = pool.allocate(0, 1);
+    let slot3 = pool.allocate(0, 1);
+
+    assert_eq!(pool.pages.len(), 1, "Exactly 1 slab page must be created");
+    assert_eq!(pool.pages[0].capacity, 4);
+    assert_eq!(pool.pages[0].active_slots, 4);
+    assert_eq!(pool.pages[0].quarantined_slots, 0);
+    assert_eq!(pool.pages[0].status, SlabStatus::Active);
+
+    unsafe {
+        // Mark all 4 slots as Epoch 1 and at max generation to trigger quarantine upon deallocation
+        for &slot in &[slot0, slot1, slot2, slot3] {
+            let h = (slot as *mut GenHeader).sub(1);
+            (*h).allocation_flags |= FLAG_EPOCH_1;
+            (*h).generation_counter = u32::MAX;
+        }
+
+        // 3. Free first 3 slots with secondary overflow (transition to quarantined)
+        for &slot in &[slot0, slot1, slot2] {
+            let h = (slot as *mut GenHeader).sub(1);
+            let tr = (*h).mark_freed();
+            assert_eq!(tr, ifa_runtime::header::EpochTransition::Quarantined);
+            pool.recycle(slot);
+        }
+
+        // Slab page is partially quarantined (3/4)
+        assert_eq!(pool.pages.len(), 1);
+        assert_eq!(pool.pages[0].active_slots, 1);
+        assert_eq!(pool.pages[0].quarantined_slots, 3);
+        assert_eq!(pool.pages[0].status, SlabStatus::PartiallyQuarantined);
+        assert!(!pool.pages[0].is_fully_quarantined());
+        assert_eq!(pool.pages[0].quarantine_ratio(), 0.75);
+
+        // 4. Free the 4th and final slot: reaches 100% saturation (4/4)
+        let h3 = (slot3 as *mut GenHeader).sub(1);
+        let tr3 = (*h3).mark_freed();
+        assert_eq!(tr3, ifa_runtime::header::EpochTransition::Quarantined);
+        pool.recycle(slot3);
+
+        // Automatic quarantine policy: the saturated slab must be moved out of active pages into quarantined_pages
+        assert_eq!(
+            pool.pages.len(),
+            0,
+            "Saturated slab must be removed from active operational pages"
+        );
+        assert_eq!(
+            pool.quarantined_pages.len(),
+            1,
+            "Saturated slab must be placed into quarantined_pages"
+        );
+
+        let saturated_slab = &pool.quarantined_pages[0];
+        assert_eq!(saturated_slab.status, SlabStatus::QuarantinedSaturated);
+        assert!(saturated_slab.is_fully_quarantined());
+        assert_eq!(saturated_slab.quarantine_ratio(), 1.0);
+        assert_eq!(saturated_slab.active_slots, 0);
+        assert_eq!(saturated_slab.quarantined_slots, 4);
+
+        // 5. Subsequent allocation must grow a fresh new slab page and not collide with any quarantined slot
+        let fresh_slot = pool.allocate(0, 1);
+        assert!(!fresh_slot.is_null());
+        assert_eq!(
+            pool.pages.len(),
+            1,
+            "A fresh active slab page must be grown"
+        );
+        assert_eq!(pool.quarantined_pages.len(), 1);
+
+        for &retired in &[slot0, slot1, slot2, slot3] {
+            assert_ne!(
+                fresh_slot, retired,
+                "Fresh allocation must never alias any quarantined slot from saturated slab"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_auto_quarantine_saturated_slabs_threshold_policy() {
+    let mut pool = SizeClassPool::with_capacity(64, 4);
+    let s0 = pool.allocate(0, 2);
+    let s1 = pool.allocate(0, 2);
+    let s2 = pool.allocate(0, 2);
+    let s3 = pool.allocate(0, 2);
+
+    unsafe {
+        // Quarantining 3 out of 4 slots gives a 75% saturation ratio
+        for &s in &[s0, s1, s2] {
+            let h = (s as *mut GenHeader).sub(1);
+            (*h).allocation_flags |= FLAG_EPOCH_1;
+            (*h).generation_counter = u32::MAX;
+            let _ = (*h).mark_freed();
+            pool.recycle(s);
+        }
+
+        // Release slot 3 normally (not quarantined)
+        let h3 = (s3 as *mut GenHeader).sub(1);
+        let _ = (*h3).mark_freed();
+        pool.recycle(s3);
+
+        assert_eq!(pool.pages.len(), 1);
+        assert_eq!(pool.pages[0].active_slots, 0);
+        assert_eq!(pool.pages[0].quarantined_slots, 3);
+        assert_eq!(pool.pages[0].quarantine_ratio(), 0.75);
+
+        // Applying threshold of 0.70 triggers automatic quarantine of the 75%-saturated slab
+        let quarantined_count = pool.auto_quarantine_saturated_slabs(0.70);
+        assert_eq!(quarantined_count, 1);
+        assert_eq!(pool.pages.len(), 0);
+        assert_eq!(pool.quarantined_pages.len(), 1);
+        assert_eq!(
+            pool.quarantined_pages[0].status,
+            SlabStatus::QuarantinedSaturated
+        );
+
+        // Verification of aggregate metrics
+        let stats = pool.saturation_stats();
+        assert_eq!(stats.size_class, 64);
+        assert_eq!(stats.active_pages, 0);
+        assert_eq!(stats.quarantined_pages, 1);
+        assert_eq!(stats.quarantined_slots, 3);
+        assert_eq!(stats.saturation_ratio, 0.75);
+    }
+}
+
+#[test]
+fn test_global_allocator_and_ffi_slab_quarantine_metrics() {
+    let initial_quarantined_slabs = ifa_rt_epoch_quarantined_slabs_count();
+    let stats = GLOBAL_ALLOCATOR.slab_saturation_stats();
+    assert_eq!(stats.len(), ifa_runtime::allocator::SIZE_CLASSES.len());
+
+    for (idx, stat) in stats.iter().enumerate() {
+        assert_eq!(stat.size_class, ifa_runtime::allocator::SIZE_CLASSES[idx]);
+        let ratio = ifa_rt_slab_saturation_ratio(idx);
+        assert_eq!(ratio, stat.saturation_ratio);
+        assert!((0.0..=1.0).contains(&ratio));
+    }
+
+    // Trigger auto-quarantine with default threshold of 1.0
+    let retired = ifa_rt_auto_quarantine_saturated_slabs(1.0);
+    let final_quarantined_slabs = ifa_rt_epoch_quarantined_slabs_count();
+    assert_eq!(final_quarantined_slabs, initial_quarantined_slabs + retired);
 }
