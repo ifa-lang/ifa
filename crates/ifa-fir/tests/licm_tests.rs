@@ -744,3 +744,125 @@ fn test_streaming_pipeline_disjoint_arena_load_hoisting() {
         "Load from disjoint arena must be hoisted by LICM"
     );
 }
+
+#[test]
+fn test_partial_alias_elimination_on_disjoint_composite_paths_under_loop() {
+    let src = r#"
+        struct State {
+            data: i64,
+            counter: i64,
+        }
+
+        pub fn process_disjoint_loop(mut s: State, n: i64) -> i64 {
+            mut acc = 0;
+            mut i = 0;
+            while i < n {
+                acc = acc + s.data;
+                s.counter = s.counter + 1;
+                i = i + 1;
+            }
+            return acc + s.counter;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("partial_alias.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = lower_program(&prog, &analysis.symbols);
+    let mut licm = LicmPass::new();
+    licm.run_on_module(&mut module);
+
+    let stats = licm.stats();
+    assert!(
+        stats.eliminated_partial_aliases >= 1 || stats.hoisted_projections >= 1,
+        "Disjoint composite field read s.data must have partial alias eliminated or hoisted: {:?}",
+        stats
+    );
+
+    let mut interp = FirInterpreter::new(&module);
+    let state_obj = FirValue::Struct {
+        name: ifa_span::INTERNER.intern("State"),
+        fields: vec![FirValue::Int(10), FirValue::Int(0)],
+    };
+
+    // 10 * 5 + 5 = 55
+    let res = interp
+        .execute_function("process_disjoint_loop", vec![state_obj, FirValue::Int(5)])
+        .unwrap();
+    assert_eq!(res, FirValue::Int(55));
+}
+
+#[test]
+fn test_partial_alias_elimination_nested_composite_fields() {
+    let src = r#"
+        struct Metadata {
+            tag: i64,
+        }
+
+        struct Container {
+            meta: Metadata,
+            counter: i64,
+        }
+
+        pub fn compute_nested(mut c: Container, limit: i64) -> i64 {
+            mut sum = 0;
+            mut k = 0;
+            while k < limit {
+                sum = sum + c.meta.tag;
+                c.counter = c.counter + 2;
+                k = k + 1;
+            }
+            return sum + c.counter;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("nested_partial_alias.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = lower_program(&prog, &analysis.symbols);
+    let mut licm = LicmPass::new();
+    licm.run_on_module(&mut module);
+
+    let stats = licm.stats();
+    assert!(
+        stats.loops_optimized >= 1,
+        "Loop must be optimized: {:?}",
+        stats
+    );
+
+    let mut interp = FirInterpreter::new(&module);
+    let meta_obj = FirValue::Struct {
+        name: ifa_span::INTERNER.intern("Metadata"),
+        fields: vec![FirValue::Int(7)],
+    };
+    let container_obj = FirValue::Struct {
+        name: ifa_span::INTERNER.intern("Container"),
+        fields: vec![meta_obj, FirValue::Int(0)],
+    };
+
+    // 7 * 4 + (2 * 4) = 28 + 8 = 36
+    let res = interp
+        .execute_function("compute_nested", vec![container_obj, FirValue::Int(4)])
+        .unwrap();
+    assert_eq!(res, FirValue::Int(36));
+}

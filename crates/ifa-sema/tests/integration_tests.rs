@@ -4233,3 +4233,88 @@ fn test_slice_symbolic_index_disjoint_allowed() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_symbolic_offset_indices_disjoint_allowed() {
+    let code = r#"
+        fn swap_neighbors(inout a: i64, inout b: i64) {
+            let tmp = a;
+            a = b;
+            b = tmp;
+        }
+
+        pub fn main() {
+            mut arr = [10, 20, 30, 40, 50];
+            let i: i64 = 1;
+            // arr[i] and arr[i + 1] are provably disjoint symbolic offset paths
+            swap_neighbors(inout arr[i], inout arr[i + 1]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Symbolic offset indices arr[i] and arr[i + 1] must be proven disjoint: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_partial_alias_composite_parent_and_child_rejected() {
+    let code = r#"
+        struct State {
+            data: i64,
+            flag: bool,
+        }
+
+        fn mutate_both(inout s: State, inout d: i64) {
+            d = 42;
+            s.data = 100;
+        }
+
+        pub fn main() {
+            mut st = State { data: 10, flag: false };
+            // st.data is mutated via s.data and via d simultaneously
+            mutate_both(inout st, inout st.data);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Partial aliasing between composite parent and child must be rejected with E0011: {:?}",
+        res.diagnostics
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0011")),
+        "Expected E0011 for partial alias conflict, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_disjoint_composite_fields_under_while_loop_allowed() {
+    let code = r#"
+        struct Worker {
+            items: [i64; 4],
+            counter: i64,
+        }
+
+        pub fn main() {
+            mut w = Worker { items: [1, 2, 3, 4], counter: 0 };
+            mut i = 0;
+            while i < 4 {
+                // Accessing disjoint composite fields under loop
+                let val = w.items[0];
+                w.counter = w.counter + val;
+                i = i + 1;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Accessing disjoint composite fields under while loop must succeed: {:?}",
+        res.diagnostics
+    );
+}

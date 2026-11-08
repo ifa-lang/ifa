@@ -12,7 +12,7 @@ pub use escape::{
     extract_escape_root, format_projection_expr, AllocKind, ContainedRef, EscapeAnalyzer,
     EscapeStatus, VarEscapeInfo, VarOrigin,
 };
-pub use exclusivity::check_call_exclusivity;
+pub use exclusivity::{check_call_exclusivity, AccessPath, PathAliasKind, PathSegment};
 pub use symbol_table::{
     CapturedVariable, FunctionSymbol, StructSymbol, SymbolTable, VariableSymbol,
 };

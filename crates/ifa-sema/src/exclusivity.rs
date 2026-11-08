@@ -63,6 +63,7 @@ pub enum PathSegment {
     Field(Symbol),
     IndexConst(i64),
     IndexSymbolic(Symbol),
+    IndexOffset(Symbol, i64),
     IndexUnknown,
     SliceConst {
         start: Option<i64>,
@@ -208,6 +209,18 @@ fn is_index_disjoint_from_slice(
 /// A relative access path starting from a parameter or local base variable.
 pub type RelativePath = Vec<PathSegment>;
 
+/// Classification of alias relationships between structured memory access paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PathAliasKind {
+    /// Provably disjoint memory locations (NoAlias, e.g. `s.a` vs `s.b`, `arr[i]` vs `arr[i+1]`).
+    Disjoint,
+    /// Identical memory location (MustAlias, exact matching root and segments).
+    Exact,
+    /// Partial aliasing (PartialAlias): one path is a composite parent or prefix of the other,
+    /// or ranges overlap.
+    Partial,
+}
+
 /// A path-sensitive access descriptor representing variable or field projections (e.g. `node.lhs.rhs` or `p.a`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccessPath {
@@ -217,21 +230,30 @@ pub struct AccessPath {
 }
 
 impl AccessPath {
-    /// Determines whether two access paths overlap (alias).
-    /// If both paths refer to the same root, and their prefix of field/index segments match
-    /// without proven disjointness, they overlap.
-    pub fn overlaps(&self, other: &AccessPath) -> bool {
+    /// Classifies the aliasing relationship between two structured access paths.
+    pub fn alias_kind(&self, other: &AccessPath) -> PathAliasKind {
         if self.root != other.root {
-            return false;
+            return PathAliasKind::Disjoint;
         }
         let min_len = self.segments.len().min(other.segments.len());
         for i in 0..min_len {
             match (&self.segments[i], &other.segments[i]) {
                 (PathSegment::Field(f1), PathSegment::Field(f2)) if f1 != f2 => {
-                    return false; // distinct fields at the same depth are provably disjoint
+                    return PathAliasKind::Disjoint; // distinct fields at the same depth are provably disjoint
                 }
                 (PathSegment::IndexConst(c1), PathSegment::IndexConst(c2)) if c1 != c2 => {
-                    return false; // distinct constant indices are provably disjoint
+                    return PathAliasKind::Disjoint; // distinct constant indices are provably disjoint
+                }
+                (PathSegment::IndexOffset(s1, o1), PathSegment::IndexOffset(s2, o2))
+                    if s1 == s2 && o1 != o2 =>
+                {
+                    return PathAliasKind::Disjoint; // arr[i+1] vs arr[i+2]
+                }
+                (PathSegment::IndexSymbolic(s1), PathSegment::IndexOffset(s2, off))
+                | (PathSegment::IndexOffset(s2, off), PathSegment::IndexSymbolic(s1))
+                    if s1 == s2 && *off != 0 =>
+                {
+                    return PathAliasKind::Disjoint; // arr[i] vs arr[i+1]
                 }
                 (
                     PathSegment::IndexConst(c),
@@ -258,7 +280,7 @@ impl AccessPath {
                         b_e.as_ref(),
                         *inclusive,
                     ) {
-                        return false;
+                        return PathAliasKind::Disjoint;
                     }
                 }
                 (
@@ -284,7 +306,7 @@ impl AccessPath {
                         end.as_ref(),
                         *inclusive,
                     ) {
-                        return false;
+                        return PathAliasKind::Disjoint;
                     }
                 }
                 (
@@ -310,7 +332,33 @@ impl AccessPath {
                         end.as_ref(),
                         *inclusive,
                     ) {
-                        return false;
+                        return PathAliasKind::Disjoint;
+                    }
+                }
+                (
+                    PathSegment::IndexOffset(sym, off),
+                    PathSegment::SliceRange {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                )
+                | (
+                    PathSegment::SliceRange {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                    PathSegment::IndexOffset(sym, off),
+                ) => {
+                    let idx_bound = SliceBound::Offset(*sym, *off);
+                    if is_index_disjoint_from_slice(
+                        &idx_bound,
+                        start.as_ref(),
+                        end.as_ref(),
+                        *inclusive,
+                    ) {
+                        return PathAliasKind::Disjoint;
                     }
                 }
                 (
@@ -337,7 +385,7 @@ impl AccessPath {
                         b_e2.as_ref(),
                         *inc2,
                     ) {
-                        return false;
+                        return PathAliasKind::Disjoint;
                     }
                 }
                 (
@@ -360,7 +408,7 @@ impl AccessPath {
                         e2.as_ref(),
                         *inc2,
                     ) {
-                        return false;
+                        return PathAliasKind::Disjoint;
                     }
                 }
                 (
@@ -397,18 +445,39 @@ impl AccessPath {
                         b_e2.as_ref(),
                         *inc2,
                     ) {
-                        return false;
+                        return PathAliasKind::Disjoint;
                     }
                 }
                 (PathSegment::Method(m1), PathSegment::Method(m2)) if m1 != m2 => {
                     // Different method call projections on same receiver
+                    return PathAliasKind::Disjoint;
                 }
                 _ => {
                     // Unknown index or matching segment -> potentially overlapping
                 }
             }
         }
-        true
+
+        if self.segments.len() == other.segments.len() {
+            let has_unknown = self
+                .segments
+                .iter()
+                .any(|s| matches!(s, PathSegment::IndexUnknown));
+            if has_unknown {
+                PathAliasKind::Partial
+            } else {
+                PathAliasKind::Exact
+            }
+        } else {
+            PathAliasKind::Partial
+        }
+    }
+
+    /// Determines whether two access paths overlap (alias).
+    /// If both paths refer to the same root, and their prefix of field/index segments match
+    /// without proven disjointness, they overlap.
+    pub fn overlaps(&self, other: &AccessPath) -> bool {
+        self.alias_kind(other) != PathAliasKind::Disjoint
     }
 
     /// Extends this access path by appending relative projection segments.
@@ -430,6 +499,14 @@ impl AccessPath {
                 }
                 PathSegment::IndexSymbolic(sym) => {
                     display.push_str(&format!("[{}]", INTERNER.resolve(sym)));
+                }
+                PathSegment::IndexOffset(sym, off) => {
+                    let name = INTERNER.resolve(sym);
+                    if *off >= 0 {
+                        display.push_str(&format!("[{}+{}]", name, off));
+                    } else {
+                        display.push_str(&format!("[{}{}]", name, off));
+                    }
                 }
                 PathSegment::IndexUnknown => {
                     display.push_str("[*]");
@@ -1072,6 +1149,33 @@ pub fn extract_access_path(expr: &Expr) -> Option<AccessPath> {
                     let s = INTERNER.resolve(sym);
                     parent.display.push_str(&format!("[{}]", s));
                     parent.segments.push(PathSegment::IndexSymbolic(*sym));
+                }
+                ExprKind::Binary { .. } => {
+                    if let Some(bound) = extract_slice_bound(index) {
+                        match bound {
+                            SliceBound::Offset(sym, off) => {
+                                let name = INTERNER.resolve(&sym);
+                                if off >= 0 {
+                                    parent.display.push_str(&format!("[{}+{}]", name, off));
+                                } else {
+                                    parent.display.push_str(&format!("[{}{}]", name, off));
+                                }
+                                parent.segments.push(PathSegment::IndexOffset(sym, off));
+                            }
+                            SliceBound::Const(c) => {
+                                parent.display.push_str(&format!("[{}]", c));
+                                parent.segments.push(PathSegment::IndexConst(c));
+                            }
+                            SliceBound::Symbolic(s) => {
+                                let name = INTERNER.resolve(&s);
+                                parent.display.push_str(&format!("[{}]", name));
+                                parent.segments.push(PathSegment::IndexSymbolic(s));
+                            }
+                        }
+                    } else {
+                        parent.display.push_str("[*]");
+                        parent.segments.push(PathSegment::IndexUnknown);
+                    }
                 }
                 ExprKind::Range {
                     start,

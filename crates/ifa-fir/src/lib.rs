@@ -33,7 +33,7 @@ pub use ipo::{
 };
 pub use ir::*;
 pub use layout_opt::{CacheLayoutPass, CacheLayoutStats, CACHE_LINE_SIZE};
-pub use licm::{LicmPass, LicmStats};
+pub use licm::{FirPathAliasKind, LicmPass, LicmStats};
 pub use lower::lower_program;
 pub use printer::{format_function, format_module, FirPrinter};
 pub use sroa::{SroaPass, SroaStats};

@@ -2,6 +2,7 @@ use crate::cfg::ControlFlowGraph;
 use crate::dominance::DominanceTree;
 use crate::gen_opt::GenerationalOptPass;
 use crate::ir::*;
+use ifa_span::Symbol;
 use std::collections::{HashMap, HashSet};
 
 /// Statistics collected by the Loop-Invariant Code Motion (LICM) pass.
@@ -17,6 +18,8 @@ pub struct LicmStats {
     pub hoisted_allocs: usize,
     /// Total number of invariant generational reference instructions hoisted out of loops.
     pub hoisted_gen_refs: usize,
+    /// Total number of partial aliases eliminated on disjoint composite paths.
+    pub eliminated_partial_aliases: usize,
     /// Total number of loops optimized.
     pub loops_optimized: usize,
 }
@@ -28,7 +31,35 @@ impl LicmStats {
             + self.hoisted_bounds_checks
             + self.hoisted_allocs
             + self.hoisted_gen_refs
+            + self.eliminated_partial_aliases
     }
+}
+
+/// Classification of aliasing between FIR structured memory access paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FirPathAliasKind {
+    /// Provably disjoint memory locations (NoAlias).
+    Disjoint,
+    /// Identical memory location (MustAlias, exact matching root, arena, and segments).
+    Exact,
+    /// Partial aliasing (PartialAlias): one path is an aggregate prefix of another or overlapping sub-slices.
+    Partial,
+}
+
+#[derive(Debug, Clone)]
+struct DisjointFieldUse {
+    result: ValueId,
+    field_idx: usize,
+    field_name: Symbol,
+}
+
+#[derive(Debug, Clone)]
+struct PartialAliasElimCandidate {
+    block_id: BlockId,
+    inst_index: usize,
+    inst: Instruction,
+    ptr: ValueId,
+    disjoint_field_uses: Vec<DisjointFieldUse>,
 }
 
 /// A segment in a FIR structured memory access path.
@@ -36,6 +67,8 @@ impl LicmStats {
 pub enum FirPathSegment {
     Field(usize),
     ElementConst(i64),
+    ElementSymbolic(ValueId),
+    ElementOffset(ValueId, i64),
     ElementUnknown,
     SliceConst {
         start: Option<i64>,
@@ -59,30 +92,41 @@ pub struct FirAccessPath {
 }
 
 impl FirAccessPath {
-    /// Determines whether two access paths overlap (alias).
-    /// If both paths refer to the same root, and their prefix of field/index segments match
-    /// without proven disjointness, they overlap.
-    pub fn overlaps(&self, other: &FirAccessPath) -> bool {
+    /// Classifies the aliasing relationship between two FIR structured memory access paths.
+    pub fn alias_kind(&self, other: &FirAccessPath) -> FirPathAliasKind {
         // Memory arena isolation: distinct non-zero generational arenas can never alias
         if let (Some(a1), Some(a2)) = (self.arena_id, other.arena_id) {
             if a1 != a2 && a1 > 0 && a2 > 0 {
-                return false;
+                return FirPathAliasKind::Disjoint;
             }
         }
 
         if self.root != other.root {
-            return false;
+            return FirPathAliasKind::Disjoint;
         }
+
         let min_len = self.segments.len().min(other.segments.len());
         for i in 0..min_len {
             match (&self.segments[i], &other.segments[i]) {
                 (FirPathSegment::Field(f1), FirPathSegment::Field(f2)) if f1 != f2 => {
-                    return false; // distinct fields at the same depth are provably disjoint
+                    return FirPathAliasKind::Disjoint; // distinct fields at the same depth are provably disjoint
                 }
                 (FirPathSegment::ElementConst(c1), FirPathSegment::ElementConst(c2))
                     if c1 != c2 =>
                 {
-                    return false; // distinct constant element indices are provably disjoint
+                    return FirPathAliasKind::Disjoint; // distinct constant element indices are provably disjoint
+                }
+                (
+                    FirPathSegment::ElementOffset(v1, off1),
+                    FirPathSegment::ElementOffset(v2, off2),
+                ) if v1 == v2 && off1 != off2 => {
+                    return FirPathAliasKind::Disjoint;
+                }
+                (FirPathSegment::ElementSymbolic(v1), FirPathSegment::ElementOffset(v2, off))
+                | (FirPathSegment::ElementOffset(v2, off), FirPathSegment::ElementSymbolic(v1))
+                    if v1 == v2 && *off != 0 =>
+                {
+                    return FirPathAliasKind::Disjoint;
                 }
                 (
                     FirPathSegment::SliceConst {
@@ -101,13 +145,13 @@ impl FirAccessPath {
                     if let Some(end1) = e1 {
                         let max1 = if *inc1 { *end1 } else { *end1 - 1 };
                         if max1 < min2 {
-                            return false; // slice 1 ends strictly before slice 2 starts
+                            return FirPathAliasKind::Disjoint; // slice 1 ends strictly before slice 2 starts
                         }
                     }
                     if let Some(end2) = e2 {
                         let max2 = if *inc2 { *end2 } else { *end2 - 1 };
                         if max2 < min1 {
-                            return false; // slice 2 ends strictly before slice 1 starts
+                            return FirPathAliasKind::Disjoint; // slice 2 ends strictly before slice 1 starts
                         }
                     }
                 }
@@ -117,7 +161,7 @@ impl FirAccessPath {
                         start: Some(s2), ..
                     },
                 ) if e1 == s2 => {
-                    return false; // provably disjoint symbolic split point
+                    return FirPathAliasKind::Disjoint; // provably disjoint symbolic split point
                 }
                 (
                     FirPathSegment::SliceSymbolic {
@@ -125,7 +169,7 @@ impl FirAccessPath {
                     },
                     FirPathSegment::SliceSymbolic { end: Some(e2), .. },
                 ) if s1 == e2 => {
-                    return false; // provably disjoint symbolic split point
+                    return FirPathAliasKind::Disjoint; // provably disjoint symbolic split point
                 }
                 (
                     FirPathSegment::ElementConst(c),
@@ -145,24 +189,44 @@ impl FirAccessPath {
                 ) => {
                     let min_idx = start.unwrap_or(0);
                     if *c < min_idx {
-                        return false;
+                        return FirPathAliasKind::Disjoint;
                     }
                     if let Some(e) = end {
                         let past_end = if *inclusive { *c > *e } else { *c >= *e };
                         if past_end {
-                            return false;
+                            return FirPathAliasKind::Disjoint;
                         }
                     }
                 }
                 (FirPathSegment::Arena(a1), FirPathSegment::Arena(a2))
                     if a1 != a2 && *a1 > 0 && *a2 > 0 =>
                 {
-                    return false;
+                    return FirPathAliasKind::Disjoint;
                 }
                 _ => {}
             }
         }
-        true
+
+        if self.segments.len() == other.segments.len() {
+            let has_unknown = self
+                .segments
+                .iter()
+                .any(|s| matches!(s, FirPathSegment::ElementUnknown));
+            if has_unknown {
+                FirPathAliasKind::Partial
+            } else {
+                FirPathAliasKind::Exact
+            }
+        } else {
+            FirPathAliasKind::Partial
+        }
+    }
+
+    /// Determines whether two access paths overlap (alias).
+    /// If both paths refer to the same root, and their prefix of field/index segments match
+    /// without proven disjointness, they overlap.
+    pub fn overlaps(&self, other: &FirAccessPath) -> bool {
+        self.alias_kind(other) != FirPathAliasKind::Disjoint
     }
 }
 
@@ -197,8 +261,33 @@ fn resolve_access_path(
                 let mut path = resolve_access_path(*base, inst_defs, constants, depth + 1);
                 if let Some(&c) = constants.get(index) {
                     path.segments.push(FirPathSegment::ElementConst(c));
+                } else if let Some(ValueExpr::Binary {
+                    op: BinaryOp::Add,
+                    lhs,
+                    rhs,
+                }) = inst_defs.get(index)
+                {
+                    if let Some(&off) = constants.get(rhs) {
+                        path.segments.push(FirPathSegment::ElementOffset(*lhs, off));
+                    } else if let Some(&off) = constants.get(lhs) {
+                        path.segments.push(FirPathSegment::ElementOffset(*rhs, off));
+                    } else {
+                        path.segments.push(FirPathSegment::ElementSymbolic(*index));
+                    }
+                } else if let Some(ValueExpr::Binary {
+                    op: BinaryOp::Sub,
+                    lhs,
+                    rhs,
+                }) = inst_defs.get(index)
+                {
+                    if let Some(&off) = constants.get(rhs) {
+                        path.segments
+                            .push(FirPathSegment::ElementOffset(*lhs, -off));
+                    } else {
+                        path.segments.push(FirPathSegment::ElementSymbolic(*index));
+                    }
                 } else {
-                    path.segments.push(FirPathSegment::ElementUnknown);
+                    path.segments.push(FirPathSegment::ElementSymbolic(*index));
                 }
                 return path;
             }
@@ -367,8 +456,32 @@ impl LicmPass {
                                 let mut p = resolve_access_path(*base, &inst_defs, &constants, 0);
                                 if let Some(&c) = constants.get(index) {
                                     p.segments.push(FirPathSegment::ElementConst(c));
+                                } else if let Some(ValueExpr::Binary {
+                                    op: BinaryOp::Add,
+                                    lhs,
+                                    rhs,
+                                }) = inst_defs.get(index)
+                                {
+                                    if let Some(&off) = constants.get(rhs) {
+                                        p.segments.push(FirPathSegment::ElementOffset(*lhs, off));
+                                    } else if let Some(&off) = constants.get(lhs) {
+                                        p.segments.push(FirPathSegment::ElementOffset(*rhs, off));
+                                    } else {
+                                        p.segments.push(FirPathSegment::ElementSymbolic(*index));
+                                    }
+                                } else if let Some(ValueExpr::Binary {
+                                    op: BinaryOp::Sub,
+                                    lhs,
+                                    rhs,
+                                }) = inst_defs.get(index)
+                                {
+                                    if let Some(&off) = constants.get(rhs) {
+                                        p.segments.push(FirPathSegment::ElementOffset(*lhs, -off));
+                                    } else {
+                                        p.segments.push(FirPathSegment::ElementSymbolic(*index));
+                                    }
                                 } else {
-                                    p.segments.push(FirPathSegment::ElementUnknown);
+                                    p.segments.push(FirPathSegment::ElementSymbolic(*index));
                                 }
                                 written_paths.push(p);
                             }
@@ -397,6 +510,208 @@ impl LicmPass {
                             }
                             _ => {}
                         }
+                    }
+                }
+            }
+
+            // Detection and elimination of partial aliases on composite paths under SSA loop:
+            // If a coarse aggregate load `Load { ptr }` in the loop overlaps with written_paths only partially
+            // (i.e. written_paths only writes to disjoint sub-paths like `ptr.field_b`),
+            // and inside the loop the loaded aggregate is only queried for provably disjoint sub-paths like `ptr.field_a`:
+            // We eliminate the partial alias by hoisting the disjoint field access into the preheader.
+            if !has_impure_call {
+                // Compute current definition blocks for loop invariance
+                let mut def_block_init: HashMap<ValueId, BlockId> = HashMap::new();
+                for p in &func.params {
+                    def_block_init.insert(p.val, func.entry_block);
+                }
+                for block in &func.blocks {
+                    for (p_val, _) in &block.params {
+                        def_block_init.insert(*p_val, block.id);
+                    }
+                    for inst in &block.instructions {
+                        if let Some(res) = inst.result {
+                            def_block_init.insert(res, block.id);
+                        }
+                    }
+                }
+
+                let mut eliminated_candidates: Vec<PartialAliasElimCandidate> = Vec::new();
+
+                for &b_id in &loop_info.blocks {
+                    if let Some(b) = func.get_block(b_id) {
+                        for (i_idx, inst) in b.instructions.iter().enumerate() {
+                            if let (Some(load_res), ValueExpr::Load { ptr }) =
+                                (inst.result, &inst.expr)
+                            {
+                                let ptr_operands = inst.expr.uses();
+                                let ptr_invariant = ptr_operands.iter().all(|u| {
+                                    param_values.contains(u)
+                                        || constants.contains_key(u)
+                                        || def_block_init.get(u).is_some_and(|&d_b| {
+                                            !loop_info.blocks.contains(&d_b)
+                                                && dom_tree.dominates(d_b, preheader_id)
+                                        })
+                                });
+
+                                if !ptr_invariant {
+                                    continue;
+                                }
+
+                                let load_path =
+                                    resolve_access_path(*ptr, &inst_defs, &constants, 0);
+                                let overlaps_any =
+                                    written_paths.iter().any(|w| load_path.overlaps(w));
+                                if !overlaps_any {
+                                    continue;
+                                }
+
+                                // Check if all overlaps are partial aliases
+                                let only_partial_aliases = written_paths.iter().all(|w| {
+                                    let ak = load_path.alias_kind(w);
+                                    ak == FirPathAliasKind::Disjoint
+                                        || ak == FirPathAliasKind::Partial
+                                });
+
+                                if !only_partial_aliases {
+                                    continue;
+                                }
+
+                                // Collect all uses of load_res in the entire function
+                                let mut all_uses_in_loop = Vec::new();
+                                let mut used_outside_loop = false;
+
+                                for blk in &func.blocks {
+                                    let in_loop = loop_info.blocks.contains(&blk.id);
+                                    for (inst_pos, other_inst) in
+                                        blk.instructions.iter().enumerate()
+                                    {
+                                        if other_inst.expr.uses().contains(&load_res) {
+                                            if in_loop {
+                                                all_uses_in_loop.push((
+                                                    blk.id,
+                                                    inst_pos,
+                                                    other_inst.clone(),
+                                                ));
+                                            } else {
+                                                used_outside_loop = true;
+                                            }
+                                        }
+                                    }
+                                    if let Some(term) = &blk.terminator {
+                                        if term.uses().contains(&load_res) {
+                                            used_outside_loop = true;
+                                        }
+                                    }
+                                }
+
+                                if used_outside_loop || all_uses_in_loop.is_empty() {
+                                    continue;
+                                }
+
+                                // Check if EVERY use in the loop is a field projection provably disjoint from written_paths
+                                let mut disjoint_uses = Vec::new();
+                                let mut all_uses_disjoint = true;
+
+                                for (_u_bid, _u_idx, u_inst) in &all_uses_in_loop {
+                                    match &u_inst.expr {
+                                        ValueExpr::GetField {
+                                            base,
+                                            field_idx,
+                                            field_name,
+                                        } if *base == load_res => {
+                                            let mut field_path = load_path.clone();
+                                            field_path
+                                                .segments
+                                                .push(FirPathSegment::Field(*field_idx));
+                                            if written_paths.iter().any(|w| field_path.overlaps(w))
+                                            {
+                                                all_uses_disjoint = false;
+                                                break;
+                                            }
+                                            if let Some(res) = u_inst.result {
+                                                disjoint_uses.push(DisjointFieldUse {
+                                                    result: res,
+                                                    field_idx: *field_idx,
+                                                    field_name: *field_name,
+                                                });
+                                            } else {
+                                                all_uses_disjoint = false;
+                                                break;
+                                            }
+                                        }
+                                        _ => {
+                                            all_uses_disjoint = false;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if all_uses_disjoint && !disjoint_uses.is_empty() {
+                                    eliminated_candidates.push(PartialAliasElimCandidate {
+                                        block_id: b_id,
+                                        inst_index: i_idx,
+                                        inst: inst.clone(),
+                                        ptr: *ptr,
+                                        disjoint_field_uses: disjoint_uses,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for cand in eliminated_candidates {
+                    let hoisted_whole = func.alloc_value();
+                    let mut preheader_insts = Vec::new();
+                    preheader_insts.push((hoisted_whole, ValueExpr::Load { ptr: cand.ptr }));
+
+                    for field_use in cand.disjoint_field_uses {
+                        preheader_insts.push((
+                            field_use.result,
+                            ValueExpr::GetField {
+                                base: hoisted_whole,
+                                field_idx: field_use.field_idx,
+                                field_name: field_use.field_name,
+                            },
+                        ));
+                    }
+
+                    if let Some(src_b) = func.get_block_mut(cand.block_id) {
+                        if cand.inst_index < src_b.instructions.len()
+                            && src_b.instructions[cand.inst_index].result == cand.inst.result
+                        {
+                            src_b.instructions.remove(cand.inst_index);
+                        }
+                    }
+
+                    let hoisted_results: HashSet<ValueId> =
+                        preheader_insts.iter().map(|(res, _)| *res).collect();
+                    for &b in &loop_info.blocks {
+                        if let Some(blk) = func.get_block_mut(b) {
+                            blk.instructions.retain(|in_i| {
+                                if let Some(r) = in_i.result {
+                                    !hoisted_results.contains(&r)
+                                } else {
+                                    true
+                                }
+                            });
+                        }
+                    }
+
+                    if let Some(pre_b) = func.get_block_mut(preheader_id) {
+                        for (res, expr) in preheader_insts {
+                            inst_defs.insert(res, expr.clone());
+                            pre_b.instructions.push(Instruction::new(
+                                Some(res),
+                                expr,
+                                cand.inst.span,
+                            ));
+                        }
+                        self.stats.eliminated_partial_aliases += 1;
+                        self.stats.hoisted_loads += 1;
+                        self.stats.hoisted_projections += 1;
+                        loop_optimized = true;
                     }
                 }
             }
@@ -441,15 +756,81 @@ impl LicmPass {
 
                             if let Some(res_val) = inst.result {
                                 // Category 1: Invariant projection, allocation, or memory load
-                                let is_projection = matches!(
-                                    &inst.expr,
-                                    ValueExpr::GetField { .. }
-                                        | ValueExpr::GetFieldPtr { .. }
-                                        | ValueExpr::GetElement { .. }
-                                        | ValueExpr::GetElementPtr { .. }
-                                        | ValueExpr::GenDeref { .. }
-                                        | ValueExpr::ArrayLen { .. }
-                                );
+                                let is_projection = match &inst.expr {
+                                    ValueExpr::GetField {
+                                        base, field_idx, ..
+                                    }
+                                    | ValueExpr::GetFieldPtr {
+                                        base, field_idx, ..
+                                    } => {
+                                        let mut proj_path =
+                                            resolve_access_path(*base, &inst_defs, &constants, 0);
+                                        proj_path.segments.push(FirPathSegment::Field(*field_idx));
+                                        !written_paths.iter().any(|w| proj_path.overlaps(w))
+                                    }
+                                    ValueExpr::GetElement { base, index }
+                                    | ValueExpr::GetElementPtr { base, index } => {
+                                        let mut proj_path =
+                                            resolve_access_path(*base, &inst_defs, &constants, 0);
+                                        if let Some(&c) = constants.get(index) {
+                                            proj_path
+                                                .segments
+                                                .push(FirPathSegment::ElementConst(c));
+                                        } else if let Some(ValueExpr::Binary {
+                                            op: BinaryOp::Add,
+                                            lhs,
+                                            rhs,
+                                        }) = inst_defs.get(index)
+                                        {
+                                            if let Some(&off) = constants.get(rhs) {
+                                                proj_path
+                                                    .segments
+                                                    .push(FirPathSegment::ElementOffset(*lhs, off));
+                                            } else if let Some(&off) = constants.get(lhs) {
+                                                proj_path
+                                                    .segments
+                                                    .push(FirPathSegment::ElementOffset(*rhs, off));
+                                            } else {
+                                                proj_path
+                                                    .segments
+                                                    .push(FirPathSegment::ElementSymbolic(*index));
+                                            }
+                                        } else if let Some(ValueExpr::Binary {
+                                            op: BinaryOp::Sub,
+                                            lhs,
+                                            rhs,
+                                        }) = inst_defs.get(index)
+                                        {
+                                            if let Some(&off) = constants.get(rhs) {
+                                                proj_path.segments.push(
+                                                    FirPathSegment::ElementOffset(*lhs, -off),
+                                                );
+                                            } else {
+                                                proj_path
+                                                    .segments
+                                                    .push(FirPathSegment::ElementSymbolic(*index));
+                                            }
+                                        } else {
+                                            proj_path
+                                                .segments
+                                                .push(FirPathSegment::ElementSymbolic(*index));
+                                        }
+                                        !written_paths.iter().any(|w| proj_path.overlaps(w))
+                                    }
+                                    ValueExpr::GenDeref { ref_val } => {
+                                        let mut proj_path = resolve_access_path(
+                                            *ref_val, &inst_defs, &constants, 0,
+                                        );
+                                        proj_path.segments.push(FirPathSegment::Deref);
+                                        !written_paths.iter().any(|w| proj_path.overlaps(w))
+                                    }
+                                    ValueExpr::ArrayLen { array } => {
+                                        let arr_path =
+                                            resolve_access_path(*array, &inst_defs, &constants, 0);
+                                        !written_paths.iter().any(|w| arr_path.overlaps(w))
+                                    }
+                                    _ => false,
+                                };
 
                                 let is_alloca = matches!(&inst.expr, ValueExpr::Alloca { .. });
 
