@@ -4,7 +4,7 @@ use crate::types::Type;
 use ifa_ast::{Expr, ExprKind, Function, ParamMode, Pattern, Stmt, UnaryOp};
 use ifa_diagnostics::Diagnostic;
 use ifa_span::{Span, Symbol, INTERNER};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Determines if a type contains or is a generational reference (`ref T`).
 pub fn type_contains_ref(ty: &Type) -> bool {
@@ -171,6 +171,7 @@ pub struct VarEscapeInfo {
     pub escape_status: EscapeStatus,
     pub defined_span: Span,
     pub contained_refs: Vec<ContainedRef>,
+    pub is_compound: bool,
 }
 
 /// Nature of an access performed within a concurrent fiber or borrow.
@@ -197,6 +198,8 @@ pub struct EscapeAnalyzer<'a> {
     pub current_func_span: Span,
     pub var_info: HashMap<Symbol, VarEscapeInfo>,
     pub ref_dependencies: HashMap<Symbol, Vec<Symbol>>,
+    pub shared_values: HashMap<Symbol, HashSet<Symbol>>,
+    pub stack_arrays: HashMap<Symbol, Span>,
     pub spawn_depth: usize,
     pub spawn_counter: usize,
     pub current_spawn_id: Option<usize>,
@@ -212,6 +215,8 @@ impl<'a> EscapeAnalyzer<'a> {
             current_func_span: func_span,
             var_info: HashMap::new(),
             ref_dependencies: HashMap::new(),
+            shared_values: HashMap::new(),
+            stack_arrays: HashMap::new(),
             spawn_depth: 0,
             spawn_counter: 0,
             current_spawn_id: None,
@@ -221,6 +226,11 @@ impl<'a> EscapeAnalyzer<'a> {
     }
 
     pub fn record_local_var(&mut self, var: Symbol, span: Span) {
+        if let Some(var_sym) = self.symbols.lookup_variable(&var) {
+            if matches!(var_sym.ty, Type::Array(_, _)) {
+                self.stack_arrays.insert(var, span);
+            }
+        }
         self.var_info.insert(
             var,
             VarEscapeInfo {
@@ -230,11 +240,17 @@ impl<'a> EscapeAnalyzer<'a> {
                 escape_status: EscapeStatus::Local,
                 defined_span: span,
                 contained_refs: Vec::new(),
+                is_compound: false,
             },
         );
     }
 
     pub fn record_param(&mut self, var: Symbol, mode: ParamMode, span: Span) {
+        let is_compound = self
+            .symbols
+            .lookup_variable(&var)
+            .map(|v| v.ty.is_cow_candidate())
+            .unwrap_or(false);
         self.var_info.insert(
             var,
             VarEscapeInfo {
@@ -244,8 +260,111 @@ impl<'a> EscapeAnalyzer<'a> {
                 escape_status: EscapeStatus::Local,
                 defined_span: span,
                 contained_refs: Vec::new(),
+                is_compound,
             },
         );
+    }
+
+    /// Checks whether a variable is of a type candidate for Copy-on-Write (CoW).
+    pub fn is_type_cow_candidate(&self, sym: &Symbol) -> bool {
+        if let Some(info) = self.var_info.get(sym) {
+            if info.is_compound {
+                return true;
+            }
+        }
+        if self.stack_arrays.contains_key(sym) {
+            return true;
+        }
+        if let Some(var_sym) = self.symbols.lookup_variable(sym) {
+            var_sym.ty.is_cow_candidate()
+        } else {
+            false
+        }
+    }
+
+    /// Records that variable `a` and `b` share the same underlying memory/value without exclusive transfer.
+    pub fn record_share(&mut self, a: Symbol, b: Symbol) {
+        if a == b {
+            return;
+        }
+        if !self.is_type_cow_candidate(&b) && !self.is_type_cow_candidate(&a) {
+            return;
+        }
+        let existing: Vec<Symbol> = self
+            .shared_values
+            .get(&b)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
+
+        self.shared_values.entry(a).or_default().insert(b);
+        self.shared_values.entry(b).or_default().insert(a);
+
+        for other in existing {
+            if other != a {
+                self.shared_values.entry(a).or_default().insert(other);
+                self.shared_values.entry(other).or_default().insert(a);
+            }
+        }
+    }
+
+    /// Removes all sharing associations for a consumed (`sink`) or reassigned variable.
+    pub fn remove_share(&mut self, a: Symbol) {
+        if let Some(aliases) = self.shared_values.remove(&a) {
+            for other in aliases {
+                if let Some(other_set) = self.shared_values.get_mut(&other) {
+                    other_set.remove(&a);
+                }
+            }
+        }
+    }
+
+    /// Checks if a mutation on `target` in a strict function violates the prohibition
+    /// of hidden Copy-on-Write (CoW) by operating on a shared, non-unique memory object.
+    pub fn check_strict_cow_mutation(&mut self, target: &Expr, span: Span) -> bool {
+        if !self.current_func_is_strict {
+            return true;
+        }
+
+        if let Some((root_sym, root_span)) = extract_escape_root(target) {
+            if let Some(aliases) = self.shared_values.get(&root_sym) {
+                if !aliases.is_empty()
+                    && (self.is_type_cow_candidate(&root_sym)
+                        || !matches!(target.kind, ExprKind::Ident(_)))
+                {
+                    let root_name = INTERNER.resolve(&root_sym);
+                    let alias_names: Vec<String> =
+                        aliases.iter().map(|s| INTERNER.resolve(s)).collect();
+                    let target_repr = format_projection_expr(target);
+
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "violation du mode strict : mutation sur '{}' nécessitant un Copy-on-Write (CoW) masqué interdite dans une fonction 'strict fn'",
+                            target_repr
+                        ))
+                        .with_code("E0020")
+                        .with_primary_label(
+                            span,
+                            format!(
+                                "mutation sur '{}' requérant un dédoublement CoW masqué interdit en mode strict",
+                                target_repr
+                            ),
+                        )
+                        .with_secondary_label(
+                            root_span,
+                            format!(
+                                "'{}' partage sa mémoire avec '{}' sans transfert exclusif 'sink'",
+                                root_name,
+                                alias_names.join(", ")
+                            ),
+                        )
+                        .with_note("Le mode strict garantit l'absence totale d'allocation implicite sur le tas. Tout Copy-on-Write masqué est prohibé.")
+                        .with_help("Transférez la propriété exclusive avec 'sink' (ex: 'let b = sink a'), utilisez un emprunt 'inout' exclusif sans aliasing, ou opérez dans une 'Arena' pré-allouée."),
+                    );
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     pub fn check_function(&mut self, func: &Function) {
@@ -617,8 +736,40 @@ impl<'a> EscapeAnalyzer<'a> {
             } => {
                 let bound = pattern.bound_variables();
                 let is_arena = init.as_ref().is_some_and(is_arena_expr);
+                let is_array_init = init.as_ref().is_some_and(|e| {
+                    matches!(&e.kind, ExprKind::Array(_) | ExprKind::ArrayRepeat(..))
+                });
+                let is_compound_init = init.as_ref().is_some_and(|e| match &e.kind {
+                    ExprKind::Array(_)
+                    | ExprKind::ArrayRepeat(..)
+                    | ExprKind::StructInit { .. }
+                    | ExprKind::Tuple(_) => true,
+                    ExprKind::Call { .. } => true,
+                    ExprKind::Index { .. } => true,
+                    ExprKind::Ident(s) => self.is_type_cow_candidate(s),
+                    ExprKind::Unary {
+                        op: UnaryOp::Sink,
+                        expr: inner,
+                    } => {
+                        if let Some((s, _)) = extract_escape_root(inner) {
+                            self.is_type_cow_candidate(&s)
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                });
+
                 for (sym, p_span) in &bound {
                     self.record_local_var(*sym, *p_span);
+                    if is_array_init {
+                        self.stack_arrays.insert(*sym, *p_span);
+                    }
+                    if is_compound_init {
+                        if let Some(info) = self.var_info.get_mut(sym) {
+                            info.is_compound = true;
+                        }
+                    }
                     let sym_str = INTERNER.resolve(sym);
                     if is_arena || sym_str.to_lowercase().contains("arena") {
                         if let Some(info) = self.var_info.get_mut(sym) {
@@ -628,6 +779,43 @@ impl<'a> EscapeAnalyzer<'a> {
                 }
                 self.check_pattern_ref_bindings(pattern, init.as_ref(), *span);
                 if let Some(expr) = init {
+                    // Track value sharing for Copy-on-Write analysis
+                    if let ExprKind::Unary {
+                        op: UnaryOp::Sink,
+                        expr: inner,
+                    } = &expr.kind
+                    {
+                        if let Some((consumed_sym, _)) = extract_escape_root(inner) {
+                            self.remove_share(consumed_sym);
+                        }
+                    } else if let ExprKind::Ident(src_sym) = &expr.kind {
+                        if self.is_type_cow_candidate(src_sym) {
+                            for (bound_sym, _) in &bound {
+                                self.record_share(*bound_sym, *src_sym);
+                            }
+                        }
+                    } else if let Some((src_sym, _)) = extract_escape_root(expr) {
+                        let is_inout_param = self
+                            .var_info
+                            .get(&src_sym)
+                            .map(|v| v.origin == VarOrigin::Param(ParamMode::InOut))
+                            .unwrap_or(false);
+
+                        if !is_inout_param {
+                            let is_range_slice = match &expr.kind {
+                                ExprKind::Index { index, .. } => {
+                                    matches!(index.kind, ExprKind::Range { .. })
+                                }
+                                _ => false,
+                            };
+                            if is_range_slice && self.is_type_cow_candidate(&src_sym) {
+                                for (bound_sym, _) in &bound {
+                                    self.record_share(*bound_sym, src_sym);
+                                }
+                            }
+                        }
+                    }
+
                     let refs = self.collect_contained_refs(expr);
                     if !refs.is_empty() {
                         for (sym, _) in &bound {
@@ -700,6 +888,18 @@ impl<'a> EscapeAnalyzer<'a> {
 
                 self.check_expr(target);
                 self.check_expr(val);
+
+                // Static detection of hidden Copy-on-Write in strict fn
+                self.check_strict_cow_mutation(target, *span);
+
+                if let Some((root_sym, _)) = extract_escape_root(target) {
+                    if matches!(target.kind, ExprKind::Ident(_)) {
+                        // Reassignment of whole variable with fresh value breaks old sharing
+                        if !matches!(&val.kind, ExprKind::Ident(_)) {
+                            self.remove_share(root_sym);
+                        }
+                    }
+                }
 
                 if is_arena_expr(val) {
                     if let Some((root_sym, _)) = extract_escape_root(target) {
@@ -949,6 +1149,13 @@ impl<'a> EscapeAnalyzer<'a> {
                             _ => {}
                         }
                     }
+                    if let ExprKind::Unary {
+                        op: UnaryOp::InOut,
+                        expr: inner,
+                    } = &arg.value.kind
+                    {
+                        self.check_strict_cow_mutation(inner, arg.value.span);
+                    }
                     self.check_expr(&arg.value);
                 }
             }
@@ -958,8 +1165,11 @@ impl<'a> EscapeAnalyzer<'a> {
                 args,
                 ..
             } => {
+                let rx_mode = self.method_receiver_mode(receiver, *method, expr.span);
+                if rx_mode == ParamMode::InOut {
+                    self.check_strict_cow_mutation(receiver, receiver.span);
+                }
                 if self.spawn_depth > 0 {
-                    let rx_mode = self.method_receiver_mode(receiver, *method, expr.span);
                     if rx_mode == ParamMode::InOut {
                         self.check_concurrent_arg(
                             receiver,
@@ -976,6 +1186,13 @@ impl<'a> EscapeAnalyzer<'a> {
                 }
                 self.check_expr(receiver);
                 for arg in args {
+                    if let ExprKind::Unary {
+                        op: UnaryOp::InOut,
+                        expr: inner,
+                    } = &arg.value.kind
+                    {
+                        self.check_strict_cow_mutation(inner, arg.value.span);
+                    }
                     if self.spawn_depth > 0 {
                         if let Some((root_sym, root_span)) = extract_escape_root(&arg.value) {
                             if let Some(info) = self.var_info.get(&root_sym) {
@@ -1118,6 +1335,40 @@ impl<'a> EscapeAnalyzer<'a> {
                     self.check_stmt(s);
                 }
                 if let Some(e) = &blk.expr {
+                    self.check_expr(e);
+                }
+            }
+            ExprKind::Lambda { params, body, .. } => {
+                if self.current_func_is_strict {
+                    let p_names: Vec<Symbol> = params.iter().map(|p| p.name).collect();
+                    let captures = crate::checker::collect_lambda_free_variables(
+                        body,
+                        &p_names,
+                        self.symbols.current_depth(),
+                        self.symbols,
+                    );
+                    if !captures.is_empty() {
+                        let cap_names: Vec<String> =
+                            captures.iter().map(|c| INTERNER.resolve(&c.name)).collect();
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "violation du mode strict : la clôture capture des variables locales ('{}') provoquant une promotion implicite vers le tas interdite dans une fonction 'strict fn'",
+                                cap_names.join(", ")
+                            ))
+                            .with_code("E0020")
+                            .with_primary_label(
+                                expr.span,
+                                "capture d'environnement local provoquant une promotion implicite sur le tas",
+                            )
+                            .with_note("Le mode strict impose une exécution zéro-heap déterministe. Les clôtures avec capture d'environnement dynamique sont interdites.")
+                            .with_help("Utilisez des fonctions pures sans capture ou transmettez explicitement les paramètres."),
+                        );
+                    }
+                }
+                for s in &body.stmts {
+                    self.check_stmt(s);
+                }
+                if let Some(e) = &body.expr {
                     self.check_expr(e);
                 }
             }
@@ -1354,6 +1605,43 @@ impl<'a> EscapeAnalyzer<'a> {
 
     fn check_return_expr(&mut self, expr: &Expr) {
         self.check_expr(expr);
+
+        // Strict Mode: Check for illegal heap promotion or escape of a slice pointing to a local stack array
+        if self.current_func_is_strict {
+            if let Some((root_sym, _)) = extract_escape_root(expr) {
+                if let Some(arr_span) = self.stack_arrays.get(&root_sym) {
+                    let is_slice_or_proj = matches!(
+                        &expr.kind,
+                        ExprKind::Index { .. }
+                            | ExprKind::FieldAccess { .. }
+                            | ExprKind::Unary {
+                                op: UnaryOp::Ref,
+                                ..
+                            }
+                    );
+                    if is_slice_or_proj {
+                        let var_name = INTERNER.resolve(&root_sym);
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "violation du mode strict : tentative de promotion implicite vers le tas interdite : la tranche retournée pointe vers le tableau de pile locale '{}'",
+                                var_name
+                            ))
+                            .with_code("E0020")
+                            .with_primary_label(
+                                expr.span,
+                                format!("retour de tranche pointant vers le tableau de pile '{}' expirant avec la fonction", var_name),
+                            )
+                            .with_secondary_label(
+                                *arr_span,
+                                format!("'{}' est alloué sur le cadre de pile locale", var_name),
+                            )
+                            .with_note("Le mode strict interdit la promotion implicite de pointeurs de pile vers le tas.")
+                            .with_help("Retournez le tableau par valeur '[T; N]' ou allouez le tampon dans une 'Arena' pré-allouée."),
+                        );
+                    }
+                }
+            }
+        }
 
         // Case 1: Returning a direct reference `ref target` or `ref target.field`
         if let ExprKind::Unary {

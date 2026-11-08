@@ -192,10 +192,75 @@ impl CowPass {
             block.instructions = new_instructions;
         }
     }
+
+    /// Verifies that a strict deterministic function contains zero Copy-on-Write instructions
+    /// and that no hidden heap allocations occur prior to in-place mutations.
+    pub fn verify_strict_zero_cow(&self, func: &FirFunction) -> Result<(), String> {
+        if !func.is_strict {
+            return Ok(());
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if matches!(inst.expr, ValueExpr::CoWMakeUnique { .. }) {
+                    return Err(format!(
+                        "Strict deterministic function '{}' contains forbidden implicit Copy-on-Write instruction at span {:?}",
+                        func.name, inst.span
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for CowPass {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::FirType;
+    use ifa_ast::ParamMode;
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    #[test]
+    fn test_strict_fn_zero_cow_validation() {
+        let fn_name = INTERNER.intern("strict_compute");
+        let param = FirParam {
+            name: INTERNER.intern("buf"),
+            val: ValueId(0),
+            ty: FirType::Array(Box::new(FirType::Int(IntType::I64)), 4),
+            mode: ParamMode::InOut,
+            noalias: true,
+        };
+
+        let mut func = FirFunction::new(
+            fn_name,
+            vec![param],
+            FirType::Unit,
+            true, // is_strict: true
+            false,
+            false,
+            None,
+            Span::DUMMY,
+        );
+
+        let mut cow_pass = CowPass::new();
+        cow_pass.run_on_function(&mut func);
+        assert_eq!(cow_pass.inserted_count(), 0);
+        assert!(cow_pass.verify_strict_zero_cow(&func).is_ok());
+
+        // Forcibly inject a forbidden CoW instruction to verify detection
+        let entry = func.get_block_mut(func.entry_block).unwrap();
+        entry.push_instruction(Instruction::new(
+            Some(ValueId(99)),
+            ValueExpr::CoWMakeUnique { val: ValueId(0) },
+            Span::DUMMY,
+        ));
+        assert!(cow_pass.verify_strict_zero_cow(&func).is_err());
     }
 }

@@ -1093,3 +1093,170 @@ pub fn spawn_slice_overlapping() -> () {
         analysis.diagnostics
     );
 }
+
+#[test]
+fn test_strict_fn_hidden_cow_mutation_rejected() {
+    let src = r#"
+pub strict fn process_array() -> () {
+    mut a = [1, 2, 3, 4]
+    let b = a
+    a[0] = 99
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_cow.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Hidden Copy-on-Write mutation on shared array in strict fn must be rejected"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0020")),
+        "Expected E0020 for hidden CoW mutation in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_strict_fn_sink_transfer_avoids_cow_allowed() {
+    let src = r#"
+pub strict fn process_unique_transfer() -> () {
+    mut a = [1, 2, 3, 4]
+    mut b = sink a
+    b[0] = 99
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_sink_unique.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Exclusive sink transfer avoids CoW and must succeed in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_strict_fn_closure_capture_heap_promotion_rejected() {
+    let src = r#"
+pub strict fn compute_with_closure() -> () {
+    let factor = 10
+    let mul = fn(x: i64) -> i64 { x * factor }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_closure_capture.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Closure capturing local stack variable in strict fn must be rejected (implicit heap promotion)"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0020")),
+        "Expected E0020 for closure capture heap promotion in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_strict_fn_closure_pure_no_capture_allowed() {
+    let src = r#"
+pub strict fn compute_pure_closure() -> () {
+    let double = fn(x: i64) -> i64 { x * 2 }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_closure_pure.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Pure non-capturing closure without heap allocation must succeed in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_strict_fn_stack_array_slice_return_heap_promotion_rejected() {
+    let src = r#"
+pub strict fn leak_stack_array() -> Slice<i64> {
+    let buf = [1, 2, 3, 4]
+    return buf[0..2]
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_slice_ret.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Returning a slice pointing to local stack array in strict fn must be rejected"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0020")),
+        "Expected E0020 for returning stack array slice in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_strict_fn_shared_struct_field_mutation_cow_rejected() {
+    let src = r#"
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+pub strict fn process_struct() -> () {
+    mut p = Point(x: 10, y: 20)
+    let q = p
+    p.x = 42
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_struct_cow.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Mutating shared struct field requiring CoW in strict fn must be rejected"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0020")),
+        "Expected E0020 for mutating shared struct field in strict fn: {:?}",
+        analysis.diagnostics
+    );
+}

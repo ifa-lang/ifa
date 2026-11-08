@@ -163,6 +163,21 @@ impl Type {
         matches!(self, Type::Unknown)
     }
 
+    /// Determines if this type represents a compound or indirect memory structure
+    /// that would require Copy-on-Write (CoW) allocation if mutated while shared.
+    pub fn is_cow_candidate(&self) -> bool {
+        matches!(
+            self,
+            Type::String
+                | Type::Slice(_)
+                | Type::Array(_, _)
+                | Type::Struct { .. }
+                | Type::Tuple(_)
+                | Type::Generic { .. }
+                | Type::Enum { .. }
+        )
+    }
+
     pub fn parse_int_literal(text: &str, expected: Option<&Type>) -> Type {
         if text.ends_with("u8") {
             Type::Int(IntType::U8)

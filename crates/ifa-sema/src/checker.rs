@@ -2529,6 +2529,24 @@ impl<'a> SemanticAnalyzer<'a> {
                         );
                     }
                 }
+
+                if self.current_func_is_strict && !captures.is_empty() {
+                    let cap_names: Vec<String> =
+                        captures.iter().map(|c| INTERNER.resolve(&c.name)).collect();
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "violation du mode strict : la clôture capture les variables locales ('{}') provoquant une promotion implicite vers le tas interdite dans une fonction 'strict fn'",
+                            cap_names.join(", ")
+                        ))
+                        .with_code("E0020")
+                        .with_primary_label(
+                            expr.span,
+                            "capture d'environnement local provoquant une promotion implicite sur le tas",
+                        )
+                        .with_note("Le mode strict impose une exécution zéro-heap déterministe. Les clôtures avec capture d'environnement dynamique sont interdites.")
+                        .with_help("Utilisez des fonctions pures sans capture ou transmettez explicitement les paramètres."),
+                    );
+                }
                 self.symbols.lambda_captures.insert(expr.span, captures);
 
                 let explicit_ret = ret_ty
@@ -5071,7 +5089,7 @@ impl<'a> SemanticAnalyzer<'a> {
 
 /// Traverses an AST block to identify all free variables belonging to enclosing parent scopes
 /// that are captured by this lambda, returning them as generational reference captures.
-fn collect_lambda_free_variables(
+pub(crate) fn collect_lambda_free_variables(
     body: &Block,
     local_params: &[Symbol],
     parent_depth: usize,
