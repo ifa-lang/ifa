@@ -195,3 +195,93 @@ fn test_purge_redundant_checks_removes_instructions() {
         formatted
     );
 }
+
+#[test]
+fn test_strided_slice_bounds_check_elimination_and_lowering() {
+    let src = r#"
+        pub fn strided_access() -> i64 {
+            let arr: [i64; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
+            let sub = arr[0..8:2];
+            return sub[0];
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strided_bce.ifa".to_string(), src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = ifa_fir::lower_program(&prog, &analysis.symbols);
+    let lowered_formatted = format_function(&module.functions[0]);
+    assert!(
+        lowered_formatted.contains("slicestrided"),
+        "Lowered FIR must emit slicestrided instruction:\n{}",
+        lowered_formatted
+    );
+
+    let mut bce = BcePass::new();
+    bce.run_on_module(&mut module);
+
+    let stats = bce.stats();
+    assert!(
+        stats.total_checks >= 1,
+        "Expected at least 1 bounds check, got {:?}",
+        stats
+    );
+    assert!(
+        stats.eliminated_checks >= 1,
+        "Constant in-bounds strided slice check must be eliminated, got {:?}",
+        stats
+    );
+
+    bce.purge_redundant_checks(&mut module.functions[0]);
+    let purged_formatted = format_function(&module.functions[0]);
+    assert!(
+        !purged_formatted.contains("slicestrided.bounds.check"),
+        "Purged function must not contain slicestrided.bounds.check:\n{}",
+        purged_formatted
+    );
+}
+
+#[test]
+fn test_strided_for_loop_lowering_and_interpretation() {
+    let src = r#"
+        pub fn sum_evens() -> i64 {
+            let mut sum: i64 = 0;
+            for i in 0..10:2 {
+                sum = sum + i;
+            }
+            return sum;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("for_strided.ifa".to_string(), src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = ifa_fir::lower_program(&prog, &analysis.symbols);
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp
+        .execute_function("sum_evens", vec![])
+        .expect("Interpretation of strided for loop failed");
+
+    // 0 + 2 + 4 + 6 + 8 = 20
+    assert_eq!(res, FirValue::Int(20));
+}

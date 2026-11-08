@@ -4514,3 +4514,138 @@ fn test_symbolic_sliding_window_negative_offset_disjoint_allowed() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_strided_slices_interleaved_even_odd_disjoint_allowed() {
+    let code = r#"
+        fn process_stereo(inout left: Slice<i64>, inout right: Slice<i64>) {
+            left[0] = 10;
+            right[0] = 20;
+        }
+
+        pub fn main() {
+            mut audio = [1, 2, 3, 4, 5, 6, 7, 8];
+            let n: i64 = 8;
+            // Strided slices: even indices (0, 2, 4, 6) and odd indices (1, 3, 5, 7)
+            // Stride 2 with offset difference 1 is mathematically guaranteed disjoint
+            process_stereo(inout audio[0..n:2], inout audio[1..n:2]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Interleaved even and odd strided slices must be proven disjoint without E0011: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_strided_slices_same_congruence_overlapping_rejected() {
+    let code = r#"
+        fn process_overlap(inout s1: Slice<i64>, inout s2: Slice<i64>) {
+            s1[0] = 10;
+            s2[0] = 20;
+        }
+
+        pub fn main() {
+            mut audio = [1, 2, 3, 4, 5, 6, 7, 8];
+            let n: i64 = 8;
+            // Both start at even positions (0 and 2) with stride 2: overlap at index 2, 4, 6!
+            process_overlap(inout audio[0..n:2], inout audio[2..n:2]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Strided slices with congruent offsets and overlapping intervals must be rejected with E0011: {:?}",
+        res.diagnostics
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0011")),
+        "Expected E0011 diagnostic code for congruent strided slices, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_strided_slice_vs_single_index_disjoint_allowed() {
+    let code = r#"
+        fn process_sample_and_rest(inout sample: i64, inout odd_slice: Slice<i64>) {
+            sample = 99;
+            odd_slice[0] = 42;
+        }
+
+        pub fn main() {
+            mut audio = [1, 2, 3, 4, 5, 6, 7, 8];
+            let n: i64 = 8;
+            // audio[0] (even) vs audio[1..n:2] (odd indices 1, 3, 5, 7)
+            process_sample_and_rest(inout audio[0], inout audio[1..n:2]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Even index vs odd strided slice must be proven disjoint without E0011: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_strided_slice_vs_single_index_congruent_overlapping_rejected() {
+    let code = r#"
+        fn process_clashing_sample(inout sample: i64, inout even_slice: Slice<i64>) {
+            sample = 99;
+            even_slice[0] = 42;
+        }
+
+        pub fn main() {
+            mut audio = [1, 2, 3, 4, 5, 6, 7, 8];
+            let n: i64 = 8;
+            // audio[2] is an even index, contained within audio[0..n:2] (0, 2, 4, 6)!
+            process_clashing_sample(inout audio[2], inout audio[0..n:2]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Index matching strided slice congruence must be rejected with E0011: {:?}",
+        res.diagnostics
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0011")),
+        "Expected E0011 diagnostic code for congruent index and strided slice, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_strided_slices_three_channel_rgb_disjoint_allowed() {
+    let code = r#"
+        fn process_rgb(inout r: Slice<i64>, inout g: Slice<i64>, inout b: Slice<i64>) {
+            r[0] = 1;
+            g[0] = 2;
+            b[0] = 3;
+        }
+
+        pub fn main() {
+            mut pixels = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+            let n: i64 = 12;
+            // RGB channels interleaved at stride 3:
+            // R: 0, 3, 6, 9
+            // G: 1, 4, 7, 10
+            // B: 2, 5, 8, 11
+            // All 3 channels are pairwise disjoint mod 3
+            process_rgb(inout pixels[0..n:3], inout pixels[1..n:3], inout pixels[2..n:3]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Three-channel RGB interleaved strided slices must be proven pairwise disjoint without E0011: {:?}",
+        res.diagnostics
+    );
+}

@@ -1932,18 +1932,29 @@ impl Parser {
                     && !self.check(&TokenKind::CloseBrace)
                     && !self.check(&TokenKind::Comma)
                     && !self.check(&TokenKind::Semicolon)
+                    && !self.check(&TokenKind::Colon)
                     && !self.check(&TokenKind::Eof);
                 let end = if has_end {
                     Some(Box::new(self.parse_expr_precedence(16)?))
                 } else {
                     None
                 };
-                let end_pos = end.as_ref().map(|e| e.span.end).unwrap_or(op_tok.span.end);
+                let step = if self.match_token(&TokenKind::Colon) {
+                    Some(Box::new(self.parse_expr_precedence(16)?))
+                } else {
+                    None
+                };
+                let end_pos = step
+                    .as_ref()
+                    .map(|s| s.span.end)
+                    .or_else(|| end.as_ref().map(|e| e.span.end))
+                    .unwrap_or(op_tok.span.end);
                 let span = Span::new(self.file_id, op_tok.span.start, end_pos);
                 Ok(Expr::new(
                     ExprKind::Range {
                         start: None,
                         end,
+                        step,
                         inclusive,
                     },
                     span,
@@ -2669,7 +2680,7 @@ impl Parser {
                     span,
                 ))
             }
-            // Range Infix Operators: start..end, start..=end, start..
+            // Range Infix Operators: start..end, start..=end, start.., start..end:step
             TokenKind::DotDot | TokenKind::DotDotEq => {
                 let op_tok = self.advance();
                 let inclusive = op_tok.kind == TokenKind::DotDotEq;
@@ -2678,18 +2689,29 @@ impl Parser {
                     && !self.check(&TokenKind::CloseBrace)
                     && !self.check(&TokenKind::Comma)
                     && !self.check(&TokenKind::Semicolon)
+                    && !self.check(&TokenKind::Colon)
                     && !self.check(&TokenKind::Eof);
                 let end = if has_end {
                     Some(Box::new(self.parse_expr_precedence(16)?))
                 } else {
                     None
                 };
-                let end_pos = end.as_ref().map(|e| e.span.end).unwrap_or(op_tok.span.end);
+                let step = if self.match_token(&TokenKind::Colon) {
+                    Some(Box::new(self.parse_expr_precedence(16)?))
+                } else {
+                    None
+                };
+                let end_pos = step
+                    .as_ref()
+                    .map(|s| s.span.end)
+                    .or_else(|| end.as_ref().map(|e| e.span.end))
+                    .unwrap_or(op_tok.span.end);
                 let span = Span::new(self.file_id, left.span.start, end_pos);
                 Ok(Expr::new(
                     ExprKind::Range {
                         start: Some(Box::new(left)),
                         end,
+                        step,
                         inclusive,
                     },
                     span,
@@ -3250,6 +3272,117 @@ mod tests {
             }
         } else {
             panic!("Expected function");
+        }
+    }
+
+    #[test]
+    fn test_parse_strided_range_and_slice_step() {
+        let src = r#"
+            fn test_strided() {
+                let r_stride = 0..100:2;
+                let r_inc_stride = 1..=50:5;
+                let r_prefix = ..64:4;
+                let s = arr[0..32:2];
+                for i in 0..10:2 {
+                    let v = i;
+                }
+            }
+        "#;
+        let fid = FileId(0);
+        let tokens = tokenize(fid, src);
+        let (prog, diags) = parse(fid, tokens);
+        assert!(diags.is_empty(), "Parse diags: {:?}", diags);
+        assert_eq!(prog.items.len(), 1);
+
+        if let Item::Function(f) = &prog.items[0] {
+            let body = f.body.as_ref().unwrap();
+            assert_eq!(body.stmts.len(), 5);
+
+            // 1. let r_stride = 0..100:2;
+            if let Stmt::Let { init: Some(e), .. } = &body.stmts[0] {
+                if let ExprKind::Range {
+                    start,
+                    end,
+                    step,
+                    inclusive,
+                } = &e.kind
+                {
+                    assert!(start.is_some());
+                    assert!(end.is_some());
+                    assert!(step.is_some());
+                    assert!(!inclusive);
+                } else {
+                    panic!("Expected range with step, found {:?}", e.kind);
+                }
+            } else {
+                panic!("Expected let r_stride");
+            }
+
+            // 2. let r_inc_stride = 1..=50:5;
+            if let Stmt::Let { init: Some(e), .. } = &body.stmts[1] {
+                if let ExprKind::Range {
+                    start,
+                    end,
+                    step,
+                    inclusive,
+                } = &e.kind
+                {
+                    assert!(start.is_some());
+                    assert!(end.is_some());
+                    assert!(step.is_some());
+                    assert!(*inclusive);
+                } else {
+                    panic!("Expected inclusive range with step, found {:?}", e.kind);
+                }
+            } else {
+                panic!("Expected let r_inc_stride");
+            }
+
+            // 3. let r_prefix = ..64:4;
+            if let Stmt::Let { init: Some(e), .. } = &body.stmts[2] {
+                if let ExprKind::Range {
+                    start,
+                    end,
+                    step,
+                    inclusive,
+                } = &e.kind
+                {
+                    assert!(start.is_none());
+                    assert!(end.is_some());
+                    assert!(step.is_some());
+                    assert!(!inclusive);
+                } else {
+                    panic!("Expected prefix range with step, found {:?}", e.kind);
+                }
+            } else {
+                panic!("Expected let r_prefix");
+            }
+
+            // 4. let s = arr[0..32:2];
+            if let Stmt::Let { init: Some(e), .. } = &body.stmts[3] {
+                if let ExprKind::Index { receiver: _, index } = &e.kind {
+                    if let ExprKind::Range { step, .. } = &index.kind {
+                        assert!(step.is_some());
+                    } else {
+                        panic!("Expected range index");
+                    }
+                } else {
+                    panic!("Expected index expr");
+                }
+            } else {
+                panic!("Expected let s");
+            }
+
+            // 5. for i in 0..10:2
+            if let Stmt::For { iterable, .. } = &body.stmts[4] {
+                if let ExprKind::Range { step, .. } = &iterable.kind {
+                    assert!(step.is_some());
+                } else {
+                    panic!("Expected range iterable in for loop");
+                }
+            } else {
+                panic!("Expected for loop stmt");
+            }
         }
     }
 }

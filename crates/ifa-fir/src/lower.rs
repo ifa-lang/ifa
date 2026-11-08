@@ -739,6 +739,7 @@ impl<'a> FunctionLoweringContext<'a> {
             ExprKind::Range {
                 start,
                 end,
+                step: _,
                 inclusive,
             } => {
                 let elem_ty = start
@@ -1972,13 +1973,19 @@ impl<'a> FunctionLoweringContext<'a> {
                     || matches!(iter_ty, Some(FirType::Range { .. }));
 
                 if is_range {
-                    let (start_opt, end_opt, inclusive) = match &iterable.kind {
+                    let (start_opt, end_opt, step_opt, inclusive) = match &iterable.kind {
                         ExprKind::Range {
                             start,
                             end,
+                            step,
                             inclusive,
-                        } => (start.as_deref(), end.as_deref(), *inclusive),
-                        _ => (None, None, false),
+                        } => (
+                            start.as_deref(),
+                            end.as_deref(),
+                            step.as_deref(),
+                            *inclusive,
+                        ),
+                        _ => (None, None, None, false),
                     };
 
                     let elem_ty = match &iter_ty {
@@ -2148,19 +2155,24 @@ impl<'a> FunctionLoweringContext<'a> {
                     self.current_block = step_block;
                     let cur = self.alloc_value();
                     self.emit(Some(cur), ValueExpr::Load { ptr: idx_ptr }, *span);
-                    let one_val = self.alloc_value();
-                    self.emit(
-                        Some(one_val),
-                        ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
-                        *span,
-                    );
+                    let step_val = if let Some(st) = step_opt {
+                        self.lower_expr(st)
+                    } else {
+                        let one_val = self.alloc_value();
+                        self.emit(
+                            Some(one_val),
+                            ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+                            *span,
+                        );
+                        one_val
+                    };
                     let next_val = self.alloc_value();
                     self.emit(
                         Some(next_val),
                         ValueExpr::Binary {
                             op: BinaryOp::Add,
                             lhs: cur,
-                            rhs: one_val,
+                            rhs: step_val,
                         },
                         *span,
                     );
@@ -3489,6 +3501,7 @@ impl<'a> FunctionLoweringContext<'a> {
                 if let ExprKind::Range {
                     start,
                     end,
+                    step,
                     inclusive,
                 } = &index.kind
                 {
@@ -3531,36 +3544,110 @@ impl<'a> FunctionLoweringContext<'a> {
                         self.emit(Some(lim), ValueExpr::ArrayLen { array: base }, span);
                         lim
                     };
-                    let len_val = self.alloc_value();
-                    self.emit(
-                        Some(len_val),
-                        ValueExpr::Binary {
-                            op: BinaryOp::Sub,
-                            lhs: end_val,
-                            rhs: start_val,
-                        },
-                        span,
-                    );
-                    self.emit(
-                        None,
-                        ValueExpr::SliceBoundsCheck {
-                            base,
-                            start: start_val,
-                            end: end_val,
-                            redundant: false,
-                        },
-                        span,
-                    );
-                    let res = self.alloc_value();
-                    self.emit(
-                        Some(res),
-                        ValueExpr::SliceSub {
-                            base,
-                            start: start_val,
-                            end: end_val,
-                        },
-                        span,
-                    );
+                    let (len_val, res) = if let Some(st) = step {
+                        let stride_val = self.lower_expr(st);
+                        let span_diff = self.alloc_value();
+                        self.emit(
+                            Some(span_diff),
+                            ValueExpr::Binary {
+                                op: BinaryOp::Sub,
+                                lhs: end_val,
+                                rhs: start_val,
+                            },
+                            span,
+                        );
+                        let span_stride = self.alloc_value();
+                        self.emit(
+                            Some(span_stride),
+                            ValueExpr::Binary {
+                                op: BinaryOp::Add,
+                                lhs: span_diff,
+                                rhs: stride_val,
+                            },
+                            span,
+                        );
+                        let one_c = self.alloc_value();
+                        self.emit(
+                            Some(one_c),
+                            ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+                            span,
+                        );
+                        let span_adj = self.alloc_value();
+                        self.emit(
+                            Some(span_adj),
+                            ValueExpr::Binary {
+                                op: BinaryOp::Sub,
+                                lhs: span_stride,
+                                rhs: one_c,
+                            },
+                            span,
+                        );
+                        let calculated_len = self.alloc_value();
+                        self.emit(
+                            Some(calculated_len),
+                            ValueExpr::Binary {
+                                op: BinaryOp::Div,
+                                lhs: span_adj,
+                                rhs: stride_val,
+                            },
+                            span,
+                        );
+                        self.emit(
+                            None,
+                            ValueExpr::SliceStridedBoundsCheck {
+                                base,
+                                start: start_val,
+                                end: end_val,
+                                stride: stride_val,
+                                redundant: false,
+                            },
+                            span,
+                        );
+                        let res = self.alloc_value();
+                        self.emit(
+                            Some(res),
+                            ValueExpr::SliceStrided {
+                                base,
+                                start: start_val,
+                                end: end_val,
+                                stride: stride_val,
+                            },
+                            span,
+                        );
+                        (calculated_len, res)
+                    } else {
+                        let len_val = self.alloc_value();
+                        self.emit(
+                            Some(len_val),
+                            ValueExpr::Binary {
+                                op: BinaryOp::Sub,
+                                lhs: end_val,
+                                rhs: start_val,
+                            },
+                            span,
+                        );
+                        self.emit(
+                            None,
+                            ValueExpr::SliceBoundsCheck {
+                                base,
+                                start: start_val,
+                                end: end_val,
+                                redundant: false,
+                            },
+                            span,
+                        );
+                        let res = self.alloc_value();
+                        self.emit(
+                            Some(res),
+                            ValueExpr::SliceSub {
+                                base,
+                                start: start_val,
+                                end: end_val,
+                            },
+                            span,
+                        );
+                        (len_val, res)
+                    };
                     self.slice_lens.insert(res, len_val);
                     res
                 } else {
@@ -4874,6 +4961,7 @@ impl<'a> FunctionLoweringContext<'a> {
             ExprKind::Range {
                 start,
                 end,
+                step,
                 inclusive,
             } => {
                 let s_val = if let Some(s) = start {
@@ -4904,12 +4992,13 @@ impl<'a> FunctionLoweringContext<'a> {
                     ValueExpr::Constant(ConstantValue::Bool(*inclusive)),
                     span,
                 );
+                let mut tuple_vals = vec![s_val, e_val, inc_val];
+                if let Some(st) = step {
+                    let st_val = self.lower_expr(st);
+                    tuple_vals.push(st_val);
+                }
                 let res = self.alloc_value();
-                self.emit(
-                    Some(res),
-                    ValueExpr::TupleInit(vec![s_val, e_val, inc_val]),
-                    span,
-                );
+                self.emit(Some(res), ValueExpr::TupleInit(tuple_vals), span);
                 res
             }
 

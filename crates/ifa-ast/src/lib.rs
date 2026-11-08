@@ -632,6 +632,7 @@ pub enum ExprKind {
     Range {
         start: Option<Box<Expr>>,
         end: Option<Box<Expr>>,
+        step: Option<Box<Expr>>,
         inclusive: bool,
     },
 }
@@ -858,12 +859,17 @@ pub trait Visitor<'ast>: Sized {
                     self.visit_expr(part);
                 }
             }
-            ExprKind::Range { start, end, .. } => {
+            ExprKind::Range {
+                start, end, step, ..
+            } => {
                 if let Some(s) = start {
                     self.visit_expr(s);
                 }
                 if let Some(e) = end {
                     self.visit_expr(e);
+                }
+                if let Some(st) = step {
+                    self.visit_expr(st);
                 }
             }
         }

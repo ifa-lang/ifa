@@ -56,6 +56,7 @@ pub fn format_projection_expr(expr: &Expr) -> String {
             if let ExprKind::Range {
                 start,
                 end,
+                step,
                 inclusive,
             } = &index.kind
             {
@@ -67,15 +68,25 @@ pub fn format_projection_expr(expr: &Expr) -> String {
                     ExprKind::Lit(ifa_ast::Lit::Int(sym)) => Some(INTERNER.resolve(sym)),
                     _ => None,
                 });
+                let step_val = step.as_ref().and_then(|e| match &e.kind {
+                    ExprKind::Lit(ifa_ast::Lit::Int(sym)) => Some(INTERNER.resolve(sym)),
+                    _ => None,
+                });
                 let s_str = s_val.unwrap_or_default();
                 let sep = if *inclusive { "..=" } else { ".." };
                 let e_str = e_val.unwrap_or_default();
+                let step_suffix = if let Some(st) = step_val {
+                    format!(":{}", st)
+                } else {
+                    String::new()
+                };
                 format!(
-                    "{}[{}{}{}]",
+                    "{}[{}{}{}{}]",
                     format_projection_expr(receiver),
                     s_str,
                     sep,
-                    e_str
+                    e_str,
+                    step_suffix
                 )
             } else {
                 format!("{}[...]", format_projection_expr(receiver))
@@ -1122,12 +1133,17 @@ impl<'a> EscapeAnalyzer<'a> {
                 self.current_spawn_id = prev_spawn_id;
             }
             ExprKind::Comptime(inner) => self.check_expr(inner),
-            ExprKind::Range { start, end, .. } => {
+            ExprKind::Range {
+                start, end, step, ..
+            } => {
                 if let Some(s) = start {
                     self.check_expr(s);
                 }
                 if let Some(e) = end {
                     self.check_expr(e);
+                }
+                if let Some(st) = step {
+                    self.check_expr(st);
                 }
             }
             ExprKind::InterpolatedString(parts) => {

@@ -2602,6 +2602,7 @@ impl<'a> SemanticAnalyzer<'a> {
             ExprKind::Range {
                 start,
                 end,
+                step,
                 inclusive,
             } => {
                 let start_ty = start.as_ref().map(|s| self.infer_expr(s));
@@ -2612,6 +2613,20 @@ impl<'a> SemanticAnalyzer<'a> {
                         self.infer_expr(e)
                     }
                 });
+                if let Some(st) = step {
+                    let st_ty = self.infer_expr(st);
+                    let st_res = st_ty.resolve_defaults();
+                    if !st_res.is_integer() {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "le pas de l'intervalle doit être un entier, mais trouvé '{}'",
+                                st_ty
+                            ))
+                            .with_code("E0001")
+                            .with_primary_label(st.span, "pas non entier"),
+                        );
+                    }
+                }
 
                 let elem_ty = match (start_ty, end_ty) {
                     (Some(s), Some(e)) => {
@@ -5398,12 +5413,17 @@ fn collect_captures_in_expr(
                 collect_captures_in_expr(part, parent_depth, symbols, local_vars, seen, captured);
             }
         }
-        ExprKind::Range { start, end, .. } => {
+        ExprKind::Range {
+            start, end, step, ..
+        } => {
             if let Some(s) = start {
                 collect_captures_in_expr(s, parent_depth, symbols, local_vars, seen, captured);
             }
             if let Some(e) = end {
                 collect_captures_in_expr(e, parent_depth, symbols, local_vars, seen, captured);
+            }
+            if let Some(st) = step {
+                collect_captures_in_expr(st, parent_depth, symbols, local_vars, seen, captured);
             }
         }
         ExprKind::Catch {

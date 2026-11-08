@@ -473,6 +473,41 @@ impl BcePass {
                             }
                         }
                     }
+                    ValueExpr::SliceStridedBoundsCheck {
+                        base,
+                        start,
+                        end,
+                        stride: _,
+                        redundant,
+                    } if !*redundant => {
+                        self.stats.total_checks += 1;
+                        let c_base = Self::canonical(*base, aliases);
+                        let c_start = Self::canonical(*start, aliases);
+                        let c_end = Self::canonical(*end, aliases);
+                        let s_opt = constants.get(start).or_else(|| constants.get(&c_start));
+                        let e_opt = constants.get(end).or_else(|| constants.get(&c_end));
+                        if let (Some(&s), Some(&e)) = (s_opt, e_opt) {
+                            if s >= 0 && e >= s {
+                                let cap = array_capacities
+                                    .get(base)
+                                    .or_else(|| array_capacities.get(&c_base))
+                                    .copied()
+                                    .or_else(|| {
+                                        slice_lengths
+                                            .get(base)
+                                            .or_else(|| slice_lengths.get(&c_base))
+                                            .copied()
+                                    });
+                                if let Some(bound) = cap {
+                                    if (e as usize) <= bound {
+                                        *redundant = true;
+                                        self.stats.eliminated_checks += 1;
+                                        self.stats.constant_checks_eliminated += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -787,7 +822,8 @@ impl BcePass {
         for block in &mut func.blocks {
             block.instructions.retain(|inst| match &inst.expr {
                 ValueExpr::BoundsCheck { redundant, .. }
-                | ValueExpr::SliceBoundsCheck { redundant, .. } => !*redundant,
+                | ValueExpr::SliceBoundsCheck { redundant, .. }
+                | ValueExpr::SliceStridedBoundsCheck { redundant, .. } => !*redundant,
                 _ => true,
             });
         }

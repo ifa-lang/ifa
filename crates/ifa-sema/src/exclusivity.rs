@@ -73,20 +73,81 @@ pub enum PathSegment {
     SliceRange {
         start: Option<SliceBound>,
         end: Option<SliceBound>,
+        step: Option<SliceBound>,
         inclusive: bool,
     },
     Method(Symbol),
 }
 
+/// Helper computing greatest common divisor for strided congruence analysis.
+fn num_gcd(mut a: i64, mut b: i64) -> i64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a.abs().max(1)
+}
+
 /// Helper determining whether two slice ranges are mathematically provable to be disjoint.
+#[allow(clippy::too_many_arguments)]
 fn are_slice_ranges_disjoint(
     start1: Option<&SliceBound>,
     end1: Option<&SliceBound>,
+    step1: Option<&SliceBound>,
     inc1: bool,
     start2: Option<&SliceBound>,
     end2: Option<&SliceBound>,
+    step2: Option<&SliceBound>,
     inc2: bool,
 ) -> bool {
+    // 0. Strided Congruence & GCD Disjointness Analysis:
+    // When both ranges specify a constant stride, test whether solutions to the linear
+    // Diophantine equation start1 + k1*step1 == start2 + k2*step2 can exist.
+    if let (Some(st1_b), Some(st2_b)) = (step1, step2) {
+        if let (Some(st1), Some(st2)) = (st1_b.as_const(), st2_b.as_const()) {
+            if st1 > 0 && st2 > 0 {
+                let gcd = num_gcd(st1, st2);
+                // 0a. Both start bounds are constant integers
+                let s1_c = start1.and_then(|b| b.as_const()).unwrap_or(0);
+                let s2_c = start2.and_then(|b| b.as_const()).unwrap_or(0);
+                if (s1_c - s2_c).abs() % gcd != 0 {
+                    return true; // No integer solution exists by Bezout's identity: Provably Disjoint!
+                }
+                // 0b. Start bounds share the exact same symbolic variable with constant offsets
+                if let (Some(b1), Some(b2)) = (start1, start2) {
+                    let diff_opt = match (b1, b2) {
+                        (SliceBound::Offset(sym1, off1), SliceBound::Offset(sym2, off2))
+                            if sym1 == sym2 =>
+                        {
+                            Some(*off1 - *off2)
+                        }
+                        (SliceBound::Symbolic(sym1), SliceBound::Offset(sym2, off2))
+                            if sym1 == sym2 =>
+                        {
+                            Some(-*off2)
+                        }
+                        (SliceBound::Offset(sym1, off1), SliceBound::Symbolic(sym2))
+                            if sym1 == sym2 =>
+                        {
+                            Some(*off1)
+                        }
+                        (SliceBound::Symbolic(sym1), SliceBound::Symbolic(sym2))
+                            if sym1 == sym2 =>
+                        {
+                            Some(0)
+                        }
+                        _ => None,
+                    };
+                    if let Some(diff) = diff_opt {
+                        if diff.abs() % gcd != 0 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
     // 1. Both bounds are constant integers
     if let (Some(s1), Some(e1), Some(s2), Some(e2)) = (
         start1.and_then(|b| b.as_const()).or(Some(0)),
@@ -187,8 +248,56 @@ fn is_index_disjoint_from_slice(
     index: &SliceBound,
     start: Option<&SliceBound>,
     end: Option<&SliceBound>,
+    step: Option<&SliceBound>,
     inc: bool,
 ) -> bool {
+    // 0. Strided Index Congruence Check:
+    // If the slice has a constant stride > 1, check modular congruence of index vs start
+    if let Some(step_bound) = step {
+        if let Some(stride) = step_bound.as_const() {
+            if stride > 1 {
+                // Constant index vs constant slice start
+                if let (SliceBound::Const(idx_c), s_const) =
+                    (index, start.and_then(|b| b.as_const()).unwrap_or(0))
+                {
+                    if (*idx_c - s_const).abs() % stride != 0 {
+                        return true;
+                    }
+                }
+                // Symbolic index with offset vs symbolic slice start
+                if let Some(s_bound) = start {
+                    let diff_opt = match (index, s_bound) {
+                        (SliceBound::Offset(sym1, off1), SliceBound::Offset(sym2, off2))
+                            if sym1 == sym2 =>
+                        {
+                            Some(*off1 - *off2)
+                        }
+                        (SliceBound::Symbolic(sym1), SliceBound::Offset(sym2, off2))
+                            if sym1 == sym2 =>
+                        {
+                            Some(-*off2)
+                        }
+                        (SliceBound::Offset(sym1, off1), SliceBound::Symbolic(sym2))
+                            if sym1 == sym2 =>
+                        {
+                            Some(*off1)
+                        }
+                        (SliceBound::Symbolic(sym1), SliceBound::Symbolic(sym2))
+                            if sym1 == sym2 =>
+                        {
+                            Some(0)
+                        }
+                        _ => None,
+                    };
+                    if let Some(diff) = diff_opt {
+                        if diff.abs() % stride != 0 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
     // 1. Index constant vs constant slice
     if let (SliceBound::Const(c), Some(s), Some(e)) = (
         index,
@@ -328,6 +437,7 @@ impl AccessPath {
                         &idx_bound,
                         b_s.as_ref(),
                         b_e.as_ref(),
+                        None,
                         *inclusive,
                     ) {
                         return PathAliasKind::Disjoint;
@@ -356,6 +466,7 @@ impl AccessPath {
                         &idx_bound,
                         b_s.as_ref(),
                         b_e.as_ref(),
+                        None,
                         *inclusive,
                     ) {
                         return PathAliasKind::Disjoint;
@@ -384,6 +495,7 @@ impl AccessPath {
                         &idx_bound,
                         b_s.as_ref(),
                         b_e.as_ref(),
+                        None,
                         *inclusive,
                     ) {
                         return PathAliasKind::Disjoint;
@@ -394,6 +506,7 @@ impl AccessPath {
                     PathSegment::SliceRange {
                         start,
                         end,
+                        step,
                         inclusive,
                     },
                 )
@@ -401,6 +514,7 @@ impl AccessPath {
                     PathSegment::SliceRange {
                         start,
                         end,
+                        step,
                         inclusive,
                     },
                     PathSegment::IndexConst(c),
@@ -410,6 +524,7 @@ impl AccessPath {
                         &idx_bound,
                         start.as_ref(),
                         end.as_ref(),
+                        step.as_ref(),
                         *inclusive,
                     ) {
                         return PathAliasKind::Disjoint;
@@ -420,6 +535,7 @@ impl AccessPath {
                     PathSegment::SliceRange {
                         start,
                         end,
+                        step,
                         inclusive,
                     },
                 )
@@ -427,6 +543,7 @@ impl AccessPath {
                     PathSegment::SliceRange {
                         start,
                         end,
+                        step,
                         inclusive,
                     },
                     PathSegment::IndexSymbolic(sym),
@@ -436,6 +553,7 @@ impl AccessPath {
                         &idx_bound,
                         start.as_ref(),
                         end.as_ref(),
+                        step.as_ref(),
                         *inclusive,
                     ) {
                         return PathAliasKind::Disjoint;
@@ -446,6 +564,7 @@ impl AccessPath {
                     PathSegment::SliceRange {
                         start,
                         end,
+                        step,
                         inclusive,
                     },
                 )
@@ -453,6 +572,7 @@ impl AccessPath {
                     PathSegment::SliceRange {
                         start,
                         end,
+                        step,
                         inclusive,
                     },
                     PathSegment::IndexOffset(sym, off),
@@ -462,6 +582,7 @@ impl AccessPath {
                         &idx_bound,
                         start.as_ref(),
                         end.as_ref(),
+                        step.as_ref(),
                         *inclusive,
                     ) {
                         return PathAliasKind::Disjoint;
@@ -486,9 +607,11 @@ impl AccessPath {
                     if are_slice_ranges_disjoint(
                         b_s1.as_ref(),
                         b_e1.as_ref(),
+                        None,
                         *inc1,
                         b_s2.as_ref(),
                         b_e2.as_ref(),
+                        None,
                         *inc2,
                     ) {
                         return PathAliasKind::Disjoint;
@@ -498,20 +621,24 @@ impl AccessPath {
                     PathSegment::SliceRange {
                         start: s1,
                         end: e1,
+                        step: st1,
                         inclusive: inc1,
                     },
                     PathSegment::SliceRange {
                         start: s2,
                         end: e2,
+                        step: st2,
                         inclusive: inc2,
                     },
                 ) => {
                     if are_slice_ranges_disjoint(
                         s1.as_ref(),
                         e1.as_ref(),
+                        st1.as_ref(),
                         *inc1,
                         s2.as_ref(),
                         e2.as_ref(),
+                        st2.as_ref(),
                         *inc2,
                     ) {
                         return PathAliasKind::Disjoint;
@@ -521,6 +648,7 @@ impl AccessPath {
                     PathSegment::SliceRange {
                         start: s1,
                         end: e1,
+                        step: st1,
                         inclusive: inc1,
                     },
                     PathSegment::SliceConst {
@@ -538,6 +666,7 @@ impl AccessPath {
                     PathSegment::SliceRange {
                         start: s1,
                         end: e1,
+                        step: st1,
                         inclusive: inc1,
                     },
                 ) => {
@@ -546,9 +675,11 @@ impl AccessPath {
                     if are_slice_ranges_disjoint(
                         s1.as_ref(),
                         e1.as_ref(),
+                        st1.as_ref(),
                         *inc1,
                         b_s2.as_ref(),
                         b_e2.as_ref(),
+                        None,
                         *inc2,
                     ) {
                         return PathAliasKind::Disjoint;
@@ -630,12 +761,18 @@ impl AccessPath {
                 PathSegment::SliceRange {
                     start,
                     end,
+                    step,
                     inclusive,
                 } => {
                     let s_str = start.as_ref().map(|s| s.format()).unwrap_or_default();
                     let sep = if *inclusive { "..=" } else { ".." };
                     let e_str = end.as_ref().map(|e| e.format()).unwrap_or_default();
-                    display.push_str(&format!("[{}{}{}]", s_str, sep, e_str));
+                    let step_suffix = if let Some(st) = step {
+                        format!(":{}", st.format())
+                    } else {
+                        String::new()
+                    };
+                    display.push_str(&format!("[{}{}{}{}]", s_str, sep, e_str, step_suffix));
                 }
                 PathSegment::Method(m) => {
                     display.push('.');
@@ -1286,20 +1423,27 @@ pub fn extract_access_path(expr: &Expr) -> Option<AccessPath> {
                 ExprKind::Range {
                     start,
                     end,
+                    step,
                     inclusive,
                 } => {
                     let s_bound = start.as_deref().and_then(extract_slice_bound);
                     let e_bound = end.as_deref().and_then(extract_slice_bound);
+                    let step_bound = step.as_deref().and_then(extract_slice_bound);
                     let s_str = s_bound.as_ref().map(|b| b.format()).unwrap_or_default();
                     let sep = if *inclusive { "..=" } else { ".." };
                     let e_str = e_bound.as_ref().map(|b| b.format()).unwrap_or_default();
+                    let step_suffix = if let Some(st) = &step_bound {
+                        format!(":{}", st.format())
+                    } else {
+                        String::new()
+                    };
                     parent
                         .display
-                        .push_str(&format!("[{}{}{}]", s_str, sep, e_str));
+                        .push_str(&format!("[{}{}{}{}]", s_str, sep, e_str, step_suffix));
 
                     let s_const = s_bound.as_ref().and_then(|b| b.as_const());
                     let e_const = e_bound.as_ref().and_then(|b| b.as_const());
-                    if s_const.is_some() || e_const.is_some() {
+                    if step_bound.is_none() && (s_const.is_some() || e_const.is_some()) {
                         parent.segments.push(PathSegment::SliceConst {
                             start: s_const,
                             end: e_const,
@@ -1309,6 +1453,7 @@ pub fn extract_access_path(expr: &Expr) -> Option<AccessPath> {
                     parent.segments.push(PathSegment::SliceRange {
                         start: s_bound,
                         end: e_bound,
+                        step: step_bound,
                         inclusive: *inclusive,
                     });
                 }
