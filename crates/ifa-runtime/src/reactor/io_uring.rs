@@ -54,6 +54,27 @@ pub mod opcodes {
     pub const IORING_OP_UNLINKAT: u8 = 36;
 }
 
+/// Linux kernel timespec matching `struct __kernel_timespec` from io_uring UAPI.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KernelTimespec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveTimeout {
+    user_data: u64,
+    deadline: std::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActivePoll {
+    user_data: u64,
+    fd: i32,
+    events: u32,
+}
+
 /// Submission Queue Entry (SQE) layout: exactly 64 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -156,6 +177,8 @@ pub struct IoUringConnector {
     is_available: AtomicBool,
     pending_sqes: std::sync::Mutex<Vec<IoUringSqe>>,
     completed_cqes: std::sync::Mutex<Vec<IoUringCqe>>,
+    active_timeouts: std::sync::Mutex<Vec<ActiveTimeout>>,
+    active_polls: std::sync::Mutex<Vec<ActivePoll>>,
 }
 
 impl IoUringConnector {
@@ -183,6 +206,8 @@ impl IoUringConnector {
                     is_available: AtomicBool::new(true),
                     pending_sqes: std::sync::Mutex::new(Vec::with_capacity(entries as usize)),
                     completed_cqes: std::sync::Mutex::new(Vec::with_capacity(entries as usize)),
+                    active_timeouts: std::sync::Mutex::new(Vec::new()),
+                    active_polls: std::sync::Mutex::new(Vec::new()),
                 };
             }
         }
@@ -193,6 +218,8 @@ impl IoUringConnector {
             is_available: AtomicBool::new(false),
             pending_sqes: std::sync::Mutex::new(Vec::with_capacity(entries as usize)),
             completed_cqes: std::sync::Mutex::new(Vec::with_capacity(entries as usize)),
+            active_timeouts: std::sync::Mutex::new(Vec::new()),
+            active_polls: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -237,56 +264,252 @@ impl IoUringConnector {
         // Complete submitted SQEs and produce corresponding CQEs
         let mut completed = Vec::new();
         for sqe in sqes {
-            let res = match sqe.opcode {
-                opcodes::IORING_OP_NOP => 0,
+            match sqe.opcode {
+                opcodes::IORING_OP_NOP => {
+                    completed.push(IoUringCqe {
+                        user_data: sqe.user_data,
+                        res: 0,
+                        flags: 0,
+                    });
+                }
                 opcodes::IORING_OP_READ => {
                     let fd = sqe.fd;
                     let buf = sqe.addr as *mut u8;
                     let len = sqe.len as usize;
                     #[cfg(unix)]
-                    unsafe {
-                        libc::read(fd, buf as *mut libc::c_void, len) as i32
-                    }
+                    let res = unsafe { libc::read(fd, buf as *mut libc::c_void, len) as i32 };
                     #[cfg(not(unix))]
-                    {
+                    let res = {
                         let _ = (fd, buf, len);
                         0
-                    }
+                    };
+                    completed.push(IoUringCqe {
+                        user_data: sqe.user_data,
+                        res,
+                        flags: 0,
+                    });
                 }
                 opcodes::IORING_OP_WRITE => {
                     let fd = sqe.fd;
                     let buf = sqe.addr as *const u8;
                     let len = sqe.len as usize;
                     #[cfg(unix)]
-                    unsafe {
-                        libc::write(fd, buf as *const libc::c_void, len) as i32
-                    }
+                    let res = unsafe { libc::write(fd, buf as *const libc::c_void, len) as i32 };
                     #[cfg(not(unix))]
-                    {
+                    let res = {
                         let _ = (fd, buf, len);
                         len as i32
-                    }
+                    };
+                    completed.push(IoUringCqe {
+                        user_data: sqe.user_data,
+                        res,
+                        flags: 0,
+                    });
                 }
                 opcodes::IORING_OP_CLOSE => {
                     let fd = sqe.fd;
                     #[cfg(unix)]
-                    unsafe {
-                        libc::close(fd)
-                    }
+                    let res = unsafe { libc::close(fd) };
                     #[cfg(not(unix))]
-                    {
+                    let res = {
                         let _ = fd;
                         0
+                    };
+                    completed.push(IoUringCqe {
+                        user_data: sqe.user_data,
+                        res,
+                        flags: 0,
+                    });
+                }
+                opcodes::IORING_OP_TIMEOUT | opcodes::IORING_OP_LINK_TIMEOUT => {
+                    let dur = if sqe.addr != 0 {
+                        let ts = unsafe { &*(sqe.addr as *const KernelTimespec) };
+                        std::time::Duration::new(
+                            ts.tv_sec.max(0) as u64,
+                            (ts.tv_nsec.max(0) as u32).min(999_999_999),
+                        )
+                    } else if sqe.off != 0 {
+                        std::time::Duration::from_nanos(sqe.off)
+                    } else {
+                        std::time::Duration::ZERO
+                    };
+
+                    if dur.is_zero() {
+                        completed.push(IoUringCqe {
+                            user_data: sqe.user_data,
+                            res: 0,
+                            flags: 0,
+                        });
+                    } else {
+                        let mut timeouts = self.active_timeouts.lock().unwrap();
+                        timeouts.push(ActiveTimeout {
+                            user_data: sqe.user_data,
+                            deadline: std::time::Instant::now() + dur,
+                        });
                     }
                 }
-                _ => 0,
-            };
+                opcodes::IORING_OP_TIMEOUT_REMOVE => {
+                    let target_token = sqe.addr;
+                    let mut timeouts = self.active_timeouts.lock().unwrap();
+                    let before_len = timeouts.len();
+                    timeouts.retain(|t| t.user_data != target_token);
+                    let removed = timeouts.len() < before_len;
+                    completed.push(IoUringCqe {
+                        user_data: sqe.user_data,
+                        res: if removed { 0 } else { -2 },
+                        flags: 0,
+                    });
+                }
+                opcodes::IORING_OP_POLL_ADD => {
+                    let fd = sqe.fd;
+                    let events = sqe.len;
+                    #[cfg(unix)]
+                    let ready_events = {
+                        let mut pfd = libc::pollfd {
+                            fd,
+                            events: events as i16,
+                            revents: 0,
+                        };
+                        let poll_res = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 0) };
+                        if poll_res > 0 && pfd.revents != 0 {
+                            Some(pfd.revents as i32)
+                        } else {
+                            None
+                        }
+                    };
+                    #[cfg(not(unix))]
+                    let ready_events: Option<i32> = Some(events as i32);
 
-            completed.push(IoUringCqe {
-                user_data: sqe.user_data,
-                res,
-                flags: 0,
-            });
+                    if let Some(rev) = ready_events {
+                        completed.push(IoUringCqe {
+                            user_data: sqe.user_data,
+                            res: rev,
+                            flags: 0,
+                        });
+                    } else {
+                        let mut polls = self.active_polls.lock().unwrap();
+                        polls.push(ActivePoll {
+                            user_data: sqe.user_data,
+                            fd,
+                            events,
+                        });
+                    }
+                }
+                opcodes::IORING_OP_POLL_REMOVE => {
+                    let target_token = sqe.addr;
+                    let mut polls = self.active_polls.lock().unwrap();
+                    let before_len = polls.len();
+                    polls.retain(|p| p.user_data != target_token);
+                    let removed = polls.len() < before_len;
+                    completed.push(IoUringCqe {
+                        user_data: sqe.user_data,
+                        res: if removed { 0 } else { -2 },
+                        flags: 0,
+                    });
+                }
+                opcodes::IORING_OP_ASYNC_CANCEL => {
+                    let target_token = sqe.addr;
+                    let mut timeouts = self.active_timeouts.lock().unwrap();
+                    let mut polls = self.active_polls.lock().unwrap();
+                    let before_t = timeouts.len();
+                    timeouts.retain(|t| t.user_data != target_token);
+                    let before_p = polls.len();
+                    polls.retain(|p| p.user_data != target_token);
+                    let removed = timeouts.len() < before_t || polls.len() < before_p;
+                    completed.push(IoUringCqe {
+                        user_data: sqe.user_data,
+                        res: if removed { 0 } else { -2 },
+                        flags: 0,
+                    });
+                }
+                _ => {
+                    completed.push(IoUringCqe {
+                        user_data: sqe.user_data,
+                        res: 0,
+                        flags: 0,
+                    });
+                }
+            }
+        }
+
+        // Reap expired active timeouts
+        let now = std::time::Instant::now();
+        {
+            let mut timeouts = self.active_timeouts.lock().unwrap();
+            let mut i = 0;
+            while i < timeouts.len() {
+                if now >= timeouts[i].deadline {
+                    let t = timeouts.swap_remove(i);
+                    completed.push(IoUringCqe {
+                        user_data: t.user_data,
+                        res: 0,
+                        flags: 0,
+                    });
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        // Reap ready active polls
+        {
+            let mut polls = self.active_polls.lock().unwrap();
+            let mut j = 0;
+            while j < polls.len() {
+                #[cfg(unix)]
+                let ready = {
+                    let mut pfd = libc::pollfd {
+                        fd: polls[j].fd,
+                        events: polls[j].events as i16,
+                        revents: 0,
+                    };
+                    let poll_res = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 0) };
+                    if poll_res > 0 && pfd.revents != 0 {
+                        Some(pfd.revents as i32)
+                    } else {
+                        None
+                    }
+                };
+                #[cfg(not(unix))]
+                let ready: Option<i32> = Some(polls[j].events as i32);
+
+                if let Some(rev) = ready {
+                    let p = polls.swap_remove(j);
+                    completed.push(IoUringCqe {
+                        user_data: p.user_data,
+                        res: rev,
+                        flags: 0,
+                    });
+                } else {
+                    j += 1;
+                }
+            }
+        }
+
+        if min_complete > 0 && completed.is_empty() {
+            let has_waitables = {
+                let t_lock = self.active_timeouts.lock().unwrap();
+                let p_lock = self.active_polls.lock().unwrap();
+                !t_lock.is_empty() || !p_lock.is_empty()
+            };
+            if has_waitables {
+                std::thread::sleep(std::time::Duration::from_micros(250));
+                let now2 = std::time::Instant::now();
+                let mut timeouts = self.active_timeouts.lock().unwrap();
+                let mut i = 0;
+                while i < timeouts.len() {
+                    if now2 >= timeouts[i].deadline {
+                        let t = timeouts.swap_remove(i);
+                        completed.push(IoUringCqe {
+                            user_data: t.user_data,
+                            res: 0,
+                            flags: 0,
+                        });
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
         }
 
         let count = completed.len();
@@ -294,6 +517,26 @@ impl IoUringConnector {
         cqes.extend(completed);
         let _ = min_complete;
         count
+    }
+
+    /// Cancel an active registered timeout by its target user_data token.
+    pub fn cancel_timeout(&self, target_token: u64) -> bool {
+        let mut timeouts = self.active_timeouts.lock().unwrap();
+        let before = timeouts.len();
+        timeouts.retain(|t| t.user_data != target_token);
+        timeouts.len() < before
+    }
+
+    /// Number of active registered timeouts pending completion.
+    pub fn active_timeouts_count(&self) -> usize {
+        let timeouts = self.active_timeouts.lock().unwrap();
+        timeouts.len()
+    }
+
+    /// Number of active registered socket/file polls pending events.
+    pub fn active_polls_count(&self) -> usize {
+        let polls = self.active_polls.lock().unwrap();
+        polls.len()
     }
 
     /// Pop a completed CQE if available.

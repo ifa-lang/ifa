@@ -562,6 +562,18 @@ impl FiberScheduler {
         wm.len() + cr.len()
     }
 
+    /// Check if an asynchronous I/O event token has already completed.
+    pub fn has_completed_io(&self, token: u64) -> bool {
+        let cr = self.completed_io_results.lock().unwrap();
+        cr.contains_key(&token)
+    }
+
+    /// Retrieve and consume the completion result of an asynchronous I/O token if ready.
+    pub fn take_completed_io(&self, token: u64) -> Option<i64> {
+        let mut cr = self.completed_io_results.lock().unwrap();
+        cr.remove(&token)
+    }
+
     /// Park a fiber directly into the waiting I/O table.
     pub fn park_fiber_for_io(&self, token: u64, mut fiber: Fiber, result_slot: Option<*mut i64>) {
         let mut wm = self.waiting_io_fibers.lock().unwrap();

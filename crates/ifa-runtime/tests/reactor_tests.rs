@@ -310,3 +310,311 @@ fn test_concurrent_coroutines_mn_reactor_io() {
         }
     }
 }
+
+#[test]
+fn test_io_uring_timeout_and_cancellation() {
+    let connector = IoUringConnector::new(32);
+    // 1. Submit a timeout of 50ms
+    let sqe = IoUringSqe {
+        opcode: opcodes::IORING_OP_TIMEOUT,
+        off: 50_000_000, // 50ms in nanos
+        user_data: 0x9001,
+        ..Default::default()
+    };
+    connector.submit_sqe(sqe);
+    let entered = connector.enter(0);
+    assert_eq!(entered, 0); // Not completed yet
+    assert_eq!(connector.active_timeouts_count(), 1);
+
+    // Immediate check before time elapses: no CQE
+    assert!(connector.pop_cqe().is_none());
+
+    // 2. Submit cancellation
+    let cancel_sqe = IoUringSqe {
+        opcode: opcodes::IORING_OP_TIMEOUT_REMOVE,
+        addr: 0x9001,
+        user_data: 0x9002,
+        ..Default::default()
+    };
+    connector.submit_sqe(cancel_sqe);
+    connector.enter(0);
+
+    // Cancel CQE should succeed with res = 0
+    let cqe = connector.pop_cqe().expect("Expected cancellation CQE");
+    assert_eq!(cqe.user_data, 0x9002);
+    assert_eq!(cqe.res, 0);
+    assert_eq!(connector.active_timeouts_count(), 0);
+
+    // 3. Submit a short timeout (15ms) and wait for expiration
+    let sqe2 = IoUringSqe {
+        opcode: opcodes::IORING_OP_TIMEOUT,
+        off: 15_000_000,
+        user_data: 0x9003,
+        ..Default::default()
+    };
+    connector.submit_sqe(sqe2);
+    connector.enter(0);
+    assert_eq!(connector.active_timeouts_count(), 1);
+
+    std::thread::sleep(Duration::from_millis(25));
+    connector.enter(0);
+    let cqe2 = connector.pop_cqe().expect("Expected expired timeout CQE");
+    assert_eq!(cqe2.user_data, 0x9003);
+    assert_eq!(cqe2.res, 0);
+    assert_eq!(connector.active_timeouts_count(), 0);
+}
+
+#[repr(C)]
+struct CoroTimeoutTestFrame {
+    stage: i32,
+    result_slot: i64,
+    token: u64,
+    coro_ptr: *mut ifa_runtime::ffi::IfaCoroutine,
+    success: bool,
+}
+
+extern "C" fn coro_io_uring_timeout_resume(frame_ptr: *mut u8) -> i32 {
+    let frame = unsafe { &mut *(frame_ptr as *mut CoroTimeoutTestFrame) };
+    match frame.stage {
+        0 => {
+            frame.stage = 1;
+            let token = ifa_runtime::ffi::ifa_rt_coro_register_io_uring_timeout(
+                frame.coro_ptr,
+                20_000_000, // 20ms
+                &mut frame.result_slot,
+            );
+            frame.token = token;
+            ifa_runtime::CoroStatus::WaitingIo as i32
+        }
+        1 => {
+            frame.stage = 2;
+            assert_eq!(frame.result_slot, 0);
+            frame.success = true;
+            ifa_runtime::CoroStatus::Completed as i32
+        }
+        _ => ifa_runtime::CoroStatus::Completed as i32,
+    }
+}
+
+#[test]
+fn test_coroutine_io_uring_timeout_and_scheduler_wake() {
+    let frame = Box::into_raw(Box::new(CoroTimeoutTestFrame {
+        stage: 0,
+        result_slot: -1,
+        token: 0,
+        coro_ptr: std::ptr::null_mut(),
+        success: false,
+    }));
+
+    let coro = ifa_runtime::ffi::ifa_rt_coro_create_custom(
+        frame as *mut u8,
+        coro_io_uring_timeout_resume,
+        None,
+    );
+    unsafe {
+        (*frame).coro_ptr = coro;
+    }
+
+    let fid = ifa_runtime::ffi::ifa_rt_coro_spawn(coro);
+    assert!(fid > 0);
+
+    let start = Instant::now();
+    let mut completed = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !completed && Instant::now() < deadline {
+        GLOBAL_REACTOR.poll_and_wake();
+        completed = GLOBAL_SCHEDULER.join_timeout(fid, Duration::from_millis(5));
+    }
+
+    assert!(
+        completed,
+        "Coroutine timed out waiting for io_uring timer wake"
+    );
+    assert!(start.elapsed() >= Duration::from_millis(15));
+    unsafe {
+        assert!((*frame).success);
+        assert_eq!((*frame).result_slot, 0);
+        let _ = Box::from_raw(frame);
+    }
+    ifa_runtime::ffi::ifa_rt_coro_destroy(coro);
+}
+
+#[test]
+fn test_unified_select_wait_table_channels_and_io_uring_timeout() {
+    let chan1 = ifa_runtime::ffi::ifa_rt_channel_create(4);
+    let chan2 = ifa_runtime::ffi::ifa_rt_channel_create(4);
+
+    let mut entries = [
+        ifa_runtime::ffi::IfaSelectWaitEntry {
+            chan: chan1,
+            op: ifa_runtime::ffi::IFA_SELECT_OP_RECV,
+            status: ifa_runtime::ffi::IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+            priority: 10,
+            _pad: 0,
+            timeout_ns: 0,
+        },
+        ifa_runtime::ffi::IfaSelectWaitEntry {
+            chan: chan2,
+            op: ifa_runtime::ffi::IFA_SELECT_OP_RECV,
+            status: ifa_runtime::ffi::IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+            priority: 20,
+            _pad: 0,
+            timeout_ns: 0,
+        },
+        ifa_runtime::ffi::IfaSelectWaitEntry {
+            chan: std::ptr::null_mut(),
+            op: ifa_runtime::ffi::IFA_SELECT_OP_TIMEOUT,
+            status: ifa_runtime::ffi::IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+            priority: i32::MIN,
+            _pad: 0,
+            timeout_ns: 25_000_000, // 25ms
+        },
+    ];
+
+    let mut table = ifa_runtime::ffi::IfaSelectWaitTable {
+        entries: entries.as_mut_ptr(),
+        count: 3,
+        has_default: 0,
+        _pad: 0,
+        start_ns: -1,
+    };
+
+    let start = Instant::now();
+    let winner = ifa_runtime::ffi::ifa_rt_channel_select_wait_table(&mut table);
+    assert_eq!(
+        winner, 2,
+        "Timeout branch should be chosen when channels are empty"
+    );
+    assert!(start.elapsed() >= Duration::from_millis(20));
+
+    ifa_runtime::ffi::ifa_rt_channel_destroy(chan1);
+    ifa_runtime::ffi::ifa_rt_channel_destroy(chan2);
+}
+
+#[test]
+fn test_unified_select_wait_table_channel_beats_timeout_with_cancellation() {
+    let chan1 = ifa_runtime::ffi::ifa_rt_channel_create(4);
+    let chan2 = ifa_runtime::ffi::ifa_rt_channel_create(4);
+
+    let mut entries = [
+        ifa_runtime::ffi::IfaSelectWaitEntry {
+            chan: chan1,
+            op: ifa_runtime::ffi::IFA_SELECT_OP_RECV,
+            status: ifa_runtime::ffi::IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+            priority: 10,
+            _pad: 0,
+            timeout_ns: 0,
+        },
+        ifa_runtime::ffi::IfaSelectWaitEntry {
+            chan: chan2,
+            op: ifa_runtime::ffi::IFA_SELECT_OP_RECV,
+            status: ifa_runtime::ffi::IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+            priority: 20,
+            _pad: 0,
+            timeout_ns: 0,
+        },
+        ifa_runtime::ffi::IfaSelectWaitEntry {
+            chan: std::ptr::null_mut(),
+            op: ifa_runtime::ffi::IFA_SELECT_OP_TIMEOUT,
+            status: ifa_runtime::ffi::IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+            priority: i32::MIN,
+            _pad: 0,
+            timeout_ns: 500_000_000, // 500ms
+        },
+    ];
+
+    let mut table = ifa_runtime::ffi::IfaSelectWaitTable {
+        entries: entries.as_mut_ptr(),
+        count: 3,
+        has_default: 0,
+        _pad: 0,
+        start_ns: -1,
+    };
+
+    // Producer sends on chan2 after 10ms
+    let c2 = chan2 as usize;
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10));
+        let ptr = c2 as *mut ifa_runtime::ffi::IfaChannelHandle;
+        let mut msg: u64 = 42;
+        ifa_runtime::ffi::ifa_rt_channel_send(ptr, &mut msg as *mut u64 as *mut u8);
+    });
+
+    let start = Instant::now();
+    let winner = ifa_runtime::ffi::ifa_rt_channel_select_wait_table(&mut table);
+    assert_eq!(
+        winner, 1,
+        "Channel 2 should win as priority 20 and active before timeout"
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(350),
+        "Should complete well before the 500ms timeout"
+    );
+
+    ifa_runtime::ffi::ifa_rt_channel_destroy(chan1);
+    ifa_runtime::ffi::ifa_rt_channel_destroy(chan2);
+}
+
+#[test]
+fn test_unified_select_wait_table_fd_read_and_io_token() {
+    let mut pipe_fds = [0i32; 2];
+    #[cfg(unix)]
+    unsafe {
+        assert_eq!(libc::pipe(pipe_fds.as_mut_ptr()), 0);
+        let msg = b"x";
+        assert_eq!(
+            libc::write(pipe_fds[1], msg.as_ptr() as *const libc::c_void, 1),
+            1
+        );
+    }
+
+    let token = GLOBAL_REACTOR.next_token();
+    // Simulate an IO completion registered in the scheduler
+    GLOBAL_SCHEDULER.wake_io(token, 1024);
+
+    let mut result_slot: i64 = 0;
+    let mut entries = [
+        ifa_runtime::ffi::IfaSelectWaitEntry {
+            chan: std::ptr::null_mut(),
+            op: ifa_runtime::ffi::IFA_SELECT_OP_FD_READ,
+            status: ifa_runtime::ffi::IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+            priority: 10,
+            _pad: 0,
+            timeout_ns: pipe_fds[0] as u64,
+        },
+        ifa_runtime::ffi::IfaSelectWaitEntry {
+            chan: std::ptr::null_mut(),
+            op: ifa_runtime::ffi::IFA_SELECT_OP_IO_TOKEN,
+            status: ifa_runtime::ffi::IFA_SELECT_STATUS_PENDING,
+            val: &mut result_slot as *mut i64 as *mut u8,
+            priority: 50, // higher priority!
+            _pad: 0,
+            timeout_ns: token,
+        },
+    ];
+
+    let mut table = ifa_runtime::ffi::IfaSelectWaitTable {
+        entries: entries.as_mut_ptr(),
+        count: 2,
+        has_default: 0,
+        _pad: 0,
+        start_ns: -1,
+    };
+
+    let winner = ifa_runtime::ffi::ifa_rt_channel_select_table(&mut table);
+    assert_eq!(winner, 1, "IO token branch with priority 50 should win");
+    assert_eq!(result_slot, 1024);
+
+    #[cfg(unix)]
+    unsafe {
+        libc::close(pipe_fds[0]);
+        libc::close(pipe_fds[1]);
+    }
+}

@@ -297,6 +297,9 @@ int64_t ifa_rt_channel_capacity(ifa_channel_handle_t* chan);
 #define IFA_SELECT_OP_SEND 1
 #define IFA_SELECT_OP_TIMEOUT 2
 #define IFA_SELECT_OP_DEADLINE 3
+#define IFA_SELECT_OP_FD_READ 4
+#define IFA_SELECT_OP_FD_WRITE 5
+#define IFA_SELECT_OP_IO_TOKEN 6
 
 #define IFA_SELECT_STATUS_PENDING 0
 #define IFA_SELECT_STATUS_READY 1
@@ -380,6 +383,10 @@ int32_t ifa_rt_async_close(int32_t handle_fd);
 
 uint64_t ifa_rt_coro_register_io_uring_read(ifa_coroutine_t* coro, int32_t fd, uint8_t* buf, uint32_t len, uint64_t offset, int64_t* out_result);
 uint64_t ifa_rt_coro_register_io_uring_write(ifa_coroutine_t* coro, int32_t fd, const uint8_t* buf, uint32_t len, uint64_t offset, int64_t* out_result);
+uint64_t ifa_rt_coro_register_io_uring_timeout(ifa_coroutine_t* coro, uint64_t timeout_ns, int64_t* out_result);
+int32_t ifa_rt_coro_cancel_io_uring_timeout(uint64_t target_token);
+uint64_t ifa_rt_coro_register_io_uring_poll(ifa_coroutine_t* coro, int32_t fd, uint32_t poll_mask, int64_t* out_result);
+int32_t ifa_rt_coro_cancel_io_uring_poll(uint64_t target_token);
 uint64_t ifa_rt_coro_register_iocp_read(ifa_coroutine_t* coro, size_t key, uint8_t* buf, uint32_t len, int64_t* out_result);
 uint64_t ifa_rt_coro_register_iocp_write(ifa_coroutine_t* coro, size_t key, const uint8_t* buf, uint32_t len, int64_t* out_result);
 void ifa_rt_coro_set_waiting_io(ifa_coroutine_t* coro, uint64_t token, int64_t* out_result);

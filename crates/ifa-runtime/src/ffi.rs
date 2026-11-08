@@ -765,6 +765,73 @@ pub extern "C" fn ifa_rt_coro_register_iocp_write(
     token
 }
 
+/// Register an asynchronous io_uring high-precision timeout on the global reactor and bind to the coroutine.
+/// Returns the allocated I/O event token.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_register_io_uring_timeout(
+    coro: *mut IfaCoroutine,
+    timeout_ns: u64,
+    out_result: *mut i64,
+) -> u64 {
+    let token = crate::reactor::GLOBAL_REACTOR.next_token();
+    crate::reactor::GLOBAL_REACTOR.submit_io_uring_timeout(timeout_ns, token);
+    if !coro.is_null() {
+        let c = unsafe { &mut *coro };
+        c.pending_io_token = Some(token);
+        c.pending_result_slot = if out_result.is_null() {
+            None
+        } else {
+            Some(out_result)
+        };
+        c.status = CoroStatus::WaitingIo;
+    }
+    crate::fiber::set_current_fiber_io_token(token);
+    token
+}
+
+/// Cancel an active registered io_uring timeout by target token.
+/// Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_cancel_io_uring_timeout(target_token: u64) -> i32 {
+    let cancel_token = crate::reactor::GLOBAL_REACTOR.next_token();
+    crate::reactor::GLOBAL_REACTOR.cancel_io_uring_timeout(target_token, cancel_token);
+    1
+}
+
+/// Register an asynchronous io_uring poll request on the global reactor and bind to the coroutine.
+/// Returns the allocated I/O event token.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_register_io_uring_poll(
+    coro: *mut IfaCoroutine,
+    fd: i32,
+    poll_mask: u32,
+    out_result: *mut i64,
+) -> u64 {
+    let token = crate::reactor::GLOBAL_REACTOR.next_token();
+    crate::reactor::GLOBAL_REACTOR.submit_io_uring_poll(fd, poll_mask, token);
+    if !coro.is_null() {
+        let c = unsafe { &mut *coro };
+        c.pending_io_token = Some(token);
+        c.pending_result_slot = if out_result.is_null() {
+            None
+        } else {
+            Some(out_result)
+        };
+        c.status = CoroStatus::WaitingIo;
+    }
+    crate::fiber::set_current_fiber_io_token(token);
+    token
+}
+
+/// Cancel an active registered io_uring poll by target token.
+/// Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_cancel_io_uring_poll(target_token: u64) -> i32 {
+    let cancel_token = crate::reactor::GLOBAL_REACTOR.next_token();
+    crate::reactor::GLOBAL_REACTOR.cancel_io_uring_poll(target_token, cancel_token);
+    1
+}
+
 /// Manually mark a coroutine as waiting for an I/O token with optional result slot.
 #[no_mangle]
 pub extern "C" fn ifa_rt_coro_set_waiting_io(
@@ -1388,6 +1455,9 @@ pub const IFA_SELECT_OP_RECV: u32 = 0;
 pub const IFA_SELECT_OP_SEND: u32 = 1;
 pub const IFA_SELECT_OP_TIMEOUT: u32 = 2;
 pub const IFA_SELECT_OP_DEADLINE: u32 = 3;
+pub const IFA_SELECT_OP_FD_READ: u32 = 4;
+pub const IFA_SELECT_OP_FD_WRITE: u32 = 5;
+pub const IFA_SELECT_OP_IO_TOKEN: u32 = 6;
 
 /// Readiness status for a zero-allocation select wait entry.
 pub const IFA_SELECT_STATUS_PENDING: u32 = 0;
@@ -1399,19 +1469,19 @@ pub const IFA_SELECT_STATUS_TIMED_OUT: u32 = 3;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IfaSelectWaitEntry {
-    /// Pointer to the IFA channel handle (or null for timeout/deadline arm).
+    /// Pointer to the IFA channel handle (or null for timeout/deadline/io arm).
     pub chan: *mut IfaChannelHandle,
-    /// Operation to wait for: 0 = RECV, 1 = SEND, 2 = TIMEOUT, 3 = DEADLINE.
+    /// Operation to wait for: 0 = RECV, 1 = SEND, 2 = TIMEOUT, 3 = DEADLINE, 4 = FD_READ, 5 = FD_WRITE, 6 = IO_TOKEN.
     pub op: u32,
     /// Status: 0 = PENDING, 1 = READY, 2 = CLOSED, 3 = TIMED_OUT.
     pub status: u32,
-    /// Payload pointer (transferred value or target buffer).
+    /// Payload pointer (transferred value or target buffer/result slot).
     pub val: *mut u8,
     /// Priority weight for deterministic selection (higher value = preferred).
     pub priority: i32,
     /// Alignment padding.
     pub _pad: u32,
-    /// Timeout duration in nanoseconds (or absolute monotonic deadline).
+    /// Timeout duration in nanoseconds (or absolute monotonic deadline, or fd/token).
     pub timeout_ns: u64,
 }
 
@@ -1539,6 +1609,85 @@ pub extern "C" fn ifa_rt_channel_select_table(table: *mut IfaSelectWaitTable) ->
                     entry.status = IFA_SELECT_STATUS_PENDING;
                 }
             }
+            IFA_SELECT_OP_FD_READ => {
+                any_open = true;
+                let fd = entry.timeout_ns as i32;
+                #[cfg(unix)]
+                let is_ready = {
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 0) };
+                    ret > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0
+                };
+                #[cfg(not(unix))]
+                let is_ready = false;
+
+                if is_ready {
+                    entry.status = IFA_SELECT_STATUS_READY;
+                    match best_ready {
+                        None => best_ready = Some((idx, entry.priority)),
+                        Some((_, best_prio)) if entry.priority > best_prio => {
+                            best_ready = Some((idx, entry.priority));
+                        }
+                        _ => {}
+                    }
+                } else {
+                    entry.status = IFA_SELECT_STATUS_PENDING;
+                }
+            }
+            IFA_SELECT_OP_FD_WRITE => {
+                any_open = true;
+                let fd = entry.timeout_ns as i32;
+                #[cfg(unix)]
+                let is_ready = {
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    let ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 0) };
+                    ret > 0 && (pfd.revents & (libc::POLLOUT | libc::POLLERR)) != 0
+                };
+                #[cfg(not(unix))]
+                let is_ready = false;
+
+                if is_ready {
+                    entry.status = IFA_SELECT_STATUS_READY;
+                    match best_ready {
+                        None => best_ready = Some((idx, entry.priority)),
+                        Some((_, best_prio)) if entry.priority > best_prio => {
+                            best_ready = Some((idx, entry.priority));
+                        }
+                        _ => {}
+                    }
+                } else {
+                    entry.status = IFA_SELECT_STATUS_PENDING;
+                }
+            }
+            IFA_SELECT_OP_IO_TOKEN => {
+                any_open = true;
+                let token = entry.timeout_ns;
+                if let Some(res) = GLOBAL_SCHEDULER.take_completed_io(token) {
+                    if !entry.val.is_null() {
+                        unsafe {
+                            *(entry.val as *mut i64) = res;
+                        }
+                    }
+                    entry.status = IFA_SELECT_STATUS_READY;
+                    match best_ready {
+                        None => best_ready = Some((idx, entry.priority)),
+                        Some((_, best_prio)) if entry.priority > best_prio => {
+                            best_ready = Some((idx, entry.priority));
+                        }
+                        _ => {}
+                    }
+                } else {
+                    entry.status = IFA_SELECT_STATUS_PENDING;
+                }
+            }
             _ => {
                 if !entry.chan.is_null() {
                     let handle = unsafe { &*entry.chan };
@@ -1573,7 +1722,7 @@ pub extern "C" fn ifa_rt_channel_select_table(table: *mut IfaSelectWaitTable) ->
 }
 
 /// Zero-allocation blocking/cooperative multiplexing evaluation of a select wait table.
-/// Cooperatively yields the calling fiber or spins until an entry is satisfied or timeout elapses.
+/// Integrates with io_uring and async reactor to wake IO and timed events without busy-spinning.
 #[no_mangle]
 pub extern "C" fn ifa_rt_channel_select_wait_table(table: *mut IfaSelectWaitTable) -> i64 {
     if table.is_null() {
@@ -1591,7 +1740,12 @@ pub extern "C" fn ifa_rt_channel_select_wait_table(table: *mut IfaSelectWaitTabl
         } else if spins < 64 {
             GLOBAL_SCHEDULER.yield_now();
         } else {
-            std::thread::yield_now();
+            let woken = crate::reactor::GLOBAL_REACTOR.poll_and_wake();
+            if woken > 0 {
+                spins = 0;
+                continue;
+            }
+            crate::reactor::GLOBAL_REACTOR.wait_and_wake(std::time::Duration::from_millis(1));
             spins = 32;
         }
     }

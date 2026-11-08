@@ -11,7 +11,7 @@ pub mod io_uring;
 pub mod iocp;
 pub mod nonblocking;
 
-pub use io_uring::{IoUringConnector, IoUringCqe, IoUringSqe};
+pub use io_uring::{IoUringConnector, IoUringCqe, IoUringSqe, KernelTimespec};
 pub use iocp::{IocpCompletionPacket, IocpConnector, IocpOpCode};
 pub use nonblocking::{AsyncTcpListener, AsyncTcpStream, AsyncTimer};
 
@@ -86,6 +86,51 @@ impl AsyncReactor {
             len,
             off: offset,
             user_data: token,
+            ..Default::default()
+        };
+        self.io_uring.submit_sqe(sqe);
+    }
+
+    /// Submit an asynchronous high-precision timeout via io_uring with the specified event token.
+    pub fn submit_io_uring_timeout(&self, timeout_ns: u64, token: u64) {
+        let sqe = IoUringSqe {
+            opcode: io_uring::opcodes::IORING_OP_TIMEOUT,
+            off: timeout_ns,
+            user_data: token,
+            ..Default::default()
+        };
+        self.io_uring.submit_sqe(sqe);
+    }
+
+    /// Cancel an active registered io_uring timeout by target token.
+    pub fn cancel_io_uring_timeout(&self, target_token: u64, cancel_token: u64) {
+        let sqe = IoUringSqe {
+            opcode: io_uring::opcodes::IORING_OP_TIMEOUT_REMOVE,
+            addr: target_token,
+            user_data: cancel_token,
+            ..Default::default()
+        };
+        self.io_uring.submit_sqe(sqe);
+    }
+
+    /// Submit an asynchronous socket or file poll via io_uring with the specified event token.
+    pub fn submit_io_uring_poll(&self, fd: i32, events: u32, token: u64) {
+        let sqe = IoUringSqe {
+            opcode: io_uring::opcodes::IORING_OP_POLL_ADD,
+            fd,
+            len: events,
+            user_data: token,
+            ..Default::default()
+        };
+        self.io_uring.submit_sqe(sqe);
+    }
+
+    /// Cancel an active registered io_uring poll by target token.
+    pub fn cancel_io_uring_poll(&self, target_token: u64, cancel_token: u64) {
+        let sqe = IoUringSqe {
+            opcode: io_uring::opcodes::IORING_OP_POLL_REMOVE,
+            addr: target_token,
+            user_data: cancel_token,
             ..Default::default()
         };
         self.io_uring.submit_sqe(sqe);
