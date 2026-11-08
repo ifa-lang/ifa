@@ -21,6 +21,7 @@ pub enum FiberState {
     Suspended,
     WaitingIo(u64),
     Completed,
+    Panicked,
 }
 
 /// Execution outcome of resuming a stackless fiber / coroutine.
@@ -84,6 +85,7 @@ pub enum FiberStepResult {
     Completed,
     Suspended,
     WaitingIo(u64, Option<*mut i64>),
+    Panicked,
 }
 
 /// Entry tracking a fiber parked waiting for an asynchronous I/O completion event.
@@ -153,28 +155,46 @@ impl Fiber {
                 let task = self.task.take().unwrap();
                 if let FiberTask::Once(exec) = task {
                     self.state = FiberState::Running;
-                    exec();
-                    self.state = FiberState::Completed;
+                    let outcome = crate::panic::catch_panic(std::panic::AssertUnwindSafe(exec));
+                    match outcome {
+                        Ok(()) => {
+                            self.state = FiberState::Completed;
+                            FiberStepResult::Completed
+                        }
+                        Err(_) => {
+                            self.state = FiberState::Panicked;
+                            FiberStepResult::Panicked
+                        }
+                    }
+                } else {
+                    FiberStepResult::Completed
                 }
-                FiberStepResult::Completed
             }
             Some(FiberTask::Resumable(closure)) => {
                 self.state = FiberState::Running;
-                let status = closure();
-                if status == CoroStatus::Completed {
-                    self.state = FiberState::Completed;
-                    FiberStepResult::Completed
-                } else if status == CoroStatus::WaitingIo {
-                    let tok = current_fiber_io_token();
-                    let slot = current_fiber_result_slot();
-                    self.state = FiberState::WaitingIo(tok);
-                    FiberStepResult::WaitingIo(tok, slot)
-                } else if status == CoroStatus::Suspended {
-                    self.state = FiberState::Suspended;
-                    FiberStepResult::Suspended
-                } else {
-                    self.state = FiberState::Completed;
-                    FiberStepResult::Completed
+                let outcome = crate::panic::catch_panic(std::panic::AssertUnwindSafe(closure));
+                match outcome {
+                    Ok(status) => {
+                        if status == CoroStatus::Completed {
+                            self.state = FiberState::Completed;
+                            FiberStepResult::Completed
+                        } else if status == CoroStatus::WaitingIo {
+                            let tok = current_fiber_io_token();
+                            let slot = current_fiber_result_slot();
+                            self.state = FiberState::WaitingIo(tok);
+                            FiberStepResult::WaitingIo(tok, slot)
+                        } else if status == CoroStatus::Suspended {
+                            self.state = FiberState::Suspended;
+                            FiberStepResult::Suspended
+                        } else {
+                            self.state = FiberState::Panicked;
+                            FiberStepResult::Panicked
+                        }
+                    }
+                    Err(_) => {
+                        self.state = FiberState::Panicked;
+                        FiberStepResult::Panicked
+                    }
                 }
             }
             Some(FiberTask::Stackless(coro)) => {
@@ -198,8 +218,8 @@ impl Fiber {
                     FiberStepResult::Suspended
                 } else {
                     coro.status = CoroStatus::Panicked;
-                    self.state = FiberState::Completed;
-                    FiberStepResult::Completed
+                    self.state = FiberState::Panicked;
+                    FiberStepResult::Panicked
                 }
             }
             None => FiberStepResult::Completed,
@@ -312,12 +332,12 @@ impl FiberScheduler {
                     if let Some(mut fiber) = task {
                         let step_res = fiber.step();
                         match step_res {
-                            FiberStepResult::Completed => {
+                            FiberStepResult::Completed | FiberStepResult::Panicked => {
                                 if let Some(arena_id) = fiber.arena_id {
                                     crate::allocator::GLOBAL_ALLOCATOR.destroy_arena(arena_id);
                                 }
                                 let mut comp = completed.lock().unwrap();
-                                comp.insert(fiber.id, FiberState::Completed);
+                                comp.insert(fiber.id, fiber.state);
                                 comp_notif.notify_all();
                             }
                             FiberStepResult::Suspended => {
@@ -579,12 +599,12 @@ impl FiberScheduler {
         if let Some(mut fiber) = task {
             let step_res = fiber.step();
             match step_res {
-                FiberStepResult::Completed => {
+                FiberStepResult::Completed | FiberStepResult::Panicked => {
                     if let Some(arena_id) = fiber.arena_id {
                         crate::allocator::GLOBAL_ALLOCATOR.destroy_arena(arena_id);
                     }
                     let mut comp = self.completed_fibers.lock().unwrap();
-                    comp.insert(fiber.id, FiberState::Completed);
+                    comp.insert(fiber.id, fiber.state);
                     self.completion_notifier.notify_all();
                     return true;
                 }
@@ -650,6 +670,12 @@ impl FiberScheduler {
     pub fn is_completed(&self, fiber_id: FiberId) -> bool {
         let completed = self.completed_fibers.lock().unwrap();
         completed.contains_key(&fiber_id)
+    }
+
+    /// Retrieve the final execution state of a fiber if finished.
+    pub fn get_fiber_state(&self, fiber_id: FiberId) -> Option<FiberState> {
+        let completed = self.completed_fibers.lock().unwrap();
+        completed.get(&fiber_id).copied()
     }
 
     /// Block current context until the specified fiber has finished execution.

@@ -335,6 +335,82 @@ int ifa_rt_c_abi_validate_slice(ifa_slice_t slice, size_t elem_size, size_t min_
  */
 void ifa_rt_panic_out_of_bounds(size_t index, size_t len);
 
+/* --- Bare-Metal Panic Interception & Diagnostic Driver API --- */
+
+#define IFA_PANIC_NONE             0
+#define IFA_PANIC_USE_AFTER_FREE   1
+#define IFA_PANIC_DOUBLE_FREE      2
+#define IFA_PANIC_NULL_DEREF       3
+#define IFA_PANIC_EPOCH_MISMATCH   4
+#define IFA_PANIC_OUT_OF_BOUNDS    5
+#define IFA_PANIC_ASSERT_FAILED    6
+#define IFA_PANIC_GENERIC          7
+
+#define IFA_MAX_BARE_METAL_FRAMES 32
+#define IFA_MAX_PANIC_MSG_LEN     256
+
+typedef struct {
+    uintptr_t frames[IFA_MAX_BARE_METAL_FRAMES];
+    size_t    count;
+} ifa_bare_metal_stack_trace_t;
+
+typedef struct {
+    int32_t                      kind;
+    uintptr_t                    fault_address;
+    uint32_t                     expected_gen;
+    uint32_t                     actual_gen;
+    uint16_t                     expected_epoch;
+    uint16_t                     actual_epoch;
+    uint16_t                     arena_id;
+    uint16_t                     _reserved;
+    size_t                       message_len;
+    char                         message[IFA_MAX_PANIC_MSG_LEN];
+    ifa_bare_metal_stack_trace_t stack_trace;
+} ifa_panic_record_t;
+
+typedef void (*ifa_panic_handler_fn)(const ifa_panic_record_t* record);
+
+/**
+ * Register a custom panic hook callback.
+ */
+void ifa_rt_set_panic_handler(ifa_panic_handler_fn handler);
+
+/**
+ * Reset panic handler to default.
+ */
+void ifa_rt_reset_panic_handler(void);
+
+/**
+ * Retrieve pointer to the last intercepted panic record (thread-local or global).
+ */
+const ifa_panic_record_t* ifa_rt_get_last_panic(void);
+
+/**
+ * Clear the last recorded panic.
+ */
+void ifa_rt_clear_last_panic(void);
+
+/**
+ * Execute a function within the panic interception driver.
+ * Returns 0 on success, or panic kind code on exception.
+ */
+int32_t ifa_rt_catch_panic(ifa_fiber_entry_fn func, void* arg);
+
+/**
+ * Capture current bare-metal stack trace frames into buffer.
+ */
+size_t ifa_rt_capture_stack_trace(uintptr_t* buffer, size_t max_depth);
+
+/**
+ * Format bare-metal stack trace into byte buffer without heap allocation.
+ */
+size_t ifa_rt_format_stack_trace(char* buffer, size_t buffer_len);
+
+/**
+ * Retrieve execution status of a fiber (1: Completed, 2: Panicked, 3: Running, 4: Suspended, 5: WaitingIo, 0: Ready, -1: Unknown).
+ */
+int32_t ifa_rt_fiber_status(uint64_t fiber_id);
+
 #ifdef __cplusplus
 }
 #endif

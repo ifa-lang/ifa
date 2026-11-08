@@ -8,6 +8,7 @@ pub mod ffi;
 pub mod fiber;
 pub mod header;
 pub mod io;
+pub mod panic;
 pub mod reactor;
 pub mod string;
 pub mod wasi;
@@ -35,6 +36,11 @@ pub use fiber::{
 pub use header::{
     EpochTransition, GenHeader, GenRef, FLAG_ACTIVE, FLAG_ARENA_SCOPED, FLAG_EPOCH_1, FLAG_FREE,
     FLAG_PINNED, FLAG_QUARANTINED, FLAG_READONLY,
+};
+pub use panic::{
+    catch_panic, clear_last_panic, dispatch_panic, get_last_panic, get_last_panic_raw_ptr,
+    reset_panic_handler, set_panic_handler, IfaBareMetalStackTrace, IfaPanicKind, IfaPanicRecord,
+    PanicHandlerFn, MAX_BARE_METAL_FRAMES, MAX_PANIC_MSG_LEN,
 };
 pub use reactor::{
     ifa_rt_async_close, ifa_rt_async_io_uring_supported, ifa_rt_async_iocp_supported,

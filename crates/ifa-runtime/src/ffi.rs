@@ -19,13 +19,13 @@ pub extern "C" fn ifa_rt_gen_alloc(size: usize, align: usize, arena_id: u16) -> 
 
 /// Deallocate an active generational memory slot, incrementing generation counter.
 #[no_mangle]
-pub extern "C" fn ifa_rt_gen_free(ptr: *mut u8) {
+pub extern "C-unwind" fn ifa_rt_gen_free(ptr: *mut u8) {
     GLOBAL_ALLOCATOR.free(ptr);
 }
 
 /// 1-cycle CPU generation check: aborts safely on Use-After-Free detection.
 #[no_mangle]
-pub extern "C" fn ifa_rt_gen_check(ptr: *const u8, remembered_gen: u32) {
+pub extern "C-unwind" fn ifa_rt_gen_check(ptr: *const u8, remembered_gen: u32) {
     if ptr.is_null() {
         ifa_rt_panic_null_ref();
     }
@@ -42,7 +42,7 @@ pub extern "C" fn ifa_rt_gen_check(ptr: *const u8, remembered_gen: u32) {
 
 /// 1-cycle CPU generation and epoch check: aborts safely on Use-After-Free or epoch mismatch detection.
 #[no_mangle]
-pub extern "C" fn ifa_rt_gen_check_epoch(
+pub extern "C-unwind" fn ifa_rt_gen_check_epoch(
     ptr: *const u8,
     remembered_gen: u32,
     remembered_epoch: u16,
@@ -92,62 +92,134 @@ pub extern "C" fn ifa_rt_epoch_transitions_count() -> usize {
 
 /// Intercept and abort program on detected epoch mismatch wrap-around.
 #[no_mangle]
-pub extern "C" fn ifa_rt_panic_epoch_mismatch(
+pub extern "C-unwind" fn ifa_rt_panic_epoch_mismatch(
     ptr: *const u8,
     expected_epoch: u16,
     actual_epoch: u16,
 ) -> ! {
-    eprintln!(
-        "\n[IFA RUNTIME ERROR: SAFE INTERCEPTION]\n\
-         Epoch mismatch / wrap-around ABA attempt detected on slot address {:p}!\n\
-         Expected epoch flag: 0x{:04x}\n\
-         Actual current epoch flag: 0x{:04x}\n\
-         Execution terminated deterministically before memory corruption.\n",
-        ptr, expected_epoch, actual_epoch
+    let arena_id = unsafe {
+        if !ptr.is_null() && (ptr as usize) >= std::mem::size_of::<GenHeader>() {
+            let header = &*(ptr.sub(std::mem::size_of::<GenHeader>()) as *const GenHeader);
+            header.arena_id
+        } else {
+            0
+        }
+    };
+    let rec = crate::panic::IfaPanicRecord::new_epoch_mismatch(
+        ptr as usize,
+        expected_epoch,
+        actual_epoch,
+        arena_id,
     );
-    std::process::abort();
+    crate::panic::dispatch_panic(rec);
 }
 
 /// Intercept and abort program on detected Use-After-Free without memory corruption.
 #[no_mangle]
-pub extern "C" fn ifa_rt_panic_uaf(ptr: *const u8, expected_gen: u32, actual_gen: u32) -> ! {
-    eprintln!(
-        "\n[IFA RUNTIME ERROR: SAFE INTERCEPTION]\n\
-         Use-After-Free attempt detected on slot address {:p}!\n\
-         Expected generation: {}\n\
-         Actual current generation: {}\n\
-         Execution terminated deterministically before memory corruption.\n",
-        ptr, expected_gen, actual_gen
-    );
-    std::process::abort();
+pub extern "C-unwind" fn ifa_rt_panic_uaf(ptr: *const u8, expected_gen: u32, actual_gen: u32) -> ! {
+    let arena_id = unsafe {
+        if !ptr.is_null() && (ptr as usize) >= std::mem::size_of::<GenHeader>() {
+            let header = &*(ptr.sub(std::mem::size_of::<GenHeader>()) as *const GenHeader);
+            header.arena_id
+        } else {
+            0
+        }
+    };
+    let rec =
+        crate::panic::IfaPanicRecord::new_uaf(ptr as usize, expected_gen, actual_gen, arena_id);
+    crate::panic::dispatch_panic(rec);
 }
 
 /// Intercept and abort program on detected Double-Free.
 #[no_mangle]
-pub extern "C" fn ifa_rt_panic_double_free(ptr: *const u8) -> ! {
-    eprintln!(
-        "\n[IFA RUNTIME ERROR: SAFE INTERCEPTION]\n\
-         Double-free attempt detected on slot address {:p}!\n\
-         Execution terminated deterministically before memory corruption.\n",
-        ptr
-    );
-    std::process::abort();
+pub extern "C-unwind" fn ifa_rt_panic_double_free(ptr: *const u8) -> ! {
+    let arena_id = unsafe {
+        if !ptr.is_null() && (ptr as usize) >= std::mem::size_of::<GenHeader>() {
+            let header = &*(ptr.sub(std::mem::size_of::<GenHeader>()) as *const GenHeader);
+            header.arena_id
+        } else {
+            0
+        }
+    };
+    let rec = crate::panic::IfaPanicRecord::new_double_free(ptr as usize, arena_id);
+    crate::panic::dispatch_panic(rec);
 }
 
 /// Intercept null reference dereference.
 #[no_mangle]
-pub extern "C" fn ifa_rt_panic_null_ref() -> ! {
-    eprintln!(
-        "\n[IFA RUNTIME ERROR: SAFE INTERCEPTION]\n\
-         Attempted to dereference a null generational reference!\n\
-         Execution terminated deterministically.\n"
-    );
-    std::process::abort();
+pub extern "C-unwind" fn ifa_rt_panic_null_ref() -> ! {
+    let rec = crate::panic::IfaPanicRecord::new_null_deref();
+    crate::panic::dispatch_panic(rec);
+}
+
+/// Register a custom global panic interception handler callback.
+#[no_mangle]
+pub extern "C" fn ifa_rt_set_panic_handler(
+    handler: Option<extern "C" fn(*const crate::panic::IfaPanicRecord)>,
+) {
+    crate::panic::set_panic_handler(handler);
+}
+
+/// Reset global panic interception handler callback to default.
+#[no_mangle]
+pub extern "C" fn ifa_rt_reset_panic_handler() {
+    crate::panic::reset_panic_handler();
+}
+
+/// Retrieve raw pointer to the last intercepted panic record.
+#[no_mangle]
+pub extern "C" fn ifa_rt_get_last_panic() -> *const crate::panic::IfaPanicRecord {
+    crate::panic::get_last_panic_raw_ptr()
+}
+
+/// Clear the recorded panic state.
+#[no_mangle]
+pub extern "C" fn ifa_rt_clear_last_panic() {
+    crate::panic::clear_last_panic();
+}
+
+/// Catch an execution panic within a function pointer.
+/// Returns 0 on normal execution, or the panic kind (e.g. 1 for UAF) on panic.
+#[no_mangle]
+pub extern "C" fn ifa_rt_catch_panic(func: extern "C-unwind" fn(*mut u8), arg: *mut u8) -> i32 {
+    let outcome = crate::panic::catch_panic(std::panic::AssertUnwindSafe(|| {
+        func(arg);
+    }));
+    match outcome {
+        Ok(()) => 0,
+        Err(rec) => rec.kind as i32,
+    }
+}
+
+/// Capture current bare-metal stack trace into user-provided buffer.
+/// Returns number of frames captured.
+#[no_mangle]
+pub extern "C" fn ifa_rt_capture_stack_trace(buffer: *mut usize, max_depth: usize) -> usize {
+    let trace = crate::panic::IfaBareMetalStackTrace::capture();
+    let to_copy = trace.count.min(max_depth);
+    if !buffer.is_null() && to_copy > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(trace.frames.as_ptr(), buffer, to_copy);
+        }
+    }
+    to_copy
+}
+
+/// Format current bare-metal stack trace into user-provided byte buffer.
+/// Returns number of bytes written.
+#[no_mangle]
+pub extern "C" fn ifa_rt_format_stack_trace(buffer: *mut u8, buffer_len: usize) -> usize {
+    if buffer.is_null() || buffer_len == 0 {
+        return 0;
+    }
+    let trace = crate::panic::IfaBareMetalStackTrace::capture();
+    let slice = unsafe { std::slice::from_raw_parts_mut(buffer, buffer_len) };
+    trace.format_bare_metal(slice)
 }
 
 /// Assertion check: terminates with deterministic diagnostic if condition is false.
 #[no_mangle]
-pub extern "C" fn ifa_rt_assert(cond: bool, msg: *const u8) {
+pub extern "C-unwind" fn ifa_rt_assert(cond: bool, msg: *const u8) {
     if !cond {
         ifa_rt_panic_assert(msg);
     }
@@ -155,7 +227,7 @@ pub extern "C" fn ifa_rt_assert(cond: bool, msg: *const u8) {
 
 /// Assert two 64-bit integers are equal; aborts with detailed values on mismatch.
 #[no_mangle]
-pub extern "C" fn ifa_rt_assert_eq_i64(actual: i64, expected: i64, msg: *const u8) {
+pub extern "C-unwind" fn ifa_rt_assert_eq_i64(actual: i64, expected: i64, msg: *const u8) {
     if actual != expected {
         eprintln!(
             "\n[IFA ASSERTION FAILED: assert_eq]\n\
@@ -169,7 +241,7 @@ pub extern "C" fn ifa_rt_assert_eq_i64(actual: i64, expected: i64, msg: *const u
 
 /// Assert two 64-bit integers are not equal; aborts on equality.
 #[no_mangle]
-pub extern "C" fn ifa_rt_assert_ne_i64(actual: i64, expected: i64, msg: *const u8) {
+pub extern "C-unwind" fn ifa_rt_assert_ne_i64(actual: i64, expected: i64, msg: *const u8) {
     if actual == expected {
         eprintln!(
             "\n[IFA ASSERTION FAILED: assert_ne]\n\
@@ -182,18 +254,17 @@ pub extern "C" fn ifa_rt_assert_ne_i64(actual: i64, expected: i64, msg: *const u
 
 /// Intercept assertion failure with custom message.
 #[no_mangle]
-pub extern "C" fn ifa_rt_panic_assert(msg: *const u8) -> ! {
-    if !msg.is_null() {
+pub extern "C-unwind" fn ifa_rt_panic_assert(msg: *const u8) -> ! {
+    let msg_str = if !msg.is_null() {
         let c_str = unsafe { std::ffi::CStr::from_ptr(msg as *const std::ffi::c_char) };
-        if let Ok(s) = c_str.to_str() {
-            eprintln!("\n[IFA RUNTIME ERROR: ASSERTION FAILED]\n{}\n", s);
-        } else {
-            eprintln!("\n[IFA RUNTIME ERROR: ASSERTION FAILED]\n");
-        }
+        c_str
+            .to_str()
+            .unwrap_or("<invalid utf-8 assertion message>")
     } else {
-        eprintln!("\n[IFA RUNTIME ERROR: ASSERTION FAILED]\n");
-    }
-    std::process::abort();
+        "Runtime assertion failed"
+    };
+    let rec = crate::panic::IfaPanicRecord::new_assertion(msg_str);
+    crate::panic::dispatch_panic(rec);
 }
 
 /// Create a new scoped generational arena.
@@ -222,7 +293,7 @@ pub extern "C" fn ifa_rt_arena_alloc(arena_id: u16, size: usize, align: usize) -
 
 /// Spawn a new colorless fiber running an `extern "C"` function pointer with argument.
 #[no_mangle]
-pub extern "C" fn ifa_rt_fiber_spawn(entry: extern "C" fn(*mut u8), arg: *mut u8) -> u64 {
+pub extern "C" fn ifa_rt_fiber_spawn(entry: extern "C-unwind" fn(*mut u8), arg: *mut u8) -> u64 {
     let arg_addr = arg as usize;
     GLOBAL_SCHEDULER.spawn(move || {
         let raw_arg = arg_addr as *mut u8;
@@ -240,6 +311,20 @@ pub extern "C" fn ifa_rt_fiber_yield() {
 #[no_mangle]
 pub extern "C" fn ifa_rt_fiber_join(fiber_id: u64) {
     GLOBAL_SCHEDULER.join(fiber_id);
+}
+
+/// Retrieve execution status of a fiber (1: Completed, 2: Panicked, 3: Running, 4: Suspended, 5: WaitingIo, 0: Ready, -1: Unknown).
+#[no_mangle]
+pub extern "C" fn ifa_rt_fiber_status(fiber_id: u64) -> i32 {
+    match GLOBAL_SCHEDULER.get_fiber_state(fiber_id) {
+        Some(crate::fiber::FiberState::Completed) => 1,
+        Some(crate::fiber::FiberState::Panicked) => 2,
+        Some(crate::fiber::FiberState::Running) => 3,
+        Some(crate::fiber::FiberState::Suspended) => 4,
+        Some(crate::fiber::FiberState::WaitingIo(_)) => 5,
+        Some(crate::fiber::FiberState::Ready) => 0,
+        None => -1,
+    }
 }
 
 /// Retrieve the identifier of the currently executing fiber on this worker thread (0 if unassigned / main thread).
@@ -263,7 +348,7 @@ pub extern "C" fn ifa_rt_arena_verify_owner(arena_id: u16, fiber_id: u64) -> boo
 /// Spawn a new colorless fiber with an isolated, automatically managed generational arena.
 #[no_mangle]
 pub extern "C" fn ifa_rt_fiber_spawn_with_arena(
-    entry: extern "C" fn(*mut u8),
+    entry: extern "C-unwind" fn(*mut u8),
     arg: *mut u8,
 ) -> u64 {
     let arg_addr = arg as usize;
@@ -1284,7 +1369,7 @@ pub extern "C" fn ifa_rt_channel_select(
 ///
 /// Aborts safely on index out of bounds detection without memory corruption or undefined behavior.
 #[no_mangle]
-pub extern "C" fn ifa_rt_bounds_check(index: usize, len: usize, msg: *const u8) {
+pub extern "C-unwind" fn ifa_rt_bounds_check(index: usize, len: usize, msg: *const u8) {
     if index >= len {
         if !msg.is_null() {
             ifa_rt_panic_assert(msg);
@@ -1296,7 +1381,12 @@ pub extern "C" fn ifa_rt_bounds_check(index: usize, len: usize, msg: *const u8) 
 
 /// Verify that a sub-slice range `[start..end]` is strictly within bounds `[0..len]`.
 #[no_mangle]
-pub extern "C" fn ifa_rt_slice_bounds_check(start: usize, end: usize, len: usize, msg: *const u8) {
+pub extern "C-unwind" fn ifa_rt_slice_bounds_check(
+    start: usize,
+    end: usize,
+    len: usize,
+    msg: *const u8,
+) {
     if start > end || end > len {
         if !msg.is_null() {
             ifa_rt_panic_assert(msg);
@@ -1334,14 +1424,7 @@ pub extern "C" fn ifa_rt_c_abi_validate_slice(
 
 /// Intercept and abort program on detected buffer or slice index out-of-bounds attempt.
 #[no_mangle]
-pub extern "C" fn ifa_rt_panic_out_of_bounds(index: usize, len: usize) -> ! {
-    eprintln!(
-        "\n[IFA RUNTIME ERROR: SAFE BOUNDS CHECK]\n\
-         Attempted out-of-bounds buffer access!\n\
-         Accessed index: {}\n\
-         Buffer length : {}\n\
-         Execution terminated deterministically before memory corruption.\n",
-        index, len
-    );
-    std::process::abort();
+pub extern "C-unwind" fn ifa_rt_panic_out_of_bounds(index: usize, len: usize) -> ! {
+    let rec = crate::panic::IfaPanicRecord::new_out_of_bounds(index, len);
+    crate::panic::dispatch_panic(rec);
 }
