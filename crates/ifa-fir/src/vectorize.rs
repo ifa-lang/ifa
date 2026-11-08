@@ -34,6 +34,10 @@ pub struct VectorizeStats {
     pub min_reductions_vectorized: usize,
     /// Number of scalar maximum reduction loops identified and accelerated.
     pub max_reductions_vectorized: usize,
+    /// Number of loops operating over multidimensional slice projections vectorized.
+    pub multidim_projections_vectorized: usize,
+    /// Number of loops operating over symbolic slice partitions vectorized.
+    pub symbolic_partitions_vectorized: usize,
     /// Number of loops vectorized operating over guaranteed disjoint slice iterations.
     pub disjoint_slice_loops: usize,
     /// Number of distinct slice accesses vectorized with guaranteed disjoint memory.
@@ -344,6 +348,16 @@ impl VectorizePass {
                         self.stats.disjoint_slice_loops += 1;
                         self.stats.disjoint_slices_vectorized +=
                             slice_write_bases.len() + slice_read_bases.len();
+
+                        for &b in slice_write_bases.iter().chain(slice_read_bases.iter()) {
+                            let root = Self::trace_slice_root(func, b);
+                            if root.has_projection() {
+                                self.stats.multidim_projections_vectorized += 1;
+                            }
+                            if root.has_symbolic_partition() {
+                                self.stats.symbolic_partitions_vectorized += 1;
+                            }
+                        }
                     }
                 }
 
@@ -868,7 +882,7 @@ impl VectorizePass {
 
     /// Analyze whether two slice aggregate values operate over provably disjoint underlying memory
     /// (distinct stack allocas, distinct function parameters with inout exclusivity, distinct fields,
-    /// or non-overlapping constant subslices).
+    /// disjoint multidimensional projections, or non-overlapping symbolic subslices).
     pub fn are_slice_bases_disjoint(func: &FirFunction, b1: ValueId, b2: ValueId) -> bool {
         if b1 == b2 {
             return false;
@@ -877,10 +891,10 @@ impl VectorizePass {
         let root1 = Self::trace_slice_root(func, b1);
         let root2 = Self::trace_slice_root(func, b2);
 
-        Self::are_slice_roots_disjoint(&root1, &root2, func)
+        Self::are_slice_roots_disjoint(&root1, &root2)
     }
 
-    fn are_slice_roots_disjoint(r1: &SliceRoot, r2: &SliceRoot, func: &FirFunction) -> bool {
+    fn are_slice_roots_disjoint(r1: &SliceRoot, r2: &SliceRoot) -> bool {
         match (r1, r2) {
             (SliceRoot::Alloca(a1), SliceRoot::Alloca(a2)) => a1 != a2,
             (SliceRoot::CallArena(c1), SliceRoot::CallArena(c2)) => c1 != c2,
@@ -893,32 +907,107 @@ impl VectorizePass {
                 g1 != g2
             }
             (SliceRoot::Param(p1), SliceRoot::Param(p2)) => p1 != p2,
-            (SliceRoot::Field(base1, idx1), SliceRoot::Field(base2, idx2)) => {
-                if base1 == base2 {
+            (SliceRoot::Field(p1, idx1), SliceRoot::Field(p2, idx2)) => {
+                if p1 == p2 {
                     idx1 != idx2
                 } else {
-                    Self::are_slice_bases_disjoint(func, *base1, *base2)
+                    Self::are_slice_roots_disjoint(p1, p2)
                 }
             }
-            (SliceRoot::SubSlice(base1, s1, e1), SliceRoot::SubSlice(base2, s2, e2)) => {
-                if base1 == base2 {
-                    *e1 <= *s2 || *e2 <= *s1
+            (
+                SliceRoot::Projection {
+                    parent: p1,
+                    dim_index: d1,
+                },
+                SliceRoot::Projection {
+                    parent: p2,
+                    dim_index: d2,
+                },
+            ) => {
+                if p1 == p2 {
+                    d1.are_indices_disjoint(d2)
                 } else {
-                    Self::are_slice_roots_disjoint(base1, base2, func)
+                    Self::are_slice_roots_disjoint(p1, p2)
                 }
             }
-            (SliceRoot::SubSlice(base1, ..), other) => {
-                if &**base1 == other {
+            (
+                SliceRoot::SubSlice {
+                    parent: p1,
+                    start: s1,
+                    end: e1,
+                },
+                SliceRoot::SubSlice {
+                    parent: p2,
+                    start: s2,
+                    end: e2,
+                },
+            ) => {
+                if p1 == p2 {
+                    FirBound::are_ranges_disjoint(s1, e1, s2, e2)
+                } else {
+                    Self::are_slice_roots_disjoint(p1, p2)
+                }
+            }
+            (
+                SliceRoot::Projection {
+                    parent: p1,
+                    dim_index: d1,
+                },
+                SliceRoot::SubSlice {
+                    parent: p2,
+                    start: s2,
+                    end: e2,
+                },
+            ) => {
+                if p1 == p2 {
+                    FirBound::is_index_disjoint_from_range(d1, s2, e2)
+                } else {
+                    Self::are_slice_roots_disjoint(p1, p2)
+                }
+            }
+            (
+                SliceRoot::SubSlice {
+                    parent: p1,
+                    start: s1,
+                    end: e1,
+                },
+                SliceRoot::Projection {
+                    parent: p2,
+                    dim_index: d2,
+                },
+            ) => {
+                if p1 == p2 {
+                    FirBound::is_index_disjoint_from_range(d2, s1, e1)
+                } else {
+                    Self::are_slice_roots_disjoint(p1, p2)
+                }
+            }
+            (SliceRoot::SubSlice { parent: p1, .. }, other) => {
+                if &**p1 == other {
                     false
                 } else {
-                    Self::are_slice_roots_disjoint(base1, other, func)
+                    Self::are_slice_roots_disjoint(p1, other)
                 }
             }
-            (other, SliceRoot::SubSlice(base2, ..)) => {
-                if other == &**base2 {
+            (other, SliceRoot::SubSlice { parent: p2, .. }) => {
+                if other == &**p2 {
                     false
                 } else {
-                    Self::are_slice_roots_disjoint(other, base2, func)
+                    Self::are_slice_roots_disjoint(other, p2)
+                }
+            }
+            (SliceRoot::Projection { parent: p1, .. }, other) => {
+                if &**p1 == other {
+                    false
+                } else {
+                    Self::are_slice_roots_disjoint(p1, other)
+                }
+            }
+            (other, SliceRoot::Projection { parent: p2, .. }) => {
+                if other == &**p2 {
+                    false
+                } else {
+                    Self::are_slice_roots_disjoint(other, p2)
                 }
             }
             (SliceRoot::Alloca(_), SliceRoot::Param(_))
@@ -965,18 +1054,27 @@ impl VectorizePass {
                             | ValueExpr::GetFieldPtr {
                                 base, field_idx, ..
                             } => {
-                                return SliceRoot::Field(*base, *field_idx);
+                                let parent = Self::trace_slice_root(func, *base);
+                                return SliceRoot::Field(Box::new(parent), *field_idx);
+                            }
+                            ValueExpr::GetElement { base, index }
+                            | ValueExpr::GetElementPtr { base, index } => {
+                                let dim_idx = FirBound::from_value(func, *index);
+                                let parent = Self::trace_slice_root(func, *base);
+                                return SliceRoot::Projection {
+                                    parent: Box::new(parent),
+                                    dim_index: dim_idx,
+                                };
                             }
                             ValueExpr::SliceSub { base, start, end } => {
-                                if let (Some(s), Some(e)) = (
-                                    Self::resolve_const_int(func, *start),
-                                    Self::resolve_const_int(func, *end),
-                                ) {
-                                    let parent = Self::trace_slice_root(func, *base);
-                                    return SliceRoot::SubSlice(Box::new(parent), s, e);
-                                } else {
-                                    val = *base;
-                                }
+                                let s_bound = FirBound::from_value(func, *start);
+                                let e_bound = FirBound::from_value(func, *end);
+                                let parent = Self::trace_slice_root(func, *base);
+                                return SliceRoot::SubSlice {
+                                    parent: Box::new(parent),
+                                    start: s_bound,
+                                    end: e_bound,
+                                };
                             }
                             ValueExpr::CoWMakeUnique { val: src_val } => {
                                 val = *src_val;
@@ -1003,6 +1101,133 @@ impl VectorizePass {
     }
 }
 
+/// Symbolic or constant bound/index for FIR slice partitioning and multidimensional projections.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FirBound {
+    /// Constant literal index/bound (e.g. `0`, `32`).
+    Const(i64),
+    /// Symbolic SSA value reference (e.g. `split_idx`, `mid`).
+    Symbolic(ValueId),
+    /// Symbolic SSA value with constant offset (e.g. `mid + 16`, `base - 8`).
+    Offset(ValueId, i64),
+}
+
+impl FirBound {
+    /// Resolve a `FirBound` from an SSA `ValueId`.
+    pub fn from_value(func: &FirFunction, val: ValueId) -> Self {
+        if let Some(c) = VectorizePass::resolve_const_int(func, val) {
+            return FirBound::Const(c);
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if inst.result == Some(val) {
+                    match &inst.expr {
+                        ValueExpr::Binary {
+                            op: BinaryOp::Add,
+                            lhs,
+                            rhs,
+                        } => {
+                            if let Some(c) = VectorizePass::resolve_const_int(func, *rhs) {
+                                return FirBound::Offset(*lhs, c);
+                            } else if let Some(c) = VectorizePass::resolve_const_int(func, *lhs) {
+                                return FirBound::Offset(*rhs, c);
+                            }
+                        }
+                        ValueExpr::Binary {
+                            op: BinaryOp::Sub,
+                            lhs,
+                            rhs,
+                        } => {
+                            if let Some(c) = VectorizePass::resolve_const_int(func, *rhs) {
+                                return FirBound::Offset(*lhs, -c);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        FirBound::Symbolic(val)
+    }
+
+    /// Check if two bounds are provably disjoint indices (i.e. cannot be equal).
+    pub fn are_indices_disjoint(&self, other: &FirBound) -> bool {
+        match (self, other) {
+            (FirBound::Const(c1), FirBound::Const(c2)) => c1 != c2,
+            (FirBound::Offset(s1, o1), FirBound::Offset(s2, o2)) if s1 == s2 => o1 != o2,
+            (FirBound::Symbolic(s1), FirBound::Offset(s2, off))
+            | (FirBound::Offset(s2, off), FirBound::Symbolic(s1))
+                if s1 == s2 =>
+            {
+                *off != 0
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if Range 1 `[s1..e1]` is provably disjoint from Range 2 `[s2..e2]` (half-open).
+    pub fn are_ranges_disjoint(s1: &FirBound, e1: &FirBound, s2: &FirBound, e2: &FirBound) -> bool {
+        // 1. Both constant ranges: [s1..e1] vs [s2..e2]
+        if let (
+            FirBound::Const(s1_c),
+            FirBound::Const(e1_c),
+            FirBound::Const(s2_c),
+            FirBound::Const(e2_c),
+        ) = (s1, e1, s2, e2)
+        {
+            return *e1_c <= *s2_c || *e2_c <= *s1_c;
+        }
+
+        // 2. Symbolic split-point partition: Range 1 ends at K (exclusive) and Range 2 starts at K
+        // e.g. [0..split] vs [split..N] or [s1..split] vs [split..e2]
+        if e1 == s2 || e2 == s1 {
+            return true;
+        }
+
+        // 3. Symbolic offset ranges: [base + off1 .. base + off2] vs [base + off3 .. base + off4]
+        match (s1, e1, s2, e2) {
+            (
+                FirBound::Offset(b1, o_s1),
+                FirBound::Offset(b2, o_e1),
+                FirBound::Offset(b3, o_s2),
+                FirBound::Offset(b4, o_e2),
+            ) if b1 == b2 && b2 == b3 && b3 == b4 => *o_e1 <= *o_s2 || *o_e2 <= *o_s1,
+            (
+                FirBound::Symbolic(b1),
+                FirBound::Offset(b2, o_e1),
+                FirBound::Offset(b3, o_s2),
+                FirBound::Offset(b4, o_e2),
+            ) if b1 == b2 && b2 == b3 && b3 == b4 => *o_e1 <= *o_s2 || *o_e2 <= 0,
+            _ => false,
+        }
+    }
+
+    /// Check if an index is provably disjoint from a slice range `[start..end]`.
+    pub fn is_index_disjoint_from_range(idx: &FirBound, start: &FirBound, end: &FirBound) -> bool {
+        if let (FirBound::Const(c), FirBound::Const(s), FirBound::Const(e)) = (idx, start, end) {
+            return *c < *s || *c >= *e;
+        }
+        if idx == end {
+            return true;
+        }
+        if let FirBound::Offset(s_sym, off) = start {
+            if let FirBound::Symbolic(sym) = idx {
+                if sym == s_sym && *off > 0 {
+                    return true;
+                }
+            }
+        }
+        if let FirBound::Offset(i_sym, off) = idx {
+            if let FirBound::Symbolic(sym) = end {
+                if sym == i_sym && *off >= 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 /// Discovered provenance root for a slice buffer in SSA FIR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SliceRoot {
@@ -1010,8 +1235,16 @@ enum SliceRoot {
     CallArena(ValueId),
     GenArena(ValueId, Option<u16>),
     Param(usize),
-    Field(ValueId, usize),
-    SubSlice(Box<SliceRoot>, i64, i64),
+    Field(Box<SliceRoot>, usize),
+    Projection {
+        parent: Box<SliceRoot>,
+        dim_index: FirBound,
+    },
+    SubSlice {
+        parent: Box<SliceRoot>,
+        start: FirBound,
+        end: FirBound,
+    },
     Unknown(ValueId),
 }
 
@@ -1022,12 +1255,36 @@ impl SliceRoot {
         match self {
             SliceRoot::Alloca(_) | SliceRoot::CallArena(_) | SliceRoot::GenArena(..) => true,
             SliceRoot::Param(_) => func.is_strict,
-            SliceRoot::Field(base, _) => {
-                let parent = VectorizePass::trace_slice_root(func, *base);
-                parent.is_local_arena_or_stack(func)
-            }
-            SliceRoot::SubSlice(parent, ..) => parent.is_local_arena_or_stack(func),
+            SliceRoot::Field(parent, _) => parent.is_local_arena_or_stack(func),
+            SliceRoot::Projection { parent, .. } => parent.is_local_arena_or_stack(func),
+            SliceRoot::SubSlice { parent, .. } => parent.is_local_arena_or_stack(func),
             SliceRoot::Unknown(_) => false,
+        }
+    }
+
+    /// Check if this slice root involves multidimensional projection.
+    pub fn has_projection(&self) -> bool {
+        match self {
+            SliceRoot::Projection { .. } => true,
+            SliceRoot::Field(parent, _) | SliceRoot::SubSlice { parent, .. } => {
+                parent.has_projection()
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if this slice root involves symbolic slice partitioning.
+    pub fn has_symbolic_partition(&self) -> bool {
+        match self {
+            SliceRoot::SubSlice { start, end, parent } => {
+                matches!(start, FirBound::Symbolic(_) | FirBound::Offset(..))
+                    || matches!(end, FirBound::Symbolic(_) | FirBound::Offset(..))
+                    || parent.has_symbolic_partition()
+            }
+            SliceRoot::Projection { parent, .. } | SliceRoot::Field(parent, _) => {
+                parent.has_symbolic_partition()
+            }
+            _ => false,
         }
     }
 }

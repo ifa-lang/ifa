@@ -840,6 +840,11 @@ impl LicmPass {
                                             resolve_access_path(*array, &inst_defs, &constants, 0);
                                         !written_paths.iter().any(|w| arr_path.overlaps(w))
                                     }
+                                    ValueExpr::SliceSub { base, .. } => {
+                                        let base_path =
+                                            resolve_access_path(*base, &inst_defs, &constants, 0);
+                                        !written_paths.iter().any(|w| base_path.overlaps(w))
+                                    }
                                     _ => false,
                                 };
 
@@ -905,6 +910,7 @@ impl LicmPass {
                                             break;
                                         }
                                     }
+
                                     _ => {}
                                 }
                             }

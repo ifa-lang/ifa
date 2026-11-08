@@ -1143,3 +1143,95 @@ fn test_vectorize_pass_direct_count_if_and_filter_specialization() {
         panic!("Inst 2 must remain CallDirect");
     }
 }
+
+#[test]
+fn test_vectorize_pass_symbolic_partition_split_point_disjoint() {
+    let src = r#"
+        pub strict fn symbolic_partition_stream(buf: [f32; 64], split: i64, inout out_buf: [f32; 64]) {
+            let src = buf[0..split];
+            let mut dst = out_buf[split..64];
+            let factor: f32 = 1.5;
+            let mut i: i64 = 0;
+            while i < split {
+                dst[i] = src[i] * factor;
+                i = i + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("symbolic_partition.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
+    assert!(formatted.contains("// [disjoint_slices: true]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.disjoint_slice_loops, 1);
+    assert!(stats.symbolic_partitions_vectorized >= 1);
+}
+
+#[test]
+fn test_vectorize_pass_multidimensional_projection_disjoint() {
+    let src = r#"
+        pub strict fn matrix_row_transform(grid: [[f32; 32]; 8], inout out_grid: [[f32; 32]; 8]) {
+            let src_row = grid[0][0..32];
+            let mut dst_row = out_grid[1][0..32];
+            let scale: f32 = 4.0;
+            let mut c: i64 = 0;
+            while c < 32 {
+                dst_row[c] = src_row[c] * scale;
+                c = c + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("matrix_disjoint.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
+    assert!(formatted.contains("// [disjoint_slices: true]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.disjoint_slice_loops, 1);
+    assert!(stats.multidim_projections_vectorized >= 1);
+}

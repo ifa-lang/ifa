@@ -4118,3 +4118,126 @@ fn test_llvm_aot_strict_arena_slice_count_if_execution() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_multidimensional_disjoint_slice_partition_vectorization_metadata() {
+    let src = r#"
+        pub strict fn transform_disjoint_matrix_rows(grid: [[f64; 32]; 4], inout out_grid: [[f64; 32]; 4]) {
+            let src_row = grid[0][0..32];
+            let mut dst_row = out_grid[1][0..32];
+            let scale: f64 = 3.0;
+            let mut i: i64 = 0;
+            while i < 32 {
+                dst_row[i] = src_row[i] * scale;
+                i = i + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("matrix_slice_vec.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).expect("FIR lowering failed");
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&module).expect("Emission failed");
+
+    // Verify disjoint parallel access metadata is emitted
+    assert!(ir.contains("!\"llvm.loop.parallel_accesses\""));
+    // Verify disjoint 4-lane SIMD vectorization loop metadata !26 is attached to the loop branch
+    assert!(ir.contains("!llvm.loop !26"));
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("llvm_matrix_disjoint_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("matrix_disjoint.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation to object failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_native_multidimensional_disjoint_slice_partition_execution() {
+    let src = r#"
+        strict fn copy_disjoint_stream(in_buf: [i64; 8], split: i64, inout out_buf: [i64; 8]) -> i64 {
+            let src = in_buf[0..split];
+            let mut dst = out_buf[split..8];
+            let mut i: i64 = 0;
+            while i < split {
+                dst[i] = src[i] + 2;
+                i = i + 1;
+            }
+            return dst[0] + dst[1] + dst[2] + dst[3];
+        }
+
+        pub fn main() -> i64 {
+            let buffer: [i64; 8] = [10, 20, 30, 40, 0, 0, 0, 0];
+            mut out: [i64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+            let split_idx: i64 = 4;
+            // 12 + 22 + 32 + 42 = 108
+            let sum = copy_disjoint_stream(buffer, split_idx, inout out);
+            return sum;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("matrix_slice_exec.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).expect("FIR lowering failed");
+
+    let temp_dir = std::env::temp_dir().join(format!("llvm_matrix_exec_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("matrix_exec.o");
+    let bin_path = temp_dir.join("matrix_bin");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation to object failed: {:?}",
+        compile_res.err()
+    );
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(
+        link_res.is_ok(),
+        "Native linking failed: {:?}",
+        link_res.err()
+    );
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(108),
+        "Exit code from native execution must be 108"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

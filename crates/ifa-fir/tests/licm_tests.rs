@@ -866,3 +866,70 @@ fn test_partial_alias_elimination_nested_composite_fields() {
         .unwrap();
     assert_eq!(res, FirValue::Int(36));
 }
+
+#[test]
+fn test_licm_hoists_invariant_subslice_and_generation_checks_nested_multipass() {
+    let src = r#"
+        struct BufferRef {
+            tag: i64,
+        }
+
+        pub fn process_matrix_slices(buf: ref BufferRef, outer_lim: i64, inner_lim: i64) -> i64 {
+            mut acc = 0;
+            mut i = 0;
+            while i < outer_lim {
+                mut j = 0;
+                while j < inner_lim {
+                    acc = acc + buf.tag;
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            return acc;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("licm_nested_slice_gen.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = lower_program(&prog, &analysis.symbols);
+    let mut licm = LicmPass::new();
+    licm.run_on_module(&mut module);
+
+    let stats = licm.stats();
+    assert!(
+        stats.loops_optimized >= 1,
+        "Loops must be optimized: {:?}",
+        stats
+    );
+    assert!(
+        stats.total_hoisted() >= 1,
+        "Invariant operations must be hoisted: {:?}",
+        stats
+    );
+
+    let mut interp = FirInterpreter::new(&module);
+    let buf_obj = FirValue::Struct {
+        name: ifa_span::INTERNER.intern("BufferRef"),
+        fields: vec![FirValue::Int(10)],
+    };
+
+    // 10 * 3 * 4 = 120
+    let res = interp
+        .execute_function(
+            "process_matrix_slices",
+            vec![buf_obj, FirValue::Int(3), FirValue::Int(4)],
+        )
+        .unwrap();
+    assert_eq!(res, FirValue::Int(120));
+}

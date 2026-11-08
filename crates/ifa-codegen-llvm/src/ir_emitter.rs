@@ -1451,6 +1451,13 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("!20 = distinct !{!20, !2, !9, !22, !5, !12, !13}\n");
         out.push_str("!21 = distinct !{!21, !2, !11, !22, !5, !12, !13}\n");
         out.push_str("!22 = !{!\"llvm.loop.interleave.count\", i32 8}\n");
+        // Specialized multidimensional disjoint slice vectorization hints with parallel access groups
+        out.push_str("!23 = distinct !{!23, !2, !3, !4, !5, !12, !13, !24}\n");
+        out.push_str("!24 = !{!\"llvm.loop.parallel_accesses\", !25}\n");
+        out.push_str("!25 = distinct !{}\n");
+        out.push_str("!26 = distinct !{!26, !2, !7, !4, !5, !12, !13, !24}\n");
+        out.push_str("!27 = distinct !{!27, !2, !9, !4, !5, !12, !13, !24}\n");
+        out.push_str("!28 = distinct !{!28, !2, !11, !4, !5, !12, !13, !24}\n");
 
         Ok(out)
     }
@@ -1517,7 +1524,11 @@ impl<'a> LlvmIrEmitter<'a> {
         // Precompute SSA value types within this function
         let mut value_types: HashMap<ifa_fir::ValueId, ifa_fir::FirType> = HashMap::new();
         for p in &func.params {
-            value_types.insert(p.val, p.ty.clone());
+            if p.mode == ifa_fir::ParamMode::InOut {
+                value_types.insert(p.val, ifa_fir::FirType::Pointer(Box::new(p.ty.clone())));
+            } else {
+                value_types.insert(p.val, p.ty.clone());
+            }
         }
         for block in &func.blocks {
             for (p_id, p_ty) in &block.params {
@@ -1727,6 +1738,24 @@ impl<'a> LlvmIrEmitter<'a> {
                                 ifa_sema::types::IntType::I64,
                             ))),
                         },
+                        ValueExpr::GetElementPtr { base, .. } => match value_types.get(base) {
+                            Some(ifa_fir::FirType::Array(inner, _))
+                            | Some(ifa_fir::FirType::Slice(inner)) => {
+                                ifa_fir::FirType::Pointer(inner.clone())
+                            }
+                            Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
+                                ifa_fir::FirType::Array(elem, _)
+                                | ifa_fir::FirType::Slice(elem) => {
+                                    ifa_fir::FirType::Pointer(elem.clone())
+                                }
+                                _ => ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Int(
+                                    ifa_sema::types::IntType::I64,
+                                ))),
+                            },
+                            _ => ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Int(
+                                ifa_sema::types::IntType::I64,
+                            ))),
+                        },
                         _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
                     };
                     value_types.insert(res, ty);
@@ -1736,14 +1765,32 @@ impl<'a> LlvmIrEmitter<'a> {
 
         // Map loaded array variables back to their memory alloca pointers for passing to calls/slices
         let mut array_allocas: HashMap<ifa_fir::ValueId, ifa_fir::ValueId> = HashMap::new();
+        let mut array_ptrs: HashMap<ifa_fir::ValueId, String> = HashMap::new();
+        for p in &func.params {
+            if matches!(p.ty, ifa_fir::FirType::Array(..)) || p.mode == ifa_fir::ParamMode::InOut {
+                array_ptrs.insert(p.val, format!("%v{}", p.val.0));
+            }
+        }
         for block in &func.blocks {
             for inst in &block.instructions {
                 if let (Some(res), ValueExpr::Load { ptr }) = (inst.result, &inst.expr) {
                     if let Some(ifa_fir::FirType::Pointer(inner)) = value_types.get(ptr) {
                         if matches!(&**inner, ifa_fir::FirType::Array(..)) {
                             array_allocas.insert(res, *ptr);
+                            array_ptrs.insert(res, format!("%v{}", ptr.0));
                         }
                     }
+                } else if let (Some(res), ValueExpr::GetElement { .. }) = (inst.result, &inst.expr)
+                {
+                    if let Some(ty) = value_types.get(&res) {
+                        if matches!(ty, ifa_fir::FirType::Array(..)) {
+                            array_ptrs.insert(res, format!("%gep_{}", res.0));
+                        }
+                    }
+                } else if let (Some(res), ValueExpr::GetElementPtr { .. }) =
+                    (inst.result, &inst.expr)
+                {
+                    array_ptrs.insert(res, format!("%v{}", res.0));
                 }
             }
         }
@@ -1871,6 +1918,7 @@ impl<'a> LlvmIrEmitter<'a> {
                         module,
                         &value_types,
                         &array_allocas,
+                        &array_ptrs,
                         is_coro,
                         &mut coro_yield_idx,
                         out,
@@ -1881,6 +1929,7 @@ impl<'a> LlvmIrEmitter<'a> {
                         module,
                         &value_types,
                         &array_allocas,
+                        &array_ptrs,
                         is_coro,
                         &mut coro_yield_idx,
                         &mut eff_idx,
@@ -2004,6 +2053,7 @@ impl<'a> LlvmIrEmitter<'a> {
         module: &FirModule,
         value_types: &HashMap<ifa_fir::ValueId, ifa_fir::FirType>,
         array_allocas: &HashMap<ifa_fir::ValueId, ifa_fir::ValueId>,
+        array_ptrs: &HashMap<ifa_fir::ValueId, String>,
         is_coro: bool,
         coro_yield_idx: &mut usize,
         out: &mut String,
@@ -2617,9 +2667,10 @@ impl<'a> LlvmIrEmitter<'a> {
                         ));
                         format!("%gep_slice_ptr_{}", res_id)
                     }
-                    _ => array_allocas
+                    _ => array_ptrs
                         .get(base)
-                        .map(|p| format!("%v{}", p.0))
+                        .cloned()
+                        .or_else(|| array_allocas.get(base).map(|p| format!("%v{}", p.0)))
                         .unwrap_or_else(|| format!("%v{}", base.0)),
                 };
                 out.push_str(&format!(
@@ -2671,21 +2722,24 @@ impl<'a> LlvmIrEmitter<'a> {
                         ));
                         format!("%slice_elem_ptr_{}", res_id)
                     }
-                    Some(ifa_fir::FirType::Array(..)) => array_allocas
+                    Some(ifa_fir::FirType::Array(..)) => array_ptrs
                         .get(base)
-                        .map(|p| format!("%v{}", p.0))
+                        .cloned()
+                        .or_else(|| array_allocas.get(base).map(|p| format!("%v{}", p.0)))
                         .unwrap_or_else(|| format!("%v{}", base.0)),
                     Some(ifa_fir::FirType::Pointer(inner))
                         if matches!(&**inner, ifa_fir::FirType::Array(..)) =>
                     {
-                        array_allocas
+                        array_ptrs
                             .get(base)
-                            .map(|p| format!("%v{}", p.0))
+                            .cloned()
+                            .or_else(|| array_allocas.get(base).map(|p| format!("%v{}", p.0)))
                             .unwrap_or_else(|| format!("%v{}", base.0))
                     }
-                    _ => array_allocas
+                    _ => array_ptrs
                         .get(base)
-                        .map(|p| format!("%v{}", p.0))
+                        .cloned()
+                        .or_else(|| array_allocas.get(base).map(|p| format!("%v{}", p.0)))
                         .unwrap_or_else(|| format!("%v{}", base.0)),
                 };
                 out.push_str(&format!(
@@ -3323,21 +3377,24 @@ impl<'a> LlvmIrEmitter<'a> {
                         ));
                         format!("%sub_base_ptr_{}", res_id)
                     }
-                    Some(ifa_fir::FirType::Array(..)) => array_allocas
+                    Some(ifa_fir::FirType::Array(..)) => array_ptrs
                         .get(base)
-                        .map(|p| format!("%v{}", p.0))
+                        .cloned()
+                        .or_else(|| array_allocas.get(base).map(|p| format!("%v{}", p.0)))
                         .unwrap_or_else(|| format!("%v{}", base.0)),
                     Some(ifa_fir::FirType::Pointer(inner))
                         if matches!(&**inner, ifa_fir::FirType::Array(..)) =>
                     {
-                        array_allocas
+                        array_ptrs
                             .get(base)
-                            .map(|p| format!("%v{}", p.0))
+                            .cloned()
+                            .or_else(|| array_allocas.get(base).map(|p| format!("%v{}", p.0)))
                             .unwrap_or_else(|| format!("%v{}", base.0))
                     }
-                    _ => array_allocas
+                    _ => array_ptrs
                         .get(base)
-                        .map(|p| format!("%v{}", p.0))
+                        .cloned()
+                        .or_else(|| array_allocas.get(base).map(|p| format!("%v{}", p.0)))
                         .unwrap_or_else(|| format!("%v{}", base.0)),
                 };
 
@@ -3508,6 +3565,7 @@ impl<'a> LlvmIrEmitter<'a> {
         module: &FirModule,
         value_types: &HashMap<ifa_fir::ValueId, ifa_fir::FirType>,
         array_allocas: &HashMap<ifa_fir::ValueId, ifa_fir::ValueId>,
+        array_ptrs: &HashMap<ifa_fir::ValueId, String>,
         is_coro: bool,
         coro_yield_idx: &mut usize,
         eff_idx: &mut usize,
@@ -4059,7 +4117,11 @@ impl<'a> LlvmIrEmitter<'a> {
                         ));
                         format!("%slice_set_ptr_{}", val.0)
                     }
-                    _ => format!("%v{}", base.0),
+                    _ => array_ptrs
+                        .get(base)
+                        .cloned()
+                        .or_else(|| array_allocas.get(base).map(|p| format!("%v{}", p.0)))
+                        .unwrap_or_else(|| format!("%v{}", base.0)),
                 };
                 out.push_str(&format!(
                     "  %gep_set_{} = getelementptr inbounds {}, ptr {}, i64 %v{}\n",
@@ -4341,10 +4403,16 @@ impl<'a> LlvmIrEmitter<'a> {
                             16 | 32 => 20,
                             _ => 18,
                         }
+                    } else if hint.disjoint_slices {
+                        match hint.vector_width {
+                            2 => 28,
+                            4 => 26,
+                            16 | 32 => 27,
+                            _ => 23,
+                        }
                     } else if hint.predicate_enable
                         || hint.predicated_scatter_gather
                         || hint.is_strict
-                        || hint.disjoint_slices
                     {
                         match hint.vector_width {
                             2 => 17,
@@ -4384,10 +4452,16 @@ impl<'a> LlvmIrEmitter<'a> {
                             16 | 32 => 20,
                             _ => 18,
                         }
+                    } else if hint.disjoint_slices {
+                        match hint.vector_width {
+                            2 => 28,
+                            4 => 26,
+                            16 | 32 => 27,
+                            _ => 23,
+                        }
                     } else if hint.predicate_enable
                         || hint.predicated_scatter_gather
                         || hint.is_strict
-                        || hint.disjoint_slices
                     {
                         match hint.vector_width {
                             2 => 17,
