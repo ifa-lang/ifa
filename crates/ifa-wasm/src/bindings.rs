@@ -10,10 +10,40 @@ pub enum WasmType {
     Bool,
     String,
     Void,
+    SliceI64,
+    SliceF64,
+    SliceU8,
+    SliceI32,
     Function(Vec<WasmType>, Box<WasmType>),
 }
 
 impl WasmType {
+    pub fn is_slice(&self) -> bool {
+        matches!(
+            self,
+            WasmType::SliceI64 | WasmType::SliceF64 | WasmType::SliceU8 | WasmType::SliceI32
+        )
+    }
+
+    pub fn typed_array_constructor(&self) -> &'static str {
+        match self {
+            WasmType::SliceI64 => "BigInt64Array",
+            WasmType::SliceF64 => "Float64Array",
+            WasmType::SliceU8 => "Uint8Array",
+            WasmType::SliceI32 => "Int32Array",
+            _ => "Uint8Array",
+        }
+    }
+
+    pub fn slice_elem_size(&self) -> usize {
+        match self {
+            WasmType::SliceI64 | WasmType::SliceF64 => 8,
+            WasmType::SliceI32 => 4,
+            WasmType::SliceU8 => 1,
+            _ => 1,
+        }
+    }
+
     pub fn to_typescript(&self) -> String {
         match self {
             WasmType::I32 | WasmType::F32 | WasmType::F64 => "number".to_string(),
@@ -21,6 +51,10 @@ impl WasmType {
             WasmType::Bool => "boolean".to_string(),
             WasmType::String => "string".to_string(),
             WasmType::Void => "void".to_string(),
+            WasmType::SliceI64 => "BigInt64Array".to_string(),
+            WasmType::SliceF64 => "Float64Array".to_string(),
+            WasmType::SliceU8 => "Uint8Array".to_string(),
+            WasmType::SliceI32 => "Int32Array".to_string(),
             WasmType::Function(params, ret) => {
                 let p_str = params
                     .iter()
@@ -30,6 +64,37 @@ impl WasmType {
                     .join(", ");
                 format!("({}) => {}", p_str, ret.to_typescript())
             }
+        }
+    }
+
+    pub fn from_fir_type(ty: &ifa_fir::FirType) -> Self {
+        use ifa_sema::types::{FloatType, IntType};
+        match ty {
+            ifa_fir::FirType::Int(IntType::I64 | IntType::U64) => WasmType::I64,
+            ifa_fir::FirType::Int(_) => WasmType::I32,
+            ifa_fir::FirType::Float(FloatType::F64) => WasmType::F64,
+            ifa_fir::FirType::Float(FloatType::F32) => WasmType::F32,
+            ifa_fir::FirType::Bool => WasmType::Bool,
+            ifa_fir::FirType::String | ifa_fir::FirType::Str => WasmType::String,
+            ifa_fir::FirType::Unit => WasmType::Void,
+            ifa_fir::FirType::Slice(inner) => match inner.as_ref() {
+                ifa_fir::FirType::Int(IntType::I64 | IntType::U64) => WasmType::SliceI64,
+                ifa_fir::FirType::Float(FloatType::F64) => WasmType::SliceF64,
+                ifa_fir::FirType::Int(IntType::I32 | IntType::U32) => WasmType::SliceI32,
+                _ => WasmType::SliceU8,
+            },
+            ifa_fir::FirType::Array(inner, _) => match inner.as_ref() {
+                ifa_fir::FirType::Int(IntType::I64 | IntType::U64) => WasmType::SliceI64,
+                ifa_fir::FirType::Float(FloatType::F64) => WasmType::SliceF64,
+                ifa_fir::FirType::Int(IntType::I32 | IntType::U32) => WasmType::SliceI32,
+                _ => WasmType::SliceU8,
+            },
+            ifa_fir::FirType::Function { params, ret } => {
+                let p = params.iter().map(Self::from_fir_type).collect();
+                let r = Box::new(Self::from_fir_type(ret));
+                WasmType::Function(p, r)
+            }
+            _ => WasmType::I32,
         }
     }
 }
@@ -194,6 +259,8 @@ impl TypeScriptBindingsGenerator {
         for func in &self.exports {
             let has_string_param = func.params.iter().any(|(_, t)| *t == WasmType::String);
             let returns_string = func.ret_ty == WasmType::String;
+            let has_slice_param = func.params.iter().any(|(_, t)| t.is_slice());
+            let returns_slice = func.ret_ty.is_slice();
             let param_names = func
                 .params
                 .iter()
@@ -207,13 +274,13 @@ impl TypeScriptBindingsGenerator {
             ));
             js.push_str("  if (!wasmInstance) throw new Error(\"IFA Wasm module not initialized. Call 'await init()' first.\");\n");
 
-            if !has_string_param && !returns_string {
+            if !has_string_param && !returns_string && !has_slice_param && !returns_slice {
                 js.push_str(&format!(
                     "  return wasmInstance.exports.{}({});\n",
                     func.name, param_names
                 ));
             } else {
-                // String marshalling logic
+                // Parameter marshalling logic
                 for (p_name, p_ty) in &func.params {
                     if *p_ty == WasmType::String {
                         js.push_str(&format!(
@@ -221,10 +288,23 @@ impl TypeScriptBindingsGenerator {
                             p_name, p_name
                         ));
                         js.push_str(&format!(
-                            "  const {}Ptr = wasmInstance.exports.ifa_alloc({}Encoded.length);\n",
+                            "  const {}Ptr = wasmInstance.exports.ifa_alloc ? wasmInstance.exports.ifa_alloc({}Encoded.length) : 0;\n",
                             p_name, p_name
                         ));
                         js.push_str(&format!("  new Uint8Array(wasmInstance.exports.memory.buffer, {}Ptr, {}Encoded.length).set({}Encoded);\n", p_name, p_name, p_name));
+                    } else if p_ty.is_slice() {
+                        js.push_str(&format!(
+                            "  const {}Bytes = new Uint8Array({}.buffer, {}.byteOffset, {}.byteLength);\n",
+                            p_name, p_name, p_name, p_name
+                        ));
+                        js.push_str(&format!(
+                            "  const {}Ptr = wasmInstance.exports.ifa_alloc ? wasmInstance.exports.ifa_alloc({}Bytes.length) : 0;\n",
+                            p_name, p_name
+                        ));
+                        js.push_str(&format!(
+                            "  new Uint8Array(wasmInstance.exports.memory.buffer, {}Ptr, {}Bytes.length).set({}Bytes);\n",
+                            p_name, p_name, p_name
+                        ));
                     }
                 }
                 let call_args = func
@@ -233,6 +313,8 @@ impl TypeScriptBindingsGenerator {
                     .map(|(p_name, p_ty)| {
                         if *p_ty == WasmType::String {
                             format!("{}Ptr, {}Encoded.length", p_name, p_name)
+                        } else if p_ty.is_slice() {
+                            format!("{}Ptr, {}.length", p_name, p_name)
                         } else {
                             p_name.clone()
                         }
@@ -245,8 +327,20 @@ impl TypeScriptBindingsGenerator {
                         "  const retPtr = wasmInstance.exports.{}({});\n",
                         func.name, call_args
                     ));
-                    js.push_str("  const retLen = wasmInstance.exports.ifa_str_len(retPtr);\n");
+                    js.push_str("  const retLen = wasmInstance.exports.ifa_str_len ? wasmInstance.exports.ifa_str_len(retPtr) : 0;\n");
                     js.push_str("  return textDecoder.decode(new Uint8Array(wasmInstance.exports.memory.buffer, retPtr, retLen));\n");
+                } else if returns_slice {
+                    let typed_arr = func.ret_ty.typed_array_constructor();
+                    let elem_size = func.ret_ty.slice_elem_size();
+                    js.push_str(&format!(
+                        "  const retPtr = wasmInstance.exports.{}({});\n",
+                        func.name, call_args
+                    ));
+                    js.push_str("  const retLen = wasmInstance.exports.ifa_slice_len ? wasmInstance.exports.ifa_slice_len(retPtr) : 0;\n");
+                    js.push_str(&format!(
+                        "  return new {}(wasmInstance.exports.memory.buffer.slice(retPtr, retPtr + retLen * {}));\n",
+                        typed_arr, elem_size
+                    ));
                 } else {
                     js.push_str(&format!(
                         "  return wasmInstance.exports.{}({});\n",
@@ -368,6 +462,25 @@ impl TypeScriptBindingsGenerator {
         js.push_str("    this.isRunning = false;\n");
         js.push_str("    this.exitCode = 128 + signal;\n");
         js.push_str("    this.emitStderr(`Process ${this.pid} terminated by signal ${signal}`);\n");
+        js.push_str("  }\n\n");
+        js.push_str("  getMemoryBuffer() {\n");
+        js.push_str("    if (!this.instance || !this.instance.memory) return null;\n");
+        js.push_str("    return this.instance.memory.buffer;\n");
+        js.push_str("  }\n\n");
+        js.push_str("  getMemoryView(offset, length) {\n");
+        js.push_str("    const buf = this.getMemoryBuffer();\n");
+        js.push_str("    if (!buf) return null;\n");
+        js.push_str("    return new Uint8Array(buf, offset, length);\n");
+        js.push_str("  }\n\n");
+        js.push_str("  getSliceView(offset, length, type = 'u8') {\n");
+        js.push_str("    const buf = this.getMemoryBuffer();\n");
+        js.push_str("    if (!buf) return null;\n");
+        js.push_str("    switch (type) {\n");
+        js.push_str("      case 'i64': return new BigInt64Array(buf, offset, length);\n");
+        js.push_str("      case 'f64': return new Float64Array(buf, offset, length);\n");
+        js.push_str("      case 'i32': return new Int32Array(buf, offset, length);\n");
+        js.push_str("      default: return new Uint8Array(buf, offset, length);\n");
+        js.push_str("    }\n");
         js.push_str("  }\n");
         js.push_str("}\n");
         js
@@ -394,6 +507,9 @@ impl TypeScriptBindingsGenerator {
         dts.push_str("  onStderr(callback: (text: string) => void): this;\n");
         dts.push_str("  spawn(wasmSource?: RequestInfo | BufferSource | WebAssembly.Module): Promise<number>;\n");
         dts.push_str("  kill(signal?: number): void;\n");
+        dts.push_str("  getMemoryBuffer(): ArrayBuffer | null;\n");
+        dts.push_str("  getMemoryView(offset: number, length: number): Uint8Array | null;\n");
+        dts.push_str("  getSliceView(offset: number, length: number, type?: 'u8' | 'i32' | 'i64' | 'f64'): ArrayBufferView | null;\n");
         dts.push_str("}\n");
         dts
     }

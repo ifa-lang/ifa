@@ -32,9 +32,61 @@ impl WasmBundler {
         }
     }
 
+    /// Construct a WasmBundler directly from an IFA FIR Module, extracting exported functions and typing.
+    pub fn from_fir_module(
+        module_name: impl Into<String>,
+        wasm_bytes: Vec<u8>,
+        fir_module: &ifa_fir::FirModule,
+    ) -> Self {
+        let mut functions = Vec::new();
+        for func in &fir_module.functions {
+            if func.is_pub || func.is_extern.is_some() {
+                let fn_name = ifa_span::INTERNER.resolve(&func.name);
+                if fn_name == "main" || fn_name.starts_with("__") {
+                    continue;
+                }
+                let params = func
+                    .params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let p_name = ifa_span::INTERNER.resolve(&p.name);
+                        let name_str = if p_name.is_empty() {
+                            format!("arg{}", i)
+                        } else {
+                            p_name
+                        };
+                        (name_str, WasmType::from_fir_type(&p.ty))
+                    })
+                    .collect();
+                let ret_ty = WasmType::from_fir_type(&func.ret_ty);
+                let doc = if func.is_strict {
+                    Some("Strict zero-heap deterministic WebAssembly function".to_string())
+                } else {
+                    Some("Exported IFA WebAssembly function".to_string())
+                };
+                functions.push(WasmExportFunction {
+                    name: fn_name,
+                    params,
+                    ret_ty,
+                    doc,
+                });
+            }
+        }
+        Self {
+            module_name: module_name.into(),
+            wasm_bytes,
+            functions,
+        }
+    }
+
     pub fn with_functions(mut self, functions: Vec<WasmExportFunction>) -> Self {
         self.functions = functions;
         self
+    }
+
+    pub fn functions(&self) -> &[WasmExportFunction] {
+        &self.functions
     }
 
     /// Package the WebAssembly module and bindings into output directory.

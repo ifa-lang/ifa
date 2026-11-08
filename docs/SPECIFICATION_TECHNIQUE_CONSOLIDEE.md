@@ -202,6 +202,19 @@ Le compilateur IFA intègre des optimisations spécialisées de bout en bout pou
    - L'évasion de structures récursives ou auto-référentielles allouées en arène isolée (`E0028`).
    - L'évasion de fermetures mutables capturant une arène isolée hors de la frontière comptime (`E0029`).
 
+### 5.4. Empaquettage WebAssembly, TypedArrays et Sandbox Web OS
+
+Le générateur de liaisons WebAssembly (`ifa-wasm`) assure l'interopérabilité sans couture entre les noyaux IFA et les environnements d'exécution JavaScript / TypeScript modernes :
+
+1. **Projection Bidirectionnelle des Tranches Typées (*TypedArrays*)** :
+   Les tranches natives IFA (`Slice<i64>`, `Slice<f64>`, `Slice<i32>`, `Slice<u8>`) sont automatiquement traduites vers leurs équivalents typés JavaScript (`BigInt64Array`, `Float64Array`, `Int32Array`, `Uint8Array`). Le marshalling copie directement les buffers dans la mémoire linéaire WebAssembly via `ifa_alloc` et reconstitue les vues typées à la restitution sans désérialisation JSON.
+
+2. **Inférence Automatique d'Exports depuis le Module FIR SSA** :
+   Le bundleur extrait statiquement les métadonnées et signatures des fonctions publiques et `extern "C"` directement à partir de la représentation intermédiaire `FirModule` (`WasmBundler::from_fir_module`), générant automatiquement les fichiers `index.d.ts`, `index.js`, `react.d.ts`, et `web_os.d.ts`.
+
+3. **Inspection Mémoire Directe dans le Sandbox Processus Web OS** :
+   La classe `WebOsProcess` expose des primitives d'accès direct à la mémoire linéaire WebAssembly (`getMemoryBuffer()`, `getMemoryView(offset, length)` et `getSliceView(offset, length, type)`) permettant une isolation sécurisée et une supervision fine des processus Web OS sans copie superflue.
+
 ---
 
 ## 6. Outillage Développeur et Commandes CLI

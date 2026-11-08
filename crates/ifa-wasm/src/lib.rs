@@ -247,4 +247,104 @@ mod tests {
         assert!(dts.contains("callback: (arg0: bigint) => bigint"));
         assert!(dts.contains("val: bigint"));
     }
+
+    #[test]
+    fn test_wasm_typed_array_slices_and_tensor_bindings() {
+        let mut gen = TypeScriptBindingsGenerator::new("tensor_engine");
+        gen.add_function(WasmExportFunction {
+            name: "matrix_vector_mult".to_string(),
+            params: vec![
+                ("matrix".to_string(), WasmType::SliceF64),
+                ("vector".to_string(), WasmType::SliceF64),
+                ("out".to_string(), WasmType::SliceF64),
+                ("dim".to_string(), WasmType::I32),
+            ],
+            ret_ty: WasmType::SliceF64,
+            doc: Some("Compute matrix-vector multiplication returning result vector".to_string()),
+        });
+
+        let dts = gen.generate_dts();
+        assert!(dts.contains("matrix: Float64Array"));
+        assert!(dts.contains("vector: Float64Array"));
+        assert!(dts.contains("out: Float64Array"));
+        assert!(dts.contains("dim: number"));
+        assert!(dts.contains("): Float64Array"));
+
+        let esm = gen.generate_esm();
+        assert!(esm.contains("const matrixBytes = new Uint8Array(matrix.buffer, matrix.byteOffset, matrix.byteLength)"));
+        assert!(esm.contains("const matrixPtr = wasmInstance.exports.ifa_alloc ? wasmInstance.exports.ifa_alloc(matrixBytes.length) : 0"));
+        assert!(esm.contains("matrixPtr, matrix.length"));
+        assert!(esm.contains("new Float64Array(wasmInstance.exports.memory.buffer.slice(retPtr, retPtr + retLen * 8))"));
+    }
+
+    #[test]
+    fn test_web_os_sandbox_memory_and_slice_views() {
+        let gen = TypeScriptBindingsGenerator::new("web_os_sandbox_test");
+        let web_os_js = gen.generate_web_os_js();
+        assert!(web_os_js.contains("getMemoryBuffer()"));
+        assert!(web_os_js.contains("getMemoryView(offset, length)"));
+        assert!(web_os_js.contains("getSliceView(offset, length, type = 'u8')"));
+        assert!(web_os_js.contains("case 'i64': return new BigInt64Array(buf, offset, length)"));
+        assert!(web_os_js.contains("case 'f64': return new Float64Array(buf, offset, length)"));
+
+        let web_os_dts = gen.generate_web_os_dts();
+        assert!(web_os_dts.contains("getMemoryBuffer(): ArrayBuffer | null"));
+        assert!(
+            web_os_dts.contains("getMemoryView(offset: number, length: number): Uint8Array | null")
+        );
+        assert!(web_os_dts.contains("getSliceView(offset: number, length: number, type?: 'u8' | 'i32' | 'i64' | 'f64'): ArrayBufferView | null"));
+    }
+
+    #[test]
+    fn test_bundler_from_fir_module_inference() {
+        use ifa_fir::{BasicBlock, BlockId, FirFunction, FirModule, FirParam, FirType, ParamMode};
+        use ifa_sema::types::IntType;
+        use ifa_span::{Span, INTERNER};
+
+        let mut func = FirFunction::new(
+            INTERNER.intern("gemm_kernel"),
+            vec![
+                FirParam::new(
+                    INTERNER.intern("a"),
+                    ifa_fir::ValueId(0),
+                    FirType::Slice(Box::new(FirType::Int(IntType::I64))),
+                    ParamMode::In,
+                ),
+                FirParam::new(
+                    INTERNER.intern("dim"),
+                    ifa_fir::ValueId(1),
+                    FirType::Int(IntType::I64),
+                    ParamMode::In,
+                ),
+            ],
+            FirType::Int(IntType::I64),
+            true, // is_strict
+            true, // is_pub
+            false,
+            None,
+            Span::DUMMY,
+        );
+        let mut bb = BasicBlock::new(BlockId(0));
+        bb.terminator = Some(ifa_fir::Terminator::Return(Some(ifa_fir::ValueId(1))));
+        func.blocks.push(bb);
+
+        let fir_module = FirModule {
+            name: INTERNER.intern("gemm_wasm_mod"),
+            functions: vec![func],
+            structs: Vec::new(),
+            enums: Vec::new(),
+            constants: Vec::new(),
+        };
+
+        let bundler = WasmBundler::from_fir_module(
+            "gemm_pkg",
+            vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00],
+            &fir_module,
+        );
+        assert_eq!(bundler.functions().len(), 1);
+        assert_eq!(bundler.functions()[0].name, "gemm_kernel");
+        assert_eq!(bundler.functions()[0].params[0].1, WasmType::SliceI64);
+        assert_eq!(bundler.functions()[0].params[1].1, WasmType::I64);
+        assert_eq!(bundler.functions()[0].ret_ty, WasmType::I64);
+    }
 }
