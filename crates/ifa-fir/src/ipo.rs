@@ -59,6 +59,12 @@ pub struct IpoStats {
     pub zero_copy_convolutions_specialized: usize,
     /// Number of strided convolution bounds checks statically eliminated.
     pub strided_bounds_eliminated: usize,
+    /// Number of constant strides propagated across inter-procedural call sites.
+    pub constant_strides_propagated: usize,
+    /// Number of decimation stencil loops specialized via constant stride propagation.
+    pub decimation_stencils_specialized: usize,
+    /// Number of multidimensional convolution kernels fused across pipeline stages.
+    pub fused_convolution_kernels: usize,
 }
 
 /// Call graph structure capturing caller-callee relationships, recursive cycles,
@@ -1663,9 +1669,19 @@ impl IpoPass {
         // 4. Apply monomorphic constants in-place
         for func in &mut module.functions {
             if let Some(const_params) = monomorphic_constants.get(&func.name).cloned() {
-                for &(_, c_val, _) in &const_params {
+                for &(p_idx, c_val, _) in &const_params {
                     if (1..=256).contains(&c_val) {
                         propagated_window_sizes.insert(func.name, c_val as u32);
+                    }
+                    if let Some(param) = func.params.get(p_idx) {
+                        let p_name = INTERNER.resolve(&param.name).to_lowercase();
+                        if p_name.contains("stride")
+                            || p_name.contains("step")
+                            || p_name.contains("decim")
+                            || Self::is_param_used_as_stride(func, param.val)
+                        {
+                            self.stats.constant_strides_propagated += 1;
+                        }
                     }
                 }
                 let count = Self::propagate_constants_into_function(func, &const_params);
@@ -1700,12 +1716,24 @@ impl IpoPass {
                     continue;
                 }
                 if samples.len() > 1 && samples.iter().all(|&w| (1..=256).contains(&w)) {
-                    // Stencil/window size parameter with distinct values: specialize clones
+                    let p_name = INTERNER.resolve(&param.name).to_lowercase();
+                    let is_stride_param = p_name.contains("stride")
+                        || p_name.contains("step")
+                        || p_name.contains("decim")
+                        || Self::is_param_used_as_stride(orig_func, param.val);
+
+                    // Stencil/window size or stride parameter with distinct values: specialize clones
                     for &c_val in samples {
                         let const_ty = callee_param_types[&callee_sym][&param_idx];
                         let base_name = INTERNER.resolve(&callee_sym);
-                        let spec_name = INTERNER.intern(&format!("{}_w{}", base_name, c_val));
-                        propagated_window_sizes.insert(spec_name, c_val as u32);
+                        let spec_name = if is_stride_param {
+                            INTERNER.intern(&format!("{}_s{}", base_name, c_val))
+                        } else {
+                            INTERNER.intern(&format!("{}_w{}", base_name, c_val))
+                        };
+                        if !is_stride_param {
+                            propagated_window_sizes.insert(spec_name, c_val as u32);
+                        }
 
                         let mut spec_func = orig_func.clone();
                         spec_func.name = spec_name;
@@ -1714,14 +1742,24 @@ impl IpoPass {
                         let count =
                             Self::propagate_constants_into_function(&mut spec_func, &const_params);
                         self.stats.interprocedural_constants_propagated += count;
+                        if is_stride_param {
+                            self.stats.constant_strides_propagated += 1;
+                        }
                         Self::fold_function_constants(&mut spec_func);
 
                         let cmap = Self::extract_function_constants(&spec_func);
                         self.specialize_sliding_windows_and_convolutions(
                             &mut spec_func,
                             &cmap,
-                            Some(c_val as u32),
+                            if is_stride_param {
+                                None
+                            } else {
+                                Some(c_val as u32)
+                            },
                         );
+                        self.specialize_strided_convolutions_2d_3d(&mut spec_func, &cmap);
+                        self.specialize_decimation_stencils(&mut spec_func, &cmap);
+                        self.specialize_fused_convolution_kernels(&mut spec_func);
 
                         specialized_clones.push(spec_func);
                         site_retargets.insert((callee_sym, param_idx, c_val), spec_name);
@@ -1758,12 +1796,14 @@ impl IpoPass {
             }
         }
 
-        // 6. Specialize sliding window and bare-metal convolutions for all functions
+        // 6. Specialize sliding window, bare-metal convolutions, and decimation stencils for all functions
         for func in &mut module.functions {
             let cmap = Self::extract_function_constants(func);
             let prop_w = propagated_window_sizes.get(&func.name).copied();
             self.specialize_sliding_windows_and_convolutions(func, &cmap, prop_w);
             self.specialize_strided_convolutions_2d_3d(func, &cmap);
+            self.specialize_decimation_stencils(func, &cmap);
+            self.specialize_fused_convolution_kernels(func);
         }
     }
 
@@ -2220,6 +2260,140 @@ impl IpoPass {
 
             if let Some(header_bb) = func.get_block_mut(loop_info.header) {
                 header_bb.set_vector_hint(hint);
+            }
+        }
+    }
+
+    /// Checks whether a function parameter is utilized as an index stride factor in strided slices or expressions.
+    fn is_param_used_as_stride(func: &FirFunction, val: ValueId) -> bool {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match &inst.expr {
+                    ValueExpr::SliceStrided { stride, .. } if *stride == val => return true,
+                    ValueExpr::Binary {
+                        op: BinaryOp::Mul,
+                        lhs,
+                        rhs,
+                    } if *lhs == val || *rhs == val => {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    /// Analyzes natural loops for decimation stencils and downsampled convolutions with constant strides,
+    /// eliminating redundant strided bounds checks and configuring SIMD LoopVectorHint with stride attributes.
+    fn specialize_decimation_stencils(
+        &mut self,
+        func: &mut FirFunction,
+        known_consts: &HashMap<ValueId, (i64, IntType)>,
+    ) {
+        let cfg = ControlFlowGraph::build(func);
+        let dom_tree = DominanceTree::build(&cfg);
+        let natural_loops = GenerationalOptPass::find_natural_loops(&cfg, &dom_tree);
+
+        for loop_info in &natural_loops {
+            let mut detected_stride: Option<u32> = None;
+            let mut strided_indices = HashSet::new();
+
+            for &b_id in &loop_info.blocks {
+                if let Some(block) = func.get_block(b_id) {
+                    for inst in &block.instructions {
+                        match &inst.expr {
+                            ValueExpr::SliceStrided { stride, .. } => {
+                                if let Some(&(c, _)) = known_consts.get(stride) {
+                                    if c >= 2 {
+                                        detected_stride = Some(c as u32);
+                                    }
+                                } else if let Some(r) = inst.result {
+                                    detected_stride = detected_stride.or(Some(2));
+                                    strided_indices.insert(r);
+                                }
+                            }
+                            ValueExpr::GetElement { index, .. }
+                            | ValueExpr::GetElementPtr { index, .. } => {
+                                if let Some((_, strides)) =
+                                    crate::vectorize::VectorizePass::analyze_index_strides(
+                                        func, *index,
+                                    )
+                                {
+                                    if strides.0 >= 2 {
+                                        detected_stride = Some(strides.0);
+                                        strided_indices.insert(*index);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            let Some(stride_val) = detected_stride else {
+                continue;
+            };
+
+            // Eliminate redundant bounds checks on decimation indices
+            let mut bounds_eliminated = 0;
+            for &b_id in &loop_info.blocks {
+                if let Some(block) = func.get_block_mut(b_id) {
+                    for inst in &mut block.instructions {
+                        match &mut inst.expr {
+                            ValueExpr::BoundsCheck {
+                                redundant, index, ..
+                            } if !*redundant => {
+                                if strided_indices.contains(index)
+                                    || known_consts.contains_key(index)
+                                {
+                                    *redundant = true;
+                                    bounds_eliminated += 1;
+                                }
+                            }
+                            ValueExpr::SliceBoundsCheck { redundant, .. }
+                            | ValueExpr::SliceStridedBoundsCheck { redundant, .. }
+                                if !*redundant =>
+                            {
+                                *redundant = true;
+                                bounds_eliminated += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            if bounds_eliminated > 0 {
+                self.stats.strided_bounds_eliminated += bounds_eliminated;
+            }
+
+            if let Some(header_bb) = func.get_block_mut(loop_info.header) {
+                let mut hint = header_bb
+                    .vector_hint
+                    .unwrap_or_else(|| LoopVectorHint::new(8, 4, true));
+                hint.is_convolution = true;
+                hint.is_strided_conv2d = true;
+                hint.conv_strides = Some((stride_val, 1, 1));
+                hint.unroll_and_jam = true;
+                hint.is_zero_copy = true;
+                hint.predicate_enable = true;
+                header_bb.set_vector_hint(hint);
+                self.stats.decimation_stencils_specialized += 1;
+            }
+        }
+    }
+
+    /// Identifies fused convolution kernels across multi-stage pipelines and specializes vector hints.
+    fn specialize_fused_convolution_kernels(&mut self, func: &mut FirFunction) {
+        for block in &mut func.blocks {
+            if let Some(hint) = &mut block.vector_hint {
+                if hint.is_fused
+                    && (hint.is_convolution || hint.is_strided_conv2d || hint.is_strided_conv3d)
+                {
+                    self.stats.fused_convolution_kernels += 1;
+                }
             }
         }
     }

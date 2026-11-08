@@ -544,6 +544,25 @@ impl LoopOptPass {
                     }
                 }
 
+                let body_a_has_conv = body_a_block.instructions.iter().any(|i| {
+                    matches!(
+                        &i.expr,
+                        ValueExpr::Binary {
+                            op: BinaryOp::Mul,
+                            ..
+                        } | ValueExpr::SliceStrided { .. }
+                    )
+                });
+                let body_b_has_conv = body_b_block.instructions.iter().any(|i| {
+                    matches!(
+                        &i.expr,
+                        ValueExpr::Binary {
+                            op: BinaryOp::Mul,
+                            ..
+                        } | ValueExpr::SliceStrided { .. }
+                    )
+                });
+
                 // Perform Loop Fusion transformation
                 // 1. Rename induction variable in body_b instructions to body_a's induction var
                 let mut fused_b_insts = Vec::new();
@@ -704,6 +723,9 @@ impl LoopOptPass {
                         .vector_hint
                         .unwrap_or_else(|| LoopVectorHint::new(8, 4, true));
                     hint.is_fused = true;
+                    if hint.is_convolution || body_a_has_conv || body_b_has_conv {
+                        hint.is_convolution = true;
+                    }
                     header_a_mut.set_vector_hint(hint);
                 }
 

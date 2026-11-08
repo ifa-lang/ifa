@@ -1437,4 +1437,105 @@ fn test_ipo_pass_strided_conv2d_specialization_and_bounds_elimination() {
         "Zero-copy convolution must be specialized: {:?}",
         stats
     );
+    assert!(
+        stats.constant_strides_propagated >= 2,
+        "Stride parameters (stride_y, stride_x) must be propagated inter-procedurally: {:?}",
+        stats
+    );
+}
+
+#[test]
+fn test_ipo_decimation_stencil_specialization_and_bounds_elimination() {
+    let src = r#"
+        fn decimate_stencil(
+            inout out: Slice<f32>,
+            src: Slice<f32>,
+            n: i64,
+            stride: i64
+        ) {
+            let mut i: i64 = 0;
+            while i < n {
+                let in_idx = i * stride;
+                out[i] = src[in_idx] + src[in_idx + 1];
+                i = i + 1;
+            }
+        }
+
+        pub fn caller_decimate(inout out: Slice<f32>, src: Slice<f32>) {
+            decimate_stencil(out, src, 32, 2);
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("decim_ipo.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut ipo_pass = IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    let stats = ipo_pass.stats();
+    assert!(
+        stats.constant_strides_propagated >= 1,
+        "Decimation stride parameter must be propagated: {:?}",
+        stats
+    );
+    assert!(
+        stats.decimation_stencils_specialized >= 1,
+        "Decimation stencil must be specialized: {:?}",
+        stats
+    );
+}
+
+#[test]
+fn test_ipo_fused_convolution_kernels_and_strided_pipelines() {
+    let src = r#"
+        pub fn fused_pipeline(
+            inout out: Slice<f32>,
+            inout temp: Slice<f32>,
+            src: Slice<f32>,
+            n: i64
+        ) {
+            let mut i: i64 = 0;
+            while i < n {
+                temp[i] = src[i] * 1.5;
+                i = i + 1;
+            }
+
+            let mut j: i64 = 0;
+            while j < n {
+                out[j] = temp[j] + 2.0;
+                j = j + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("fused_ipo.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut ipo_pass = IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    let stats = ipo_pass.stats();
+    assert!(
+        stats.fused_convolution_kernels >= 1,
+        "Fused convolution pipeline kernel must be detected and specialized: {:?}",
+        stats
+    );
 }

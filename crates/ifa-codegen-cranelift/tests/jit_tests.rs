@@ -1505,3 +1505,220 @@ fn test_cranelift_call_arena_lowering_and_execution() {
     let result = jit.run_main().expect("Failed to execute native main");
     assert_eq!(result, 42);
 }
+
+#[test]
+fn test_cranelift_jit_strided_slice_sum_lowering_without_runtime() {
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, Instruction, Terminator,
+        ValueExpr, ValueId,
+    };
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let b0 = BlockId(0);
+    let mut bb0 = BasicBlock::new(b0);
+
+    // 1. Mark call arena
+    let mark_val = ValueId(0);
+    bb0.instructions.push(Instruction::new(
+        Some(mark_val),
+        ValueExpr::CallArenaMark,
+        Span::DUMMY,
+    ));
+
+    // 2. Allocate an array of 6 i64 elements in call arena
+    let alloc_val = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(alloc_val),
+        ValueExpr::CallArenaAlloc {
+            ty: ifa_fir::FirType::Array(
+                Box::new(ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)),
+                6,
+            ),
+        },
+        Span::DUMMY,
+    ));
+
+    // 3. Store values: [10, 20, 30, 40, 50, 60]
+    let values = [10i64, 20, 30, 40, 50, 60];
+    for (idx, &v) in values.iter().enumerate() {
+        let v_id = ValueId((10 + idx) as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(v_id),
+            ValueExpr::Constant(ConstantValue::Int(v as i128, ifa_sema::types::IntType::I64)),
+            Span::DUMMY,
+        ));
+        let idx_id = ValueId((20 + idx) as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(idx_id),
+            ValueExpr::Constant(ConstantValue::Int(
+                idx as i128,
+                ifa_sema::types::IntType::I64,
+            )),
+            Span::DUMMY,
+        ));
+        bb0.instructions.push(Instruction::new(
+            None,
+            ValueExpr::SetElement {
+                base: alloc_val,
+                index: idx_id,
+                val: v_id,
+            },
+            Span::DUMMY,
+        ));
+    }
+
+    // 4. Set up strided reduction arguments: len = 3, stride = 2
+    // Elements sampled: index 0 (10), index 2 (30), index 4 (50) -> sum = 90
+    let len_val = ValueId(30);
+    bb0.instructions.push(Instruction::new(
+        Some(len_val),
+        ValueExpr::Constant(ConstantValue::Int(3, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    let stride_val = ValueId(31);
+    bb0.instructions.push(Instruction::new(
+        Some(stride_val),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    // 5. Directly invoke lowered ifa_simd_strided_slice_sum_i64 without runtime call
+    let sum_res = ValueId(32);
+    bb0.instructions.push(Instruction::new(
+        Some(sum_res),
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("ifa_simd_strided_slice_sum_i64"),
+            args: vec![alloc_val, len_val, stride_val],
+        },
+        Span::DUMMY,
+    ));
+
+    // 6. Rewind call arena
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::CallArenaRewind { mark: mark_val },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(sum_res)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("strided_simd_jit_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile FIR with strided reduction to Cranelift JIT");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 90,
+        "Directly lowered strided slice reduction must compute 10 + 30 + 50 = 90"
+    );
+}
+
+#[test]
+fn test_cranelift_jit_strided_bounds_check_safety_elimination() {
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, Instruction, Terminator,
+        ValueExpr, ValueId,
+    };
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let b0 = BlockId(0);
+    let mut bb0 = BasicBlock::new(b0);
+
+    let dummy_base = ValueId(0);
+    let start_val = ValueId(1);
+    let end_val = ValueId(2);
+    let stride_val = ValueId(3);
+    let ret_val = ValueId(4);
+
+    bb0.instructions.push(Instruction::new(
+        Some(dummy_base),
+        ValueExpr::Constant(ConstantValue::Int(0, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(start_val),
+        ValueExpr::Constant(ConstantValue::Int(0, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(end_val),
+        ValueExpr::Constant(ConstantValue::Int(10, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(stride_val),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    // Valid strided bounds check (redundant: false) executed natively without panicking
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::SliceStridedBoundsCheck {
+            base: dummy_base,
+            start: start_val,
+            end: end_val,
+            stride: stride_val,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+
+    bb0.instructions.push(Instruction::new(
+        Some(ret_val),
+        ValueExpr::Constant(ConstantValue::Int(42, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.terminator = Some(Terminator::Return(Some(ret_val)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("strided_bce_jit_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile FIR with SliceStridedBoundsCheck to Cranelift JIT");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 42);
+}
