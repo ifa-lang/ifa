@@ -467,13 +467,14 @@ pub enum ReductionKind {
     Bitwise,
 }
 
-/// Optimization hint for loop vectorization (SIMD lane width, interleave, unroll directives, and reduction kind).
+/// Optimization hint for loop vectorization (SIMD lane width, interleave, unroll directives, reduction kind, and disjoint slices guarantee).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LoopVectorHint {
     pub vector_width: u32,
     pub interleave_count: u32,
     pub unroll_enable: bool,
     pub reduction_kind: Option<ReductionKind>,
+    pub disjoint_slices: bool,
 }
 
 impl LoopVectorHint {
@@ -484,12 +485,19 @@ impl LoopVectorHint {
             interleave_count,
             unroll_enable,
             reduction_kind: None,
+            disjoint_slices: false,
         }
     }
 
     /// Attach an identified scalar reduction classification to this vectorization hint.
     pub fn with_reduction(mut self, kind: ReductionKind) -> Self {
         self.reduction_kind = Some(kind);
+        self
+    }
+
+    /// Mark the loop accesses as operating over guaranteed disjoint slices (eliminating runtime alias checks).
+    pub fn with_disjoint_slices(mut self, disjoint: bool) -> Self {
+        self.disjoint_slices = disjoint;
         self
     }
 }

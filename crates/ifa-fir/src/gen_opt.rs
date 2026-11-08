@@ -1,7 +1,7 @@
 use crate::cfg::ControlFlowGraph;
 use crate::dominance::DominanceTree;
 use crate::ir::*;
-use ifa_span::{Span, Symbol};
+use ifa_span::{Span, Symbol, INTERNER};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Representation of an interprocedural call-site (caller, block, instruction index, argument values).
@@ -57,11 +57,21 @@ fn canonical_ref(mut val: ValueId, aliases: &HashMap<ValueId, ValueId>) -> Value
     val
 }
 
+/// Interprocedural generational safety summary discovered across the entire module.
+#[derive(Debug, Clone, Default)]
+pub struct InterproceduralGenSafety {
+    /// Function parameters proven safe across all call-sites: (func_name, param_idx).
+    pub safe_params: HashSet<(Symbol, usize)>,
+    /// Closure environment captured fields proven safe across all invocations: (lambda_func_name, field_idx).
+    pub safe_env_captures: HashSet<(Symbol, usize)>,
+}
+
 /// Optimizes generational references by statically eliminating redundant `GenCheck` instructions
 /// and hoisting loop-invariant checks out of loops (Section 9.3).
 pub struct GenerationalOptPass {
     stats: GenOptStats,
     safe_params: HashSet<(Symbol, usize)>,
+    safe_env_captures: HashSet<(Symbol, usize)>,
 }
 
 impl GenerationalOptPass {
@@ -69,6 +79,7 @@ impl GenerationalOptPass {
         Self {
             stats: GenOptStats::default(),
             safe_params: HashSet::new(),
+            safe_env_captures: HashSet::new(),
         }
     }
 
@@ -76,6 +87,18 @@ impl GenerationalOptPass {
         Self {
             stats: GenOptStats::default(),
             safe_params,
+            safe_env_captures: HashSet::new(),
+        }
+    }
+
+    pub fn with_safety(
+        safe_params: HashSet<(Symbol, usize)>,
+        safe_env_captures: HashSet<(Symbol, usize)>,
+    ) -> Self {
+        Self {
+            stats: GenOptStats::default(),
+            safe_params,
+            safe_env_captures,
         }
     }
 
@@ -104,7 +127,13 @@ impl GenerationalOptPass {
     /// Inter-procedurally computes parameters that are guaranteed to receive valid (already checked
     /// or locally allocated) references across all call-sites in the module.
     pub fn compute_interprocedural_safe_params(module: &FirModule) -> HashSet<(Symbol, usize)> {
+        Self::compute_interprocedural_safety(module).safe_params
+    }
+
+    /// Computes full interprocedural generational safety summary: formal parameters and closure environment captures.
+    pub fn compute_interprocedural_safety(module: &FirModule) -> InterproceduralGenSafety {
         let mut safe_params: HashSet<(Symbol, usize)> = HashSet::new();
+        let mut safe_env_captures: HashSet<(Symbol, usize)> = HashSet::new();
 
         // Structural per-function analysis
         struct FuncAnalysis {
@@ -115,6 +144,8 @@ impl GenerationalOptPass {
             checks_by_block: HashMap<BlockId, HashSet<ValueId>>,
             gen_creations: HashMap<ValueId, BlockId>,
             recursive_projections: HashMap<ValueId, ValueId>,
+            struct_inits: HashMap<ValueId, (Symbol, Vec<ValueId>, BlockId, usize)>,
+            closure_creations: Vec<(Symbol, ValueId, BlockId, usize)>,
         }
 
         let mut func_analyses: HashMap<Symbol, FuncAnalysis> = HashMap::new();
@@ -128,9 +159,25 @@ impl GenerationalOptPass {
             let mut checks_by_block: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
             let mut deref_roots: HashMap<ValueId, ValueId> = HashMap::new();
             let mut recursive_projections: HashMap<ValueId, ValueId> = HashMap::new();
+            let mut struct_inits: HashMap<ValueId, (Symbol, Vec<ValueId>, BlockId, usize)> =
+                HashMap::new();
+            let mut closure_creations: Vec<(Symbol, ValueId, BlockId, usize)> = Vec::new();
+            let mut string_constants: HashMap<ValueId, Symbol> = HashMap::new();
 
             for block in &func.blocks {
                 for inst in &block.instructions {
+                    if let Some(res) = inst.result {
+                        if let ValueExpr::Constant(ConstantValue::String(s)) = &inst.expr {
+                            string_constants.insert(res, *s);
+                        } else if let ValueExpr::Constant(ConstantValue::Function(s)) = &inst.expr {
+                            string_constants.insert(res, *s);
+                        }
+                    }
+                }
+            }
+
+            for block in &func.blocks {
+                for (inst_idx, inst) in block.instructions.iter().enumerate() {
                     match &inst.expr {
                         ValueExpr::GenFree { .. } => {
                             freeing_blocks.insert(block.id);
@@ -154,6 +201,24 @@ impl GenerationalOptPass {
                             if let Some(res) = inst.result {
                                 let root = deref_roots.get(base).copied().unwrap_or(*base);
                                 recursive_projections.insert(res, root);
+                            }
+                        }
+                        ValueExpr::StructInit { name, fields } => {
+                            if let Some(res) = inst.result {
+                                struct_inits
+                                    .insert(res, (*name, fields.clone(), block.id, inst_idx));
+                                let name_str = INTERNER.resolve(name);
+                                if (name_str.starts_with("__ifa_closure_")
+                                    || name_str.starts_with("__ifa_fnref_"))
+                                    && fields.len() >= 2
+                                {
+                                    let fn_val = fields[0];
+                                    let env_val = fields[1];
+                                    if let Some(&lambda_sym) = string_constants.get(&fn_val) {
+                                        closure_creations
+                                            .push((lambda_sym, env_val, block.id, inst_idx));
+                                    }
+                                }
                             }
                         }
                         ValueExpr::GenCheck { ref_val, .. } => {
@@ -202,9 +267,151 @@ impl GenerationalOptPass {
                     checks_by_block,
                     gen_creations,
                     recursive_projections,
+                    struct_inits,
+                    closure_creations,
                 },
             );
         }
+
+        // Helper to check if a value is guaranteed safe at a specific caller point
+        let is_val_safe_at = |caller_name: Symbol,
+                              block_id: BlockId,
+                              inst_idx: usize,
+                              arg_val: ValueId,
+                              safe_params: &HashSet<(Symbol, usize)>,
+                              safe_env_captures: &HashSet<(Symbol, usize)>|
+         -> bool {
+            let analysis = match func_analyses.get(&caller_name) {
+                Some(a) => a,
+                None => return false,
+            };
+            let canon = canonical_ref(arg_val, &analysis.global_aliases);
+
+            // 1. Stack alloca
+            if analysis.alloca_values.contains(&arg_val) || analysis.alloca_values.contains(&canon)
+            {
+                return true;
+            }
+
+            // 2. Caller's own parameter is safe
+            if let Some(caller_fn) = module.functions.iter().find(|f| f.name == caller_name) {
+                for (c_idx, c_p) in caller_fn.params.iter().enumerate() {
+                    if (c_p.val == arg_val || c_p.val == canon)
+                        && safe_params.contains(&(caller_name, c_idx))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            // 3. Closure environment capture in caller (if caller itself is a lambda)
+            let caller_name_str = INTERNER.resolve(&caller_name);
+            if caller_name_str.starts_with("__ifa_lambda_") {
+                if let Some(caller_fn) = module.functions.iter().find(|f| f.name == caller_name) {
+                    if let Some(entry_b) = caller_fn.get_block(caller_fn.entry_block) {
+                        for inst in &entry_b.instructions {
+                            if let ValueExpr::GetField {
+                                base, field_idx, ..
+                            } = &inst.expr
+                            {
+                                if (*base == ValueId(0)
+                                    || caller_fn.params.first().is_some_and(|p| p.val == *base))
+                                    && inst.result.is_some_and(|r| {
+                                        r == arg_val
+                                            || r == canon
+                                            || canonical_ref(r, &analysis.global_aliases) == canon
+                                    })
+                                    && safe_env_captures.contains(&(caller_name, *field_idx))
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. Dominating GenRef / GenAlloc without intervening GenFree
+            let is_fresh_ref = analysis
+                .gen_creations
+                .get(&arg_val)
+                .or_else(|| analysis.gen_creations.get(&canon));
+            if let Some(&def_b) = is_fresh_ref {
+                let no_free = !analysis.freeing_blocks.iter().any(|&fb| {
+                    analysis.dom_tree.dominates(def_b, fb)
+                        && analysis.dom_tree.dominates(fb, block_id)
+                });
+                if no_free && analysis.dom_tree.dominates(def_b, block_id) {
+                    return true;
+                }
+            }
+
+            // 5. Dominating GenCheck
+            let mut check_dominates = false;
+            for (&chk_b, chk_vals) in &analysis.checks_by_block {
+                if chk_vals.contains(&arg_val) || chk_vals.contains(&canon) {
+                    if chk_b == block_id {
+                        if let Some(caller_fn) =
+                            module.functions.iter().find(|f| f.name == caller_name)
+                        {
+                            if let Some(b) = caller_fn.get_block(block_id) {
+                                for inst in b.instructions.iter().take(inst_idx) {
+                                    if let ValueExpr::GenCheck { ref_val, .. } = &inst.expr {
+                                        if *ref_val == arg_val
+                                            || *ref_val == canon
+                                            || canonical_ref(*ref_val, &analysis.global_aliases)
+                                                == canon
+                                        {
+                                            check_dominates = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if analysis.dom_tree.dominates(chk_b, block_id) {
+                        let no_free = !analysis.freeing_blocks.iter().any(|&fb| {
+                            analysis.dom_tree.dominates(chk_b, fb)
+                                && analysis.dom_tree.dominates(fb, block_id)
+                        });
+                        if no_free {
+                            check_dominates = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if check_dominates {
+                return true;
+            }
+
+            // 6. Recursive child projection from safe root reference
+            if let Some(&root_ref) = analysis
+                .recursive_projections
+                .get(&arg_val)
+                .or_else(|| analysis.recursive_projections.get(&canon))
+            {
+                let canon_root = canonical_ref(root_ref, &analysis.global_aliases);
+                if let Some(caller_fn) = module.functions.iter().find(|f| f.name == caller_name) {
+                    for (c_idx, c_p) in caller_fn.params.iter().enumerate() {
+                        if (c_p.val == root_ref || c_p.val == canon_root)
+                            && safe_params.contains(&(caller_name, c_idx))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                for (&chk_b, chk_vals) in &analysis.checks_by_block {
+                    if (chk_vals.contains(&root_ref) || chk_vals.contains(&canon_root))
+                        && analysis.dom_tree.dominates(chk_b, block_id)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            false
+        };
 
         let mut changed = true;
         let mut iter = 0;
@@ -232,198 +439,171 @@ impl GenerationalOptPass {
 
             for func in &module.functions {
                 let target_name = func.name;
-                if let Some(call_sites) = call_sites_by_target.get(&target_name) {
-                    if call_sites.is_empty() {
-                        continue;
-                    }
+                let target_name_str = INTERNER.resolve(&target_name);
 
-                    for p_idx in 0..func.params.len() {
-                        if safe_params.contains(&(target_name, p_idx)) {
+                // 1. Direct scalar function parameters
+                if let Some(call_sites) = call_sites_by_target.get(&target_name) {
+                    if !call_sites.is_empty() {
+                        for p_idx in 0..func.params.len() {
+                            if safe_params.contains(&(target_name, p_idx)) {
+                                continue;
+                            }
+
+                            let all_callers_safe =
+                                call_sites
+                                    .iter()
+                                    .all(|(caller_name, block_id, inst_idx, args)| {
+                                        if let Some(&arg_val) = args.get(p_idx) {
+                                            is_val_safe_at(
+                                                *caller_name,
+                                                *block_id,
+                                                *inst_idx,
+                                                arg_val,
+                                                &safe_params,
+                                                &safe_env_captures,
+                                            )
+                                        } else {
+                                            false
+                                        }
+                                    });
+
+                            if all_callers_safe {
+                                safe_params.insert((target_name, p_idx));
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+
+                // 2. Closure environment captures: analyze fields captured in __env (param 0)
+                if target_name_str.starts_with("__ifa_lambda_") {
+                    let env_field_indices: Vec<usize> = func
+                        .blocks
+                        .first()
+                        .map(|b| {
+                            b.instructions
+                                .iter()
+                                .filter_map(|i| match &i.expr {
+                                    ValueExpr::GetField {
+                                        base, field_idx, ..
+                                    } if *base == ValueId(0)
+                                        || func.params.first().is_some_and(|p| p.val == *base) =>
+                                    {
+                                        Some(*field_idx)
+                                    }
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    for f_idx in env_field_indices {
+                        if safe_env_captures.contains(&(target_name, f_idx)) {
                             continue;
                         }
 
-                        let all_callers_safe =
-                            call_sites
-                                .iter()
-                                .all(|(caller_name, block_id, inst_idx, args)| {
-                                    if let Some(&arg_val) = args.get(p_idx) {
-                                        if let Some(analysis) = func_analyses.get(caller_name) {
-                                            let canon =
-                                                canonical_ref(arg_val, &analysis.global_aliases);
-
-                                            // 1. Stack alloca
-                                            if analysis.alloca_values.contains(&arg_val)
-                                                || analysis.alloca_values.contains(&canon)
-                                            {
-                                                return true;
-                                            }
-
-                                            // 2. Caller's own parameter is safe
-                                            if let Some(caller_fn) = module
-                                                .functions
-                                                .iter()
-                                                .find(|f| f.name == *caller_name)
-                                            {
-                                                for (c_idx, c_p) in
-                                                    caller_fn.params.iter().enumerate()
-                                                {
-                                                    if (c_p.val == arg_val || c_p.val == canon)
-                                                        && safe_params
-                                                            .contains(&(*caller_name, c_idx))
-                                                    {
-                                                        return true;
-                                                    }
-                                                }
-                                            }
-
-                                            // 3. Dominating GenRef / GenAlloc without intervening GenFree
-                                            let is_fresh_ref = analysis
-                                                .gen_creations
-                                                .get(&arg_val)
-                                                .or_else(|| analysis.gen_creations.get(&canon));
-                                            if let Some(&def_b) = is_fresh_ref {
-                                                let no_free =
-                                                    !analysis.freeing_blocks.iter().any(|&fb| {
-                                                        analysis.dom_tree.dominates(def_b, fb)
-                                                            && analysis
-                                                                .dom_tree
-                                                                .dominates(fb, *block_id)
-                                                    });
-                                                if no_free
-                                                    && analysis.dom_tree.dominates(def_b, *block_id)
-                                                {
-                                                    return true;
-                                                }
-                                            }
-
-                                            // 4. Dominating GenCheck
-                                            let mut check_dominates = false;
-                                            for (&chk_b, chk_vals) in &analysis.checks_by_block {
-                                                if chk_vals.contains(&arg_val)
-                                                    || chk_vals.contains(&canon)
-                                                {
-                                                    if chk_b == *block_id {
-                                                        if let Some(caller_fn) = module
-                                                            .functions
-                                                            .iter()
-                                                            .find(|f| f.name == *caller_name)
-                                                        {
-                                                            if let Some(b) =
-                                                                caller_fn.get_block(*block_id)
-                                                            {
-                                                                for inst in b
-                                                                    .instructions
-                                                                    .iter()
-                                                                    .take(*inst_idx)
-                                                                {
-                                                                    if let ValueExpr::GenCheck {
-                                                                        ref_val,
-                                                                        ..
-                                                                    } = &inst.expr
-                                                                    {
-                                                                        if *ref_val == arg_val
-                                                                            || *ref_val == canon
-                                                                            || canonical_ref(
-                                                                                *ref_val,
-                                                                                &analysis
-                                                                                    .global_aliases,
-                                                                            ) == canon
-                                                                        {
-                                                                            check_dominates = true;
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    } else if analysis
-                                                        .dom_tree
-                                                        .dominates(chk_b, *block_id)
-                                                    {
-                                                        let no_free = !analysis
-                                                            .freeing_blocks
-                                                            .iter()
-                                                            .any(|&fb| {
-                                                                analysis
-                                                                    .dom_tree
-                                                                    .dominates(chk_b, fb)
-                                                                    && analysis
-                                                                        .dom_tree
-                                                                        .dominates(fb, *block_id)
-                                                            });
-                                                        if no_free {
-                                                            check_dominates = true;
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if check_dominates {
-                                                return true;
-                                            }
-
-                                            // 5. Recursive child projection from a safe root reference
-                                            if let Some(&root_ref) = analysis
-                                                .recursive_projections
-                                                .get(&arg_val)
-                                                .or_else(|| {
-                                                    analysis.recursive_projections.get(&canon)
-                                                })
-                                            {
-                                                let canon_root = canonical_ref(
-                                                    root_ref,
+                        // Check via direct call sites passing env_val as args[0]
+                        if let Some(call_sites) = call_sites_by_target.get(&target_name) {
+                            if !call_sites.is_empty() {
+                                let all_calls_safe = call_sites.iter().all(
+                                    |(caller_name, block_id, inst_idx, args)| {
+                                        if let Some(&env_val) = args.first() {
+                                            if let Some(analysis) = func_analyses.get(caller_name) {
+                                                let canon_env = canonical_ref(
+                                                    env_val,
                                                     &analysis.global_aliases,
                                                 );
-                                                if let Some(caller_fn) = module
-                                                    .functions
-                                                    .iter()
-                                                    .find(|f| f.name == *caller_name)
-                                                {
-                                                    for (c_idx, c_p) in
-                                                        caller_fn.params.iter().enumerate()
-                                                    {
-                                                        if (c_p.val == root_ref
-                                                            || c_p.val == canon_root)
-                                                            && safe_params
-                                                                .contains(&(*caller_name, c_idx))
-                                                        {
-                                                            return true;
-                                                        }
-                                                    }
-                                                }
-                                                for (&chk_b, chk_vals) in &analysis.checks_by_block
-                                                {
-                                                    if (chk_vals.contains(&root_ref)
-                                                        || chk_vals.contains(&canon_root))
-                                                        && analysis
-                                                            .dom_tree
-                                                            .dominates(chk_b, *block_id)
-                                                    {
-                                                        return true;
+                                                let struct_init =
+                                                    analysis.struct_inits.get(&env_val).or_else(
+                                                        || analysis.struct_inits.get(&canon_env),
+                                                    );
+                                                if let Some((_, fields, _, _)) = struct_init {
+                                                    if let Some(&cap_val) = fields.get(f_idx) {
+                                                        return is_val_safe_at(
+                                                            *caller_name,
+                                                            *block_id,
+                                                            *inst_idx,
+                                                            cap_val,
+                                                            &safe_params,
+                                                            &safe_env_captures,
+                                                        );
                                                     }
                                                 }
                                             }
                                         }
+                                        false
+                                    },
+                                );
+
+                                if all_calls_safe {
+                                    safe_env_captures.insert((target_name, f_idx));
+                                    changed = true;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Check via closure instantiation point across all module functions
+                        let mut creation_sites = Vec::new();
+                        for (c_fn_sym, analysis) in &func_analyses {
+                            for (lambda_sym, env_val, b_id, i_idx) in &analysis.closure_creations {
+                                if *lambda_sym == target_name {
+                                    creation_sites.push((*c_fn_sym, *env_val, *b_id, *i_idx));
+                                }
+                            }
+                        }
+
+                        if !creation_sites.is_empty() {
+                            let all_creations_safe = creation_sites.iter().all(
+                                |(caller_name, env_val, block_id, inst_idx)| {
+                                    if let Some(analysis) = func_analyses.get(caller_name) {
+                                        let canon_env =
+                                            canonical_ref(*env_val, &analysis.global_aliases);
+                                        let struct_init = analysis
+                                            .struct_inits
+                                            .get(env_val)
+                                            .or_else(|| analysis.struct_inits.get(&canon_env));
+                                        if let Some((_, fields, _, _)) = struct_init {
+                                            if let Some(&cap_val) = fields.get(f_idx) {
+                                                let no_frees_in_caller =
+                                                    analysis.freeing_blocks.is_empty();
+                                                let is_safe = is_val_safe_at(
+                                                    *caller_name,
+                                                    *block_id,
+                                                    *inst_idx,
+                                                    cap_val,
+                                                    &safe_params,
+                                                    &safe_env_captures,
+                                                );
+                                                return is_safe && no_frees_in_caller;
+                                            }
+                                        }
                                     }
                                     false
-                                });
+                                },
+                            );
 
-                        if all_callers_safe {
-                            safe_params.insert((target_name, p_idx));
-                            changed = true;
+                            if all_creations_safe {
+                                safe_env_captures.insert((target_name, f_idx));
+                                changed = true;
+                            }
                         }
                     }
                 }
             }
         }
 
-        safe_params
+        InterproceduralGenSafety {
+            safe_params,
+            safe_env_captures,
+        }
     }
 
     /// Run the optimization on an entire module with whole-program interprocedural constraint propagation.
     pub fn run_on_module(&mut self, module: &mut FirModule) {
-        let interprocedural_safe = Self::compute_interprocedural_safe_params(module);
-        self.safe_params.extend(interprocedural_safe);
+        let safety = Self::compute_interprocedural_safety(module);
+        self.safe_params.extend(safety.safe_params);
+        self.safe_env_captures.extend(safety.safe_env_captures);
 
         let mut callee_has_free = HashMap::new();
         for f in &module.functions {
@@ -451,6 +631,10 @@ impl GenerationalOptPass {
         func: &mut FirFunction,
         callee_has_free: &HashMap<Symbol, bool>,
     ) {
+        if func.blocks.is_empty() {
+            return;
+        }
+
         let cfg = ControlFlowGraph::build(func);
         let dom_tree = DominanceTree::build(&cfg);
 
@@ -783,6 +967,10 @@ impl GenerationalOptPass {
             loop_by_header.entry(l.header).or_insert(l);
         }
 
+        let func_name = func.name;
+        let is_func_lambda = INTERNER.resolve(&func_name).starts_with("__ifa_lambda_");
+        let env_param_val = func.params.first().map(|p| p.val);
+
         for &block_id in &cx.dom_tree.rpo_blocks {
             let mut available: HashSet<ValueId> = HashSet::new();
 
@@ -791,9 +979,28 @@ impl GenerationalOptPass {
             } else if block_id == func.entry_block {
                 // Inter-procedural propagation: formal parameters proven safe across all call-sites
                 for (p_idx, p) in func.params.iter().enumerate() {
-                    if self.safe_params.contains(&(func.name, p_idx)) {
+                    if self.safe_params.contains(&(func_name, p_idx)) {
                         available.insert(p.val);
                         available.insert(canonical_ref(p.val, cx.aliases));
+                    }
+                }
+
+                // Inter-procedural propagation: closure captured fields proven safe across all call-sites
+                if let Some(entry_blk) = func.get_block(func.entry_block) {
+                    for inst in &entry_blk.instructions {
+                        if let ValueExpr::GetField {
+                            base, field_idx, ..
+                        } = &inst.expr
+                        {
+                            let is_env = (is_func_lambda && *base == ValueId(0))
+                                || env_param_val.is_some_and(|p| p == *base);
+                            if is_env && self.safe_env_captures.contains(&(func_name, *field_idx)) {
+                                if let Some(res) = inst.result {
+                                    available.insert(res);
+                                    available.insert(canonical_ref(res, cx.aliases));
+                                }
+                            }
+                        }
                     }
                 }
             } else if block_id != func.entry_block {
@@ -927,12 +1134,26 @@ impl GenerationalOptPass {
                                 deref_roots.insert(res, *ref_val);
                             }
                         }
-                        ValueExpr::GetField { base, .. } | ValueExpr::GetFieldPtr { base, .. } => {
+                        ValueExpr::GetField {
+                            base, field_idx, ..
+                        }
+                        | ValueExpr::GetFieldPtr {
+                            base, field_idx, ..
+                        } => {
                             if let Some(res) = inst.result {
                                 let root = deref_roots.get(base).copied().unwrap_or(*base);
                                 let canon_root = canonical_ref(root, cx.aliases);
                                 if available.contains(&root) || available.contains(&canon_root) {
                                     // Recursive child projection derived from verified root reference
+                                    available.insert(res);
+                                    available.insert(canonical_ref(res, cx.aliases));
+                                }
+
+                                let is_env = (is_func_lambda && *base == ValueId(0))
+                                    || env_param_val.is_some_and(|p| p == *base);
+                                if is_env
+                                    && self.safe_env_captures.contains(&(func_name, *field_idx))
+                                {
                                     available.insert(res);
                                     available.insert(canonical_ref(res, cx.aliases));
                                 }

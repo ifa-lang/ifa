@@ -171,9 +171,15 @@ impl BcePass {
                                     if let Some(&cap) = array_capacities.get(&stored) {
                                         array_capacities.insert(res, cap);
                                     }
+                                    if let Some(&slen) = slice_lengths.get(&stored) {
+                                        slice_lengths.insert(res, slen);
+                                    }
                                 }
                                 if let Some(&cap) = array_capacities.get(ptr) {
                                     array_capacities.insert(res, cap);
+                                }
+                                if let Some(&slen) = slice_lengths.get(ptr) {
+                                    slice_lengths.insert(res, slen);
                                 }
                             }
                             ValueExpr::ArrayLen { array } => {
@@ -213,6 +219,13 @@ impl BcePass {
                                 }
                             }
                             _ => {}
+                        }
+                    } else if let ValueExpr::Store { ptr, val } = &inst.expr {
+                        if let Some(&cap) = array_capacities.get(val) {
+                            array_capacities.insert(*ptr, cap);
+                        }
+                        if let Some(&slen) = slice_lengths.get(val) {
+                            slice_lengths.insert(*ptr, slen);
                         }
                     }
                 }

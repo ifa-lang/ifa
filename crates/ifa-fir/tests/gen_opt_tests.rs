@@ -765,3 +765,54 @@ fn test_interprocedural_generic_monomorphic_receiver_check_elimination() {
         .unwrap();
     assert_eq!(res, FirValue::Int(42));
 }
+
+#[test]
+fn test_interprocedural_closure_capture_generational_check_elimination() {
+    let src = r#"
+        struct Data {
+            val: i64,
+        }
+
+        pub fn compute_with_closure(n: i64) -> i64 {
+            let d = Data(val: n);
+            let r = ref d;
+            let add_offset = fn(offset: i64) -> i64 {
+                return r.val + offset;
+            };
+            let first = add_offset(5);
+            let second = add_offset(15);
+            return first + second;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("closure_gce.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = compile_to_fir(&prog, &analysis.symbols, true, false).unwrap();
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_module(&mut module);
+
+    let stats = gce.stats();
+    assert!(
+        stats.eliminated_checks >= 1,
+        "Expected at least 1 eliminated check in closure capture body, got {}",
+        stats.eliminated_checks
+    );
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp
+        .execute_function("compute_with_closure", vec![FirValue::Int(10)])
+        .unwrap();
+    // first = 10 + 5 = 15; second = 10 + 15 = 25; sum = 40.
+    assert_eq!(res, FirValue::Int(40));
+}

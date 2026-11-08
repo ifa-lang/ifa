@@ -31,7 +31,11 @@ fn test_vectorize_pass_array_sum_f32() {
 
     // Verify vectorization hint is attached in printer representation
     let formatted = format_function(func);
-    assert!(formatted.contains("// [vector_hint: width=8, interleave=4]"));
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
 
     let mut pass = VectorizePass::new();
     let mut mod_clone = module.clone();
@@ -140,7 +144,11 @@ fn test_vectorize_pass_array_map_transform_f32() {
     let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
     let func = &module.functions[0];
     let formatted = format_function(func);
-    assert!(formatted.contains("// [vector_hint: width=8, interleave=4]"));
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
 
     let mut pass = VectorizePass::new();
     let mut mod_clone = module.clone();
@@ -174,7 +182,11 @@ fn test_vectorize_pass_array_copy_map_i32() {
     let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
     let func = &module.functions[0];
     let formatted = format_function(func);
-    assert!(formatted.contains("// [vector_hint: width=8, interleave=4]"));
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
 
     let mut pass = VectorizePass::new();
     let mut mod_clone = module.clone();
@@ -336,7 +348,11 @@ fn test_vectorize_pass_slice_product_f32() {
     let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
     let func = &module.functions[0];
     let formatted = format_function(func);
-    assert!(formatted.contains("// [vector_hint: width=8, interleave=4]"));
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
     assert!(formatted.contains("// [reduction: product]"));
 
     let mut pass = VectorizePass::new();
@@ -405,7 +421,11 @@ fn test_vectorize_pass_slice_min_reduction_f32() {
     let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
     let func = &module.functions[0];
     let formatted = format_function(func);
-    assert!(formatted.contains("// [vector_hint: width=8, interleave=4]"));
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
     assert!(formatted.contains("// [reduction: min]"));
 
     let mut pass = VectorizePass::new();
@@ -438,7 +458,11 @@ fn test_vectorize_pass_intrinsic_min_reduction() {
     let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
     let func = &module.functions[0];
     let formatted = format_function(func);
-    assert!(formatted.contains("// [vector_hint: width=8, interleave=4]"));
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
     assert!(formatted.contains("// [reduction: min]"));
 
     let mut pass = VectorizePass::new();
@@ -473,7 +497,11 @@ fn test_vectorize_pass_slice_max_reduction_i32() {
     let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
     let func = &module.functions[0];
     let formatted = format_function(func);
-    assert!(formatted.contains("// [vector_hint: width=8, interleave=4]"));
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
     assert!(formatted.contains("// [reduction: max]"));
 
     let mut pass = VectorizePass::new();
@@ -543,7 +571,11 @@ fn test_vectorize_pass_intrinsic_max_reduction() {
     let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
     let func = &module.functions[0];
     let formatted = format_function(func);
-    assert!(formatted.contains("// [vector_hint: width=8, interleave=4]"));
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
     assert!(formatted.contains("// [reduction: max]"));
 
     let mut pass = VectorizePass::new();
@@ -553,4 +585,51 @@ fn test_vectorize_pass_intrinsic_max_reduction() {
     let stats = pass.stats();
     assert_eq!(stats.loops_vectorized, 1);
     assert_eq!(stats.max_reductions_vectorized, 1);
+}
+
+#[test]
+fn test_vectorize_pass_disjoint_slices_parallel_iteration() {
+    let src = r#"
+        pub fn slice_scale_map(src_arr: [f32; 64], inout dst_arr: [f32; 64]) {
+            let src = src_arr[0..64];
+            let mut dst = dst_arr[0..64];
+            let factor: f32 = 3.5;
+            let mut i: i64 = 0;
+            while i < 64 {
+                dst[i] = src[i] * factor;
+                i = i + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("disjoint_slice_map.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    assert!(!module.functions.is_empty());
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
+    assert!(formatted.contains("// [disjoint_slices: true]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.disjoint_slice_loops, 1);
+    assert!(stats.disjoint_slices_vectorized >= 2);
 }

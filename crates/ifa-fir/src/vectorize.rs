@@ -34,6 +34,10 @@ pub struct VectorizeStats {
     pub min_reductions_vectorized: usize,
     /// Number of scalar maximum reduction loops identified and accelerated.
     pub max_reductions_vectorized: usize,
+    /// Number of loops vectorized operating over guaranteed disjoint slice iterations.
+    pub disjoint_slice_loops: usize,
+    /// Number of distinct slice accesses vectorized with guaranteed disjoint memory.
+    pub disjoint_slices_vectorized: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -123,6 +127,8 @@ impl VectorizePass {
             let mut has_reduction_op = false;
             let mut detected_reduction: Option<crate::ir::ReductionKind> = None;
             let mut had_eliminated_bounds = false;
+            let mut slice_read_bases: HashSet<ValueId> = HashSet::new();
+            let mut slice_write_bases: HashSet<ValueId> = HashSet::new();
 
             for &b_id in &loop_info.blocks {
                 if let Some(block) = func.get_block(b_id) {
@@ -137,6 +143,7 @@ impl VectorizePass {
                                         read_elements += 1;
                                         if Self::is_slice_aggregate(&value_types, *base) {
                                             slice_elements += 1;
+                                            slice_read_bases.insert(*base);
                                         } else {
                                             array_elements += 1;
                                         }
@@ -152,6 +159,7 @@ impl VectorizePass {
                                         write_elements += 1;
                                         if Self::is_slice_aggregate(&value_types, *base) {
                                             slice_elements += 1;
+                                            slice_write_bases.insert(*base);
                                         } else {
                                             array_elements += 1;
                                         }
@@ -166,6 +174,7 @@ impl VectorizePass {
                                         detected_elem_types.push(elem_ty);
                                         if Self::is_slice_aggregate(&value_types, *base) {
                                             slice_elements += 1;
+                                            slice_read_bases.insert(*base);
                                         } else {
                                             array_elements += 1;
                                         }
@@ -269,6 +278,21 @@ impl VectorizePass {
                 let primary_ty = &detected_elem_types[0];
                 let vector_width = Self::select_simd_width(primary_ty);
 
+                let mut disjoint_slices = false;
+                if !slice_write_bases.is_empty() && !slice_read_bases.is_empty() {
+                    let all_disjoint = slice_write_bases.iter().all(|&wb| {
+                        slice_read_bases
+                            .iter()
+                            .all(|&rb| Self::are_slice_bases_disjoint(func, wb, rb))
+                    });
+                    if all_disjoint {
+                        disjoint_slices = true;
+                        self.stats.disjoint_slice_loops += 1;
+                        self.stats.disjoint_slices_vectorized +=
+                            slice_write_bases.len() + slice_read_bases.len();
+                    }
+                }
+
                 let hint = LoopVectorHint {
                     vector_width,
                     interleave_count: 4,
@@ -278,6 +302,7 @@ impl VectorizePass {
                     } else {
                         None
                     },
+                    disjoint_slices,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)
@@ -564,6 +589,94 @@ impl VectorizePass {
 
         value_types
     }
+
+    /// Analyze whether two slice aggregate values operate over provably disjoint underlying memory
+    /// (distinct stack allocas, distinct function parameters with inout exclusivity, or distinct fields).
+    pub fn are_slice_bases_disjoint(func: &FirFunction, b1: ValueId, b2: ValueId) -> bool {
+        if b1 == b2 {
+            return false;
+        }
+
+        let root1 = Self::trace_slice_root(func, b1);
+        let root2 = Self::trace_slice_root(func, b2);
+
+        match (root1, root2) {
+            (SliceRoot::Alloca(a1), SliceRoot::Alloca(a2)) => a1 != a2,
+            (SliceRoot::Param(p1), SliceRoot::Param(p2)) => p1 != p2,
+            (SliceRoot::Field(base1, idx1), SliceRoot::Field(base2, idx2)) => {
+                if base1 == base2 {
+                    idx1 != idx2
+                } else {
+                    Self::are_slice_bases_disjoint(func, base1, base2)
+                }
+            }
+            (SliceRoot::Alloca(_), SliceRoot::Param(_))
+            | (SliceRoot::Param(_), SliceRoot::Alloca(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// Trace the originating memory root for a slice value through SSA definitions.
+    fn trace_slice_root(func: &FirFunction, mut val: ValueId) -> SliceRoot {
+        let mut visited = HashSet::new();
+
+        while visited.insert(val) {
+            // Check if val is a formal function parameter
+            if let Some(pos) = func.params.iter().position(|p| p.val == val) {
+                return SliceRoot::Param(pos);
+            }
+
+            // Search defining instruction in all blocks
+            let mut def_found = false;
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if inst.result == Some(val) {
+                        def_found = true;
+                        match &inst.expr {
+                            ValueExpr::Alloca { .. } => return SliceRoot::Alloca(val),
+                            ValueExpr::GetField {
+                                base, field_idx, ..
+                            }
+                            | ValueExpr::GetFieldPtr {
+                                base, field_idx, ..
+                            } => {
+                                return SliceRoot::Field(*base, *field_idx);
+                            }
+                            ValueExpr::SliceSub { base, .. } => {
+                                val = *base;
+                            }
+                            ValueExpr::CoWMakeUnique { val: src_val } => {
+                                val = *src_val;
+                            }
+                            ValueExpr::Load { ptr } => {
+                                val = *ptr;
+                            }
+                            _ => return SliceRoot::Unknown(val),
+                        }
+                        break;
+                    }
+                }
+                if def_found {
+                    break;
+                }
+            }
+
+            if !def_found {
+                break;
+            }
+        }
+
+        SliceRoot::Unknown(val)
+    }
+}
+
+/// Discovered provenance root for a slice buffer in SSA FIR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SliceRoot {
+    Alloca(ValueId),
+    Param(usize),
+    Field(ValueId, usize),
+    Unknown(ValueId),
 }
 
 impl Default for VectorizePass {

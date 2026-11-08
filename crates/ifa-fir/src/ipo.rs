@@ -407,6 +407,7 @@ impl InterproceduralMemoryMap {
                     param_derived.push(s);
                 }
 
+                let mut alloca_param_map: HashMap<ValueId, HashSet<usize>> = HashMap::new();
                 let mut p_changed = true;
                 while p_changed {
                     p_changed = false;
@@ -414,7 +415,8 @@ impl InterproceduralMemoryMap {
                         for inst in &block.instructions {
                             if let Some(res) = inst.result {
                                 match &inst.expr {
-                                    ValueExpr::GetFieldPtr { base, .. }
+                                    ValueExpr::GetField { base, .. }
+                                    | ValueExpr::GetFieldPtr { base, .. }
                                     | ValueExpr::GetElementPtr { base, .. } => {
                                         for set in &mut param_derived {
                                             if set.contains(base) && set.insert(res) {
@@ -422,7 +424,35 @@ impl InterproceduralMemoryMap {
                                             }
                                         }
                                     }
+                                    ValueExpr::StructInit { fields, .. } => {
+                                        for set in &mut param_derived {
+                                            if fields.iter().any(|f| set.contains(f))
+                                                && set.insert(res)
+                                            {
+                                                p_changed = true;
+                                            }
+                                        }
+                                    }
+                                    ValueExpr::Load { ptr } => {
+                                        if let Some(indices) = alloca_param_map.get(ptr) {
+                                            for &idx in indices {
+                                                if param_derived[idx].insert(res) {
+                                                    p_changed = true;
+                                                }
+                                            }
+                                        }
+                                    }
                                     _ => {}
+                                }
+                            } else if let ValueExpr::Store { ptr, val } = &inst.expr {
+                                if local_alloca_ptrs.contains(ptr) {
+                                    for (idx, set) in param_derived.iter().enumerate() {
+                                        if set.contains(val)
+                                            && alloca_param_map.entry(*ptr).or_default().insert(idx)
+                                        {
+                                            p_changed = true;
+                                        }
+                                    }
                                 }
                             }
                         }

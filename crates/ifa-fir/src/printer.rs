@@ -116,6 +116,10 @@ impl<'a> FirPrinter<'a> {
                 };
                 writeln!(self.output, "// [reduction: {}]", red_name)?;
             }
+            if hint.disjoint_slices {
+                self.indent();
+                writeln!(self.output, "// [disjoint_slices: true]")?;
+            }
         }
         for inst in &block.instructions {
             self.indent();
