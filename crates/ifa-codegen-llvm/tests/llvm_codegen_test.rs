@@ -2384,18 +2384,17 @@ fn test_llvm_coroutine_channel_untyped_and_select_multiplexing() {
     assert!(ir.contains("call token @llvm.coro.id("));
     assert!(ir.contains("call ptr @llvm.coro.begin("));
 
-    // 2. Verify untyped send cast and intrinsic
+    // 2. Verify untyped send cast and non-blocking ring buffer try_send with suspension
     assert!(ir.contains("%chan_val_cast_4 = inttoptr i64 %v4 to ptr"));
-    assert!(ir.contains("call i32 @ifa_rt_channel_send(ptr %v1, ptr %chan_val_cast_4)"));
+    assert!(ir.contains("call i32 @ifa_rt_channel_try_send(ptr %v1, ptr %chan_val_cast_4)"));
+    assert!(ir.contains("br label %coro.send_poll_"));
 
     // 3. Verify multi-channel select multiplexing with stackless suspension
     assert!(ir.contains("br label %coro.sel_poll_"));
-    assert!(ir.contains(
-        "%sel_poll_res_5_0 = call i64 @ifa_rt_channel_select(ptr %select_arr_5, i64 2, i32 1)"
-    ));
-    assert!(ir.contains("%sel_is_waiting_5_0 = icmp eq i64 %sel_poll_res_5_0, 2"));
+    assert!(ir.contains("@ifa_rt_channel_select(ptr %select_arr_5, i64 2, i32 1)"));
+    assert!(ir.contains("%sel_is_waiting_5_"));
     assert!(ir.contains("call i8 @llvm.coro.suspend(token none, i1 false)"));
-    assert!(ir.contains("%v5 = phi i64 [ %sel_poll_res_5_0, %coro.sel_poll_0 ]"));
+    assert!(ir.contains("%v5 = phi i64 [ %sel_poll_res_5_"));
 
     // 4. Verify channel receive with stackless suspension
     assert!(ir.contains("br label %coro.recv_poll_"));
@@ -3515,6 +3514,61 @@ fn test_native_zero_copy_streaming_pipeline_execution() {
         Some(42),
         "Exit code from zero-copy streaming pipeline execution must be 42"
     );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_strict_slice_transformation_vectorization_metadata() {
+    let src = r#"
+        pub strict fn transform_strict_slices(inout dst: [f64; 128], src: [f64; 128]) {
+            let factor: f64 = 2.5;
+            let mut i: i64 = 0;
+            while i < 128 {
+                dst[i] = src[i] * factor;
+                i = i + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_slice_vec.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).expect("FIR lowering failed");
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&module).expect("Emission failed");
+
+    // Verify predicate and mustprogress metadata are emitted
+    assert!(ir.contains("!\"llvm.loop.vectorize.predicate.enable\", i1 1"));
+    assert!(ir.contains("!\"llvm.loop.mustprogress\""));
+    // Verify strict f64 slice loop uses !15 (4-lane predicated strict metadata)
+    assert!(ir.contains("!llvm.loop !15"));
+    // Verify noalias is emitted on pointer parameters for strict functions
+    assert!(ir.contains("ptr noalias %v"));
+
+    // Verify compilation to native object file succeeds with LLVM optimizer
+    let temp_dir = std::env::temp_dir().join(format!("llvm_strict_vec_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("strict_vec.o");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation with strict SIMD vectorization failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

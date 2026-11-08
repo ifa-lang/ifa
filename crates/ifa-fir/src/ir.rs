@@ -467,7 +467,7 @@ pub enum ReductionKind {
     Bitwise,
 }
 
-/// Optimization hint for loop vectorization (SIMD lane width, interleave, unroll directives, reduction kind, and disjoint slices guarantee).
+/// Optimization hint for loop vectorization (SIMD lane width, interleave, unroll directives, reduction kind, disjoint slices guarantee, tail-folding predication, and strict determinism).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LoopVectorHint {
     pub vector_width: u32,
@@ -475,6 +475,8 @@ pub struct LoopVectorHint {
     pub unroll_enable: bool,
     pub reduction_kind: Option<ReductionKind>,
     pub disjoint_slices: bool,
+    pub predicate_enable: bool,
+    pub is_strict: bool,
 }
 
 impl LoopVectorHint {
@@ -486,6 +488,8 @@ impl LoopVectorHint {
             unroll_enable,
             reduction_kind: None,
             disjoint_slices: false,
+            predicate_enable: false,
+            is_strict: false,
         }
     }
 
@@ -498,6 +502,18 @@ impl LoopVectorHint {
     /// Mark the loop accesses as operating over guaranteed disjoint slices (eliminating runtime alias checks).
     pub fn with_disjoint_slices(mut self, disjoint: bool) -> Self {
         self.disjoint_slices = disjoint;
+        self
+    }
+
+    /// Enable predicated SIMD tail folding on slice iterations of dynamic or unaligned lengths.
+    pub fn with_predicate_enable(mut self, predicate: bool) -> Self {
+        self.predicate_enable = predicate;
+        self
+    }
+
+    /// Mark the vectorization hint as originating from a strict deterministic zero-heap function.
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.is_strict = strict;
         self
     }
 }

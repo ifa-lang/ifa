@@ -633,3 +633,99 @@ fn test_vectorize_pass_disjoint_slices_parallel_iteration() {
     assert_eq!(stats.disjoint_slice_loops, 1);
     assert!(stats.disjoint_slices_vectorized >= 2);
 }
+
+#[test]
+fn test_vectorize_pass_strict_slice_transformation() {
+    let src = r#"
+        pub strict fn strict_slice_scale(mut s: [f32], factor: f32) -> [f32] {
+            let mut i: i64 = 0;
+            let len: i64 = s.len();
+            while i < len {
+                s[i] = s[i] * factor;
+                i = i + 1;
+            }
+            return s;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_scale.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
+    assert!(formatted.contains("// [predicate_enable: true]"));
+    assert!(formatted.contains("// [strict_vectorize: true]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.strict_slice_loops_vectorized, 1);
+    assert_eq!(stats.predicated_loops_vectorized, 1);
+    assert!(stats.slices_vectorized >= 1);
+}
+
+#[test]
+fn test_vectorize_pass_strict_partitioned_subslice_disjoint() {
+    let src = r#"
+        pub strict fn strict_partition_copy(buf: [f32; 64], inout out_buf: [f32; 64]) {
+            let src = buf[0..32];
+            let mut dst = out_buf[32..64];
+            let factor: f32 = 2.0;
+            let mut i: i64 = 0;
+            while i < 32 {
+                dst[i] = src[i] * factor;
+                i = i + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_partition.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
+    assert!(formatted.contains("// [disjoint_slices: true]"));
+    assert!(formatted.contains("// [predicate_enable: true]"));
+    assert!(formatted.contains("// [strict_vectorize: true]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.disjoint_slice_loops, 1);
+    assert_eq!(stats.strict_slice_loops_vectorized, 1);
+    assert_eq!(stats.predicated_loops_vectorized, 1);
+}

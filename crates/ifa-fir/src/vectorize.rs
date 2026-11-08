@@ -38,6 +38,10 @@ pub struct VectorizeStats {
     pub disjoint_slice_loops: usize,
     /// Number of distinct slice accesses vectorized with guaranteed disjoint memory.
     pub disjoint_slices_vectorized: usize,
+    /// Number of loops vectorized in strict deterministic functions operating on slices.
+    pub strict_slice_loops_vectorized: usize,
+    /// Number of loops vectorized with predicated tail-folding metadata.
+    pub predicated_loops_vectorized: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -293,6 +297,9 @@ impl VectorizePass {
                     }
                 }
 
+                let predicate_enable = slice_elements > 0;
+                let is_strict_slice_loop = func.is_strict && slice_elements > 0;
+
                 let hint = LoopVectorHint {
                     vector_width,
                     interleave_count: 4,
@@ -303,6 +310,8 @@ impl VectorizePass {
                         None
                     },
                     disjoint_slices,
+                    predicate_enable,
+                    is_strict: func.is_strict,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)
@@ -345,6 +354,12 @@ impl VectorizePass {
                     }
                     if has_pure_calls {
                         self.stats.ipo_vectorized_loops += 1;
+                    }
+                    if is_strict_slice_loop {
+                        self.stats.strict_slice_loops_vectorized += 1;
+                    }
+                    if predicate_enable {
+                        self.stats.predicated_loops_vectorized += 1;
                     }
                     if write_elements > 0 {
                         self.stats.maps_vectorized += 1;
@@ -590,8 +605,22 @@ impl VectorizePass {
         value_types
     }
 
+    fn resolve_const_int(func: &FirFunction, val: ValueId) -> Option<i64> {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if inst.result == Some(val) {
+                    if let ValueExpr::Constant(ConstantValue::Int(v, _)) = inst.expr {
+                        return Some(v as i64);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Analyze whether two slice aggregate values operate over provably disjoint underlying memory
-    /// (distinct stack allocas, distinct function parameters with inout exclusivity, or distinct fields).
+    /// (distinct stack allocas, distinct function parameters with inout exclusivity, distinct fields,
+    /// or non-overlapping constant subslices).
     pub fn are_slice_bases_disjoint(func: &FirFunction, b1: ValueId, b2: ValueId) -> bool {
         if b1 == b2 {
             return false;
@@ -600,14 +629,39 @@ impl VectorizePass {
         let root1 = Self::trace_slice_root(func, b1);
         let root2 = Self::trace_slice_root(func, b2);
 
-        match (root1, root2) {
+        Self::are_slice_roots_disjoint(&root1, &root2, func)
+    }
+
+    fn are_slice_roots_disjoint(r1: &SliceRoot, r2: &SliceRoot, func: &FirFunction) -> bool {
+        match (r1, r2) {
             (SliceRoot::Alloca(a1), SliceRoot::Alloca(a2)) => a1 != a2,
             (SliceRoot::Param(p1), SliceRoot::Param(p2)) => p1 != p2,
             (SliceRoot::Field(base1, idx1), SliceRoot::Field(base2, idx2)) => {
                 if base1 == base2 {
                     idx1 != idx2
                 } else {
-                    Self::are_slice_bases_disjoint(func, base1, base2)
+                    Self::are_slice_bases_disjoint(func, *base1, *base2)
+                }
+            }
+            (SliceRoot::SubSlice(base1, s1, e1), SliceRoot::SubSlice(base2, s2, e2)) => {
+                if base1 == base2 {
+                    *e1 <= *s2 || *e2 <= *s1
+                } else {
+                    Self::are_slice_roots_disjoint(base1, base2, func)
+                }
+            }
+            (SliceRoot::SubSlice(base1, ..), other) => {
+                if &**base1 == other {
+                    false
+                } else {
+                    Self::are_slice_roots_disjoint(base1, other, func)
+                }
+            }
+            (other, SliceRoot::SubSlice(base2, ..)) => {
+                if other == &**base2 {
+                    false
+                } else {
+                    Self::are_slice_roots_disjoint(other, base2, func)
                 }
             }
             (SliceRoot::Alloca(_), SliceRoot::Param(_))
@@ -642,8 +696,16 @@ impl VectorizePass {
                             } => {
                                 return SliceRoot::Field(*base, *field_idx);
                             }
-                            ValueExpr::SliceSub { base, .. } => {
-                                val = *base;
+                            ValueExpr::SliceSub { base, start, end } => {
+                                if let (Some(s), Some(e)) = (
+                                    Self::resolve_const_int(func, *start),
+                                    Self::resolve_const_int(func, *end),
+                                ) {
+                                    let parent = Self::trace_slice_root(func, *base);
+                                    return SliceRoot::SubSlice(Box::new(parent), s, e);
+                                } else {
+                                    val = *base;
+                                }
                             }
                             ValueExpr::CoWMakeUnique { val: src_val } => {
                                 val = *src_val;
@@ -671,11 +733,12 @@ impl VectorizePass {
 }
 
 /// Discovered provenance root for a slice buffer in SSA FIR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SliceRoot {
     Alloca(ValueId),
     Param(usize),
     Field(ValueId, usize),
+    SubSlice(Box<SliceRoot>, i64, i64),
     Unknown(ValueId),
 }
 

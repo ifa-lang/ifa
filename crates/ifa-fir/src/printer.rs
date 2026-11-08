@@ -120,6 +120,14 @@ impl<'a> FirPrinter<'a> {
                 self.indent();
                 writeln!(self.output, "// [disjoint_slices: true]")?;
             }
+            if hint.predicate_enable {
+                self.indent();
+                writeln!(self.output, "// [predicate_enable: true]")?;
+            }
+            if hint.is_strict {
+                self.indent();
+                writeln!(self.output, "// [strict_vectorize: true]")?;
+            }
         }
         for inst in &block.instructions {
             self.indent();

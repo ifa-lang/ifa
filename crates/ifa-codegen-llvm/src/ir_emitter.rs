@@ -1096,6 +1096,17 @@ impl<'a> LlvmIrEmitter<'a> {
         // 2-lane SIMD vectorization hint (AArch64 Neon f64, i64)
         out.push_str("!10 = distinct !{!10, !2, !11, !4, !5}\n");
         out.push_str("!11 = !{!\"llvm.loop.vectorize.width\", i32 2}\n");
+        // Predicated tail-folding and strict loop vectorization hints
+        out.push_str("!12 = !{!\"llvm.loop.vectorize.predicate.enable\", i1 1}\n");
+        out.push_str("!13 = !{!\"llvm.loop.mustprogress\"}\n");
+        // 8-lane strict/predicated SIMD vectorization hint (f32, i32 strict slices)
+        out.push_str("!14 = distinct !{!14, !2, !3, !4, !5, !12, !13}\n");
+        // 4-lane strict/predicated SIMD vectorization hint (f64, i64 strict slices)
+        out.push_str("!15 = distinct !{!15, !2, !7, !4, !5, !12, !13}\n");
+        // 16-lane strict/predicated SIMD vectorization hint (u8, i8 strict slices)
+        out.push_str("!16 = distinct !{!16, !2, !9, !4, !5, !12, !13}\n");
+        // 2-lane strict/predicated SIMD vectorization hint (Neon strict slices)
+        out.push_str("!17 = distinct !{!17, !2, !11, !4, !5, !12, !13}\n");
 
         Ok(out)
     }
@@ -3396,10 +3407,39 @@ impl<'a> LlvmIrEmitter<'a> {
                     ));
                     cast_val
                 };
-                out.push_str(&format!(
-                    "  call i32 @ifa_rt_channel_send(ptr %v{}, ptr {})\n",
-                    chan.0, val_ptr_expr
-                ));
+                if is_coro {
+                    let y_id = *coro_yield_idx;
+                    *coro_yield_idx += 1;
+                    out.push_str(&format!("  br label %coro.send_poll_{}\n", y_id));
+                    out.push_str(&format!("coro.send_poll_{}:\n", y_id));
+                    out.push_str(&format!(
+                        "  %send_st_{}_{} = call i32 @ifa_rt_channel_try_send(ptr %v{}, ptr {})\n",
+                        val.0, y_id, chan.0, val_ptr_expr
+                    ));
+                    out.push_str(&format!(
+                        "  %send_full_{}_{} = icmp eq i32 %send_st_{}_{}, 1\n",
+                        val.0, y_id, val.0, y_id
+                    ));
+                    out.push_str(&format!(
+                        "  br i1 %send_full_{}_{}, label %coro.send_susp_{}, label %coro.send_done_{}\n",
+                        val.0, y_id, y_id, y_id
+                    ));
+                    out.push_str(&format!("coro.send_susp_{}:\n", y_id));
+                    out.push_str(&format!(
+                        "  %coro.send_tok_{} = call i8 @llvm.coro.suspend(token none, i1 false)\n",
+                        y_id
+                    ));
+                    out.push_str(&format!(
+                        "  switch i8 %coro.send_tok_{}, label %coro.susp_ret [ i8 0, label %coro.send_poll_{} i8 1, label %coro.cleanup ]\n",
+                        y_id, y_id
+                    ));
+                    out.push_str(&format!("coro.send_done_{}:\n", y_id));
+                } else {
+                    out.push_str(&format!(
+                        "  call i32 @ifa_rt_channel_send(ptr %v{}, ptr {})\n",
+                        chan.0, val_ptr_expr
+                    ));
+                }
             }
             ValueExpr::ChanClose { chan } => {
                 out.push_str(&format!(
@@ -3733,11 +3773,21 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             Terminator::Branch { target, .. } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = match hint.vector_width {
-                        2 => 10,
-                        4 => 6,
-                        16 | 32 => 8,
-                        _ => 1,
+                    let meta_id = if hint.predicate_enable || hint.is_strict || hint.disjoint_slices
+                    {
+                        match hint.vector_width {
+                            2 => 17,
+                            4 => 15,
+                            16 | 32 => 16,
+                            _ => 14,
+                        }
+                    } else {
+                        match hint.vector_width {
+                            2 => 10,
+                            4 => 6,
+                            16 | 32 => 8,
+                            _ => 1,
+                        }
                     };
                     out.push_str(&format!(
                         "  br label %bb{}, !llvm.loop !{}\n",
@@ -3754,11 +3804,21 @@ impl<'a> LlvmIrEmitter<'a> {
                 ..
             } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = match hint.vector_width {
-                        2 => 10,
-                        4 => 6,
-                        16 | 32 => 8,
-                        _ => 1,
+                    let meta_id = if hint.predicate_enable || hint.is_strict || hint.disjoint_slices
+                    {
+                        match hint.vector_width {
+                            2 => 17,
+                            4 => 15,
+                            16 | 32 => 16,
+                            _ => 14,
+                        }
+                    } else {
+                        match hint.vector_width {
+                            2 => 10,
+                            4 => 6,
+                            16 | 32 => 8,
+                            _ => 1,
+                        }
                     };
                     out.push_str(&format!(
                         "  br i1 %v{}, label %bb{}, label %bb{}, !llvm.loop !{}\n",
