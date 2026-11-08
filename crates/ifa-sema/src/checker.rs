@@ -1308,6 +1308,9 @@ impl<'a> SemanticAnalyzer<'a> {
                 if let Some(init_expr) = init {
                     self.check_inout_source_mutability(pattern, init_expr);
                 }
+                let pattern_borrows =
+                    self.check_pattern_and_register_borrows(pattern, init.as_ref());
+                self.active_borrows.extend(pattern_borrows);
 
                 self.check_pattern_with_mut(pattern, &actual_ty, *is_mut, init.is_some());
                 for (sym, _) in pattern.bound_variables() {
@@ -1611,31 +1614,14 @@ impl<'a> SemanticAnalyzer<'a> {
                     }
                 }
 
-                let has_inout = !pattern.inout_bindings().is_empty();
-                let has_ref = !pattern.ref_bindings().is_empty();
-                let borrow_kind_opt = if has_inout {
-                    Some(BorrowKind::InOut)
-                } else if has_ref {
-                    Some(BorrowKind::In)
-                } else {
-                    None
-                };
-                let while_borrow = borrow_kind_opt.and_then(|k| {
-                    crate::exclusivity::extract_access_path(expr).map(|path| BorrowRecord {
-                        path,
-                        kind: k,
-                        span: pattern.span(),
-                    })
-                });
-                if let Some(b) = &while_borrow {
-                    self.active_borrows.push(b.clone());
-                }
+                let while_borrows = self.check_pattern_and_register_borrows(pattern, Some(expr));
+                let num_borrows = while_borrows.len();
+                self.active_borrows.extend(while_borrows);
 
                 self.check_block(body, None);
 
-                if while_borrow.is_some() {
-                    self.active_borrows.pop();
-                }
+                self.active_borrows
+                    .truncate(self.active_borrows.len() - num_borrows);
                 self.symbols.exit_scope();
             }
             Stmt::For {
@@ -2281,31 +2267,14 @@ impl<'a> SemanticAnalyzer<'a> {
                     }
                 }
 
-                let has_inout = !pattern.inout_bindings().is_empty();
-                let has_ref = !pattern.ref_bindings().is_empty();
-                let borrow_kind_opt = if has_inout {
-                    Some(BorrowKind::InOut)
-                } else if has_ref {
-                    Some(BorrowKind::In)
-                } else {
-                    None
-                };
-                let if_borrow = borrow_kind_opt.and_then(|k| {
-                    crate::exclusivity::extract_access_path(cond_expr).map(|path| BorrowRecord {
-                        path,
-                        kind: k,
-                        span: pattern.span(),
-                    })
-                });
-                if let Some(b) = &if_borrow {
-                    self.active_borrows.push(b.clone());
-                }
+                let if_borrows = self.check_pattern_and_register_borrows(pattern, Some(cond_expr));
+                let num_borrows = if_borrows.len();
+                self.active_borrows.extend(if_borrows);
 
                 let then_ty = self.check_block(then_branch, expected);
 
-                if if_borrow.is_some() {
-                    self.active_borrows.pop();
-                }
+                self.active_borrows
+                    .truncate(self.active_borrows.len() - num_borrows);
                 self.symbols.exit_scope();
 
                 if let Some(el) = else_branch {
@@ -2822,33 +2791,15 @@ impl<'a> SemanticAnalyzer<'a> {
                                 );
                             }
                         }
-                        let has_inout = !arm.pattern.inout_bindings().is_empty();
-                        let has_ref = !arm.pattern.ref_bindings().is_empty();
-                        let borrow_kind_opt = if has_inout {
-                            Some(BorrowKind::InOut)
-                        } else if has_ref {
-                            Some(BorrowKind::In)
-                        } else {
-                            None
-                        };
-                        let arm_borrow = borrow_kind_opt.and_then(|k| {
-                            crate::exclusivity::extract_access_path(target_expr).map(|path| {
-                                BorrowRecord {
-                                    path,
-                                    kind: k,
-                                    span: arm.pattern.span(),
-                                }
-                            })
-                        });
-                        if let Some(b) = &arm_borrow {
-                            self.active_borrows.push(b.clone());
-                        }
+                        let arm_borrows = self
+                            .check_pattern_and_register_borrows(&arm.pattern, Some(target_expr));
+                        let num_borrows = arm_borrows.len();
+                        self.active_borrows.extend(arm_borrows);
 
                         let arm_ty = self.check_expr(&arm.body, expected);
 
-                        if arm_borrow.is_some() {
-                            self.active_borrows.pop();
-                        }
+                        self.active_borrows
+                            .truncate(self.active_borrows.len() - num_borrows);
                         self.symbols.exit_scope();
                         arm_types.push(arm_ty);
                     }
@@ -4033,6 +3984,58 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
             }
         }
+    }
+
+    /// Evaluates path-sensitive exclusivity across all bindings within a pattern,
+    /// verifies disjointness, and creates scoped borrow records against active borrows.
+    fn check_pattern_and_register_borrows(
+        &mut self,
+        pattern: &Pattern,
+        source_expr: Option<&Expr>,
+    ) -> Vec<BorrowRecord> {
+        let mut bindings = Vec::new();
+        let mut cur_path = Vec::new();
+        let mut cur_display = String::new();
+        crate::exclusivity::extract_pattern_bindings_with_paths(
+            pattern,
+            &mut cur_path,
+            &mut cur_display,
+            &mut bindings,
+            &mut self.diagnostics,
+        );
+        crate::exclusivity::validate_pattern_bindings_disjointness(
+            &bindings,
+            &mut self.diagnostics,
+        );
+
+        let base_path = source_expr.and_then(crate::exclusivity::extract_access_path);
+        let mut borrows = crate::exclusivity::register_and_validate_pattern_borrows(
+            &bindings,
+            base_path.as_ref(),
+            &self.active_borrows,
+            &mut self.diagnostics,
+        );
+
+        if borrows.is_empty() {
+            let has_inout = !pattern.inout_bindings().is_empty();
+            let has_ref = !pattern.ref_bindings().is_empty();
+            let borrow_kind_opt = if has_inout {
+                Some(BorrowKind::InOut)
+            } else if has_ref {
+                Some(BorrowKind::In)
+            } else {
+                None
+            };
+            if let (Some(kind), Some(path)) = (borrow_kind_opt, base_path) {
+                borrows.push(BorrowRecord {
+                    path,
+                    kind,
+                    span: pattern.span(),
+                });
+            }
+        }
+
+        borrows
     }
 
     fn check_binary_expr(&mut self, op: BinOp, left: &Expr, right: &Expr, span: Span) -> Type {

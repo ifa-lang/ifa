@@ -4649,3 +4649,118 @@ fn test_strided_slices_three_channel_rgb_disjoint_allowed() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_pattern_destructuring_disjoint_fields_inout_allowed() {
+    let code = r#"
+        struct Point {
+            x: i64,
+            y: i64,
+        }
+
+        pub fn main() {
+            mut pt = Point(x: 10, y: 20);
+            let Point { x: inout px, y: inout py } = pt;
+            px += 5;
+            py += 15;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Simultaneous inout borrows of provably disjoint struct fields in destructuring must be allowed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_pattern_destructuring_overlapping_parent_child_paths_rejected_with_e0011() {
+    let code = r#"
+        struct SubNode {
+            val: i64,
+        }
+
+        struct Node {
+            lhs: SubNode,
+            rhs: SubNode,
+        }
+
+        pub fn main() {
+            mut node = Node(lhs: SubNode(val: 1), rhs: SubNode(val: 2));
+            // node.lhs (parent) and node.lhs.val (child) overlap!
+            let Node { lhs: inout l, lhs: SubNode { val: inout lv }, .. } = node;
+            l.val = 99;
+            lv = 100;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Overlapping parent/child inout borrows in destructuring pattern must be rejected: {:?}",
+        res.diagnostics
+    );
+    let has_e0011_or_e0048 = res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0011") || d.code.as_deref() == Some("E0048"));
+    assert!(
+        has_e0011_or_e0048,
+        "Expected E0011 or E0048 diagnostic code, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_pattern_destructuring_duplicate_struct_field_rejected() {
+    let code = r#"
+        struct Vec2 {
+            x: i64,
+            y: i64,
+        }
+
+        pub fn main() {
+            mut v = Vec2(x: 1, y: 2);
+            let Vec2 { x: inout a, x: inout b } = v;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Duplicated struct field in pattern must be rejected: {:?}",
+        res.diagnostics
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0048") || d.code.as_deref() == Some("E0011")),
+        "Expected E0048 or E0011 diagnostic code for duplicate field pattern, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_match_destructuring_disjoint_fields_inout_allowed() {
+    let code = r#"
+        struct Pair {
+            first: i64,
+            second: i64,
+        }
+
+        pub fn main() -> i64 {
+            mut p = Pair(first: 42, second: 100);
+            match p {
+                Pair { first: inout f, second: inout s } => {
+                    f += 1;
+                    s += 2;
+                    return f + s;
+                }
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Match arm with disjoint inout fields must be accepted: {:?}",
+        res.diagnostics
+    );
+}

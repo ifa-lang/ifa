@@ -1,5 +1,8 @@
 use crate::symbol_table::SymbolTable;
-use ifa_ast::{Arg, Block, Expr, ExprKind, Function, Item, ParamMode, Program, Stmt, UnaryOp};
+use ifa_ast::{
+    Arg, BindingMode, Block, Expr, ExprKind, Function, Item, ParamMode, Pattern, Program, Stmt,
+    UnaryOp,
+};
 use ifa_diagnostics::Diagnostic;
 use ifa_span::{Span, Symbol, INTERNER};
 use std::collections::HashMap;
@@ -388,326 +391,331 @@ pub struct AccessPath {
     pub display: String,
 }
 
+/// Classifies the aliasing relationship between two sequences of access path segments.
+pub fn segments_alias_kind(seg1: &[PathSegment], seg2: &[PathSegment]) -> PathAliasKind {
+    let min_len = seg1.len().min(seg2.len());
+    for i in 0..min_len {
+        match (&seg1[i], &seg2[i]) {
+            (PathSegment::Field(f1), PathSegment::Field(f2)) if f1 != f2 => {
+                return PathAliasKind::Disjoint; // distinct fields at the same depth are provably disjoint
+            }
+            (PathSegment::IndexConst(c1), PathSegment::IndexConst(c2)) if c1 != c2 => {
+                return PathAliasKind::Disjoint; // distinct constant indices are provably disjoint
+            }
+            (PathSegment::IndexOffset(s1, o1), PathSegment::IndexOffset(s2, o2))
+                if s1 == s2 && o1 != o2 =>
+            {
+                return PathAliasKind::Disjoint; // arr[i+1] vs arr[i+2]
+            }
+            (PathSegment::IndexSymbolic(s1), PathSegment::IndexOffset(s2, off))
+            | (PathSegment::IndexOffset(s2, off), PathSegment::IndexSymbolic(s1))
+                if s1 == s2 && *off != 0 =>
+            {
+                return PathAliasKind::Disjoint; // arr[i] vs arr[i+1]
+            }
+            (
+                PathSegment::IndexConst(c),
+                PathSegment::SliceConst {
+                    start,
+                    end,
+                    inclusive,
+                },
+            )
+            | (
+                PathSegment::SliceConst {
+                    start,
+                    end,
+                    inclusive,
+                },
+                PathSegment::IndexConst(c),
+            ) => {
+                let idx_bound = SliceBound::Const(*c);
+                let b_s = start.map(SliceBound::Const);
+                let b_e = end.map(SliceBound::Const);
+                if is_index_disjoint_from_slice(
+                    &idx_bound,
+                    b_s.as_ref(),
+                    b_e.as_ref(),
+                    None,
+                    *inclusive,
+                ) {
+                    return PathAliasKind::Disjoint;
+                }
+            }
+            (
+                PathSegment::IndexSymbolic(sym),
+                PathSegment::SliceConst {
+                    start,
+                    end,
+                    inclusive,
+                },
+            )
+            | (
+                PathSegment::SliceConst {
+                    start,
+                    end,
+                    inclusive,
+                },
+                PathSegment::IndexSymbolic(sym),
+            ) => {
+                let idx_bound = SliceBound::Symbolic(*sym);
+                let b_s = start.map(SliceBound::Const);
+                let b_e = end.map(SliceBound::Const);
+                if is_index_disjoint_from_slice(
+                    &idx_bound,
+                    b_s.as_ref(),
+                    b_e.as_ref(),
+                    None,
+                    *inclusive,
+                ) {
+                    return PathAliasKind::Disjoint;
+                }
+            }
+            (
+                PathSegment::IndexOffset(sym, off),
+                PathSegment::SliceConst {
+                    start,
+                    end,
+                    inclusive,
+                },
+            )
+            | (
+                PathSegment::SliceConst {
+                    start,
+                    end,
+                    inclusive,
+                },
+                PathSegment::IndexOffset(sym, off),
+            ) => {
+                let idx_bound = SliceBound::Offset(*sym, *off);
+                let b_s = start.map(SliceBound::Const);
+                let b_e = end.map(SliceBound::Const);
+                if is_index_disjoint_from_slice(
+                    &idx_bound,
+                    b_s.as_ref(),
+                    b_e.as_ref(),
+                    None,
+                    *inclusive,
+                ) {
+                    return PathAliasKind::Disjoint;
+                }
+            }
+            (
+                PathSegment::IndexConst(c),
+                PathSegment::SliceRange {
+                    start,
+                    end,
+                    step,
+                    inclusive,
+                },
+            )
+            | (
+                PathSegment::SliceRange {
+                    start,
+                    end,
+                    step,
+                    inclusive,
+                },
+                PathSegment::IndexConst(c),
+            ) => {
+                let idx_bound = SliceBound::Const(*c);
+                if is_index_disjoint_from_slice(
+                    &idx_bound,
+                    start.as_ref(),
+                    end.as_ref(),
+                    step.as_ref(),
+                    *inclusive,
+                ) {
+                    return PathAliasKind::Disjoint;
+                }
+            }
+            (
+                PathSegment::IndexSymbolic(sym),
+                PathSegment::SliceRange {
+                    start,
+                    end,
+                    step,
+                    inclusive,
+                },
+            )
+            | (
+                PathSegment::SliceRange {
+                    start,
+                    end,
+                    step,
+                    inclusive,
+                },
+                PathSegment::IndexSymbolic(sym),
+            ) => {
+                let idx_bound = SliceBound::Symbolic(*sym);
+                if is_index_disjoint_from_slice(
+                    &idx_bound,
+                    start.as_ref(),
+                    end.as_ref(),
+                    step.as_ref(),
+                    *inclusive,
+                ) {
+                    return PathAliasKind::Disjoint;
+                }
+            }
+            (
+                PathSegment::IndexOffset(sym, off),
+                PathSegment::SliceRange {
+                    start,
+                    end,
+                    step,
+                    inclusive,
+                },
+            )
+            | (
+                PathSegment::SliceRange {
+                    start,
+                    end,
+                    step,
+                    inclusive,
+                },
+                PathSegment::IndexOffset(sym, off),
+            ) => {
+                let idx_bound = SliceBound::Offset(*sym, *off);
+                if is_index_disjoint_from_slice(
+                    &idx_bound,
+                    start.as_ref(),
+                    end.as_ref(),
+                    step.as_ref(),
+                    *inclusive,
+                ) {
+                    return PathAliasKind::Disjoint;
+                }
+            }
+            (
+                PathSegment::SliceConst {
+                    start: s1,
+                    end: e1,
+                    inclusive: inc1,
+                },
+                PathSegment::SliceConst {
+                    start: s2,
+                    end: e2,
+                    inclusive: inc2,
+                },
+            ) => {
+                let b_s1 = s1.map(SliceBound::Const);
+                let b_e1 = e1.map(SliceBound::Const);
+                let b_s2 = s2.map(SliceBound::Const);
+                let b_e2 = e2.map(SliceBound::Const);
+                if are_slice_ranges_disjoint(
+                    b_s1.as_ref(),
+                    b_e1.as_ref(),
+                    None,
+                    *inc1,
+                    b_s2.as_ref(),
+                    b_e2.as_ref(),
+                    None,
+                    *inc2,
+                ) {
+                    return PathAliasKind::Disjoint;
+                }
+            }
+            (
+                PathSegment::SliceRange {
+                    start: s1,
+                    end: e1,
+                    step: st1,
+                    inclusive: inc1,
+                },
+                PathSegment::SliceRange {
+                    start: s2,
+                    end: e2,
+                    step: st2,
+                    inclusive: inc2,
+                },
+            ) => {
+                if are_slice_ranges_disjoint(
+                    s1.as_ref(),
+                    e1.as_ref(),
+                    st1.as_ref(),
+                    *inc1,
+                    s2.as_ref(),
+                    e2.as_ref(),
+                    st2.as_ref(),
+                    *inc2,
+                ) {
+                    return PathAliasKind::Disjoint;
+                }
+            }
+            (
+                PathSegment::SliceRange {
+                    start: s1,
+                    end: e1,
+                    step: st1,
+                    inclusive: inc1,
+                },
+                PathSegment::SliceConst {
+                    start: s2,
+                    end: e2,
+                    inclusive: inc2,
+                },
+            )
+            | (
+                PathSegment::SliceConst {
+                    start: s2,
+                    end: e2,
+                    inclusive: inc2,
+                },
+                PathSegment::SliceRange {
+                    start: s1,
+                    end: e1,
+                    step: st1,
+                    inclusive: inc1,
+                },
+            ) => {
+                let b_s2 = s2.map(SliceBound::Const);
+                let b_e2 = e2.map(SliceBound::Const);
+                if are_slice_ranges_disjoint(
+                    s1.as_ref(),
+                    e1.as_ref(),
+                    st1.as_ref(),
+                    *inc1,
+                    b_s2.as_ref(),
+                    b_e2.as_ref(),
+                    None,
+                    *inc2,
+                ) {
+                    return PathAliasKind::Disjoint;
+                }
+            }
+            (PathSegment::Method(m1), PathSegment::Method(m2)) if m1 != m2 => {
+                // Different method call projections on same receiver
+                return PathAliasKind::Disjoint;
+            }
+            _ => {
+                // Unknown index or matching segment -> potentially overlapping
+            }
+        }
+    }
+
+    if seg1.len() == seg2.len() {
+        let has_unknown = seg1
+            .iter()
+            .chain(seg2.iter())
+            .any(|s| matches!(s, PathSegment::IndexUnknown));
+        if has_unknown {
+            PathAliasKind::Partial
+        } else {
+            PathAliasKind::Exact
+        }
+    } else {
+        PathAliasKind::Partial
+    }
+}
+
 impl AccessPath {
     /// Classifies the aliasing relationship between two structured access paths.
     pub fn alias_kind(&self, other: &AccessPath) -> PathAliasKind {
         if self.root != other.root {
             return PathAliasKind::Disjoint;
         }
-        let min_len = self.segments.len().min(other.segments.len());
-        for i in 0..min_len {
-            match (&self.segments[i], &other.segments[i]) {
-                (PathSegment::Field(f1), PathSegment::Field(f2)) if f1 != f2 => {
-                    return PathAliasKind::Disjoint; // distinct fields at the same depth are provably disjoint
-                }
-                (PathSegment::IndexConst(c1), PathSegment::IndexConst(c2)) if c1 != c2 => {
-                    return PathAliasKind::Disjoint; // distinct constant indices are provably disjoint
-                }
-                (PathSegment::IndexOffset(s1, o1), PathSegment::IndexOffset(s2, o2))
-                    if s1 == s2 && o1 != o2 =>
-                {
-                    return PathAliasKind::Disjoint; // arr[i+1] vs arr[i+2]
-                }
-                (PathSegment::IndexSymbolic(s1), PathSegment::IndexOffset(s2, off))
-                | (PathSegment::IndexOffset(s2, off), PathSegment::IndexSymbolic(s1))
-                    if s1 == s2 && *off != 0 =>
-                {
-                    return PathAliasKind::Disjoint; // arr[i] vs arr[i+1]
-                }
-                (
-                    PathSegment::IndexConst(c),
-                    PathSegment::SliceConst {
-                        start,
-                        end,
-                        inclusive,
-                    },
-                )
-                | (
-                    PathSegment::SliceConst {
-                        start,
-                        end,
-                        inclusive,
-                    },
-                    PathSegment::IndexConst(c),
-                ) => {
-                    let idx_bound = SliceBound::Const(*c);
-                    let b_s = start.map(SliceBound::Const);
-                    let b_e = end.map(SliceBound::Const);
-                    if is_index_disjoint_from_slice(
-                        &idx_bound,
-                        b_s.as_ref(),
-                        b_e.as_ref(),
-                        None,
-                        *inclusive,
-                    ) {
-                        return PathAliasKind::Disjoint;
-                    }
-                }
-                (
-                    PathSegment::IndexSymbolic(sym),
-                    PathSegment::SliceConst {
-                        start,
-                        end,
-                        inclusive,
-                    },
-                )
-                | (
-                    PathSegment::SliceConst {
-                        start,
-                        end,
-                        inclusive,
-                    },
-                    PathSegment::IndexSymbolic(sym),
-                ) => {
-                    let idx_bound = SliceBound::Symbolic(*sym);
-                    let b_s = start.map(SliceBound::Const);
-                    let b_e = end.map(SliceBound::Const);
-                    if is_index_disjoint_from_slice(
-                        &idx_bound,
-                        b_s.as_ref(),
-                        b_e.as_ref(),
-                        None,
-                        *inclusive,
-                    ) {
-                        return PathAliasKind::Disjoint;
-                    }
-                }
-                (
-                    PathSegment::IndexOffset(sym, off),
-                    PathSegment::SliceConst {
-                        start,
-                        end,
-                        inclusive,
-                    },
-                )
-                | (
-                    PathSegment::SliceConst {
-                        start,
-                        end,
-                        inclusive,
-                    },
-                    PathSegment::IndexOffset(sym, off),
-                ) => {
-                    let idx_bound = SliceBound::Offset(*sym, *off);
-                    let b_s = start.map(SliceBound::Const);
-                    let b_e = end.map(SliceBound::Const);
-                    if is_index_disjoint_from_slice(
-                        &idx_bound,
-                        b_s.as_ref(),
-                        b_e.as_ref(),
-                        None,
-                        *inclusive,
-                    ) {
-                        return PathAliasKind::Disjoint;
-                    }
-                }
-                (
-                    PathSegment::IndexConst(c),
-                    PathSegment::SliceRange {
-                        start,
-                        end,
-                        step,
-                        inclusive,
-                    },
-                )
-                | (
-                    PathSegment::SliceRange {
-                        start,
-                        end,
-                        step,
-                        inclusive,
-                    },
-                    PathSegment::IndexConst(c),
-                ) => {
-                    let idx_bound = SliceBound::Const(*c);
-                    if is_index_disjoint_from_slice(
-                        &idx_bound,
-                        start.as_ref(),
-                        end.as_ref(),
-                        step.as_ref(),
-                        *inclusive,
-                    ) {
-                        return PathAliasKind::Disjoint;
-                    }
-                }
-                (
-                    PathSegment::IndexSymbolic(sym),
-                    PathSegment::SliceRange {
-                        start,
-                        end,
-                        step,
-                        inclusive,
-                    },
-                )
-                | (
-                    PathSegment::SliceRange {
-                        start,
-                        end,
-                        step,
-                        inclusive,
-                    },
-                    PathSegment::IndexSymbolic(sym),
-                ) => {
-                    let idx_bound = SliceBound::Symbolic(*sym);
-                    if is_index_disjoint_from_slice(
-                        &idx_bound,
-                        start.as_ref(),
-                        end.as_ref(),
-                        step.as_ref(),
-                        *inclusive,
-                    ) {
-                        return PathAliasKind::Disjoint;
-                    }
-                }
-                (
-                    PathSegment::IndexOffset(sym, off),
-                    PathSegment::SliceRange {
-                        start,
-                        end,
-                        step,
-                        inclusive,
-                    },
-                )
-                | (
-                    PathSegment::SliceRange {
-                        start,
-                        end,
-                        step,
-                        inclusive,
-                    },
-                    PathSegment::IndexOffset(sym, off),
-                ) => {
-                    let idx_bound = SliceBound::Offset(*sym, *off);
-                    if is_index_disjoint_from_slice(
-                        &idx_bound,
-                        start.as_ref(),
-                        end.as_ref(),
-                        step.as_ref(),
-                        *inclusive,
-                    ) {
-                        return PathAliasKind::Disjoint;
-                    }
-                }
-                (
-                    PathSegment::SliceConst {
-                        start: s1,
-                        end: e1,
-                        inclusive: inc1,
-                    },
-                    PathSegment::SliceConst {
-                        start: s2,
-                        end: e2,
-                        inclusive: inc2,
-                    },
-                ) => {
-                    let b_s1 = s1.map(SliceBound::Const);
-                    let b_e1 = e1.map(SliceBound::Const);
-                    let b_s2 = s2.map(SliceBound::Const);
-                    let b_e2 = e2.map(SliceBound::Const);
-                    if are_slice_ranges_disjoint(
-                        b_s1.as_ref(),
-                        b_e1.as_ref(),
-                        None,
-                        *inc1,
-                        b_s2.as_ref(),
-                        b_e2.as_ref(),
-                        None,
-                        *inc2,
-                    ) {
-                        return PathAliasKind::Disjoint;
-                    }
-                }
-                (
-                    PathSegment::SliceRange {
-                        start: s1,
-                        end: e1,
-                        step: st1,
-                        inclusive: inc1,
-                    },
-                    PathSegment::SliceRange {
-                        start: s2,
-                        end: e2,
-                        step: st2,
-                        inclusive: inc2,
-                    },
-                ) => {
-                    if are_slice_ranges_disjoint(
-                        s1.as_ref(),
-                        e1.as_ref(),
-                        st1.as_ref(),
-                        *inc1,
-                        s2.as_ref(),
-                        e2.as_ref(),
-                        st2.as_ref(),
-                        *inc2,
-                    ) {
-                        return PathAliasKind::Disjoint;
-                    }
-                }
-                (
-                    PathSegment::SliceRange {
-                        start: s1,
-                        end: e1,
-                        step: st1,
-                        inclusive: inc1,
-                    },
-                    PathSegment::SliceConst {
-                        start: s2,
-                        end: e2,
-                        inclusive: inc2,
-                    },
-                )
-                | (
-                    PathSegment::SliceConst {
-                        start: s2,
-                        end: e2,
-                        inclusive: inc2,
-                    },
-                    PathSegment::SliceRange {
-                        start: s1,
-                        end: e1,
-                        step: st1,
-                        inclusive: inc1,
-                    },
-                ) => {
-                    let b_s2 = s2.map(SliceBound::Const);
-                    let b_e2 = e2.map(SliceBound::Const);
-                    if are_slice_ranges_disjoint(
-                        s1.as_ref(),
-                        e1.as_ref(),
-                        st1.as_ref(),
-                        *inc1,
-                        b_s2.as_ref(),
-                        b_e2.as_ref(),
-                        None,
-                        *inc2,
-                    ) {
-                        return PathAliasKind::Disjoint;
-                    }
-                }
-                (PathSegment::Method(m1), PathSegment::Method(m2)) if m1 != m2 => {
-                    // Different method call projections on same receiver
-                    return PathAliasKind::Disjoint;
-                }
-                _ => {
-                    // Unknown index or matching segment -> potentially overlapping
-                }
-            }
-        }
-
-        if self.segments.len() == other.segments.len() {
-            let has_unknown = self
-                .segments
-                .iter()
-                .any(|s| matches!(s, PathSegment::IndexUnknown));
-            if has_unknown {
-                PathAliasKind::Partial
-            } else {
-                PathAliasKind::Exact
-            }
-        } else {
-            PathAliasKind::Partial
-        }
+        segments_alias_kind(&self.segments, &other.segments)
     }
 
     /// Determines whether two access paths overlap (alias).
@@ -1989,4 +1997,358 @@ pub fn check_assignment_target_with_active(
             .with_primary_label(target.span, "cette expression n'est pas assignable"),
         );
     }
+}
+
+/// A named or destructured binding within a pattern, associated with its relative path projection.
+#[derive(Debug, Clone)]
+pub struct PatternBindingDesc {
+    pub name: Symbol,
+    pub mode: BindingMode,
+    pub span: Span,
+    pub rel_path: RelativePath,
+    pub display: String,
+}
+
+/// Recursively traverses a pattern to extract all variable bindings along with their relative access sub-paths.
+///
+/// Statically validates that no structure field is duplicated within the same pattern node (E0048).
+pub fn extract_pattern_bindings_with_paths(
+    pattern: &Pattern,
+    current_path: &mut RelativePath,
+    current_display: &mut String,
+    bindings: &mut Vec<PatternBindingDesc>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match pattern {
+        Pattern::Wildcard(_) | Pattern::Lit(_, _) => {}
+        Pattern::Ident(sym, span) => {
+            let name_str = INTERNER.resolve(sym);
+            let display = if current_display.is_empty() {
+                name_str.to_string()
+            } else {
+                current_display.clone()
+            };
+            bindings.push(PatternBindingDesc {
+                name: *sym,
+                mode: BindingMode::Value,
+                span: *span,
+                rel_path: current_path.clone(),
+                display,
+            });
+        }
+        Pattern::Binding { mode, name, span } => {
+            let name_str = INTERNER.resolve(name);
+            let display = if current_display.is_empty() {
+                name_str.to_string()
+            } else {
+                current_display.clone()
+            };
+            bindings.push(PatternBindingDesc {
+                name: *name,
+                mode: *mode,
+                span: *span,
+                rel_path: current_path.clone(),
+                display,
+            });
+        }
+        Pattern::Struct { fields, .. } => {
+            let mut seen_fields: HashMap<Symbol, Span> = HashMap::new();
+            for f in fields {
+                let f_name = INTERNER.resolve(&f.name);
+                if let Some(prev_span) = seen_fields.insert(f.name, f.span) {
+                    diagnostics.push(
+                        Diagnostic::error(format!(
+                            "le champ '{}' est présent plusieurs fois dans le même motif de structure",
+                            f_name
+                        ))
+                        .with_code("E0048")
+                        .with_primary_label(f.span, "champ dupliqué dans le motif")
+                        .with_secondary_label(prev_span, "première apparition ici"),
+                    );
+                }
+
+                current_path.push(PathSegment::Field(f.name));
+                let prev_len = current_display.len();
+                if !current_display.is_empty() {
+                    current_display.push('.');
+                }
+                current_display.push_str(&f_name);
+
+                extract_pattern_bindings_with_paths(
+                    &f.pattern,
+                    current_path,
+                    current_display,
+                    bindings,
+                    diagnostics,
+                );
+
+                current_display.truncate(prev_len);
+                current_path.pop();
+            }
+        }
+        Pattern::Tuple(elems, _) => {
+            for (idx, elem) in elems.iter().enumerate() {
+                let idx_val = idx as i64;
+                current_path.push(PathSegment::IndexConst(idx_val));
+                let prev_len = current_display.len();
+                if !current_display.is_empty() {
+                    current_display.push('.');
+                }
+                current_display.push_str(&idx.to_string());
+
+                extract_pattern_bindings_with_paths(
+                    elem,
+                    current_path,
+                    current_display,
+                    bindings,
+                    diagnostics,
+                );
+
+                current_display.truncate(prev_len);
+                current_path.pop();
+            }
+        }
+        Pattern::Slice {
+            prefix,
+            rest,
+            suffix,
+            ..
+        } => {
+            for (idx, p) in prefix.iter().enumerate() {
+                let idx_val = idx as i64;
+                current_path.push(PathSegment::IndexConst(idx_val));
+                let prev_len = current_display.len();
+                current_display.push_str(&format!("[{}]", idx));
+
+                extract_pattern_bindings_with_paths(
+                    p,
+                    current_path,
+                    current_display,
+                    bindings,
+                    diagnostics,
+                );
+
+                current_display.truncate(prev_len);
+                current_path.pop();
+            }
+            if let Some(Some(r)) = rest {
+                current_path.push(PathSegment::SliceConst {
+                    start: Some(prefix.len() as i64),
+                    end: None,
+                    inclusive: false,
+                });
+                let prev_len = current_display.len();
+                current_display.push_str(&format!("[{}..]", prefix.len()));
+
+                extract_pattern_bindings_with_paths(
+                    r,
+                    current_path,
+                    current_display,
+                    bindings,
+                    diagnostics,
+                );
+
+                current_display.truncate(prev_len);
+                current_path.pop();
+            }
+            for (j, s) in suffix.iter().enumerate() {
+                let idx_val = j as i64;
+                let suffix_sym = INTERNER.intern(&format!("-{}", j));
+                current_path.push(PathSegment::IndexOffset(suffix_sym, idx_val));
+                let prev_len = current_display.len();
+                current_display.push_str(&format!("[..-{}]", j));
+
+                extract_pattern_bindings_with_paths(
+                    s,
+                    current_path,
+                    current_display,
+                    bindings,
+                    diagnostics,
+                );
+
+                current_display.truncate(prev_len);
+                current_path.pop();
+            }
+        }
+        Pattern::Variant { inner: Some(p), .. } => {
+            extract_pattern_bindings_with_paths(
+                p,
+                current_path,
+                current_display,
+                bindings,
+                diagnostics,
+            );
+        }
+        Pattern::Variant { inner: None, .. } | Pattern::Range { .. } => {}
+        Pattern::Or(patterns, _) => {
+            for alt in patterns {
+                let mut alt_bindings = Vec::new();
+                extract_pattern_bindings_with_paths(
+                    alt,
+                    current_path,
+                    current_display,
+                    &mut alt_bindings,
+                    diagnostics,
+                );
+                validate_pattern_bindings_disjointness(&alt_bindings, diagnostics);
+                bindings.extend(alt_bindings);
+            }
+        }
+    }
+}
+
+/// Validates pairwise path exclusivity between all bindings inside a pattern.
+///
+/// In IFA: simultaneous mutable borrowings (`inout`) on overlapping sub-paths
+/// (such as `node.lhs` and `node.lhs.rhs`) are rejected statically with E0011,
+/// whereas provably disjoint fields (such as `p.a` and `p.b`) are strictly permitted.
+pub fn validate_pattern_bindings_disjointness(
+    bindings: &[PatternBindingDesc],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for i in 0..bindings.len() {
+        for j in (i + 1)..bindings.len() {
+            let b1 = &bindings[i];
+            let b2 = &bindings[j];
+
+            let is_inout1 = b1.mode == BindingMode::InOut;
+            let is_inout2 = b2.mode == BindingMode::InOut;
+            let is_ref1 = b1.mode == BindingMode::Ref;
+            let is_ref2 = b2.mode == BindingMode::Ref;
+
+            if !is_inout1 && !is_inout2 {
+                continue;
+            }
+
+            let alias = segments_alias_kind(&b1.rel_path, &b2.rel_path);
+            if alias != PathAliasKind::Disjoint {
+                let p1_str = if b1.display.is_empty() {
+                    INTERNER.resolve(&b1.name)
+                } else {
+                    b1.display.clone()
+                };
+                let p2_str = if b2.display.is_empty() {
+                    INTERNER.resolve(&b2.name)
+                } else {
+                    b2.display.clone()
+                };
+
+                if is_inout1 && is_inout2 {
+                    diagnostics.push(
+                        Diagnostic::error(format!(
+                            "loi d'exclusivité violée : les chemins '{}' et '{}' font l'objet d'emprunts mutables 'inout' simultanés qui se chevauchent",
+                            p1_str, p2_str
+                        ))
+                        .with_code("E0011")
+                        .with_primary_label(
+                            b2.span,
+                            format!("second emprunt mutable exclusif 'inout' en conflit sur '{}'", p2_str),
+                        )
+                        .with_secondary_label(
+                            b1.span,
+                            format!("premier emprunt mutable 'inout' sur '{}'", p1_str),
+                        )
+                        .with_help("Deux emprunts mutables simultanés ne peuvent porter sur des sous-chemins qui se chevauchent."),
+                    );
+                } else if is_inout1 && (is_ref2 || b2.mode == BindingMode::Value) {
+                    diagnostics.push(
+                        Diagnostic::error(format!(
+                            "loi d'exclusivité violée : le sous-chemin '{}' fait l'objet d'un emprunt mutable 'inout' en conflit avec l'emprunt sur '{}'",
+                            p1_str, p2_str
+                        ))
+                        .with_code("E0011")
+                        .with_primary_label(
+                            b2.span,
+                            format!("conflit d'emprunt avec '{}' ici", p1_str),
+                        )
+                        .with_secondary_label(
+                            b1.span,
+                            format!("emprunt mutable exclusif 'inout' sur '{}'", p1_str),
+                        )
+                        .with_help("Un emprunt mutable 'inout' ne peut coexister avec un autre emprunt sur un sous-chemin qui se chevauche."),
+                    );
+                } else if is_inout2 && (is_ref1 || b1.mode == BindingMode::Value) {
+                    diagnostics.push(
+                        Diagnostic::error(format!(
+                            "loi d'exclusivité violée : le sous-chemin '{}' fait l'objet d'un emprunt mutable 'inout' en conflit avec l'emprunt sur '{}'",
+                            p2_str, p1_str
+                        ))
+                        .with_code("E0011")
+                        .with_primary_label(
+                            b2.span,
+                            format!("emprunt mutable exclusif 'inout' sur '{}'", p2_str),
+                        )
+                        .with_secondary_label(
+                            b1.span,
+                            format!("premier emprunt en conflit sur '{}'", p1_str),
+                        )
+                        .with_help("Un emprunt mutable 'inout' ne peut coexister avec un autre emprunt sur un sous-chemin qui se chevauche."),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Validates pattern bindings against currently active external borrows and creates
+/// active borrow records for the scope of the pattern.
+pub fn register_and_validate_pattern_borrows(
+    bindings: &[PatternBindingDesc],
+    base_path: Option<&AccessPath>,
+    active_borrows: &[BorrowRecord],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<BorrowRecord> {
+    let mut new_borrows = Vec::new();
+
+    if let Some(base) = base_path {
+        for b in bindings {
+            let borrow_kind = match b.mode {
+                BindingMode::InOut => Some(BorrowKind::InOut),
+                BindingMode::Ref => Some(BorrowKind::In),
+                _ => None,
+            };
+
+            if let Some(kind) = borrow_kind {
+                let full_path = base.append_relative(&b.rel_path);
+
+                if let Some(conflict) = active_borrows
+                    .iter()
+                    .find(|act| act.path.overlaps(&full_path))
+                {
+                    let is_conflict = kind == BorrowKind::InOut || conflict.kind != BorrowKind::In;
+                    if is_conflict {
+                        let (code, mode_str) = match conflict.kind {
+                            BorrowKind::In => ("E0012", "en lecture ('in')"),
+                            BorrowKind::InOut => ("E0011", "en écriture exclusive ('inout')"),
+                            BorrowKind::Sink => ("E0017", "transférée ('sink')"),
+                            BorrowKind::PendingAssign => ("E0011", "en cours d'assignation"),
+                        };
+                        diagnostics.push(
+                            Diagnostic::error(format!(
+                                "loi d'exclusivité violée : le sous-chemin '{}' ne peut pas être emprunté car il fait déjà l'objet d'un emprunt actif {}",
+                                full_path.display, mode_str
+                            ))
+                            .with_code(code)
+                            .with_primary_label(
+                                b.span,
+                                format!("emprunt interdit sur '{}' pendant un emprunt actif", full_path.display),
+                            )
+                            .with_secondary_label(
+                                conflict.span,
+                                format!("emprunt actif {} ici", mode_str),
+                            ),
+                        );
+                    }
+                }
+
+                new_borrows.push(BorrowRecord {
+                    path: full_path,
+                    kind,
+                    span: b.span,
+                });
+            }
+        }
+    }
+
+    new_borrows
 }
