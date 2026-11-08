@@ -695,3 +695,151 @@ pub strict fn get_dynamic_name() -> String {
         analysis.diagnostics
     );
 }
+
+#[test]
+fn test_concurrent_disjoint_slice_spawns_allowed() {
+    let src = r#"
+fn worker(inout s: Slice<i64>) -> () {
+    s[0] = 42
+}
+
+pub fn spawn_disjoint_slices() -> () {
+    mut buf = [1, 2, 3, 4, 5, 6, 7, 8]
+    spawn {
+        worker(inout buf[0..4])
+    }
+    spawn {
+        worker(inout buf[4..8])
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("disjoint_spawns.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Concurrent spawns with provably disjoint slice projections must be allowed: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_concurrent_overlapping_slice_spawns_rejected() {
+    let src = r#"
+fn worker(inout s: Slice<i64>) -> () {
+    s[0] = 42
+}
+
+pub fn spawn_overlapping_slices() -> () {
+    mut buf = [1, 2, 3, 4, 5, 6, 7, 8]
+    spawn {
+        worker(inout buf[0..5])
+    }
+    spawn {
+        worker(inout buf[4..8])
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("overlapping_spawns.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Concurrent spawns with overlapping slice projections must trigger E0025"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0025")),
+        "Expected E0025 for overlapping slice spawns: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_concurrent_disjoint_field_spawns_allowed() {
+    let src = r#"
+struct Node {
+    lhs: i64,
+    rhs: i64,
+}
+
+fn mutate_field(inout f: i64) -> () {
+    f = f + 1
+}
+
+pub fn spawn_disjoint_fields() -> () {
+    mut node = Node(lhs: 10, rhs: 20)
+    spawn {
+        mutate_field(inout node.lhs)
+    }
+    spawn {
+        mutate_field(inout node.rhs)
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("disjoint_field_spawns.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Concurrent spawns on provably disjoint struct fields must be allowed: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_concurrent_overlapping_field_spawns_rejected() {
+    let src = r#"
+struct Node {
+    lhs: i64,
+    rhs: i64,
+}
+
+fn mutate_field(inout f: i64) -> () {
+    f = f + 1
+}
+
+pub fn spawn_overlapping_fields() -> () {
+    mut node = Node(lhs: 10, rhs: 20)
+    spawn {
+        mutate_field(inout node.lhs)
+    }
+    spawn {
+        mutate_field(inout node.lhs)
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("overlapping_field_spawns.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty());
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Concurrent spawns on same struct field must trigger E0025"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0025")),
+        "Expected E0025 for overlapping field spawns: {:?}",
+        analysis.diagnostics
+    );
+}

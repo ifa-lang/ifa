@@ -11,6 +11,7 @@ pub fn extract_root_variable(expr: &Expr) -> Option<(Symbol, Span)> {
         ExprKind::Ident(sym) => Some((*sym, expr.span)),
         ExprKind::FieldAccess { receiver, .. } => extract_root_variable(receiver),
         ExprKind::Index { receiver, .. } => extract_root_variable(receiver),
+        ExprKind::MethodCall { receiver, .. } => extract_root_variable(receiver),
         ExprKind::Unary {
             op: UnaryOp::InOut | UnaryOp::Sink | UnaryOp::Ref,
             expr: inner,
@@ -25,6 +26,12 @@ pub enum PathSegment {
     Field(Symbol),
     IndexConst(i64),
     IndexUnknown,
+    SliceConst {
+        start: Option<i64>,
+        end: Option<i64>,
+        inclusive: bool,
+    },
+    Method(Symbol),
 }
 
 /// A relative access path starting from a parameter or local base variable.
@@ -55,6 +62,65 @@ impl AccessPath {
                 (PathSegment::IndexConst(c1), PathSegment::IndexConst(c2)) if c1 != c2 => {
                     return false; // distinct constant indices are provably disjoint
                 }
+                (
+                    PathSegment::IndexConst(c),
+                    PathSegment::SliceConst {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                )
+                | (
+                    PathSegment::SliceConst {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                    PathSegment::IndexConst(c),
+                ) => {
+                    let min_idx = start.unwrap_or(0);
+                    if *c < min_idx {
+                        return false; // constant index is strictly before slice start -> provably disjoint
+                    }
+                    if let Some(e) = end {
+                        let past_end = if *inclusive { *c > *e } else { *c >= *e };
+                        if past_end {
+                            return false; // constant index is strictly past slice end -> provably disjoint
+                        }
+                    }
+                    // Otherwise index falls inside slice -> overlaps!
+                }
+                (
+                    PathSegment::SliceConst {
+                        start: s1,
+                        end: e1,
+                        inclusive: inc1,
+                    },
+                    PathSegment::SliceConst {
+                        start: s2,
+                        end: e2,
+                        inclusive: inc2,
+                    },
+                ) => {
+                    let min1 = s1.unwrap_or(0);
+                    let min2 = s2.unwrap_or(0);
+                    if let Some(end1) = e1 {
+                        let max1 = if *inc1 { *end1 } else { *end1 - 1 };
+                        if max1 < min2 {
+                            return false; // slice 1 ends strictly before slice 2 starts -> provably disjoint
+                        }
+                    }
+                    if let Some(end2) = e2 {
+                        let max2 = if *inc2 { *end2 } else { *end2 - 1 };
+                        if max2 < min1 {
+                            return false; // slice 2 ends strictly before slice 1 starts -> provably disjoint
+                        }
+                    }
+                    // Otherwise slices overlap!
+                }
+                (PathSegment::Method(m1), PathSegment::Method(m2)) if m1 != m2 => {
+                    // Different method call projections on same receiver
+                }
                 _ => {
                     // Unknown index or matching segment -> potentially overlapping
                 }
@@ -82,6 +148,21 @@ impl AccessPath {
                 }
                 PathSegment::IndexUnknown => {
                     display.push_str("[*]");
+                }
+                PathSegment::SliceConst {
+                    start,
+                    end,
+                    inclusive,
+                } => {
+                    let s_str = start.map(|s| s.to_string()).unwrap_or_default();
+                    let sep = if *inclusive { "..=" } else { ".." };
+                    let e_str = end.map(|e| e.to_string()).unwrap_or_default();
+                    display.push_str(&format!("[{}{}{}]", s_str, sep, e_str));
+                }
+                PathSegment::Method(m) => {
+                    display.push('.');
+                    display.push_str(&INTERNER.resolve(m));
+                    display.push_str("()");
                 }
             }
         }
@@ -692,11 +773,51 @@ pub fn extract_access_path(expr: &Expr) -> Option<AccessPath> {
                     let val: i64 = s.parse().unwrap_or(0);
                     parent.segments.push(PathSegment::IndexConst(val));
                 }
+                ExprKind::Range {
+                    start,
+                    end,
+                    inclusive,
+                } => {
+                    let s_val = start.as_ref().and_then(|e| match &e.kind {
+                        ExprKind::Lit(ifa_ast::Lit::Int(sym)) => {
+                            INTERNER.resolve(sym).parse::<i64>().ok()
+                        }
+                        _ => None,
+                    });
+                    let e_val = end.as_ref().and_then(|e| match &e.kind {
+                        ExprKind::Lit(ifa_ast::Lit::Int(sym)) => {
+                            INTERNER.resolve(sym).parse::<i64>().ok()
+                        }
+                        _ => None,
+                    });
+                    let s_str = s_val.map(|s| s.to_string()).unwrap_or_default();
+                    let sep = if *inclusive { "..=" } else { ".." };
+                    let e_str = e_val.map(|e| e.to_string()).unwrap_or_default();
+                    parent
+                        .display
+                        .push_str(&format!("[{}{}{}]", s_str, sep, e_str));
+                    parent.segments.push(PathSegment::SliceConst {
+                        start: s_val,
+                        end: e_val,
+                        inclusive: *inclusive,
+                    });
+                }
                 _ => {
                     parent.display.push_str("[*]");
                     parent.segments.push(PathSegment::IndexUnknown);
                 }
             }
+            Some(parent)
+        }
+        ExprKind::MethodCall {
+            receiver, method, ..
+        } => {
+            let mut parent = extract_access_path(receiver)?;
+            let m_name = INTERNER.resolve(method);
+            parent.display.push('.');
+            parent.display.push_str(&m_name);
+            parent.display.push_str("()");
+            parent.segments.push(PathSegment::Method(*method));
             Some(parent)
         }
         ExprKind::Unary {
@@ -714,6 +835,7 @@ pub fn is_lvalue(expr: &Expr) -> bool {
         ExprKind::Ident(_)
             | ExprKind::FieldAccess { .. }
             | ExprKind::Index { .. }
+            | ExprKind::MethodCall { .. }
             | ExprKind::Unary {
                 op: UnaryOp::InOut | UnaryOp::Sink | UnaryOp::Ref,
                 ..

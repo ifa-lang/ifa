@@ -1,3 +1,4 @@
+use crate::exclusivity::{extract_access_path, AccessPath, PathSegment};
 use crate::symbol_table::SymbolTable;
 use crate::types::Type;
 use ifa_ast::{Expr, ExprKind, Function, ParamMode, Pattern, Stmt, UnaryOp};
@@ -22,12 +23,13 @@ pub fn type_contains_ref(ty: &Type) -> bool {
 }
 
 /// Identifies the root variable of an expression, traversing field accesses, array indices,
-/// and unary operators (inout, sink, ref).
+/// chained method calls, and unary operators (inout, sink, ref).
 pub fn extract_escape_root(expr: &Expr) -> Option<(Symbol, Span)> {
     match &expr.kind {
         ExprKind::Ident(sym) => Some((*sym, expr.span)),
         ExprKind::FieldAccess { receiver, .. } => extract_escape_root(receiver),
         ExprKind::Index { receiver, .. } => extract_escape_root(receiver),
+        ExprKind::MethodCall { receiver, .. } => extract_escape_root(receiver),
         ExprKind::Unary { expr: inner, .. } => extract_escape_root(inner),
         _ => None,
     }
@@ -50,8 +52,43 @@ pub fn format_projection_expr(expr: &Expr) -> String {
                 INTERNER.resolve(field)
             )
         }
-        ExprKind::Index { receiver, .. } => {
-            format!("{}[...]", format_projection_expr(receiver))
+        ExprKind::Index { receiver, index } => {
+            if let ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } = &index.kind
+            {
+                let s_val = start.as_ref().and_then(|e| match &e.kind {
+                    ExprKind::Lit(ifa_ast::Lit::Int(sym)) => Some(INTERNER.resolve(sym)),
+                    _ => None,
+                });
+                let e_val = end.as_ref().and_then(|e| match &e.kind {
+                    ExprKind::Lit(ifa_ast::Lit::Int(sym)) => Some(INTERNER.resolve(sym)),
+                    _ => None,
+                });
+                let s_str = s_val.unwrap_or_default();
+                let sep = if *inclusive { "..=" } else { ".." };
+                let e_str = e_val.unwrap_or_default();
+                format!(
+                    "{}[{}{}{}]",
+                    format_projection_expr(receiver),
+                    s_str,
+                    sep,
+                    e_str
+                )
+            } else {
+                format!("{}[...]", format_projection_expr(receiver))
+            }
+        }
+        ExprKind::MethodCall {
+            receiver, method, ..
+        } => {
+            format!(
+                "{}.{}()",
+                format_projection_expr(receiver),
+                INTERNER.resolve(method)
+            )
         }
         ExprKind::Unary { op, expr } => match op {
             UnaryOp::Ref => format!("ref {}", format_projection_expr(expr)),
@@ -125,6 +162,15 @@ pub struct VarEscapeInfo {
     pub contained_refs: Vec<ContainedRef>,
 }
 
+/// An access to a structured path performed within a concurrent fiber (`spawn`).
+#[derive(Debug, Clone)]
+pub struct ConcurrentAccess {
+    pub path: AccessPath,
+    pub is_write: bool,
+    pub spawn_id: usize,
+    pub span: Span,
+}
+
 pub struct EscapeAnalyzer<'a> {
     pub symbols: &'a SymbolTable,
     pub current_func_is_strict: bool,
@@ -132,6 +178,9 @@ pub struct EscapeAnalyzer<'a> {
     pub var_info: HashMap<Symbol, VarEscapeInfo>,
     pub ref_dependencies: HashMap<Symbol, Vec<Symbol>>,
     pub spawn_depth: usize,
+    pub spawn_counter: usize,
+    pub current_spawn_id: Option<usize>,
+    pub concurrent_accesses: Vec<ConcurrentAccess>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -144,6 +193,9 @@ impl<'a> EscapeAnalyzer<'a> {
             var_info: HashMap::new(),
             ref_dependencies: HashMap::new(),
             spawn_depth: 0,
+            spawn_counter: 0,
+            current_spawn_id: None,
+            concurrent_accesses: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -189,6 +241,89 @@ impl<'a> EscapeAnalyzer<'a> {
                 self.check_return_expr(ret_expr);
             }
         }
+    }
+
+    /// Checks and records an `inout` borrow within a `spawn` fiber,
+    /// permitting provably disjoint slice or field projections across concurrent fibers.
+    fn check_concurrent_inout(&mut self, inner: &Expr, arg_span: Span) -> bool {
+        let cur_spawn = match self.current_spawn_id {
+            Some(id) => id,
+            None => return true,
+        };
+        if let Some((root_sym, root_span)) = extract_escape_root(inner) {
+            if self.var_info.contains_key(&root_sym) {
+                let var_name = INTERNER.resolve(&root_sym);
+                if let Some(path) = extract_access_path(inner) {
+                    let has_slice_or_field = path.segments.iter().any(|seg| {
+                        matches!(seg, PathSegment::SliceConst { .. } | PathSegment::Field(_))
+                    });
+
+                    if !has_slice_or_field {
+                        let is_projection = !matches!(&inner.kind, ExprKind::Ident(_));
+                        let inner_repr = format_projection_expr(inner);
+
+                        let error_msg = if is_projection {
+                            format!(
+                                "mutation concurrente interdite : l'argument 'inout' sur la projection scalaire '{}' de '{}' crée un accès mutable concurrent au sein d'une fibre 'spawn'",
+                                inner_repr, var_name
+                            )
+                        } else {
+                            format!(
+                                "mutation concurrente interdite : l'argument 'inout {}' crée un accès mutable concurrent au sein d'une fibre 'spawn'",
+                                var_name
+                            )
+                        };
+
+                        let primary_label = if is_projection {
+                            format!(
+                                "passage inout de '{}' interdit dans une fibre concurrente",
+                                inner_repr
+                            )
+                        } else {
+                            "passage inout interdit dans une fibre concurrente".to_string()
+                        };
+
+                        self.diagnostics.push(
+                            Diagnostic::error(error_msg)
+                                .with_code("E0025")
+                                .with_primary_label(arg_span, primary_label)
+                                .with_secondary_label(
+                                    root_span,
+                                    format!("'{}' appartient au thread parent", var_name),
+                                )
+                                .with_help("Transférez la propriété avec 'sink' ou envoyez un message via un canal."),
+                        );
+                        return false;
+                    }
+
+                    for other in &self.concurrent_accesses {
+                        if other.spawn_id != cur_spawn && other.path.overlaps(&path) {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "mutation concurrente interdite : l'argument 'inout' sur la projection '{}' dans une fibre 'spawn' chevauche l'accès concurrent sur '{}' dans une autre fibre (data race statique)",
+                                    path.display, other.path.display
+                                ))
+                                .with_code("E0025")
+                                .with_primary_label(arg_span, format!("passage inout en conflit sur '{}'", path.display))
+                                .with_secondary_label(other.span, format!("accès concurrent actif ici sur '{}'", other.path.display))
+                                .with_note("Deux fibres concurrentes ne peuvent pas emprunter simultanément des projections mémoires chevauchantes.")
+                                .with_help("Partitionnez vos tranches de façon strictement disjointe (ex: '[0..3]' et '[3..6]') ou utilisez un 'Channel'."),
+                            );
+                            return false;
+                        }
+                    }
+
+                    self.concurrent_accesses.push(ConcurrentAccess {
+                        path,
+                        is_write: true,
+                        spawn_id: cur_spawn,
+                        span: arg_span,
+                    });
+                    return true;
+                }
+            }
+        }
+        true
     }
 
     /// Recursively collects reference targets embedded in an expression.
@@ -627,49 +762,16 @@ impl<'a> EscapeAnalyzer<'a> {
                             expr: inner,
                         } = &arg.value.kind
                         {
-                            if let Some((root_sym, root_span)) = extract_escape_root(inner) {
-                                if self.var_info.contains_key(&root_sym) {
-                                    let var_name = INTERNER.resolve(&root_sym);
-                                    let is_projection = !matches!(&inner.kind, ExprKind::Ident(_));
-                                    let inner_repr = format_projection_expr(inner);
-
-                                    let error_msg = if is_projection {
-                                        format!(
-                                            "mutation concurrente interdite : l'argument 'inout' sur la projection scalaire '{}' de '{}' crée un accès mutable concurrent au sein d'une fibre 'spawn'",
-                                            inner_repr, var_name
-                                        )
-                                    } else {
-                                        format!(
-                                            "mutation concurrente interdite : l'argument 'inout {}' crée un accès mutable concurrent au sein d'une fibre 'spawn'",
-                                            var_name
-                                        )
-                                    };
-
-                                    let primary_label = if is_projection {
-                                        format!("passage inout de '{}' interdit dans une fibre concurrente", inner_repr)
-                                    } else {
-                                        "passage inout interdit dans une fibre concurrente"
-                                            .to_string()
-                                    };
-
-                                    self.diagnostics.push(
-                                        Diagnostic::error(error_msg)
-                                            .with_code("E0025")
-                                            .with_primary_label(arg.value.span, primary_label)
-                                            .with_secondary_label(
-                                                root_span,
-                                                format!("'{}' appartient au thread parent", var_name),
-                                            )
-                                            .with_help("Transférez la propriété avec 'sink' ou envoyez un message via un canal."),
-                                    );
-                                }
-                            }
+                            self.check_concurrent_inout(inner, arg.value.span);
                         }
                     }
                     self.check_expr(&arg.value);
                 }
             }
             ExprKind::MethodCall { receiver, args, .. } => {
+                if self.spawn_depth > 0 {
+                    self.check_concurrent_inout(receiver, receiver.span);
+                }
                 self.check_expr(receiver);
                 for arg in args {
                     if self.spawn_depth > 0 {
@@ -697,43 +799,7 @@ impl<'a> EscapeAnalyzer<'a> {
                             expr: inner,
                         } = &arg.value.kind
                         {
-                            if let Some((root_sym, root_span)) = extract_escape_root(inner) {
-                                if self.var_info.contains_key(&root_sym) {
-                                    let var_name = INTERNER.resolve(&root_sym);
-                                    let is_projection = !matches!(&inner.kind, ExprKind::Ident(_));
-                                    let inner_repr = format_projection_expr(inner);
-
-                                    let error_msg = if is_projection {
-                                        format!(
-                                            "mutation concurrente interdite : l'argument 'inout' sur la projection scalaire '{}' de '{}' crée un accès mutable concurrent au sein d'une fibre 'spawn'",
-                                            inner_repr, var_name
-                                        )
-                                    } else {
-                                        format!(
-                                            "mutation concurrente interdite : l'argument 'inout {}' crée un accès mutable concurrent au sein d'une fibre 'spawn'",
-                                            var_name
-                                        )
-                                    };
-
-                                    let primary_label = if is_projection {
-                                        format!("passage inout de '{}' interdit dans une fibre concurrente", inner_repr)
-                                    } else {
-                                        "passage inout interdit dans une fibre concurrente"
-                                            .to_string()
-                                    };
-
-                                    self.diagnostics.push(
-                                        Diagnostic::error(error_msg)
-                                            .with_code("E0025")
-                                            .with_primary_label(arg.value.span, primary_label)
-                                            .with_secondary_label(
-                                                root_span,
-                                                format!("'{}' appartient au thread parent", var_name),
-                                            )
-                                            .with_help("Transférez la propriété avec 'sink' ou envoyez un message via un canal."),
-                                    );
-                                }
-                            }
+                            self.check_concurrent_inout(inner, arg.value.span);
                         }
                     }
                     self.check_expr(&arg.value);
@@ -829,9 +895,14 @@ impl<'a> EscapeAnalyzer<'a> {
             }
             ExprKind::Spawn(inner) => {
                 let prev_depth = self.spawn_depth;
+                let prev_spawn_id = self.current_spawn_id;
+                let spawn_id = self.spawn_counter;
+                self.spawn_counter += 1;
                 self.spawn_depth += 1;
+                self.current_spawn_id = Some(spawn_id);
                 self.check_expr(inner);
                 self.spawn_depth = prev_depth;
+                self.current_spawn_id = prev_spawn_id;
             }
             ExprKind::Comptime(inner) => self.check_expr(inner),
             ExprKind::Range { start, end, .. } => {

@@ -3943,3 +3943,192 @@ fn test_struct_method_exclusivity_read_write_conflict_rejected() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_slice_projection_exclusivity_disjoint_ranges_allowed() {
+    let code = r#"
+        fn mutate_slices(inout s1: Slice<i64>, inout s2: Slice<i64>) {
+            s1[0] = 100;
+            s2[0] = 200;
+        }
+
+        pub fn main() {
+            mut arr = [1, 2, 3, 4, 5, 6];
+            // Disjoint slice ranges [0..3] and [3..6] must be provably permitted
+            mutate_slices(inout arr[0..3], inout arr[3..6]);
+            // Also disjoint unbounded slice ranges [..3] and [3..]
+            mutate_slices(inout arr[..3], inout arr[3..]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Provably disjoint slice ranges must not trigger exclusivity errors: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_slice_projection_exclusivity_overlapping_ranges_rejected() {
+    let code = r#"
+        fn mutate_slices(inout s1: Slice<i64>, inout s2: Slice<i64>) {
+            s1[0] = 100;
+            s2[0] = 200;
+        }
+
+        pub fn main() {
+            mut arr = [1, 2, 3, 4, 5, 6];
+            // Overlapping slice ranges [0..4] and [3..6] share index 3
+            mutate_slices(inout arr[0..4], inout arr[3..6]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Overlapping slice ranges must trigger E0011 exclusivity error: {:?}",
+        res.diagnostics
+    );
+    let has_e0011 = res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0011"));
+    assert!(
+        has_e0011,
+        "Expected E0011 diagnostic code for overlapping slice ranges, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_slice_and_constant_index_exclusivity_disjoint_allowed() {
+    let code = r#"
+        fn mutate_elem_and_slice(inout elem: i64, inout sl: Slice<i64>) {
+            elem = 42;
+            sl[0] = 99;
+        }
+
+        pub fn main() {
+            mut arr = [10, 20, 30, 40, 50, 60];
+            // Constant index 5 is strictly outside slice [0..4] (0, 1, 2, 3)
+            mutate_elem_and_slice(inout arr[5], inout arr[0..4]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Disjoint element index and slice range must be permitted: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_slice_and_constant_index_exclusivity_overlapping_rejected() {
+    let code = r#"
+        fn mutate_elem_and_slice(inout elem: i64, inout sl: Slice<i64>) {
+            elem = 42;
+            sl[0] = 99;
+        }
+
+        pub fn main() {
+            mut arr = [10, 20, 30, 40, 50, 60];
+            // Constant index 2 falls inside slice range [0..4] (0, 1, 2, 3)
+            mutate_elem_and_slice(inout arr[2], inout arr[0..4]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Overlapping element index inside slice range must trigger E0011: {:?}",
+        res.diagnostics
+    );
+    let has_e0011 = res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0011"));
+    assert!(
+        has_e0011,
+        "Expected E0011 diagnostic code for index overlapping slice, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_chained_method_receiver_exclusivity_disjoint_allowed() {
+    let code = r#"
+        struct Pair {
+            x: i64,
+            y: i64,
+        }
+
+        struct Wrapper {
+            coord: Pair,
+        }
+
+        impl Pair {
+            fn set_x(inout self, v: i64, inout other: i64) {
+                self.x = v;
+                other = other + 1;
+            }
+        }
+
+        impl Wrapper {
+            fn get_pair(inout self) -> Pair {
+                return self.coord;
+            }
+        }
+
+        pub fn test_disjoint_chained() {
+            mut w = Wrapper(coord: Pair(x: 1, y: 2));
+            // Receiver accesses coord, mutating self.x; other argument mutates disjoint field coord.y
+            w.coord.set_x(10, inout w.coord.y);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Disjoint field mutation via receiver must be allowed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_chained_method_receiver_exclusivity_overlapping_rejected() {
+    let code = r#"
+        struct Pair {
+            x: i64,
+            y: i64,
+        }
+
+        struct Wrapper {
+            coord: Pair,
+        }
+
+        impl Pair {
+            fn set_x_and_touch_other(inout self, v: i64, inout other: i64) {
+                self.x = v;
+                other = other + 10;
+            }
+        }
+
+        pub fn test_overlap_chained() {
+            mut w = Wrapper(coord: Pair(x: 1, y: 2));
+            // Overlapping: receiver mutates w.coord.x, argument also mutates w.coord.x
+            w.coord.set_x_and_touch_other(100, inout w.coord.x);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Overlapping chained receiver path must trigger E0011: {:?}",
+        res.diagnostics
+    );
+    let has_e0011 = res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0011"));
+    assert!(
+        has_e0011,
+        "Expected E0011 diagnostic code for overlapping chained method receiver, got: {:?}",
+        res.diagnostics
+    );
+}
