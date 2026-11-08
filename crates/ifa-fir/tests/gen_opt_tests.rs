@@ -1321,3 +1321,203 @@ fn test_dominance_elimination_with_thread_local_call_arena_isolation() {
         "GenCheck in b2 must be marked redundant due to call arena isolation"
     );
 }
+
+#[test]
+fn test_interprocedural_cyclical_cfg_with_convergent_branches_elimination() {
+    let src = r#"
+        struct State {
+            flag: i64,
+            value: i64,
+        }
+
+        fn helper_read(s: ref State) -> i64 {
+            let v = s.value;
+            return v;
+        }
+
+        pub fn process_cycle(limit: i64) -> i64 {
+            mut st = State(flag: 1, value: 10);
+            let r = ref st;
+            mut acc = 0;
+            mut i = 0;
+
+            while i < limit {
+                if i % 2 == 0 {
+                    let f = r.flag;
+                    acc = acc + f;
+                } else {
+                    let v = r.value;
+                    acc = acc + v;
+                }
+                let extra = helper_read(r);
+                acc = acc + extra;
+                i = i + 1;
+            }
+
+            return acc;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("cyclical_convergent_ipo.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = compile_to_fir(&prog, &analysis.symbols, true, false).unwrap();
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_module(&mut module);
+
+    let stats = gce.stats();
+    assert!(
+        stats.eliminated_checks >= 1,
+        "Expected eliminated checks across cyclic CFG with convergent branches, got {}",
+        stats.eliminated_checks
+    );
+
+    // Interpret to verify mathematical and deterministic equivalence
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp
+        .execute_function("process_cycle", vec![FirValue::Int(4)])
+        .unwrap();
+    // i=0: 1 + 10 = 11; i=1: 10 + 10 = 20 (acc=31); i=2: 1 + 10 = 11 (acc=42); i=3: 10 + 10 = 20 (acc=62)
+    assert_eq!(res, FirValue::Int(62));
+}
+
+#[test]
+fn test_interprocedural_mutual_recursion_cyclical_flow() {
+    let src = r#"
+        struct Payload {
+            weight: i64,
+        }
+
+        fn ping(p: ref Payload, step: i64) -> i64 {
+            if step <= 0 {
+                return p.weight;
+            }
+            let w = p.weight;
+            return w + pong(p, step - 1);
+        }
+
+        fn pong(p: ref Payload, step: i64) -> i64 {
+            if step <= 0 {
+                return p.weight;
+            }
+            let w = p.weight;
+            return w + ping(p, step - 1);
+        }
+
+        pub fn run_mutual(init_step: i64) -> i64 {
+            mut load = Payload(weight: 5);
+            let r = ref load;
+            return ping(r, init_step);
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("mutual_rec_ipo.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = compile_to_fir(&prog, &analysis.symbols, true, false).unwrap();
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_module(&mut module);
+
+    let stats = gce.stats();
+    assert!(
+        stats.eliminated_checks >= 2,
+        "Expected eliminated checks across mutual recursion cycle, got {}",
+        stats.eliminated_checks
+    );
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp
+        .execute_function("run_mutual", vec![FirValue::Int(3)])
+        .unwrap();
+    // 4 calls of weight 5 = 20
+    assert_eq!(res, FirValue::Int(20));
+}
+
+#[test]
+fn test_confluent_loop_strip_redundant_checks_preserves_semantics() {
+    let src = r#"
+        struct Counter {
+            val: i64,
+        }
+
+        pub fn count_branches(n: i64) -> i64 {
+            mut c = Counter(val: 1);
+            let r = ref c;
+            mut acc = 0;
+            mut i = 0;
+
+            while i < n {
+                if i % 3 == 0 {
+                    acc = acc + r.val;
+                } else {
+                    acc = acc + r.val + r.val;
+                }
+                let post = r.val;
+                acc = acc + post;
+                i = i + 1;
+            }
+
+            return acc;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("strip_confluent_loop.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = compile_to_fir(&prog, &analysis.symbols, true, false).unwrap();
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_module(&mut module);
+
+    for f in &mut module.functions {
+        let stripped = GenerationalOptPass::strip_redundant_checks(f);
+        if f.name == ifa_span::INTERNER.intern("count_branches") {
+            assert!(
+                stripped >= 1,
+                "Stripped redundant checks in count_branches must be >= 1, got {}",
+                stripped
+            );
+        }
+    }
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp
+        .execute_function("count_branches", vec![FirValue::Int(6)])
+        .unwrap();
+    // i=0: 0%3==0 -> acc=1+1=2
+    // i=1: 1%3!=0 -> acc=2 + 2 + 1 = 5
+    // i=2: 2%3!=0 -> acc=5 + 2 + 1 = 8
+    // i=3: 3%3==0 -> acc=8 + 1 + 1 = 10
+    // i=4: 4%3!=0 -> acc=10 + 2 + 1 = 13
+    // i=5: 5%3!=0 -> acc=13 + 2 + 1 = 16
+    assert_eq!(res, FirValue::Int(16));
+}
