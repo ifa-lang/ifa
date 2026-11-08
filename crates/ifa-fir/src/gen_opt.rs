@@ -75,6 +75,7 @@ pub struct GenOptStats {
     pub eliminated_checks: usize,
     pub hoisted_checks: usize,
     pub interprocedural_eliminated_checks: usize,
+    pub coroutine_sync_barriers_eliminated: usize,
 }
 
 impl GenOptStats {
@@ -284,6 +285,7 @@ impl GenerationalOptPass {
         let before_hoist = self.stats.hoisted_checks;
         let before_total = self.stats.total_checks;
         let before_interprocedural = self.stats.interprocedural_eliminated_checks;
+        let before_coro_sync = self.stats.coroutine_sync_barriers_eliminated;
 
         self.run_on_module(module);
 
@@ -293,6 +295,8 @@ impl GenerationalOptPass {
             hoisted_checks: self.stats.hoisted_checks - before_hoist,
             interprocedural_eliminated_checks: self.stats.interprocedural_eliminated_checks
                 - before_interprocedural,
+            coroutine_sync_barriers_eliminated: self.stats.coroutine_sync_barriers_eliminated
+                - before_coro_sync,
         }
     }
 
@@ -1136,6 +1140,7 @@ impl GenerationalOptPass {
     /// Performs dominance-based and dataflow elimination in Reverse Post-Order.
     fn run_dominance_elimination(&mut self, func: &mut FirFunction, cx: &DominanceContext<'_>) {
         let is_strict = func.is_strict;
+        let is_coroutine = func.is_coroutine();
         let mut verified_at_exit: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
 
         // Helper to extract argument slice passed to a specific target block from a terminator
@@ -1488,6 +1493,24 @@ impl GenerationalOptPass {
                                 }
                             }
                         }
+                        ValueExpr::Yield
+                        | ValueExpr::YieldValue { .. }
+                        | ValueExpr::ChanRecv { .. }
+                        | ValueExpr::ChanSend { .. }
+                        | ValueExpr::ChanSelect {
+                            has_default: false, ..
+                        } => {
+                            // During coroutine suspension, keep available references in disjoint arenas
+                            available.retain(|&val| {
+                                let val_canon = canonical_ref(val, cx.aliases);
+                                let val_arena = cx
+                                    .val_arenas
+                                    .get(&val)
+                                    .or_else(|| cx.val_arenas.get(&val_canon))
+                                    .copied();
+                                val_arena.is_some_and(|a| a > 0)
+                            });
+                        }
                         ValueExpr::GenCheck { ref_val, redundant } => {
                             self.stats.total_checks += 1;
                             let canon = canonical_ref(*ref_val, cx.aliases);
@@ -1503,6 +1526,9 @@ impl GenerationalOptPass {
                                 *redundant = true;
                                 self.stats.eliminated_checks += 1;
                                 self.stats.interprocedural_eliminated_checks += 1;
+                                if is_coroutine {
+                                    self.stats.coroutine_sync_barriers_eliminated += 1;
+                                }
                                 available.insert(*ref_val);
                                 available.insert(canon);
                             } else {

@@ -65,6 +65,12 @@ pub struct IpoStats {
     pub decimation_stencils_specialized: usize,
     /// Number of multidimensional convolution kernels fused across pipeline stages.
     pub fused_convolution_kernels: usize,
+    /// Number of colorless coroutines with disjoint arena references analyzed.
+    pub coroutine_disjoint_arenas_analyzed: usize,
+    /// Number of superfluous synchronization/access barriers eliminated around coroutine suspension/resumption points.
+    pub coroutine_sync_barriers_eliminated: usize,
+    /// Number of disjoint arena parameters propagated inter-procedurally.
+    pub disjoint_arena_parameters_propagated: usize,
 }
 
 /// Call graph structure capturing caller-callee relationships, recursive cycles,
@@ -219,7 +225,7 @@ pub enum PathRoot {
     Param(usize),
     Alloca(ValueId),
     CallArena(ValueId),
-    GenArena(ValueId),
+    GenArena(ValueId, Option<u16>),
     Global(Symbol),
     Unknown(ValueId),
 }
@@ -253,17 +259,25 @@ impl StructAccessPath {
         match (self.root, other.root) {
             (PathRoot::Alloca(a1), PathRoot::Alloca(a2)) => a1 != a2,
             (PathRoot::CallArena(c1), PathRoot::CallArena(c2)) => c1 != c2,
-            (PathRoot::GenArena(g1), PathRoot::GenArena(g2)) => g1 != g2,
-            (PathRoot::Alloca(_), PathRoot::CallArena(_) | PathRoot::GenArena(_))
-            | (PathRoot::CallArena(_), PathRoot::Alloca(_) | PathRoot::GenArena(_))
-            | (PathRoot::GenArena(_), PathRoot::Alloca(_) | PathRoot::CallArena(_)) => true,
+            (PathRoot::GenArena(g1, a1), PathRoot::GenArena(g2, a2)) => {
+                if g1 != g2 {
+                    true
+                } else if let (Some(id1), Some(id2)) = (a1, a2) {
+                    id1 > 0 && id2 > 0 && id1 != id2
+                } else {
+                    false
+                }
+            }
+            (PathRoot::Alloca(_), PathRoot::CallArena(_) | PathRoot::GenArena(..))
+            | (PathRoot::CallArena(_), PathRoot::Alloca(_) | PathRoot::GenArena(..))
+            | (PathRoot::GenArena(..), PathRoot::Alloca(_) | PathRoot::CallArena(_)) => true,
             (PathRoot::Param(p1), PathRoot::Param(p2)) if p1 != p2 => true,
             (
                 PathRoot::Param(_),
-                PathRoot::Alloca(_) | PathRoot::CallArena(_) | PathRoot::GenArena(_),
+                PathRoot::Alloca(_) | PathRoot::CallArena(_) | PathRoot::GenArena(..),
             )
             | (
-                PathRoot::Alloca(_) | PathRoot::CallArena(_) | PathRoot::GenArena(_),
+                PathRoot::Alloca(_) | PathRoot::CallArena(_) | PathRoot::GenArena(..),
                 PathRoot::Param(_),
             ) => true,
             _ => {
@@ -301,6 +315,13 @@ pub struct ParamMemorySummary {
     pub nested_fields_disjoint: bool,
     /// Unique field projection paths accessed through this parameter.
     pub accessed_field_paths: Vec<Vec<usize>>,
+    /// Known generational arena identifier for this parameter if determined statically.
+    pub arena_id: Option<u16>,
+    /// True if this parameter points into a proven disjoint memory arena.
+    pub is_disjoint_arena: bool,
+    /// True if this reference resides in an isolated disjoint arena and is guaranteed to survive
+    /// coroutine suspensions/resumptions without requiring memory synchronization barriers.
+    pub survives_coroutine_yield: bool,
 }
 
 /// Whole-function inter-procedural memory summary.
@@ -309,6 +330,14 @@ pub struct FunctionMemorySummary {
     pub name: Symbol,
     pub effect: MemoryEffect,
     pub params: Vec<ParamMemorySummary>,
+    /// True if this function is a colorless coroutine or contains yield points.
+    pub is_coroutine: bool,
+    /// True if this function contains coroutine suspension points (Yield, YieldValue, blocking channel ops).
+    pub has_suspension_points: bool,
+    /// Set of distinct non-zero generational arenas accessed or allocated in this function.
+    pub disjoint_arenas: HashSet<u16>,
+    /// Number of redundant coroutine synchronization/access barriers eliminated for this function.
+    pub coroutine_sync_barriers_eliminated: usize,
 }
 
 /// Whole-module repository of inter-procedural memory summaries.
@@ -319,6 +348,9 @@ pub struct InterproceduralMemoryMap {
     pub noalias_parameters_propagated: usize,
     pub nested_struct_paths_disambiguated: usize,
     pub disjoint_call_sites_verified: usize,
+    pub coroutine_disjoint_arenas_analyzed: usize,
+    pub coroutine_sync_barriers_eliminated: usize,
+    pub disjoint_arena_parameters_propagated: usize,
 }
 
 impl InterproceduralMemoryMap {
@@ -360,6 +392,9 @@ impl InterproceduralMemoryMap {
             has_impure_primitives: bool,
             writes_global: bool,
             reads_non_local: bool,
+            is_coroutine: bool,
+            has_suspension_points: bool,
+            disjoint_arenas: HashSet<u16>,
             call_sites: Vec<(Symbol, Vec<ValueId>)>,
             param_derived: Vec<HashSet<ValueId>>,
             param_escapes: Vec<bool>,
@@ -368,6 +403,7 @@ impl InterproceduralMemoryMap {
             value_paths: HashMap<ValueId, StructAccessPath>,
             param_field_paths: Vec<HashSet<Vec<usize>>>,
             nested_fields_disjoint: Vec<bool>,
+            val_arenas: HashMap<ValueId, u16>,
         }
 
         let mut local_infos: HashMap<Symbol, FuncLocalInfo> = HashMap::new();
@@ -388,6 +424,10 @@ impl InterproceduralMemoryMap {
                             name: func.name,
                             effect: MemoryEffect::Pure,
                             params: vec![ParamMemorySummary::default(); param_count],
+                            is_coroutine: false,
+                            has_suspension_points: false,
+                            disjoint_arenas: HashSet::new(),
+                            coroutine_sync_barriers_eliminated: 0,
                         },
                     );
                 } else if func.is_strict && !is_side_effect {
@@ -431,6 +471,9 @@ impl InterproceduralMemoryMap {
                                     noalias: true,
                                     nested_fields_disjoint: true,
                                     accessed_field_paths: Vec::new(),
+                                    arena_id: None,
+                                    is_disjoint_arena: true,
+                                    survives_coroutine_yield: true,
                                 }
                             })
                             .collect();
@@ -441,6 +484,10 @@ impl InterproceduralMemoryMap {
                                 name: func.name,
                                 effect,
                                 params,
+                                is_coroutine: false,
+                                has_suspension_points: false,
+                                disjoint_arenas: HashSet::new(),
+                                coroutine_sync_barriers_eliminated: 0,
                             },
                         );
                     } else {
@@ -457,6 +504,9 @@ impl InterproceduralMemoryMap {
                                     noalias: true,
                                     nested_fields_disjoint: true,
                                     accessed_field_paths: Vec::new(),
+                                    arena_id: None,
+                                    is_disjoint_arena: true,
+                                    survives_coroutine_yield: true,
                                 }
                             })
                             .collect();
@@ -467,6 +517,10 @@ impl InterproceduralMemoryMap {
                                 name: func.name,
                                 effect: MemoryEffect::ArgWrite,
                                 params,
+                                is_coroutine: false,
+                                has_suspension_points: false,
+                                disjoint_arenas: HashSet::new(),
+                                coroutine_sync_barriers_eliminated: 0,
                             },
                         );
                     }
@@ -485,9 +539,16 @@ impl InterproceduralMemoryMap {
                                     noalias: false,
                                     nested_fields_disjoint: false,
                                     accessed_field_paths: Vec::new(),
+                                    arena_id: None,
+                                    is_disjoint_arena: false,
+                                    survives_coroutine_yield: false,
                                 };
                                 param_count
                             ],
+                            is_coroutine: false,
+                            has_suspension_points: false,
+                            disjoint_arenas: HashSet::new(),
+                            coroutine_sync_barriers_eliminated: 0,
                         },
                     );
                 }
@@ -595,20 +656,47 @@ impl InterproceduralMemoryMap {
                 let mut writes_global = false;
                 let mut reads_non_local = false;
                 let mut call_sites = Vec::new();
+                let mut val_arenas: HashMap<ValueId, u16> = HashMap::new();
+                let mut disjoint_arenas: HashSet<u16> = HashSet::new();
+                let mut has_suspension_points = false;
 
                 for block in &func.blocks {
                     for inst in &block.instructions {
+                        if let Some(res) = inst.result {
+                            match &inst.expr {
+                                ValueExpr::GenAlloc { arena: Some(a), .. } if *a > 0 => {
+                                    val_arenas.insert(res, *a);
+                                    disjoint_arenas.insert(*a);
+                                }
+                                ValueExpr::CallArenaAlloc { .. } => {
+                                    val_arenas
+                                        .insert(res, crate::closure_opt::ARENA_THREAD_LOCAL_CALL);
+                                }
+                                _ => {}
+                            }
+                        }
+
                         match &inst.expr {
                             ValueExpr::Yield
                             | ValueExpr::YieldValue { .. }
-                            | ValueExpr::Spawn { .. }
-                            | ValueExpr::ChanCreate { .. }
-                            | ValueExpr::ChanSend { .. }
-                            | ValueExpr::ChanTrySend { .. }
                             | ValueExpr::ChanRecv { .. }
+                            | ValueExpr::ChanSend { .. }
+                            | ValueExpr::ChanSelect { .. } => {
+                                has_suspension_points = true;
+                                has_impure_primitives = true;
+                                for (idx, set) in param_derived.iter().enumerate() {
+                                    for u in inst.expr.uses() {
+                                        if set.contains(&u) {
+                                            param_escapes[idx] = true;
+                                        }
+                                    }
+                                }
+                            }
+                            ValueExpr::Spawn { .. }
+                            | ValueExpr::ChanCreate { .. }
+                            | ValueExpr::ChanTrySend { .. }
                             | ValueExpr::ChanTryRecv { .. }
                             | ValueExpr::ChanClose { .. }
-                            | ValueExpr::ChanSelect { .. }
                             | ValueExpr::GenFree { .. }
                             | ValueExpr::CoWClone { .. }
                             | ValueExpr::BlockingCallDirect { .. } => {
@@ -698,10 +786,10 @@ impl InterproceduralMemoryMap {
                                         StructAccessPath::new(PathRoot::CallArena(res)),
                                     );
                                 }
-                                ValueExpr::GenAlloc { .. } => {
+                                ValueExpr::GenAlloc { arena, .. } => {
                                     value_paths.insert(
                                         res,
-                                        StructAccessPath::new(PathRoot::GenArena(res)),
+                                        StructAccessPath::new(PathRoot::GenArena(res, *arena)),
                                     );
                                 }
                                 _ => {}
@@ -809,12 +897,55 @@ impl InterproceduralMemoryMap {
                     }
                 }
 
+                // Propagate val_arenas across Loads, Stores, GenRef, GetField
+                let mut arena_changed = true;
+                while arena_changed {
+                    arena_changed = false;
+                    for block in &func.blocks {
+                        for inst in &block.instructions {
+                            if let Some(res) = inst.result {
+                                match &inst.expr {
+                                    ValueExpr::GenRef { ptr, .. } | ValueExpr::Load { ptr } => {
+                                        if let Some(&a) = val_arenas.get(ptr) {
+                                            if val_arenas.insert(res, a).is_none() {
+                                                arena_changed = true;
+                                            }
+                                        }
+                                    }
+                                    ValueExpr::GetField { base, .. }
+                                    | ValueExpr::GetFieldPtr { base, .. }
+                                    | ValueExpr::GetElement { base, .. }
+                                    | ValueExpr::GetElementPtr { base, .. } => {
+                                        if let Some(&a) = val_arenas.get(base) {
+                                            if val_arenas.insert(res, a).is_none() {
+                                                arena_changed = true;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else if let ValueExpr::Store { ptr, val } = &inst.expr {
+                                if let Some(&a) = val_arenas.get(val) {
+                                    if val_arenas.insert(*ptr, a).is_none() {
+                                        arena_changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let is_coroutine = func.is_coroutine() || has_suspension_points;
+
                 local_infos.insert(
                     func.name,
                     FuncLocalInfo {
                         has_impure_primitives,
                         writes_global,
                         reads_non_local,
+                        is_coroutine,
+                        has_suspension_points,
+                        disjoint_arenas,
                         call_sites,
                         param_derived,
                         param_escapes,
@@ -823,6 +954,7 @@ impl InterproceduralMemoryMap {
                         value_paths,
                         param_field_paths,
                         nested_fields_disjoint,
+                        val_arenas,
                     },
                 );
             }
@@ -842,12 +974,19 @@ impl InterproceduralMemoryMap {
                         noalias: is_noalias,
                         nested_fields_disjoint: info.nested_fields_disjoint[i],
                         accessed_field_paths: info.param_field_paths[i].iter().cloned().collect(),
+                        arena_id: None,
+                        is_disjoint_arena: func.is_strict,
+                        survives_coroutine_yield: func.is_strict,
                     });
                 }
                 FunctionMemorySummary {
                     name: func.name,
                     effect: MemoryEffect::Pure,
                     params: initial_params,
+                    is_coroutine: info.is_coroutine,
+                    has_suspension_points: info.has_suspension_points,
+                    disjoint_arenas: info.disjoint_arenas.clone(),
+                    coroutine_sync_barriers_eliminated: 0,
                 }
             });
         }
@@ -1105,6 +1244,62 @@ impl InterproceduralMemoryMap {
             }
         }
 
+        // Propagate disjoint arenas to function parameters across all incoming calls
+        let mut disjoint_arena_parameters_propagated = 0;
+        let mut coroutine_disjoint_arenas_analyzed = 0;
+
+        for (sym, sum) in summaries.iter_mut() {
+            if sum.is_coroutine || sum.has_suspension_points {
+                coroutine_disjoint_arenas_analyzed += 1;
+            }
+            if let Some(incoming_calls) = call_sites_by_callee.get(sym) {
+                if !incoming_calls.is_empty() {
+                    for k in 0..sum.params.len() {
+                        let mut common_arena: Option<u16> = None;
+                        let mut is_consistent = true;
+                        for (caller_sym, args) in incoming_calls {
+                            if k >= args.len() {
+                                is_consistent = false;
+                                break;
+                            }
+                            if let Some(caller_info) = local_infos.get(caller_sym) {
+                                let arg = args[k];
+                                let a_opt = caller_info.val_arenas.get(&arg).copied();
+                                match (common_arena, a_opt) {
+                                    (None, Some(a)) => common_arena = Some(a),
+                                    (Some(a1), Some(a2)) if a1 == a2 => {}
+                                    _ => {
+                                        is_consistent = false;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                is_consistent = false;
+                                break;
+                            }
+                        }
+
+                        if is_consistent && common_arena.is_some() {
+                            let p = &mut sum.params[k];
+                            p.arena_id = common_arena;
+                            p.is_disjoint_arena = true;
+                            p.noalias = true;
+                            if sum.is_coroutine || sum.has_suspension_points {
+                                p.survives_coroutine_yield = true;
+                            }
+                            disjoint_arena_parameters_propagated += 1;
+                        }
+                    }
+                }
+            } else {
+                for p in &mut sum.params {
+                    if p.is_disjoint_arena {
+                        disjoint_arena_parameters_propagated += 1;
+                    }
+                }
+            }
+        }
+
         let noalias_parameters_propagated = summaries
             .values()
             .map(|s| s.params.iter().filter(|p| p.noalias).count())
@@ -1116,6 +1311,9 @@ impl InterproceduralMemoryMap {
             noalias_parameters_propagated,
             nested_struct_paths_disambiguated,
             disjoint_call_sites_verified,
+            coroutine_disjoint_arenas_analyzed,
+            coroutine_sync_barriers_eliminated: 0,
+            disjoint_arena_parameters_propagated,
         }
     }
 }
@@ -1171,6 +1369,9 @@ impl IpoPass {
         self.stats.noalias_parameters_propagated = mem_map.noalias_parameters_propagated;
         self.stats.nested_struct_paths_disambiguated = mem_map.nested_struct_paths_disambiguated;
         self.stats.disjoint_call_sites_verified = mem_map.disjoint_call_sites_verified;
+        self.stats.coroutine_disjoint_arenas_analyzed = mem_map.coroutine_disjoint_arenas_analyzed;
+        self.stats.disjoint_arena_parameters_propagated =
+            mem_map.disjoint_arena_parameters_propagated;
 
         // Apply propagated noalias guarantees directly to function parameters
         for func in &mut module.functions {
@@ -1204,6 +1405,9 @@ impl IpoPass {
 
         // 7. Inter-procedural symbolic constant propagation for sliding windows and bare-metal convolutions
         self.propagate_interprocedural_constants_and_specialize_convolutions(module);
+
+        // 8. Inter-procedural disjoint arena alias analysis & coroutine synchronization barrier elimination
+        self.optimize_coroutine_disjoint_arenas(module, &mem_map);
     }
 
     /// Analyzes the entire FIR module and computes the set of provably pure function symbols.
@@ -1576,6 +1780,256 @@ impl IpoPass {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Inter-procedural disjoint arena alias analysis for colorless coroutines.
+    ///
+    /// Statically analyzes generational references surviving across coroutine suspension points
+    /// (`Yield`, `YieldValue`, blocking channel primitives). When references are proven to reside
+    /// in strictly disjoint arenas (different non-zero static arena IDs, coroutine-local call arenas,
+    /// or parameters proven disjoint across all call sites), they cannot be mutated or invalidated
+    /// by concurrent tasks or scheduler fiber switches. Consequently, redundant memory synchronization
+    /// barriers and generational access checks (`GenCheck`) following coroutine resumption points
+    /// are eliminated, avoiding superfluous atomic memory fences and cache coherency penalties.
+    pub fn optimize_coroutine_disjoint_arenas(
+        &mut self,
+        module: &mut FirModule,
+        mem_map: &InterproceduralMemoryMap,
+    ) {
+        use crate::cfg::ControlFlowGraph;
+        use crate::dominance::DominanceTree;
+
+        for func in &mut module.functions {
+            let func_summary = mem_map.get_summary(&func.name);
+            let is_coro = func.is_coroutine()
+                || func_summary
+                    .map(|s| s.is_coroutine || s.has_suspension_points)
+                    .unwrap_or(false);
+
+            if !is_coro {
+                continue;
+            }
+
+            // Map each FIR value to its known arena ID and alias root
+            let mut val_arenas: HashMap<ValueId, u16> = HashMap::new();
+            let mut aliases: HashMap<ValueId, ValueId> = HashMap::new();
+            let mut disjoint_refs: HashSet<ValueId> = HashSet::new();
+
+            // 1. Initialize formal parameters from interprocedural memory summary
+            if let Some(sum) = func_summary {
+                for (idx, p) in func.params.iter().enumerate() {
+                    if let Some(param_sum) = sum.params.get(idx) {
+                        if let Some(a_id) = param_sum.arena_id {
+                            val_arenas.insert(p.val, a_id);
+                        }
+                        if param_sum.is_disjoint_arena || param_sum.survives_coroutine_yield {
+                            disjoint_refs.insert(p.val);
+                        }
+                    }
+                }
+            }
+
+            // 2. Intra-procedural propagation of allocations, call arenas, and aliases
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Some(res) = inst.result {
+                        match &inst.expr {
+                            ValueExpr::GenAlloc {
+                                arena: Some(a_id), ..
+                            } if *a_id > 0 => {
+                                val_arenas.insert(res, *a_id);
+                                disjoint_refs.insert(res);
+                            }
+                            ValueExpr::CallArenaAlloc { .. } => {
+                                val_arenas.insert(res, crate::closure_opt::ARENA_THREAD_LOCAL_CALL);
+                                disjoint_refs.insert(res);
+                            }
+                            ValueExpr::GenRef { ptr, .. } => {
+                                aliases.insert(res, *ptr);
+                                if let Some(&a) = val_arenas.get(ptr) {
+                                    val_arenas.insert(res, a);
+                                }
+                                if disjoint_refs.contains(ptr) {
+                                    disjoint_refs.insert(res);
+                                }
+                            }
+                            ValueExpr::Load { ptr } => {
+                                if let Some(&a) = val_arenas.get(ptr) {
+                                    val_arenas.insert(res, a);
+                                }
+                                if let Some(&root) = aliases.get(ptr) {
+                                    aliases.insert(res, root);
+                                    if disjoint_refs.contains(&root) {
+                                        disjoint_refs.insert(res);
+                                    }
+                                }
+                            }
+                            ValueExpr::GetField { base, .. }
+                            | ValueExpr::GetFieldPtr { base, .. } => {
+                                if let Some(&a) = val_arenas.get(base) {
+                                    val_arenas.insert(res, a);
+                                }
+                                if disjoint_refs.contains(base) {
+                                    disjoint_refs.insert(res);
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if let ValueExpr::Store { ptr, val } = &inst.expr {
+                        aliases.insert(*ptr, *val);
+                        if let Some(&a) = val_arenas.get(val) {
+                            val_arenas.insert(*ptr, a);
+                        }
+                        if disjoint_refs.contains(val) {
+                            disjoint_refs.insert(*ptr);
+                        }
+                    }
+                }
+            }
+
+            // 3. Flow-sensitive elimination of GenCheck barriers across coroutine suspension points
+            let cfg = ControlFlowGraph::build(func);
+            let dom_tree = DominanceTree::build(&cfg);
+
+            // Compute blocks that contain or are preceded by at least one coroutine suspension point
+            let mut block_has_suspension: HashSet<BlockId> = HashSet::new();
+            for block in &func.blocks {
+                let has_susp = block.instructions.iter().any(|i| {
+                    matches!(
+                        i.expr,
+                        ValueExpr::Yield
+                            | ValueExpr::YieldValue { .. }
+                            | ValueExpr::ChanRecv { .. }
+                            | ValueExpr::ChanSend { .. }
+                            | ValueExpr::ChanSelect {
+                                has_default: false,
+                                ..
+                            }
+                    )
+                });
+                if has_susp {
+                    block_has_suspension.insert(block.id);
+                }
+            }
+
+            let mut post_suspension_blocks: HashSet<BlockId> = HashSet::new();
+            for &b_id in &dom_tree.rpo_blocks {
+                let mut is_post_susp = block_has_suspension.contains(&b_id);
+                if !is_post_susp {
+                    if let Some(preds) = cfg.predecessors.get(&b_id) {
+                        for &p_id in preds {
+                            if block_has_suspension.contains(&p_id)
+                                || post_suspension_blocks.contains(&p_id)
+                            {
+                                is_post_susp = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if is_post_susp {
+                    post_suspension_blocks.insert(b_id);
+                }
+            }
+
+            let mut verified_at_exit: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
+
+            for &block_id in &dom_tree.rpo_blocks {
+                let mut verified: HashSet<ValueId> = HashSet::new();
+                if let Some(preds) = cfg.predecessors.get(&block_id) {
+                    if !preds.is_empty() {
+                        let mut common: Option<HashSet<ValueId>> = None;
+                        for &pred_id in preds {
+                            if let Some(pred_set) = verified_at_exit.get(&pred_id) {
+                                match &mut common {
+                                    None => common = Some(pred_set.clone()),
+                                    Some(c) => c.retain(|v| pred_set.contains(v)),
+                                }
+                            }
+                        }
+                        if let Some(c) = common {
+                            verified.extend(c);
+                        }
+                    }
+                }
+
+                if block_id == func.entry_block {
+                    for p in &func.params {
+                        if disjoint_refs.contains(&p.val) {
+                            verified.insert(p.val);
+                        }
+                    }
+                }
+
+                let mut local_suspension_seen = false;
+                let is_strict_func = func.is_strict;
+
+                if let Some(block) = func.get_block_mut(block_id) {
+                    for inst in &mut block.instructions {
+                        match &mut inst.expr {
+                            ValueExpr::Yield
+                            | ValueExpr::YieldValue { .. }
+                            | ValueExpr::ChanRecv { .. }
+                            | ValueExpr::ChanSend { .. }
+                            | ValueExpr::ChanSelect {
+                                has_default: false, ..
+                            } => {
+                                local_suspension_seen = true;
+                                // Non-disjoint references could theoretically be modified during suspension.
+                                // BUT references in proven disjoint arenas remain strictly valid!
+                                verified.retain(|v| {
+                                    disjoint_refs.contains(v)
+                                        || val_arenas.get(v).is_some_and(|&a| a > 0)
+                                });
+                            }
+                            ValueExpr::GenAlloc { .. }
+                            | ValueExpr::CallArenaAlloc { .. }
+                            | ValueExpr::GenRef { .. } => {
+                                if let Some(res) = inst.result {
+                                    verified.insert(res);
+                                }
+                            }
+                            ValueExpr::GenFree { ptr } => {
+                                verified.remove(ptr);
+                            }
+                            ValueExpr::GenCheck { ref_val, redundant } => {
+                                let mut canon = *ref_val;
+                                while let Some(&t) = aliases.get(&canon) {
+                                    canon = t;
+                                }
+
+                                let is_disjoint = disjoint_refs.contains(ref_val)
+                                    || disjoint_refs.contains(&canon)
+                                    || val_arenas.get(ref_val).is_some_and(|&a| a > 0)
+                                    || val_arenas.get(&canon).is_some_and(|&a| a > 0);
+
+                                if *redundant {
+                                    verified.insert(*ref_val);
+                                    verified.insert(canon);
+                                } else if is_disjoint
+                                    && (verified.contains(ref_val)
+                                        || verified.contains(&canon)
+                                        || is_strict_func
+                                        || local_suspension_seen
+                                        || post_suspension_blocks.contains(&block_id))
+                                {
+                                    *redundant = true;
+                                    self.stats.coroutine_sync_barriers_eliminated += 1;
+                                    verified.insert(*ref_val);
+                                    verified.insert(canon);
+                                } else {
+                                    verified.insert(*ref_val);
+                                    verified.insert(canon);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                verified_at_exit.insert(block_id, verified);
             }
         }
     }

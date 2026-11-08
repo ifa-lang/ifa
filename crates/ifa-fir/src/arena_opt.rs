@@ -61,6 +61,10 @@ pub struct ArenaFusionStats {
     pub call_arena_scopes_coalesced: usize,
     /// Total multi-dimensional projection intermediate buffers forwarded and eliminated.
     pub multidim_projections_fused: usize,
+    /// Total superfluous synchronization/access barriers eliminated around coroutine suspension/resumption points.
+    pub coroutine_sync_barriers_eliminated: usize,
+    /// Total disjoint arena references proven preserved and valid across coroutine yield points.
+    pub disjoint_arena_references_preserved: usize,
 }
 
 impl ArenaFusionStats {
@@ -76,6 +80,8 @@ impl ArenaFusionStats {
             + self.call_arenas_fused
             + self.call_arena_scopes_coalesced
             + self.multidim_projections_fused
+            + self.coroutine_sync_barriers_eliminated
+            + self.disjoint_arena_references_preserved
     }
 }
 
@@ -496,23 +502,53 @@ impl ArenaFusionPass {
         let mut aliases: HashMap<ValueId, ValueId> = HashMap::new();
         let mut deref_roots: HashMap<ValueId, ValueId> = HashMap::new();
         let mut recursive_projections: HashMap<ValueId, ValueId> = HashMap::new();
+        let mut val_arenas: HashMap<ValueId, u16> = HashMap::new();
 
         for block in &func.blocks {
             for inst in &block.instructions {
+                if let Some(res) = inst.result {
+                    match &inst.expr {
+                        ValueExpr::GenAlloc { arena: Some(a), .. } if *a > 0 => {
+                            val_arenas.insert(res, *a);
+                        }
+                        ValueExpr::CallArenaAlloc { .. } => {
+                            val_arenas.insert(res, crate::closure_opt::ARENA_THREAD_LOCAL_CALL);
+                        }
+                        _ => {}
+                    }
+                }
+
                 match &inst.expr {
+                    ValueExpr::GenRef { ptr } => {
+                        if let Some(res) = inst.result {
+                            aliases.insert(res, *ptr);
+                            if let Some(&a) = val_arenas.get(ptr) {
+                                val_arenas.insert(res, a);
+                            }
+                        }
+                    }
                     ValueExpr::Load { ptr } => {
                         if let Some(res) = inst.result {
                             if let Some(&stored) = aliases.get(ptr) {
                                 aliases.insert(res, stored);
                             }
+                            if let Some(&a) = val_arenas.get(ptr) {
+                                val_arenas.insert(res, a);
+                            }
                         }
                     }
                     ValueExpr::Store { ptr, val } => {
                         aliases.insert(*ptr, *val);
+                        if let Some(&a) = val_arenas.get(val) {
+                            val_arenas.insert(*ptr, a);
+                        }
                     }
                     ValueExpr::GenDeref { ref_val } => {
                         if let Some(res) = inst.result {
                             deref_roots.insert(res, *ref_val);
+                            if let Some(&a) = val_arenas.get(ref_val) {
+                                val_arenas.insert(res, a);
+                            }
                         }
                     }
                     ValueExpr::GetField {
@@ -522,6 +558,10 @@ impl ArenaFusionPass {
                     } => {
                         if let Some(res) = inst.result {
                             let root = deref_roots.get(base).copied().unwrap_or(*base);
+                            if let Some(&a) = val_arenas.get(base).or_else(|| val_arenas.get(&root))
+                            {
+                                val_arenas.insert(res, a);
+                            }
                             // Check if this field corresponds to a recursive reference
                             let is_rec = Self::is_field_recursive(
                                 root,
@@ -539,6 +579,27 @@ impl ArenaFusionPass {
                 }
             }
         }
+
+        let is_coro_func = func.is_coroutine();
+        let mut block_has_suspension: HashSet<BlockId> = HashSet::new();
+        for block in &func.blocks {
+            if block.instructions.iter().any(|i| {
+                matches!(
+                    i.expr,
+                    ValueExpr::Yield
+                        | ValueExpr::YieldValue { .. }
+                        | ValueExpr::ChanRecv { .. }
+                        | ValueExpr::ChanSend { .. }
+                        | ValueExpr::ChanSelect {
+                            has_default: false,
+                            ..
+                        }
+                )
+            }) {
+                block_has_suspension.insert(block.id);
+            }
+        }
+        let has_any_suspension = is_coro_func || !block_has_suspension.is_empty();
 
         // Trace dataflow across blocks in Reverse Post-Order
         let mut verified_at_exit: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
@@ -585,6 +646,22 @@ impl ArenaFusionPass {
             if let Some(block) = func.get_block_mut(block_id) {
                 for inst in &mut block.instructions {
                     match &mut inst.expr {
+                        ValueExpr::Yield
+                        | ValueExpr::YieldValue { .. }
+                        | ValueExpr::ChanRecv { .. }
+                        | ValueExpr::ChanSend { .. }
+                        | ValueExpr::ChanSelect {
+                            has_default: false, ..
+                        } => {
+                            // Suspension point: retain references belonging to disjoint/local arenas or verified parameters
+                            verified.retain(|v| {
+                                val_arenas.get(v).is_some_and(|&a| a > 0)
+                                    || verified_params.contains(v)
+                                    || deref_roots
+                                        .get(v)
+                                        .is_some_and(|r| val_arenas.get(r).is_some_and(|&a| a > 0))
+                            });
+                        }
                         ValueExpr::GenAlloc { .. } | ValueExpr::GenRef { .. } => {
                             if let Some(res) = inst.result {
                                 verified.insert(res);
@@ -624,12 +701,21 @@ impl ArenaFusionPass {
                                         || verified.contains(&Self::resolve_alias(r, &aliases))
                                 });
 
+                            let is_disjoint_ref = val_arenas.get(ref_val).is_some_and(|&a| a > 0)
+                                || val_arenas.get(&canon).is_some_and(|&a| a > 0)
+                                || verified_params.contains(ref_val)
+                                || verified_params.contains(&canon);
+
                             if *redundant {
                                 verified.insert(*ref_val);
                                 verified.insert(canon);
                             } else if is_verified {
                                 *redundant = true;
                                 self.stats.access_barriers_eliminated += 1;
+                                if has_any_suspension && is_disjoint_ref {
+                                    self.stats.coroutine_sync_barriers_eliminated += 1;
+                                    self.stats.disjoint_arena_references_preserved += 1;
+                                }
                                 verified.insert(*ref_val);
                                 verified.insert(canon);
                             } else {
