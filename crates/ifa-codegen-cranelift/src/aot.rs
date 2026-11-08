@@ -184,6 +184,47 @@ void* ifa_rt_arena_alloc(uint16_t arena_id, size_t size, size_t align) {
     return ifa_rt_gen_alloc(size, align, arena_id);
 }
 
+static __thread char ifa_rt_call_arena_buf[65536];
+static __thread size_t ifa_rt_call_arena_off = 0;
+static __thread uint32_t ifa_rt_call_arena_gen = 1;
+
+void* ifa_rt_call_arena_alloc(size_t size, size_t align) {
+    if (align < 8) align = 8;
+    size_t header_size = sizeof(ifa_gen_header_t);
+    size_t aligned_header_offset = (ifa_rt_call_arena_off + 7) & ~7;
+    size_t payload_offset = aligned_header_offset + header_size;
+    size_t aligned_payload_offset = (payload_offset + align - 1) & ~(align - 1);
+    size_t actual_header_offset = aligned_payload_offset - header_size;
+    size_t total_needed = aligned_payload_offset + size;
+    if (total_needed > sizeof(ifa_rt_call_arena_buf)) {
+        return ifa_rt_gen_alloc(size, align, 0xFFF0);
+    }
+    ifa_gen_header_t* header = (ifa_gen_header_t*)(ifa_rt_call_arena_buf + actual_header_offset);
+    header->generation_counter = ifa_rt_call_arena_gen++;
+    header->allocation_flags = 0x0001 | 0x0008;
+    header->arena_id = 0xFFF0;
+    ifa_rt_call_arena_off = total_needed;
+    return (void*)(ifa_rt_call_arena_buf + aligned_payload_offset);
+}
+
+size_t ifa_rt_call_arena_mark(void) {
+    return ifa_rt_call_arena_off;
+}
+
+void ifa_rt_call_arena_rewind(size_t mark) {
+    if (mark < ifa_rt_call_arena_off) {
+        ifa_rt_call_arena_gen++;
+        ifa_rt_call_arena_off = mark;
+    }
+}
+
+void ifa_rt_call_arena_reset(void) {
+    if (ifa_rt_call_arena_off > 0) {
+        ifa_rt_call_arena_gen++;
+    }
+    ifa_rt_call_arena_off = 0;
+}
+
 ifa_slice_t ifa_rt_slice_from_raw(const char* ptr, size_t len) {
     ifa_slice_t s;
     s.ptr = ptr;

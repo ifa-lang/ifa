@@ -173,6 +173,10 @@ impl GenerationalOptPass {
                     if *a_id > 0 {
                         val_arenas.insert(res, *a_id);
                     }
+                } else if let (Some(res), ValueExpr::CallArenaAlloc { .. }) =
+                    (inst.result, &inst.expr)
+                {
+                    val_arenas.insert(res, crate::closure_opt::ARENA_THREAD_LOCAL_CALL);
                 }
             }
         }
@@ -947,6 +951,13 @@ impl GenerationalOptPass {
                             arena: free_arena,
                         });
                     }
+                    ValueExpr::CallArenaRewind { .. } => {
+                        free_operations.push(FreeOperation {
+                            block: block.id,
+                            ptr: ValueId(0),
+                            arena: Some(crate::closure_opt::ARENA_THREAD_LOCAL_CALL),
+                        });
+                    }
                     ValueExpr::CallDirect { name, .. }
                     | ValueExpr::BlockingCallDirect { name, .. }
                         if callee_has_free.get(name) == Some(&true) =>
@@ -1411,11 +1422,30 @@ impl GenerationalOptPass {
                                 }
                             }
                         }
-                        ValueExpr::GenRef { .. } | ValueExpr::GenAlloc { .. } => {
+                        ValueExpr::GenRef { .. }
+                        | ValueExpr::GenAlloc { .. }
+                        | ValueExpr::CallArenaAlloc { .. } => {
                             if let Some(res) = inst.result {
                                 available.insert(res);
                                 available.insert(canonical_ref(res, cx.aliases));
                             }
+                        }
+                        ValueExpr::CallArenaRewind { .. } => {
+                            let free_op = FreeOperation {
+                                block: block_id,
+                                ptr: ValueId(0),
+                                arena: Some(crate::closure_opt::ARENA_THREAD_LOCAL_CALL),
+                            };
+
+                            available.retain(|&val| {
+                                let val_canon = canonical_ref(val, cx.aliases);
+                                let val_arena = cx
+                                    .val_arenas
+                                    .get(&val)
+                                    .or_else(|| cx.val_arenas.get(&val_canon))
+                                    .copied();
+                                !free_op.interferes_with_ref(val, val_arena, cx.aliases)
+                            });
                         }
                         ValueExpr::GenFree { ptr } => {
                             let canon = canonical_ref(*ptr, cx.aliases);

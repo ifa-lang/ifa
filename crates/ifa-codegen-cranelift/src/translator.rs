@@ -578,23 +578,34 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let size = crate::types::fir_type_byte_size(ty).max(8);
                 let size_val = self.builder.ins().iconst(self.ptr_type, size as i64);
                 let align_val = self.builder.ins().iconst(self.ptr_type, 8);
-                let arena_val = self
-                    .builder
-                    .ins()
-                    .iconst(types::I32, arena.unwrap_or(0) as i64);
-
-                if let Some(func_id) = self.func_ids.get("ifa_rt_gen_alloc") {
-                    let local_func = self
-                        .module
-                        .declare_func_in_func(*func_id, self.builder.func);
-                    let call = self
-                        .builder
-                        .ins()
-                        .call(local_func, &[size_val, align_val, arena_val]);
-                    let results = self.builder.inst_results(call);
-                    results.first().copied()
+                let arena_id = arena.unwrap_or(0);
+                if arena_id == ifa_fir::ARENA_THREAD_LOCAL_CALL {
+                    if let Some(func_id) = self.func_ids.get("ifa_rt_call_arena_alloc") {
+                        let local_func = self
+                            .module
+                            .declare_func_in_func(*func_id, self.builder.func);
+                        let call = self.builder.ins().call(local_func, &[size_val, align_val]);
+                        let results = self.builder.inst_results(call);
+                        results.first().copied()
+                    } else {
+                        Some(self.builder.ins().iconst(self.ptr_type, 0))
+                    }
                 } else {
-                    Some(self.builder.ins().iconst(self.ptr_type, 0))
+                    let arena_val = self.builder.ins().iconst(types::I32, arena_id as i64);
+
+                    if let Some(func_id) = self.func_ids.get("ifa_rt_gen_alloc") {
+                        let local_func = self
+                            .module
+                            .declare_func_in_func(*func_id, self.builder.func);
+                        let call = self
+                            .builder
+                            .ins()
+                            .call(local_func, &[size_val, align_val, arena_val]);
+                        let results = self.builder.inst_results(call);
+                        results.first().copied()
+                    } else {
+                        Some(self.builder.ins().iconst(self.ptr_type, 0))
+                    }
                 }
             }
 
@@ -602,19 +613,11 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let size = crate::types::fir_type_byte_size(ty).max(8);
                 let size_val = self.builder.ins().iconst(self.ptr_type, size as i64);
                 let align_val = self.builder.ins().iconst(self.ptr_type, 8);
-                let arena_val = self
-                    .builder
-                    .ins()
-                    .iconst(types::I32, ifa_fir::ARENA_THREAD_LOCAL_CALL as i64);
-
-                if let Some(func_id) = self.func_ids.get("ifa_rt_gen_alloc") {
+                if let Some(func_id) = self.func_ids.get("ifa_rt_call_arena_alloc") {
                     let local_func = self
                         .module
                         .declare_func_in_func(*func_id, self.builder.func);
-                    let call = self
-                        .builder
-                        .ins()
-                        .call(local_func, &[size_val, align_val, arena_val]);
+                    let call = self.builder.ins().call(local_func, &[size_val, align_val]);
                     let results = self.builder.inst_results(call);
                     results.first().copied()
                 } else {
@@ -622,9 +625,29 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 }
             }
 
-            ValueExpr::CallArenaMark => Some(self.builder.ins().iconst(types::I64, 0)),
+            ValueExpr::CallArenaMark => {
+                if let Some(func_id) = self.func_ids.get("ifa_rt_call_arena_mark") {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    let call = self.builder.ins().call(local_func, &[]);
+                    let results = self.builder.inst_results(call);
+                    results.first().copied()
+                } else {
+                    Some(self.builder.ins().iconst(types::I64, 0))
+                }
+            }
 
-            ValueExpr::CallArenaRewind { .. } => Some(self.builder.ins().iconst(types::I64, 0)),
+            ValueExpr::CallArenaRewind { mark } => {
+                let m = self.value_map[mark];
+                if let Some(func_id) = self.func_ids.get("ifa_rt_call_arena_rewind") {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    self.builder.ins().call(local_func, &[m]);
+                }
+                Some(self.builder.ins().iconst(types::I64, 0))
+            }
 
             ValueExpr::GenFree { ptr } => {
                 let p = self.value_map[ptr];

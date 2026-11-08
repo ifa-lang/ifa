@@ -320,6 +320,17 @@ fn resolve_access_path(
                 }
                 return path;
             }
+            ValueExpr::CallArenaAlloc { .. } => {
+                let mut path = FirAccessPath {
+                    root: val,
+                    arena_id: Some(crate::closure_opt::ARENA_THREAD_LOCAL_CALL),
+                    segments: Vec::new(),
+                };
+                path.segments.push(FirPathSegment::Arena(
+                    crate::closure_opt::ARENA_THREAD_LOCAL_CALL,
+                ));
+                return path;
+            }
             ValueExpr::GenDeref { ref_val } => {
                 let mut path = resolve_access_path(*ref_val, inst_defs, constants, depth + 1);
                 path.segments.push(FirPathSegment::Deref);

@@ -38,6 +38,22 @@ impl JitEngine {
         builder.symbol("ifa_rt_gen_alloc", ifa_rt_gen_alloc as *const u8);
         builder.symbol("ifa_rt_gen_free", ifa_rt_gen_free as *const u8);
         builder.symbol("ifa_rt_gen_check", ifa_rt_gen_check as *const u8);
+        builder.symbol(
+            "ifa_rt_call_arena_alloc",
+            ifa_rt_call_arena_alloc as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_call_arena_mark",
+            ifa_rt_call_arena_mark as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_call_arena_rewind",
+            ifa_rt_call_arena_rewind as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_call_arena_reset",
+            ifa_rt_call_arena_reset as *const u8,
+        );
         builder.symbol("ifa_rt_fiber_yield", ifa_rt_fiber_yield as *const u8);
         builder.symbol("ifa_rt_channel_create", ifa_rt_channel_create as *const u8);
         builder.symbol(
@@ -128,6 +144,47 @@ impl JitEngine {
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids
             .insert("ifa_rt_gen_check".into(), gen_check_id);
+
+        let mut call_alloc_sig = Signature::new(call_conv);
+        call_alloc_sig.params.push(AbiParam::new(ptr_type));
+        call_alloc_sig.params.push(AbiParam::new(ptr_type));
+        call_alloc_sig.returns.push(AbiParam::new(ptr_type));
+        let call_alloc_id = self
+            .module
+            .declare_function("ifa_rt_call_arena_alloc", Linkage::Import, &call_alloc_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_call_arena_alloc".into(), call_alloc_id);
+
+        let mut call_mark_sig = Signature::new(call_conv);
+        call_mark_sig.returns.push(AbiParam::new(types::I64));
+        let call_mark_id = self
+            .module
+            .declare_function("ifa_rt_call_arena_mark", Linkage::Import, &call_mark_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_call_arena_mark".into(), call_mark_id);
+
+        let mut call_rewind_sig = Signature::new(call_conv);
+        call_rewind_sig.params.push(AbiParam::new(types::I64));
+        let call_rewind_id = self
+            .module
+            .declare_function(
+                "ifa_rt_call_arena_rewind",
+                Linkage::Import,
+                &call_rewind_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_call_arena_rewind".into(), call_rewind_id);
+
+        let call_reset_sig = Signature::new(call_conv);
+        let call_reset_id = self
+            .module
+            .declare_function("ifa_rt_call_arena_reset", Linkage::Import, &call_reset_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_call_arena_reset".into(), call_reset_id);
 
         let yield_sig = Signature::new(call_conv);
         let yield_id = self

@@ -1211,16 +1211,80 @@ fn test_thread_local_call_arena_alloc_and_rewind() {
     let ptr2 = ifa_rt_call_arena_alloc(128, 16);
     assert!(!ptr2.is_null());
     assert_ne!(ptr1, ptr2);
-    ifa_rt_gen_check(ptr2, 1);
+    unsafe {
+        let header2 = (ptr2 as *const GenHeader).sub(1);
+        assert_eq!((*header2).arena_id, ARENA_THREAD_LOCAL_CALL);
+        assert_eq!((*header2).generation_counter, 2);
+    }
+    ifa_rt_gen_check(ptr2, 2);
 
     // Rewind back to ptr1 mark
     ifa_rt_call_arena_rewind(mark_after_ptr1);
 
-    // Allocating again should reuse the memory space rewound
+    // Allocating again should reuse the memory space rewound, but with a bumped generation counter
     let ptr3 = ifa_rt_call_arena_alloc(128, 16);
     assert_eq!(ptr2, ptr3);
+    unsafe {
+        let header3 = (ptr3 as *const GenHeader).sub(1);
+        assert_eq!((*header3).arena_id, ARENA_THREAD_LOCAL_CALL);
+        assert!((*header3).generation_counter > 2);
+        assert_eq!((*header3).generation_counter, 4);
+    }
+    ifa_rt_gen_check(ptr3, 4);
 
     // Reset completely
     ifa_rt_call_arena_reset();
     assert_eq!(ifa_rt_call_arena_mark(), mark_initial);
+}
+
+#[test]
+fn test_call_arena_stale_reference_invalidation() {
+    use ifa_runtime::ffi::{
+        ifa_rt_call_arena_alloc, ifa_rt_call_arena_mark, ifa_rt_call_arena_reset,
+        ifa_rt_call_arena_rewind, ifa_rt_catch_panic, ifa_rt_clear_last_panic, ifa_rt_gen_check,
+        ifa_rt_get_last_panic,
+    };
+    use ifa_runtime::header::{GenHeader, ARENA_THREAD_LOCAL_CALL};
+    use ifa_runtime::IfaPanicKind;
+
+    ifa_rt_call_arena_reset();
+
+    let mark = ifa_rt_call_arena_mark();
+    let ptr1 = ifa_rt_call_arena_alloc(64, 8);
+    let gen1 = unsafe { (*(ptr1 as *const GenHeader).sub(1)).generation_counter };
+    ifa_rt_gen_check(ptr1, gen1);
+
+    // Rewind scope
+    ifa_rt_call_arena_rewind(mark);
+
+    // Re-allocate at the same address for a new invocation
+    let ptr2 = ifa_rt_call_arena_alloc(64, 8);
+    assert_eq!(ptr1, ptr2);
+    let gen2 = unsafe { (*(ptr2 as *const GenHeader).sub(1)).generation_counter };
+    assert!(gen2 > gen1);
+
+    // Verification of new allocation succeeds with its own generation
+    ifa_rt_gen_check(ptr2, gen2);
+
+    // Stale reference with gen1 pointing to the same address is intercepted safely via ifa_rt_catch_panic
+    extern "C-unwind" fn trigger_stale(arg: *mut u8) {
+        let (target_ptr, remembered_gen) = unsafe { *(arg as *const (*const u8, u32)) };
+        ifa_rt_gen_check(target_ptr, remembered_gen);
+    }
+
+    let mut args = (ptr1 as *const u8, gen1);
+    let res = ifa_rt_catch_panic(trigger_stale, &mut args as *mut _ as *mut u8);
+    assert_eq!(res, IfaPanicKind::UseAfterFree as i32);
+
+    let last_panic_ptr = ifa_rt_get_last_panic();
+    assert!(!last_panic_ptr.is_null());
+    unsafe {
+        let rec = &*last_panic_ptr;
+        assert_eq!(rec.kind, IfaPanicKind::UseAfterFree);
+        assert_eq!(rec.fault_address, ptr1 as usize);
+        assert_eq!(rec.expected_gen, gen1);
+        assert_eq!(rec.actual_gen, gen2);
+        assert_eq!(rec.arena_id, ARENA_THREAD_LOCAL_CALL);
+    }
+    ifa_rt_clear_last_panic();
 }

@@ -1411,3 +1411,97 @@ fn test_cranelift_vector_array_execution_and_alignment() {
     // sum_{i=0}^{15} 2*i = 2 * (15 * 16 / 2) = 240
     assert_eq!(result, 240);
 }
+
+#[test]
+fn test_cranelift_call_arena_lowering_and_execution() {
+    use ifa_fir::{
+        BasicBlock, BlockId, FirFunction, FirModule, Instruction, Terminator, ValueExpr, ValueId,
+    };
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let b0 = BlockId(0);
+    let mut bb0 = BasicBlock::new(b0);
+
+    // 1. Mark call arena
+    let mark_val = ValueId(0);
+    bb0.instructions.push(Instruction::new(
+        Some(mark_val),
+        ValueExpr::CallArenaMark,
+        Span::DUMMY,
+    ));
+
+    // 2. Allocate an i64 in call arena
+    let alloc_val = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(alloc_val),
+        ValueExpr::CallArenaAlloc {
+            ty: ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
+        },
+        Span::DUMMY,
+    ));
+
+    // 3. Store 42 into allocated pointer
+    let forty_two = ValueId(2);
+    bb0.instructions.push(Instruction::new(
+        Some(forty_two),
+        ValueExpr::Constant(ifa_fir::ConstantValue::Int(
+            42,
+            ifa_sema::types::IntType::I64,
+        )),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::Store {
+            ptr: alloc_val,
+            val: forty_two,
+        },
+        Span::DUMMY,
+    ));
+
+    // 4. Load from allocated pointer
+    let loaded_val = ValueId(3);
+    bb0.instructions.push(Instruction::new(
+        Some(loaded_val),
+        ValueExpr::Load { ptr: alloc_val },
+        Span::DUMMY,
+    ));
+
+    // 5. Rewind call arena
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::CallArenaRewind { mark: mark_val },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(loaded_val)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("call_arena_jit_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile FIR with call arena to Cranelift JIT");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 42);
+}

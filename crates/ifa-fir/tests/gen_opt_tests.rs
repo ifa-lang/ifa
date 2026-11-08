@@ -1195,3 +1195,126 @@ fn test_disjoint_arena_free_does_not_break_dominance() {
     });
     assert!(check_elim, "GenCheck in b2 must be marked redundant");
 }
+
+#[test]
+fn test_dominance_elimination_with_thread_local_call_arena_isolation() {
+    use ifa_fir::types::FirType;
+    use ifa_fir::{
+        BasicBlock, BlockId, FirFunction, GenerationalOptPass, Instruction, Terminator, ValueExpr,
+        ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("call_arena_isolation");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let b0 = BlockId(0);
+    let b1 = BlockId(1);
+    let b2 = BlockId(2);
+
+    let mut bb0 = BasicBlock::new(b0);
+    // Allocate in thread-local call arena
+    let v_env = ValueId(0);
+    bb0.push_instruction(Instruction::new(
+        Some(v_env),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Int(IntType::I64),
+        },
+        Span::DUMMY,
+    ));
+
+    // Create reference and check
+    let v_ref = ValueId(1);
+    bb0.push_instruction(Instruction::new(
+        Some(v_ref),
+        ValueExpr::GenRef { ptr: v_env },
+        Span::DUMMY,
+    ));
+    bb0.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: v_ref,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    bb0.set_terminator(Terminator::Branch {
+        target: b1,
+        args: Vec::new(),
+    });
+    func.blocks.push(bb0);
+
+    // Block 1: Heap allocation and free on unrelated arena (e.g. Arena 5)
+    let mut bb1 = BasicBlock::new(b1);
+    let v_heap = ValueId(2);
+    bb1.push_instruction(Instruction::new(
+        Some(v_heap),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(5),
+        },
+        Span::DUMMY,
+    ));
+    bb1.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenFree { ptr: v_heap },
+        Span::DUMMY,
+    ));
+    bb1.set_terminator(Terminator::Branch {
+        target: b2,
+        args: Vec::new(),
+    });
+    func.blocks.push(bb1);
+
+    // Block 2: Subsequent GenCheck on v_ref
+    let mut bb2 = BasicBlock::new(b2);
+    bb2.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: v_ref,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    let v_res = ValueId(3);
+    bb2.push_instruction(Instruction::new(
+        Some(v_res),
+        ValueExpr::GenDeref { ref_val: v_ref },
+        Span::DUMMY,
+    ));
+    bb2.set_terminator(Terminator::Return(Some(v_res)));
+    func.blocks.push(bb2);
+
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_function(&mut func);
+
+    // Both checks on v_ref are eliminated:
+    // First check in b0 because it immediately follows definition without free.
+    // Second check in b2 because GenFree was in disjoint Arena 5 vs ARENA_THREAD_LOCAL_CALL!
+    let stats = gce.stats();
+    assert_eq!(
+        stats.eliminated_checks, 2,
+        "Dominance check must eliminate check in b0 and b2 across disjoint arena free"
+    );
+
+    let bb2_final = func.get_block(b2).unwrap();
+    let check_elim = bb2_final.instructions.iter().any(|inst| match &inst.expr {
+        ValueExpr::GenCheck { ref_val, redundant } => *ref_val == v_ref && *redundant,
+        _ => false,
+    });
+    assert!(
+        check_elim,
+        "GenCheck in b2 must be marked redundant due to call arena isolation"
+    );
+}

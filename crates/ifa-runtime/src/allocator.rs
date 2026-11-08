@@ -504,6 +504,8 @@ pub const CALL_ARENA_INITIAL_CAPACITY: usize = 65536;
 pub struct ThreadLocalCallArena {
     buffer: Vec<u8>,
     offset: usize,
+    generation_counter: u32,
+    epoch_flags: u16,
 }
 
 impl Default for ThreadLocalCallArena {
@@ -518,6 +520,8 @@ impl ThreadLocalCallArena {
         Self {
             buffer: vec![0u8; CALL_ARENA_INITIAL_CAPACITY],
             offset: 0,
+            generation_counter: 1,
+            epoch_flags: 0,
         }
     }
 
@@ -538,14 +542,28 @@ impl ThreadLocalCallArena {
             self.buffer.resize(new_cap, 0);
         }
 
+        // Monotonically allocate generation for this call arena slot
+        let current_gen = self.generation_counter;
+        if self.generation_counter == u32::MAX {
+            if (self.epoch_flags & crate::header::FLAG_EPOCH_1) == 0 {
+                self.epoch_flags |= crate::header::FLAG_EPOCH_1;
+                self.generation_counter = 1;
+            } else {
+                // Secondary generation overflow: mark quarantined
+                self.epoch_flags |= crate::header::FLAG_QUARANTINED;
+            }
+        } else {
+            self.generation_counter += 1;
+        }
+
         let base_ptr = self.buffer.as_mut_ptr();
         unsafe {
             let header_ptr = base_ptr.add(actual_header_offset) as *mut GenHeader;
             std::ptr::write(
                 header_ptr,
                 GenHeader {
-                    generation_counter: 1,
-                    allocation_flags: FLAG_ACTIVE | FLAG_ARENA_SCOPED,
+                    generation_counter: current_gen,
+                    allocation_flags: FLAG_ACTIVE | FLAG_ARENA_SCOPED | self.epoch_flags,
                     arena_id: crate::header::ARENA_THREAD_LOCAL_CALL,
                 },
             );
@@ -563,7 +581,10 @@ impl ThreadLocalCallArena {
     /// Rewind the bump offset to a previously marked position, resetting the call arena scope.
     #[inline(always)]
     pub fn rewind(&mut self, mark: usize) {
-        if mark <= self.offset {
+        if mark < self.offset {
+            // Advancing generation on rewind ensures any subsequent allocation at the same offset
+            // receives a strictly higher generation counter, preventing ABA and Use-After-Scope reference collisions.
+            self.generation_counter = self.generation_counter.saturating_add(1);
             self.offset = mark;
         }
     }
@@ -571,6 +592,9 @@ impl ThreadLocalCallArena {
     /// Reset the entire call arena block.
     #[inline(always)]
     pub fn reset(&mut self) {
+        if self.offset > 0 {
+            self.generation_counter = self.generation_counter.saturating_add(1);
+        }
         self.offset = 0;
     }
 
