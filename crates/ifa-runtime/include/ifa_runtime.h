@@ -202,9 +202,19 @@ typedef struct ifa_coroutine ifa_coroutine_t;
 ifa_coroutine_t* ifa_rt_coro_create(size_t frame_size, ifa_coro_resume_fn resume_fn, ifa_coro_destroy_fn destroy_fn);
 
 /**
+ * Allocate and initialize a stackless native coroutine inside a pre-allocated arena.
+ */
+ifa_coroutine_t* ifa_rt_coro_create_with_arena(size_t frame_size, uint16_t arena_id, ifa_coro_resume_fn resume_fn, ifa_coro_destroy_fn destroy_fn);
+
+/**
  * Initialize a stackless coroutine from an externally managed handle or LLVM coroutine frame.
  */
 ifa_coroutine_t* ifa_rt_coro_create_custom(void* handle, ifa_coro_resume_fn resume_fn, ifa_coro_destroy_fn destroy_fn);
+
+/**
+ * Initialize a stackless coroutine from an externally managed handle inside a pre-allocated arena.
+ */
+ifa_coroutine_t* ifa_rt_coro_create_custom_with_arena(void* handle, uint16_t arena_id, ifa_coro_resume_fn resume_fn, ifa_coro_destroy_fn destroy_fn);
 
 /**
  * Resume execution of a stackless coroutine for one cooperative step.
@@ -215,6 +225,11 @@ int32_t ifa_rt_coro_resume(ifa_coroutine_t* coro);
  * Spawn a stackless coroutine into the global M:N scheduler for continuous execution.
  */
 uint64_t ifa_rt_coro_spawn(ifa_coroutine_t* coro);
+
+/**
+ * Spawn a stackless coroutine into the global M:N scheduler with an isolated generational arena.
+ */
+uint64_t ifa_rt_coro_spawn_with_arena(ifa_coroutine_t* coro, uint16_t arena_id);
 
 /**
  * Destroy a stackless coroutine and release its frame.
@@ -235,6 +250,11 @@ int32_t ifa_rt_coro_status(ifa_coroutine_t* coro);
  * Access the state memory frame of a stackless coroutine.
  */
 void* ifa_rt_coro_frame(ifa_coroutine_t* coro);
+
+/**
+ * Query the arena ID associated with a coroutine handle.
+ */
+uint16_t ifa_rt_coro_arena_id(ifa_coroutine_t* coro);
 
 /* --- Concurrency Channels API --- */
 
@@ -292,6 +312,46 @@ int64_t ifa_rt_channel_len(ifa_channel_handle_t* chan);
  * Query the capacity of the channel buffer.
  */
 int64_t ifa_rt_channel_capacity(ifa_channel_handle_t* chan);
+
+/**
+ * Send an immutable slice descriptor over the channel via an allocated message slot.
+ */
+int32_t ifa_rt_channel_send_slice(ifa_channel_handle_t* chan, ifa_slice_t slice);
+
+/**
+ * Receive an immutable slice descriptor from the channel.
+ */
+int32_t ifa_rt_channel_recv_slice(ifa_channel_handle_t* chan, ifa_slice_t* out_slice);
+
+/**
+ * Non-blocking try send for an immutable slice descriptor over the channel.
+ */
+int32_t ifa_rt_channel_try_send_slice(ifa_channel_handle_t* chan, ifa_slice_t slice);
+
+/**
+ * Non-blocking try receive for an immutable slice descriptor from the channel.
+ */
+int32_t ifa_rt_channel_try_recv_slice(ifa_channel_handle_t* chan, ifa_slice_t* out_slice);
+
+/**
+ * Send a mutable slice descriptor over the channel via an allocated message slot.
+ */
+int32_t ifa_rt_channel_send_mut_slice(ifa_channel_handle_t* chan, ifa_mut_slice_t slice);
+
+/**
+ * Receive a mutable slice descriptor from the channel.
+ */
+int32_t ifa_rt_channel_recv_mut_slice(ifa_channel_handle_t* chan, ifa_mut_slice_t* out_slice);
+
+/**
+ * Transfer ownership of a pre-allocated generational arena to a target fiber.
+ */
+int32_t ifa_rt_arena_transfer_owner(uint16_t arena_id, uint64_t new_fiber_id);
+
+/**
+ * Verify that a slice memory buffer belongs to a specified generational arena.
+ */
+int32_t ifa_rt_slice_verify_arena(ifa_slice_t slice, uint16_t arena_id);
 
 #define IFA_SELECT_OP_RECV 0
 #define IFA_SELECT_OP_SEND 1

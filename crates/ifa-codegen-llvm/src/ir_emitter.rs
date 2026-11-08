@@ -312,6 +312,15 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("yield_step:\n  call void @ifa_rt_fiber_yield()\n  br label %step_loop\n");
         out.push_str("extract:\n  %slot = call ptr @llvm.coro.promise(ptr %hdl, i32 8, i1 false)\n  %val = load i64, ptr %slot, align 8\n  call void @llvm.coro.destroy(ptr %hdl)\n  ret i64 %val\n}\n\n");
 
+        out.push_str(
+            "define linkonce_odr { ptr, i64 } @ifa_coro_run_to_completion_slice(ptr %hdl) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  br label %step_loop\n");
+        out.push_str("step_loop:\n  %done = call i1 @llvm.coro.done(ptr %hdl)\n  br i1 %done, label %extract, label %resume_step\n");
+        out.push_str("resume_step:\n  call void @llvm.coro.resume(ptr %hdl)\n  %done_after = call i1 @llvm.coro.done(ptr %hdl)\n  br i1 %done_after, label %extract, label %yield_step\n");
+        out.push_str("yield_step:\n  call void @ifa_rt_fiber_yield()\n  br label %step_loop\n");
+        out.push_str("extract:\n  %slot = call ptr @llvm.coro.promise(ptr %hdl, i32 8, i1 false)\n  %val = load { ptr, i64 }, ptr %slot, align 8\n  call void @llvm.coro.destroy(ptr %hdl)\n  ret { ptr, i64 } %val\n}\n\n");
+
         // IFA Stackless Generator Iterator Helpers
         out.push_str("; IFA Stackless Generator Iterator Helpers\n");
         out.push_str(
@@ -1583,6 +1592,11 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("!62 = distinct !{!62, !2, !7, !4, !5, !12, !13, !24}\n");
         out.push_str("!63 = distinct !{!63, !2, !9, !4, !5, !12, !13, !24}\n");
         out.push_str("!64 = distinct !{!64, !2, !11, !4, !5, !12, !13, !24}\n");
+        // Specialized multidimensional strided projection vectorization hints (unroll-and-jam 4x/8x, parallel accesses, noalias, vector width)
+        out.push_str("!65 = distinct !{!65, !2, !3, !4, !5, !12, !13, !24, !37, !38}\n");
+        out.push_str("!66 = distinct !{!66, !2, !7, !4, !5, !12, !13, !24, !37, !38}\n");
+        out.push_str("!67 = distinct !{!67, !2, !9, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!68 = distinct !{!68, !2, !11, !4, !5, !12, !13, !24, !37, !38}\n");
 
         Ok(out)
     }
@@ -2042,6 +2056,37 @@ impl<'a> LlvmIrEmitter<'a> {
             }
         }
 
+        // Collect constant integers for stride calculations
+        let mut const_ints: HashMap<ifa_fir::ValueId, i64> = HashMap::new();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let (Some(res), ValueExpr::Constant(ConstantValue::Int(v, _))) =
+                    (inst.result, &inst.expr)
+                {
+                    const_ints.insert(res, *v as i64);
+                }
+            }
+        }
+
+        // Map strided slice result -> (stride_value_id, Option<constant_stride>)
+        let mut strided_slice_info: HashMap<ifa_fir::ValueId, (ifa_fir::ValueId, Option<i64>)> =
+            HashMap::new();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let (Some(res), ValueExpr::SliceStrided { base, stride, .. }) =
+                    (inst.result, &inst.expr)
+                {
+                    let direct_const = const_ints.get(stride).copied();
+                    let parent_st = strided_slice_info
+                        .get(base)
+                        .and_then(|(_, c)| *c)
+                        .unwrap_or(1);
+                    let comb_const = direct_const.map(|c| c * parent_st);
+                    strided_slice_info.insert(res, (*stride, comb_const));
+                }
+            }
+        }
+
         // Basic blocks
         let mut coro_yield_idx: usize = 0;
         let mut eff_idx: usize = 0;
@@ -2054,7 +2099,24 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str(&format!("{}:\n", label));
 
             if is_coro && b_idx == 0 {
-                out.push_str("  %coro.yield_slot = alloca i64, align 8\n");
+                let is_slice_coro = matches!(func.ret_ty, ifa_fir::FirType::Slice(_))
+                    || func.blocks.iter().any(|b| {
+                        b.instructions.iter().any(|inst| {
+                            matches!(
+                                inst.expr,
+                                ValueExpr::YieldValue { val }
+                                    if matches!(
+                                        value_types.get(&val),
+                                        Some(ifa_fir::FirType::Slice(_))
+                                    )
+                            )
+                        })
+                    });
+                if is_slice_coro {
+                    out.push_str("  %coro.yield_slot = alloca { ptr, i64 }, align 8\n");
+                } else {
+                    out.push_str("  %coro.yield_slot = alloca i64, align 8\n");
+                }
                 out.push_str(
                     "  %coro.id = call token @llvm.coro.id(i32 8, ptr %coro.yield_slot, ptr null, ptr null)\n",
                 );
@@ -2064,13 +2126,25 @@ impl<'a> LlvmIrEmitter<'a> {
                 } else {
                     out.push_str("  %coro.size = call i64 @llvm.coro.size.i64()\n");
                 }
-                out.push_str(
-                    "  %coro.alloc = call ptr @ifa_rt_gen_alloc(i64 %coro.size, i64 8, i16 0)\n",
-                );
+                if func.is_strict {
+                    out.push_str(
+                        "  %coro.alloc = call ptr @ifa_rt_call_arena_alloc(i64 %coro.size, i64 8)\n",
+                    );
+                } else {
+                    out.push_str(
+                        "  %coro.alloc = call ptr @ifa_rt_gen_alloc(i64 %coro.size, i64 8, i16 0)\n",
+                    );
+                }
                 out.push_str(
                     "  %coro.hdl = call ptr @llvm.coro.begin(token %coro.id, ptr %coro.alloc)\n",
                 );
-                out.push_str("  store i64 0, ptr %coro.yield_slot, align 8\n");
+                if is_slice_coro {
+                    out.push_str(
+                        "  store { ptr, i64 } zeroinitializer, ptr %coro.yield_slot, align 8\n",
+                    );
+                } else {
+                    out.push_str("  store i64 0, ptr %coro.yield_slot, align 8\n");
+                }
             }
 
             // Emit PHI nodes for block arguments
@@ -2116,6 +2190,7 @@ impl<'a> LlvmIrEmitter<'a> {
                         &value_types,
                         &array_allocas,
                         &array_ptrs,
+                        &strided_slice_info,
                         is_coro,
                         &mut coro_yield_idx,
                         out,
@@ -2127,6 +2202,7 @@ impl<'a> LlvmIrEmitter<'a> {
                         &value_types,
                         &array_allocas,
                         &array_ptrs,
+                        &strided_slice_info,
                         is_coro,
                         &mut coro_yield_idx,
                         &mut eff_idx,
@@ -2252,6 +2328,7 @@ impl<'a> LlvmIrEmitter<'a> {
         value_types: &HashMap<ifa_fir::ValueId, ifa_fir::FirType>,
         array_allocas: &HashMap<ifa_fir::ValueId, ifa_fir::ValueId>,
         array_ptrs: &HashMap<ifa_fir::ValueId, String>,
+        strided_slice_info: &HashMap<ifa_fir::ValueId, (ifa_fir::ValueId, Option<i64>)>,
         is_coro: bool,
         coro_yield_idx: &mut usize,
         out: &mut String,
@@ -2932,9 +3009,38 @@ impl<'a> LlvmIrEmitter<'a> {
                         .or_else(|| array_allocas.get(base).map(|p| format!("%v{}", p.0)))
                         .unwrap_or_else(|| format!("%v{}", base.0)),
                 };
+                let effective_idx = if let Some(&(st_vid, c_opt)) = strided_slice_info.get(base) {
+                    if let Some(c) = c_opt {
+                        if c == 1 {
+                            format!("%v{}", index.0)
+                        } else if c > 0 && (c as u64).is_power_of_two() {
+                            out.push_str(&format!(
+                                "  %strided_gep_idx_{} = shl i64 %v{}, {}\n",
+                                res_id,
+                                index.0,
+                                (c as u64).trailing_zeros()
+                            ));
+                            format!("%strided_gep_idx_{}", res_id)
+                        } else {
+                            out.push_str(&format!(
+                                "  %strided_gep_idx_{} = mul i64 %v{}, {}\n",
+                                res_id, index.0, c
+                            ));
+                            format!("%strided_gep_idx_{}", res_id)
+                        }
+                    } else {
+                        out.push_str(&format!(
+                            "  %strided_gep_idx_{} = mul i64 %v{}, %v{}\n",
+                            res_id, index.0, st_vid.0
+                        ));
+                        format!("%strided_gep_idx_{}", res_id)
+                    }
+                } else {
+                    format!("%v{}", index.0)
+                };
                 out.push_str(&format!(
-                    "  %v{} = getelementptr inbounds {}, ptr {}, i64 %v{}\n",
-                    res_id, elem_ty_str, ptr_operand, index.0
+                    "  %v{} = getelementptr inbounds {}, ptr {}, i64 {}\n",
+                    res_id, elem_ty_str, ptr_operand, effective_idx
                 ));
             }
             ValueExpr::GenRef { ptr } | ValueExpr::GenDeref { ref_val: ptr } => {
@@ -3001,9 +3107,38 @@ impl<'a> LlvmIrEmitter<'a> {
                         .or_else(|| array_allocas.get(base).map(|p| format!("%v{}", p.0)))
                         .unwrap_or_else(|| format!("%v{}", base.0)),
                 };
+                let effective_idx = if let Some(&(st_vid, c_opt)) = strided_slice_info.get(base) {
+                    if let Some(c) = c_opt {
+                        if c == 1 {
+                            format!("%v{}", index.0)
+                        } else if c > 0 && (c as u64).is_power_of_two() {
+                            out.push_str(&format!(
+                                "  %strided_idx_{} = shl i64 %v{}, {}\n",
+                                res_id,
+                                index.0,
+                                (c as u64).trailing_zeros()
+                            ));
+                            format!("%strided_idx_{}", res_id)
+                        } else {
+                            out.push_str(&format!(
+                                "  %strided_idx_{} = mul i64 %v{}, {}\n",
+                                res_id, index.0, c
+                            ));
+                            format!("%strided_idx_{}", res_id)
+                        }
+                    } else {
+                        out.push_str(&format!(
+                            "  %strided_idx_{} = mul i64 %v{}, %v{}\n",
+                            res_id, index.0, st_vid.0
+                        ));
+                        format!("%strided_idx_{}", res_id)
+                    }
+                } else {
+                    format!("%v{}", index.0)
+                };
                 out.push_str(&format!(
-                    "  %gep_{} = getelementptr inbounds {}, ptr {}, i64 %v{}\n",
-                    res_id, elem_ty_str, ptr_operand, index.0
+                    "  %gep_{} = getelementptr inbounds {}, ptr {}, i64 {}\n",
+                    res_id, elem_ty_str, ptr_operand, effective_idx
                 ));
                 out.push_str(&format!(
                     "  %v{} = load {}, ptr %gep_{}, align {}\n",
@@ -4002,6 +4137,11 @@ impl<'a> LlvmIrEmitter<'a> {
                             "  store {} %v{}, ptr %coro.yield_slot, align 8\n",
                             val_llvm_ty, val.0
                         ));
+                    } else if val_llvm_ty == "{ ptr, i64 }" {
+                        out.push_str(&format!(
+                            "  store {{ ptr, i64 }} %v{}, ptr %coro.yield_slot, align 8\n",
+                            val.0
+                        ));
                     } else {
                         out.push_str(&format!(
                             "  %coro_val_cast_{} = sext {} %v{} to i64\n",
@@ -4043,6 +4183,7 @@ impl<'a> LlvmIrEmitter<'a> {
         value_types: &HashMap<ifa_fir::ValueId, ifa_fir::FirType>,
         array_allocas: &HashMap<ifa_fir::ValueId, ifa_fir::ValueId>,
         array_ptrs: &HashMap<ifa_fir::ValueId, String>,
+        strided_slice_info: &HashMap<ifa_fir::ValueId, (ifa_fir::ValueId, Option<i64>)>,
         is_coro: bool,
         coro_yield_idx: &mut usize,
         eff_idx: &mut usize,
@@ -4504,6 +4645,11 @@ impl<'a> LlvmIrEmitter<'a> {
                             "  store {} %v{}, ptr %coro.yield_slot, align 8\n",
                             val_llvm_ty, val.0
                         ));
+                    } else if val_llvm_ty == "{ ptr, i64 }" {
+                        out.push_str(&format!(
+                            "  store {{ ptr, i64 }} %v{}, ptr %coro.yield_slot, align 8\n",
+                            val.0
+                        ));
                     } else {
                         out.push_str(&format!(
                             "  %coro_val_cast_{} = sext {} %v{} to i64\n",
@@ -4681,9 +4827,38 @@ impl<'a> LlvmIrEmitter<'a> {
                         .or_else(|| array_allocas.get(base).map(|p| format!("%v{}", p.0)))
                         .unwrap_or_else(|| format!("%v{}", base.0)),
                 };
+                let effective_idx = if let Some(&(st_vid, c_opt)) = strided_slice_info.get(base) {
+                    if let Some(c) = c_opt {
+                        if c == 1 {
+                            format!("%v{}", index.0)
+                        } else if c > 0 && (c as u64).is_power_of_two() {
+                            out.push_str(&format!(
+                                "  %strided_set_idx_{} = shl i64 %v{}, {}\n",
+                                val.0,
+                                index.0,
+                                (c as u64).trailing_zeros()
+                            ));
+                            format!("%strided_set_idx_{}", val.0)
+                        } else {
+                            out.push_str(&format!(
+                                "  %strided_set_idx_{} = mul i64 %v{}, {}\n",
+                                val.0, index.0, c
+                            ));
+                            format!("%strided_set_idx_{}", val.0)
+                        }
+                    } else {
+                        out.push_str(&format!(
+                            "  %strided_set_idx_{} = mul i64 %v{}, %v{}\n",
+                            val.0, index.0, st_vid.0
+                        ));
+                        format!("%strided_set_idx_{}", val.0)
+                    }
+                } else {
+                    format!("%v{}", index.0)
+                };
                 out.push_str(&format!(
-                    "  %gep_set_{} = getelementptr inbounds {}, ptr {}, i64 %v{}\n",
-                    val.0, elem_ty_str, ptr_operand, index.0
+                    "  %gep_set_{} = getelementptr inbounds {}, ptr {}, i64 {}\n",
+                    val.0, elem_ty_str, ptr_operand, effective_idx
                 ));
                 out.push_str(&format!(
                     "  store {} %v{}, ptr %gep_set_{}, align {}\n",
@@ -4994,7 +5169,14 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             Terminator::Branch { target, .. } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = if hint.is_strided_conv3d {
+                    let meta_id = if hint.is_strided_multidim {
+                        match hint.vector_width {
+                            2 => 68,
+                            4 => 66,
+                            16 | 32 => 67,
+                            _ => 65,
+                        }
+                    } else if hint.is_strided_conv3d {
                         match hint.vector_width {
                             2 => 56,
                             4 => 54,
@@ -5099,7 +5281,14 @@ impl<'a> LlvmIrEmitter<'a> {
                 ..
             } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = if hint.is_strided_conv3d {
+                    let meta_id = if hint.is_strided_multidim {
+                        match hint.vector_width {
+                            2 => 68,
+                            4 => 66,
+                            16 | 32 => 67,
+                            _ => 65,
+                        }
+                    } else if hint.is_strided_conv3d {
                         match hint.vector_width {
                             2 => 56,
                             4 => 54,

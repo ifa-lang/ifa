@@ -555,6 +555,7 @@ pub struct LoopVectorHint {
     pub is_zero_copy: bool,
     pub is_strided_loop: bool,
     pub loop_stride: Option<i64>,
+    pub is_strided_multidim: bool,
 }
 
 impl LoopVectorHint {
@@ -587,7 +588,14 @@ impl LoopVectorHint {
             is_zero_copy: false,
             is_strided_loop: false,
             loop_stride: None,
+            is_strided_multidim: false,
         }
+    }
+
+    /// Mark the loop as operating over zero-copy multidimensional strided projections.
+    pub fn with_strided_multidim(mut self) -> Self {
+        self.is_strided_multidim = true;
+        self
     }
 
     /// Attach an identified scalar reduction classification to this vectorization hint.

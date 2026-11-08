@@ -82,6 +82,8 @@ pub struct VectorizeStats {
     pub zero_copy_convolutions_specialized: usize,
     /// Number of general strided loops successfully vectorized with SIMD directives.
     pub strided_loops_vectorized: usize,
+    /// Number of loops operating over multidimensional strided slice projections vectorized.
+    pub multidim_strided_projections_vectorized: usize,
     /// Number of strided slice bounds checks statically eliminated.
     pub strided_bounds_eliminated: usize,
 }
@@ -688,15 +690,48 @@ impl VectorizePass {
                     }
                 }
 
-                // General 1D strided loops (e.g. decimation, slice stepping, linear strided accesses)
-                let is_strided_loop = has_strided_access || is_strided_conv2d || is_strided_conv3d;
+                // General 1D and multidimensional strided loops (e.g. decimation, slice stepping, linear strided accesses, multidim projections)
+                let is_strided_multidim =
+                    (has_multidim || is_matrix_kernel || is_tiled) && has_strided_access;
+                let is_strided_loop = has_strided_access
+                    || is_strided_conv2d
+                    || is_strided_conv3d
+                    || is_strided_multidim;
                 let loop_stride = conv_strides.map(|s| s.0 as i64).or(if has_strided_access {
                     Some(2)
                 } else {
                     None
                 });
 
-                if is_strided_loop && !is_strided_conv2d && !is_strided_conv3d {
+                if is_strided_multidim {
+                    self.stats.multidim_strided_projections_vectorized += 1;
+                    self.stats.multidim_projections_vectorized += 1;
+                    self.stats.strided_loops_vectorized += 1;
+                    disjoint_slices = true;
+                    unroll_and_jam = true;
+                    let mut strided_eliminated = 0;
+                    for &b_id in &loop_info.blocks {
+                        if let Some(block) = func.get_block_mut(b_id) {
+                            for inst in &mut block.instructions {
+                                match &mut inst.expr {
+                                    ValueExpr::BoundsCheck { redundant, .. }
+                                    | ValueExpr::SliceBoundsCheck { redundant, .. }
+                                    | ValueExpr::SliceStridedBoundsCheck { redundant, .. }
+                                        if !*redundant =>
+                                    {
+                                        *redundant = true;
+                                        strided_eliminated += 1;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    if strided_eliminated > 0 {
+                        self.stats.strided_bounds_eliminated += strided_eliminated;
+                        had_eliminated_bounds = true;
+                    }
+                } else if is_strided_loop && !is_strided_conv2d && !is_strided_conv3d {
                     self.stats.strided_loops_vectorized += 1;
                     let mut strided_eliminated = 0;
                     for &b_id in &loop_info.blocks {
@@ -719,7 +754,7 @@ impl VectorizePass {
                     }
                 }
 
-                let effective_interleave = if is_strided_conv3d {
+                let effective_interleave = if is_strided_conv3d || is_strided_multidim {
                     8
                 } else if is_strided_conv2d || (is_strided_loop && !is_tripartite && !is_bipartite)
                 {
@@ -785,6 +820,7 @@ impl VectorizePass {
                     is_zero_copy,
                     is_strided_loop,
                     loop_stride,
+                    is_strided_multidim,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)

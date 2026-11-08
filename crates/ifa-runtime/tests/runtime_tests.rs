@@ -1753,3 +1753,93 @@ fn test_concurrent_multithreaded_slab_allocation_quarantine_cycles() {
         threads_quarantined
     );
 }
+
+#[test]
+fn test_coroutine_with_arena_and_channel_slice_exchange() {
+    use ifa_runtime::ffi::{
+        ifa_rt_arena_transfer_owner, ifa_rt_channel_create, ifa_rt_channel_destroy,
+        ifa_rt_channel_recv_slice, ifa_rt_channel_send_slice, ifa_rt_channel_try_recv_slice,
+        ifa_rt_channel_try_send_slice, ifa_rt_coro_arena_id, ifa_rt_coro_create_with_arena,
+        ifa_rt_coro_destroy, ifa_rt_coro_frame, ifa_rt_coro_spawn_with_arena, ifa_rt_slice_alloc,
+        ifa_rt_slice_free, ifa_rt_slice_verify_arena, IfaSlice,
+    };
+    use ifa_runtime::header::GenHeader;
+
+    extern "C" fn dummy_coro_step(_frame: *mut u8) -> i32 {
+        1 // Completed
+    }
+
+    let target_arena: u16 = 42;
+    let coro = ifa_rt_coro_create_with_arena(64, target_arena, dummy_coro_step, None);
+    assert!(!coro.is_null());
+    assert_eq!(ifa_rt_coro_arena_id(coro), target_arena);
+
+    let frame = ifa_rt_coro_frame(coro);
+    assert!(!frame.is_null());
+    unsafe {
+        let header = &*(frame.sub(std::mem::size_of::<GenHeader>()) as *const GenHeader);
+        assert_eq!(
+            header.arena_id, target_arena,
+            "Frame allocation must reside in configured arena"
+        );
+    }
+
+    let fid = ifa_rt_coro_spawn_with_arena(coro, target_arena);
+    assert!(fid > 0, "Spawn with arena must return positive fiber ID");
+
+    // Test channel slice exchange with arena verification
+    let chan = ifa_rt_channel_create(4);
+    assert!(!chan.is_null());
+
+    let mut_slice = ifa_rt_slice_alloc(128, target_arena);
+    assert!(!mut_slice.ptr.is_null());
+    let immut_slice = IfaSlice {
+        ptr: mut_slice.ptr,
+        len: 128,
+    };
+
+    assert_eq!(
+        ifa_rt_slice_verify_arena(immut_slice, target_arena),
+        1,
+        "Slice must be verified in arena 42"
+    );
+    assert_eq!(
+        ifa_rt_slice_verify_arena(immut_slice, 999),
+        0,
+        "Slice must NOT match disjoint arena 999"
+    );
+
+    // Send and receive slice over channel
+    let send_res = ifa_rt_channel_send_slice(chan, immut_slice);
+    assert_eq!(send_res, 0, "Channel send slice must succeed");
+
+    let mut recv_slice = IfaSlice {
+        ptr: std::ptr::null(),
+        len: 0,
+    };
+    let recv_res = ifa_rt_channel_recv_slice(chan, &mut recv_slice);
+    assert_eq!(recv_res, 0, "Channel recv slice must succeed");
+    assert_eq!(recv_slice.ptr, immut_slice.ptr);
+    assert_eq!(recv_slice.len, 128);
+
+    // Non-blocking try send / try recv
+    let try_send_res = ifa_rt_channel_try_send_slice(chan, immut_slice);
+    assert_eq!(try_send_res, 0, "Channel try send slice must succeed");
+
+    let mut try_recv_slice = IfaSlice {
+        ptr: std::ptr::null(),
+        len: 0,
+    };
+    let try_recv_res = ifa_rt_channel_try_recv_slice(chan, &mut try_recv_slice);
+    assert_eq!(try_recv_res, 0, "Channel try recv slice must succeed");
+    assert_eq!(try_recv_slice.ptr, immut_slice.ptr);
+    assert_eq!(try_recv_slice.len, 128);
+
+    // Arena owner transfer
+    let xfer_res = ifa_rt_arena_transfer_owner(target_arena, 8888);
+    assert_eq!(xfer_res, 1, "Arena owner transfer must succeed");
+
+    ifa_rt_slice_free(mut_slice);
+    ifa_rt_channel_destroy(chan);
+    ifa_rt_coro_destroy(coro);
+}

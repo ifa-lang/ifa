@@ -434,6 +434,7 @@ pub struct IfaCoroutine {
     pub owns_frame: bool,
     pub pending_io_token: Option<u64>,
     pub pending_result_slot: Option<*mut i64>,
+    pub arena_id: u16,
 }
 
 unsafe impl Send for IfaCoroutine {}
@@ -460,6 +461,34 @@ pub extern "C" fn ifa_rt_coro_create(
         owns_frame: true,
         pending_io_token: None,
         pending_result_slot: None,
+        arena_id: 0,
+    });
+    Box::into_raw(coro)
+}
+
+/// Create a stackless native coroutine with an allocated memory frame inside a specified arena.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_create_with_arena(
+    frame_size: usize,
+    arena_id: u16,
+    resume_fn: extern "C" fn(*mut u8) -> i32,
+    destroy_fn: Option<extern "C" fn(*mut u8)>,
+) -> *mut IfaCoroutine {
+    let actual_size = frame_size.max(16);
+    let frame = GLOBAL_ALLOCATOR.alloc(actual_size, 8, arena_id);
+    unsafe {
+        std::ptr::write_bytes(frame, 0, actual_size);
+    }
+    let coro = Box::new(IfaCoroutine {
+        frame,
+        resume_fn,
+        destroy_fn,
+        status: CoroStatus::Suspended,
+        fiber_id: None,
+        owns_frame: true,
+        pending_io_token: None,
+        pending_result_slot: None,
+        arena_id,
     });
     Box::into_raw(coro)
 }
@@ -480,6 +509,29 @@ pub extern "C" fn ifa_rt_coro_create_custom(
         owns_frame: false,
         pending_io_token: None,
         pending_result_slot: None,
+        arena_id: 0,
+    });
+    Box::into_raw(coro)
+}
+
+/// Create a stackless native coroutine from an externally allocated handle inside a specified arena.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_create_custom_with_arena(
+    handle: *mut u8,
+    arena_id: u16,
+    resume_fn: extern "C" fn(*mut u8) -> i32,
+    destroy_fn: Option<extern "C" fn(*mut u8)>,
+) -> *mut IfaCoroutine {
+    let coro = Box::new(IfaCoroutine {
+        frame: handle,
+        resume_fn,
+        destroy_fn,
+        status: CoroStatus::Suspended,
+        fiber_id: None,
+        owns_frame: false,
+        pending_io_token: None,
+        pending_result_slot: None,
+        arena_id,
     });
     Box::into_raw(coro)
 }
@@ -541,6 +593,48 @@ pub extern "C" fn ifa_rt_coro_spawn(coro: *mut IfaCoroutine) -> u64 {
     });
     c.fiber_id = Some(fid);
     fid
+}
+
+/// Spawn a stackless coroutine into the global M:N scheduler with an isolated generational arena.
+/// Returns the assigned FiberId.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_spawn_with_arena(coro: *mut IfaCoroutine, arena_id: u16) -> u64 {
+    if coro.is_null() {
+        return 0;
+    }
+    let c = unsafe { &mut *coro };
+    c.arena_id = arena_id;
+    let coro_ptr = coro as usize;
+    let fid = GLOBAL_SCHEDULER.spawn_resumable(move || {
+        let raw_coro = coro_ptr as *mut IfaCoroutine;
+        let res = ifa_rt_coro_resume(raw_coro);
+        if res == CoroStatus::Completed as i32 {
+            CoroStatus::Completed
+        } else if res == CoroStatus::WaitingIo as i32 {
+            let rc = unsafe { &mut *raw_coro };
+            let token = rc.pending_io_token.take().unwrap_or(0);
+            let slot = rc.pending_result_slot.take();
+            crate::fiber::set_current_fiber_io_token(token);
+            crate::fiber::set_current_fiber_result_slot(slot);
+            CoroStatus::WaitingIo
+        } else if res == CoroStatus::Suspended as i32 {
+            CoroStatus::Suspended
+        } else {
+            CoroStatus::Panicked
+        }
+    });
+    c.fiber_id = Some(fid);
+    GLOBAL_ALLOCATOR.set_arena_owner(arena_id, fid);
+    fid
+}
+
+/// Query the generational arena ID associated with a coroutine handle.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_arena_id(coro: *mut IfaCoroutine) -> u16 {
+    if coro.is_null() {
+        return 0;
+    }
+    unsafe { (*coro).arena_id }
 }
 
 /// Destroy a stackless coroutine and free its state frame.
@@ -1461,6 +1555,157 @@ pub extern "C" fn ifa_rt_channel_capacity(chan: *mut IfaChannelHandle) -> i64 {
     }
     let handle = unsafe { &*chan };
     handle.0.capacity() as i64
+}
+
+/// Send an immutable slice descriptor over the channel via an allocated message slot.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_send_slice(chan: *mut IfaChannelHandle, slice: IfaSlice) -> i32 {
+    if chan.is_null() {
+        return -1;
+    }
+    let slot = GLOBAL_ALLOCATOR.alloc(std::mem::size_of::<IfaSlice>(), 8, 0) as *mut IfaSlice;
+    unsafe {
+        *slot = slice;
+    }
+    let res = ifa_rt_channel_send(chan, slot as *mut u8);
+    if res != 0 {
+        GLOBAL_ALLOCATOR.free(slot as *mut u8);
+    }
+    res
+}
+
+/// Receive an immutable slice descriptor from the channel.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_recv_slice(
+    chan: *mut IfaChannelHandle,
+    out_slice: *mut IfaSlice,
+) -> i32 {
+    if chan.is_null() || out_slice.is_null() {
+        return -1;
+    }
+    let mut msg_ptr = std::ptr::null_mut();
+    let res = ifa_rt_channel_recv(chan, &mut msg_ptr);
+    if res == 0 && !msg_ptr.is_null() {
+        unsafe {
+            *out_slice = *(msg_ptr as *const IfaSlice);
+        }
+        GLOBAL_ALLOCATOR.free(msg_ptr);
+    }
+    res
+}
+
+/// Non-blocking try send for an immutable slice descriptor over the channel.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_try_send_slice(
+    chan: *mut IfaChannelHandle,
+    slice: IfaSlice,
+) -> i32 {
+    if chan.is_null() {
+        return -1;
+    }
+    let slot = GLOBAL_ALLOCATOR.alloc(std::mem::size_of::<IfaSlice>(), 8, 0) as *mut IfaSlice;
+    unsafe {
+        *slot = slice;
+    }
+    let res = ifa_rt_channel_try_send(chan, slot as *mut u8);
+    if res != 0 {
+        GLOBAL_ALLOCATOR.free(slot as *mut u8);
+    }
+    res
+}
+
+/// Non-blocking try receive for an immutable slice descriptor from the channel.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_try_recv_slice(
+    chan: *mut IfaChannelHandle,
+    out_slice: *mut IfaSlice,
+) -> i32 {
+    if chan.is_null() || out_slice.is_null() {
+        return -1;
+    }
+    let mut msg_ptr = std::ptr::null_mut();
+    let res = ifa_rt_channel_try_recv(chan, &mut msg_ptr);
+    if res == 0 && !msg_ptr.is_null() {
+        unsafe {
+            *out_slice = *(msg_ptr as *const IfaSlice);
+        }
+        GLOBAL_ALLOCATOR.free(msg_ptr);
+    }
+    res
+}
+
+/// Send a mutable slice descriptor over the channel via an allocated message slot.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_send_mut_slice(
+    chan: *mut IfaChannelHandle,
+    slice: IfaMutSlice,
+) -> i32 {
+    if chan.is_null() {
+        return -1;
+    }
+    let slot = GLOBAL_ALLOCATOR.alloc(std::mem::size_of::<IfaMutSlice>(), 8, 0) as *mut IfaMutSlice;
+    unsafe {
+        *slot = slice;
+    }
+    let res = ifa_rt_channel_send(chan, slot as *mut u8);
+    if res != 0 {
+        GLOBAL_ALLOCATOR.free(slot as *mut u8);
+    }
+    res
+}
+
+/// Receive a mutable slice descriptor from the channel.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_recv_mut_slice(
+    chan: *mut IfaChannelHandle,
+    out_slice: *mut IfaMutSlice,
+) -> i32 {
+    if chan.is_null() || out_slice.is_null() {
+        return -1;
+    }
+    let mut msg_ptr = std::ptr::null_mut();
+    let res = ifa_rt_channel_recv(chan, &mut msg_ptr);
+    if res == 0 && !msg_ptr.is_null() {
+        unsafe {
+            *out_slice = *(msg_ptr as *const IfaMutSlice);
+        }
+        GLOBAL_ALLOCATOR.free(msg_ptr);
+    }
+    res
+}
+
+/// Transfer ownership of a pre-allocated generational arena to a target fiber.
+#[no_mangle]
+pub extern "C" fn ifa_rt_arena_transfer_owner(arena_id: u16, new_fiber_id: u64) -> i32 {
+    if arena_id == 0 {
+        return 0;
+    }
+    GLOBAL_ALLOCATOR.set_arena_owner(arena_id, new_fiber_id);
+    1
+}
+
+/// Verify that a slice memory buffer belongs to a specified generational arena.
+/// Returns 1 if slice memory is validated inside arena (or global arena), 0 on mismatch.
+#[no_mangle]
+pub extern "C" fn ifa_rt_slice_verify_arena(slice: IfaSlice, arena_id: u16) -> i32 {
+    if slice.ptr.is_null() || slice.len == 0 {
+        return 1;
+    }
+    if arena_id == 0 {
+        return 1;
+    }
+    unsafe {
+        let header = &*(slice
+            .ptr
+            .sub(std::mem::size_of::<crate::header::GenHeader>())
+            as *const crate::header::GenHeader);
+        if header.arena_id == arena_id || header.arena_id == crate::header::ARENA_THREAD_LOCAL_CALL
+        {
+            1
+        } else {
+            0
+        }
+    }
 }
 
 /// Monotonic time base reference for zero-allocation nanosecond clocks.

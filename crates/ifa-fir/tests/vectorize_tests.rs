@@ -1,6 +1,6 @@
 use ifa_fir::{
-    compile_to_fir, format_function, ConstantValue, FirFunction, FirParam, FirType, Instruction,
-    ParamMode, Terminator, ValueExpr, ValueId, VectorizePass,
+    compile_to_fir, format_function, BasicBlock, BinaryOp, BlockId, ConstantValue, FirFunction,
+    FirParam, FirType, Instruction, ParamMode, Terminator, ValueExpr, ValueId, VectorizePass,
 };
 use ifa_lexer::tokenize;
 use ifa_parser::parse;
@@ -1758,4 +1758,192 @@ fn test_strided_loop_vectorization_directive_and_bounds_elimination() {
     let hint = latch_b.vector_hint.expect("Latch must have vector hint");
     assert!(hint.is_strided_loop, "Vector hint must mark strided loop");
     assert_eq!(hint.loop_stride, Some(2), "Stride must be detected as 2");
+}
+
+#[test]
+fn test_vectorize_multidim_strided_projections_vectorized_and_bce() {
+    let mut func = FirFunction::new(
+        INTERNER.intern("test_multidim_strided_proj"),
+        vec![FirParam::new(
+            INTERNER.intern("matrix"),
+            ValueId(0),
+            FirType::Slice(Box::new(FirType::Slice(Box::new(FirType::Float(
+                ifa_sema::types::FloatType::F32,
+            ))))),
+            ParamMode::InOut,
+        )],
+        FirType::Unit,
+        true,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let b0 = BlockId(0);
+    let b1 = BlockId(1);
+    let b2 = BlockId(2);
+    let b3 = BlockId(3);
+
+    let mut bb0 = BasicBlock::new(b0);
+    let mut bb1 = BasicBlock::new(b1);
+    let mut bb2 = BasicBlock::new(b2);
+    let mut bb3 = BasicBlock::new(b3);
+
+    // Block 0: Entry -> Project row 0 of 2D matrix, then extract strided slice [0..100:2]
+    let v_row_idx = ValueId(1);
+    bb0.push_instruction(Instruction::new(
+        Some(v_row_idx),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let v_row_slice = ValueId(2);
+    bb0.push_instruction(Instruction::new(
+        Some(v_row_slice),
+        ValueExpr::GetElement {
+            base: ValueId(0),
+            index: v_row_idx,
+        },
+        Span::DUMMY,
+    ));
+
+    let v_start = ValueId(3);
+    bb0.push_instruction(Instruction::new(
+        Some(v_start),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let v_end = ValueId(4);
+    bb0.push_instruction(Instruction::new(
+        Some(v_end),
+        ValueExpr::Constant(ConstantValue::Int(100, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let v_stride = ValueId(5);
+    bb0.push_instruction(Instruction::new(
+        Some(v_stride),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let v_strided_proj = ValueId(6);
+    bb0.push_instruction(Instruction::new(
+        Some(v_strided_proj),
+        ValueExpr::SliceStrided {
+            base: v_row_slice,
+            start: v_start,
+            end: v_end,
+            stride: v_stride,
+        },
+        Span::DUMMY,
+    ));
+    let v_init_i = ValueId(7);
+    bb0.push_instruction(Instruction::new(
+        Some(v_init_i),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.set_terminator(Terminator::Branch {
+        target: b1,
+        args: vec![v_init_i],
+    });
+
+    // Block 1: Header (Loop over strided projection)
+    let v_i = ValueId(8);
+    bb1.params.push((v_i, FirType::Int(IntType::I64)));
+    let v_cond = ValueId(9);
+    bb1.push_instruction(Instruction::new(
+        Some(v_cond),
+        ValueExpr::Binary {
+            op: BinaryOp::Lt,
+            lhs: v_i,
+            rhs: v_end,
+        },
+        Span::DUMMY,
+    ));
+    bb1.set_terminator(Terminator::BranchCond {
+        cond: v_cond,
+        then_block: b2,
+        then_args: Vec::new(),
+        else_block: b3,
+        else_args: Vec::new(),
+    });
+
+    // Block 2: Body with SliceStridedBoundsCheck and GetElement
+    bb2.push_instruction(Instruction::new(
+        None,
+        ValueExpr::SliceStridedBoundsCheck {
+            base: v_strided_proj,
+            start: v_start,
+            end: v_end,
+            stride: v_stride,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    let v_elem = ValueId(10);
+    bb2.push_instruction(Instruction::new(
+        Some(v_elem),
+        ValueExpr::GetElement {
+            base: v_strided_proj,
+            index: v_i,
+        },
+        Span::DUMMY,
+    ));
+    let v_c1 = ValueId(11);
+    bb2.push_instruction(Instruction::new(
+        Some(v_c1),
+        ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let v_next_i = ValueId(12);
+    bb2.push_instruction(Instruction::new(
+        Some(v_next_i),
+        ValueExpr::Binary {
+            op: BinaryOp::Add,
+            lhs: v_i,
+            rhs: v_c1,
+        },
+        Span::DUMMY,
+    ));
+    bb2.set_terminator(Terminator::Branch {
+        target: b1,
+        args: vec![v_next_i],
+    });
+
+    // Block 3: Exit
+    bb3.set_terminator(Terminator::Return(None));
+
+    func.blocks.push(bb0);
+    func.blocks.push(bb1);
+    func.blocks.push(bb2);
+    func.blocks.push(bb3);
+
+    let mut pass = VectorizePass::new();
+    pass.run_on_function(&mut func);
+    let stats = pass.stats();
+
+    assert!(
+        stats.multidim_strided_projections_vectorized >= 1,
+        "Multidimensional strided projection must be vectorized: {:?}",
+        stats
+    );
+    assert!(
+        stats.multidim_projections_vectorized >= 1,
+        "Multidimensional projection count must increase: {:?}",
+        stats
+    );
+    assert!(
+        stats.strided_bounds_eliminated >= 1,
+        "Strided bounds check must be eliminated: {:?}",
+        stats
+    );
+
+    let latch_b = func.get_block(b2).unwrap();
+    let hint = latch_b.vector_hint.expect("Latch must have vector hint");
+    assert!(
+        hint.is_strided_multidim,
+        "Hint must mark is_strided_multidim"
+    );
+    assert!(hint.unroll_and_jam, "Hint must enable unroll_and_jam");
+    assert!(hint.disjoint_slices, "Hint must mark disjoint_slices");
 }

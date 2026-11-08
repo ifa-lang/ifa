@@ -5496,3 +5496,261 @@ fn test_llvm_aot_strict_closure_capturing_local_arena_execution() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_multidim_strided_projection_simd_metadata_and_compilation() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirParam, FirType, Instruction,
+        LoopVectorHint, ParamMode, Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let fn_name = INTERNER.intern("test_llvm_multidim_strided");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![FirParam::new(
+            INTERNER.intern("matrix"),
+            ValueId(0),
+            FirType::Slice(Box::new(FirType::Slice(Box::new(FirType::Int(
+                IntType::I64,
+            ))))),
+            ParamMode::InOut,
+        )],
+        FirType::Unit,
+        true,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let b0 = BlockId(0);
+    let b1 = BlockId(1);
+    let mut bb0 = BasicBlock::new(b0);
+    let mut bb1 = BasicBlock::new(b1);
+
+    // Block 0: Extract row 0, then create strided subslice with stride 2
+    let v_row_idx = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(v_row_idx),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let v_row_slice = ValueId(2);
+    bb0.instructions.push(Instruction::new(
+        Some(v_row_slice),
+        ValueExpr::GetElement {
+            base: ValueId(0),
+            index: v_row_idx,
+        },
+        Span::DUMMY,
+    ));
+    let v_start = ValueId(3);
+    bb0.instructions.push(Instruction::new(
+        Some(v_start),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let v_end = ValueId(4);
+    bb0.instructions.push(Instruction::new(
+        Some(v_end),
+        ValueExpr::Constant(ConstantValue::Int(100, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let v_stride = ValueId(5);
+    bb0.instructions.push(Instruction::new(
+        Some(v_stride),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let v_strided_slice = ValueId(6);
+    bb0.instructions.push(Instruction::new(
+        Some(v_strided_slice),
+        ValueExpr::SliceStrided {
+            base: v_row_slice,
+            start: v_start,
+            end: v_end,
+            stride: v_stride,
+        },
+        Span::DUMMY,
+    ));
+    bb0.terminator = Some(Terminator::Branch {
+        target: b1,
+        args: vec![],
+    });
+
+    // Block 1: GetElement on strided slice (index scaled by 2)
+    let v_idx = ValueId(7);
+    bb1.instructions.push(Instruction::new(
+        Some(v_idx),
+        ValueExpr::Constant(ConstantValue::Int(5, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let v_elem = ValueId(8);
+    bb1.instructions.push(Instruction::new(
+        Some(v_elem),
+        ValueExpr::GetElement {
+            base: v_strided_slice,
+            index: v_idx,
+        },
+        Span::DUMMY,
+    ));
+
+    // Multidimensional strided vector hint (4 lanes, unroll-and-jam)
+    let hint = LoopVectorHint::new(4, 4, true).with_strided_multidim();
+    bb1.set_vector_hint(hint);
+    bb1.terminator = Some(Terminator::Branch {
+        target: b1,
+        args: vec![],
+    });
+
+    func.blocks.push(bb0);
+    func.blocks.push(bb1);
+
+    let module = FirModule {
+        name: INTERNER.intern("test_llvm_multidim_strided_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    assert!(
+        ir.contains("!llvm.loop !66"),
+        "Must attach metadata !66 for 4-lane multidim strided loop:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("!65 = distinct !{!65, !2, !3, !4, !5, !12, !13, !24, !37, !38}"),
+        "Must declare metadata !65"
+    );
+    assert!(
+        ir.contains("!66 = distinct !{!66, !2, !7, !4, !5, !12, !13, !24, !37, !38}"),
+        "Must declare metadata !66"
+    );
+    assert!(
+        ir.contains("%strided_idx_8 = shl i64 %v7, 1"),
+        "Must scale strided element index with power-of-two shift (stride 2):\n{}",
+        ir
+    );
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("llvm_multidim_strided_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("multidim_strided.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        res.is_ok(),
+        "Compilation to object must succeed: {:?}",
+        res.err()
+    );
+    assert!(obj_path.exists());
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_strict_coroutine_arena_frame_and_slice_exchange() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BasicBlock, BlockId, FirFunction, FirModule, FirParam, FirType, Instruction, ParamMode,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let fn_name = INTERNER.intern("test_strict_coro_slice");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![FirParam::new(
+            INTERNER.intern("input_slice"),
+            ValueId(0),
+            FirType::Slice(Box::new(FirType::Int(IntType::I64))),
+            ParamMode::In,
+        )],
+        FirType::Slice(Box::new(FirType::Int(IntType::I64))),
+        true,
+        false,
+        true, // strict fn
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+    func.blocks.clear();
+
+    let b0 = BlockId(0);
+    let mut bb0 = BasicBlock::new(b0);
+
+    // Yield slice ValueId(0)
+    let v_res = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(v_res),
+        ValueExpr::YieldValue { val: ValueId(0) },
+        Span::DUMMY,
+    ));
+
+    // Return slice ValueId(0)
+    bb0.terminator = Some(Terminator::Return(Some(ValueId(0))));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("test_strict_coro_slice_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    assert!(
+        ir.contains("%coro.yield_slot = alloca { ptr, i64 }, align 8"),
+        "Must allocate composite {{ ptr, i64 }} yield slot for slice coroutine:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("call ptr @ifa_rt_call_arena_alloc(i64 %coro.size, i64 8)"),
+        "Must allocate coroutine frame in strict mode from pre-allocated call arena:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("store { ptr, i64 } %v0, ptr %coro.yield_slot, align 8"),
+        "Must store yielded slice into yield slot:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("define linkonce_odr { ptr, i64 } @ifa_coro_run_to_completion_slice(ptr %hdl)"),
+        "Must emit slice run_to_completion helper:\n{}",
+        ir
+    );
+
+    let temp_dir = std::env::temp_dir().join(format!("llvm_strict_coro_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("strict_coro.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        res.is_ok(),
+        "Compilation to object must succeed: {:?}",
+        res.err()
+    );
+    assert!(obj_path.exists());
+    let _ = fs::remove_dir_all(&temp_dir);
+}
