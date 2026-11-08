@@ -3659,3 +3659,123 @@ fn test_where_clause_on_generic_struct_and_impl() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_nested_struct_exclusivity_disjoint_fields_allowed() {
+    let code = r#"
+        struct Leaf {
+            x: i64,
+            y: i64,
+        }
+
+        struct Branch {
+            left: Leaf,
+            right: Leaf,
+        }
+
+        struct Tree {
+            root: Branch,
+            tag: i64,
+        }
+
+        fn mutate_two(inout a: i64, inout b: i64) {
+            a = a + 1;
+            b = b + 2;
+        }
+
+        pub fn main() {
+            mut t = Tree(
+                root: Branch(
+                    left: Leaf(x: 10, y: 20),
+                    right: Leaf(x: 30, y: 40),
+                ),
+                tag: 1,
+            );
+
+            // 1. Disjoint across different sub-branches
+            mutate_two(inout t.root.left.x, inout t.root.right.x);
+
+            // 2. Disjoint within the same sub-branch
+            mutate_two(inout t.root.left.x, inout t.root.left.y);
+
+            // 3. Disjoint across different depths
+            mutate_two(inout t.root.left.x, inout t.tag);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Disjoint nested struct fields must be allowed simultaneously in inout: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_nested_struct_exclusivity_overlapping_paths_rejected() {
+    let code = r#"
+        struct Leaf {
+            x: i64,
+            y: i64,
+        }
+
+        struct Branch {
+            left: Leaf,
+            right: Leaf,
+        }
+
+        struct Tree {
+            root: Branch,
+        }
+
+        fn mutate_same_leaf_field(inout a: Leaf, inout b: Leaf) {
+            a.x = a.x + 1;
+            b.x = b.x + 1;
+        }
+
+        fn mutate_whole_branch_and_child(inout branch: Branch, inout leaf: Leaf) {
+            branch = Branch(
+                left: Leaf(x: 0, y: 0),
+                right: Leaf(x: 0, y: 0),
+            );
+            leaf.x = 2;
+        }
+
+        pub fn test_same_leaf() {
+            mut t = Tree(
+                root: Branch(
+                    left: Leaf(x: 1, y: 2),
+                    right: Leaf(x: 3, y: 4),
+                ),
+            );
+            // Overlapping: both parameters mutate the exact same nested sub-field 't.root.left.x'
+            mutate_same_leaf_field(inout t.root.left, inout t.root.left);
+        }
+
+        pub fn test_parent_child_overlap() {
+            mut t = Tree(
+                root: Branch(
+                    left: Leaf(x: 1, y: 2),
+                    right: Leaf(x: 3, y: 4),
+                ),
+            );
+            // Overlapping: parent branch is fully reassigned while child leaf is passed inout
+            mutate_whole_branch_and_child(inout t.root, inout t.root.left);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Overlapping nested struct inout paths must be rejected with E0011: {:?}",
+        res.diagnostics
+    );
+    let e0011_count = res
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.as_deref() == Some("E0011"))
+        .count();
+    assert_eq!(
+        e0011_count, 2,
+        "Expected exactly 2 E0011 exclusivity errors, got: {:?}",
+        res.diagnostics
+    );
+}

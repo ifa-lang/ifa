@@ -401,6 +401,7 @@ impl<'a> AccessCollector<'a> {
             ExprKind::Call { callee, args } => {
                 let callee_sym = match &callee.kind {
                     ExprKind::Ident(s) => Some(*s),
+                    ExprKind::Path(p) => p.last().copied(),
                     _ => None,
                 };
 
