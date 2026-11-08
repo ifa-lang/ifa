@@ -50,6 +50,12 @@ pub struct VectorizeStats {
     pub dot_reductions_vectorized: usize,
     /// Number of slice reductions vectorized in strict zero-heap mode.
     pub strict_zero_heap_reductions: usize,
+    /// Number of scalar count-if reduction loops identified and accelerated.
+    pub count_if_reductions_vectorized: usize,
+    /// Number of conditional slice filters and projections specialized under arena constraints.
+    pub arena_slice_filters_specialized: usize,
+    /// Number of loops vectorized with predicated scatter/gather or masked operations.
+    pub predicated_scatter_gather_loops: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -110,8 +116,10 @@ impl VectorizePass {
                 continue;
             }
 
-            // Identify condition values used for loop boundary / termination checks
+            // Identify condition values used for loop boundary / termination checks vs internal predicates
             let mut loop_exit_conds: HashSet<ValueId> = HashSet::new();
+            let mut loop_internal_conds: HashSet<ValueId> = HashSet::new();
+            let mut internal_cond_blocks: HashSet<BlockId> = HashSet::new();
             for &b_id in &loop_info.blocks {
                 if let Some(b) = func.get_block(b_id) {
                     if let Some(Terminator::BranchCond {
@@ -125,6 +133,10 @@ impl VectorizePass {
                             || !loop_info.blocks.contains(else_block)
                         {
                             loop_exit_conds.insert(*cond);
+                        } else {
+                            loop_internal_conds.insert(*cond);
+                            internal_cond_blocks.insert(*then_block);
+                            internal_cond_blocks.insert(*else_block);
                         }
                     }
                 }
@@ -139,6 +151,8 @@ impl VectorizePass {
             let mut has_reduction_op = false;
             let mut has_mul = false;
             let mut has_add = false;
+            let mut has_conditional_add = false;
+            let mut has_filter_call = false;
             let mut detected_reduction: Option<crate::ir::ReductionKind> = None;
             let mut had_eliminated_bounds = false;
             let mut slice_read_bases: HashSet<ValueId> = HashSet::new();
@@ -241,6 +255,9 @@ impl VectorizePass {
                                     has_reduction_op = true;
                                     if *op == BinaryOp::Add {
                                         has_add = true;
+                                        if internal_cond_blocks.contains(&b_id) {
+                                            has_conditional_add = true;
+                                        }
                                     }
                                     Self::update_reduction_kind(
                                         &mut detected_reduction,
@@ -284,6 +301,18 @@ impl VectorizePass {
                                         &mut detected_reduction,
                                         crate::ir::ReductionKind::Dot,
                                     );
+                                } else if callee.contains("slice_count")
+                                    || callee.contains("count_if")
+                                {
+                                    has_reduction_op = true;
+                                    Self::update_reduction_kind(
+                                        &mut detected_reduction,
+                                        crate::ir::ReductionKind::CountIf,
+                                    );
+                                } else if callee.contains("slice_filter")
+                                    || callee.contains("filter_into")
+                                {
+                                    has_filter_call = true;
                                 } else if callee.contains("slice_sum") {
                                     has_reduction_op = true;
                                     Self::update_reduction_kind(
@@ -323,7 +352,20 @@ impl VectorizePass {
                     detected_reduction = Some(crate::ir::ReductionKind::Dot);
                 }
 
-                let predicate_enable = slice_elements > 0;
+                let has_internal_filter = !loop_internal_conds.is_empty();
+                let is_count_if = (write_elements == 0 && read_elements > 0)
+                    && (detected_reduction == Some(crate::ir::ReductionKind::CountIf)
+                        || has_conditional_add);
+
+                if is_count_if {
+                    detected_reduction = Some(crate::ir::ReductionKind::CountIf);
+                    has_reduction_op = true;
+                }
+
+                let predicated_scatter_gather =
+                    (write_elements > 0 && has_internal_filter) || has_filter_call;
+                let predicate_enable =
+                    slice_elements > 0 || has_internal_filter || predicated_scatter_gather;
                 let is_strict_slice_loop = func.is_strict && slice_elements > 0;
                 let is_reduction = write_elements == 0 && read_elements > 0 && has_reduction_op;
                 let contiguous_reduction = is_reduction && (slice_elements > 0);
@@ -367,6 +409,7 @@ impl VectorizePass {
                     is_strict: func.is_strict,
                     local_arena,
                     contiguous_reduction,
+                    predicated_scatter_gather,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)
@@ -416,6 +459,9 @@ impl VectorizePass {
                     if predicate_enable {
                         self.stats.predicated_loops_vectorized += 1;
                     }
+                    if predicated_scatter_gather {
+                        self.stats.predicated_scatter_gather_loops += 1;
+                    }
                     if write_elements > 0 {
                         self.stats.maps_vectorized += 1;
                     } else if read_elements > 0 && has_reduction_op {
@@ -442,6 +488,9 @@ impl VectorizePass {
                             Some(crate::ir::ReductionKind::Dot) => {
                                 self.stats.dot_reductions_vectorized += 1;
                             }
+                            Some(crate::ir::ReductionKind::CountIf) => {
+                                self.stats.count_if_reductions_vectorized += 1;
+                            }
                             _ => {}
                         }
                     }
@@ -453,7 +502,7 @@ impl VectorizePass {
         self.specialize_direct_slice_reductions(func, &value_types);
     }
 
-    /// Statically specialize direct slice reduction function calls to SIMD-accelerated arena vectorizers
+    /// Statically specialize direct slice reduction and filter function calls to SIMD-accelerated arena vectorizers
     /// when the underlying slices are proven contiguous on the local thread arena or stack.
     fn specialize_direct_slice_reductions(
         &mut self,
@@ -469,7 +518,14 @@ impl VectorizePass {
                         || callee.contains("slice_prod")
                         || callee.contains("slice_min")
                         || callee.contains("slice_max")
-                        || callee.contains("slice_dot");
+                        || callee.contains("slice_dot")
+                        || callee.contains("slice_count")
+                        || callee.contains("count_if")
+                        || callee.contains("slice_filter")
+                        || callee.contains("filter_into")
+                        || callee.contains("slice_select")
+                        || callee.contains("slice_clamp")
+                        || callee == "clamp";
                     if is_reduction_candidate && !args.is_empty() {
                         let first_arg = args[0];
                         let root = Self::trace_slice_root(func, first_arg);
@@ -490,33 +546,74 @@ impl VectorizePass {
                                     _ => "_i64",
                                 }
                             };
-                            let op = if callee.contains("dot") {
-                                "dot"
+                            let (op, is_count, is_filter) = if callee.contains("dot") {
+                                ("dot", false, false)
                             } else if callee.contains("prod") {
-                                "prod"
+                                ("prod", false, false)
                             } else if callee.contains("min") {
-                                "min"
+                                ("min", false, false)
                             } else if callee.contains("max") {
-                                "max"
+                                ("max", false, false)
+                            } else if callee.contains("count") || callee.contains("count_if") {
+                                let pred = if callee.contains("lt") {
+                                    "count_if_lt"
+                                } else if callee.contains("ne") {
+                                    "count_if_ne"
+                                } else if callee.contains("eq") {
+                                    "count_if_eq"
+                                } else {
+                                    "count_if_gt"
+                                };
+                                (pred, true, false)
+                            } else if callee.contains("filter") {
+                                let pred = if callee.contains("gt") {
+                                    "filter_gt"
+                                } else if callee.contains("_lt") || callee.contains("filter_lt") {
+                                    "filter_lt"
+                                } else if callee.contains("eq") {
+                                    "filter_eq"
+                                } else {
+                                    "filter_gt"
+                                };
+                                (pred, false, true)
+                            } else if callee.contains("clamp") {
+                                ("clamp", false, true)
+                            } else if callee.contains("select") {
+                                ("select_gt", false, true)
                             } else {
-                                "sum"
+                                ("sum", false, false)
                             };
                             let specialized_name =
                                 format!("ifa_simd_arena_slice_{}{}", op, elem_suffix);
-                            rewrites.push((b_idx, i_idx, INTERNER.intern(&specialized_name)));
+                            rewrites.push((
+                                b_idx,
+                                i_idx,
+                                INTERNER.intern(&specialized_name),
+                                is_count,
+                                is_filter,
+                            ));
                         }
                     }
                 }
             }
         }
 
-        for (b_idx, i_idx, specialized_sym) in rewrites {
+        for (b_idx, i_idx, specialized_sym, is_count, is_filter) in rewrites {
             if let Some(block) = func.blocks.get_mut(b_idx) {
                 if let Some(inst) = block.instructions.get_mut(i_idx) {
                     if let ValueExpr::CallDirect { name, .. } = &mut inst.expr {
                         *name = specialized_sym;
-                        self.stats.arena_slice_reductions_specialized += 1;
-                        self.stats.contiguous_slice_reductions += 1;
+                        if is_count {
+                            self.stats.count_if_reductions_vectorized += 1;
+                            self.stats.arena_slice_reductions_specialized += 1;
+                            self.stats.contiguous_slice_reductions += 1;
+                        } else if is_filter {
+                            self.stats.arena_slice_filters_specialized += 1;
+                            self.stats.predicated_scatter_gather_loops += 1;
+                        } else {
+                            self.stats.arena_slice_reductions_specialized += 1;
+                            self.stats.contiguous_slice_reductions += 1;
+                        }
                         if func.is_strict {
                             self.stats.strict_zero_heap_reductions += 1;
                         }
@@ -547,6 +644,9 @@ impl VectorizePass {
             }
             (Some(_), crate::ir::ReductionKind::Dot) => {
                 *current = Some(crate::ir::ReductionKind::Dot)
+            }
+            (Some(_), crate::ir::ReductionKind::CountIf) => {
+                *current = Some(crate::ir::ReductionKind::CountIf)
             }
             _ => {}
         }
@@ -625,8 +725,10 @@ impl VectorizePass {
                         ValueExpr::BoundsCheck { redundant, .. }
                         | ValueExpr::SliceBoundsCheck { redundant, .. } => {
                             // If a bounds check is not statically eliminated, it can trigger
-                            // a dynamic panic or branching, inhibiting safe auto-vectorization
-                            if !*redundant {
+                            // a dynamic panic or branching, inhibiting safe auto-vectorization.
+                            // In strict functions, memory accesses to contiguous pre-allocated arena/stack slices
+                            // are bounded, allowing predicated scatter/gather vectorization.
+                            if !*redundant && !func.is_strict {
                                 return (false, false);
                             }
                         }

@@ -946,3 +946,200 @@ fn test_vectorize_pass_direct_reduction_call_specialization() {
         panic!("Instruction must remain a CallDirect");
     }
 }
+
+#[test]
+fn test_vectorize_pass_strict_arena_slice_count_if_i32() {
+    let src = r#"
+        pub strict fn count_positives(s: Slice<i32>) -> i64 {
+            let mut count: i64 = 0;
+            for x in s {
+                if x > 0 {
+                    count = count + 1;
+                }
+            }
+            return count;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_count_if.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=8]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
+    assert!(formatted.contains("// [reduction: count_if]"));
+    assert!(formatted.contains("// [predicate_enable: true]"));
+    assert!(formatted.contains("// [contiguous_reduction: true]"));
+    assert!(formatted.contains("// [local_arena: true]"));
+    assert!(formatted.contains("// [strict_vectorize: true]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.count_if_reductions_vectorized, 1);
+    assert_eq!(stats.contiguous_slice_reductions, 1);
+    assert_eq!(stats.arena_slice_reductions_specialized, 1);
+    assert_eq!(stats.strict_zero_heap_reductions, 1);
+}
+
+#[test]
+fn test_vectorize_pass_predicated_filter_and_scatter() {
+    let src = r#"
+        pub strict fn filter_threshold(src: Slice<i32>, mut dst: Slice<i32>) -> () {
+            let mut i: i64 = 0;
+            for x in src {
+                if x > 10 {
+                    dst[i] = x;
+                    i = i + 1;
+                }
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("predicated_filter.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [predicated_scatter_gather: true]")
+            || formatted.contains("// [predicate_enable: true]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert!(stats.predicated_scatter_gather_loops >= 1);
+}
+
+#[test]
+fn test_vectorize_pass_direct_count_if_and_filter_specialization() {
+    use ifa_fir::{
+        BasicBlock, BlockId, FirFunction, FirModule, FirParam, FirType, Instruction, ParamMode,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_sym = INTERNER.intern("call_predicated_arena_primitives");
+    let param = FirParam {
+        name: INTERNER.intern("s"),
+        ty: FirType::Slice(Box::new(FirType::Int(IntType::I32))),
+        val: ValueId(0),
+        mode: ParamMode::In,
+    };
+    let mut func = FirFunction::new(
+        fn_sym,
+        vec![param],
+        FirType::Int(IntType::I64),
+        true,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    // 1. Call slice_count_gt_i32
+    let count_sym = INTERNER.intern("slice_count_gt_i32");
+    bb0.instructions.push(Instruction::new(
+        Some(ValueId(1)),
+        ValueExpr::CallDirect {
+            name: count_sym,
+            args: vec![ValueId(0), ValueId(10)],
+        },
+        Span::DUMMY,
+    ));
+    // 2. Call slice_filter_gt_i32
+    let filter_sym = INTERNER.intern("slice_filter_gt_i32");
+    bb0.instructions.push(Instruction::new(
+        Some(ValueId(2)),
+        ValueExpr::CallDirect {
+            name: filter_sym,
+            args: vec![ValueId(0), ValueId(0), ValueId(10)],
+        },
+        Span::DUMMY,
+    ));
+    // 3. Call slice_clamp_f32 on f32 slice
+    let clamp_sym = INTERNER.intern("slice_clamp_f32");
+    bb0.instructions.push(Instruction::new(
+        Some(ValueId(3)),
+        ValueExpr::CallDirect {
+            name: clamp_sym,
+            args: vec![ValueId(0), ValueId(0), ValueId(10), ValueId(20)],
+        },
+        Span::DUMMY,
+    ));
+    bb0.terminator = Some(Terminator::Return(Some(ValueId(1))));
+    func.blocks[0] = bb0;
+
+    let mut module = FirModule {
+        name: INTERNER.intern("arena_pred_spec_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut pass = VectorizePass::new();
+    pass.run_on_module(&mut module);
+
+    let stats = pass.stats();
+    assert_eq!(stats.count_if_reductions_vectorized, 1);
+    assert_eq!(stats.arena_slice_filters_specialized, 2);
+    assert!(stats.predicated_scatter_gather_loops >= 2);
+    assert!(stats.arena_slice_reductions_specialized >= 1);
+
+    // Verify rewritten function names
+    let updated_func = &module.functions[0];
+    if let ValueExpr::CallDirect { name, .. } = &updated_func.blocks[0].instructions[0].expr {
+        assert_eq!(
+            INTERNER.resolve(name),
+            "ifa_simd_arena_slice_count_if_gt_i32"
+        );
+    } else {
+        panic!("Inst 0 must remain CallDirect");
+    }
+
+    if let ValueExpr::CallDirect { name, .. } = &updated_func.blocks[0].instructions[1].expr {
+        assert_eq!(INTERNER.resolve(name), "ifa_simd_arena_slice_filter_gt_i32");
+    } else {
+        panic!("Inst 1 must remain CallDirect");
+    }
+
+    if let ValueExpr::CallDirect { name, .. } = &updated_func.blocks[0].instructions[2].expr {
+        assert_eq!(INTERNER.resolve(name), "ifa_simd_arena_slice_clamp_f32");
+    } else {
+        panic!("Inst 2 must remain CallDirect");
+    }
+}

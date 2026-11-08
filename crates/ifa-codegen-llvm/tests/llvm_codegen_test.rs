@@ -390,6 +390,25 @@ fn test_llvm_simd_slice_vectorization() {
     assert!(ir.contains("@ifa_simd_arena_slice_dot_f32"));
     assert!(ir.contains("@ifa_simd_arena_slice_dot_f64"));
 
+    // Verify IFA Standard Library SIMD Contiguous Arena Predicates and Filters
+    assert!(ir.contains("@ifa_simd_arena_slice_count_if_gt_f32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_count_if_gt_f64"));
+    assert!(ir.contains("@ifa_simd_arena_slice_count_if_gt_i32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_count_if_gt_i64"));
+    assert!(ir.contains("@ifa_simd_arena_slice_count_if_lt_i32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_count_if_eq_i32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_count_if_ne_i32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_filter_gt_i32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_filter_gt_f32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_filter_gt_f64"));
+    assert!(ir.contains("@ifa_simd_arena_slice_filter_gt_i64"));
+    assert!(ir.contains("@ifa_simd_arena_slice_filter_lt_i32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_filter_eq_i32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_select_gt_f32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_select_gt_i32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_clamp_f32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_clamp_i32"));
+
     assert!(ir.contains("<8 x float>"));
     assert!(ir.contains("<4 x double>"));
     assert!(ir.contains("<8 x i32>"));
@@ -4017,6 +4036,84 @@ fn test_llvm_aot_strict_arena_slice_reduction() {
         output.status.code(),
         Some(42),
         "Native binary output exit code must be 42"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_aot_strict_arena_slice_count_if_execution() {
+    let src = r#"
+        pub strict fn count_gt_ten(s: Slice<i64>) -> i64 {
+            mut count: i64 = 0;
+            for x in s {
+                if x > 10 {
+                    count = count + 1;
+                }
+            }
+            return count;
+        }
+
+        pub fn main() -> i64 {
+            let arr: [i64; 6] = [5, 12, 8, 15, 20, 2];
+            let s = arr[0..6];
+            let res: i64 = count_gt_ten(s);
+            return res;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_arena_count_if.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = ifa_codegen_llvm::ir_emitter::LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&fir_module).unwrap();
+
+    assert!(
+        ir.contains("@ifa_simd_arena_slice_count_if_gt_i64")
+            || ir.contains("count_gt_ten")
+            || ir.contains("llvm.vector.reduce.add"),
+        "LLVM IR must include count-if vectorizer logic:\n{}",
+        ir
+    );
+
+    let temp_dir = std::env::temp_dir().join(format!("llvm_aot_count_if_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("count_if.o");
+    let bin_path = temp_dir.join("count_if_exec");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&fir_module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "Native binary output exit code must be 3 (elements 12, 15, 20)"
     );
 
     let _ = fs::remove_dir_all(&temp_dir);

@@ -478,9 +478,11 @@ pub enum ReductionKind {
     Bitwise,
     /// Scalar dot product reduction (e.g., acc = acc + a[i] * b[i]).
     Dot,
+    /// Conditional counting reduction (e.g., if cond { count += 1 } or count_if).
+    CountIf,
 }
 
-/// Optimization hint for loop vectorization (SIMD lane width, interleave, unroll directives, reduction kind, disjoint slices guarantee, tail-folding predication, strict determinism, and contiguous arena reductions).
+/// Optimization hint for loop vectorization (SIMD lane width, interleave, unroll directives, reduction kind, disjoint slices guarantee, tail-folding predication, strict determinism, contiguous arena reductions, and predicated scatter/gather filters).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LoopVectorHint {
     pub vector_width: u32,
@@ -492,6 +494,7 @@ pub struct LoopVectorHint {
     pub is_strict: bool,
     pub local_arena: bool,
     pub contiguous_reduction: bool,
+    pub predicated_scatter_gather: bool,
 }
 
 impl LoopVectorHint {
@@ -507,6 +510,7 @@ impl LoopVectorHint {
             is_strict: false,
             local_arena: false,
             contiguous_reduction: false,
+            predicated_scatter_gather: false,
         }
     }
 
@@ -543,6 +547,12 @@ impl LoopVectorHint {
     /// Mark the loop reduction as operating across a contiguous slice aggregate.
     pub fn with_contiguous_reduction(mut self, contiguous: bool) -> Self {
         self.contiguous_reduction = contiguous;
+        self
+    }
+
+    /// Mark the loop as employing predicated SIMD scatter/gather or conditional projection.
+    pub fn with_predicated_scatter_gather(mut self, predicated: bool) -> Self {
+        self.predicated_scatter_gather = predicated;
         self
     }
 }
