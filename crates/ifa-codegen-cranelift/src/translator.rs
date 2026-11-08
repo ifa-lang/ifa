@@ -1190,8 +1190,36 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     base_addr
                 };
                 let idx = self.value_map[index];
-                let scaled = self.builder.ins().imul_imm_s(idx, 8);
-                Some(self.builder.ins().iadd(p, scaled))
+                let elem_size = match base_ty {
+                    Some(FirType::Array(elem, _)) | Some(FirType::Slice(elem)) => {
+                        crate::types::fir_type_byte_size(elem).max(8)
+                    }
+                    Some(FirType::Pointer(inner)) => match &**inner {
+                        FirType::Array(elem, _) | FirType::Slice(elem) => {
+                            crate::types::fir_type_byte_size(elem).max(8)
+                        }
+                        _ => 8,
+                    },
+                    _ => 8,
+                };
+                let elem_scale =
+                    self.strided_slices.get(base).copied().unwrap_or(1) * (elem_size as i64);
+                let offset = if elem_scale > 0 && (elem_scale as u64).is_power_of_two() {
+                    let shift = elem_scale.trailing_zeros() as i64;
+                    self.builder.ins().ishl_imm_u(idx, shift)
+                } else {
+                    self.builder.ins().imul_imm_s(idx, elem_scale)
+                };
+                if let Some(res_id) = result {
+                    if let Some(FirType::Array(elem, _)) | Some(FirType::Slice(elem)) = base_ty {
+                        self.pointer_fir_types.insert(res_id, *elem.clone());
+                    } else if let Some(FirType::Pointer(inner)) = base_ty {
+                        if let FirType::Array(elem, _) | FirType::Slice(elem) = &**inner {
+                            self.pointer_fir_types.insert(res_id, *elem.clone());
+                        }
+                    }
+                }
+                Some(self.builder.ins().iadd(p, offset))
             }
 
             ValueExpr::SetField {

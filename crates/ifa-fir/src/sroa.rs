@@ -755,6 +755,9 @@ impl SroaPass {
                     | ValueExpr::SetElement { base, .. }
                     | ValueExpr::ArrayPush { array: base, .. }
                     | ValueExpr::StructPushField { base, .. }
+                    | ValueExpr::GetFieldPtr { base, .. }
+                    | ValueExpr::GetElementPtr { base, .. }
+                    | ValueExpr::GetElement { base, .. }
                         if candidates.contains(base) =>
                     {
                         has_other_mutations.insert(*base);
@@ -768,6 +771,35 @@ impl SroaPass {
         let mut dead_loads: HashSet<ValueId> = HashSet::new();
         let mut dead_allocas: HashSet<ValueId> = HashSet::new();
         let mut dead_stores: HashSet<(BlockId, usize)> = HashSet::new();
+
+        // Count non-load/store uses of each candidate alloca (e.g. GetElement, BoundsCheck, GetElementPtr, etc.)
+        let mut other_uses: HashMap<ValueId, usize> = HashMap::new();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match &inst.expr {
+                    ValueExpr::Store { ptr: _, val } => {
+                        if candidates.contains(val) {
+                            *other_uses.entry(*val).or_default() += 1;
+                        }
+                    }
+                    ValueExpr::Load { .. } => {}
+                    _ => {
+                        for u in inst.expr.uses() {
+                            if candidates.contains(&u) {
+                                *other_uses.entry(u).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(term) = &block.terminator {
+                for u in term.uses() {
+                    if candidates.contains(&u) {
+                        *other_uses.entry(u).or_default() += 1;
+                    }
+                }
+            }
+        }
 
         for &ptr in candidates {
             let empty_stores = Vec::new();
@@ -799,10 +831,13 @@ impl SroaPass {
                         dead_loads.insert(load_res);
                         self.stats.promoted_loads += 1;
                     }
-                    dead_stores.insert((store_block, store_idx));
-                    dead_allocas.insert(ptr);
-                    self.stats.eliminated_allocas += 1;
-                    self.stats.eliminated_stores += 1;
+                    let has_other = other_uses.get(&ptr).copied().unwrap_or(0) > 0;
+                    if !has_other {
+                        dead_stores.insert((store_block, store_idx));
+                        dead_allocas.insert(ptr);
+                        self.stats.eliminated_allocas += 1;
+                        self.stats.eliminated_stores += 1;
+                    }
                     continue;
                 }
             }
@@ -854,7 +889,8 @@ impl SroaPass {
 
                 // Check if all loads of this alloca were promoted
                 let all_loads_eliminated = ptr_loads.iter().all(|(_, _, r)| dead_loads.contains(r));
-                if all_loads_eliminated && !ptr_loads.is_empty() {
+                let has_other = other_uses.get(&ptr).copied().unwrap_or(0) > 0;
+                if all_loads_eliminated && !ptr_loads.is_empty() && !has_other {
                     dead_allocas.insert(ptr);
                     self.stats.eliminated_allocas += 1;
                     for &(s_b, s_i, _) in ptr_stores {

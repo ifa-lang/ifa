@@ -1974,3 +1974,82 @@ fn test_cranelift_jit_nonblocking_synchronized_channel_state_machine() {
         "Non-blocking synchronized channel must successfully transmit 777"
     );
 }
+
+#[test]
+fn test_jit_for_loop_inout_array_mutation() {
+    let src = r#"
+pub fn main() -> i64 {
+    mut nums: [i64; 4] = [1, 2, 3, 4];
+    for inout n in nums {
+        n = n * 10;
+    }
+    return nums[0] + nums[1] + nums[2] + nums[3];
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("for_inout_arr.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR with for-loop inout array mutation to Cranelift JIT");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 100,
+        "Inout iteration must mutate array elements in place (10 + 20 + 30 + 40 = 100)"
+    );
+}
+
+#[test]
+fn test_jit_for_loop_inout_tuple_destructuring() {
+    let src = r#"
+pub fn main() -> i64 {
+    mut pairs: [(i64, i64); 2] = [(1, 2), (3, 4)];
+    for (inout a, inout b) in pairs {
+        a = a + 10;
+        b = b * 2;
+    }
+    let (x0, y0) = pairs[0];
+    let (x1, y1) = pairs[1];
+    return x0 + y0 + x1 + y1;
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("for_inout_tuple.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR with for-loop inout tuple destructuring to Cranelift JIT");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 36,
+        "Inout tuple destructuring must mutate tuple fields in place (11 + 4 + 13 + 8 = 36)"
+    );
+}

@@ -5340,3 +5340,74 @@ pub fn main() -> i64 {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_aot_for_loop_inout_array_and_tuple_destructuring() {
+    let src = r#"
+pub fn main() -> i64 {
+    mut nums: [i64; 4] = [2, 4, 6, 8];
+    for inout n in nums {
+        n = n / 2;
+    }
+    // nums is now [1, 2, 3, 4]
+    let sum1 = nums[0] + nums[1] + nums[2] + nums[3]; // 10
+
+    mut pairs: [(i64, i64); 2] = [(1, 2), (3, 4)];
+    for (inout a, inout b) in pairs {
+        a = a + 10;
+        b = b * 2;
+    }
+    // pairs is now [(11, 4), (13, 8)]
+    let (x0, y0) = pairs[0];
+    let (x1, y1) = pairs[1];
+    let sum2 = x0 + y0 + x1 + y1; // 36
+
+    if sum1 == 10 && sum2 == 36 {
+        return 42;
+    }
+    return 1;
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("for_inout_llvm.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir = std::env::temp_dir().join(format!("llvm_for_inout_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("for_inout.o");
+    let bin_path = temp_dir.join("for_inout_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "Native binary output exit code must be 42"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

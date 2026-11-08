@@ -4880,3 +4880,93 @@ fn test_block_scoped_borrow_release() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_for_loop_inout_on_immutable_collection_rejected() {
+    let code = r#"
+        pub fn main() {
+            let items = [1, 2, 3];
+            for inout x in items {
+                x = 10;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Binding inout in for loop over immutable array must be rejected: {:?}",
+        res.diagnostics
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0010")),
+        "Expected E0010 diagnostic for inout binding on immutable collection, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_for_loop_mutation_of_collection_during_inout_iteration_rejected() {
+    let code = r#"
+        pub fn main() {
+            mut items = [1, 2, 3];
+            for inout x in items {
+                items[0] = 42;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Mutating collection while inout iteration is active must be rejected: {:?}",
+        res.diagnostics
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0011")),
+        "Expected E0011 diagnostic for mutating active inout borrow, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_for_loop_inout_on_mutable_collection_allowed() {
+    let code = r#"
+        pub fn main() {
+            mut items = [1, 2, 3];
+            for inout x in items {
+                x = 10;
+            }
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Inout iteration over mutable collection must succeed without error: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_unary_inout_on_rvalue_rejected() {
+    let code = r#"
+        pub fn main() {
+            let r = inout 42;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Taking inout of rvalue 42 must be rejected: {:?}",
+        res.diagnostics
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0013")),
+        "Expected E0013 diagnostic for rvalue inout, got: {:?}",
+        res.diagnostics
+    );
+}

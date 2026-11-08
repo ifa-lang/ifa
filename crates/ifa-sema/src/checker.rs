@@ -1662,6 +1662,11 @@ impl<'a> SemanticAnalyzer<'a> {
                 };
 
                 self.check_pattern_binding_duplicates(pattern);
+                self.check_inout_source_mutability(pattern, iterable);
+
+                let pat_borrows = self.check_pattern_and_register_borrows(pattern, Some(iterable));
+                let num_pat_borrows = pat_borrows.len();
+
                 self.symbols.enter_scope(true, false);
                 self.check_pattern(pattern, &elem_ty);
 
@@ -1671,7 +1676,7 @@ impl<'a> SemanticAnalyzer<'a> {
                         op: UnaryOp::InOut,
                         ..
                     }
-                );
+                ) || pattern_has_inout(pattern);
                 let borrow_kind = if is_inout_iterable {
                     BorrowKind::InOut
                 } else {
@@ -1685,9 +1690,12 @@ impl<'a> SemanticAnalyzer<'a> {
                 if let Some(b) = &iter_borrow {
                     self.active_borrows.push(b.clone());
                 }
+                self.active_borrows.extend(pat_borrows);
 
                 self.check_block(body, None);
 
+                self.active_borrows
+                    .truncate(self.active_borrows.len() - num_pat_borrows);
                 if iter_borrow.is_some() {
                     self.active_borrows.pop();
                 }
@@ -2551,10 +2559,11 @@ impl<'a> SemanticAnalyzer<'a> {
                         Type::from_ast(&p.ty, &known_structs, &known_enums).unwrap_or(Type::Unknown)
                     };
 
+                    let is_mut = matches!(p.mode, ParamMode::Mut | ParamMode::InOut);
                     let _ = self.symbols.define_variable(
                         p.name,
                         ty.clone(),
-                        false,
+                        is_mut,
                         true,
                         Some(p.mode),
                         p.span,
@@ -4191,8 +4200,65 @@ impl<'a> SemanticAnalyzer<'a> {
                 let ty = self.infer_expr(inner);
                 Type::Ref(Box::new(ty))
             }
-            UnaryOp::InOut => self.infer_expr(inner),
-            UnaryOp::Sink => self.infer_expr(inner),
+            UnaryOp::InOut => {
+                if !crate::exclusivity::is_lvalue(inner) {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "l'opérateur 'inout' attend une variable ou un champ modifiable (lvalue)",
+                        )
+                        .with_code("E0013")
+                        .with_primary_label(span, "expression non modifiable (rvalue) passée à 'inout'")
+                        .with_help("Fournissez une variable ou un accès à un champ de structure modifiable."),
+                    );
+                } else if let Some((root_sym, _)) = crate::exclusivity::extract_root_variable(inner)
+                {
+                    if let Some(var) = self.symbols.lookup_variable(&root_sym) {
+                        if !var.is_mut
+                            && !self.diagnostics.iter().any(|d| {
+                                d.code.as_deref() == Some("E0010")
+                                    && d.labels
+                                        .iter()
+                                        .any(|l| l.span == span || l.span == inner.span)
+                            })
+                        {
+                            let var_name = INTERNER.resolve(&root_sym);
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "impossible d'emprunter la variable immuable '{}' avec l'opérateur 'inout'",
+                                    var_name
+                                ))
+                                .with_code("E0010")
+                                .with_primary_label(
+                                    span,
+                                    format!("emprunt mutable exclusif 'inout' interdit sur '{}'", var_name),
+                                )
+                                .with_secondary_label(
+                                    var.span,
+                                    format!(
+                                        "la variable '{}' a été déclarée immuable avec 'let' (utilisez 'mut')",
+                                        var_name
+                                    ),
+                                )
+                                .with_help("Changez la déclaration en 'mut' pour autoriser l'emprunt mutable 'inout'."),
+                            );
+                        }
+                    }
+                }
+                self.infer_expr(inner)
+            }
+            UnaryOp::Sink => {
+                if !crate::exclusivity::is_lvalue(inner) {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "l'opérateur 'sink' attend une variable ou un champ modifiable (lvalue)",
+                        )
+                        .with_code("E0013")
+                        .with_primary_label(span, "expression non déplaçable (rvalue) passée à 'sink'")
+                        .with_help("Fournissez une variable ou un accès de structure transférable."),
+                    );
+                }
+                self.infer_expr(inner)
+            }
             UnaryOp::Try => {
                 let ty = self.infer_expr(inner);
                 match ty {

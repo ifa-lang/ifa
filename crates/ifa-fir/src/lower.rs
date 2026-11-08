@@ -2194,7 +2194,13 @@ impl<'a> FunctionLoweringContext<'a> {
                     return;
                 }
 
-                let iter_val = self.lower_expr(iterable);
+                let saved_allocas = self.var_allocas.clone();
+                let needs_ptr = pattern_needs_pointer(pattern);
+                let iter_val = if needs_ptr {
+                    self.lower_lvalue_ptr(iterable, *span)
+                } else {
+                    self.lower_expr(iterable)
+                };
                 let iter_ty = self.infer_expr_fir_type(iterable);
 
                 let limit_val = if let Some(FirType::Array(_, len)) = iter_ty {
@@ -2257,27 +2263,31 @@ impl<'a> FunctionLoweringContext<'a> {
                 );
 
                 // Allocate loop element variable if single ident or simple binding
-                let simple_var_info = match pattern {
-                    Pattern::Ident(var, p_span)
-                    | Pattern::Binding {
-                        mode: BindingMode::Value | BindingMode::Mut,
-                        name: var,
-                        span: p_span,
-                    } => {
-                        let var_ptr = self.alloc_value();
-                        self.emit(
-                            Some(var_ptr),
-                            ValueExpr::Alloca {
-                                ty: elem_ty.clone(),
-                                name: Some(*var),
-                            },
-                            *p_span,
-                        );
-                        self.var_allocas.insert(*var, var_ptr);
-                        self.var_types.insert(*var, elem_ty.clone());
-                        Some((*p_span, var_ptr))
+                let simple_var_info = if needs_ptr {
+                    None
+                } else {
+                    match pattern {
+                        Pattern::Ident(var, p_span)
+                        | Pattern::Binding {
+                            mode: BindingMode::Value | BindingMode::Mut,
+                            name: var,
+                            span: p_span,
+                        } => {
+                            let var_ptr = self.alloc_value();
+                            self.emit(
+                                Some(var_ptr),
+                                ValueExpr::Alloca {
+                                    ty: elem_ty.clone(),
+                                    name: Some(*var),
+                                },
+                                *p_span,
+                            );
+                            self.var_allocas.insert(*var, var_ptr);
+                            self.var_types.insert(*var, elem_ty.clone());
+                            Some((*p_span, var_ptr))
+                        }
+                        _ => None,
                     }
-                    _ => None,
                 };
 
                 let cond_block = self.alloc_block();
@@ -2339,7 +2349,56 @@ impl<'a> FunctionLoweringContext<'a> {
                     *span,
                 );
 
-                if let Some((p_span, var_ptr)) = simple_var_info {
+                if needs_ptr {
+                    if let Pattern::Binding {
+                        mode: BindingMode::InOut,
+                        name: var,
+                        ..
+                    } = pattern
+                    {
+                        let elem_ptr = self.alloc_value();
+                        self.emit(
+                            Some(elem_ptr),
+                            ValueExpr::GetElementPtr {
+                                base: iter_val,
+                                index: cur_idx,
+                            },
+                            *span,
+                        );
+                        self.var_allocas.insert(*var, elem_ptr);
+                        self.var_types.insert(*var, elem_ty.clone());
+                    } else if !matches!(pattern, Pattern::Wildcard(_)) {
+                        let composite_ptr = if matches!(elem_ty, FirType::Struct(..)) {
+                            elem_val
+                        } else {
+                            let elem_ptr = self.alloc_value();
+                            self.emit(
+                                Some(elem_ptr),
+                                ValueExpr::GetElementPtr {
+                                    base: iter_val,
+                                    index: cur_idx,
+                                },
+                                *span,
+                            );
+                            elem_ptr
+                        };
+                        self.val_ptrs.insert(elem_val, composite_ptr);
+
+                        let match_body_block = self.alloc_block();
+                        let match_fail_block = step_block;
+
+                        self.lower_pattern_match(
+                            elem_val,
+                            &elem_ty,
+                            pattern,
+                            match_body_block,
+                            match_fail_block,
+                            *span,
+                        );
+
+                        self.current_block = match_body_block;
+                    }
+                } else if let Some((p_span, var_ptr)) = simple_var_info {
                     self.emit(
                         None,
                         ValueExpr::Store {
@@ -2416,6 +2475,7 @@ impl<'a> FunctionLoweringContext<'a> {
 
                 // Exit block
                 self.current_block = exit_block;
+                self.var_allocas = saved_allocas;
             }
         }
     }
