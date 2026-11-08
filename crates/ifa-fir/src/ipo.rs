@@ -31,6 +31,10 @@ pub struct IpoStats {
     pub tail_call_functions_transformed: usize,
     /// Number of mutual tail-recursive calls inlined between pure functions.
     pub mutual_tail_calls_inlined: usize,
+    /// Number of colorless coroutines specialized into direct synchronous functions.
+    pub coroutines_specialized_sync: usize,
+    /// Number of direct call sites retargeted to specialized synchronous coroutine variants.
+    pub direct_coroutine_calls_specialized: usize,
 }
 
 /// Call graph structure capturing caller-callee relationships, recursive cycles,
@@ -761,6 +765,9 @@ impl IpoPass {
         self.stats.tail_calls_eliminated = tco_stats.tail_calls_eliminated;
         self.stats.tail_call_functions_transformed = tco_stats.functions_transformed;
         self.stats.mutual_tail_calls_inlined = tco_stats.mutual_tail_calls_inlined;
+
+        // 6. Inter-procedural colorless coroutine specialization for direct synchronous callers
+        self.specialize_colorless_coroutines(module);
     }
 
     /// Analyzes the entire FIR module and computes the set of provably pure function symbols.
@@ -1008,6 +1015,128 @@ impl IpoPass {
                         }
                         if let Some(term) = &mut block.terminator {
                             SroaPass::substitute_terminator_operands(term, &func_subst);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Inter-procedural specialization of colorless coroutines invoked via direct synchronous calls.
+    ///
+    /// In IFA's colorless concurrency model, functions containing cooperative suspension points (`yield`)
+    /// are lowered as stackless coroutines for asynchronous execution (`spawn`). However, when invoked
+    /// directly via synchronous call (`CallDirect`), the coroutine can either:
+    /// 1. Be specialized in-place into a synchronous direct function when it is never spawned.
+    /// 2. Be cloned and specialized into a dedicated synchronous variant (`_direct_sync`) when invoked
+    ///    both asynchronously and synchronously, retargeting direct call sites to eliminate coroutine
+    ///    state-machine frame allocation overhead.
+    pub fn specialize_colorless_coroutines(&mut self, module: &mut FirModule) {
+        let coro_symbols: HashSet<Symbol> = module
+            .functions
+            .iter()
+            .filter(|f| f.is_coroutine())
+            .map(|f| f.name)
+            .collect();
+
+        if coro_symbols.is_empty() {
+            return;
+        }
+
+        let mut direct_calls: HashMap<Symbol, usize> = HashMap::new();
+        let mut spawn_calls: HashMap<Symbol, usize> = HashMap::new();
+
+        for func in &module.functions {
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    match &inst.expr {
+                        ValueExpr::CallDirect { name, .. } if coro_symbols.contains(name) => {
+                            *direct_calls.entry(*name).or_default() += 1;
+                        }
+                        ValueExpr::Spawn { target, .. } if coro_symbols.contains(target) => {
+                            *spawn_calls.entry(*target).or_default() += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let yield_sym = INTERNER.intern("ifa_rt_fiber_yield");
+        let mut specialized_clones: Vec<FirFunction> = Vec::new();
+        let mut retarget_map: HashMap<Symbol, Symbol> = HashMap::new();
+
+        for &coro_sym in &coro_symbols {
+            let direct_count = direct_calls.get(&coro_sym).copied().unwrap_or(0);
+            if direct_count == 0 {
+                continue;
+            }
+
+            let is_spawned = spawn_calls.get(&coro_sym).copied().unwrap_or(0) > 0;
+
+            if !is_spawned {
+                // Case 1: Exclusively direct synchronous callers -> specialize in-place
+                if let Some(func) = module.functions.iter_mut().find(|f| f.name == coro_sym) {
+                    func.is_coroutine = false;
+                    for block in &mut func.blocks {
+                        for inst in &mut block.instructions {
+                            match &mut inst.expr {
+                                ValueExpr::Yield | ValueExpr::YieldValue { .. } => {
+                                    inst.expr = ValueExpr::CallDirect {
+                                        name: yield_sym,
+                                        args: vec![],
+                                    };
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    self.stats.coroutines_specialized_sync += 1;
+                    self.stats.direct_coroutine_calls_specialized += direct_count;
+                }
+            } else {
+                // Case 2: Inactive both in spawn and direct calls -> generate dedicated synchronous clone
+                if let Some(orig_func) = module.functions.iter().find(|f| f.name == coro_sym) {
+                    let base_name = INTERNER.resolve(&coro_sym);
+                    let sync_name = INTERNER.intern(&format!("{}_direct_sync", base_name));
+                    let mut sync_func = orig_func.clone();
+                    sync_func.name = sync_name;
+                    sync_func.is_coroutine = false;
+
+                    for block in &mut sync_func.blocks {
+                        for inst in &mut block.instructions {
+                            match &mut inst.expr {
+                                ValueExpr::Yield | ValueExpr::YieldValue { .. } => {
+                                    inst.expr = ValueExpr::CallDirect {
+                                        name: yield_sym,
+                                        args: vec![],
+                                    };
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    specialized_clones.push(sync_func);
+                    retarget_map.insert(coro_sym, sync_name);
+                    self.stats.coroutines_specialized_sync += 1;
+                    self.stats.direct_coroutine_calls_specialized += direct_count;
+                }
+            }
+        }
+
+        // Add specialized cloned functions to module
+        module.functions.extend(specialized_clones);
+
+        // Retarget direct calls to the specialized synchronous clone
+        if !retarget_map.is_empty() {
+            for func in &mut module.functions {
+                for block in &mut func.blocks {
+                    for inst in &mut block.instructions {
+                        if let ValueExpr::CallDirect { name, .. } = &mut inst.expr {
+                            if let Some(&new_name) = retarget_map.get(name) {
+                                *name = new_name;
+                            }
                         }
                     }
                 }

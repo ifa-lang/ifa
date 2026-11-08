@@ -3221,3 +3221,168 @@ fn test_llvm_aot_monomorphic_async_traits_and_stream_specialization() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_colorless_coroutine_direct_synchronous_call_specialization() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BinaryOp, BlockId, FirFunction, FirModule, FirParam, FirType, Instruction, ParamMode,
+        Terminator, ValueExpr,
+    };
+    use ifa_span::{Span, INTERNER};
+    use std::fs;
+
+    let mut module = FirModule::new(INTERNER.intern("coro_direct_sync_mod"));
+
+    // 1. Define a coroutine function: compute_async(x: i64) -> i64
+    let coro_name = INTERNER.intern("compute_async");
+    let mut coro_func = FirFunction::new(
+        coro_name,
+        vec![FirParam {
+            name: INTERNER.intern("x"),
+            val: ifa_fir::ValueId(0),
+            ty: FirType::Int(ifa_sema::types::IntType::I64),
+            mode: ParamMode::In,
+        }],
+        FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    coro_func.next_value_id = 1;
+    let b0 = BlockId(0);
+    let bb0 = coro_func.get_block_mut(b0).unwrap();
+    // Yield points inside colorless coroutine
+    bb0.push_instruction(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    bb0.push_instruction(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+
+    let ten_val = coro_func.alloc_value();
+    let sum_val = coro_func.alloc_value();
+    let bb0 = coro_func.get_block_mut(b0).unwrap();
+    bb0.push_instruction(Instruction::new(
+        Some(ten_val),
+        ValueExpr::Constant(ifa_fir::ConstantValue::Int(
+            10,
+            ifa_sema::types::IntType::I64,
+        )),
+        Span::DUMMY,
+    ));
+    bb0.push_instruction(Instruction::new(
+        Some(sum_val),
+        ValueExpr::Binary {
+            op: BinaryOp::Add,
+            lhs: ifa_fir::ValueId(0),
+            rhs: ten_val,
+        },
+        Span::DUMMY,
+    ));
+    bb0.set_terminator(Terminator::Return(Some(sum_val)));
+    assert!(coro_func.is_coroutine());
+    module.functions.push(coro_func);
+
+    // 2. Define main function that directly calls compute_async(32) synchronously
+    let main_name = INTERNER.intern("main");
+    let mut main_func = FirFunction::new(
+        main_name,
+        vec![],
+        FirType::Int(ifa_sema::types::IntType::I32),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let arg_val = main_func.alloc_value();
+    let call_res = main_func.alloc_value();
+    let mb0 = BlockId(0);
+    let mbb0 = main_func.get_block_mut(mb0).unwrap();
+    mbb0.push_instruction(Instruction::new(
+        Some(arg_val),
+        ValueExpr::Constant(ifa_fir::ConstantValue::Int(
+            32,
+            ifa_sema::types::IntType::I64,
+        )),
+        Span::DUMMY,
+    ));
+    // Direct synchronous call to coroutine
+    mbb0.push_instruction(Instruction::new(
+        Some(call_res),
+        ValueExpr::CallDirect {
+            name: coro_name,
+            args: vec![arg_val],
+        },
+        Span::DUMMY,
+    ));
+    // Also an effectful direct call without result
+    mbb0.push_instruction(Instruction::new(
+        None,
+        ValueExpr::CallDirect {
+            name: coro_name,
+            args: vec![arg_val],
+        },
+        Span::DUMMY,
+    ));
+    mbb0.set_terminator(Terminator::Return(Some(call_res)));
+    module.functions.push(main_func);
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&module).expect("Emission failed");
+
+    // Assert IR properties for direct synchronous coroutine execution
+    assert!(
+        ir.contains("define linkonce_odr i64 @ifa_coro_run_to_completion(ptr %hdl)"),
+        "Missing run-to-completion helper in LLVM IR"
+    );
+    assert!(
+        ir.contains("coro.final_suspend:"),
+        "Missing final suspend state machine block in coroutine"
+    );
+    assert!(
+        ir.contains("@ifa_coro_run_to_completion(ptr %coro_direct_hdl_"),
+        "Missing direct synchronous call wrapper to run_to_completion in caller"
+    );
+    assert!(
+        ir.contains("@ifa_coro_llvm_run(ptr %eff_coro_direct_"),
+        "Missing effectful coroutine run helper invocation"
+    );
+
+    // Compile to native object and binary, then execute to verify 42 exit code
+    let temp_dir =
+        std::env::temp_dir().join(format!("llvm_coro_sync_direct_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("coro_sync.o");
+    let bin_path = temp_dir.join("coro_sync_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Compilation to object failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(
+        link_res.is_ok(),
+        "Native linking failed: {:?}",
+        link_res.err()
+    );
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native coroutine direct call binary");
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "Exit code from direct synchronous coroutine execution must be 42"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

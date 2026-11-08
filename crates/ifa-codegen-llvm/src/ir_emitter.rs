@@ -269,6 +269,15 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("yield_step:\n  call void @ifa_rt_fiber_yield()\n  br label %step_loop\n");
         out.push_str("cleanup:\n  call void @llvm.coro.destroy(ptr %hdl)\n  ret void\n}\n\n");
 
+        out.push_str(
+            "define linkonce_odr i64 @ifa_coro_run_to_completion(ptr %hdl) alwaysinline {\n",
+        );
+        out.push_str("entry:\n  br label %step_loop\n");
+        out.push_str("step_loop:\n  %done = call i1 @llvm.coro.done(ptr %hdl)\n  br i1 %done, label %extract, label %resume_step\n");
+        out.push_str("resume_step:\n  call void @llvm.coro.resume(ptr %hdl)\n  %done_after = call i1 @llvm.coro.done(ptr %hdl)\n  br i1 %done_after, label %extract, label %yield_step\n");
+        out.push_str("yield_step:\n  call void @ifa_rt_fiber_yield()\n  br label %step_loop\n");
+        out.push_str("extract:\n  %slot = call ptr @llvm.coro.promise(ptr %hdl, i32 8, i1 false)\n  %val = load i64, ptr %slot, align 8\n  call void @llvm.coro.destroy(ptr %hdl)\n  ret i64 %val\n}\n\n");
+
         // IFA Stackless Generator Iterator Helpers
         out.push_str("; IFA Stackless Generator Iterator Helpers\n");
         out.push_str(
@@ -1506,6 +1515,9 @@ impl<'a> LlvmIrEmitter<'a> {
         }
 
         if is_coro {
+            out.push_str("coro.final_suspend:\n");
+            out.push_str("  %coro.final_tok = call i8 @llvm.coro.suspend(token none, i1 true)\n");
+            out.push_str("  switch i8 %coro.final_tok, label %coro.susp_ret [ i8 0, label %coro.cleanup i8 1, label %coro.cleanup ]\n");
             out.push_str("coro.cleanup:\n");
             out.push_str("  %coro.mem = call ptr @llvm.coro.free(token %coro.id, ptr %coro.hdl)\n");
             out.push_str("  call void @ifa_rt_gen_free(ptr %coro.mem)\n");
@@ -1900,7 +1912,60 @@ impl<'a> LlvmIrEmitter<'a> {
                         out,
                     );
 
-                    if ret_ty_str == "void" {
+                    let target_fn_opt = module.functions.iter().find(|f| f.name == *name);
+                    let is_target_coro = target_fn_opt.map(|f| f.is_coroutine()).unwrap_or(false);
+
+                    if is_target_coro {
+                        let target_fn = target_fn_opt.unwrap();
+                        out.push_str(&format!(
+                            "  %coro_direct_hdl_{} = call ptr @{}({})\n",
+                            res_id,
+                            callee_name,
+                            args_str.join(", ")
+                        ));
+                        out.push_str(&format!(
+                            "  %coro_raw_res_{} = call i64 @ifa_coro_run_to_completion(ptr %coro_direct_hdl_{})\n",
+                            res_id, res_id
+                        ));
+                        let expected_llvm_ty = fir_to_llvm_type(&target_fn.ret_ty)?;
+                        if expected_llvm_ty == "i64" {
+                            out.push_str(&format!(
+                                "  %v{} = add i64 %coro_raw_res_{}, 0\n",
+                                res_id, res_id
+                            ));
+                        } else if expected_llvm_ty == "ptr" {
+                            out.push_str(&format!(
+                                "  %v{} = inttoptr i64 %coro_raw_res_{} to ptr\n",
+                                res_id, res_id
+                            ));
+                        } else if expected_llvm_ty == "void" {
+                            out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
+                        } else if expected_llvm_ty.starts_with('i') {
+                            out.push_str(&format!(
+                                "  %v{} = trunc i64 %coro_raw_res_{} to {}\n",
+                                res_id, res_id, expected_llvm_ty
+                            ));
+                        } else if expected_llvm_ty == "float" {
+                            out.push_str(&format!(
+                                "  %coro_f32_bits_{} = trunc i64 %coro_raw_res_{} to i32\n",
+                                res_id, res_id
+                            ));
+                            out.push_str(&format!(
+                                "  %v{} = bitcast i32 %coro_f32_bits_{} to float\n",
+                                res_id, res_id
+                            ));
+                        } else if expected_llvm_ty == "double" {
+                            out.push_str(&format!(
+                                "  %v{} = bitcast i64 %coro_raw_res_{} to double\n",
+                                res_id, res_id
+                            ));
+                        } else {
+                            out.push_str(&format!(
+                                "  %v{} = add i64 %coro_raw_res_{}, 0\n",
+                                res_id, res_id
+                            ));
+                        }
+                    } else if ret_ty_str == "void" {
                         out.push_str(&format!(
                             "  call void @{}({})\n",
                             callee_name,
@@ -3034,12 +3099,34 @@ impl<'a> LlvmIrEmitter<'a> {
                         array_allocas,
                         out,
                     );
-                    out.push_str(&format!(
-                        "  call {} @{}({})\n",
-                        ret_ty_str,
-                        callee,
-                        args_str.join(", ")
-                    ));
+                    let is_target_coro = module
+                        .functions
+                        .iter()
+                        .find(|f| f.name == *name)
+                        .map(|f| f.is_coroutine())
+                        .unwrap_or(false);
+
+                    if is_target_coro {
+                        let eff_coro_id = format!("eff_coro_direct_{}", eff_idx);
+                        *eff_idx += 1;
+                        out.push_str(&format!(
+                            "  %{} = call ptr @{}({})\n",
+                            eff_coro_id,
+                            callee,
+                            args_str.join(", ")
+                        ));
+                        out.push_str(&format!(
+                            "  call void @ifa_coro_llvm_run(ptr %{})\n",
+                            eff_coro_id
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  call {} @{}({})\n",
+                            ret_ty_str,
+                            callee,
+                            args_str.join(", ")
+                        ));
+                    }
                 }
             }
             ValueExpr::BlockingCallDirect { name, args } => {
@@ -3588,7 +3675,39 @@ impl<'a> LlvmIrEmitter<'a> {
         match term {
             Terminator::Return(val_opt) => {
                 if is_coro {
-                    out.push_str("  br label %coro.cleanup\n");
+                    if let Some(val) = val_opt {
+                        let llvm_ty = fir_to_llvm_type(ret_ty)?;
+                        if llvm_ty == "i64" {
+                            out.push_str(&format!(
+                                "  store i64 %v{}, ptr %coro.yield_slot, align 8\n",
+                                val.0
+                            ));
+                        } else if llvm_ty == "ptr" {
+                            out.push_str(&format!(
+                                "  %coro_ret_cast_{} = ptrtoint ptr %v{} to i64\n",
+                                val.0, val.0
+                            ));
+                            out.push_str(&format!(
+                                "  store i64 %coro_ret_cast_{}, ptr %coro.yield_slot, align 8\n",
+                                val.0
+                            ));
+                        } else if llvm_ty.starts_with('i') {
+                            out.push_str(&format!(
+                                "  %coro_ret_cast_{} = sext {} %v{} to i64\n",
+                                val.0, llvm_ty, val.0
+                            ));
+                            out.push_str(&format!(
+                                "  store i64 %coro_ret_cast_{}, ptr %coro.yield_slot, align 8\n",
+                                val.0
+                            ));
+                        } else if llvm_ty != "void" {
+                            out.push_str(&format!(
+                                "  store {} %v{}, ptr %coro.yield_slot, align 8\n",
+                                llvm_ty, val.0
+                            ));
+                        }
+                    }
+                    out.push_str("  br label %coro.final_suspend\n");
                     return Ok(());
                 }
                 if is_main_unit {

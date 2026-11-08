@@ -536,3 +536,215 @@ fn test_ipo_non_strict_ffi_remains_impure() {
         "Caller of non-strict extern C must inherit Arbitrary effect"
     );
 }
+
+#[test]
+fn test_ipo_colorless_coroutine_in_place_specialization() {
+    use ifa_fir::{BlockId, FirFunction, FirModule, FirType, Instruction, Terminator, ValueExpr};
+    use ifa_span::Span;
+
+    let mut module = FirModule::new(INTERNER.intern("test_coro_spec_mod"));
+
+    // 1. Define a coroutine function that performs cooperative yields
+    let coro_name = INTERNER.intern("stream_worker");
+    let mut coro_func = FirFunction::new(
+        coro_name,
+        vec![],
+        FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let ret_val = coro_func.alloc_value();
+    let b0 = BlockId(0);
+    let bb0 = coro_func.get_block_mut(b0).unwrap();
+    bb0.push_instruction(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    bb0.push_instruction(Instruction::new(
+        Some(ret_val),
+        ValueExpr::Constant(ifa_fir::ConstantValue::Int(
+            42,
+            ifa_sema::types::IntType::I64,
+        )),
+        Span::DUMMY,
+    ));
+    bb0.set_terminator(Terminator::Return(Some(ret_val)));
+    assert!(coro_func.is_coroutine());
+    module.functions.push(coro_func);
+
+    // 2. Define a caller that directly invokes the coroutine synchronously via CallDirect
+    let caller_name = INTERNER.intern("sync_caller");
+    let mut caller_func = FirFunction::new(
+        caller_name,
+        vec![],
+        FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let call_res = caller_func.alloc_value();
+    let cb0 = BlockId(0);
+    let cbb0 = caller_func.get_block_mut(cb0).unwrap();
+    cbb0.push_instruction(Instruction::new(
+        Some(call_res),
+        ValueExpr::CallDirect {
+            name: coro_name,
+            args: vec![],
+        },
+        Span::DUMMY,
+    ));
+    cbb0.set_terminator(Terminator::Return(Some(call_res)));
+    module.functions.push(caller_func);
+
+    // Run IPO pass
+    let mut ipo_pass = IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    assert_eq!(ipo_pass.stats().coroutines_specialized_sync, 1);
+    assert_eq!(ipo_pass.stats().direct_coroutine_calls_specialized, 1);
+
+    // The coroutine must have been specialized in place into a synchronous function
+    let target = module
+        .functions
+        .iter()
+        .find(|f| f.name == coro_name)
+        .unwrap();
+    assert!(!target.is_coroutine());
+    let has_yield = target.blocks.iter().any(|b| {
+        b.instructions
+            .iter()
+            .any(|i| matches!(i.expr, ValueExpr::Yield | ValueExpr::YieldValue { .. }))
+    });
+    assert!(
+        !has_yield,
+        "Yield instructions must be replaced with ifa_rt_fiber_yield"
+    );
+}
+
+#[test]
+fn test_ipo_colorless_coroutine_cloned_variant_specialization() {
+    use ifa_fir::{BlockId, FirFunction, FirModule, FirType, Instruction, Terminator, ValueExpr};
+    use ifa_span::Span;
+
+    let mut module = FirModule::new(INTERNER.intern("test_coro_dual_mod"));
+
+    // 1. Define a coroutine function
+    let coro_name = INTERNER.intern("hybrid_task");
+    let mut coro_func = FirFunction::new(
+        coro_name,
+        vec![],
+        FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let ret_val = coro_func.alloc_value();
+    let b0 = BlockId(0);
+    let bb0 = coro_func.get_block_mut(b0).unwrap();
+    bb0.push_instruction(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    bb0.push_instruction(Instruction::new(
+        Some(ret_val),
+        ValueExpr::Constant(ifa_fir::ConstantValue::Int(
+            100,
+            ifa_sema::types::IntType::I64,
+        )),
+        Span::DUMMY,
+    ));
+    bb0.set_terminator(Terminator::Return(Some(ret_val)));
+    assert!(coro_func.is_coroutine());
+    module.functions.push(coro_func);
+
+    // 2. Caller A spawns the coroutine asynchronously
+    let async_caller_name = INTERNER.intern("async_launcher");
+    let mut async_caller = FirFunction::new(
+        async_caller_name,
+        vec![],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let spawn_res = async_caller.alloc_value();
+    let ab0 = async_caller.get_block_mut(BlockId(0)).unwrap();
+    ab0.push_instruction(Instruction::new(
+        Some(spawn_res),
+        ValueExpr::Spawn {
+            target: coro_name,
+            args: vec![],
+        },
+        Span::DUMMY,
+    ));
+    ab0.set_terminator(Terminator::Return(None));
+    module.functions.push(async_caller);
+
+    // 3. Caller B directly calls the coroutine synchronously
+    let sync_caller_name = INTERNER.intern("direct_caller");
+    let mut sync_caller = FirFunction::new(
+        sync_caller_name,
+        vec![],
+        FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let direct_call_res = sync_caller.alloc_value();
+    let sb0 = sync_caller.get_block_mut(BlockId(0)).unwrap();
+    sb0.push_instruction(Instruction::new(
+        Some(direct_call_res),
+        ValueExpr::CallDirect {
+            name: coro_name,
+            args: vec![],
+        },
+        Span::DUMMY,
+    ));
+    sb0.set_terminator(Terminator::Return(Some(direct_call_res)));
+    module.functions.push(sync_caller);
+
+    // Run IPO pass
+    let mut ipo_pass = IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    assert_eq!(ipo_pass.stats().coroutines_specialized_sync, 1);
+    assert_eq!(ipo_pass.stats().direct_coroutine_calls_specialized, 1);
+
+    // The original function must remain a coroutine for async spawn
+    let orig = module
+        .functions
+        .iter()
+        .find(|f| f.name == coro_name)
+        .unwrap();
+    assert!(orig.is_coroutine());
+
+    // A specialized sync clone must have been created
+    let sync_clone_name = INTERNER.intern("hybrid_task_direct_sync");
+    let clone_opt = module.functions.iter().find(|f| f.name == sync_clone_name);
+    assert!(clone_opt.is_some(), "Specialized sync clone must exist");
+    let clone = clone_opt.unwrap();
+    assert!(!clone.is_coroutine());
+
+    // The direct caller must have been retargeted to the specialized sync clone
+    let updated_sync_caller = module
+        .functions
+        .iter()
+        .find(|f| f.name == sync_caller_name)
+        .unwrap();
+    let called_target = updated_sync_caller.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|i| {
+            if let ValueExpr::CallDirect { name, .. } = &i.expr {
+                Some(*name)
+            } else {
+                None
+            }
+        });
+    assert_eq!(called_target, Some(sync_clone_name));
+}
