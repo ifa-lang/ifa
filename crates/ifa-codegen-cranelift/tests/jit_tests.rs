@@ -1722,3 +1722,101 @@ fn test_cranelift_jit_strided_bounds_check_safety_elimination() {
     let result = jit.run_main().expect("Failed to execute native main");
     assert_eq!(result, 42);
 }
+
+#[test]
+fn test_cranelift_jit_nonblocking_synchronized_channel_state_machine() {
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let b0 = BlockId(0);
+    let mut bb0 = BasicBlock::new(b0);
+
+    let v_cap = ValueId(0);
+    let v_chan = ValueId(1);
+    let v_send_val = ValueId(2);
+    let v_send_res = ValueId(3);
+    let v_recv_val = ValueId(4);
+
+    // 1. Capacity = 4
+    bb0.instructions.push(Instruction::new(
+        Some(v_cap),
+        ValueExpr::Constant(ConstantValue::Int(4, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    // 2. ChanCreate
+    bb0.instructions.push(Instruction::new(
+        Some(v_chan),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(ifa_sema::types::IntType::I64),
+            capacity: Some(v_cap),
+        },
+        Span::DUMMY,
+    ));
+
+    // 3. Send payload 777 using non-blocking ChanTrySend
+    bb0.instructions.push(Instruction::new(
+        Some(v_send_val),
+        ValueExpr::Constant(ConstantValue::Int(777, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(v_send_res),
+        ValueExpr::ChanTrySend {
+            chan: v_chan,
+            val: v_send_val,
+        },
+        Span::DUMMY,
+    ));
+
+    // 4. Non-blocking ChanTryRecv
+    bb0.instructions.push(Instruction::new(
+        Some(v_recv_val),
+        ValueExpr::ChanTryRecv { chan: v_chan },
+        Span::DUMMY,
+    ));
+
+    // 5. ChanClose
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::ChanClose { chan: v_chan },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(v_recv_val)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("channel_sync_jit_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile FIR with non-blocking synchronized channel to Cranelift JIT");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 777,
+        "Non-blocking synchronized channel must successfully transmit 777"
+    );
+}

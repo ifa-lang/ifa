@@ -1055,6 +1055,7 @@ impl VectorizePass {
                         | ValueExpr::Spawn { .. }
                         | ValueExpr::ChanCreate { .. }
                         | ValueExpr::ChanSend { .. }
+                        | ValueExpr::ChanTrySend { .. }
                         | ValueExpr::ChanRecv { .. }
                         | ValueExpr::ChanTryRecv { .. }
                         | ValueExpr::ChanClose { .. }

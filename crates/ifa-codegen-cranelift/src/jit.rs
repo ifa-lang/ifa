@@ -73,12 +73,25 @@ impl JitEngine {
             ifa_rt_channel_destroy as *const u8,
         );
         builder.symbol("ifa_rt_channel_send", ifa_rt_channel_send as *const u8);
+        builder.symbol(
+            "ifa_rt_channel_try_send",
+            ifa_rt_channel_try_send as *const u8,
+        );
         builder.symbol("ifa_rt_channel_recv", ifa_rt_channel_recv as *const u8);
         builder.symbol(
             "ifa_rt_channel_try_recv",
             ifa_rt_channel_try_recv as *const u8,
         );
         builder.symbol("ifa_rt_channel_close", ifa_rt_channel_close as *const u8);
+        builder.symbol(
+            "ifa_rt_channel_is_closed",
+            ifa_rt_channel_is_closed as *const u8,
+        );
+        builder.symbol("ifa_rt_channel_len", ifa_rt_channel_len as *const u8);
+        builder.symbol(
+            "ifa_rt_channel_capacity",
+            ifa_rt_channel_capacity as *const u8,
+        );
         builder.symbol("ifa_rt_channel_select", ifa_rt_channel_select as *const u8);
         builder.symbol("ifa_rt_string_concat", ifa_rt_string_concat as *const u8);
         builder.symbol(
@@ -251,6 +264,55 @@ impl JitEngine {
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids
             .insert("ifa_rt_channel_try_recv".into(), chan_try_recv_id);
+
+        let mut chan_try_send_sig = Signature::new(call_conv);
+        chan_try_send_sig.params.push(AbiParam::new(ptr_type));
+        chan_try_send_sig.params.push(AbiParam::new(ptr_type));
+        chan_try_send_sig.returns.push(AbiParam::new(types::I32));
+        let chan_try_send_id = self
+            .module
+            .declare_function(
+                "ifa_rt_channel_try_send",
+                Linkage::Import,
+                &chan_try_send_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_try_send".into(), chan_try_send_id);
+
+        let mut chan_is_closed_sig = Signature::new(call_conv);
+        chan_is_closed_sig.params.push(AbiParam::new(ptr_type));
+        chan_is_closed_sig.returns.push(AbiParam::new(types::I32));
+        let chan_is_closed_id = self
+            .module
+            .declare_function(
+                "ifa_rt_channel_is_closed",
+                Linkage::Import,
+                &chan_is_closed_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_is_closed".into(), chan_is_closed_id);
+
+        let mut chan_len_sig = Signature::new(call_conv);
+        chan_len_sig.params.push(AbiParam::new(ptr_type));
+        chan_len_sig.returns.push(AbiParam::new(types::I64));
+        let chan_len_id = self
+            .module
+            .declare_function("ifa_rt_channel_len", Linkage::Import, &chan_len_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_len".into(), chan_len_id);
+
+        let mut chan_cap_sig = Signature::new(call_conv);
+        chan_cap_sig.params.push(AbiParam::new(ptr_type));
+        chan_cap_sig.returns.push(AbiParam::new(types::I64));
+        let chan_cap_id = self
+            .module
+            .declare_function("ifa_rt_channel_capacity", Linkage::Import, &chan_cap_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_capacity".into(), chan_cap_id);
 
         let mut chan_close_sig = Signature::new(call_conv);
         chan_close_sig.params.push(AbiParam::new(ptr_type));

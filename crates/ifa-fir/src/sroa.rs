@@ -1015,7 +1015,7 @@ impl SroaPass {
                     replace(cap);
                 }
             }
-            ValueExpr::ChanSend { chan, val } => {
+            ValueExpr::ChanSend { chan, val } | ValueExpr::ChanTrySend { chan, val } => {
                 replace(chan);
                 replace(val);
             }

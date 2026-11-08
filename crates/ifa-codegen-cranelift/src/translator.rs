@@ -912,6 +912,21 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 }
             }
 
+            ValueExpr::ChanTrySend { chan, val } => {
+                let ch = self.value_map[chan];
+                let v = self.value_map[val];
+                if let Some(func_id) = self.func_ids.get("ifa_rt_channel_try_send") {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    let call = self.builder.ins().call(local_func, &[ch, v]);
+                    let results = self.builder.inst_results(call);
+                    results.first().copied()
+                } else {
+                    None
+                }
+            }
+
             ValueExpr::ChanRecv { chan } => {
                 let ch = self.value_map[chan];
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(

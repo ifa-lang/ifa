@@ -2245,7 +2245,7 @@ impl<'a> FirInterpreter<'a> {
                 self.channels.insert(id, VecDeque::new());
                 Ok(FirValue::Int(id as i128))
             }
-            ValueExpr::ChanSend { chan, val } => {
+            ValueExpr::ChanSend { chan, val } | ValueExpr::ChanTrySend { chan, val } => {
                 let cid = match env.get(chan) {
                     Some(FirValue::Int(id)) => *id as u64,
                     _ => 0,

@@ -136,6 +136,8 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i32 @ifa_rt_channel_try_recv(ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_channel_close(ptr)\n");
             out.push_str("declare i32 @ifa_rt_channel_is_closed(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_channel_len(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_channel_capacity(ptr)\n");
             out.push_str("declare i64 @ifa_rt_channel_select(ptr, i64, i32)\n");
             out.push_str("declare i64 @ifa_rt_channel_select_table(ptr)\n");
             out.push_str("declare i64 @ifa_rt_channel_select_wait_table(ptr)\n");
@@ -199,6 +201,8 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i32 @ifa_rt_channel_try_recv(ptr, ptr)\n");
             out.push_str("declare void @ifa_rt_channel_close(ptr)\n");
             out.push_str("declare i32 @ifa_rt_channel_is_closed(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_channel_len(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_channel_capacity(ptr)\n");
             out.push_str("declare i64 @ifa_rt_channel_select(ptr, i64, i32)\n");
             out.push_str("declare i64 @ifa_rt_channel_select_table(ptr)\n");
             out.push_str("declare i64 @ifa_rt_channel_select_wait_table(ptr)\n");
@@ -3086,6 +3090,35 @@ impl<'a> LlvmIrEmitter<'a> {
                     }
                 }
             }
+            ValueExpr::ChanTrySend { chan, val } => {
+                let is_val_ptr = matches!(
+                    value_types.get(val),
+                    Some(ifa_fir::FirType::Pointer(_))
+                        | Some(ifa_fir::FirType::GenerationalRef(_))
+                        | Some(ifa_fir::FirType::Str)
+                        | Some(ifa_fir::FirType::String)
+                        | Some(ifa_fir::FirType::Struct(..))
+                        | Some(ifa_fir::FirType::Enum(..))
+                        | Some(ifa_fir::FirType::Array(..))
+                        | Some(ifa_fir::FirType::Slice(..))
+                        | Some(ifa_fir::FirType::Channel(_))
+                        | Some(ifa_fir::FirType::Unit)
+                );
+                let val_ptr_expr = if is_val_ptr {
+                    format!("%v{}", val.0)
+                } else {
+                    let cast_val = format!("%chan_try_val_cast_{}", val.0);
+                    out.push_str(&format!(
+                        "  {} = inttoptr i64 %v{} to ptr\n",
+                        cast_val, val.0
+                    ));
+                    cast_val
+                };
+                out.push_str(&format!(
+                    "  %v{} = call i32 @ifa_rt_channel_try_send(ptr %v{}, ptr {})\n",
+                    res_id, chan.0, val_ptr_expr
+                ));
+            }
             ValueExpr::ChanSelect {
                 channels,
                 has_default,
@@ -4298,6 +4331,37 @@ impl<'a> LlvmIrEmitter<'a> {
                         chan.0, val_ptr_expr
                     ));
                 }
+            }
+            ValueExpr::ChanTrySend { chan, val } => {
+                let is_val_ptr = matches!(
+                    value_types.get(val),
+                    Some(ifa_fir::FirType::Pointer(_))
+                        | Some(ifa_fir::FirType::GenerationalRef(_))
+                        | Some(ifa_fir::FirType::Str)
+                        | Some(ifa_fir::FirType::String)
+                        | Some(ifa_fir::FirType::Struct(..))
+                        | Some(ifa_fir::FirType::Enum(..))
+                        | Some(ifa_fir::FirType::Array(..))
+                        | Some(ifa_fir::FirType::Slice(..))
+                        | Some(ifa_fir::FirType::Channel(_))
+                        | Some(ifa_fir::FirType::Unit)
+                );
+                let val_ptr_expr = if is_val_ptr {
+                    format!("%v{}", val.0)
+                } else {
+                    let cast_val = format!("%chan_try_eff_val_cast_{}_{}", eff_idx, val.0);
+                    out.push_str(&format!(
+                        "  {} = inttoptr i64 %v{} to ptr\n",
+                        cast_val, val.0
+                    ));
+                    cast_val
+                };
+                let id = *eff_idx;
+                *eff_idx += 1;
+                out.push_str(&format!(
+                    "  %chan_try_ign_{} = call i32 @ifa_rt_channel_try_send(ptr %v{}, ptr {})\n",
+                    id, chan.0, val_ptr_expr
+                ));
             }
             ValueExpr::ChanClose { chan } => {
                 out.push_str(&format!(

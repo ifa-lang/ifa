@@ -1353,6 +1353,26 @@ pub extern "C" fn ifa_rt_channel_is_closed(chan: *mut IfaChannelHandle) -> i32 {
     }
 }
 
+/// Query the number of elements currently queued in the channel.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_len(chan: *mut IfaChannelHandle) -> i64 {
+    if chan.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*chan };
+    handle.0.len() as i64
+}
+
+/// Query the capacity of the channel buffer.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_capacity(chan: *mut IfaChannelHandle) -> i64 {
+    if chan.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*chan };
+    handle.0.capacity() as i64
+}
+
 /// Operation mode for a zero-allocation select wait entry.
 pub const IFA_SELECT_OP_RECV: u32 = 0;
 pub const IFA_SELECT_OP_SEND: u32 = 1;

@@ -98,62 +98,131 @@ int32_t ifa_rt_coro_iter_next(void* iter, void* out) { (void)iter; (void)out; re
 int32_t ifa_rt_coro_iter_is_done(void* iter) { (void)iter; return 1; }
 void ifa_rt_coro_iter_destroy(void* iter) { (void)iter; }
 
-typedef struct ifa_channel_stub {
-    void* val;
-    int has_val;
-    int closed;
-} ifa_channel_stub_t;
+#include <stdatomic.h>
+
+#define IFA_CHAN_STATE_OPEN 0
+#define IFA_CHAN_STATE_CLOSED 1
+
+typedef struct ifa_channel_sync {
+    void** buffer;
+    size_t capacity;
+    _Atomic size_t head;
+    _Atomic size_t tail;
+    _Atomic size_t count;
+    _Atomic int state;
+} ifa_channel_sync_t;
 
 void* ifa_rt_channel_create(size_t capacity) {
-    (void)capacity;
-    ifa_channel_stub_t* c = (ifa_channel_stub_t*)calloc(1, sizeof(ifa_channel_stub_t));
+    ifa_channel_sync_t* c = (ifa_channel_sync_t*)calloc(1, sizeof(ifa_channel_sync_t));
+    if (!c) return NULL;
+    size_t cap = capacity == 0 ? 1 : capacity;
+    c->buffer = (void**)calloc(cap, sizeof(void*));
+    c->capacity = cap;
+    atomic_init(&c->head, 0);
+    atomic_init(&c->tail, 0);
+    atomic_init(&c->count, 0);
+    atomic_init(&c->state, IFA_CHAN_STATE_OPEN);
     return c;
 }
 
 void ifa_rt_channel_destroy(void* chan) {
-    if (chan) free(chan);
+    if (!chan) return;
+    ifa_channel_sync_t* c = (ifa_channel_sync_t*)chan;
+    if (c->buffer) free(c->buffer);
+    free(c);
+}
+
+int32_t ifa_rt_channel_try_send(void* chan, void* val) {
+    if (!chan) return -1;
+    ifa_channel_sync_t* c = (ifa_channel_sync_t*)chan;
+    if (atomic_load(&c->state) == IFA_CHAN_STATE_CLOSED) return -2;
+
+    size_t cur_cnt = atomic_load(&c->count);
+    while (cur_cnt < c->capacity) {
+        if (atomic_compare_exchange_weak(&c->count, &cur_cnt, cur_cnt + 1)) {
+            size_t tail_idx = atomic_fetch_add(&c->tail, 1) % c->capacity;
+            c->buffer[tail_idx] = val;
+            return 0; // Success
+        }
+        if (atomic_load(&c->state) == IFA_CHAN_STATE_CLOSED) return -2;
+    }
+    return 1; // Channel is full (non-blocking backpressure)
 }
 
 int32_t ifa_rt_channel_send(void* chan, void* val) {
     if (!chan) return -1;
-    ifa_channel_stub_t* c = (ifa_channel_stub_t*)chan;
-    if (c->closed) return -2;
-    c->val = val;
-    c->has_val = 1;
-    return 0;
+    while (1) {
+        int32_t res = ifa_rt_channel_try_send(chan, val);
+        if (res != 1) return res;
+        ifa_rt_fiber_yield();
+    }
+}
+
+int32_t ifa_rt_channel_try_recv(void* chan, void** out_val) {
+    if (!chan || !out_val) return -1;
+    ifa_channel_sync_t* c = (ifa_channel_sync_t*)chan;
+
+    size_t cur_cnt = atomic_load(&c->count);
+    while (cur_cnt > 0) {
+        if (atomic_compare_exchange_weak(&c->count, &cur_cnt, cur_cnt - 1)) {
+            size_t head_idx = atomic_fetch_add(&c->head, 1) % c->capacity;
+            *out_val = c->buffer[head_idx];
+            return 0; // Success
+        }
+    }
+    if (atomic_load(&c->state) == IFA_CHAN_STATE_CLOSED) {
+        *out_val = NULL;
+        return -2; // Closed and empty
+    }
+    *out_val = NULL;
+    return 1; // Empty (non-blocking)
 }
 
 int32_t ifa_rt_channel_recv(void* chan, void** out_val) {
     if (!chan || !out_val) return -1;
-    ifa_channel_stub_t* c = (ifa_channel_stub_t*)chan;
-    if (c->has_val) {
-        *out_val = c->val;
-        c->has_val = 0;
-        return 0;
+    while (1) {
+        int32_t res = ifa_rt_channel_try_recv(chan, out_val);
+        if (res != 1) return res;
+        ifa_rt_fiber_yield();
     }
-    if (c->closed) return -2;
-    *out_val = NULL;
-    return 0;
-}
-
-int32_t ifa_rt_channel_try_recv(void* chan, void** out_val) {
-    return ifa_rt_channel_recv(chan, out_val);
 }
 
 void ifa_rt_channel_close(void* chan) {
     if (!chan) return;
-    ifa_channel_stub_t* c = (ifa_channel_stub_t*)chan;
-    c->closed = 1;
+    ifa_channel_sync_t* c = (ifa_channel_sync_t*)chan;
+    atomic_store(&c->state, IFA_CHAN_STATE_CLOSED);
+}
+
+int32_t ifa_rt_channel_is_closed(void* chan) {
+    if (!chan) return 1;
+    ifa_channel_sync_t* c = (ifa_channel_sync_t*)chan;
+    return atomic_load(&c->state) == IFA_CHAN_STATE_CLOSED ? 1 : 0;
+}
+
+int64_t ifa_rt_channel_len(void* chan) {
+    if (!chan) return 0;
+    ifa_channel_sync_t* c = (ifa_channel_sync_t*)chan;
+    return (int64_t)atomic_load(&c->count);
+}
+
+int64_t ifa_rt_channel_capacity(void* chan) {
+    if (!chan) return 0;
+    ifa_channel_sync_t* c = (ifa_channel_sync_t*)chan;
+    return (int64_t)c->capacity;
 }
 
 int64_t ifa_rt_channel_select(void** channels, size_t num_channels, int32_t has_default) {
     if (!channels || num_channels == 0) return has_default ? 0 : -2;
+    int any_open = 0;
     for (size_t i = 0; i < num_channels; i++) {
-        ifa_channel_stub_t* c = (ifa_channel_stub_t*)channels[i];
-        if (c && c->has_val) return (int64_t)i;
+        if (!channels[i]) continue;
+        ifa_channel_sync_t* c = (ifa_channel_sync_t*)channels[i];
+        if (atomic_load(&c->count) > 0) return (int64_t)i;
+        if (atomic_load(&c->state) != IFA_CHAN_STATE_CLOSED) any_open = 1;
     }
     if (has_default) return (int64_t)num_channels;
-    return 0;
+    if (!any_open) return -2;
+    return -1;
 }
 
 typedef struct {
@@ -522,6 +591,81 @@ impl AotCompiler {
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids
             .insert("ifa_rt_channel_try_recv".into(), chan_try_recv_id);
+
+        let mut chan_try_send_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        chan_try_send_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_try_send_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_try_send_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+        let chan_try_send_id = self
+            .module
+            .declare_function(
+                "ifa_rt_channel_try_send",
+                Linkage::Import,
+                &chan_try_send_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_try_send".into(), chan_try_send_id);
+
+        let mut chan_is_closed_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        chan_is_closed_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_is_closed_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+        let chan_is_closed_id = self
+            .module
+            .declare_function(
+                "ifa_rt_channel_is_closed",
+                Linkage::Import,
+                &chan_is_closed_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_is_closed".into(), chan_is_closed_id);
+
+        let mut chan_len_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        chan_len_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_len_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        let chan_len_id = self
+            .module
+            .declare_function("ifa_rt_channel_len", Linkage::Import, &chan_len_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_len".into(), chan_len_id);
+
+        let mut chan_cap_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        chan_cap_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_cap_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        let chan_cap_id = self
+            .module
+            .declare_function("ifa_rt_channel_capacity", Linkage::Import, &chan_cap_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_capacity".into(), chan_cap_id);
 
         let mut chan_close_sig = cranelift_codegen::ir::Signature::new(call_conv);
         chan_close_sig

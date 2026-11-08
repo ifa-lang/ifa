@@ -427,6 +427,9 @@ impl<'a> FirPrinter<'a> {
             ValueExpr::ChanSend { chan, val } => {
                 write!(self.output, "chan.send {}, {}", chan, val)
             }
+            ValueExpr::ChanTrySend { chan, val } => {
+                write!(self.output, "chan.try_send {}, {}", chan, val)
+            }
             ValueExpr::ChanRecv { chan } => write!(self.output, "chan.recv {}", chan),
             ValueExpr::ChanTryRecv { chan } => write!(self.output, "chan.try_recv {}", chan),
             ValueExpr::ChanClose { chan } => write!(self.output, "chan.close {}", chan),

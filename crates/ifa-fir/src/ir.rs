@@ -287,6 +287,10 @@ pub enum ValueExpr {
         chan: ValueId,
         val: ValueId,
     },
+    ChanTrySend {
+        chan: ValueId,
+        val: ValueId,
+    },
     ChanRecv {
         chan: ValueId,
     },
@@ -380,7 +384,9 @@ impl ValueExpr {
             ValueExpr::CallArenaRewind { mark } => vec![*mark],
             ValueExpr::Spawn { args, .. } => args.clone(),
             ValueExpr::ChanCreate { capacity, .. } => capacity.iter().copied().collect(),
-            ValueExpr::ChanSend { chan, val } => vec![*chan, *val],
+            ValueExpr::ChanSend { chan, val } | ValueExpr::ChanTrySend { chan, val } => {
+                vec![*chan, *val]
+            }
             ValueExpr::ChanRecv { chan }
             | ValueExpr::ChanTryRecv { chan }
             | ValueExpr::ChanClose { chan } => vec![*chan],

@@ -1377,6 +1377,15 @@ impl<T> Channel<T> {
             false
         }
     }
+
+    /// Configured buffer capacity of the channel (0 if synchronous rendezvous or unbounded).
+    pub fn capacity(&self) -> usize {
+        if let Some(ring) = &self.ring {
+            ring.capacity()
+        } else {
+            0
+        }
+    }
 }
 
 impl<T> Default for Channel<T> {

@@ -283,6 +283,16 @@ void ifa_rt_channel_close(ifa_channel_handle_t* chan);
  */
 int32_t ifa_rt_channel_is_closed(ifa_channel_handle_t* chan);
 
+/**
+ * Query the number of elements queued in the channel buffer.
+ */
+int64_t ifa_rt_channel_len(ifa_channel_handle_t* chan);
+
+/**
+ * Query the capacity of the channel buffer.
+ */
+int64_t ifa_rt_channel_capacity(ifa_channel_handle_t* chan);
+
 #define IFA_SELECT_OP_RECV 0
 #define IFA_SELECT_OP_SEND 1
 

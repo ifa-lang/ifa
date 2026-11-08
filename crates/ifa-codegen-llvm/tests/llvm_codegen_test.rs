@@ -4970,3 +4970,74 @@ fn test_llvm_coroutine_generator_stream_licm_gen_check_elimination() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_codegen_channel_try_send_nonblocking() {
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let fn_name = INTERNER.intern("channel_try_send_test");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(IntType::I32),
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    let ch = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(ch),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+
+    let val = ValueId(2);
+    bb0.instructions.push(Instruction::new(
+        Some(val),
+        ValueExpr::Constant(ConstantValue::Int(42, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    let try_send_res = ValueId(3);
+    bb0.instructions.push(Instruction::new(
+        Some(try_send_res),
+        ValueExpr::ChanTrySend { chan: ch, val },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(try_send_res)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("try_send_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+    assert!(
+        ir.contains("call i32 @ifa_rt_channel_try_send(ptr %v1, ptr %chan_try_val_cast_2)"),
+        "LLVM IR should emit ifa_rt_channel_try_send call: \n{}",
+        ir
+    );
+    assert!(ir.contains("declare i32 @ifa_rt_channel_try_send(ptr, ptr)"));
+}
