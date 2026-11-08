@@ -47,6 +47,26 @@ impl FreeOperation {
     }
 }
 
+/// Helper determining whether any freeing operation potentially interferes with `ref_val`.
+fn is_interfering_free(
+    free_operations: &[FreeOperation],
+    ref_val: ValueId,
+    ref_arena: Option<u16>,
+    aliases: &HashMap<ValueId, ValueId>,
+    alloca_values: &HashSet<ValueId>,
+) -> bool {
+    let canon_ref = canonical_ref(ref_val, aliases);
+    // Stack-allocated alloca pointers reside on the function/coroutine frame and can never
+    // be invalidated by heap or arena freeing operations.
+    if alloca_values.contains(&ref_val) || alloca_values.contains(&canon_ref) {
+        return false;
+    }
+
+    free_operations
+        .iter()
+        .any(|op| op.interferes_with_ref(ref_val, ref_arena, aliases))
+}
+
 /// Analysis context bundled for dominance-based generational check elimination.
 struct DominanceContext<'a> {
     cfg: &'a ControlFlowGraph,
@@ -325,13 +345,27 @@ impl GenerationalDataflowAnalysis {
                 }
             }
         }
+        for block in &cx.func.blocks {
+            for inst in &block.instructions {
+                if let ValueExpr::GenRef { ptr } = &inst.expr {
+                    let canon_ptr = canonical_ref(*ptr, cx.aliases);
+                    if alloca_values.contains(ptr) || alloca_values.contains(&canon_ptr) {
+                        if let Some(res) = inst.result {
+                            alloca_values.insert(res);
+                            alloca_values.insert(canonical_ref(res, cx.aliases));
+                        }
+                    }
+                }
+            }
+        }
 
         let is_func_lambda = INTERNER.resolve(&cx.func.name).starts_with("__ifa_lambda_");
         let env_param_val = cx.func.params.first().map(|p| p.val);
+        let func_params: HashSet<ValueId> = cx.func.params.iter().map(|p| p.val).collect();
 
         // 2. Initial facts available at function entry
         let mut entry_in: HashSet<ValueId> = HashSet::new();
-        entry_in.extend(alloca_values);
+        entry_in.extend(alloca_values.clone());
 
         for (p_idx, p) in cx.func.params.iter().enumerate() {
             if cx.safe_params.contains(&(cx.func.name, p_idx)) {
@@ -541,6 +575,11 @@ impl GenerationalDataflowAnalysis {
                                 };
                                 cur.retain(|&val| {
                                     let val_canon = canonical_ref(val, cx.aliases);
+                                    if alloca_values.contains(&val)
+                                        || alloca_values.contains(&val_canon)
+                                    {
+                                        return true;
+                                    }
                                     let val_arena = cx
                                         .val_arenas
                                         .get(&val)
@@ -563,6 +602,11 @@ impl GenerationalDataflowAnalysis {
                                 };
                                 cur.retain(|&val| {
                                     let val_canon = canonical_ref(val, cx.aliases);
+                                    if alloca_values.contains(&val)
+                                        || alloca_values.contains(&val_canon)
+                                    {
+                                        return true;
+                                    }
                                     let val_arena = cx
                                         .val_arenas
                                         .get(&val)
@@ -579,6 +623,12 @@ impl GenerationalDataflowAnalysis {
                                 if callee_frees {
                                     cur.retain(|&val| {
                                         let val_canon = canonical_ref(val, cx.aliases);
+                                        // Alloca pointers reside on the caller's stack/frame and cannot be freed by callee
+                                        if alloca_values.contains(&val)
+                                            || alloca_values.contains(&val_canon)
+                                        {
+                                            return true;
+                                        }
                                         let val_arena = cx
                                             .val_arenas
                                             .get(&val)
@@ -608,12 +658,49 @@ impl GenerationalDataflowAnalysis {
                             } => {
                                 cur.retain(|&val| {
                                     let val_canon = canonical_ref(val, cx.aliases);
+
+                                    // 1. Stack frame / coroutine-local frame allocations strictly survive suspensions
+                                    if alloca_values.contains(&val)
+                                        || alloca_values.contains(&val_canon)
+                                    {
+                                        return true;
+                                    }
+
                                     let val_arena = cx
                                         .val_arenas
                                         .get(&val)
                                         .or_else(|| cx.val_arenas.get(&val_canon))
                                         .copied();
-                                    val_arena.is_some_and(|a| a > 0)
+
+                                    // If any explicit or callee freeing operation interferes, invalidate the reference
+                                    let interferes = is_interfering_free(
+                                        cx.free_operations,
+                                        val,
+                                        val_arena,
+                                        cx.aliases,
+                                        &alloca_values,
+                                    );
+
+                                    if interferes {
+                                        return false;
+                                    }
+
+                                    // 2. Formal parameters (guaranteed alive by caller over coroutine execution scope)
+                                    if func_params.contains(&val)
+                                        || func_params.contains(&val_canon)
+                                        || cx.safe_params.iter().any(|(f, _)| *f == cx.func.name)
+                                    {
+                                        return true;
+                                    }
+
+                                    // 3. Isolated non-zero memory arenas
+                                    if val_arena.is_some_and(|a| a > 0) {
+                                        return true;
+                                    }
+
+                                    // 4. Invariant dominance: if no freeing operation can touch this reference anywhere
+                                    // in the coroutine or invoked callees, the reference is invariant across suspension.
+                                    !interferes
                                 });
                             }
                             _ => {}
@@ -1250,6 +1337,7 @@ impl GenerationalOptPass {
     /// Identifies natural loops and hoists invariant `GenCheck` instructions into loop preheaders
     /// taking into account memory arena disjointness.
     fn hoist_loop_invariant_checks(&mut self, func: &mut FirFunction, cx: &LoopHoistContext<'_>) {
+        let is_coroutine = func.is_coroutine();
         let loops = Self::find_natural_loops(cx.cfg, cx.dom_tree);
         let param_values: HashSet<ValueId> = func.params.iter().map(|p| p.val).collect();
 
@@ -1365,6 +1453,9 @@ impl GenerationalOptPass {
                                 {
                                     *redundant = true;
                                     self.stats.eliminated_checks += 1;
+                                    if is_coroutine {
+                                        self.stats.coroutine_sync_barriers_eliminated += 1;
+                                    }
                                 }
                             }
                         }

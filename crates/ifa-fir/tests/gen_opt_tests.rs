@@ -1521,3 +1521,510 @@ fn test_confluent_loop_strip_redundant_checks_preserves_semantics() {
     // i=5: 5%3!=0 -> acc=13 + 2 + 1 = 16
     assert_eq!(res, FirValue::Int(16));
 }
+
+#[test]
+fn test_coroutine_dominance_invariant_propagation_across_yield() {
+    use ifa_ast::ParamMode;
+    use ifa_fir::ir::*;
+    use ifa_fir::types::FirType;
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("coro_param_invariant");
+    let param_val = ValueId(0);
+    let param = FirParam {
+        name: INTERNER.intern("data_ref"),
+        val: param_val,
+        ty: FirType::GenerationalRef(Box::new(FirType::Int(IntType::I64))),
+        mode: ParamMode::In,
+        noalias: true,
+    };
+
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![param],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+
+    let b0 = func.entry_block;
+    let b1 = func.alloc_block();
+
+    // Block 0: Dominant initial check on param, then suspend via Yield
+    let chk0 = func.alloc_value();
+    let b0_mut = func.get_block_mut(b0).unwrap();
+    b0_mut.instructions.push(Instruction::new(
+        Some(chk0),
+        ValueExpr::GenCheck {
+            ref_val: param_val,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    b0_mut
+        .instructions
+        .push(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    b0_mut.set_terminator(Terminator::Branch {
+        target: b1,
+        args: Vec::new(),
+    });
+
+    // Block 1 (post-suspension resumption): second check on param, deref and return
+    let chk1 = func.alloc_value();
+    let deref_val = func.alloc_value();
+    let b1_mut = func.get_block_mut(b1).unwrap();
+    b1_mut.instructions.push(Instruction::new(
+        Some(chk1),
+        ValueExpr::GenCheck {
+            ref_val: param_val,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    b1_mut.instructions.push(Instruction::new(
+        Some(deref_val),
+        ValueExpr::GenDeref { ref_val: param_val },
+        Span::DUMMY,
+    ));
+    b1_mut.set_terminator(Terminator::Return(Some(deref_val)));
+
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_function(&mut func);
+
+    let stats = gce.stats();
+    assert_eq!(stats.total_checks, 2, "Expected 2 total checks");
+    assert_eq!(
+        stats.eliminated_checks, 1,
+        "Post-yield check must be statically eliminated"
+    );
+    assert!(
+        stats.coroutine_sync_barriers_eliminated >= 1,
+        "Coroutine sync barrier must be recorded as eliminated: {:?}",
+        stats
+    );
+
+    // Verify block 1 check is marked redundant
+    let b1_ref = func.get_block(b1).unwrap();
+    let b1_check_redundant = b1_ref.instructions.iter().find_map(|inst| {
+        if let ValueExpr::GenCheck { redundant, .. } = inst.expr {
+            Some(redundant)
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        b1_check_redundant,
+        Some(true),
+        "Post-yield check in Block 1 must be redundant"
+    );
+}
+
+#[test]
+fn test_generator_loop_dominance_propagation_across_yield_value() {
+    use ifa_ast::ParamMode;
+    use ifa_fir::ir::*;
+    use ifa_fir::types::FirType;
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("gen_stream_loop");
+    let stream_val = ValueId(0);
+    let param = FirParam {
+        name: INTERNER.intern("stream"),
+        val: stream_val,
+        ty: FirType::GenerationalRef(Box::new(FirType::Int(IntType::I64))),
+        mode: ParamMode::In,
+        noalias: true,
+    };
+
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![param],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+
+    let b_entry = func.entry_block;
+    let b_preheader = func.alloc_block();
+    let b_header = func.alloc_block();
+    let b_body = func.alloc_block();
+    let b_exit = func.alloc_block();
+
+    func.get_block_mut(b_entry)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_preheader,
+            args: Vec::new(),
+        });
+    func.get_block_mut(b_preheader)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_header,
+            args: Vec::new(),
+        });
+
+    let v_cond = func.alloc_value();
+    func.get_block_mut(b_header)
+        .unwrap()
+        .set_terminator(Terminator::BranchCond {
+            cond: v_cond,
+            then_block: b_body,
+            then_args: Vec::new(),
+            else_block: b_exit,
+            else_args: Vec::new(),
+        });
+
+    // Body contains check, yield value, and another check after yield
+    let body_bb = func.get_block_mut(b_body).unwrap();
+    body_bb.instructions.push(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: stream_val,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_bb.instructions.push(Instruction::new(
+        None,
+        ValueExpr::YieldValue { val: stream_val },
+        Span::DUMMY,
+    ));
+    body_bb.instructions.push(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: stream_val,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_bb.set_terminator(Terminator::Branch {
+        target: b_header,
+        args: Vec::new(),
+    });
+
+    func.get_block_mut(b_exit)
+        .unwrap()
+        .set_terminator(Terminator::Return(None));
+
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_function(&mut func);
+
+    let stats = gce.stats();
+    assert!(
+        stats.eliminated_checks >= 2,
+        "Both inside-loop checks must be eliminated via hoisting/dataflow: {:?}",
+        stats
+    );
+    assert!(
+        stats.coroutine_sync_barriers_eliminated >= 1,
+        "Coroutine sync barriers must be counted: {:?}",
+        stats
+    );
+
+    // Verify body contains no active GenCheck
+    let body_final = func.get_block(b_body).unwrap();
+    let active_body_checks = body_final
+        .instructions
+        .iter()
+        .filter(|inst| {
+            matches!(
+                inst.expr,
+                ValueExpr::GenCheck {
+                    redundant: false,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        active_body_checks, 0,
+        "No active GenCheck should remain in generator loop body"
+    );
+}
+
+#[test]
+fn test_coroutine_alloca_frame_invariant_across_multiple_yields_and_frees() {
+    use ifa_fir::ir::*;
+    use ifa_fir::types::FirType;
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("coro_alloca_isolation");
+    let mut func = FirFunction::new(
+        fn_name,
+        Vec::new(),
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+
+    let b0 = func.entry_block;
+    let b1 = func.alloc_block();
+
+    let alloca_val = func.alloc_value();
+    let alloca_ref = func.alloc_value();
+    let heap_alloc = func.alloc_value();
+    let heap_ref = func.alloc_value();
+
+    let b0_mut = func.get_block_mut(b0).unwrap();
+    // 1. Stack alloca
+    b0_mut.instructions.push(Instruction::new(
+        Some(alloca_val),
+        ValueExpr::Alloca {
+            ty: FirType::Int(IntType::I64),
+            name: None,
+        },
+        Span::DUMMY,
+    ));
+    b0_mut.instructions.push(Instruction::new(
+        Some(alloca_ref),
+        ValueExpr::GenRef { ptr: alloca_val },
+        Span::DUMMY,
+    ));
+    // 2. Heap alloc in Arena 2
+    b0_mut.instructions.push(Instruction::new(
+        Some(heap_alloc),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(2),
+        },
+        Span::DUMMY,
+    ));
+    b0_mut.instructions.push(Instruction::new(
+        Some(heap_ref),
+        ValueExpr::GenRef { ptr: heap_alloc },
+        Span::DUMMY,
+    ));
+    // Check alloca_ref and heap_ref in b0
+    b0_mut.instructions.push(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: alloca_ref,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    b0_mut.instructions.push(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: heap_ref,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    // Yield
+    b0_mut
+        .instructions
+        .push(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    b0_mut.set_terminator(Terminator::Branch {
+        target: b1,
+        args: Vec::new(),
+    });
+
+    // Block 1: Free the heap_alloc pointer in Arena 2
+    let b1_mut = func.get_block_mut(b1).unwrap();
+    b1_mut.instructions.push(Instruction::new(
+        None,
+        ValueExpr::GenFree { ptr: heap_alloc },
+        Span::DUMMY,
+    ));
+    // Check alloca_ref after free (must be eliminated as redundant since alloca is on stack frame)
+    b1_mut.instructions.push(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: alloca_ref,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    // Check heap_ref after free (must NOT be eliminated because heap_alloc was freed)
+    b1_mut.instructions.push(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: heap_ref,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    b1_mut.set_terminator(Terminator::Return(None));
+
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_function(&mut func);
+
+    let b1_final = func.get_block(b1).unwrap();
+    let checks: Vec<(ValueId, bool)> = b1_final
+        .instructions
+        .iter()
+        .filter_map(|i| {
+            if let ValueExpr::GenCheck { ref_val, redundant } = i.expr {
+                Some((ref_val, redundant))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(checks.len(), 2, "Expected 2 checks in Block 1");
+    // alloca_ref check must be redundant
+    assert_eq!(checks[0].0, alloca_ref);
+    assert!(checks[0].1, "alloca_ref check must be marked redundant");
+    // heap_ref check must NOT be redundant because it was freed
+    assert_eq!(checks[1].0, heap_ref);
+    assert!(
+        !checks[1].1,
+        "heap_ref check must NOT be redundant after GenFree"
+    );
+}
+
+#[test]
+fn test_coroutine_multi_step_state_machine_sync_elimination() {
+    use ifa_ast::ParamMode;
+    use ifa_fir::ir::*;
+    use ifa_fir::types::FirType;
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("coro_state_machine");
+    let param_val = ValueId(0);
+    let param = FirParam {
+        name: INTERNER.intern("shared_state"),
+        val: param_val,
+        ty: FirType::GenerationalRef(Box::new(FirType::Int(IntType::I64))),
+        mode: ParamMode::In,
+        noalias: true,
+    };
+
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![param],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+
+    let b0 = func.entry_block;
+    let b1 = func.alloc_block();
+    let b2 = func.alloc_block();
+    let b3 = func.alloc_block();
+
+    // Step 0: Check param, then Yield
+    let b0_mut = func.get_block_mut(b0).unwrap();
+    b0_mut.instructions.push(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: param_val,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    b0_mut
+        .instructions
+        .push(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    b0_mut.set_terminator(Terminator::Branch {
+        target: b1,
+        args: Vec::new(),
+    });
+
+    // Step 1: Check param, then YieldValue
+    let b1_mut = func.get_block_mut(b1).unwrap();
+    b1_mut.instructions.push(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: param_val,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    b1_mut.instructions.push(Instruction::new(
+        None,
+        ValueExpr::YieldValue { val: param_val },
+        Span::DUMMY,
+    ));
+    b1_mut.set_terminator(Terminator::Branch {
+        target: b2,
+        args: Vec::new(),
+    });
+
+    // Step 2: Check param, then ChanRecv
+    let dummy_chan = func.alloc_value();
+    let b2_mut = func.get_block_mut(b2).unwrap();
+    b2_mut.instructions.push(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: param_val,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    b2_mut.instructions.push(Instruction::new(
+        None,
+        ValueExpr::ChanRecv { chan: dummy_chan },
+        Span::DUMMY,
+    ));
+    b2_mut.set_terminator(Terminator::Branch {
+        target: b3,
+        args: Vec::new(),
+    });
+
+    // Step 3: Check param and Return
+    let b3_mut = func.get_block_mut(b3).unwrap();
+    b3_mut.instructions.push(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: param_val,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    b3_mut.set_terminator(Terminator::Return(None));
+
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_function(&mut func);
+
+    let stats = gce.stats();
+    assert_eq!(stats.total_checks, 4, "Total checks must be 4");
+    assert_eq!(
+        stats.eliminated_checks, 3,
+        "3 redundant checks across state machine steps must be eliminated"
+    );
+    assert_eq!(
+        stats.coroutine_sync_barriers_eliminated, 3,
+        "3 coroutine sync barriers must be recorded"
+    );
+
+    // Verify that blocks 1, 2, and 3 have their checks marked redundant
+    for b_id in [b1, b2, b3] {
+        let block = func.get_block(b_id).unwrap();
+        let chk_redundant = block.instructions.iter().find_map(|inst| {
+            if let ValueExpr::GenCheck { redundant, .. } = inst.expr {
+                Some(redundant)
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            chk_redundant,
+            Some(true),
+            "Check in block {:?} must be redundant",
+            b_id
+        );
+    }
+}
