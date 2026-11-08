@@ -476,9 +476,11 @@ pub enum ReductionKind {
     Max,
     /// Scalar bitwise reduction (e.g., acc = acc & x, acc = acc | x, acc = acc ^ x).
     Bitwise,
+    /// Scalar dot product reduction (e.g., acc = acc + a[i] * b[i]).
+    Dot,
 }
 
-/// Optimization hint for loop vectorization (SIMD lane width, interleave, unroll directives, reduction kind, disjoint slices guarantee, tail-folding predication, and strict determinism).
+/// Optimization hint for loop vectorization (SIMD lane width, interleave, unroll directives, reduction kind, disjoint slices guarantee, tail-folding predication, strict determinism, and contiguous arena reductions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LoopVectorHint {
     pub vector_width: u32,
@@ -488,6 +490,8 @@ pub struct LoopVectorHint {
     pub disjoint_slices: bool,
     pub predicate_enable: bool,
     pub is_strict: bool,
+    pub local_arena: bool,
+    pub contiguous_reduction: bool,
 }
 
 impl LoopVectorHint {
@@ -501,6 +505,8 @@ impl LoopVectorHint {
             disjoint_slices: false,
             predicate_enable: false,
             is_strict: false,
+            local_arena: false,
+            contiguous_reduction: false,
         }
     }
 
@@ -525,6 +531,18 @@ impl LoopVectorHint {
     /// Mark the vectorization hint as originating from a strict deterministic zero-heap function.
     pub fn with_strict(mut self, strict: bool) -> Self {
         self.is_strict = strict;
+        self
+    }
+
+    /// Mark the loop accesses as operating over contiguous memory within a local memory arena or stack buffer.
+    pub fn with_local_arena(mut self, local_arena: bool) -> Self {
+        self.local_arena = local_arena;
+        self
+    }
+
+    /// Mark the loop reduction as operating across a contiguous slice aggregate.
+    pub fn with_contiguous_reduction(mut self, contiguous: bool) -> Self {
+        self.contiguous_reduction = contiguous;
         self
     }
 }

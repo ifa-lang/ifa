@@ -42,6 +42,14 @@ pub struct VectorizeStats {
     pub strict_slice_loops_vectorized: usize,
     /// Number of loops vectorized with predicated tail-folding metadata.
     pub predicated_loops_vectorized: usize,
+    /// Number of contiguous slice reduction loops identified and accelerated.
+    pub contiguous_slice_reductions: usize,
+    /// Number of slice reductions specialized under local arena constraints.
+    pub arena_slice_reductions_specialized: usize,
+    /// Number of scalar dot product reduction loops identified and accelerated.
+    pub dot_reductions_vectorized: usize,
+    /// Number of slice reductions vectorized in strict zero-heap mode.
+    pub strict_zero_heap_reductions: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -129,6 +137,8 @@ impl VectorizePass {
             let mut array_elements = 0;
             let mut slice_elements = 0;
             let mut has_reduction_op = false;
+            let mut has_mul = false;
+            let mut has_add = false;
             let mut detected_reduction: Option<crate::ir::ReductionKind> = None;
             let mut had_eliminated_bounds = false;
             let mut slice_read_bases: HashSet<ValueId> = HashSet::new();
@@ -196,6 +206,7 @@ impl VectorizePass {
                             ValueExpr::Binary { op, .. } => match op {
                                 BinaryOp::Mul => {
                                     has_reduction_op = true;
+                                    has_mul = true;
                                     Self::update_reduction_kind(
                                         &mut detected_reduction,
                                         crate::ir::ReductionKind::Product,
@@ -228,6 +239,9 @@ impl VectorizePass {
                                 }
                                 BinaryOp::Add | BinaryOp::Sub => {
                                     has_reduction_op = true;
+                                    if *op == BinaryOp::Add {
+                                        has_add = true;
+                                    }
                                     Self::update_reduction_kind(
                                         &mut detected_reduction,
                                         crate::ir::ReductionKind::Sum,
@@ -261,9 +275,16 @@ impl VectorizePass {
                                         &mut detected_reduction,
                                         crate::ir::ReductionKind::Product,
                                     );
-                                } else if callee.contains("slice_sum")
-                                    || callee.contains("slice_dot")
+                                } else if callee.contains("slice_dot")
+                                    || callee == "dot"
+                                    || callee.contains("dot_product")
                                 {
+                                    has_reduction_op = true;
+                                    Self::update_reduction_kind(
+                                        &mut detected_reduction,
+                                        crate::ir::ReductionKind::Dot,
+                                    );
+                                } else if callee.contains("slice_sum") {
                                     has_reduction_op = true;
                                     Self::update_reduction_kind(
                                         &mut detected_reduction,
@@ -297,14 +318,46 @@ impl VectorizePass {
                     }
                 }
 
+                // Recognize scalar dot product reductions (fmul + fadd / mul + add with multiple reads)
+                if has_mul && has_add && (read_elements >= 2 || slice_elements >= 2) {
+                    detected_reduction = Some(crate::ir::ReductionKind::Dot);
+                }
+
                 let predicate_enable = slice_elements > 0;
                 let is_strict_slice_loop = func.is_strict && slice_elements > 0;
+                let is_reduction = write_elements == 0 && read_elements > 0 && has_reduction_op;
+                let contiguous_reduction = is_reduction && (slice_elements > 0);
+
+                // Check whether slice reads are constrained to local arena, stack buffers, or strict parameters
+                let mut local_arena = false;
+                if slice_elements > 0 {
+                    if func.is_strict {
+                        local_arena = true;
+                    } else if !slice_read_bases.is_empty() {
+                        local_arena = slice_read_bases.iter().all(|&b| {
+                            let root = Self::trace_slice_root(func, b);
+                            root.is_local_arena_or_stack(func)
+                        });
+                    }
+                }
+
+                let interleave_count = if local_arena && contiguous_reduction {
+                    match primary_ty {
+                        FirType::Float(FloatType::F32)
+                        | FirType::Int(IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8) => {
+                            8
+                        }
+                        _ => 4,
+                    }
+                } else {
+                    4
+                };
 
                 let hint = LoopVectorHint {
                     vector_width,
-                    interleave_count: 4,
+                    interleave_count,
                     unroll_enable: true,
-                    reduction_kind: if write_elements == 0 && read_elements > 0 {
+                    reduction_kind: if is_reduction {
                         detected_reduction
                     } else {
                         None
@@ -312,6 +365,8 @@ impl VectorizePass {
                     disjoint_slices,
                     predicate_enable,
                     is_strict: func.is_strict,
+                    local_arena,
+                    contiguous_reduction,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)
@@ -365,6 +420,15 @@ impl VectorizePass {
                         self.stats.maps_vectorized += 1;
                     } else if read_elements > 0 && has_reduction_op {
                         self.stats.reductions_vectorized += 1;
+                        if contiguous_reduction {
+                            self.stats.contiguous_slice_reductions += 1;
+                            if local_arena {
+                                self.stats.arena_slice_reductions_specialized += 1;
+                            }
+                            if func.is_strict {
+                                self.stats.strict_zero_heap_reductions += 1;
+                            }
+                        }
                         match detected_reduction {
                             Some(crate::ir::ReductionKind::Product) => {
                                 self.stats.product_reductions_vectorized += 1;
@@ -375,7 +439,86 @@ impl VectorizePass {
                             Some(crate::ir::ReductionKind::Max) => {
                                 self.stats.max_reductions_vectorized += 1;
                             }
+                            Some(crate::ir::ReductionKind::Dot) => {
+                                self.stats.dot_reductions_vectorized += 1;
+                            }
                             _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Specialize direct slice reduction calls operating under local arena or strict zero-heap constraints
+        self.specialize_direct_slice_reductions(func, &value_types);
+    }
+
+    /// Statically specialize direct slice reduction function calls to SIMD-accelerated arena vectorizers
+    /// when the underlying slices are proven contiguous on the local thread arena or stack.
+    fn specialize_direct_slice_reductions(
+        &mut self,
+        func: &mut FirFunction,
+        value_types: &HashMap<ValueId, FirType>,
+    ) {
+        let mut rewrites = Vec::new();
+        for (b_idx, block) in func.blocks.iter().enumerate() {
+            for (i_idx, inst) in block.instructions.iter().enumerate() {
+                if let ValueExpr::CallDirect { name, args } = &inst.expr {
+                    let callee = INTERNER.resolve(name);
+                    let is_reduction_candidate = callee.contains("slice_sum")
+                        || callee.contains("slice_prod")
+                        || callee.contains("slice_min")
+                        || callee.contains("slice_max")
+                        || callee.contains("slice_dot");
+                    if is_reduction_candidate && !args.is_empty() {
+                        let first_arg = args[0];
+                        let root = Self::trace_slice_root(func, first_arg);
+                        if root.is_local_arena_or_stack(func) || func.is_strict {
+                            let elem_suffix = if callee.ends_with("_f32") {
+                                "_f32"
+                            } else if callee.ends_with("_f64") {
+                                "_f64"
+                            } else if callee.ends_with("_i32") {
+                                "_i32"
+                            } else if callee.ends_with("_i64") {
+                                "_i64"
+                            } else {
+                                match Self::get_aggregate_elem_type(value_types, first_arg) {
+                                    Some(FirType::Float(FloatType::F32)) => "_f32",
+                                    Some(FirType::Float(FloatType::F64)) => "_f64",
+                                    Some(FirType::Int(IntType::I32 | IntType::U32)) => "_i32",
+                                    _ => "_i64",
+                                }
+                            };
+                            let op = if callee.contains("dot") {
+                                "dot"
+                            } else if callee.contains("prod") {
+                                "prod"
+                            } else if callee.contains("min") {
+                                "min"
+                            } else if callee.contains("max") {
+                                "max"
+                            } else {
+                                "sum"
+                            };
+                            let specialized_name =
+                                format!("ifa_simd_arena_slice_{}{}", op, elem_suffix);
+                            rewrites.push((b_idx, i_idx, INTERNER.intern(&specialized_name)));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (b_idx, i_idx, specialized_sym) in rewrites {
+            if let Some(block) = func.blocks.get_mut(b_idx) {
+                if let Some(inst) = block.instructions.get_mut(i_idx) {
+                    if let ValueExpr::CallDirect { name, .. } = &mut inst.expr {
+                        *name = specialized_sym;
+                        self.stats.arena_slice_reductions_specialized += 1;
+                        self.stats.contiguous_slice_reductions += 1;
+                        if func.is_strict {
+                            self.stats.strict_zero_heap_reductions += 1;
                         }
                     }
                 }
@@ -401,6 +544,9 @@ impl VectorizePass {
             }
             (Some(_), crate::ir::ReductionKind::Max) => {
                 *current = Some(crate::ir::ReductionKind::Max)
+            }
+            (Some(_), crate::ir::ReductionKind::Dot) => {
+                *current = Some(crate::ir::ReductionKind::Dot)
             }
             _ => {}
         }
@@ -635,6 +781,15 @@ impl VectorizePass {
     fn are_slice_roots_disjoint(r1: &SliceRoot, r2: &SliceRoot, func: &FirFunction) -> bool {
         match (r1, r2) {
             (SliceRoot::Alloca(a1), SliceRoot::Alloca(a2)) => a1 != a2,
+            (SliceRoot::CallArena(c1), SliceRoot::CallArena(c2)) => c1 != c2,
+            (SliceRoot::GenArena(g1, a1), SliceRoot::GenArena(g2, a2)) => {
+                if let (Some(ar1), Some(ar2)) = (a1, a2) {
+                    if ar1 != ar2 {
+                        return true;
+                    }
+                }
+                g1 != g2
+            }
             (SliceRoot::Param(p1), SliceRoot::Param(p2)) => p1 != p2,
             (SliceRoot::Field(base1, idx1), SliceRoot::Field(base2, idx2)) => {
                 if base1 == base2 {
@@ -665,7 +820,17 @@ impl VectorizePass {
                 }
             }
             (SliceRoot::Alloca(_), SliceRoot::Param(_))
-            | (SliceRoot::Param(_), SliceRoot::Alloca(_)) => true,
+            | (SliceRoot::Param(_), SliceRoot::Alloca(_))
+            | (SliceRoot::CallArena(_), SliceRoot::Alloca(_))
+            | (SliceRoot::Alloca(_), SliceRoot::CallArena(_))
+            | (SliceRoot::CallArena(_), SliceRoot::Param(_))
+            | (SliceRoot::Param(_), SliceRoot::CallArena(_))
+            | (SliceRoot::GenArena(..), SliceRoot::Alloca(_))
+            | (SliceRoot::Alloca(_), SliceRoot::GenArena(..))
+            | (SliceRoot::GenArena(..), SliceRoot::CallArena(_))
+            | (SliceRoot::CallArena(_), SliceRoot::GenArena(..))
+            | (SliceRoot::GenArena(..), SliceRoot::Param(_))
+            | (SliceRoot::Param(_), SliceRoot::GenArena(..)) => true,
             _ => false,
         }
     }
@@ -688,6 +853,10 @@ impl VectorizePass {
                         def_found = true;
                         match &inst.expr {
                             ValueExpr::Alloca { .. } => return SliceRoot::Alloca(val),
+                            ValueExpr::CallArenaAlloc { .. } => return SliceRoot::CallArena(val),
+                            ValueExpr::GenAlloc { arena, .. } => {
+                                return SliceRoot::GenArena(val, *arena)
+                            }
                             ValueExpr::GetField {
                                 base, field_idx, ..
                             }
@@ -736,10 +905,29 @@ impl VectorizePass {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SliceRoot {
     Alloca(ValueId),
+    CallArena(ValueId),
+    GenArena(ValueId, Option<u16>),
     Param(usize),
     Field(ValueId, usize),
     SubSlice(Box<SliceRoot>, i64, i64),
     Unknown(ValueId),
+}
+
+impl SliceRoot {
+    /// Return whether this slice root is constrained to local arena or stack storage,
+    /// guaranteeing zero-heap flat contiguous memory layout.
+    pub fn is_local_arena_or_stack(&self, func: &FirFunction) -> bool {
+        match self {
+            SliceRoot::Alloca(_) | SliceRoot::CallArena(_) | SliceRoot::GenArena(..) => true,
+            SliceRoot::Param(_) => func.is_strict,
+            SliceRoot::Field(base, _) => {
+                let parent = VectorizePass::trace_slice_root(func, *base);
+                parent.is_local_arena_or_stack(func)
+            }
+            SliceRoot::SubSlice(parent, ..) => parent.is_local_arena_or_stack(func),
+            SliceRoot::Unknown(_) => false,
+        }
+    }
 }
 
 impl Default for VectorizePass {

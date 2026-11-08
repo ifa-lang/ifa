@@ -729,3 +729,220 @@ fn test_vectorize_pass_strict_partitioned_subslice_disjoint() {
     assert_eq!(stats.strict_slice_loops_vectorized, 1);
     assert_eq!(stats.predicated_loops_vectorized, 1);
 }
+
+#[test]
+fn test_vectorize_pass_strict_arena_slice_sum_f32() {
+    let src = r#"
+        pub strict fn sum_strict_arena_slice(s: Slice<f32>) -> f32 {
+            let mut acc: f32 = 0.0;
+            for x in s {
+                acc = acc + x;
+            }
+            return acc;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_arena_sum.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=8]"),
+        "Formatted FIR must contain width 8, interleave 8:\n{}",
+        formatted
+    );
+    assert!(formatted.contains("// [reduction: sum]"));
+    assert!(formatted.contains("// [contiguous_reduction: true]"));
+    assert!(formatted.contains("// [local_arena: true]"));
+    assert!(formatted.contains("// [strict_vectorize: true]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert!(stats.slices_vectorized >= 1);
+    assert_eq!(stats.contiguous_slice_reductions, 1);
+    assert_eq!(stats.arena_slice_reductions_specialized, 1);
+    assert_eq!(stats.strict_zero_heap_reductions, 1);
+}
+
+#[test]
+fn test_vectorize_pass_strict_arena_slice_dot_product_f64() {
+    let src = r#"
+        pub strict fn dot_strict_arena_slices(buf1: [f64; 64], buf2: [f64; 64]) -> f64 {
+            let a = buf1[0..64];
+            let b = buf2[0..64];
+            let mut acc: f64 = 0.0;
+            let mut i: i64 = 0;
+            while i < 64 {
+                acc = acc + a[i] * b[i];
+                i = i + 1;
+            }
+            return acc;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_arena_dot.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [vector_hint: width=4, interleave=4]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
+    assert!(formatted.contains("// [reduction: dot]"));
+    assert!(formatted.contains("// [contiguous_reduction: true]"));
+    assert!(formatted.contains("// [local_arena: true]"));
+    assert!(formatted.contains("// [strict_vectorize: true]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.dot_reductions_vectorized, 1);
+    assert_eq!(stats.contiguous_slice_reductions, 1);
+    assert_eq!(stats.arena_slice_reductions_specialized, 1);
+    assert_eq!(stats.strict_zero_heap_reductions, 1);
+}
+
+#[test]
+fn test_vectorize_pass_strict_arena_slice_min_max_i32() {
+    let src = r#"
+        pub strict fn min_strict_arena(s: Slice<i32>) -> i32 {
+            let mut m: i32 = 2147483647;
+            for x in s {
+                if x < m {
+                    m = x;
+                }
+            }
+            return m;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_arena_min.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(!analysis.has_errors());
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [vector_hint: width=8, interleave=8]"),
+        "Formatted FIR:\n{}",
+        formatted
+    );
+    assert!(formatted.contains("// [reduction: min]"));
+    assert!(formatted.contains("// [contiguous_reduction: true]"));
+    assert!(formatted.contains("// [local_arena: true]"));
+    assert!(formatted.contains("// [strict_vectorize: true]"));
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.min_reductions_vectorized, 1);
+    assert_eq!(stats.contiguous_slice_reductions, 1);
+    assert_eq!(stats.arena_slice_reductions_specialized, 1);
+    assert_eq!(stats.strict_zero_heap_reductions, 1);
+}
+
+#[test]
+fn test_vectorize_pass_direct_reduction_call_specialization() {
+    use ifa_fir::{
+        BasicBlock, BlockId, FirFunction, FirModule, FirParam, FirType, Instruction, ParamMode,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::FloatType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_sym = INTERNER.intern("call_arena_slice_reduce");
+    let param = FirParam {
+        name: INTERNER.intern("s"),
+        ty: FirType::Slice(Box::new(FirType::Float(FloatType::F32))),
+        val: ValueId(0),
+        mode: ParamMode::In,
+    };
+    let mut func = FirFunction::new(
+        fn_sym,
+        vec![param],
+        FirType::Float(FloatType::F32),
+        true,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    // Call generic slice_sum with local slice argument
+    let sum_sym = INTERNER.intern("slice_sum_f32");
+    bb0.instructions.push(Instruction::new(
+        Some(ValueId(1)),
+        ValueExpr::CallDirect {
+            name: sum_sym,
+            args: vec![ValueId(0)],
+        },
+        Span::DUMMY,
+    ));
+    bb0.terminator = Some(Terminator::Return(Some(ValueId(1))));
+    func.blocks[0] = bb0;
+
+    let mut module = FirModule {
+        name: INTERNER.intern("arena_spec_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut pass = VectorizePass::new();
+    pass.run_on_module(&mut module);
+
+    let stats = pass.stats();
+    assert_eq!(stats.arena_slice_reductions_specialized, 1);
+    assert_eq!(stats.contiguous_slice_reductions, 1);
+    assert_eq!(stats.strict_zero_heap_reductions, 1);
+
+    // Verify the function call was specialized to ifa_simd_arena_slice_sum_f32
+    let updated_func = &module.functions[0];
+    let inst = &updated_func.blocks[0].instructions[0];
+    if let ValueExpr::CallDirect { name, .. } = inst.expr {
+        let specialized_callee = INTERNER.resolve(&name);
+        assert_eq!(
+            specialized_callee, "ifa_simd_arena_slice_sum_f32",
+            "Call must be specialized to contiguous arena SIMD vectorizer"
+        );
+    } else {
+        panic!("Instruction must remain a CallDirect");
+    }
+}

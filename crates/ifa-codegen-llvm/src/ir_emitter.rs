@@ -727,6 +727,176 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("tail_step:\n  %tp = getelementptr inbounds i64, ptr %src, i64 %ti\n  %tv = load i64, ptr %tp, align 8\n  %tcmp = icmp sgt i64 %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, i64 %tv, i64 %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
         out.push_str("done:\n  ret i64 %s_acc\n}\n\n");
 
+        // IFA Standard Library SIMD Contiguous Arena Slice Reductions (Zero-Heap Strict Determinism)
+        out.push_str("; IFA Standard Library SIMD Contiguous Arena Slice Reductions\n");
+
+        // 1. Arena Slice Sum (f32, f64, i32, i64)
+        out.push_str("define linkonce_odr float @ifa_simd_arena_slice_sum_f32(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x float> [ zeroinitializer, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds float, ptr %src, i64 %i\n  %v = load <8 x float>, ptr %p, align 32\n  %next_acc = fadd <8 x float> %acc, %v\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !18\n");
+        out.push_str("reduce:\n  %vec_sum = call float @llvm.vector.reduce.fadd.v8f32(float 0.0, <8 x float> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi float [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds float, ptr %src, i64 %ti\n  %tv = load float, ptr %tp, align 4\n  %next_s_acc = fadd float %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret float %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr double @ifa_simd_arena_slice_sum_f64(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x double> [ zeroinitializer, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds double, ptr %src, i64 %i\n  %v = load <4 x double>, ptr %p, align 32\n  %next_acc = fadd <4 x double> %acc, %v\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !19\n");
+        out.push_str("reduce:\n  %vec_sum = call double @llvm.vector.reduce.fadd.v4f64(double 0.0, <4 x double> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi double [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds double, ptr %src, i64 %ti\n  %tv = load double, ptr %tp, align 8\n  %next_s_acc = fadd double %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret double %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr i32 @ifa_simd_arena_slice_sum_i32(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x i32> [ zeroinitializer, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i32, ptr %src, i64 %i\n  %v = load <8 x i32>, ptr %p, align 32\n  %next_acc = add <8 x i32> %acc, %v\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !18\n");
+        out.push_str("reduce:\n  %vec_sum = call i32 @llvm.vector.reduce.add.v8i32(<8 x i32> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i32 [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i32, ptr %src, i64 %ti\n  %tv = load i32, ptr %tp, align 4\n  %next_s_acc = add i32 %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i32 %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr i64 @ifa_simd_arena_slice_sum_i64(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x i64> [ zeroinitializer, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i64, ptr %src, i64 %i\n  %v = load <4 x i64>, ptr %p, align 32\n  %next_acc = add <4 x i64> %acc, %v\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !19\n");
+        out.push_str("reduce:\n  %vec_sum = call i64 @llvm.vector.reduce.add.v4i64(<4 x i64> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i64 [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i64, ptr %src, i64 %ti\n  %tv = load i64, ptr %tp, align 8\n  %next_s_acc = add i64 %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i64 %s_acc\n}\n\n");
+
+        // 2. Arena Slice Product (f32, f64, i32, i64)
+        out.push_str("define linkonce_odr float @ifa_simd_arena_slice_prod_f32(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x float> [ <float 1.0, float 1.0, float 1.0, float 1.0, float 1.0, float 1.0, float 1.0, float 1.0>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds float, ptr %src, i64 %i\n  %v = load <8 x float>, ptr %p, align 32\n  %next_acc = fmul <8 x float> %acc, %v\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !18\n");
+        out.push_str("reduce:\n  %vec_prod = call float @llvm.vector.reduce.fmul.v8f32(float 1.0, <8 x float> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi float [ %vec_prod, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds float, ptr %src, i64 %ti\n  %tv = load float, ptr %tp, align 4\n  %next_s_acc = fmul float %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret float %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr double @ifa_simd_arena_slice_prod_f64(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x double> [ <double 1.0, double 1.0, double 1.0, double 1.0>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds double, ptr %src, i64 %i\n  %v = load <4 x double>, ptr %p, align 32\n  %next_acc = fmul <4 x double> %acc, %v\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !19\n");
+        out.push_str("reduce:\n  %vec_prod = call double @llvm.vector.reduce.fmul.v4f64(double 1.0, <4 x double> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi double [ %vec_prod, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds double, ptr %src, i64 %ti\n  %tv = load double, ptr %tp, align 8\n  %next_s_acc = fmul double %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret double %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr i32 @ifa_simd_arena_slice_prod_i32(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x i32> [ <i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i32, ptr %src, i64 %i\n  %v = load <8 x i32>, ptr %p, align 32\n  %next_acc = mul <8 x i32> %acc, %v\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !18\n");
+        out.push_str("reduce:\n  %vec_prod = call i32 @llvm.vector.reduce.mul.v8i32(<8 x i32> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i32 [ %vec_prod, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i32, ptr %src, i64 %ti\n  %tv = load i32, ptr %tp, align 4\n  %next_s_acc = mul i32 %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i32 %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr i64 @ifa_simd_arena_slice_prod_i64(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x i64> [ <i64 1, i64 1, i64 1, i64 1>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i64, ptr %src, i64 %i\n  %v = load <4 x i64>, ptr %p, align 32\n  %next_acc = mul <4 x i64> %acc, %v\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !19\n");
+        out.push_str("reduce:\n  %vec_prod = call i64 @llvm.vector.reduce.mul.v4i64(<4 x i64> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i64 [ %vec_prod, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i64, ptr %src, i64 %ti\n  %tv = load i64, ptr %tp, align 8\n  %next_s_acc = mul i64 %s_acc, %tv\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i64 %s_acc\n}\n\n");
+
+        // 3. Arena Slice Min (f32, f64, i32, i64)
+        out.push_str("define linkonce_odr float @ifa_simd_arena_slice_min_f32(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x float> [ <float 0x7FF0000000000000, float 0x7FF0000000000000, float 0x7FF0000000000000, float 0x7FF0000000000000, float 0x7FF0000000000000, float 0x7FF0000000000000, float 0x7FF0000000000000, float 0x7FF0000000000000>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds float, ptr %src, i64 %i\n  %v = load <8 x float>, ptr %p, align 32\n  %cmp = fcmp olt <8 x float> %v, %acc\n  %next_acc = select <8 x i1> %cmp, <8 x float> %v, <8 x float> %acc\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !18\n");
+        out.push_str("reduce:\n  %vec_min = call float @llvm.vector.reduce.fmin.v8f32(<8 x float> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi float [ %vec_min, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds float, ptr %src, i64 %ti\n  %tv = load float, ptr %tp, align 4\n  %tcmp = fcmp olt float %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, float %tv, float %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret float %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr double @ifa_simd_arena_slice_min_f64(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x double> [ <double 0x7FF0000000000000, double 0x7FF0000000000000, double 0x7FF0000000000000, double 0x7FF0000000000000>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds double, ptr %src, i64 %i\n  %v = load <4 x double>, ptr %p, align 32\n  %cmp = fcmp olt <4 x double> %v, %acc\n  %next_acc = select <4 x i1> %cmp, <4 x double> %v, <4 x double> %acc\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !19\n");
+        out.push_str("reduce:\n  %vec_min = call double @llvm.vector.reduce.fmin.v4f64(<4 x double> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi double [ %vec_min, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds double, ptr %src, i64 %ti\n  %tv = load double, ptr %tp, align 8\n  %tcmp = fcmp olt double %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, double %tv, double %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret double %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr i32 @ifa_simd_arena_slice_min_i32(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x i32> [ <i32 2147483647, i32 2147483647, i32 2147483647, i32 2147483647, i32 2147483647, i32 2147483647, i32 2147483647, i32 2147483647>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i32, ptr %src, i64 %i\n  %v = load <8 x i32>, ptr %p, align 32\n  %cmp = icmp slt <8 x i32> %v, %acc\n  %next_acc = select <8 x i1> %cmp, <8 x i32> %v, <8 x i32> %acc\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !18\n");
+        out.push_str("reduce:\n  %vec_min = call i32 @llvm.vector.reduce.smin.v8i32(<8 x i32> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i32 [ %vec_min, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i32, ptr %src, i64 %ti\n  %tv = load i32, ptr %tp, align 4\n  %tcmp = icmp slt i32 %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, i32 %tv, i32 %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i32 %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr i64 @ifa_simd_arena_slice_min_i64(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x i64> [ <i64 9223372036854775807, i64 9223372036854775807, i64 9223372036854775807, i64 9223372036854775807>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i64, ptr %src, i64 %i\n  %v = load <4 x i64>, ptr %p, align 32\n  %cmp = icmp slt <4 x i64> %v, %acc\n  %next_acc = select <4 x i1> %cmp, <4 x i64> %v, <4 x i64> %acc\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !19\n");
+        out.push_str("reduce:\n  %vec_min = call i64 @llvm.vector.reduce.smin.v4i64(<4 x i64> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i64 [ %vec_min, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i64, ptr %src, i64 %ti\n  %tv = load i64, ptr %tp, align 8\n  %tcmp = icmp slt i64 %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, i64 %tv, i64 %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i64 %s_acc\n}\n\n");
+
+        // 4. Arena Slice Max (f32, f64, i32, i64)
+        out.push_str("define linkonce_odr float @ifa_simd_arena_slice_max_f32(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x float> [ <float 0xFFF0000000000000, float 0xFFF0000000000000, float 0xFFF0000000000000, float 0xFFF0000000000000, float 0xFFF0000000000000, float 0xFFF0000000000000, float 0xFFF0000000000000, float 0xFFF0000000000000>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds float, ptr %src, i64 %i\n  %v = load <8 x float>, ptr %p, align 32\n  %cmp = fcmp ogt <8 x float> %v, %acc\n  %next_acc = select <8 x i1> %cmp, <8 x float> %v, <8 x float> %acc\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !18\n");
+        out.push_str("reduce:\n  %vec_max = call float @llvm.vector.reduce.fmax.v8f32(<8 x float> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi float [ %vec_max, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds float, ptr %src, i64 %ti\n  %tv = load float, ptr %tp, align 4\n  %tcmp = fcmp ogt float %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, float %tv, float %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret float %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr double @ifa_simd_arena_slice_max_f64(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x double> [ <double 0xFFF0000000000000, double 0xFFF0000000000000, double 0xFFF0000000000000, double 0xFFF0000000000000>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds double, ptr %src, i64 %i\n  %v = load <4 x double>, ptr %p, align 32\n  %cmp = fcmp ogt <4 x double> %v, %acc\n  %next_acc = select <4 x i1> %cmp, <4 x double> %v, <4 x double> %acc\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !19\n");
+        out.push_str("reduce:\n  %vec_max = call double @llvm.vector.reduce.fmax.v4f64(<4 x double> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi double [ %vec_max, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds double, ptr %src, i64 %ti\n  %tv = load double, ptr %tp, align 8\n  %tcmp = fcmp ogt double %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, double %tv, double %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret double %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr i32 @ifa_simd_arena_slice_max_i32(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x i32> [ <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 -2147483648>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i32, ptr %src, i64 %i\n  %v = load <8 x i32>, ptr %p, align 32\n  %cmp = icmp sgt <8 x i32> %v, %acc\n  %next_acc = select <8 x i1> %cmp, <8 x i32> %v, <8 x i32> %acc\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !18\n");
+        out.push_str("reduce:\n  %vec_max = call i32 @llvm.vector.reduce.smax.v8i32(<8 x i32> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i32 [ %vec_max, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i32, ptr %src, i64 %ti\n  %tv = load i32, ptr %tp, align 4\n  %tcmp = icmp sgt i32 %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, i32 %tv, i32 %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i32 %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr i64 @ifa_simd_arena_slice_max_i64(ptr %src, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x i64> [ <i64 -9223372036854775808, i64 -9223372036854775808, i64 -9223372036854775808, i64 -9223372036854775808>, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p = getelementptr inbounds i64, ptr %src, i64 %i\n  %v = load <4 x i64>, ptr %p, align 32\n  %cmp = icmp sgt <4 x i64> %v, %acc\n  %next_acc = select <4 x i1> %cmp, <4 x i64> %v, <4 x i64> %acc\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !19\n");
+        out.push_str("reduce:\n  %vec_max = call i64 @llvm.vector.reduce.smax.v4i64(<4 x i64> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi i64 [ %vec_max, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp = getelementptr inbounds i64, ptr %src, i64 %ti\n  %tv = load i64, ptr %tp, align 8\n  %tcmp = icmp sgt i64 %tv, %s_acc\n  %next_s_acc = select i1 %tcmp, i64 %tv, i64 %s_acc\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret i64 %s_acc\n}\n\n");
+
+        // 5. Arena Slice Dot Product (f32, f64)
+        out.push_str("define linkonce_odr float @ifa_simd_arena_slice_dot_f32(ptr %src1, ptr %src2, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -8\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <8 x float> [ zeroinitializer, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p1 = getelementptr inbounds float, ptr %src1, i64 %i\n  %p2 = getelementptr inbounds float, ptr %src2, i64 %i\n  %v1 = load <8 x float>, ptr %p1, align 32\n  %v2 = load <8 x float>, ptr %p2, align 32\n  %prod = fmul <8 x float> %v1, %v2\n  %next_acc = fadd <8 x float> %acc, %prod\n  %next_i = add i64 %i, 8\n  br label %vec_loop, !llvm.loop !18\n");
+        out.push_str("reduce:\n  %vec_sum = call float @llvm.vector.reduce.fadd.v8f32(float 0.0, <8 x float> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi float [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp1 = getelementptr inbounds float, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds float, ptr %src2, i64 %ti\n  %tv1 = load float, ptr %tp1, align 4\n  %tv2 = load float, ptr %tp2, align 4\n  %tprod = fmul float %tv1, %tv2\n  %next_s_acc = fadd float %s_acc, %tprod\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret float %s_acc\n}\n\n");
+
+        out.push_str("define linkonce_odr double @ifa_simd_arena_slice_dot_f64(ptr %src1, ptr %src2, i64 %len) alwaysinline {\n");
+        out.push_str("entry:\n  %vec_len = and i64 %len, -4\n  br label %vec_loop\n");
+        out.push_str("vec_loop:\n  %i = phi i64 [ 0, %entry ], [ %next_i, %vec_step ]\n  %acc = phi <4 x double> [ zeroinitializer, %entry ], [ %next_acc, %vec_step ]\n  %has_vec = icmp ult i64 %i, %vec_len\n  br i1 %has_vec, label %vec_step, label %reduce\n");
+        out.push_str("vec_step:\n  %p1 = getelementptr inbounds double, ptr %src1, i64 %i\n  %p2 = getelementptr inbounds double, ptr %src2, i64 %i\n  %v1 = load <4 x double>, ptr %p1, align 32\n  %v2 = load <4 x double>, ptr %p2, align 32\n  %prod = fmul <4 x double> %v1, %v2\n  %next_acc = fadd <4 x double> %acc, %prod\n  %next_i = add i64 %i, 4\n  br label %vec_loop, !llvm.loop !19\n");
+        out.push_str("reduce:\n  %vec_sum = call double @llvm.vector.reduce.fadd.v4f64(double 0.0, <4 x double> %acc)\n  br label %tail_loop\n");
+        out.push_str("tail_loop:\n  %ti = phi i64 [ %vec_len, %reduce ], [ %next_ti, %tail_step ]\n  %s_acc = phi double [ %vec_sum, %reduce ], [ %next_s_acc, %tail_step ]\n  %has_tail = icmp ult i64 %ti, %len\n  br i1 %has_tail, label %tail_step, label %done\n");
+        out.push_str("tail_step:\n  %tp1 = getelementptr inbounds double, ptr %src1, i64 %ti\n  %tp2 = getelementptr inbounds double, ptr %src2, i64 %ti\n  %tv1 = load double, ptr %tp1, align 8\n  %tv2 = load double, ptr %tp2, align 8\n  %tprod = fmul double %tv1, %tv2\n  %next_s_acc = fadd double %s_acc, %tprod\n  %next_ti = add i64 %ti, 1\n  br label %tail_loop\n");
+        out.push_str("done:\n  ret double %s_acc\n}\n\n");
+
         if self.target.arch == TargetArch::AArch64 {
             out.push_str("; AArch64 Advanced SIMD (NEON) Hardware-Accelerated Vectorizers\n");
             out.push_str("define linkonce_odr float @ifa_neon_slice_sum_f32(ptr %src, i64 %len) alwaysinline {\n");
@@ -1123,6 +1293,12 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("!16 = distinct !{!16, !2, !9, !4, !5, !12, !13}\n");
         // 2-lane strict/predicated SIMD vectorization hint (Neon strict slices)
         out.push_str("!17 = distinct !{!17, !2, !11, !4, !5, !12, !13}\n");
+        // Contiguous local arena reduction hints (interleave 8, zero-heap strict mode)
+        out.push_str("!18 = distinct !{!18, !2, !3, !22, !5, !12, !13}\n");
+        out.push_str("!19 = distinct !{!19, !2, !7, !22, !5, !12, !13}\n");
+        out.push_str("!20 = distinct !{!20, !2, !9, !22, !5, !12, !13}\n");
+        out.push_str("!21 = distinct !{!21, !2, !11, !22, !5, !12, !13}\n");
+        out.push_str("!22 = !{!\"llvm.loop.interleave.count\", i32 8}\n");
 
         Ok(out)
     }
@@ -1284,19 +1460,34 @@ impl<'a> LlvmIrEmitter<'a> {
                         ValueExpr::CallDirect { name, .. }
                         | ValueExpr::BlockingCallDirect { name, .. } => {
                             let callee = INTERNER.resolve(name);
-                            if callee.starts_with("ifa_simd_") {
-                                if callee.ends_with("_f32")
-                                    && (callee.contains("dot") || callee.contains("sum"))
+                            if callee.starts_with("ifa_simd_")
+                                || callee.starts_with("ifa_simd_arena_")
+                            {
+                                let is_f32 = callee.ends_with("_f32");
+                                let is_f64 = callee.ends_with("_f64");
+                                let is_i32 = callee.ends_with("_i32");
+                                let _is_i64 = callee.ends_with("_i64");
+
+                                if callee.contains("dot") {
+                                    if is_f64 {
+                                        ifa_fir::FirType::Float(ifa_sema::types::FloatType::F64)
+                                    } else {
+                                        ifa_fir::FirType::Float(ifa_sema::types::FloatType::F32)
+                                    }
+                                } else if callee.contains("sum")
+                                    || callee.contains("prod")
+                                    || callee.contains("min")
+                                    || callee.contains("max")
                                 {
-                                    ifa_fir::FirType::Float(ifa_sema::types::FloatType::F32)
-                                } else if callee.ends_with("_f64")
-                                    && (callee.contains("dot") || callee.contains("sum"))
-                                {
-                                    ifa_fir::FirType::Float(ifa_sema::types::FloatType::F64)
-                                } else if callee.ends_with("_i32") && callee.contains("sum") {
-                                    ifa_fir::FirType::Int(ifa_sema::types::IntType::I32)
-                                } else if callee.ends_with("_i64") && callee.contains("sum") {
-                                    ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                                    if is_f32 {
+                                        ifa_fir::FirType::Float(ifa_sema::types::FloatType::F32)
+                                    } else if is_f64 {
+                                        ifa_fir::FirType::Float(ifa_sema::types::FloatType::F64)
+                                    } else if is_i32 {
+                                        ifa_fir::FirType::Int(ifa_sema::types::IntType::I32)
+                                    } else {
+                                        ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                                    }
                                 } else if callee.contains("slice_add")
                                     || callee.contains("slice_mul")
                                     || callee.contains("slice_xor")
@@ -1899,35 +2090,35 @@ impl<'a> LlvmIrEmitter<'a> {
                             })
                             .collect();
                         (ret_ty, params)
-                    } else if callee.starts_with("ifa_simd_") {
-                        if callee.ends_with("_f32")
-                            && (callee.contains("dot") || callee.contains("sum"))
-                        {
-                            let p_types = if callee.contains("dot") {
-                                vec!["ptr".to_string(), "ptr".to_string(), "i64".to_string()]
-                            } else {
-                                vec!["ptr".to_string(), "i64".to_string()]
-                            };
-                            ("float".to_string(), p_types)
-                        } else if callee.ends_with("_f64")
-                            && (callee.contains("dot") || callee.contains("sum"))
-                        {
-                            let p_types = if callee.contains("dot") {
-                                vec!["ptr".to_string(), "ptr".to_string(), "i64".to_string()]
-                            } else {
-                                vec!["ptr".to_string(), "i64".to_string()]
-                            };
-                            ("double".to_string(), p_types)
-                        } else if callee.ends_with("_i32") && callee.contains("sum") {
+                    } else if callee.starts_with("ifa_simd_")
+                        || callee.starts_with("ifa_simd_arena_")
+                    {
+                        let is_f32 = callee.ends_with("_f32");
+                        let is_f64 = callee.ends_with("_f64");
+                        let is_i32 = callee.ends_with("_i32");
+                        let _is_i64 = callee.ends_with("_i64");
+
+                        if callee.contains("dot") {
+                            let ret = if is_f64 { "double" } else { "float" };
                             (
-                                "i32".to_string(),
-                                vec!["ptr".to_string(), "i64".to_string()],
+                                ret.to_string(),
+                                vec!["ptr".to_string(), "ptr".to_string(), "i64".to_string()],
                             )
-                        } else if callee.ends_with("_i64") && callee.contains("sum") {
-                            (
-                                "i64".to_string(),
-                                vec!["ptr".to_string(), "i64".to_string()],
-                            )
+                        } else if callee.contains("sum")
+                            || callee.contains("prod")
+                            || callee.contains("min")
+                            || callee.contains("max")
+                        {
+                            let ret = if is_f32 {
+                                "float"
+                            } else if is_f64 {
+                                "double"
+                            } else if is_i32 {
+                                "i32"
+                            } else {
+                                "i64"
+                            };
+                            (ret.to_string(), vec!["ptr".to_string(), "i64".to_string()])
                         } else if callee.contains("slice_add")
                             || callee.contains("slice_mul")
                             || callee.contains("slice_xor")
@@ -3180,35 +3371,35 @@ impl<'a> LlvmIrEmitter<'a> {
                             })
                             .collect();
                         (ret_ty, params)
-                    } else if callee.starts_with("ifa_simd_") {
-                        if callee.ends_with("_f32")
-                            && (callee.contains("dot") || callee.contains("sum"))
-                        {
-                            let p_types = if callee.contains("dot") {
-                                vec!["ptr".to_string(), "ptr".to_string(), "i64".to_string()]
-                            } else {
-                                vec!["ptr".to_string(), "i64".to_string()]
-                            };
-                            ("float".to_string(), p_types)
-                        } else if callee.ends_with("_f64")
-                            && (callee.contains("dot") || callee.contains("sum"))
-                        {
-                            let p_types = if callee.contains("dot") {
-                                vec!["ptr".to_string(), "ptr".to_string(), "i64".to_string()]
-                            } else {
-                                vec!["ptr".to_string(), "i64".to_string()]
-                            };
-                            ("double".to_string(), p_types)
-                        } else if callee.ends_with("_i32") && callee.contains("sum") {
+                    } else if callee.starts_with("ifa_simd_")
+                        || callee.starts_with("ifa_simd_arena_")
+                    {
+                        let is_f32 = callee.ends_with("_f32");
+                        let is_f64 = callee.ends_with("_f64");
+                        let is_i32 = callee.ends_with("_i32");
+                        let _is_i64 = callee.ends_with("_i64");
+
+                        if callee.contains("dot") {
+                            let ret = if is_f64 { "double" } else { "float" };
                             (
-                                "i32".to_string(),
-                                vec!["ptr".to_string(), "i64".to_string()],
+                                ret.to_string(),
+                                vec!["ptr".to_string(), "ptr".to_string(), "i64".to_string()],
                             )
-                        } else if callee.ends_with("_i64") && callee.contains("sum") {
-                            (
-                                "i64".to_string(),
-                                vec!["ptr".to_string(), "i64".to_string()],
-                            )
+                        } else if callee.contains("sum")
+                            || callee.contains("prod")
+                            || callee.contains("min")
+                            || callee.contains("max")
+                        {
+                            let ret = if is_f32 {
+                                "float"
+                            } else if is_f64 {
+                                "double"
+                            } else if is_i32 {
+                                "i32"
+                            } else {
+                                "i64"
+                            };
+                            (ret.to_string(), vec!["ptr".to_string(), "i64".to_string()])
                         } else if callee.contains("slice_add")
                             || callee.contains("slice_mul")
                             || callee.contains("slice_xor")
@@ -3897,8 +4088,14 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             Terminator::Branch { target, .. } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = if hint.predicate_enable || hint.is_strict || hint.disjoint_slices
-                    {
+                    let meta_id = if hint.local_arena && hint.contiguous_reduction {
+                        match hint.vector_width {
+                            2 => 21,
+                            4 => 19,
+                            16 | 32 => 20,
+                            _ => 18,
+                        }
+                    } else if hint.predicate_enable || hint.is_strict || hint.disjoint_slices {
                         match hint.vector_width {
                             2 => 17,
                             4 => 15,
@@ -3928,8 +4125,14 @@ impl<'a> LlvmIrEmitter<'a> {
                 ..
             } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = if hint.predicate_enable || hint.is_strict || hint.disjoint_slices
-                    {
+                    let meta_id = if hint.local_arena && hint.contiguous_reduction {
+                        match hint.vector_width {
+                            2 => 21,
+                            4 => 19,
+                            16 | 32 => 20,
+                            _ => 18,
+                        }
+                    } else if hint.predicate_enable || hint.is_strict || hint.disjoint_slices {
                         match hint.vector_width {
                             2 => 17,
                             4 => 15,

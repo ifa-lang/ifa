@@ -370,6 +370,26 @@ fn test_llvm_simd_slice_vectorization() {
     assert!(ir.contains("@ifa_simd_slice_min_i64"));
     assert!(ir.contains("@ifa_simd_slice_max_i64"));
 
+    // Verify IFA Standard Library SIMD Contiguous Arena Slice Reductions
+    assert!(ir.contains("@ifa_simd_arena_slice_sum_f32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_sum_f64"));
+    assert!(ir.contains("@ifa_simd_arena_slice_sum_i32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_sum_i64"));
+    assert!(ir.contains("@ifa_simd_arena_slice_prod_f32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_prod_f64"));
+    assert!(ir.contains("@ifa_simd_arena_slice_prod_i32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_prod_i64"));
+    assert!(ir.contains("@ifa_simd_arena_slice_min_f32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_min_f64"));
+    assert!(ir.contains("@ifa_simd_arena_slice_min_i32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_min_i64"));
+    assert!(ir.contains("@ifa_simd_arena_slice_max_f32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_max_f64"));
+    assert!(ir.contains("@ifa_simd_arena_slice_max_i32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_max_i64"));
+    assert!(ir.contains("@ifa_simd_arena_slice_dot_f32"));
+    assert!(ir.contains("@ifa_simd_arena_slice_dot_f64"));
+
     assert!(ir.contains("<8 x float>"));
     assert!(ir.contains("<4 x double>"));
     assert!(ir.contains("<8 x i32>"));
@@ -3920,6 +3940,83 @@ fn test_llvm_aot_bounded_closure_thread_local_call_arena_lowering() {
         output.status.code(),
         Some(42),
         "Native binary output exit code must be 42 (17 + 25)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_aot_strict_arena_slice_reduction() {
+    let src = r#"
+        pub strict fn sum_slice(s: Slice<i64>) -> i64 {
+            mut acc: i64 = 0;
+            for x in s {
+                acc = acc + x;
+            }
+            return acc;
+        }
+
+        pub fn main() -> i64 {
+            let arr: [i64; 4] = [10, 12, 8, 12];
+            let s = arr[0..4];
+            let res: i64 = sum_slice(s);
+            return res;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("strict_arena_slice_reduction.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = ifa_codegen_llvm::ir_emitter::LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&fir_module).unwrap();
+
+    assert!(
+        ir.contains("@ifa_simd_arena_slice_sum_i64")
+            || ir.contains("llvm.vector.reduce.add")
+            || ir.contains("sum_slice"),
+        "LLVM IR must include vectorized arena slice reduction logic:\n{}",
+        ir
+    );
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("llvm_aot_arena_reduction_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("arena_reduction.o");
+    let bin_path = temp_dir.join("arena_reduction_exec");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&fir_module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "Native binary output exit code must be 42"
     );
 
     let _ = fs::remove_dir_all(&temp_dir);

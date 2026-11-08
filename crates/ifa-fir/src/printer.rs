@@ -113,6 +113,7 @@ impl<'a> FirPrinter<'a> {
                     crate::ir::ReductionKind::Min => "min",
                     crate::ir::ReductionKind::Max => "max",
                     crate::ir::ReductionKind::Bitwise => "bitwise",
+                    crate::ir::ReductionKind::Dot => "dot",
                 };
                 writeln!(self.output, "// [reduction: {}]", red_name)?;
             }
@@ -123,6 +124,14 @@ impl<'a> FirPrinter<'a> {
             if hint.predicate_enable {
                 self.indent();
                 writeln!(self.output, "// [predicate_enable: true]")?;
+            }
+            if hint.contiguous_reduction {
+                self.indent();
+                writeln!(self.output, "// [contiguous_reduction: true]")?;
+            }
+            if hint.local_arena {
+                self.indent();
+                writeln!(self.output, "// [local_arena: true]")?;
             }
             if hint.is_strict {
                 self.indent();
