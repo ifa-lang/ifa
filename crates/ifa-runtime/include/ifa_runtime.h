@@ -247,6 +247,43 @@ void ifa_rt_channel_close(ifa_channel_handle_t* chan);
  */
 int32_t ifa_rt_channel_is_closed(ifa_channel_handle_t* chan);
 
+#define IFA_SELECT_OP_RECV 0
+#define IFA_SELECT_OP_SEND 1
+
+#define IFA_SELECT_STATUS_PENDING 0
+#define IFA_SELECT_STATUS_READY 1
+#define IFA_SELECT_STATUS_CLOSED 2
+
+/**
+ * A single wait entry for zero-allocation multi-channel multiplexing.
+ */
+typedef struct ifa_select_wait_entry {
+    ifa_channel_handle_t* chan;
+    uint32_t op;
+    uint32_t status;
+    void* val;
+} ifa_select_wait_entry_t;
+
+/**
+ * Zero-allocation select wait table descriptor.
+ */
+typedef struct ifa_select_wait_table {
+    ifa_select_wait_entry_t* entries;
+    size_t count;
+    int32_t has_default;
+} ifa_select_wait_table_t;
+
+/**
+ * Zero-allocation non-blocking multiplexing evaluation of a select wait table.
+ * Returns index >= 0 if ready, count if has_default, -2 if closed, -1 if waiting (coroutine suspend).
+ */
+int64_t ifa_rt_channel_select_table(ifa_select_wait_table_t* table);
+
+/**
+ * Zero-allocation blocking/cooperative multiplexing evaluation of a select wait table.
+ */
+int64_t ifa_rt_channel_select_wait_table(ifa_select_wait_table_t* table);
+
 /**
  * Multiplex multiple channels non-blocking or cooperatively yielding until one has data.
  * Returns the index of the ready channel, num_channels if has_default and none ready, or -2 if all closed.

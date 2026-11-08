@@ -2389,9 +2389,11 @@ fn test_llvm_coroutine_channel_untyped_and_select_multiplexing() {
     assert!(ir.contains("call i32 @ifa_rt_channel_try_send(ptr %v1, ptr %chan_val_cast_4)"));
     assert!(ir.contains("br label %coro.send_poll_"));
 
-    // 3. Verify multi-channel select multiplexing with stackless suspension
+    // 3. Verify multi-channel select multiplexing with zero-allocation wait table and stackless suspension
+    assert!(ir.contains("%select_entries_5 = alloca [2 x %struct.ifa_select_wait_entry], align 8"));
+    assert!(ir.contains("%select_table_5 = alloca %struct.ifa_select_wait_table, align 8"));
     assert!(ir.contains("br label %coro.sel_poll_"));
-    assert!(ir.contains("@ifa_rt_channel_select(ptr %select_arr_5, i64 2, i32 1)"));
+    assert!(ir.contains("@ifa_rt_channel_select_table(ptr %select_table_5)"));
     assert!(ir.contains("%sel_is_waiting_5_"));
     assert!(ir.contains("call i8 @llvm.coro.suspend(token none, i1 false)"));
     assert!(ir.contains("%v5 = phi i64 [ %sel_poll_res_5_"));
@@ -3570,5 +3572,118 @@ fn test_llvm_strict_slice_transformation_vectorization_metadata() {
     );
     assert!(obj_path.exists());
 
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_channel_select_wait_table_non_coro_and_default() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BasicBlock, BlockId, FirFunction, FirModule, FirType, Instruction, Terminator, ValueExpr,
+        ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+    use std::fs;
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let fn_name = INTERNER.intern("non_coro_select_worker");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Unit,
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = false;
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+
+    let ch1 = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(ch1),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+
+    let ch2 = ValueId(2);
+    bb0.instructions.push(Instruction::new(
+        Some(ch2),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: Some(ValueId(3)),
+        },
+        Span::DUMMY,
+    ));
+
+    // Blocking select wait table lowering in non-coroutine context
+    let sel_res = ValueId(4);
+    bb0.instructions.push(Instruction::new(
+        Some(sel_res),
+        ValueExpr::ChanSelect {
+            channels: vec![ch1, ch2],
+            has_default: false,
+        },
+        Span::DUMMY,
+    ));
+
+    // Non-blocking select with default clause
+    let sel_def_res = ValueId(5);
+    bb0.instructions.push(Instruction::new(
+        Some(sel_def_res),
+        ValueExpr::ChanSelect {
+            channels: vec![ch1, ch2],
+            has_default: true,
+        },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(None));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("select_tbl_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    // Verify zero-allocation wait table struct definitions
+    assert!(ir.contains("%struct.ifa_select_wait_entry = type { ptr, i32, i32, ptr }"));
+    assert!(ir.contains("%struct.ifa_select_wait_table = type { ptr, i64, i32 }"));
+
+    // Verify stack alloca for entry table and wait table descriptor
+    assert!(ir.contains("%select_entries_4 = alloca [2 x %struct.ifa_select_wait_entry], align 8"));
+    assert!(ir.contains("%select_table_4 = alloca %struct.ifa_select_wait_table, align 8"));
+    assert!(ir.contains("@ifa_rt_channel_select_wait_table(ptr %select_table_4)"));
+
+    // Verify default arm flag setup
+    assert!(ir.contains("store i32 1, ptr %select_tbl_def_5, align 4"));
+
+    // Verify native clang compilation succeeds
+    let temp_dir = std::env::temp_dir().join(format!("llvm_chan_tbl_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("chan_tbl.o");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation of select wait table module failed: {:?}",
+        compile_res.err()
+    );
     let _ = fs::remove_dir_all(&temp_dir);
 }

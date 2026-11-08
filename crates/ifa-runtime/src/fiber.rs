@@ -1368,6 +1368,15 @@ impl<T> Channel<T> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Check if the channel is at capacity (always false for unbounded channels).
+    pub fn is_full(&self) -> bool {
+        if let Some(ring) = &self.ring {
+            ring.is_full()
+        } else {
+            false
+        }
+    }
 }
 
 impl<T> Default for Channel<T> {

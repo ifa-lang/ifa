@@ -133,6 +133,8 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare void @ifa_rt_channel_close(ptr)\n");
             out.push_str("declare i32 @ifa_rt_channel_is_closed(ptr)\n");
             out.push_str("declare i64 @ifa_rt_channel_select(ptr, i64, i32)\n");
+            out.push_str("declare i64 @ifa_rt_channel_select_table(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_channel_select_wait_table(ptr)\n");
             out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n");
             out.push_str("declare ptr @ifa_rt_string_concat(ptr, ptr)\n");
             out.push_str("declare ptr @ifa_rt_string_from_i64(i64)\n");
@@ -187,6 +189,8 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare void @ifa_rt_channel_close(ptr)\n");
             out.push_str("declare i32 @ifa_rt_channel_is_closed(ptr)\n");
             out.push_str("declare i64 @ifa_rt_channel_select(ptr, i64, i32)\n");
+            out.push_str("declare i64 @ifa_rt_channel_select_table(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_channel_select_wait_table(ptr)\n");
             out.push_str("declare void @ifa_rt_panic_uaf(ptr, i32, i32)\n");
             out.push_str("declare ptr @ifa_rt_string_concat(ptr, ptr)\n");
             out.push_str("declare ptr @ifa_rt_string_from_i64(i64)\n");
@@ -230,6 +234,10 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("declare ptr @llvm.coro.free(token, ptr)\n");
         out.push_str("declare ptr @llvm.coro.promise(ptr, i32, i1)\n");
         out.push_str("declare ptr @llvm.coro.frame()\n\n");
+
+        // Zero-Allocation Channel Multiplexing Select Wait Table Descriptors
+        out.push_str("%struct.ifa_select_wait_entry = type { ptr, i32, i32, ptr }\n");
+        out.push_str("%struct.ifa_select_wait_table = type { ptr, i64, i32 }\n\n");
 
         // IFA Stackless Fiber Continuous Execution Helpers
         out.push_str("; IFA Stackless Fiber Continuous Execution Helpers\n");
@@ -2484,32 +2492,94 @@ impl<'a> LlvmIrEmitter<'a> {
             } => {
                 let n = channels.len();
                 let arr_len = n.max(1);
+                // Zero-allocation wait table descriptor allocated on stack frame
                 out.push_str(&format!(
-                    "  %select_arr_{} = alloca [{} x ptr], align 8\n",
+                    "  %select_entries_{} = alloca [{} x %struct.ifa_select_wait_entry], align 8\n",
                     res_id, arr_len
+                ));
+                out.push_str(&format!(
+                    "  %select_table_{} = alloca %struct.ifa_select_wait_table, align 8\n",
+                    res_id
                 ));
                 for (i, chan_id) in channels.iter().enumerate() {
                     out.push_str(&format!(
-                        "  %select_elem_{}_{} = getelementptr inbounds [{} x ptr], ptr %select_arr_{}, i64 0, i64 {}\n",
+                        "  %select_entry_{}_{} = getelementptr inbounds [{} x %struct.ifa_select_wait_entry], ptr %select_entries_{}, i64 0, i64 {}\n",
                         res_id, i, arr_len, res_id, i
                     ));
                     out.push_str(&format!(
-                        "  store ptr %v{}, ptr %select_elem_{}_{}, align 8\n",
+                        "  %select_chan_slot_{}_{} = getelementptr inbounds %struct.ifa_select_wait_entry, ptr %select_entry_{}_{}, i32 0, i32 0\n",
+                        res_id, i, res_id, i
+                    ));
+                    out.push_str(&format!(
+                        "  store ptr %v{}, ptr %select_chan_slot_{}_{}, align 8\n",
                         chan_id.0, res_id, i
                     ));
+                    out.push_str(&format!(
+                        "  %select_op_slot_{}_{} = getelementptr inbounds %struct.ifa_select_wait_entry, ptr %select_entry_{}_{}, i32 0, i32 1\n",
+                        res_id, i, res_id, i
+                    ));
+                    out.push_str(&format!(
+                        "  store i32 0, ptr %select_op_slot_{}_{}, align 4\n",
+                        res_id, i
+                    ));
+                    out.push_str(&format!(
+                        "  %select_rdy_slot_{}_{} = getelementptr inbounds %struct.ifa_select_wait_entry, ptr %select_entry_{}_{}, i32 0, i32 2\n",
+                        res_id, i, res_id, i
+                    ));
+                    out.push_str(&format!(
+                        "  store i32 0, ptr %select_rdy_slot_{}_{}, align 4\n",
+                        res_id, i
+                    ));
+                    out.push_str(&format!(
+                        "  %select_val_slot_{}_{} = getelementptr inbounds %struct.ifa_select_wait_entry, ptr %select_entry_{}_{}, i32 0, i32 3\n",
+                        res_id, i, res_id, i
+                    ));
+                    out.push_str(&format!(
+                        "  store ptr null, ptr %select_val_slot_{}_{}, align 8\n",
+                        res_id, i
+                    ));
                 }
+                out.push_str(&format!(
+                    "  %select_tbl_ent_{} = getelementptr inbounds %struct.ifa_select_wait_table, ptr %select_table_{}, i32 0, i32 0\n",
+                    res_id, res_id
+                ));
+                out.push_str(&format!(
+                    "  %select_base_ent_{} = getelementptr inbounds [{} x %struct.ifa_select_wait_entry], ptr %select_entries_{}, i64 0, i64 0\n",
+                    res_id, arr_len, res_id
+                ));
+                out.push_str(&format!(
+                    "  store ptr %select_base_ent_{}, ptr %select_tbl_ent_{}, align 8\n",
+                    res_id, res_id
+                ));
+                out.push_str(&format!(
+                    "  %select_tbl_cnt_{} = getelementptr inbounds %struct.ifa_select_wait_table, ptr %select_table_{}, i32 0, i32 1\n",
+                    res_id, res_id
+                ));
+                out.push_str(&format!(
+                    "  store i64 {}, ptr %select_tbl_cnt_{}, align 8\n",
+                    n, res_id
+                ));
+                out.push_str(&format!(
+                    "  %select_tbl_def_{} = getelementptr inbounds %struct.ifa_select_wait_table, ptr %select_table_{}, i32 0, i32 2\n",
+                    res_id, res_id
+                ));
+                out.push_str(&format!(
+                    "  store i32 {}, ptr %select_tbl_def_{}, align 4\n",
+                    if *has_default { 1 } else { 0 },
+                    res_id
+                ));
                 if is_coro && !has_default {
                     let y_id = *coro_yield_idx;
                     *coro_yield_idx += 1;
                     out.push_str(&format!("  br label %coro.sel_poll_{}\n", y_id));
                     out.push_str(&format!("coro.sel_poll_{}:\n", y_id));
                     out.push_str(&format!(
-                        "  %sel_poll_res_{}_{} = call i64 @ifa_rt_channel_select(ptr %select_arr_{}, i64 {}, i32 1)\n",
-                        res_id, y_id, res_id, n
+                        "  %sel_poll_res_{}_{} = call i64 @ifa_rt_channel_select_table(ptr %select_table_{})\n",
+                        res_id, y_id, res_id
                     ));
                     out.push_str(&format!(
-                        "  %sel_is_waiting_{}_{} = icmp eq i64 %sel_poll_res_{}_{}, {}\n",
-                        res_id, y_id, res_id, y_id, n
+                        "  %sel_is_waiting_{}_{} = icmp eq i64 %sel_poll_res_{}_{}, -1\n",
+                        res_id, y_id, res_id, y_id
                     ));
                     out.push_str(&format!(
                         "  br i1 %sel_is_waiting_{}_{}, label %coro.sel_susp_{}, label %coro.sel_done_{}\n",
@@ -2529,13 +2599,15 @@ impl<'a> LlvmIrEmitter<'a> {
                         "  %v{} = phi i64 [ %sel_poll_res_{}_{}, %coro.sel_poll_{} ]\n",
                         res_id, res_id, y_id, y_id
                     ));
+                } else if is_coro && *has_default {
+                    out.push_str(&format!(
+                        "  %v{} = call i64 @ifa_rt_channel_select_table(ptr %select_table_{})\n",
+                        res_id, res_id
+                    ));
                 } else {
                     out.push_str(&format!(
-                        "  %v{} = call i64 @ifa_rt_channel_select(ptr %select_arr_{}, i64 {}, i32 {})\n",
-                        res_id,
-                        res_id,
-                        n,
-                        if *has_default { 1 } else { 0 }
+                        "  %v{} = call i64 @ifa_rt_channel_select_wait_table(ptr %select_table_{})\n",
+                        res_id, res_id
                     ));
                 }
             }

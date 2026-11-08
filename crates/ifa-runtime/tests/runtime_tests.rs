@@ -392,6 +392,139 @@ fn test_c_abi_channel_select() {
 }
 
 #[test]
+fn test_channel_select_wait_table_zero_allocation() {
+    use ifa_runtime::ffi::{
+        ifa_rt_channel_close, ifa_rt_channel_create, ifa_rt_channel_destroy, ifa_rt_channel_recv,
+        ifa_rt_channel_select_table, ifa_rt_channel_select_wait_table, ifa_rt_channel_send,
+        IfaSelectWaitEntry, IfaSelectWaitTable, IFA_SELECT_OP_RECV, IFA_SELECT_OP_SEND,
+        IFA_SELECT_STATUS_CLOSED, IFA_SELECT_STATUS_PENDING, IFA_SELECT_STATUS_READY,
+    };
+
+    let ch1 = ifa_rt_channel_create(2);
+    let ch2 = ifa_rt_channel_create(2);
+    let ch3 = ifa_rt_channel_create(2);
+
+    let mut entries = [
+        IfaSelectWaitEntry {
+            chan: ch1,
+            op: IFA_SELECT_OP_RECV,
+            status: IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+        },
+        IfaSelectWaitEntry {
+            chan: ch2,
+            op: IFA_SELECT_OP_RECV,
+            status: IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+        },
+    ];
+
+    // 1. Polling without default when both channels are empty must return -1 (coroutine suspend)
+    let mut table_no_def = IfaSelectWaitTable {
+        entries: entries.as_mut_ptr(),
+        count: 2,
+        has_default: 0,
+    };
+    assert_eq!(ifa_rt_channel_select_table(&mut table_no_def), -1);
+
+    // 2. Polling with default when empty must return count (2)
+    let mut table_with_def = IfaSelectWaitTable {
+        entries: entries.as_mut_ptr(),
+        count: 2,
+        has_default: 1,
+    };
+    assert_eq!(ifa_rt_channel_select_table(&mut table_with_def), 2);
+
+    // 3. Send message into ch2
+    let val2 = 0x4242 as *mut u8;
+    assert_eq!(ifa_rt_channel_send(ch2, val2), 0);
+
+    // Now table polling without default must immediately select index 1 (ch2)
+    let sel_idx = ifa_rt_channel_select_table(&mut table_no_def);
+    assert_eq!(sel_idx, 1);
+    assert_eq!(entries[1].status, IFA_SELECT_STATUS_READY);
+
+    // Receive the message
+    let mut out: *mut u8 = std::ptr::null_mut();
+    assert_eq!(ifa_rt_channel_recv(ch2, &mut out), 0);
+    assert_eq!(out, val2);
+
+    // 4. Test SEND wait operation in table
+    let mut send_entries = [IfaSelectWaitEntry {
+        chan: ch3,
+        op: IFA_SELECT_OP_SEND,
+        status: IFA_SELECT_STATUS_PENDING,
+        val: 0x9999 as *mut u8,
+    }];
+    let mut send_table = IfaSelectWaitTable {
+        entries: send_entries.as_mut_ptr(),
+        count: 1,
+        has_default: 0,
+    };
+    // ch3 is empty so SEND capacity is ready
+    assert_eq!(ifa_rt_channel_select_table(&mut send_table), 0);
+    assert_eq!(send_entries[0].status, IFA_SELECT_STATUS_READY);
+
+    // 5. Test cooperative wait table execution on background thread
+    let ch1_addr = ch1 as usize;
+    let handle = std::thread::spawn(move || {
+        let mut bg_entries = [IfaSelectWaitEntry {
+            chan: ch1_addr as *mut _,
+            op: IFA_SELECT_OP_RECV,
+            status: IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+        }];
+        let mut bg_table = IfaSelectWaitTable {
+            entries: bg_entries.as_mut_ptr(),
+            count: 1,
+            has_default: 0,
+        };
+        ifa_rt_channel_select_wait_table(&mut bg_table)
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let val1 = 0x1111 as *mut u8;
+    assert_eq!(ifa_rt_channel_send(ch1, val1), 0);
+
+    let waited_idx = handle.join().expect("join failed");
+    assert_eq!(waited_idx, 0);
+
+    let mut out1: *mut u8 = std::ptr::null_mut();
+    assert_eq!(ifa_rt_channel_recv(ch1, &mut out1), 0);
+    assert_eq!(out1, val1);
+
+    // 6. Test all closed channels returns -2
+    ifa_rt_channel_close(ch1);
+    ifa_rt_channel_close(ch2);
+    let mut closed_entries = [
+        IfaSelectWaitEntry {
+            chan: ch1,
+            op: IFA_SELECT_OP_RECV,
+            status: IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+        },
+        IfaSelectWaitEntry {
+            chan: ch2,
+            op: IFA_SELECT_OP_RECV,
+            status: IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+        },
+    ];
+    let mut closed_table = IfaSelectWaitTable {
+        entries: closed_entries.as_mut_ptr(),
+        count: 2,
+        has_default: 0,
+    };
+    assert_eq!(ifa_rt_channel_select_table(&mut closed_table), -2);
+    assert_eq!(closed_entries[0].status, IFA_SELECT_STATUS_CLOSED);
+    assert_eq!(closed_entries[1].status, IFA_SELECT_STATUS_CLOSED);
+
+    ifa_rt_channel_destroy(ch1);
+    ifa_rt_channel_destroy(ch2);
+    ifa_rt_channel_destroy(ch3);
+}
+
+#[test]
 fn test_stackless_fiber_resumable_scheduler() {
     let sched = FiberScheduler::new(2);
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));

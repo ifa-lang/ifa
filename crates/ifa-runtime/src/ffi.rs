@@ -1311,6 +1311,138 @@ pub extern "C" fn ifa_rt_channel_is_closed(chan: *mut IfaChannelHandle) -> i32 {
     }
 }
 
+/// Operation mode for a zero-allocation select wait entry.
+pub const IFA_SELECT_OP_RECV: u32 = 0;
+pub const IFA_SELECT_OP_SEND: u32 = 1;
+
+/// Readiness status for a zero-allocation select wait entry.
+pub const IFA_SELECT_STATUS_PENDING: u32 = 0;
+pub const IFA_SELECT_STATUS_READY: u32 = 1;
+pub const IFA_SELECT_STATUS_CLOSED: u32 = 2;
+
+/// A single wait entry in a zero-allocation select wait table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct IfaSelectWaitEntry {
+    /// Pointer to the IFA channel handle.
+    pub chan: *mut IfaChannelHandle,
+    /// Operation to wait for: 0 = RECV, 1 = SEND.
+    pub op: u32,
+    /// Status: 0 = PENDING, 1 = READY, 2 = CLOSED.
+    pub status: u32,
+    /// Payload pointer (transferred value or target buffer).
+    pub val: *mut u8,
+}
+
+/// A zero-allocation descriptor table representing multiple channel operations to multiplex.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct IfaSelectWaitTable {
+    /// Pointer to contiguous array of wait entries allocated on the stack.
+    pub entries: *mut IfaSelectWaitEntry,
+    /// Number of entries in the table.
+    pub count: usize,
+    /// Non-zero if a default fallback branch is present.
+    pub has_default: i32,
+}
+
+/// Zero-allocation non-blocking multiplexing evaluation of a select wait table.
+///
+/// Returns:
+/// - index >= 0: the index of the first satisfied entry (marked READY)
+/// - table.count: if `has_default != 0` and no entry is ready
+/// - -2: if all monitored channels are closed
+/// - -1: if no entry is ready and `has_default == 0` (signals coroutine suspension)
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_select_table(table: *mut IfaSelectWaitTable) -> i64 {
+    if table.is_null() {
+        return -2;
+    }
+    let t = unsafe { &mut *table };
+    if t.entries.is_null() || t.count == 0 {
+        return if t.has_default != 0 { 0 } else { -2 };
+    }
+
+    let entries = unsafe { std::slice::from_raw_parts_mut(t.entries, t.count) };
+    let mut any_open = false;
+
+    for (idx, entry) in entries.iter_mut().enumerate() {
+        if entry.chan.is_null() {
+            continue;
+        }
+        let handle = unsafe { &*entry.chan };
+        let is_closed = handle.0.is_closed();
+
+        if !is_closed {
+            any_open = true;
+        }
+
+        match entry.op {
+            IFA_SELECT_OP_RECV => {
+                if !handle.0.is_empty() {
+                    entry.status = IFA_SELECT_STATUS_READY;
+                    return idx as i64;
+                } else if is_closed {
+                    entry.status = IFA_SELECT_STATUS_CLOSED;
+                } else {
+                    entry.status = IFA_SELECT_STATUS_PENDING;
+                }
+            }
+            IFA_SELECT_OP_SEND => {
+                if !handle.0.is_full() && !is_closed {
+                    entry.status = IFA_SELECT_STATUS_READY;
+                    return idx as i64;
+                } else if is_closed {
+                    entry.status = IFA_SELECT_STATUS_CLOSED;
+                } else {
+                    entry.status = IFA_SELECT_STATUS_PENDING;
+                }
+            }
+            _ => {
+                if !handle.0.is_empty() {
+                    entry.status = IFA_SELECT_STATUS_READY;
+                    return idx as i64;
+                }
+            }
+        }
+    }
+
+    if t.has_default != 0 {
+        return t.count as i64;
+    }
+
+    if !any_open {
+        return -2;
+    }
+
+    -1
+}
+
+/// Zero-allocation blocking/cooperative multiplexing evaluation of a select wait table.
+/// Cooperatively yields the calling fiber or spins until an entry is satisfied.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_select_wait_table(table: *mut IfaSelectWaitTable) -> i64 {
+    if table.is_null() {
+        return -2;
+    }
+    let mut spins: u32 = 0;
+    loop {
+        let res = ifa_rt_channel_select_table(table);
+        if res != -1 {
+            return res;
+        }
+        spins += 1;
+        if spins < 32 {
+            std::hint::spin_loop();
+        } else if spins < 64 {
+            GLOBAL_SCHEDULER.yield_now();
+        } else {
+            std::thread::yield_now();
+            spins = 32;
+        }
+    }
+}
+
 /// Non-blocking or cooperative select over an array of channels.
 ///
 /// Returns:
@@ -1328,40 +1460,39 @@ pub extern "C" fn ifa_rt_channel_select(
     }
 
     let chan_slice = unsafe { std::slice::from_raw_parts(channels, num_channels) };
-    let mut spins: u32 = 0;
+    let mut stack_entries = [IfaSelectWaitEntry {
+        chan: std::ptr::null_mut(),
+        op: IFA_SELECT_OP_RECV,
+        status: IFA_SELECT_STATUS_PENDING,
+        val: std::ptr::null_mut(),
+    }; 32];
 
-    loop {
-        let mut any_open = false;
+    if num_channels <= 32 {
         for (idx, &handle_ptr) in chan_slice.iter().enumerate() {
-            if handle_ptr.is_null() {
-                continue;
-            }
-            let handle = unsafe { &*handle_ptr };
-            if !handle.0.is_closed() {
-                any_open = true;
-            }
-            if !handle.0.is_empty() {
-                return idx as i64;
-            }
+            stack_entries[idx].chan = handle_ptr;
         }
-
-        if has_default != 0 {
-            return num_channels as i64;
-        }
-
-        if !any_open {
-            return -2;
-        }
-
-        spins += 1;
-        if spins < 32 {
-            std::hint::spin_loop();
-        } else if spins < 64 {
-            GLOBAL_SCHEDULER.yield_now();
-        } else {
-            std::thread::yield_now();
-            spins = 32;
-        }
+        let mut table = IfaSelectWaitTable {
+            entries: stack_entries.as_mut_ptr(),
+            count: num_channels,
+            has_default,
+        };
+        ifa_rt_channel_select_wait_table(&mut table)
+    } else {
+        let mut dynamic_entries: Vec<IfaSelectWaitEntry> = chan_slice
+            .iter()
+            .map(|&ch| IfaSelectWaitEntry {
+                chan: ch,
+                op: IFA_SELECT_OP_RECV,
+                status: IFA_SELECT_STATUS_PENDING,
+                val: std::ptr::null_mut(),
+            })
+            .collect();
+        let mut table = IfaSelectWaitTable {
+            entries: dynamic_entries.as_mut_ptr(),
+            count: num_channels,
+            has_default,
+        };
+        ifa_rt_channel_select_wait_table(&mut table)
     }
 }
 
