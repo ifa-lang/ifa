@@ -75,6 +75,7 @@ struct DominanceContext<'a> {
     val_arenas: &'a HashMap<ValueId, u16>,
     aliases: &'a HashMap<ValueId, ValueId>,
     callee_has_free: &'a HashMap<Symbol, bool>,
+    inst_defs: &'a HashMap<ValueId, ValueExpr>,
 }
 
 /// Analysis context bundled for loop-invariant generational check hoisting.
@@ -85,6 +86,7 @@ struct LoopHoistContext<'a> {
     val_arenas: &'a HashMap<ValueId, u16>,
     ref_defs: &'a HashMap<ValueId, BlockId>,
     aliases: &'a HashMap<ValueId, ValueId>,
+    inst_defs: &'a HashMap<ValueId, ValueExpr>,
 }
 
 /// Statistics collected by the generational check elimination (GCE) pass.
@@ -126,6 +128,38 @@ fn canonical_ref(mut val: ValueId, aliases: &HashMap<ValueId, ValueId>) -> Value
         val = target;
     }
     val
+}
+
+/// Traverses projections (GetField, GetElement, SliceSub, SliceStrided, GenDeref, GenRef)
+/// upwards to discover the enclosing composite structure or slice allocation root.
+pub fn find_allocation_root(
+    mut val: ValueId,
+    inst_defs: &HashMap<ValueId, ValueExpr>,
+    aliases: &HashMap<ValueId, ValueId>,
+) -> ValueId {
+    let mut visited = HashSet::new();
+    while visited.insert(val) {
+        let canon = canonical_ref(val, aliases);
+        match inst_defs.get(&canon).or_else(|| inst_defs.get(&val)) {
+            Some(
+                ValueExpr::GetField { base, .. }
+                | ValueExpr::GetFieldPtr { base, .. }
+                | ValueExpr::GetElement { base, .. }
+                | ValueExpr::GetElementPtr { base, .. }
+                | ValueExpr::SliceSub { base, .. }
+                | ValueExpr::SliceStrided { base, .. }
+                | ValueExpr::GenDeref { ref_val: base }
+                | ValueExpr::GenRef { ptr: base },
+            ) => {
+                val = *base;
+            }
+            _ => {
+                val = canon;
+                break;
+            }
+        }
+    }
+    canonical_ref(val, aliases)
 }
 
 /// Helper extracting arguments slice targeted by a terminator towards a specific block.
@@ -306,6 +340,7 @@ pub struct DataflowContext<'a> {
     pub callee_has_free: &'a HashMap<Symbol, bool>,
     pub safe_params: &'a HashSet<(Symbol, usize)>,
     pub safe_env_captures: &'a HashSet<(Symbol, usize)>,
+    pub inst_defs: &'a HashMap<ValueId, ValueExpr>,
 }
 
 /// Confluent forward dataflow analysis computing available generational references at each program point.
@@ -497,7 +532,7 @@ impl GenerationalDataflowAnalysis {
                 // Transfer function across instructions of block
                 let mut cur = in_facts.clone();
                 let mut ptr_aliases: HashMap<ValueId, ValueId> = HashMap::new();
-                let mut deref_roots: HashMap<ValueId, ValueId> = HashMap::new();
+                let mut projection_roots: HashMap<ValueId, ValueId> = HashMap::new();
 
                 if let Some(block) = cx.func.get_block(b_id) {
                     for (inst_idx, inst) in block.instructions.iter().enumerate() {
@@ -508,6 +543,10 @@ impl GenerationalDataflowAnalysis {
                                 let canon = canonical_ref(*ref_val, cx.aliases);
                                 cur.insert(*ref_val);
                                 cur.insert(canon);
+                                if let Some(&root) = projection_roots.get(ref_val) {
+                                    cur.insert(root);
+                                    cur.insert(canonical_ref(root, cx.aliases));
+                                }
                             }
                             ValueExpr::GenRef { .. }
                             | ValueExpr::GenAlloc { .. }
@@ -523,7 +562,9 @@ impl GenerationalDataflowAnalysis {
                             }
                             ValueExpr::GenDeref { ref_val } => {
                                 if let Some(res) = inst.result {
-                                    deref_roots.insert(res, *ref_val);
+                                    let root =
+                                        projection_roots.get(ref_val).copied().unwrap_or(*ref_val);
+                                    projection_roots.insert(res, root);
                                 }
                             }
                             ValueExpr::GetField {
@@ -533,9 +574,16 @@ impl GenerationalDataflowAnalysis {
                                 base, field_idx, ..
                             } => {
                                 if let Some(res) = inst.result {
-                                    let root = deref_roots.get(base).copied().unwrap_or(*base);
+                                    let root = projection_roots.get(base).copied().unwrap_or(*base);
                                     let canon_root = canonical_ref(root, cx.aliases);
-                                    if cur.contains(&root) || cur.contains(&canon_root) {
+                                    let canon_base = canonical_ref(*base, cx.aliases);
+                                    projection_roots.insert(res, root);
+
+                                    if cur.contains(&root)
+                                        || cur.contains(&canon_root)
+                                        || cur.contains(base)
+                                        || cur.contains(&canon_base)
+                                    {
                                         cur.insert(res);
                                         cur.insert(canonical_ref(res, cx.aliases));
                                     }
@@ -546,6 +594,26 @@ impl GenerationalDataflowAnalysis {
                                         && cx
                                             .safe_env_captures
                                             .contains(&(cx.func.name, *field_idx))
+                                    {
+                                        cur.insert(res);
+                                        cur.insert(canonical_ref(res, cx.aliases));
+                                    }
+                                }
+                            }
+                            ValueExpr::GetElement { base, .. }
+                            | ValueExpr::GetElementPtr { base, .. }
+                            | ValueExpr::SliceSub { base, .. }
+                            | ValueExpr::SliceStrided { base, .. } => {
+                                if let Some(res) = inst.result {
+                                    let root = projection_roots.get(base).copied().unwrap_or(*base);
+                                    let canon_root = canonical_ref(root, cx.aliases);
+                                    let canon_base = canonical_ref(*base, cx.aliases);
+                                    projection_roots.insert(res, root);
+
+                                    if cur.contains(&root)
+                                        || cur.contains(&canon_root)
+                                        || cur.contains(base)
+                                        || cur.contains(&canon_base)
                                     {
                                         cur.insert(res);
                                         cur.insert(canonical_ref(res, cx.aliases));
@@ -691,6 +759,25 @@ impl GenerationalDataflowAnalysis {
                                         || cx.safe_params.iter().any(|(f, _)| *f == cx.func.name)
                                     {
                                         return true;
+                                    }
+
+                                    // 2b. Composite and slice projections derived from formal parameters or stack frame
+                                    if let Some(&root) = projection_roots
+                                        .get(&val)
+                                        .or_else(|| projection_roots.get(&val_canon))
+                                    {
+                                        let canon_root = canonical_ref(root, cx.aliases);
+                                        if func_params.contains(&root)
+                                            || func_params.contains(&canon_root)
+                                            || alloca_values.contains(&root)
+                                            || alloca_values.contains(&canon_root)
+                                            || cx
+                                                .safe_params
+                                                .iter()
+                                                .any(|(f, _)| *f == cx.func.name)
+                                        {
+                                            return true;
+                                        }
                                     }
 
                                     // 3. Isolated non-zero memory arenas
@@ -960,6 +1047,7 @@ impl GenerationalOptPass {
             free_operations: Vec<FreeOperation>,
             struct_inits: HashMap<ValueId, (Symbol, Vec<ValueId>, BlockId, usize)>,
             closure_creations: Vec<(Symbol, ValueId, BlockId, usize)>,
+            inst_defs: HashMap<ValueId, ValueExpr>,
         }
 
         let mut func_contexts: HashMap<Symbol, FuncContext> = HashMap::new();
@@ -973,10 +1061,12 @@ impl GenerationalOptPass {
             let free_operations =
                 compute_free_operations(func, &val_arenas, &aliases, &callee_has_free);
 
+            let mut inst_defs: HashMap<ValueId, ValueExpr> = HashMap::new();
             let mut string_constants: HashMap<ValueId, Symbol> = HashMap::new();
             for block in &func.blocks {
                 for inst in &block.instructions {
                     if let Some(res) = inst.result {
+                        inst_defs.insert(res, inst.expr.clone());
                         if let ValueExpr::Constant(ConstantValue::String(s)) = &inst.expr {
                             string_constants.insert(res, *s);
                         } else if let ValueExpr::Constant(ConstantValue::Function(s)) = &inst.expr {
@@ -1034,6 +1124,7 @@ impl GenerationalOptPass {
                     free_operations,
                     struct_inits,
                     closure_creations,
+                    inst_defs,
                 },
             );
         }
@@ -1063,6 +1154,7 @@ impl GenerationalOptPass {
                     callee_has_free: &callee_has_free,
                     safe_params: &safe_params,
                     safe_env_captures: &safe_env_captures,
+                    inst_defs: &ctx.inst_defs,
                 };
                 let df = GenerationalDataflowAnalysis::compute(&cx);
                 dataflows.insert(func.name, df);
@@ -1280,6 +1372,7 @@ impl GenerationalOptPass {
 
         // 1. Identify where each value was created/defined: val -> creating BlockId
         let mut ref_creation_block: HashMap<ValueId, BlockId> = HashMap::new();
+        let mut inst_defs: HashMap<ValueId, ValueExpr> = HashMap::new();
 
         for p in &func.params {
             ref_creation_block.insert(p.val, func.entry_block);
@@ -1291,6 +1384,7 @@ impl GenerationalOptPass {
             for inst in &block.instructions {
                 if let Some(res) = inst.result {
                     ref_creation_block.insert(res, block.id);
+                    inst_defs.insert(res, inst.expr.clone());
                 }
             }
         }
@@ -1312,6 +1406,7 @@ impl GenerationalOptPass {
             val_arenas: &val_arenas,
             ref_defs: &ref_creation_block,
             aliases: &global_aliases,
+            inst_defs: &inst_defs,
         };
 
         for _ in 0..5 {
@@ -1330,6 +1425,7 @@ impl GenerationalOptPass {
             val_arenas: &val_arenas,
             aliases: &global_aliases,
             callee_has_free,
+            inst_defs: &inst_defs,
         };
         self.run_dominance_elimination(func, &cx);
     }
@@ -1357,26 +1453,47 @@ impl GenerationalOptPass {
                         if let ValueExpr::GenCheck { ref_val, redundant } = &inst.expr {
                             if !*redundant {
                                 let canon = canonical_ref(*ref_val, cx.aliases);
-                                let is_param =
-                                    param_values.contains(ref_val) || param_values.contains(&canon);
-                                let is_defined_outside =
-                                    cx.ref_defs.get(ref_val).is_some_and(|&def_b| {
+                                let root = find_allocation_root(*ref_val, cx.inst_defs, cx.aliases);
+                                let canon_root = canonical_ref(root, cx.aliases);
+
+                                let is_ref_invariant = param_values.contains(ref_val)
+                                    || param_values.contains(&canon)
+                                    || cx.ref_defs.get(ref_val).is_some_and(|&def_b| {
                                         !loop_info.blocks.contains(&def_b)
                                             && cx.dom_tree.dominates(def_b, preheader_id)
-                                    }) || cx.ref_defs.get(&canon).is_some_and(|&def_b| {
+                                    })
+                                    || cx.ref_defs.get(&canon).is_some_and(|&def_b| {
                                         !loop_info.blocks.contains(&def_b)
                                             && cx.dom_tree.dominates(def_b, preheader_id)
                                     });
 
-                                if (is_param || is_defined_outside)
-                                    && !candidate_checks
-                                        .iter()
-                                        .any(|(v, c, _)| *v == *ref_val || *c == canon)
-                                {
-                                    // Verify that no freeing operation inside the loop interferes with ref_val
+                                let is_root_invariant = param_values.contains(&root)
+                                    || param_values.contains(&canon_root)
+                                    || cx.ref_defs.get(&root).is_some_and(|&def_b| {
+                                        !loop_info.blocks.contains(&def_b)
+                                            && cx.dom_tree.dominates(def_b, preheader_id)
+                                    })
+                                    || cx.ref_defs.get(&canon_root).is_some_and(|&def_b| {
+                                        !loop_info.blocks.contains(&def_b)
+                                            && cx.dom_tree.dominates(def_b, preheader_id)
+                                    });
+
+                                let target_hoist_val = if is_ref_invariant {
+                                    canon
+                                } else if is_root_invariant {
+                                    canon_root
+                                } else {
+                                    continue;
+                                };
+
+                                if !candidate_checks.iter().any(|(v, c, _)| {
+                                    *v == target_hoist_val || *c == target_hoist_val
+                                }) {
+                                    // Verify that no freeing operation inside the loop interferes with target_hoist_val
                                     let ref_arena = cx
                                         .val_arenas
-                                        .get(ref_val)
+                                        .get(&target_hoist_val)
+                                        .or_else(|| cx.val_arenas.get(ref_val))
                                         .or_else(|| cx.val_arenas.get(&canon))
                                         .copied();
 
@@ -1384,12 +1501,18 @@ impl GenerationalOptPass {
                                         cx.free_operations.iter().any(|op| {
                                             loop_info.blocks.contains(&op.block)
                                                 && op.interferes_with_ref(
-                                                    *ref_val, ref_arena, cx.aliases,
+                                                    target_hoist_val,
+                                                    ref_arena,
+                                                    cx.aliases,
                                                 )
                                         });
 
                                     if !has_interfering_free {
-                                        candidate_checks.push((*ref_val, canon, inst.span));
+                                        candidate_checks.push((
+                                            target_hoist_val,
+                                            target_hoist_val,
+                                            inst.span,
+                                        ));
                                     }
                                 }
                             }
@@ -1407,7 +1530,10 @@ impl GenerationalOptPass {
                 let already_checked_in_preheader = func.get_block(preheader_id).is_some_and(|pb| {
                     pb.instructions.iter().any(|inst| match &inst.expr {
                         ValueExpr::GenCheck { ref_val: r, .. } => {
-                            *r == ref_val || *r == canon || canonical_ref(*r, cx.aliases) == canon
+                            *r == ref_val
+                                || *r == canon
+                                || canonical_ref(*r, cx.aliases) == canon
+                                || find_allocation_root(*r, cx.inst_defs, cx.aliases) == canon
                         }
                         _ => false,
                     })
@@ -1446,11 +1572,15 @@ impl GenerationalOptPass {
                                 redundant,
                             } = &mut inst.expr
                             {
-                                if (*r == ref_val
+                                let r_canon = canonical_ref(*r, cx.aliases);
+                                let r_root = find_allocation_root(*r, cx.inst_defs, cx.aliases);
+                                let matches_check = *r == ref_val
                                     || *r == canon
-                                    || canonical_ref(*r, cx.aliases) == canon)
-                                    && !*redundant
-                                {
+                                    || r_canon == canon
+                                    || r_root == canon
+                                    || r_root == ref_val;
+
+                                if matches_check && !*redundant {
                                     *redundant = true;
                                     self.stats.eliminated_checks += 1;
                                     if is_coroutine {
@@ -1480,6 +1610,7 @@ impl GenerationalOptPass {
             callee_has_free: cx.callee_has_free,
             safe_params: &self.safe_params,
             safe_env_captures: &self.safe_env_captures,
+            inst_defs: cx.inst_defs,
         };
         let dataflow = GenerationalDataflowAnalysis::compute(&dataflow_cx);
 
@@ -1493,8 +1624,13 @@ impl GenerationalOptPass {
                         continue;
                     }
 
+                    let root = find_allocation_root(*ref_val, cx.inst_defs, cx.aliases);
+                    let canon_root = canonical_ref(root, cx.aliases);
+
                     if is_strict
                         || dataflow.is_available_at(block.id, inst_idx, *ref_val, cx.aliases)
+                        || dataflow.is_available_at(block.id, inst_idx, root, cx.aliases)
+                        || dataflow.is_available_at(block.id, inst_idx, canon_root, cx.aliases)
                     {
                         *redundant = true;
                         self.stats.eliminated_checks += 1;

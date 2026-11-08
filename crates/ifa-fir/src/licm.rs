@@ -682,6 +682,7 @@ impl LicmPass {
 
                 // Compute written memory paths and side-effect calls within loop blocks
                 let mut written_paths: Vec<FirAccessPath> = Vec::new();
+                let mut freed_paths: Vec<FirAccessPath> = Vec::new();
                 let mut has_impure_call = false;
                 let mut loop_has_gen_free = false;
                 let mut loop_freed_arenas: HashSet<Option<u16>> = HashSet::new();
@@ -761,6 +762,7 @@ impl LicmPass {
                                     let free_path =
                                         resolve_access_path(*ptr, &inst_defs, &constants, 0);
                                     loop_freed_arenas.insert(free_path.arena_id);
+                                    freed_paths.push(free_path.clone());
                                     written_paths.push(free_path);
                                 }
                                 ValueExpr::CallDirect { name, .. } => {
@@ -1240,8 +1242,10 @@ impl LicmPass {
                                                 } else {
                                                     true
                                                 }
+                                            } else if loop_freed_arenas.contains(&None) {
+                                                true
                                             } else {
-                                                written_paths.iter().any(|w| ref_path.overlaps(w))
+                                                freed_paths.iter().any(|f| ref_path.overlaps(f))
                                             };
 
                                             if !interfering_free {
@@ -1443,20 +1447,46 @@ impl LicmPass {
                             for in_i in &mut blk.instructions {
                                 match &mut in_i.expr {
                                     ValueExpr::GenCheck { ref_val, redundant } => {
+                                        let ref_path = resolve_access_path(
+                                            *ref_val, &inst_defs, &constants, 0,
+                                        );
+                                        let root = ref_path.root;
+                                        let is_already_checked = checked_refs_in_loop
+                                            .contains(ref_val)
+                                            || checked_refs_in_loop.contains(&root);
+
+                                        let interfering_free = if !loop_has_gen_free {
+                                            false
+                                        } else if let Some(a) = ref_path.arena_id {
+                                            if a > 0 {
+                                                loop_freed_arenas.contains(&Some(a))
+                                                    || loop_freed_arenas.contains(&None)
+                                            } else {
+                                                true
+                                            }
+                                        } else if loop_freed_arenas.contains(&None) {
+                                            true
+                                        } else {
+                                            freed_paths.iter().any(|f| ref_path.overlaps(f))
+                                        };
+
                                         if *redundant {
                                             checked_refs_in_loop.insert(*ref_val);
-                                        } else if checked_refs_in_loop.contains(ref_val)
-                                            && !loop_has_gen_free
-                                        {
+                                            checked_refs_in_loop.insert(root);
+                                        } else if is_already_checked && !interfering_free {
                                             *redundant = true;
                                             self.stats.coroutine_sync_barriers_eliminated += 1;
                                             loop_optimized = true;
                                         } else {
                                             checked_refs_in_loop.insert(*ref_val);
+                                            checked_refs_in_loop.insert(root);
                                         }
                                     }
                                     ValueExpr::GenFree { ptr } => {
+                                        let free_path =
+                                            resolve_access_path(*ptr, &inst_defs, &constants, 0);
                                         checked_refs_in_loop.remove(ptr);
+                                        checked_refs_in_loop.remove(&free_path.root);
                                     }
                                     _ => {}
                                 }

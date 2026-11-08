@@ -2028,3 +2028,79 @@ fn test_coroutine_multi_step_state_machine_sync_elimination() {
         );
     }
 }
+
+#[test]
+fn test_loop_inout_ref_composite_hoisting_and_elision() {
+    let src = r#"
+        struct Packet {
+            seq: i64,
+            payload: i64,
+        }
+
+        pub fn process_stream(inout pkt: ref Packet, limit: i64) -> i64 {
+            mut acc = 0;
+            while acc < limit {
+                pkt.seq = pkt.seq + 1;
+                pkt.payload = pkt.payload + 10;
+                acc = acc + 1;
+            }
+            return acc + pkt.seq + pkt.payload;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("composite_loop.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = compile_to_fir(&prog, &analysis.symbols, true, false).unwrap();
+    let mut gce = GenerationalOptPass::new();
+    gce.run_on_module(&mut module);
+
+    let stats = gce.stats();
+    assert_eq!(
+        stats.hoisted_checks, 2,
+        "Expected 2 hoisted checks out of the loop into the preheader"
+    );
+    assert_eq!(
+        stats.eliminated_checks, 2,
+        "Expected 2 checks eliminated inside the loop"
+    );
+
+    // Verify all GenCheck instructions inside the loop body (bb2) are eliminated
+    let func = &module.functions[0];
+    let loop_body = func
+        .blocks
+        .iter()
+        .find(|b| b.id.0 == 2)
+        .expect("bb2 must exist");
+    let body_checks: Vec<bool> = loop_body
+        .instructions
+        .iter()
+        .filter_map(|i| {
+            if let ifa_fir::ValueExpr::GenCheck { redundant, .. } = i.expr {
+                Some(redundant)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert!(
+        !body_checks.is_empty(),
+        "Loop body must contain GenCheck instructions"
+    );
+    assert!(
+        body_checks.iter().all(|&r| r),
+        "All checks inside inout loop body must be eliminated: {:?}",
+        body_checks
+    );
+}

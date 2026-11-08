@@ -555,3 +555,370 @@ fn test_interpreter_coroutine_disjoint_arena_determinism() {
         "Interpreter must evaluate to exactly 99"
     );
 }
+
+#[test]
+fn test_coroutine_loop_inout_composite_and_slice_gen_check_elision() {
+    let mut module = FirModule::new(INTERNER.intern("coro_composite_mod"));
+
+    // Coroutine stream processor mutating an inout composite struct and slice in a loop
+    let coro_name = INTERNER.intern("coro_composite_stream_worker");
+    let pt_sym = INTERNER.intern("pt");
+    let buf_sym = INTERNER.intern("buf");
+
+    let pt_val = ifa_fir::ValueId(0);
+    let buf_val = ifa_fir::ValueId(1);
+
+    let pt_param = FirParam::new(
+        pt_sym,
+        pt_val,
+        FirType::GenerationalRef(Box::new(FirType::Struct(
+            INTERNER.intern("Point"),
+            vec![
+                (INTERNER.intern("x"), FirType::Int(IntType::I64)),
+                (INTERNER.intern("y"), FirType::Int(IntType::I64)),
+            ],
+        ))),
+        ParamMode::InOut,
+    );
+    let buf_param = FirParam::new(
+        buf_sym,
+        buf_val,
+        FirType::GenerationalRef(Box::new(FirType::Slice(Box::new(FirType::Int(
+            IntType::I64,
+        ))))),
+        ParamMode::InOut,
+    );
+
+    let mut func = FirFunction::new(
+        coro_name,
+        vec![pt_param, buf_param],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+    func.next_value_id = 2;
+
+    // CFG: entry -> preheader -> header -> body -> latch -> header
+    //                                  \-> exit
+    let b_entry = func.entry_block;
+    let b_pre = func.alloc_block();
+    let b_head = func.alloc_block();
+    let b_body = func.alloc_block();
+    let b_latch = func.alloc_block();
+    let b_exit = func.alloc_block();
+
+    // Entry block jumps to preheader
+    func.get_block_mut(b_entry).unwrap().terminator = Some(Terminator::Branch {
+        target: b_pre,
+        args: Vec::new(),
+    });
+
+    // Preheader initializes iteration counter and jumps to loop header
+    let zero_const = func.alloc_value();
+    let limit_const = func.alloc_value();
+    let one_const = func.alloc_value();
+
+    let pre_b = func.get_block_mut(b_pre).unwrap();
+    pre_b.instructions.push(Instruction::new(
+        Some(zero_const),
+        ValueExpr::Constant(ifa_fir::ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    pre_b.instructions.push(Instruction::new(
+        Some(limit_const),
+        ValueExpr::Constant(ifa_fir::ConstantValue::Int(10, IntType::I64)),
+        Span::DUMMY,
+    ));
+    pre_b.instructions.push(Instruction::new(
+        Some(one_const),
+        ValueExpr::Constant(ifa_fir::ConstantValue::Int(1, IntType::I64)),
+        Span::DUMMY,
+    ));
+    pre_b.terminator = Some(Terminator::Branch {
+        target: b_head,
+        args: vec![zero_const],
+    });
+
+    // Header has loop counter param (phi node)
+    let iter_var = func.alloc_value();
+    let cmp_res = func.alloc_value();
+    let head_b = func.get_block_mut(b_head).unwrap();
+    head_b.params.push((iter_var, FirType::Int(IntType::I64)));
+
+    head_b.instructions.push(Instruction::new(
+        Some(cmp_res),
+        ValueExpr::Binary {
+            op: BinaryOp::Lt,
+            lhs: iter_var,
+            rhs: limit_const,
+        },
+        Span::DUMMY,
+    ));
+    head_b.terminator = Some(Terminator::BranchCond {
+        cond: cmp_res,
+        then_block: b_body,
+        then_args: Vec::new(),
+        else_block: b_exit,
+        else_args: Vec::new(),
+    });
+
+    // Body block:
+    // 1. Projections on struct pt
+    let f0_val = func.alloc_value();
+    let f1_ptr = func.alloc_value();
+    let chk_pt_1 = func.alloc_value();
+    let chk_f0 = func.alloc_value();
+    let chk_f1 = func.alloc_value();
+    let new_f0 = func.alloc_value();
+
+    // 2. Projections and mutation on slice buf
+    let elem_ptr = func.alloc_value();
+    let chk_buf_1 = func.alloc_value();
+    let chk_elem = func.alloc_value();
+    let elem_val = func.alloc_value();
+
+    // 3. Coroutine suspension and post-suspension checks
+    let yield_res = func.alloc_value();
+    let chk_pt_post = func.alloc_value();
+    let chk_buf_post = func.alloc_value();
+
+    let body_b = func.get_block_mut(b_body).unwrap();
+
+    // GenCheck on struct pt
+    body_b.instructions.push(Instruction::new(
+        Some(chk_pt_1),
+        ValueExpr::GenCheck {
+            ref_val: pt_val,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+
+    // GetField on field 0
+    body_b.instructions.push(Instruction::new(
+        Some(f0_val),
+        ValueExpr::GetField {
+            base: pt_val,
+            field_idx: 0,
+            field_name: INTERNER.intern("x"),
+        },
+        Span::DUMMY,
+    ));
+
+    // GenCheck on field 0
+    body_b.instructions.push(Instruction::new(
+        Some(chk_f0),
+        ValueExpr::GenCheck {
+            ref_val: f0_val,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+
+    // Inout mutation on field 0: SetField
+    body_b.instructions.push(Instruction::new(
+        Some(new_f0),
+        ValueExpr::Binary {
+            op: BinaryOp::Add,
+            lhs: f0_val,
+            rhs: one_const,
+        },
+        Span::DUMMY,
+    ));
+    body_b.instructions.push(Instruction::new(
+        None,
+        ValueExpr::SetField {
+            base: pt_val,
+            field_idx: 0,
+            val: new_f0,
+        },
+        Span::DUMMY,
+    ));
+
+    // GetFieldPtr on field 1
+    body_b.instructions.push(Instruction::new(
+        Some(f1_ptr),
+        ValueExpr::GetFieldPtr {
+            base: pt_val,
+            field_idx: 1,
+            field_name: INTERNER.intern("y"),
+        },
+        Span::DUMMY,
+    ));
+
+    // GenCheck on field 1 pointer
+    body_b.instructions.push(Instruction::new(
+        Some(chk_f1),
+        ValueExpr::GenCheck {
+            ref_val: f1_ptr,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+
+    // Inout mutation on field 1: Store through field pointer
+    body_b.instructions.push(Instruction::new(
+        None,
+        ValueExpr::Store {
+            ptr: f1_ptr,
+            val: new_f0,
+        },
+        Span::DUMMY,
+    ));
+
+    // Slice operations: GenCheck, GetElementPtr, and Store
+    body_b.instructions.push(Instruction::new(
+        Some(chk_buf_1),
+        ValueExpr::GenCheck {
+            ref_val: buf_val,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_b.instructions.push(Instruction::new(
+        Some(elem_ptr),
+        ValueExpr::GetElementPtr {
+            base: buf_val,
+            index: iter_var,
+        },
+        Span::DUMMY,
+    ));
+    body_b.instructions.push(Instruction::new(
+        Some(chk_elem),
+        ValueExpr::GenCheck {
+            ref_val: elem_ptr,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_b.instructions.push(Instruction::new(
+        Some(elem_val),
+        ValueExpr::Constant(ifa_fir::ConstantValue::Int(42, IntType::I64)),
+        Span::DUMMY,
+    ));
+    body_b.instructions.push(Instruction::new(
+        None,
+        ValueExpr::SetElement {
+            base: buf_val,
+            index: iter_var,
+            val: elem_val,
+        },
+        Span::DUMMY,
+    ));
+
+    // Coroutine suspension point: YieldValue
+    body_b.instructions.push(Instruction::new(
+        Some(yield_res),
+        ValueExpr::YieldValue { val: new_f0 },
+        Span::DUMMY,
+    ));
+
+    // Post-suspension generational checks
+    body_b.instructions.push(Instruction::new(
+        Some(chk_pt_post),
+        ValueExpr::GenCheck {
+            ref_val: pt_val,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_b.instructions.push(Instruction::new(
+        Some(chk_buf_post),
+        ValueExpr::GenCheck {
+            ref_val: buf_val,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+
+    body_b.terminator = Some(Terminator::Branch {
+        target: b_latch,
+        args: Vec::new(),
+    });
+
+    // Latch block increments loop counter and jumps back to header
+    let next_iter = func.alloc_value();
+    let latch_b = func.get_block_mut(b_latch).unwrap();
+    latch_b.instructions.push(Instruction::new(
+        Some(next_iter),
+        ValueExpr::Binary {
+            op: BinaryOp::Add,
+            lhs: iter_var,
+            rhs: one_const,
+        },
+        Span::DUMMY,
+    ));
+    latch_b.terminator = Some(Terminator::Branch {
+        target: b_head,
+        args: vec![next_iter],
+    });
+
+    // Exit block returns 0
+    let exit_b = func.get_block_mut(b_exit).unwrap();
+    exit_b.terminator = Some(Terminator::Return(Some(zero_const)));
+
+    module.functions.push(func);
+
+    // Run GenerationalOptPass, LicmPass, and IpoPass
+    let mut gen_pass = ifa_fir::GenerationalOptPass::new();
+    gen_pass.run_on_module(&mut module);
+    let gen_stats = gen_pass.stats();
+
+    let mut licm_pass = ifa_fir::LicmPass::new();
+    licm_pass.run_on_module(&mut module);
+
+    let mut ipo_pass = ifa_fir::IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    // Verify statistics
+    assert!(
+        gen_stats.hoisted_checks >= 1,
+        "Expected invariant generational check to be hoisted to preheader, got {}",
+        gen_stats.hoisted_checks
+    );
+    assert!(
+        gen_stats.eliminated_checks >= 5,
+        "Expected at least 5 checks eliminated in coroutine loop, got {}",
+        gen_stats.eliminated_checks
+    );
+    assert!(
+        gen_stats.coroutine_sync_barriers_eliminated >= 5,
+        "Expected at least 5 coroutine sync barriers eliminated, got {}",
+        gen_stats.coroutine_sync_barriers_eliminated
+    );
+
+    // Verify all GenCheck instructions inside the loop body are marked redundant
+    let opt_func = module
+        .functions
+        .iter()
+        .find(|f| f.name == coro_name)
+        .expect("coro_composite_stream_worker must exist");
+
+    let body_checks: Vec<bool> = opt_func
+        .get_block(b_body)
+        .unwrap()
+        .instructions
+        .iter()
+        .filter_map(|i| {
+            if let ValueExpr::GenCheck { redundant, .. } = i.expr {
+                Some(redundant)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert!(
+        !body_checks.is_empty(),
+        "Body block must contain checked instructions"
+    );
+    assert!(
+        body_checks.iter().all(|&r| r),
+        "All GenCheck instructions inside coroutine loop mutating inout composites/slices must be marked redundant: {:?}",
+        body_checks
+    );
+}

@@ -1867,7 +1867,11 @@ impl IpoPass {
                                 }
                             }
                             ValueExpr::GetField { base, .. }
-                            | ValueExpr::GetFieldPtr { base, .. } => {
+                            | ValueExpr::GetFieldPtr { base, .. }
+                            | ValueExpr::GetElement { base, .. }
+                            | ValueExpr::GetElementPtr { base, .. }
+                            | ValueExpr::SliceSub { base, .. }
+                            | ValueExpr::SliceStrided { base, .. } => {
                                 if let Some(&a) = val_arenas.get(base) {
                                     val_arenas.insert(res, a);
                                 }
@@ -1989,6 +1993,22 @@ impl IpoPass {
                             | ValueExpr::GenRef { .. } => {
                                 if let Some(res) = inst.result {
                                     verified.insert(res);
+                                }
+                            }
+                            ValueExpr::GetField { base, .. }
+                            | ValueExpr::GetFieldPtr { base, .. }
+                            | ValueExpr::GetElement { base, .. }
+                            | ValueExpr::GetElementPtr { base, .. }
+                            | ValueExpr::SliceSub { base, .. }
+                            | ValueExpr::SliceStrided { base, .. } => {
+                                if let Some(res) = inst.result {
+                                    let mut canon_base = *base;
+                                    while let Some(&t) = aliases.get(&canon_base) {
+                                        canon_base = t;
+                                    }
+                                    if verified.contains(base) || verified.contains(&canon_base) {
+                                        verified.insert(res);
+                                    }
                                 }
                             }
                             ValueExpr::GenFree { ptr } => {
