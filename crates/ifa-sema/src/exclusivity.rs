@@ -20,18 +20,189 @@ pub fn extract_root_variable(expr: &Expr) -> Option<(Symbol, Span)> {
     }
 }
 
+/// A symbolic or constant bound of a slice access range in zero-copy streaming pipelines.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SliceBound {
+    /// Direct constant integer bound (e.g. `0`, `1024`).
+    Const(i64),
+    /// Variable or symbolic bound (e.g. `split_at`, `CHUNK_SIZE`).
+    Symbolic(Symbol),
+    /// Symbolic bound with a constant offset (e.g. `mid + 64` or `offset - 16`).
+    Offset(Symbol, i64),
+}
+
+impl SliceBound {
+    /// Formats the slice bound into a human-readable representation for diagnostics.
+    pub fn format(&self) -> String {
+        match self {
+            SliceBound::Const(c) => c.to_string(),
+            SliceBound::Symbolic(s) => INTERNER.resolve(s),
+            SliceBound::Offset(s, off) => {
+                let name = INTERNER.resolve(s);
+                if *off >= 0 {
+                    format!("{}+{}", name, off)
+                } else {
+                    format!("{}{}", name, off)
+                }
+            }
+        }
+    }
+
+    /// Evaluates to a constant integer if constant.
+    pub fn as_const(&self) -> Option<i64> {
+        match self {
+            SliceBound::Const(c) => Some(*c),
+            _ => None,
+        }
+    }
+}
+
 /// A segment in a structured memory access path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PathSegment {
     Field(Symbol),
     IndexConst(i64),
+    IndexSymbolic(Symbol),
     IndexUnknown,
     SliceConst {
         start: Option<i64>,
         end: Option<i64>,
         inclusive: bool,
     },
+    SliceRange {
+        start: Option<SliceBound>,
+        end: Option<SliceBound>,
+        inclusive: bool,
+    },
     Method(Symbol),
+}
+
+/// Helper determining whether two slice ranges are mathematically provable to be disjoint.
+fn are_slice_ranges_disjoint(
+    start1: Option<&SliceBound>,
+    end1: Option<&SliceBound>,
+    inc1: bool,
+    start2: Option<&SliceBound>,
+    end2: Option<&SliceBound>,
+    inc2: bool,
+) -> bool {
+    // 1. Both bounds are constant integers
+    if let (Some(s1), Some(e1), Some(s2), Some(e2)) = (
+        start1.and_then(|b| b.as_const()).or(Some(0)),
+        end1.and_then(|b| b.as_const()),
+        start2.and_then(|b| b.as_const()).or(Some(0)),
+        end2.and_then(|b| b.as_const()),
+    ) {
+        let max1 = if inc1 { e1 } else { e1 - 1 };
+        let min2 = s2;
+        if max1 < min2 {
+            return true; // Range 1 strictly precedes Range 2
+        }
+        let max2 = if inc2 { e2 } else { e2 - 1 };
+        let min1 = s1;
+        if max2 < min1 {
+            return true; // Range 2 strictly precedes Range 1
+        }
+    }
+
+    // 2. Symbolic split-point partition: Range 1 ends at K (exclusive) and Range 2 starts at K
+    // e.g. [..split] vs [split..] or [s1..split] vs [split..e2]
+    if !inc1 {
+        if let (Some(e1), Some(s2)) = (end1, start2) {
+            if bounds_equal_or_disjoint_order(e1, s2) {
+                return true;
+            }
+        }
+    }
+    if !inc2 {
+        if let (Some(e2), Some(s1)) = (end2, start1) {
+            if bounds_equal_or_disjoint_order(e2, s1) {
+                return true;
+            }
+        }
+    }
+
+    // 3. Symbolic sliding window with constant offsets: [base..(base + C1)] vs [(base + C2)..]
+    if let (Some(e1), Some(s2)) = (end1, start2) {
+        if let (SliceBound::Offset(b1, off1), SliceBound::Offset(b2, off2)) = (e1, s2) {
+            if b1 == b2 {
+                let max_off1 = if inc1 { *off1 } else { *off1 - 1 };
+                if max_off1 < *off2 {
+                    return true;
+                }
+            }
+        } else if let (SliceBound::Symbolic(b1), SliceBound::Offset(b2, off2)) = (e1, s2) {
+            if b1 == b2 && *off2 >= 0 && !inc1 {
+                return true;
+            }
+        }
+    }
+    if let (Some(e2), Some(s1)) = (end2, start1) {
+        if let (SliceBound::Offset(b2, off2), SliceBound::Offset(b1, off1)) = (e2, s1) {
+            if b1 == b2 {
+                let max_off2 = if inc2 { *off2 } else { *off2 - 1 };
+                if max_off2 < *off1 {
+                    return true;
+                }
+            }
+        } else if let (SliceBound::Symbolic(b2), SliceBound::Offset(b1, off1)) = (e2, s1) {
+            if b1 == b2 && *off1 >= 0 && !inc2 {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Helper testing if bound `b1` is strictly less than or equal to bound `b2`.
+fn bounds_equal_or_disjoint_order(b1: &SliceBound, b2: &SliceBound) -> bool {
+    match (b1, b2) {
+        (SliceBound::Symbolic(s1), SliceBound::Symbolic(s2)) => s1 == s2,
+        (SliceBound::Offset(s1, off1), SliceBound::Offset(s2, off2)) => s1 == s2 && *off1 <= *off2,
+        (SliceBound::Symbolic(s1), SliceBound::Offset(s2, off2)) => s1 == s2 && *off2 >= 0,
+        (SliceBound::Offset(s1, off1), SliceBound::Symbolic(s2)) => s1 == s2 && *off1 <= 0,
+        (SliceBound::Const(c1), SliceBound::Const(c2)) => *c1 <= *c2,
+        _ => false,
+    }
+}
+
+/// Helper determining if an index is provably disjoint from a slice range.
+fn is_index_disjoint_from_slice(
+    index: &SliceBound,
+    start: Option<&SliceBound>,
+    end: Option<&SliceBound>,
+    inc: bool,
+) -> bool {
+    // 1. Index constant vs constant slice
+    if let (SliceBound::Const(c), Some(s), Some(e)) = (
+        index,
+        start.and_then(|b| b.as_const()).or(Some(0)),
+        end.and_then(|b| b.as_const()),
+    ) {
+        let max_idx = if inc { e } else { e - 1 };
+        if *c < s || *c > max_idx {
+            return true;
+        }
+    }
+
+    // 2. Symbolic index vs slice [..sym] exclusive: index sym is strictly after slice
+    if !inc {
+        if let (SliceBound::Symbolic(sym), Some(SliceBound::Symbolic(end_sym))) = (index, end) {
+            if sym == end_sym {
+                return true;
+            }
+        }
+    }
+
+    // 3. Symbolic index vs slice [(sym + off)..] where off > 0: index sym is strictly before slice
+    if let (SliceBound::Symbolic(sym), Some(SliceBound::Offset(start_sym, off))) = (index, start) {
+        if sym == start_sym && *off > 0 {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// A relative access path starting from a parameter or local base variable.
@@ -78,17 +249,69 @@ impl AccessPath {
                     },
                     PathSegment::IndexConst(c),
                 ) => {
-                    let min_idx = start.unwrap_or(0);
-                    if *c < min_idx {
-                        return false; // constant index is strictly before slice start -> provably disjoint
+                    let idx_bound = SliceBound::Const(*c);
+                    let b_s = start.map(SliceBound::Const);
+                    let b_e = end.map(SliceBound::Const);
+                    if is_index_disjoint_from_slice(
+                        &idx_bound,
+                        b_s.as_ref(),
+                        b_e.as_ref(),
+                        *inclusive,
+                    ) {
+                        return false;
                     }
-                    if let Some(e) = end {
-                        let past_end = if *inclusive { *c > *e } else { *c >= *e };
-                        if past_end {
-                            return false; // constant index is strictly past slice end -> provably disjoint
-                        }
+                }
+                (
+                    PathSegment::IndexConst(c),
+                    PathSegment::SliceRange {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                )
+                | (
+                    PathSegment::SliceRange {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                    PathSegment::IndexConst(c),
+                ) => {
+                    let idx_bound = SliceBound::Const(*c);
+                    if is_index_disjoint_from_slice(
+                        &idx_bound,
+                        start.as_ref(),
+                        end.as_ref(),
+                        *inclusive,
+                    ) {
+                        return false;
                     }
-                    // Otherwise index falls inside slice -> overlaps!
+                }
+                (
+                    PathSegment::IndexSymbolic(sym),
+                    PathSegment::SliceRange {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                )
+                | (
+                    PathSegment::SliceRange {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                    PathSegment::IndexSymbolic(sym),
+                ) => {
+                    let idx_bound = SliceBound::Symbolic(*sym);
+                    if is_index_disjoint_from_slice(
+                        &idx_bound,
+                        start.as_ref(),
+                        end.as_ref(),
+                        *inclusive,
+                    ) {
+                        return false;
+                    }
                 }
                 (
                     PathSegment::SliceConst {
@@ -102,21 +325,80 @@ impl AccessPath {
                         inclusive: inc2,
                     },
                 ) => {
-                    let min1 = s1.unwrap_or(0);
-                    let min2 = s2.unwrap_or(0);
-                    if let Some(end1) = e1 {
-                        let max1 = if *inc1 { *end1 } else { *end1 - 1 };
-                        if max1 < min2 {
-                            return false; // slice 1 ends strictly before slice 2 starts -> provably disjoint
-                        }
+                    let b_s1 = s1.map(SliceBound::Const);
+                    let b_e1 = e1.map(SliceBound::Const);
+                    let b_s2 = s2.map(SliceBound::Const);
+                    let b_e2 = e2.map(SliceBound::Const);
+                    if are_slice_ranges_disjoint(
+                        b_s1.as_ref(),
+                        b_e1.as_ref(),
+                        *inc1,
+                        b_s2.as_ref(),
+                        b_e2.as_ref(),
+                        *inc2,
+                    ) {
+                        return false;
                     }
-                    if let Some(end2) = e2 {
-                        let max2 = if *inc2 { *end2 } else { *end2 - 1 };
-                        if max2 < min1 {
-                            return false; // slice 2 ends strictly before slice 1 starts -> provably disjoint
-                        }
+                }
+                (
+                    PathSegment::SliceRange {
+                        start: s1,
+                        end: e1,
+                        inclusive: inc1,
+                    },
+                    PathSegment::SliceRange {
+                        start: s2,
+                        end: e2,
+                        inclusive: inc2,
+                    },
+                ) => {
+                    if are_slice_ranges_disjoint(
+                        s1.as_ref(),
+                        e1.as_ref(),
+                        *inc1,
+                        s2.as_ref(),
+                        e2.as_ref(),
+                        *inc2,
+                    ) {
+                        return false;
                     }
-                    // Otherwise slices overlap!
+                }
+                (
+                    PathSegment::SliceRange {
+                        start: s1,
+                        end: e1,
+                        inclusive: inc1,
+                    },
+                    PathSegment::SliceConst {
+                        start: s2,
+                        end: e2,
+                        inclusive: inc2,
+                    },
+                )
+                | (
+                    PathSegment::SliceConst {
+                        start: s2,
+                        end: e2,
+                        inclusive: inc2,
+                    },
+                    PathSegment::SliceRange {
+                        start: s1,
+                        end: e1,
+                        inclusive: inc1,
+                    },
+                ) => {
+                    let b_s2 = s2.map(SliceBound::Const);
+                    let b_e2 = e2.map(SliceBound::Const);
+                    if are_slice_ranges_disjoint(
+                        s1.as_ref(),
+                        e1.as_ref(),
+                        *inc1,
+                        b_s2.as_ref(),
+                        b_e2.as_ref(),
+                        *inc2,
+                    ) {
+                        return false;
+                    }
                 }
                 (PathSegment::Method(m1), PathSegment::Method(m2)) if m1 != m2 => {
                     // Different method call projections on same receiver
@@ -146,6 +428,9 @@ impl AccessPath {
                 PathSegment::IndexConst(c) => {
                     display.push_str(&format!("[{}]", c));
                 }
+                PathSegment::IndexSymbolic(sym) => {
+                    display.push_str(&format!("[{}]", INTERNER.resolve(sym)));
+                }
                 PathSegment::IndexUnknown => {
                     display.push_str("[*]");
                 }
@@ -157,6 +442,16 @@ impl AccessPath {
                     let s_str = start.map(|s| s.to_string()).unwrap_or_default();
                     let sep = if *inclusive { "..=" } else { ".." };
                     let e_str = end.map(|e| e.to_string()).unwrap_or_default();
+                    display.push_str(&format!("[{}{}{}]", s_str, sep, e_str));
+                }
+                PathSegment::SliceRange {
+                    start,
+                    end,
+                    inclusive,
+                } => {
+                    let s_str = start.as_ref().map(|s| s.format()).unwrap_or_default();
+                    let sep = if *inclusive { "..=" } else { ".." };
+                    let e_str = end.as_ref().map(|e| e.format()).unwrap_or_default();
                     display.push_str(&format!("[{}{}{}]", s_str, sep, e_str));
                 }
                 PathSegment::Method(m) => {
@@ -773,32 +1068,37 @@ pub fn extract_access_path(expr: &Expr) -> Option<AccessPath> {
                     let val: i64 = s.parse().unwrap_or(0);
                     parent.segments.push(PathSegment::IndexConst(val));
                 }
+                ExprKind::Ident(sym) => {
+                    let s = INTERNER.resolve(sym);
+                    parent.display.push_str(&format!("[{}]", s));
+                    parent.segments.push(PathSegment::IndexSymbolic(*sym));
+                }
                 ExprKind::Range {
                     start,
                     end,
                     inclusive,
                 } => {
-                    let s_val = start.as_ref().and_then(|e| match &e.kind {
-                        ExprKind::Lit(ifa_ast::Lit::Int(sym)) => {
-                            INTERNER.resolve(sym).parse::<i64>().ok()
-                        }
-                        _ => None,
-                    });
-                    let e_val = end.as_ref().and_then(|e| match &e.kind {
-                        ExprKind::Lit(ifa_ast::Lit::Int(sym)) => {
-                            INTERNER.resolve(sym).parse::<i64>().ok()
-                        }
-                        _ => None,
-                    });
-                    let s_str = s_val.map(|s| s.to_string()).unwrap_or_default();
+                    let s_bound = start.as_deref().and_then(extract_slice_bound);
+                    let e_bound = end.as_deref().and_then(extract_slice_bound);
+                    let s_str = s_bound.as_ref().map(|b| b.format()).unwrap_or_default();
                     let sep = if *inclusive { "..=" } else { ".." };
-                    let e_str = e_val.map(|e| e.to_string()).unwrap_or_default();
+                    let e_str = e_bound.as_ref().map(|b| b.format()).unwrap_or_default();
                     parent
                         .display
                         .push_str(&format!("[{}{}{}]", s_str, sep, e_str));
-                    parent.segments.push(PathSegment::SliceConst {
-                        start: s_val,
-                        end: e_val,
+
+                    let s_const = s_bound.as_ref().and_then(|b| b.as_const());
+                    let e_const = e_bound.as_ref().and_then(|b| b.as_const());
+                    if s_const.is_some() || e_const.is_some() {
+                        parent.segments.push(PathSegment::SliceConst {
+                            start: s_const,
+                            end: e_const,
+                            inclusive: *inclusive,
+                        });
+                    }
+                    parent.segments.push(PathSegment::SliceRange {
+                        start: s_bound,
+                        end: e_bound,
                         inclusive: *inclusive,
                     });
                 }
@@ -824,6 +1124,46 @@ pub fn extract_access_path(expr: &Expr) -> Option<AccessPath> {
             op: UnaryOp::InOut | UnaryOp::Sink | UnaryOp::Ref,
             expr: inner,
         } => extract_access_path(inner),
+        _ => None,
+    }
+}
+
+/// Extracts a slice bound (constant, symbolic identifier, or symbol with offset) from an expression.
+fn extract_slice_bound(expr: &Expr) -> Option<SliceBound> {
+    match &expr.kind {
+        ExprKind::Lit(ifa_ast::Lit::Int(sym)) => {
+            let s = INTERNER.resolve(sym);
+            s.parse::<i64>().ok().map(SliceBound::Const)
+        }
+        ExprKind::Ident(sym) => Some(SliceBound::Symbolic(*sym)),
+        ExprKind::Binary { op, left, right } => match op {
+            ifa_ast::BinOp::Add => {
+                if let (ExprKind::Ident(sym), ExprKind::Lit(ifa_ast::Lit::Int(c_sym))) =
+                    (&left.kind, &right.kind)
+                {
+                    let val = INTERNER.resolve(c_sym).parse::<i64>().ok()?;
+                    Some(SliceBound::Offset(*sym, val))
+                } else if let (ExprKind::Lit(ifa_ast::Lit::Int(c_sym)), ExprKind::Ident(sym)) =
+                    (&left.kind, &right.kind)
+                {
+                    let val = INTERNER.resolve(c_sym).parse::<i64>().ok()?;
+                    Some(SliceBound::Offset(*sym, val))
+                } else {
+                    None
+                }
+            }
+            ifa_ast::BinOp::Sub => {
+                if let (ExprKind::Ident(sym), ExprKind::Lit(ifa_ast::Lit::Int(c_sym))) =
+                    (&left.kind, &right.kind)
+                {
+                    let val = INTERNER.resolve(c_sym).parse::<i64>().ok()?;
+                    Some(SliceBound::Offset(*sym, -val))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
         _ => None,
     }
 }

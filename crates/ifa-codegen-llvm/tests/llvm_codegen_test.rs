@@ -3386,3 +3386,135 @@ fn test_llvm_colorless_coroutine_direct_synchronous_call_specialization() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_strict_fn_streaming_pipeline_noalias_emission() {
+    use ifa_fir::{FirFunction, FirModule, FirParam, ParamMode, Terminator, ValueId};
+    use ifa_span::{Span, INTERNER};
+
+    let mut module = FirModule::new(INTERNER.intern("stream_module"));
+
+    let mut stream_fn = FirFunction::new(
+        INTERNER.intern("stream_zero_copy_stage"),
+        vec![
+            FirParam {
+                name: INTERNER.intern("out_buf"),
+                ty: FirType::Pointer(Box::new(FirType::Int(IntType::U8))),
+                val: ValueId(0),
+                mode: ParamMode::In,
+            },
+            FirParam {
+                name: INTERNER.intern("in_buf"),
+                ty: FirType::Pointer(Box::new(FirType::Int(IntType::U8))),
+                val: ValueId(1),
+                mode: ParamMode::In,
+            },
+        ],
+        FirType::Unit,
+        true,  // is_strict: mode strict zero-heap
+        false, // is_pub
+        false, // is_comptime
+        None,  // is_extern
+        Span::DUMMY,
+    );
+
+    let entry = stream_fn.entry_block;
+    let bb = stream_fn.get_block_mut(entry).unwrap();
+    bb.set_terminator(Terminator::Return(None));
+    module.functions.push(stream_fn);
+
+    let target_cfg = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target_cfg);
+    let ir = emitter
+        .emit_module(&module)
+        .expect("LLVM IR emission failed");
+
+    // Verify parameter-level `noalias` emission on strict pointers
+    assert!(
+        ir.contains(
+            "define internal void @stream_zero_copy_stage(ptr noalias %v0, ptr noalias %v1) #0"
+        ),
+        "LLVM IR must emit `ptr noalias` for parameters of strict streaming functions:\n{}",
+        ir
+    );
+
+    // Verify function attribute group #0 with argmem: readwrite
+    assert!(
+        ir.contains("attributes #0 = { mustprogress nofree nosync nounwind willreturn memory(argmem: readwrite)"),
+        "Attribute #0 must declare memory(argmem: readwrite) for strict execution:\n{}",
+        ir
+    );
+}
+
+#[test]
+fn test_native_zero_copy_streaming_pipeline_execution() {
+    let src = r#"
+        strict fn stream_pipeline_stage(in_slice: Slice<i64>) -> i64 {
+            mut acc: i64 = 0;
+            for x in in_slice {
+                acc = acc + x;
+            }
+            return acc;
+        }
+
+        pub fn main() -> i64 {
+            let stream_buffer: [i64; 8] = [1, 2, 3, 4, 10, 10, 10, 2];
+            let split_idx: i64 = 4;
+            // Zero-copy partition: [0..split_idx] and [split_idx..8]
+            let stage1 = stream_pipeline_stage(stream_buffer[0..split_idx]);
+            let stage2 = stream_pipeline_stage(stream_buffer[split_idx..8]);
+
+            // stage1 = 1+2+3+4 = 10
+            // stage2 = 10+10+10+2 = 32
+            // 10 + 32 = 42
+            return stage1 + stage2;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("stream_zero_copy.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("llvm_stream_zero_copy_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("stream.o");
+    let bin_path = temp_dir.join("stream_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Compilation to object failed: {:?}",
+        compile_res.err()
+    );
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(
+        link_res.is_ok(),
+        "Native linking failed: {:?}",
+        link_res.err()
+    );
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native streaming pipeline binary");
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "Exit code from zero-copy streaming pipeline execution must be 42"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

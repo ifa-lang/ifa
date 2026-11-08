@@ -576,3 +576,159 @@ fn test_recursive_interprocedural_tree_traversal() {
     let res = interp.execute_function("run_traversal", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(100));
 }
+
+#[test]
+fn test_zero_copy_streaming_pipeline_arena_coalescing() {
+    let src = r#"
+        struct StreamChunk {
+            payload_len: i64,
+            capacity: i64,
+        }
+
+        struct StreamPacket {
+            chunk: ?ref StreamChunk,
+            seq_num: i64,
+        }
+
+        pub fn test_pipeline_marker() -> i64 {
+            return 0;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("stream_pipeline.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let chunk_ty = FirType::Struct(
+        INTERNER.intern("StreamChunk"),
+        vec![
+            (INTERNER.intern("payload_len"), FirType::Int(IntType::I64)),
+            (INTERNER.intern("capacity"), FirType::Int(IntType::I64)),
+        ],
+    );
+
+    let packet_ty = FirType::Struct(
+        INTERNER.intern("StreamPacket"),
+        vec![
+            (
+                INTERNER.intern("chunk"),
+                FirType::Optional(Box::new(FirType::GenerationalRef(Box::new(
+                    chunk_ty.clone(),
+                )))),
+            ),
+            (INTERNER.intern("seq_num"), FirType::Int(IntType::I64)),
+        ],
+    );
+
+    let mut stream_pipeline_fn = FirFunction::new(
+        INTERNER.intern("run_stream_stage"),
+        Vec::new(),
+        FirType::GenerationalRef(Box::new(packet_ty.clone())),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let entry = stream_pipeline_fn.entry_block;
+    let v_chunk1 = stream_pipeline_fn.alloc_value();
+    let v_chunk2 = stream_pipeline_fn.alloc_value();
+    let v_packet = stream_pipeline_fn.alloc_value();
+
+    let bb = stream_pipeline_fn.get_block_mut(entry).unwrap();
+    // Allocate 2 chunks and 1 packet in the pipeline
+    bb.push_instruction(Instruction::new(
+        Some(v_chunk1),
+        ValueExpr::GenAlloc {
+            ty: chunk_ty.clone(),
+            arena: None,
+        },
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(v_chunk2),
+        ValueExpr::GenAlloc {
+            ty: chunk_ty.clone(),
+            arena: None,
+        },
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(v_packet),
+        ValueExpr::GenAlloc {
+            ty: packet_ty.clone(),
+            arena: None,
+        },
+        Span::DUMMY,
+    ));
+
+    // Connect chunk1 to packet
+    bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::SetField {
+            base: v_packet,
+            field_idx: 0,
+            val: v_chunk1,
+        },
+        Span::DUMMY,
+    ));
+
+    bb.set_terminator(Terminator::Return(Some(v_packet)));
+    module.functions.push(stream_pipeline_fn);
+
+    let mut pass = ArenaFusionPass::new();
+    let stats = pass.run_on_module(&mut module);
+
+    assert!(
+        stats.allocations_fused >= 3,
+        "Expected at least 3 allocations fused in the streaming pipeline, got: {}",
+        stats.allocations_fused
+    );
+    assert!(
+        stats.streaming_arenas_fused >= 1,
+        "Expected at least 1 streaming arena fused, got: {}",
+        stats.streaming_arenas_fused
+    );
+    assert!(
+        stats.zero_copy_pipelines_optimized >= 1,
+        "Expected zero-copy pipeline optimized count >= 1, got: {}",
+        stats.zero_copy_pipelines_optimized
+    );
+
+    // Verify all allocations share the exact same synthetic arena
+    let optimized_fn = module
+        .functions
+        .iter()
+        .find(|f| INTERNER.resolve(&f.name) == "run_stream_stage")
+        .unwrap();
+
+    let mut assigned_arenas = Vec::new();
+    for inst in &optimized_fn.get_block(entry).unwrap().instructions {
+        if let ValueExpr::GenAlloc { arena, .. } = &inst.expr {
+            assigned_arenas.push(*arena);
+        }
+    }
+
+    assert_eq!(assigned_arenas.len(), 3);
+    assert!(assigned_arenas[0].is_some(), "Arena ID must be assigned");
+    assert_eq!(
+        assigned_arenas[0], assigned_arenas[1],
+        "All streaming allocations must share unified arena"
+    );
+    assert_eq!(
+        assigned_arenas[1], assigned_arenas[2],
+        "All streaming allocations must share unified arena"
+    );
+}

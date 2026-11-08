@@ -600,3 +600,147 @@ fn test_licm_preserves_gen_ref_when_loop_frees_memory() {
     // GenRef MUST NOT be hoisted due to GenFree in loop
     assert_eq!(stats.hoisted_gen_refs, 0);
 }
+
+#[test]
+fn test_streaming_pipeline_disjoint_arena_load_hoisting() {
+    use ifa_ast::ParamMode;
+    use ifa_fir::{
+        ConstantValue, FirFunction, FirParam, FirType, Instruction, Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let mut func = FirFunction::new(
+        INTERNER.intern("stream_filter_loop"),
+        vec![FirParam {
+            name: INTERNER.intern("len"),
+            ty: FirType::Int(IntType::I64),
+            val: ValueId(0),
+            mode: ParamMode::In,
+        }],
+        FirType::Unit,
+        true,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let b_entry = func.entry_block;
+    let b_header = func.alloc_block();
+    let b_body = func.alloc_block();
+    let b_exit = func.alloc_block();
+
+    let v_zero = func.alloc_value();
+    let v_one = func.alloc_value();
+    let v_in_alloc = func.alloc_value();
+    let v_out_alloc = func.alloc_value();
+
+    let entry_bb = func.get_block_mut(b_entry).unwrap();
+    entry_bb.push_instruction(Instruction::new(
+        Some(v_zero),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    entry_bb.push_instruction(Instruction::new(
+        Some(v_one),
+        ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+        Span::DUMMY,
+    ));
+    // Allocate input chunk in streaming Arena 101
+    entry_bb.push_instruction(Instruction::new(
+        Some(v_in_alloc),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(101),
+        },
+        Span::DUMMY,
+    ));
+    // Allocate output chunk in streaming Arena 102
+    entry_bb.push_instruction(Instruction::new(
+        Some(v_out_alloc),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(102),
+        },
+        Span::DUMMY,
+    ));
+    entry_bb.set_terminator(Terminator::Branch {
+        target: b_header,
+        args: vec![v_zero],
+    });
+
+    let v_idx = func.alloc_value();
+    func.get_block_mut(b_header)
+        .unwrap()
+        .params
+        .push((v_idx, FirType::Int(IntType::I64)));
+
+    let v_cond = func.alloc_value();
+    func.get_block_mut(b_header)
+        .unwrap()
+        .push_instruction(Instruction::new(
+            Some(v_cond),
+            ValueExpr::Binary {
+                op: ifa_fir::BinaryOp::Lt,
+                lhs: v_idx,
+                rhs: ValueId(0),
+            },
+            Span::DUMMY,
+        ));
+    func.get_block_mut(b_header)
+        .unwrap()
+        .set_terminator(Terminator::BranchCond {
+            cond: v_cond,
+            then_block: b_body,
+            then_args: Vec::new(),
+            else_block: b_exit,
+            else_args: Vec::new(),
+        });
+
+    let v_load_in = func.alloc_value();
+    let v_next_idx = func.alloc_value();
+    let body_bb = func.get_block_mut(b_body).unwrap();
+    // Load from input chunk in Arena 101 (invariant across loop iterations)
+    body_bb.push_instruction(Instruction::new(
+        Some(v_load_in),
+        ValueExpr::Load { ptr: v_in_alloc },
+        Span::DUMMY,
+    ));
+    // Store into output chunk in Arena 102 (different arena, provably disjoint!)
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::Store {
+            ptr: v_out_alloc,
+            val: v_load_in,
+        },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        Some(v_next_idx),
+        ValueExpr::Binary {
+            op: ifa_fir::BinaryOp::Add,
+            lhs: v_idx,
+            rhs: v_one,
+        },
+        Span::DUMMY,
+    ));
+    body_bb.set_terminator(Terminator::Branch {
+        target: b_header,
+        args: vec![v_next_idx],
+    });
+
+    func.get_block_mut(b_exit)
+        .unwrap()
+        .set_terminator(Terminator::Return(None));
+
+    let mut licm = LicmPass::new();
+    licm.run_on_function(&mut func);
+
+    let stats = licm.stats();
+    // The load from Arena 101 must be successfully hoisted out of the loop into the preheader
+    assert_eq!(
+        stats.hoisted_loads, 1,
+        "Load from disjoint arena must be hoisted by LICM"
+    );
+}

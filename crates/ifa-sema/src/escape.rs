@@ -322,7 +322,12 @@ impl<'a> EscapeAnalyzer<'a> {
                 let var_name = INTERNER.resolve(&root_sym);
                 if let Some(path) = extract_access_path(inner) {
                     let has_slice_or_field = path.segments.iter().any(|seg| {
-                        matches!(seg, PathSegment::SliceConst { .. } | PathSegment::Field(_))
+                        matches!(
+                            seg,
+                            PathSegment::SliceConst { .. }
+                                | PathSegment::SliceRange { .. }
+                                | PathSegment::Field(_)
+                        )
                     });
 
                     if kind == ConcurrentAccessKind::Write && !has_slice_or_field {

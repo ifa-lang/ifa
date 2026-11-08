@@ -45,6 +45,10 @@ pub struct ArenaFusionStats {
     pub access_barriers_eliminated: usize,
     /// Recursive field projections (`GetField`) proven safe without dynamic checks.
     pub recursive_projections_verified: usize,
+    /// Total zero-copy streaming pipeline arenas created or coalesced.
+    pub streaming_arenas_fused: usize,
+    /// Total zero-copy streaming pipelines optimized with zero-heap arena locality.
+    pub zero_copy_pipelines_optimized: usize,
 }
 
 /// Disjoint-set forest (Union-Find) for merging allocation arenas.
@@ -174,6 +178,27 @@ impl ArenaFusionPass {
         }
     }
 
+    /// Determines if a type represents a zero-copy streaming pipeline buffer, chunk, or frame.
+    fn is_streaming_or_buffer_type(ty: &FirType) -> bool {
+        match ty {
+            FirType::Slice(_) | FirType::Array(..) => true,
+            FirType::Struct(name, _) => {
+                let s = ifa_span::INTERNER.resolve(name);
+                s.contains("Stream")
+                    || s.contains("Chunk")
+                    || s.contains("Buffer")
+                    || s.contains("Packet")
+                    || s.contains("Queue")
+                    || s.contains("Frame")
+                    || s.contains("Pipeline")
+            }
+            FirType::GenerationalRef(inner) | FirType::Pointer(inner) => {
+                Self::is_streaming_or_buffer_type(inner)
+            }
+            _ => false,
+        }
+    }
+
     /// Optimizes a single function for generational arena coalescing and access barrier elimination.
     fn optimize_function(
         &mut self,
@@ -181,14 +206,14 @@ impl ArenaFusionPass {
         recursive_structs: &HashSet<Symbol>,
         struct_map: &HashMap<Symbol, &FirStruct>,
     ) {
-        // Step 1: Generational Arena Merging
+        // Step 1: Generational Arena Merging (Recursive Structs & Zero-Copy Streaming Pipelines)
         self.merge_arenas(func, recursive_structs);
 
-        // Step 2: Static Access Barrier Elimination for Recursive Structures
+        // Step 2: Static Access Barrier Elimination for Recursive & Streaming Structures
         self.eliminate_access_barriers(func, recursive_structs, struct_map);
     }
 
-    /// Coalesces allocations of recursive structures into unified generational arenas.
+    /// Coalesces allocations of recursive structures and streaming pipelines into unified generational arenas.
     fn merge_arenas(&mut self, func: &mut FirFunction, recursive_structs: &HashSet<Symbol>) {
         // 1. Collect all GenAlloc instructions with their ValueId, type, and existing arena
         let mut alloc_infos: HashMap<ValueId, (FirType, Option<u16>)> = HashMap::new();
@@ -200,7 +225,8 @@ impl ArenaFusionPass {
                         _ => Self::extract_struct_name(ty)
                             .is_some_and(|n| recursive_structs.contains(&n)),
                     };
-                    if is_rec {
+                    let is_streaming = Self::is_streaming_or_buffer_type(ty) || func.is_strict;
+                    if is_rec || is_streaming {
                         alloc_infos.insert(res, (ty.clone(), *arena));
                     }
                 }
@@ -211,7 +237,7 @@ impl ArenaFusionPass {
             return;
         }
 
-        // 2. Build DisjointSet and connect allocations via assignments and struct initializations
+        // 2. Build DisjointSet and connect allocations via assignments, struct initializations, and calls
         let mut dset = DisjointSet::new();
         for &val in alloc_infos.keys() {
             dset.parent.insert(val, val);
@@ -257,13 +283,25 @@ impl ArenaFusionPass {
                             }
                         }
                     }
+                    ValueExpr::Call { args, .. } | ValueExpr::CallDirect { args, .. } => {
+                        let mut first_alloc: Option<ValueId> = None;
+                        for &a_val in args {
+                            let canon = val_aliases.get(&a_val).copied().unwrap_or(a_val);
+                            if alloc_infos.contains_key(&canon) {
+                                match first_alloc {
+                                    None => first_alloc = Some(canon),
+                                    Some(first) => dset.union(first, canon),
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
         }
 
-        // Also merge allocations of the same recursive struct within the same function
-        // (constructors/factories creating complete sub-graphs)
+        // Also merge allocations of the same type within the same function
+        // (constructors/factories creating complete sub-graphs or uniform streaming buffers)
         let mut by_type: HashMap<FirType, Vec<ValueId>> = HashMap::new();
         for (&val, (ty, _)) in &alloc_infos {
             by_type.entry(ty.clone()).or_default().push(val);
@@ -288,10 +326,16 @@ impl ArenaFusionPass {
 
         for members in groups.values() {
             let mut existing_arenas = HashSet::new();
+            let mut is_streaming_group = false;
             for m in members {
-                if let Some((_, Some(a))) = alloc_infos.get(m) {
-                    if *a > 0 {
-                        existing_arenas.insert(*a);
+                if let Some((ty, a_opt)) = alloc_infos.get(m) {
+                    if let Some(a) = a_opt {
+                        if *a > 0 {
+                            existing_arenas.insert(*a);
+                        }
+                    }
+                    if Self::is_streaming_or_buffer_type(ty) || func.is_strict {
+                        is_streaming_group = true;
                     }
                 }
             }
@@ -312,6 +356,10 @@ impl ArenaFusionPass {
             }
 
             self.stats.allocations_fused += members.len();
+            if is_streaming_group {
+                self.stats.streaming_arenas_fused += 1;
+                self.stats.zero_copy_pipelines_optimized += 1;
+            }
         }
 
         // 4. Rewrite GenAlloc instructions with fused arena IDs
@@ -440,6 +488,16 @@ impl ArenaFusionPass {
                                 let root = deref_roots.get(base).copied().unwrap_or(*base);
                                 let canon_root = Self::resolve_alias(root, &aliases);
                                 if verified.contains(&root) || verified.contains(&canon_root) {
+                                    verified.insert(res);
+                                    verified.insert(Self::resolve_alias(res, &aliases));
+                                    self.stats.recursive_projections_verified += 1;
+                                }
+                            }
+                        }
+                        ValueExpr::SliceSub { base, .. } => {
+                            if let Some(res) = inst.result {
+                                let canon_base = Self::resolve_alias(*base, &aliases);
+                                if verified.contains(base) || verified.contains(&canon_base) {
                                     verified.insert(res);
                                     verified.insert(Self::resolve_alias(res, &aliases));
                                     self.stats.recursive_projections_verified += 1;

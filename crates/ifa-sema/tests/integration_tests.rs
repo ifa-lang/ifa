@@ -4132,3 +4132,104 @@ fn test_chained_method_receiver_exclusivity_overlapping_rejected() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_slice_symbolic_split_disjoint_allowed() {
+    let code = r#"
+        fn process_stream_split(inout s1: Slice<i64>, inout s2: Slice<i64>) {
+            s1[0] = 1;
+            s2[0] = 2;
+        }
+
+        pub fn main() {
+            mut buf = [10, 20, 30, 40, 50, 60, 70, 80];
+            let split_at: i64 = 4;
+            // Zero-copy partition: [..split_at] and [split_at..] are mathematically disjoint
+            process_stream_split(inout buf[..split_at], inout buf[split_at..]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Symbolic split point partition must be proven disjoint without E0011: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_slice_symbolic_sliding_window_disjoint_allowed() {
+    let code = r#"
+        fn process_windows(inout w1: Slice<i64>, inout w2: Slice<i64>) {
+            w1[0] = 42;
+            w2[0] = 99;
+        }
+
+        pub fn main() {
+            mut stream_buffer = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+            let base: i64 = 0;
+            // Sliding windows with disjoint offsets [base..(base + 4)] and [(base + 4)..(base + 8)]
+            process_windows(inout stream_buffer[base..(base + 4)], inout stream_buffer[(base + 4)..(base + 8)]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Symbolic sliding windows with disjoint offsets must be proven disjoint: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_slice_symbolic_overlapping_rejected() {
+    let code = r#"
+        fn process_stream_split(inout s1: Slice<i64>, inout s2: Slice<i64>) {
+            s1[0] = 1;
+            s2[0] = 2;
+        }
+
+        pub fn main() {
+            mut buf = [10, 20, 30, 40, 50, 60, 70, 80];
+            let split_at: i64 = 4;
+            // Overlapping symbolic slices: both [..split_at]
+            process_stream_split(inout buf[..split_at], inout buf[..split_at]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Overlapping symbolic slices must trigger E0011: {:?}",
+        res.diagnostics
+    );
+    let has_e0011 = res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0011"));
+    assert!(
+        has_e0011,
+        "Expected E0011 diagnostic code for overlapping symbolic slices, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_slice_symbolic_index_disjoint_allowed() {
+    let code = r#"
+        fn mutate_pivot_and_prefix(inout pivot: i64, inout prefix: Slice<i64>) {
+            pivot = 999;
+            prefix[0] = 111;
+        }
+
+        pub fn main() {
+            mut arr = [10, 20, 30, 40, 50];
+            let mid: i64 = 3;
+            // Index 'mid' is strictly after exclusive prefix slice [..mid]
+            mutate_pivot_and_prefix(inout arr[mid], inout arr[..mid]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Symbolic index outside exclusive slice prefix must be proven disjoint: {:?}",
+        res.diagnostics
+    );
+}

@@ -37,6 +37,16 @@ pub enum FirPathSegment {
     Field(usize),
     ElementConst(i64),
     ElementUnknown,
+    SliceConst {
+        start: Option<i64>,
+        end: Option<i64>,
+        inclusive: bool,
+    },
+    SliceSymbolic {
+        start: Option<ValueId>,
+        end: Option<ValueId>,
+    },
+    Arena(u16),
     Deref,
 }
 
@@ -44,6 +54,7 @@ pub enum FirPathSegment {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FirAccessPath {
     pub root: ValueId,
+    pub arena_id: Option<u16>,
     pub segments: Vec<FirPathSegment>,
 }
 
@@ -52,6 +63,13 @@ impl FirAccessPath {
     /// If both paths refer to the same root, and their prefix of field/index segments match
     /// without proven disjointness, they overlap.
     pub fn overlaps(&self, other: &FirAccessPath) -> bool {
+        // Memory arena isolation: distinct non-zero generational arenas can never alias
+        if let (Some(a1), Some(a2)) = (self.arena_id, other.arena_id) {
+            if a1 != a2 && a1 > 0 && a2 > 0 {
+                return false;
+            }
+        }
+
         if self.root != other.root {
             return false;
         }
@@ -65,6 +83,81 @@ impl FirAccessPath {
                     if c1 != c2 =>
                 {
                     return false; // distinct constant element indices are provably disjoint
+                }
+                (
+                    FirPathSegment::SliceConst {
+                        start: s1,
+                        end: e1,
+                        inclusive: inc1,
+                    },
+                    FirPathSegment::SliceConst {
+                        start: s2,
+                        end: e2,
+                        inclusive: inc2,
+                    },
+                ) => {
+                    let min1 = s1.unwrap_or(0);
+                    let min2 = s2.unwrap_or(0);
+                    if let Some(end1) = e1 {
+                        let max1 = if *inc1 { *end1 } else { *end1 - 1 };
+                        if max1 < min2 {
+                            return false; // slice 1 ends strictly before slice 2 starts
+                        }
+                    }
+                    if let Some(end2) = e2 {
+                        let max2 = if *inc2 { *end2 } else { *end2 - 1 };
+                        if max2 < min1 {
+                            return false; // slice 2 ends strictly before slice 1 starts
+                        }
+                    }
+                }
+                (
+                    FirPathSegment::SliceSymbolic { end: Some(e1), .. },
+                    FirPathSegment::SliceSymbolic {
+                        start: Some(s2), ..
+                    },
+                ) if e1 == s2 => {
+                    return false; // provably disjoint symbolic split point
+                }
+                (
+                    FirPathSegment::SliceSymbolic {
+                        start: Some(s1), ..
+                    },
+                    FirPathSegment::SliceSymbolic { end: Some(e2), .. },
+                ) if s1 == e2 => {
+                    return false; // provably disjoint symbolic split point
+                }
+                (
+                    FirPathSegment::ElementConst(c),
+                    FirPathSegment::SliceConst {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                )
+                | (
+                    FirPathSegment::SliceConst {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                    FirPathSegment::ElementConst(c),
+                ) => {
+                    let min_idx = start.unwrap_or(0);
+                    if *c < min_idx {
+                        return false;
+                    }
+                    if let Some(e) = end {
+                        let past_end = if *inclusive { *c > *e } else { *c >= *e };
+                        if past_end {
+                            return false;
+                        }
+                    }
+                }
+                (FirPathSegment::Arena(a1), FirPathSegment::Arena(a2))
+                    if a1 != a2 && *a1 > 0 && *a2 > 0 =>
+                {
+                    return false;
                 }
                 _ => {}
             }
@@ -83,6 +176,7 @@ fn resolve_access_path(
     if depth > 16 {
         return FirAccessPath {
             root: val,
+            arena_id: None,
             segments: Vec::new(),
         };
     }
@@ -108,6 +202,35 @@ fn resolve_access_path(
                 }
                 return path;
             }
+            ValueExpr::SliceSub { base, start, end } => {
+                let mut path = resolve_access_path(*base, inst_defs, constants, depth + 1);
+                let c_start = constants.get(start).copied();
+                let c_end = constants.get(end).copied();
+                if c_start.is_some() || c_end.is_some() {
+                    path.segments.push(FirPathSegment::SliceConst {
+                        start: c_start,
+                        end: c_end,
+                        inclusive: false,
+                    });
+                } else {
+                    path.segments.push(FirPathSegment::SliceSymbolic {
+                        start: Some(*start),
+                        end: Some(*end),
+                    });
+                }
+                return path;
+            }
+            ValueExpr::GenAlloc { arena, .. } => {
+                let mut path = FirAccessPath {
+                    root: val,
+                    arena_id: *arena,
+                    segments: Vec::new(),
+                };
+                if let Some(a_id) = arena {
+                    path.segments.push(FirPathSegment::Arena(*a_id));
+                }
+                return path;
+            }
             ValueExpr::GenDeref { ref_val } => {
                 let mut path = resolve_access_path(*ref_val, inst_defs, constants, depth + 1);
                 path.segments.push(FirPathSegment::Deref);
@@ -119,6 +242,7 @@ fn resolve_access_path(
 
     FirAccessPath {
         root: val,
+        arena_id: None,
         segments: Vec::new(),
     }
 }

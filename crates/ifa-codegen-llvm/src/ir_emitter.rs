@@ -1062,7 +1062,7 @@ impl<'a> LlvmIrEmitter<'a> {
         // 5. Function attribute groups for SIMD vectorization and LTO inlining
         out.push_str("; Function Attributes\n");
         out.push_str(&format!(
-            "attributes #0 = {{ mustprogress nofree nosync nounwind willreturn memory(none) \"target-cpu\"=\"{}\" \"target-features\"=\"{}\" \"no-trapping-math\"=\"true\" }}\n",
+            "attributes #0 = {{ mustprogress nofree nosync nounwind willreturn memory(argmem: readwrite) \"target-cpu\"=\"{}\" \"target-features\"=\"{}\" \"no-trapping-math\"=\"true\" }}\n",
             self.target.cpu, self.target.features
         ));
         out.push_str(&format!(
@@ -1137,7 +1137,15 @@ impl<'a> LlvmIrEmitter<'a> {
                     ifa_fir::FirType::Array(..) => "ptr".to_string(),
                     _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "ptr".to_string()),
                 };
-                format!("{} %v{}", ty, p.val.0)
+                if (func.is_strict || fn_name.contains("__"))
+                    && ty == "ptr"
+                    && fn_name != "main"
+                    && !fn_name.starts_with("ifa_rt_")
+                {
+                    format!("ptr noalias %v{}", p.val.0)
+                } else {
+                    format!("{} %v{}", ty, p.val.0)
+                }
             })
             .collect();
 
