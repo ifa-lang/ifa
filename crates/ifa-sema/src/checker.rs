@@ -836,6 +836,7 @@ impl<'a> SemanticAnalyzer<'a> {
         let prev_ret = self.current_func_ret_ty.take();
         let prev_strict = self.current_func_is_strict;
         let prev_moved = std::mem::take(&mut self.moved_vars);
+        let prev_borrows = std::mem::take(&mut self.active_borrows);
         let prev_generics = std::mem::replace(&mut self.current_func_generics, f.generics.clone());
         self.current_func_ret_ty = Some(ret_ty.clone());
         self.current_func_is_strict = f.is_strict;
@@ -891,6 +892,7 @@ impl<'a> SemanticAnalyzer<'a> {
         self.current_func_ret_ty = prev_ret;
         self.current_func_is_strict = prev_strict;
         self.moved_vars = prev_moved;
+        self.active_borrows = prev_borrows;
         self.current_func_generics = prev_generics;
     }
 
@@ -917,6 +919,7 @@ impl<'a> SemanticAnalyzer<'a> {
         let prev_ret = self.current_func_ret_ty.take();
         let prev_strict = self.current_func_is_strict;
         let prev_moved = std::mem::take(&mut self.moved_vars);
+        let prev_borrows = std::mem::take(&mut self.active_borrows);
         let prev_generics =
             std::mem::replace(&mut self.current_func_generics, combined_generics.to_vec());
         self.current_func_ret_ty = Some(ret_ty.clone());
@@ -978,6 +981,7 @@ impl<'a> SemanticAnalyzer<'a> {
         self.current_func_ret_ty = prev_ret;
         self.current_func_is_strict = prev_strict;
         self.moved_vars = prev_moved;
+        self.active_borrows = prev_borrows;
         self.current_func_generics = prev_generics;
     }
 
@@ -1091,6 +1095,7 @@ impl<'a> SemanticAnalyzer<'a> {
     }
 
     fn check_block(&mut self, block: &Block, expected_ret: Option<&Type>) -> Type {
+        let prev_borrows_len = self.active_borrows.len();
         for stmt in &block.stmts {
             self.check_stmt(stmt);
 
@@ -1120,7 +1125,7 @@ impl<'a> SemanticAnalyzer<'a> {
             }
         }
 
-        if let Some(expr) = &block.expr {
+        let actual = if let Some(expr) = &block.expr {
             let actual = self.check_expr(expr, expected_ret);
             if let Some(expected) = expected_ret {
                 if !expected.is_unit()
@@ -1144,7 +1149,10 @@ impl<'a> SemanticAnalyzer<'a> {
             Type::Never
         } else {
             Type::Unit
-        }
+        };
+
+        self.active_borrows.truncate(prev_borrows_len);
+        actual
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) {

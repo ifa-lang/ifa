@@ -456,6 +456,7 @@ impl<'a> EscapeAnalyzer<'a> {
                             seg,
                             PathSegment::SliceConst { .. }
                                 | PathSegment::SliceRange { .. }
+                                | PathSegment::SlicePatternRest { .. }
                                 | PathSegment::Field(_)
                         )
                     });

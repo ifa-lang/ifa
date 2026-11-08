@@ -4764,3 +4764,119 @@ fn test_match_destructuring_disjoint_fields_inout_allowed() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_slice_pattern_destructuring_disjoint_inout_allowed() {
+    let code = r#"
+        pub fn main() -> i64 {
+            mut arr: [i64; 5] = [10, 20, 30, 40, 50];
+            let [inout head, ..inout mid, inout tail] = arr;
+            head = 100;
+            tail = 500;
+            return head + tail;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Slice pattern with disjoint inout bindings [head, ..mid, tail] must be accepted: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_slice_pattern_destructuring_duplicate_variable_rejected() {
+    let code = r#"
+        pub fn main() {
+            mut arr: [i64; 5] = [1, 2, 3, 4, 5];
+            let [inout a, ..rest, inout a] = arr;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Duplicate variable binding in slice pattern must be rejected: {:?}",
+        res.diagnostics
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0048")),
+        "Expected E0048 diagnostic code for duplicate variable in pattern, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_slice_pattern_destructuring_suffix_duplicate_field_rejected() {
+    let code = r#"
+        struct Vec2 {
+            x: i64,
+            y: i64,
+        }
+
+        pub fn main() {
+            mut arr = [Vec2(x: 1, y: 2), Vec2(x: 3, y: 4)];
+            let [..rest, Vec2 { x: inout a, x: inout b }] = arr;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Duplicate struct field inside slice pattern suffix must be rejected: {:?}",
+        res.diagnostics
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0048") || d.code.as_deref() == Some("E0011")),
+        "Expected E0048 or E0011 diagnostic code for duplicate field, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_open_ended_slice_exclusivity_disjoint_allowed() {
+    let code = r#"
+        fn modify_halves(inout left: Slice<i64>, inout right: Slice<i64>) {
+            // disjoint sub-slices
+        }
+
+        pub fn main() {
+            mut arr: [i64; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+            modify_halves(inout arr[..5], inout arr[5..]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Disjoint open-ended slices arr[..5] and arr[5..] must be accepted without exclusivity error: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_block_scoped_borrow_release() {
+    let code = r#"
+        struct Container {
+            val: i64,
+        }
+
+        pub fn main() -> i64 {
+            mut c = Container(val: 10);
+            {
+                let Container { val: inout v } = c;
+                v = 42;
+            }
+            // After block ends, borrow on c.val must be released
+            c.val = 100;
+            return c.val;
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Reassigning c.val after inner block borrow ends must be accepted: {:?}",
+        res.diagnostics
+    );
+}

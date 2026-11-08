@@ -65,6 +65,7 @@ impl SliceBound {
 pub enum PathSegment {
     Field(Symbol),
     IndexConst(i64),
+    IndexFromEnd(usize),
     IndexSymbolic(Symbol),
     IndexOffset(Symbol, i64),
     IndexUnknown,
@@ -78,6 +79,10 @@ pub enum PathSegment {
         end: Option<SliceBound>,
         step: Option<SliceBound>,
         inclusive: bool,
+    },
+    SlicePatternRest {
+        prefix_len: usize,
+        suffix_len: usize,
     },
     Method(Symbol),
 }
@@ -151,18 +156,17 @@ fn are_slice_ranges_disjoint(
             }
         }
     }
-    // 1. Both bounds are constant integers
-    if let (Some(s1), Some(e1), Some(s2), Some(e2)) = (
-        start1.and_then(|b| b.as_const()).or(Some(0)),
-        end1.and_then(|b| b.as_const()),
-        start2.and_then(|b| b.as_const()).or(Some(0)),
-        end2.and_then(|b| b.as_const()),
-    ) {
+    // 1. Both bounds are constant integers (including open-ended ranges e.g. [..5] vs [6..])
+    let s1 = start1.and_then(|b| b.as_const()).unwrap_or(0);
+    let s2 = start2.and_then(|b| b.as_const()).unwrap_or(0);
+    if let Some(e1) = end1.and_then(|b| b.as_const()) {
         let max1 = if inc1 { e1 } else { e1 - 1 };
         let min2 = s2;
         if max1 < min2 {
             return true; // Range 1 strictly precedes Range 2
         }
+    }
+    if let Some(e2) = end2.and_then(|b| b.as_const()) {
         let max2 = if inc2 { e2 } else { e2 - 1 };
         let min1 = s1;
         if max2 < min1 {
@@ -301,15 +305,17 @@ fn is_index_disjoint_from_slice(
             }
         }
     }
-    // 1. Index constant vs constant slice
-    if let (SliceBound::Const(c), Some(s), Some(e)) = (
-        index,
-        start.and_then(|b| b.as_const()).or(Some(0)),
-        end.and_then(|b| b.as_const()),
-    ) {
-        let max_idx = if inc { e } else { e - 1 };
-        if *c < s || *c > max_idx {
+    // 1. Index constant vs constant slice (including open-ended slices)
+    if let SliceBound::Const(c) = index {
+        let s = start.and_then(|b| b.as_const()).unwrap_or(0);
+        if *c < s {
             return true;
+        }
+        if let Some(e) = end.and_then(|b| b.as_const()) {
+            let max_idx = if inc { e } else { e - 1 };
+            if *c > max_idx {
+                return true;
+            }
         }
     }
 
@@ -401,6 +407,26 @@ pub fn segments_alias_kind(seg1: &[PathSegment], seg2: &[PathSegment]) -> PathAl
             }
             (PathSegment::IndexConst(c1), PathSegment::IndexConst(c2)) if c1 != c2 => {
                 return PathAliasKind::Disjoint; // distinct constant indices are provably disjoint
+            }
+            (PathSegment::IndexFromEnd(k1), PathSegment::IndexFromEnd(k2)) if k1 != k2 => {
+                return PathAliasKind::Disjoint; // distinct end-relative indices are provably disjoint
+            }
+            (PathSegment::IndexConst(_), PathSegment::IndexFromEnd(_))
+            | (PathSegment::IndexFromEnd(_), PathSegment::IndexConst(_)) => {
+                // In slice pattern destructuring, prefix indices and suffix end indices partition disjoint positions
+                return PathAliasKind::Disjoint;
+            }
+            (PathSegment::IndexConst(c), PathSegment::SlicePatternRest { prefix_len, .. })
+            | (PathSegment::SlicePatternRest { prefix_len, .. }, PathSegment::IndexConst(c))
+                if *c >= 0 && (*c as usize) < *prefix_len =>
+            {
+                return PathAliasKind::Disjoint; // prefix index strictly precedes rest sub-slice
+            }
+            (PathSegment::IndexFromEnd(k), PathSegment::SlicePatternRest { suffix_len, .. })
+            | (PathSegment::SlicePatternRest { suffix_len, .. }, PathSegment::IndexFromEnd(k))
+                if *k <= *suffix_len =>
+            {
+                return PathAliasKind::Disjoint; // suffix index strictly succeeds rest sub-slice
             }
             (PathSegment::IndexOffset(s1, o1), PathSegment::IndexOffset(s2, o2))
                 if s1 == s2 && o1 != o2 =>
@@ -741,6 +767,19 @@ impl AccessPath {
                 }
                 PathSegment::IndexConst(c) => {
                     display.push_str(&format!("[{}]", c));
+                }
+                PathSegment::IndexFromEnd(k) => {
+                    display.push_str(&format!("[-{}]", k));
+                }
+                PathSegment::SlicePatternRest {
+                    prefix_len,
+                    suffix_len,
+                } => {
+                    if *suffix_len > 0 {
+                        display.push_str(&format!("[{}..-{}]", prefix_len, suffix_len));
+                    } else {
+                        display.push_str(&format!("[{}..]", prefix_len));
+                    }
                 }
                 PathSegment::IndexSymbolic(sym) => {
                     display.push_str(&format!("[{}]", INTERNER.resolve(sym)));
@@ -1396,6 +1435,20 @@ pub fn extract_access_path(expr: &Expr) -> Option<AccessPath> {
                     let val: i64 = s.parse().unwrap_or(0);
                     parent.segments.push(PathSegment::IndexConst(val));
                 }
+                ExprKind::Unary {
+                    op: UnaryOp::Neg,
+                    expr: inner,
+                } => {
+                    if let ExprKind::Lit(ifa_ast::Lit::Int(sym)) = &inner.kind {
+                        let s = INTERNER.resolve(sym);
+                        parent.display.push_str(&format!("[-{}]", s));
+                        let val: i64 = s.parse().unwrap_or(0);
+                        parent.segments.push(PathSegment::IndexConst(-val));
+                    } else {
+                        parent.display.push_str("[*]");
+                        parent.segments.push(PathSegment::IndexUnknown);
+                    }
+                }
                 ExprKind::Ident(sym) => {
                     let s = INTERNER.resolve(sym);
                     parent.display.push_str(&format!("[{}]", s));
@@ -1498,6 +1551,17 @@ fn extract_slice_bound(expr: &Expr) -> Option<SliceBound> {
         ExprKind::Lit(ifa_ast::Lit::Int(sym)) => {
             let s = INTERNER.resolve(sym);
             s.parse::<i64>().ok().map(SliceBound::Const)
+        }
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr: inner,
+        } => {
+            if let ExprKind::Lit(ifa_ast::Lit::Int(sym)) = &inner.kind {
+                let s = INTERNER.resolve(sym);
+                s.parse::<i64>().ok().map(|v| SliceBound::Const(-v))
+            } else {
+                None
+            }
         }
         ExprKind::Ident(sym) => Some(SliceBound::Symbolic(*sym)),
         ExprKind::Binary { op, left, right } => match op {
@@ -2114,6 +2178,9 @@ pub fn extract_pattern_bindings_with_paths(
             suffix,
             ..
         } => {
+            let p_len = prefix.len();
+            let s_len = suffix.len();
+
             for (idx, p) in prefix.iter().enumerate() {
                 let idx_val = idx as i64;
                 current_path.push(PathSegment::IndexConst(idx_val));
@@ -2132,13 +2199,16 @@ pub fn extract_pattern_bindings_with_paths(
                 current_path.pop();
             }
             if let Some(Some(r)) = rest {
-                current_path.push(PathSegment::SliceConst {
-                    start: Some(prefix.len() as i64),
-                    end: None,
-                    inclusive: false,
+                current_path.push(PathSegment::SlicePatternRest {
+                    prefix_len: p_len,
+                    suffix_len: s_len,
                 });
                 let prev_len = current_display.len();
-                current_display.push_str(&format!("[{}..]", prefix.len()));
+                if s_len > 0 {
+                    current_display.push_str(&format!("[{}..-{}]", p_len, s_len));
+                } else {
+                    current_display.push_str(&format!("[{}..]", p_len));
+                }
 
                 extract_pattern_bindings_with_paths(
                     r,
@@ -2152,11 +2222,10 @@ pub fn extract_pattern_bindings_with_paths(
                 current_path.pop();
             }
             for (j, s) in suffix.iter().enumerate() {
-                let idx_val = j as i64;
-                let suffix_sym = INTERNER.intern(&format!("-{}", j));
-                current_path.push(PathSegment::IndexOffset(suffix_sym, idx_val));
+                let from_end = s_len - j;
+                current_path.push(PathSegment::IndexFromEnd(from_end));
                 let prev_len = current_display.len();
-                current_display.push_str(&format!("[..-{}]", j));
+                current_display.push_str(&format!("[-{}]", from_end));
 
                 extract_pattern_bindings_with_paths(
                     s,
