@@ -180,6 +180,36 @@ impl FirAccessPath {
                     return FirPathAliasKind::Disjoint; // provably disjoint symbolic split point
                 }
                 (
+                    FirPathSegment::ElementSymbolic(idx),
+                    FirPathSegment::SliceSymbolic { end: Some(e), .. },
+                )
+                | (
+                    FirPathSegment::SliceSymbolic { end: Some(e), .. },
+                    FirPathSegment::ElementSymbolic(idx),
+                ) if idx == e => {
+                    return FirPathAliasKind::Disjoint; // symbolic index at exclusive split point is disjoint from [..e]
+                }
+                (
+                    FirPathSegment::ElementOffset(idx, off),
+                    FirPathSegment::SliceSymbolic { start: Some(s), .. },
+                )
+                | (
+                    FirPathSegment::SliceSymbolic { start: Some(s), .. },
+                    FirPathSegment::ElementOffset(idx, off),
+                ) if idx == s && *off < 0 => {
+                    return FirPathAliasKind::Disjoint; // offset idx - k is strictly before slice starting at idx
+                }
+                (
+                    FirPathSegment::ElementOffset(idx, off),
+                    FirPathSegment::SliceSymbolic { end: Some(e), .. },
+                )
+                | (
+                    FirPathSegment::SliceSymbolic { end: Some(e), .. },
+                    FirPathSegment::ElementOffset(idx, off),
+                ) if idx == e && *off >= 0 => {
+                    return FirPathAliasKind::Disjoint; // offset idx + k is strictly after slice ending at idx
+                }
+                (
                     FirPathSegment::ElementConst(c),
                     FirPathSegment::SliceConst {
                         start,

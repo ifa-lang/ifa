@@ -4404,3 +4404,113 @@ fn test_for_inout_iteration_rejects_concurrent_mutation_with_e0011() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_partition_quicksort_three_way_disjoint_allowed() {
+    let code = r#"
+        fn partition_three_way(inout left: Slice<i64>, inout pivot: i64, inout right: Slice<i64>) {
+            if left.len() > 0 {
+                left[0] = 100;
+            }
+            pivot = 500;
+            if right.len() > 0 {
+                right[0] = 900;
+            }
+        }
+
+        pub fn main() {
+            mut arr = [10, 20, 30, 40, 50, 60, 70];
+            let pivot_idx: i64 = 3;
+            // arr[..pivot_idx], arr[pivot_idx], and arr[(pivot_idx + 1)..] are all provably disjoint
+            partition_three_way(
+                inout arr[..pivot_idx],
+                inout arr[pivot_idx],
+                inout arr[(pivot_idx + 1)..]
+            );
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Three-way quicksort slice partitioning must be proven disjoint without E0011: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_partition_quicksort_inclusive_pivot_overlap_rejected() {
+    let code = r#"
+        fn partition_overlap(inout left: Slice<i64>, inout pivot: i64) {
+            left[0] = 10;
+            pivot = 20;
+        }
+
+        pub fn main() {
+            mut arr = [10, 20, 30, 40, 50];
+            let pivot_idx: i64 = 2;
+            // Inclusive slice [..=pivot_idx] includes pivot_idx, so it overlaps with arr[pivot_idx]
+            partition_overlap(inout arr[..=pivot_idx], inout arr[pivot_idx]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Inclusive slice range overlapping with element must be rejected with E0011: {:?}",
+        res.diagnostics
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0011")),
+        "Expected E0011 diagnostic code for inclusive slice overlapping element, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_symbolic_offset_index_outside_slice_allowed() {
+    let code = r#"
+        fn mutate_preceding_and_subslice(inout prev: i64, inout subslice: Slice<i64>) {
+            prev = 111;
+            if subslice.len() > 0 {
+                subslice[0] = 222;
+            }
+        }
+
+        pub fn main() {
+            mut arr = [1, 2, 3, 4, 5, 6];
+            let k: i64 = 2;
+            // arr[k - 1] is strictly before arr[k..]
+            mutate_preceding_and_subslice(inout arr[k - 1], inout arr[k..]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Symbolic index before slice start must be proven disjoint without E0011: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_symbolic_sliding_window_negative_offset_disjoint_allowed() {
+    let code = r#"
+        fn process_separated_windows(inout w1: Slice<i64>, inout w2: Slice<i64>) {
+            w1[0] = 77;
+            w2[0] = 88;
+        }
+
+        pub fn main() {
+            mut arr = [1, 2, 3, 4, 5, 6, 7, 8];
+            let mid: i64 = 4;
+            // w1 ends at (mid - 1) exclusively, and w2 starts at mid: provably disjoint
+            process_separated_windows(inout arr[..(mid - 1)], inout arr[mid..]);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Separated symbolic sliding windows with negative offset must be proven disjoint: {:?}",
+        res.diagnostics
+    );
+}

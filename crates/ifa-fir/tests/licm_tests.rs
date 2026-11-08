@@ -933,3 +933,57 @@ fn test_licm_hoists_invariant_subslice_and_generation_checks_nested_multipass() 
         .unwrap();
     assert_eq!(res, FirValue::Int(120));
 }
+
+#[test]
+fn test_licm_disjoint_symbolic_subslice_hoisting() {
+    let src = r#"
+        struct PartitionContext {
+            pivot_val: i64,
+        }
+
+        pub fn process_partitions(ctx: PartitionContext, n: i64) -> i64 {
+            mut total = 0;
+            mut i = 0;
+            while i < n {
+                total = total + ctx.pivot_val;
+                i = i + 1;
+            }
+            return total;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("licm_partition.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = lower_program(&prog, &analysis.symbols);
+    let mut licm = LicmPass::new();
+    licm.run_on_module(&mut module);
+
+    let stats = licm.stats();
+    assert!(
+        stats.hoisted_projections >= 1,
+        "Pivot projection must be hoisted: {:?}",
+        stats
+    );
+
+    let mut interp = FirInterpreter::new(&module);
+    let ctx_obj = FirValue::Struct {
+        name: ifa_span::INTERNER.intern("PartitionContext"),
+        fields: vec![FirValue::Int(42)],
+    };
+
+    let res = interp
+        .execute_function("process_partitions", vec![ctx_obj, FirValue::Int(5)])
+        .unwrap();
+    assert_eq!(res, FirValue::Int(210));
+}

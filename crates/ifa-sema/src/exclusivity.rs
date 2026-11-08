@@ -136,6 +136,13 @@ fn are_slice_ranges_disjoint(
             if b1 == b2 && *off2 >= 0 && !inc1 {
                 return true;
             }
+        } else if let (SliceBound::Offset(b1, off1), SliceBound::Symbolic(b2)) = (e1, s2) {
+            if b1 == b2 {
+                let max_off1 = if inc1 { *off1 } else { *off1 - 1 };
+                if max_off1 < 0 {
+                    return true;
+                }
+            }
         }
     }
     if let (Some(e2), Some(s1)) = (end2, start1) {
@@ -149,6 +156,13 @@ fn are_slice_ranges_disjoint(
         } else if let (SliceBound::Symbolic(b2), SliceBound::Offset(b1, off1)) = (e2, s1) {
             if b1 == b2 && *off1 >= 0 && !inc2 {
                 return true;
+            }
+        } else if let (SliceBound::Offset(b2, off2), SliceBound::Symbolic(b1)) = (e2, s1) {
+            if b1 == b2 {
+                let max_off2 = if inc2 { *off2 } else { *off2 - 1 };
+                if max_off2 < 0 {
+                    return true;
+                }
             }
         }
     }
@@ -187,20 +201,56 @@ fn is_index_disjoint_from_slice(
         }
     }
 
-    // 2. Symbolic index vs slice [..sym] exclusive: index sym is strictly after slice
-    if !inc {
-        if let (SliceBound::Symbolic(sym), Some(SliceBound::Symbolic(end_sym))) = (index, end) {
-            if sym == end_sym {
+    // 2. Symbolic index vs slice [..end]: index is strictly after end boundary
+    match (index, end) {
+        (SliceBound::Symbolic(sym), Some(SliceBound::Symbolic(end_sym)))
+            if sym == end_sym && !inc =>
+        {
+            return true;
+        }
+        (SliceBound::Symbolic(sym), Some(SliceBound::Offset(end_sym, end_off)))
+            if sym == end_sym =>
+        {
+            let max_off = if inc { *end_off } else { *end_off - 1 };
+            if 0 > max_off {
                 return true;
             }
         }
+        (SliceBound::Offset(sym, off), Some(SliceBound::Symbolic(end_sym))) if sym == end_sym => {
+            let max_off = if inc { 0 } else { -1 };
+            if *off > max_off {
+                return true;
+            }
+        }
+        (SliceBound::Offset(sym, off), Some(SliceBound::Offset(end_sym, end_off)))
+            if sym == end_sym =>
+        {
+            let max_off = if inc { *end_off } else { *end_off - 1 };
+            if *off > max_off {
+                return true;
+            }
+        }
+        _ => {}
     }
 
-    // 3. Symbolic index vs slice [(sym + off)..] where off > 0: index sym is strictly before slice
-    if let (SliceBound::Symbolic(sym), Some(SliceBound::Offset(start_sym, off))) = (index, start) {
-        if sym == start_sym && *off > 0 {
+    // 3. Symbolic index vs slice [start..]: index is strictly before start boundary
+    match (index, start) {
+        (SliceBound::Symbolic(sym), Some(SliceBound::Offset(start_sym, start_off)))
+            if sym == start_sym && *start_off > 0 =>
+        {
             return true;
         }
+        (SliceBound::Offset(sym, off), Some(SliceBound::Symbolic(start_sym)))
+            if sym == start_sym && *off < 0 =>
+        {
+            return true;
+        }
+        (SliceBound::Offset(sym, off), Some(SliceBound::Offset(start_sym, start_off)))
+            if sym == start_sym && *off < *start_off =>
+        {
+            return true;
+        }
+        _ => {}
     }
 
     false
@@ -272,6 +322,62 @@ impl AccessPath {
                     PathSegment::IndexConst(c),
                 ) => {
                     let idx_bound = SliceBound::Const(*c);
+                    let b_s = start.map(SliceBound::Const);
+                    let b_e = end.map(SliceBound::Const);
+                    if is_index_disjoint_from_slice(
+                        &idx_bound,
+                        b_s.as_ref(),
+                        b_e.as_ref(),
+                        *inclusive,
+                    ) {
+                        return PathAliasKind::Disjoint;
+                    }
+                }
+                (
+                    PathSegment::IndexSymbolic(sym),
+                    PathSegment::SliceConst {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                )
+                | (
+                    PathSegment::SliceConst {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                    PathSegment::IndexSymbolic(sym),
+                ) => {
+                    let idx_bound = SliceBound::Symbolic(*sym);
+                    let b_s = start.map(SliceBound::Const);
+                    let b_e = end.map(SliceBound::Const);
+                    if is_index_disjoint_from_slice(
+                        &idx_bound,
+                        b_s.as_ref(),
+                        b_e.as_ref(),
+                        *inclusive,
+                    ) {
+                        return PathAliasKind::Disjoint;
+                    }
+                }
+                (
+                    PathSegment::IndexOffset(sym, off),
+                    PathSegment::SliceConst {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                )
+                | (
+                    PathSegment::SliceConst {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                    PathSegment::IndexOffset(sym, off),
+                ) => {
+                    let idx_bound = SliceBound::Offset(*sym, *off);
                     let b_s = start.map(SliceBound::Const);
                     let b_e = end.map(SliceBound::Const);
                     if is_index_disjoint_from_slice(
