@@ -72,6 +72,16 @@ pub struct VectorizeStats {
     pub tripartite_matrix_reductions_vectorized: usize,
     /// Total number of multidimensional matrix reduction loops vectorized.
     pub multidim_matrix_reductions_vectorized: usize,
+    /// Number of loops analyzing dynamic strided memory access patterns.
+    pub loops_with_strided_accesses: usize,
+    /// Number of 2D convolution loops vectorized with zero-copy strided slices.
+    pub strided_conv2d_vectorized: usize,
+    /// Number of 3D convolution loops vectorized with zero-copy strided slices.
+    pub strided_conv3d_vectorized: usize,
+    /// Number of zero-copy strided convolutions specialized without intermediate copies.
+    pub zero_copy_convolutions_specialized: usize,
+    /// Number of strided slice bounds checks statically eliminated.
+    pub strided_bounds_eliminated: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -251,6 +261,9 @@ impl VectorizePass {
                                 redundant: true, ..
                             }
                             | ValueExpr::SliceBoundsCheck {
+                                redundant: true, ..
+                            }
+                            | ValueExpr::SliceStridedBoundsCheck {
                                 redundant: true, ..
                             } => {
                                 had_eliminated_bounds = true;
@@ -585,7 +598,105 @@ impl VectorizePass {
                     self.stats.disjoint_slices_vectorized += 2;
                 }
 
-                let effective_interleave = if is_tripartite {
+                // 5. Detect dynamic strided slices and zero-copy 2D/3D convolutions
+                let mut is_strided_conv2d =
+                    existing_hint.map(|h| h.is_strided_conv2d).unwrap_or(false);
+                let mut is_strided_conv3d =
+                    existing_hint.map(|h| h.is_strided_conv3d).unwrap_or(false);
+                let mut conv_strides = existing_hint.and_then(|h| h.conv_strides);
+                let mut is_zero_copy = existing_hint.map(|h| h.is_zero_copy).unwrap_or(false);
+                let mut has_strided_access = false;
+
+                for (_, idx, _) in &elem_reads {
+                    if let Some((dims, strides)) = Self::analyze_index_strides(func, *idx) {
+                        has_strided_access = true;
+                        if dims == 3 {
+                            is_strided_conv3d = true;
+                            if conv_strides.is_none() {
+                                conv_strides = Some(strides);
+                            }
+                        } else if dims == 2 {
+                            is_strided_conv2d = true;
+                            if conv_strides.is_none() {
+                                conv_strides = Some(strides);
+                            }
+                        }
+                    }
+                }
+
+                for &b in slice_read_bases.iter().chain(slice_write_bases.iter()) {
+                    let r = Self::trace_slice_root(func, b);
+                    if let SliceRoot::StridedSubSlice { stride, .. } = &r {
+                        has_strided_access = true;
+                        let st_val = match stride {
+                            FirBound::Const(c) => *c as u32,
+                            _ => 1,
+                        };
+                        if conv_strides.is_none() {
+                            conv_strides = Some((st_val, 1, 1));
+                        }
+                    }
+                }
+
+                if has_strided_access {
+                    self.stats.loops_with_strided_accesses += 1;
+                }
+
+                if (is_strided_conv2d || is_strided_conv3d || is_convolution)
+                    && (has_mul && has_add
+                        || detected_reduction == Some(crate::ir::ReductionKind::Dot))
+                {
+                    let zero_copy_verified = distinct_roots
+                        .iter()
+                        .all(|r| !matches!(r, SliceRoot::Unknown(_)));
+                    if zero_copy_verified {
+                        is_zero_copy = true;
+                        disjoint_slices = true;
+                        unroll_and_jam = true;
+                        self.stats.zero_copy_convolutions_specialized += 1;
+                        if is_strided_conv3d {
+                            self.stats.strided_conv3d_vectorized += 1;
+                        } else {
+                            is_strided_conv2d = true;
+                            self.stats.strided_conv2d_vectorized += 1;
+                        }
+
+                        let mut strided_eliminated = 0;
+                        for &b_id in &loop_info.blocks {
+                            if let Some(block) = func.get_block_mut(b_id) {
+                                for inst in &mut block.instructions {
+                                    match &mut inst.expr {
+                                        ValueExpr::BoundsCheck { redundant, .. }
+                                        | ValueExpr::SliceBoundsCheck { redundant, .. }
+                                        | ValueExpr::SliceStridedBoundsCheck {
+                                            redundant, ..
+                                        } if !*redundant => {
+                                            *redundant = true;
+                                            strided_eliminated += 1;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        if strided_eliminated > 0 {
+                            self.stats.strided_bounds_eliminated += strided_eliminated;
+                            had_eliminated_bounds = true;
+                        }
+                    }
+                }
+
+                let effective_interleave = if is_strided_conv3d {
+                    8
+                } else if is_strided_conv2d {
+                    match primary_ty {
+                        FirType::Float(FloatType::F32)
+                        | FirType::Int(IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8) => {
+                            8
+                        }
+                        _ => 4,
+                    }
+                } else if is_tripartite {
                     8
                 } else if is_bipartite {
                     match primary_ty {
@@ -634,6 +745,10 @@ impl VectorizePass {
                     is_swap: is_disjoint_swap,
                     is_bipartite_matrix_reduction: is_bipartite,
                     is_tripartite_matrix_reduction: is_tripartite,
+                    is_strided_conv2d,
+                    is_strided_conv3d,
+                    conv_strides,
+                    is_zero_copy,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)
@@ -947,7 +1062,8 @@ impl VectorizePass {
                         | ValueExpr::GenFree { .. }
                         | ValueExpr::CoWClone { .. } => return (false, false),
                         ValueExpr::BoundsCheck { redundant, .. }
-                        | ValueExpr::SliceBoundsCheck { redundant, .. } => {
+                        | ValueExpr::SliceBoundsCheck { redundant, .. }
+                        | ValueExpr::SliceStridedBoundsCheck { redundant, .. } => {
                             // If a bounds check is not statically eliminated, it can trigger
                             // a dynamic panic or branching, inhibiting safe auto-vectorization.
                             // In strict functions, memory accesses to contiguous pre-allocated arena/stack slices
@@ -1015,7 +1131,7 @@ impl VectorizePass {
                                 None => FirType::Int(IntType::I64),
                             }
                         }
-                        ValueExpr::SliceSub { base, .. } => {
+                        ValueExpr::SliceSub { base, .. } | ValueExpr::SliceStrided { base, .. } => {
                             match Self::get_aggregate_elem_type(&value_types, *base) {
                                 Some(elem_ty) => FirType::Slice(Box::new(elem_ty)),
                                 None => FirType::Slice(Box::new(FirType::Int(IntType::I64))),
@@ -1090,6 +1206,87 @@ impl VectorizePass {
         None
     }
 
+    /// Analyze an SSA index expression to detect 1D, 2D, or 3D strided affine access patterns.
+    pub fn analyze_index_strides(
+        func: &FirFunction,
+        idx_val: ValueId,
+    ) -> Option<(usize, (u32, u32, u32))> {
+        let mut terms = Vec::new();
+        Self::collect_additive_terms(func, idx_val, &mut terms, 0);
+
+        let mut strides = Vec::new();
+        for term in terms {
+            if let Some(stride_const) = Self::extract_stride_factor(func, term) {
+                if stride_const > 0 {
+                    strides.push(stride_const as u32);
+                }
+            }
+        }
+
+        if strides.len() >= 3 {
+            Some((3, (strides[0], strides[1], strides[2])))
+        } else if strides.len() == 2 {
+            Some((2, (strides[0], strides[1], 1)))
+        } else if strides.len() == 1 {
+            Some((1, (strides[0], 1, 1)))
+        } else {
+            None
+        }
+    }
+
+    fn collect_additive_terms(
+        func: &FirFunction,
+        val: ValueId,
+        terms: &mut Vec<ValueId>,
+        depth: usize,
+    ) {
+        if depth > 6 {
+            terms.push(val);
+            return;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if inst.result == Some(val) {
+                    if let ValueExpr::Binary {
+                        op: BinaryOp::Add,
+                        lhs,
+                        rhs,
+                    } = inst.expr
+                    {
+                        Self::collect_additive_terms(func, lhs, terms, depth + 1);
+                        Self::collect_additive_terms(func, rhs, terms, depth + 1);
+                        return;
+                    }
+                }
+            }
+        }
+        terms.push(val);
+    }
+
+    fn extract_stride_factor(func: &FirFunction, val: ValueId) -> Option<i64> {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if inst.result == Some(val) {
+                    if let ValueExpr::Binary {
+                        op: BinaryOp::Mul,
+                        lhs,
+                        rhs,
+                    } = inst.expr
+                    {
+                        if let Some(c) = Self::resolve_const_int(func, rhs) {
+                            return Some(c);
+                        } else if let Some(c) = Self::resolve_const_int(func, lhs) {
+                            return Some(c);
+                        } else {
+                            return Some(1);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Analyze whether two slice aggregate values operate over provably disjoint underlying memory
     /// (distinct stack allocas, distinct function parameters with inout exclusivity, distinct fields,
     /// disjoint multidimensional projections, or non-overlapping symbolic subslices).
@@ -1156,6 +1353,114 @@ impl VectorizePass {
                     FirBound::are_ranges_disjoint(s1, e1, s2, e2)
                 } else {
                     Self::are_slice_roots_disjoint(p1, p2)
+                }
+            }
+            (
+                SliceRoot::StridedSubSlice {
+                    parent: p1,
+                    start: s1,
+                    end: e1,
+                    stride: st1,
+                },
+                SliceRoot::StridedSubSlice {
+                    parent: p2,
+                    start: s2,
+                    end: e2,
+                    stride: st2,
+                },
+            ) => {
+                if p1 == p2 {
+                    FirBound::are_strided_ranges_disjoint(s1, e1, st1, s2, e2, st2)
+                } else {
+                    Self::are_slice_roots_disjoint(p1, p2)
+                }
+            }
+            (
+                SliceRoot::StridedSubSlice {
+                    parent: p1,
+                    start: s1,
+                    end: e1,
+                    ..
+                },
+                SliceRoot::SubSlice {
+                    parent: p2,
+                    start: s2,
+                    end: e2,
+                },
+            ) => {
+                if p1 == p2 {
+                    FirBound::are_ranges_disjoint(s1, e1, s2, e2)
+                } else {
+                    Self::are_slice_roots_disjoint(p1, p2)
+                }
+            }
+            (
+                SliceRoot::SubSlice {
+                    parent: p1,
+                    start: s1,
+                    end: e1,
+                },
+                SliceRoot::StridedSubSlice {
+                    parent: p2,
+                    start: s2,
+                    end: e2,
+                    ..
+                },
+            ) => {
+                if p1 == p2 {
+                    FirBound::are_ranges_disjoint(s1, e1, s2, e2)
+                } else {
+                    Self::are_slice_roots_disjoint(p1, p2)
+                }
+            }
+            (
+                SliceRoot::Projection {
+                    parent: p1,
+                    dim_index: d1,
+                },
+                SliceRoot::StridedSubSlice {
+                    parent: p2,
+                    start: s2,
+                    end: e2,
+                    ..
+                },
+            ) => {
+                if p1 == p2 {
+                    FirBound::is_index_disjoint_from_range(d1, s2, e2)
+                } else {
+                    Self::are_slice_roots_disjoint(p1, p2)
+                }
+            }
+            (
+                SliceRoot::StridedSubSlice {
+                    parent: p1,
+                    start: s1,
+                    end: e1,
+                    ..
+                },
+                SliceRoot::Projection {
+                    parent: p2,
+                    dim_index: d2,
+                },
+            ) => {
+                if p1 == p2 {
+                    FirBound::is_index_disjoint_from_range(d2, s1, e1)
+                } else {
+                    Self::are_slice_roots_disjoint(p1, p2)
+                }
+            }
+            (SliceRoot::StridedSubSlice { parent: p1, .. }, other) => {
+                if &**p1 == other {
+                    false
+                } else {
+                    Self::are_slice_roots_disjoint(p1, other)
+                }
+            }
+            (other, SliceRoot::StridedSubSlice { parent: p2, .. }) => {
+                if other == &**p2 {
+                    false
+                } else {
+                    Self::are_slice_roots_disjoint(other, p2)
                 }
             }
             (
@@ -1300,6 +1605,23 @@ impl VectorizePass {
                                     end: e_bound,
                                 };
                             }
+                            ValueExpr::SliceStrided {
+                                base,
+                                start,
+                                end,
+                                stride,
+                            } => {
+                                let s_bound = FirBound::from_value(func, *start);
+                                let e_bound = FirBound::from_value(func, *end);
+                                let st_bound = FirBound::from_value(func, *stride);
+                                let parent = Self::trace_slice_root(func, *base);
+                                return SliceRoot::StridedSubSlice {
+                                    parent: Box::new(parent),
+                                    start: s_bound,
+                                    end: e_bound,
+                                    stride: st_bound,
+                                };
+                            }
                             ValueExpr::CoWMakeUnique { val: src_val } => {
                                 val = *src_val;
                             }
@@ -1426,6 +1748,40 @@ impl FirBound {
         }
     }
 
+    /// Check if two strided slice ranges `[s1..e1:st1]` and `[s2..e2:st2]` are provably disjoint.
+    pub fn are_strided_ranges_disjoint(
+        s1: &FirBound,
+        e1: &FirBound,
+        stride1: &FirBound,
+        s2: &FirBound,
+        e2: &FirBound,
+        stride2: &FirBound,
+    ) -> bool {
+        if Self::are_ranges_disjoint(s1, e1, s2, e2) {
+            return true;
+        }
+
+        // Modular residue congruence check for constant strides
+        // e.g. even indices (s1 = 0, st1 = 2) vs odd indices (s2 = 1, st2 = 2)
+        if let (
+            FirBound::Const(c1),
+            FirBound::Const(d1),
+            FirBound::Const(c2),
+            FirBound::Const(d2),
+        ) = (s1, stride1, s2, stride2)
+        {
+            if *d1 > 1 && *d1 == *d2 {
+                let rem1 = c1.rem_euclid(*d1);
+                let rem2 = c2.rem_euclid(*d2);
+                if rem1 != rem2 {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Check if an index is provably disjoint from a slice range `[start..end]`.
     pub fn is_index_disjoint_from_range(idx: &FirBound, start: &FirBound, end: &FirBound) -> bool {
         if let (FirBound::Const(c), FirBound::Const(s), FirBound::Const(e)) = (idx, start, end) {
@@ -1469,6 +1825,12 @@ enum SliceRoot {
         start: FirBound,
         end: FirBound,
     },
+    StridedSubSlice {
+        parent: Box<SliceRoot>,
+        start: FirBound,
+        end: FirBound,
+        stride: FirBound,
+    },
     Unknown(ValueId),
 }
 
@@ -1481,7 +1843,9 @@ impl SliceRoot {
             SliceRoot::Param(_) => func.is_strict,
             SliceRoot::Field(parent, _) => parent.is_local_arena_or_stack(func),
             SliceRoot::Projection { parent, .. } => parent.is_local_arena_or_stack(func),
-            SliceRoot::SubSlice { parent, .. } => parent.is_local_arena_or_stack(func),
+            SliceRoot::SubSlice { parent, .. } | SliceRoot::StridedSubSlice { parent, .. } => {
+                parent.is_local_arena_or_stack(func)
+            }
             SliceRoot::Unknown(_) => false,
         }
     }
@@ -1490,9 +1854,9 @@ impl SliceRoot {
     pub fn has_projection(&self) -> bool {
         match self {
             SliceRoot::Projection { .. } => true,
-            SliceRoot::Field(parent, _) | SliceRoot::SubSlice { parent, .. } => {
-                parent.has_projection()
-            }
+            SliceRoot::Field(parent, _)
+            | SliceRoot::SubSlice { parent, .. }
+            | SliceRoot::StridedSubSlice { parent, .. } => parent.has_projection(),
             _ => false,
         }
     }
@@ -1503,6 +1867,17 @@ impl SliceRoot {
             SliceRoot::SubSlice { start, end, parent } => {
                 matches!(start, FirBound::Symbolic(_) | FirBound::Offset(..))
                     || matches!(end, FirBound::Symbolic(_) | FirBound::Offset(..))
+                    || parent.has_symbolic_partition()
+            }
+            SliceRoot::StridedSubSlice {
+                start,
+                end,
+                stride,
+                parent,
+            } => {
+                matches!(start, FirBound::Symbolic(_) | FirBound::Offset(..))
+                    || matches!(end, FirBound::Symbolic(_) | FirBound::Offset(..))
+                    || matches!(stride, FirBound::Symbolic(_) | FirBound::Offset(..))
                     || parent.has_symbolic_partition()
             }
             SliceRoot::Projection { parent, .. } | SliceRoot::Field(parent, _) => {

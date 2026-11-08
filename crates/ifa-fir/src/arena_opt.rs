@@ -574,7 +574,7 @@ impl ArenaFusionPass {
                                 }
                             }
                         }
-                        ValueExpr::SliceSub { base, .. } => {
+                        ValueExpr::SliceSub { base, .. } | ValueExpr::SliceStrided { base, .. } => {
                             if let Some(res) = inst.result {
                                 let canon_base = Self::resolve_alias(*base, &aliases);
                                 if verified.contains(base) || verified.contains(&canon_base) {

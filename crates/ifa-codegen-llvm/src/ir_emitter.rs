@@ -1487,6 +1487,16 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("!50 = distinct !{!50, !2, !7, !4, !5, !12, !13, !24, !37, !39}\n");
         out.push_str("!51 = distinct !{!51, !2, !9, !4, !5, !12, !13, !24, !37, !39}\n");
         out.push_str("!52 = distinct !{!52, !2, !11, !4, !5, !12, !13, !24, !37, !39}\n");
+        // Specialized 3D zero-copy strided convolution vectorization hints (unroll-and-jam 8x, parallel accesses, noalias, vector width)
+        out.push_str("!53 = distinct !{!53, !2, !3, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!54 = distinct !{!54, !2, !7, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!55 = distinct !{!55, !2, !9, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!56 = distinct !{!56, !2, !11, !4, !5, !12, !13, !24, !37, !39}\n");
+        // Specialized 2D zero-copy strided convolution vectorization hints (unroll-and-jam 4x/8x, parallel accesses, noalias, vector width)
+        out.push_str("!57 = distinct !{!57, !2, !3, !4, !5, !12, !13, !24, !37, !38}\n");
+        out.push_str("!58 = distinct !{!58, !2, !7, !4, !5, !12, !13, !24, !37, !38}\n");
+        out.push_str("!59 = distinct !{!59, !2, !9, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!60 = distinct !{!60, !2, !11, !4, !5, !12, !13, !24, !37, !38}\n");
 
         Ok(out)
     }
@@ -1620,24 +1630,26 @@ impl<'a> LlvmIrEmitter<'a> {
                             },
                             _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
                         },
-                        ValueExpr::SliceSub { base, .. } => match value_types.get(base) {
-                            Some(ifa_fir::FirType::Array(inner, _))
-                            | Some(ifa_fir::FirType::Slice(inner)) => {
-                                ifa_fir::FirType::Slice(inner.clone())
-                            }
-                            Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
-                                ifa_fir::FirType::Array(elem, _)
-                                | ifa_fir::FirType::Slice(elem) => {
-                                    ifa_fir::FirType::Slice(elem.clone())
+                        ValueExpr::SliceSub { base, .. } | ValueExpr::SliceStrided { base, .. } => {
+                            match value_types.get(base) {
+                                Some(ifa_fir::FirType::Array(inner, _))
+                                | Some(ifa_fir::FirType::Slice(inner)) => {
+                                    ifa_fir::FirType::Slice(inner.clone())
                                 }
+                                Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
+                                    ifa_fir::FirType::Array(elem, _)
+                                    | ifa_fir::FirType::Slice(elem) => {
+                                        ifa_fir::FirType::Slice(elem.clone())
+                                    }
+                                    _ => ifa_fir::FirType::Slice(Box::new(ifa_fir::FirType::Int(
+                                        ifa_sema::types::IntType::I64,
+                                    ))),
+                                },
                                 _ => ifa_fir::FirType::Slice(Box::new(ifa_fir::FirType::Int(
                                     ifa_sema::types::IntType::I64,
                                 ))),
-                            },
-                            _ => ifa_fir::FirType::Slice(Box::new(ifa_fir::FirType::Int(
-                                ifa_sema::types::IntType::I64,
-                            ))),
-                        },
+                            }
+                        }
                         ValueExpr::ArrayInit(elements) => {
                             let elem_ty = elements
                                 .first()
@@ -3444,6 +3456,87 @@ impl<'a> LlvmIrEmitter<'a> {
                     res_id, res_id, res_id
                 ));
             }
+            ValueExpr::SliceStrided {
+                base,
+                start,
+                end,
+                stride,
+            } => {
+                let base_ty = value_types.get(base);
+                let (elem_ty_str, _) = match base_ty {
+                    Some(ifa_fir::FirType::Array(inner, _))
+                    | Some(ifa_fir::FirType::Slice(inner)) => (
+                        fir_to_llvm_type(inner).unwrap_or_else(|_| "i64".to_string()),
+                        llvm_align_for_type(inner),
+                    ),
+                    Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
+                        ifa_fir::FirType::Array(elem, _) | ifa_fir::FirType::Slice(elem) => (
+                            fir_to_llvm_type(elem).unwrap_or_else(|_| "i64".to_string()),
+                            llvm_align_for_type(elem),
+                        ),
+                        _ => ("i64".to_string(), 8),
+                    },
+                    _ => ("i64".to_string(), 8),
+                };
+
+                let base_ptr_op = match base_ty {
+                    Some(ifa_fir::FirType::Slice(_)) => {
+                        out.push_str(&format!(
+                            "  %strided_base_ptr_{} = extractvalue {{ ptr, i64 }} %v{}, 0\n",
+                            res_id, base.0
+                        ));
+                        format!("%strided_base_ptr_{}", res_id)
+                    }
+                    Some(ifa_fir::FirType::Pointer(inner))
+                        if matches!(&**inner, ifa_fir::FirType::Slice(_)) =>
+                    {
+                        out.push_str(&format!(
+                            "  %strided_slice_ld_{} = load {{ ptr, i64 }}, ptr %v{}, align 8\n",
+                            res_id, base.0
+                        ));
+                        out.push_str(&format!(
+                            "  %strided_base_ptr_{} = extractvalue {{ ptr, i64 }} %strided_slice_ld_{}, 0\n",
+                            res_id, res_id
+                        ));
+                        format!("%strided_base_ptr_{}", res_id)
+                    }
+                    _ => array_ptrs
+                        .get(base)
+                        .cloned()
+                        .or_else(|| array_allocas.get(base).map(|p| format!("%v{}", p.0)))
+                        .unwrap_or_else(|| format!("%v{}", base.0)),
+                };
+
+                out.push_str(&format!(
+                    "  %strided_start_ptr_{} = getelementptr inbounds {}, ptr {}, i64 %v{}\n",
+                    res_id, elem_ty_str, base_ptr_op, start.0
+                ));
+                out.push_str(&format!(
+                    "  %strided_span_{} = sub i64 %v{}, %v{}\n",
+                    res_id, end.0, start.0
+                ));
+                out.push_str(&format!(
+                    "  %strided_num_{} = add i64 %strided_span_{}, %v{}\n",
+                    res_id, res_id, stride.0
+                ));
+                out.push_str(&format!(
+                    "  %strided_num_adj_{} = sub i64 %strided_num_{}, 1\n",
+                    res_id, res_id
+                ));
+                out.push_str(&format!(
+                    "  %strided_len_{} = sdiv i64 %strided_num_adj_{}, %v{}\n",
+                    res_id, res_id, stride.0
+                ));
+                out.push_str(&format!(
+                    "  %strided_t0_{} = insertvalue {{ ptr, i64 }} undef, ptr %strided_start_ptr_{}, 0\n",
+                    res_id, res_id
+                ));
+                out.push_str(&format!(
+                    "  %v{} = insertvalue {{ ptr, i64 }} %strided_t0_{}, i64 %strided_len_{}, 1\n",
+                    res_id, res_id, res_id
+                ));
+            }
+            ValueExpr::SliceStridedBoundsCheck { .. } => {}
             ValueExpr::FormatString(parts) => {
                 if parts.is_empty() {
                     out.push_str(&format!(
@@ -4423,7 +4516,21 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             Terminator::Branch { target, .. } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = if hint.is_tripartite_matrix_reduction {
+                    let meta_id = if hint.is_strided_conv3d {
+                        match hint.vector_width {
+                            2 => 56,
+                            4 => 54,
+                            16 | 32 => 55,
+                            _ => 53,
+                        }
+                    } else if hint.is_strided_conv2d {
+                        match hint.vector_width {
+                            2 => 60,
+                            4 => 58,
+                            16 | 32 => 59,
+                            _ => 57,
+                        }
+                    } else if hint.is_tripartite_matrix_reduction {
                         match hint.vector_width {
                             2 => 52,
                             4 => 50,
@@ -4507,7 +4614,21 @@ impl<'a> LlvmIrEmitter<'a> {
                 ..
             } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = if hint.is_tripartite_matrix_reduction {
+                    let meta_id = if hint.is_strided_conv3d {
+                        match hint.vector_width {
+                            2 => 56,
+                            4 => 54,
+                            16 | 32 => 55,
+                            _ => 53,
+                        }
+                    } else if hint.is_strided_conv2d {
+                        match hint.vector_width {
+                            2 => 60,
+                            4 => 58,
+                            16 | 32 => 59,
+                            _ => 57,
+                        }
+                    } else if hint.is_tripartite_matrix_reduction {
                         match hint.vector_width {
                             2 => 52,
                             4 => 50,

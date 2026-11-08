@@ -329,7 +329,10 @@ fn resolve_access_path(
                 }
                 return path;
             }
-            ValueExpr::SliceSub { base, start, end } => {
+            ValueExpr::SliceSub { base, start, end }
+            | ValueExpr::SliceStrided {
+                base, start, end, ..
+            } => {
                 let mut path = resolve_access_path(*base, inst_defs, constants, depth + 1);
                 let c_start = constants.get(start).copied();
                 let c_end = constants.get(end).copied();
@@ -904,7 +907,8 @@ impl LicmPass {
                                             );
                                             !written_paths.iter().any(|w| arr_path.overlaps(w))
                                         }
-                                        ValueExpr::SliceSub { base, .. } => {
+                                        ValueExpr::SliceSub { base, .. }
+                                        | ValueExpr::SliceStrided { base, .. } => {
                                             let base_path = resolve_access_path(
                                                 *base, &inst_defs, &constants, 0,
                                             );
@@ -1031,6 +1035,7 @@ impl LicmPass {
                             ValueExpr::GetElement { .. }
                                 | ValueExpr::GetElementPtr { .. }
                                 | ValueExpr::SliceSub { .. }
+                                | ValueExpr::SliceStrided { .. }
                                 | ValueExpr::Binary {
                                     op: BinaryOp::Mul,
                                     ..

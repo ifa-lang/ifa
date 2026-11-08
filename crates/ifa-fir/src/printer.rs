@@ -154,6 +154,18 @@ impl<'a> FirPrinter<'a> {
                 self.indent();
                 writeln!(self.output, "// [tripartite_matrix_reduction: true]")?;
             }
+            if hint.is_strided_conv2d {
+                self.indent();
+                writeln!(self.output, "// [strided_conv2d: true]")?;
+            }
+            if hint.is_strided_conv3d {
+                self.indent();
+                writeln!(self.output, "// [strided_conv3d: true]")?;
+            }
+            if hint.is_zero_copy {
+                self.indent();
+                writeln!(self.output, "// [zero_copy: true]")?;
+            }
         }
         for inst in &block.instructions {
             self.indent();
@@ -293,6 +305,18 @@ impl<'a> FirPrinter<'a> {
             ValueExpr::SliceSub { base, start, end } => {
                 write!(self.output, "slicesub {}, {}, {}", base, start, end)
             }
+            ValueExpr::SliceStrided {
+                base,
+                start,
+                end,
+                stride,
+            } => {
+                write!(
+                    self.output,
+                    "slicestrided {}, {}, {}, {}",
+                    base, start, end, stride
+                )
+            }
             ValueExpr::BoundsCheck {
                 base,
                 index,
@@ -321,6 +345,27 @@ impl<'a> FirPrinter<'a> {
                         self.output,
                         "slice.bounds.check {}, {}..{}",
                         base, start, end
+                    )
+                }
+            }
+            ValueExpr::SliceStridedBoundsCheck {
+                base,
+                start,
+                end,
+                stride,
+                redundant,
+            } => {
+                if *redundant {
+                    write!(
+                        self.output,
+                        "slicestrided.bounds.check {}, {}..{}:{} [eliminated]",
+                        base, start, end, stride
+                    )
+                } else {
+                    write!(
+                        self.output,
+                        "slicestrided.bounds.check {}, {}..{}:{}",
+                        base, start, end, stride
                     )
                 }
             }

@@ -149,7 +149,8 @@ impl LoopOptPass {
                                 match &inst.expr {
                                     ValueExpr::GetElement { .. }
                                     | ValueExpr::GetElementPtr { .. }
-                                    | ValueExpr::SliceSub { .. } => {
+                                    | ValueExpr::SliceSub { .. }
+                                    | ValueExpr::SliceStrided { .. } => {
                                         has_matrix_access = true;
                                     }
                                     ValueExpr::Binary { op, .. } => {

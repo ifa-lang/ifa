@@ -1045,6 +1045,17 @@ impl SroaPass {
                 replace(start);
                 replace(end);
             }
+            ValueExpr::SliceStrided {
+                base,
+                start,
+                end,
+                stride,
+            } => {
+                replace(base);
+                replace(start);
+                replace(end);
+                replace(stride);
+            }
             ValueExpr::BoundsCheck { base, index, .. } => {
                 replace(base);
                 replace(index);
@@ -1055,6 +1066,18 @@ impl SroaPass {
                 replace(base);
                 replace(start);
                 replace(end);
+            }
+            ValueExpr::SliceStridedBoundsCheck {
+                base,
+                start,
+                end,
+                stride,
+                ..
+            } => {
+                replace(base);
+                replace(start);
+                replace(end);
+                replace(stride);
             }
             ValueExpr::FormatString(parts) => {
                 for p in parts {
@@ -1401,6 +1424,7 @@ impl SroaPass {
                                 | ValueExpr::GetElementPtr { .. }
                                 | ValueExpr::ArrayLen { .. }
                                 | ValueExpr::SliceSub { .. }
+                                | ValueExpr::SliceStrided { .. }
                                 | ValueExpr::Alloca { .. }
                         );
 

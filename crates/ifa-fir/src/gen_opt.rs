@@ -221,6 +221,7 @@ impl GenerationalOptPass {
                         | ValueExpr::GetFieldPtr { base, .. }
                         | ValueExpr::GenDeref { ref_val: base }
                         | ValueExpr::SliceSub { base, .. }
+                        | ValueExpr::SliceStrided { base, .. }
                         | ValueExpr::GetElement { base, .. }
                         | ValueExpr::GetElementPtr { base, .. } => {
                             let canon_base = canonical_ref(*base, global_aliases);

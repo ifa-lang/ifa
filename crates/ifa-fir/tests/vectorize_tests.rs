@@ -1,8 +1,12 @@
-use ifa_fir::{compile_to_fir, format_function, VectorizePass};
+use ifa_fir::{
+    compile_to_fir, format_function, ConstantValue, FirFunction, FirParam, FirType, Instruction,
+    ParamMode, Terminator, ValueExpr, ValueId, VectorizePass,
+};
 use ifa_lexer::tokenize;
 use ifa_parser::parse;
 use ifa_sema::analyze;
-use ifa_span::SourceMap;
+use ifa_sema::types::IntType;
+use ifa_span::{SourceMap, Span, INTERNER};
 
 #[test]
 fn test_vectorize_pass_array_sum_f32() {
@@ -1381,4 +1385,217 @@ fn test_vectorize_pass_tripartite_matrix_reduction_disjoint_windows() {
     assert_eq!(stats.loops_vectorized, 1);
     assert_eq!(stats.tripartite_matrix_reductions_vectorized, 1);
     assert_eq!(stats.multidim_matrix_reductions_vectorized, 1);
+}
+
+#[test]
+fn test_vectorize_pass_strided_conv2d_zero_copy() {
+    let src = r#"
+        pub strict fn conv2d_strided_zero_copy(
+            inout out: Slice<f32>,
+            img: Slice<f32>,
+            kernel: Slice<f32>,
+            h_out: i64,
+            w_out: i64,
+            stride_y: i64,
+            stride_x: i64,
+            img_width: i64
+        ) {
+            let mut y: i64 = 0;
+            while y < h_out {
+                let mut x: i64 = 0;
+                while x < w_out {
+                    let in_idx = (y * stride_y) * img_width + (x * stride_x);
+                    let out_idx = y * w_out + x;
+                    out[out_idx] = out[out_idx] + img[in_idx] * kernel[0];
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("conv2d_strided.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [zero_copy: true]")
+            || formatted.contains("// [strided_conv2d: true]"),
+        "Formatted FIR must contain zero_copy or strided_conv2d hint:\n{}",
+        formatted
+    );
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert!(
+        stats.loops_vectorized >= 1,
+        "Loops should be vectorized: {:?}",
+        stats
+    );
+    assert!(
+        stats.strided_conv2d_vectorized >= 1,
+        "2D strided convolution must be recognized: {:?}",
+        stats
+    );
+    assert!(
+        stats.zero_copy_convolutions_specialized >= 1,
+        "Zero-copy convolution must be specialized: {:?}",
+        stats
+    );
+}
+
+#[test]
+fn test_vectorize_pass_strided_conv3d_zero_copy() {
+    let src = r#"
+        pub strict fn conv3d_strided_zero_copy(
+            inout out: Slice<f32>,
+            volume: Slice<f32>,
+            kernel: Slice<f32>,
+            d_out: i64,
+            h_out: i64,
+            w_out: i64,
+            stride_z: i64,
+            stride_y: i64,
+            stride_x: i64,
+            plane_pitch: i64,
+            row_pitch: i64
+        ) {
+            let mut z: i64 = 0;
+            while z < d_out {
+                let mut y: i64 = 0;
+                while y < h_out {
+                    let mut x: i64 = 0;
+                    while x < w_out {
+                        let in_idx = (z * stride_z) * plane_pitch + (y * stride_y) * row_pitch + (x * stride_x);
+                        let out_idx = (z * h_out + y) * w_out + x;
+                        out[out_idx] = out[out_idx] + volume[in_idx] * kernel[0];
+                        x = x + 1;
+                    }
+                    y = y + 1;
+                }
+                z = z + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("conv3d_strided.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert!(
+        stats.loops_vectorized >= 1,
+        "Loops should be vectorized: {:?}",
+        stats
+    );
+    assert!(
+        stats.strided_conv3d_vectorized >= 1,
+        "3D strided convolution must be recognized: {:?}",
+        stats
+    );
+    assert!(
+        stats.zero_copy_convolutions_specialized >= 1,
+        "Zero-copy 3D convolution must be specialized: {:?}",
+        stats
+    );
+}
+
+#[test]
+fn test_vectorize_strided_slices_non_aliasing_interleaved() {
+    let mut func = FirFunction::new(
+        INTERNER.intern("test_interleaved_strided"),
+        vec![FirParam::new(
+            INTERNER.intern("base"),
+            ValueId(0),
+            FirType::Slice(Box::new(FirType::Float(ifa_sema::types::FloatType::F32))),
+            ParamMode::InOut,
+        )],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let entry = func.entry_block;
+    let b = func.get_block_mut(entry).unwrap();
+    let v_even_start = ValueId(1);
+    let v_odd_start = ValueId(2);
+    let v_end = ValueId(3);
+    let v_stride = ValueId(4);
+    let v_even_slice = ValueId(5);
+    let v_odd_slice = ValueId(6);
+
+    b.push_instruction(Instruction::new(
+        Some(v_even_start),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    b.push_instruction(Instruction::new(
+        Some(v_odd_start),
+        ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+        Span::DUMMY,
+    ));
+    b.push_instruction(Instruction::new(
+        Some(v_end),
+        ValueExpr::Constant(ConstantValue::Int(100, IntType::I64)),
+        Span::DUMMY,
+    ));
+    b.push_instruction(Instruction::new(
+        Some(v_stride),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    b.push_instruction(Instruction::new(
+        Some(v_even_slice),
+        ValueExpr::SliceStrided {
+            base: ValueId(0),
+            start: v_even_start,
+            end: v_end,
+            stride: v_stride,
+        },
+        Span::DUMMY,
+    ));
+    b.push_instruction(Instruction::new(
+        Some(v_odd_slice),
+        ValueExpr::SliceStrided {
+            base: ValueId(0),
+            start: v_odd_start,
+            end: v_end,
+            stride: v_stride,
+        },
+        Span::DUMMY,
+    ));
+    b.set_terminator(Terminator::Return(None));
+
+    assert!(
+        VectorizePass::are_slice_bases_disjoint(&func, v_even_slice, v_odd_slice),
+        "Even and odd strided slices on the same base must be provably disjoint"
+    );
 }

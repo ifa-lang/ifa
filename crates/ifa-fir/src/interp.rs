@@ -1534,6 +1534,83 @@ impl<'a> FirInterpreter<'a> {
                 }
             }
 
+            ValueExpr::SliceStrided {
+                base,
+                start,
+                end,
+                stride,
+            } => {
+                let base_val = env.get(base).ok_or(InterpError::UndefinedValue(*base))?;
+                let start_val = env.get(start).ok_or(InterpError::UndefinedValue(*start))?;
+                let end_val = env.get(end).ok_or(InterpError::UndefinedValue(*end))?;
+                let stride_val = env
+                    .get(stride)
+                    .ok_or(InterpError::UndefinedValue(*stride))?;
+                let s_idx = match start_val {
+                    FirValue::Int(i) => (*i).max(0) as usize,
+                    _ => {
+                        return Err(InterpError::TypeMismatch(
+                            "Slice start must be an integer".into(),
+                        ))
+                    }
+                };
+                let e_idx = match end_val {
+                    FirValue::Int(i) => (*i).max(0) as usize,
+                    _ => {
+                        return Err(InterpError::TypeMismatch(
+                            "Slice end must be an integer".into(),
+                        ))
+                    }
+                };
+                let st_idx = match stride_val {
+                    FirValue::Int(i) => (*i).max(1) as usize,
+                    _ => 1,
+                };
+
+                let extract_strided = |elements: &[FirValue]| -> FirValue {
+                    let s = s_idx.min(elements.len());
+                    let e = e_idx.min(elements.len()).max(s);
+                    let mut result = Vec::new();
+                    let mut curr = s;
+                    while curr < e {
+                        result.push(elements[curr].clone());
+                        curr += st_idx;
+                    }
+                    FirValue::Array(result)
+                };
+
+                match base_val {
+                    FirValue::Array(elements) => Ok(extract_strided(elements)),
+                    FirValue::Pointer(addr) => {
+                        if let Some(target) = self.stack_memory.get(addr) {
+                            match target {
+                                FirValue::Array(elements) => Ok(extract_strided(elements)),
+                                _ => Err(InterpError::TypeMismatch(
+                                    "Referenced target is not an array".into(),
+                                )),
+                            }
+                        } else {
+                            Err(InterpError::InvalidPointer(*addr))
+                        }
+                    }
+                    FirValue::GenRef { slot, generation } => {
+                        self.heap.check(*slot, *generation)?;
+                        if let FirValue::Array(elements) = self.heap.deref(*slot)? {
+                            Ok(extract_strided(elements))
+                        } else {
+                            Err(InterpError::TypeMismatch(
+                                "Referenced target is not an array".into(),
+                            ))
+                        }
+                    }
+                    _ => Err(InterpError::TypeMismatch(
+                        "Base for SliceStrided must be an array or slice".into(),
+                    )),
+                }
+            }
+
+            ValueExpr::SliceStridedBoundsCheck { .. } => Ok(FirValue::Unit),
+
             ValueExpr::StructPushField {
                 base,
                 field_idx,

@@ -4506,3 +4506,133 @@ fn test_llvm_inout_swap_disjoint_slices_simd_metadata_and_execution() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_strided_zero_copy_conv2d_and_conv3d_metadata_emission() {
+    use ifa_fir::*;
+    use ifa_span::Span;
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let mut func = FirFunction::new(
+        ifa_span::INTERNER.intern("strided_conv_kernel"),
+        Vec::new(),
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    bb0.terminator = Some(Terminator::Branch {
+        target: BlockId(1),
+        args: Vec::new(),
+    });
+    func.blocks.push(bb0);
+
+    let mut bb1 = BasicBlock::new(BlockId(1));
+    let hint = LoopVectorHint::new(8, 8, true)
+        .with_strided_conv2d((2, 2))
+        .with_zero_copy(true);
+    bb1.set_vector_hint(hint);
+
+    let v_start = ValueId(1);
+    let v_end = ValueId(2);
+    let v_stride = ValueId(3);
+    let v_slice = ValueId(4);
+
+    bb1.instructions.push(Instruction::new(
+        Some(v_start),
+        ValueExpr::Constant(ConstantValue::Int(0, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb1.instructions.push(Instruction::new(
+        Some(v_end),
+        ValueExpr::Constant(ConstantValue::Int(64, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb1.instructions.push(Instruction::new(
+        Some(v_stride),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb1.instructions.push(Instruction::new(
+        Some(v_slice),
+        ValueExpr::SliceStrided {
+            base: v_start,
+            start: v_start,
+            end: v_end,
+            stride: v_stride,
+        },
+        Span::DUMMY,
+    ));
+
+    bb1.instructions.push(Instruction::new(
+        Some(ValueId(5)),
+        ValueExpr::Constant(ConstantValue::Bool(true)),
+        Span::DUMMY,
+    ));
+    bb1.terminator = Some(Terminator::BranchCond {
+        cond: ValueId(5),
+        then_block: BlockId(1),
+        else_block: BlockId(2),
+        then_args: Vec::new(),
+        else_args: Vec::new(),
+    });
+    func.blocks.push(bb1);
+
+    let mut bb2 = BasicBlock::new(BlockId(2));
+    bb2.terminator = Some(Terminator::Return(None));
+    func.blocks.push(bb2);
+
+    let module = FirModule {
+        name: ifa_span::INTERNER.intern("strided_conv_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let llvm_ir = emitter
+        .emit_module(&module)
+        .expect("LLVM IR emission for strided conv failed");
+
+    assert!(
+        llvm_ir.contains("!llvm.loop !57"),
+        "Loop branch must reference 2D strided convolution metadata !57:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("!57 = distinct !{!57, !2, !3, !4, !5, !12, !13, !24, !37, !38}"),
+        "Metadata table must contain !57 2D strided conv node:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("!53 = distinct !{!53, !2, !3, !4, !5, !12, !13, !24, !37, !39}"),
+        "Metadata table must contain !53 3D strided conv node:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("sdiv i64"),
+        "LLVM IR must emit strided length calculation with division:\n{}",
+        llvm_ir
+    );
+
+    let temp_dir = std::env::temp_dir().join(format!("ifa_strided_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("strided_conv.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation to object with 2D strided conv metadata failed: {:?}",
+        compile_res.err()
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

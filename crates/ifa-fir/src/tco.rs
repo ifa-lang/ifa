@@ -443,8 +443,10 @@ impl TcoPass {
                 | ValueExpr::ArrayInit(_)
                 | ValueExpr::ArrayLen { .. }
                 | ValueExpr::SliceSub { .. }
+                | ValueExpr::SliceStrided { .. }
                 | ValueExpr::BoundsCheck { .. }
                 | ValueExpr::SliceBoundsCheck { .. }
+                | ValueExpr::SliceStridedBoundsCheck { .. }
         )
     }
 }

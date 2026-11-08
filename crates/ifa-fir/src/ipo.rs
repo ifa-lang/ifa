@@ -51,6 +51,14 @@ pub struct IpoStats {
     pub nested_struct_paths_disambiguated: usize,
     /// Number of call site argument pairs statically verified as disjoint.
     pub disjoint_call_sites_verified: usize,
+    /// Number of 2D strided convolution loops specialized via inter-procedural propagation.
+    pub strided_conv2d_specialized: usize,
+    /// Number of 3D strided convolution loops specialized via inter-procedural propagation.
+    pub strided_conv3d_specialized: usize,
+    /// Number of zero-copy strided convolutions specialized without intermediate copies.
+    pub zero_copy_convolutions_specialized: usize,
+    /// Number of strided convolution bounds checks statically eliminated.
+    pub strided_bounds_eliminated: usize,
 }
 
 /// Call graph structure capturing caller-callee relationships, recursive cycles,
@@ -1755,6 +1763,7 @@ impl IpoPass {
             let cmap = Self::extract_function_constants(func);
             let prop_w = propagated_window_sizes.get(&func.name).copied();
             self.specialize_sliding_windows_and_convolutions(func, &cmap, prop_w);
+            self.specialize_strided_convolutions_2d_3d(func, &cmap);
         }
     }
 
@@ -2065,6 +2074,152 @@ impl IpoPass {
             self.stats.sliding_windows_specialized += 1;
             if is_convolution {
                 self.stats.convolutions_vectorized += 1;
+            }
+        }
+    }
+
+    /// Analyzes natural loops for multidimensional strided convolutions (2D/3D),
+    /// eliminating redundant bounds checks and attaching zero-copy SIMD LoopVectorHint directives.
+    fn specialize_strided_convolutions_2d_3d(
+        &mut self,
+        func: &mut FirFunction,
+        known_consts: &HashMap<ValueId, (i64, IntType)>,
+    ) {
+        let cfg = ControlFlowGraph::build(func);
+        let dom_tree = DominanceTree::build(&cfg);
+        let natural_loops = GenerationalOptPass::find_natural_loops(&cfg, &dom_tree);
+
+        for loop_info in &natural_loops {
+            // Verify loop purity (no blocking I/O, fibers, yields, or invalidating calls)
+            let has_side_effects = loop_info.blocks.iter().any(|&b_id| {
+                if let Some(block) = func.get_block(b_id) {
+                    block.instructions.iter().any(|inst| match &inst.expr {
+                        ValueExpr::CallDirect { name, .. } => {
+                            let callee = INTERNER.resolve(name);
+                            !Self::is_known_pure_intrinsic(&callee)
+                        }
+                        ValueExpr::Call { .. }
+                        | ValueExpr::Yield
+                        | ValueExpr::YieldValue { .. }
+                        | ValueExpr::Spawn { .. } => true,
+                        _ => false,
+                    })
+                } else {
+                    false
+                }
+            });
+            if has_side_effects {
+                continue;
+            }
+
+            let mut strided_indices = HashSet::new();
+            let mut detected_dims: usize = 0;
+            let mut detected_strides: (u32, u32, u32) = (1, 1, 1);
+            let mut has_mul = false;
+            let mut has_add = false;
+
+            for &b_id in &loop_info.blocks {
+                if let Some(block) = func.get_block(b_id) {
+                    for inst in &block.instructions {
+                        match &inst.expr {
+                            ValueExpr::GetElement { index, .. }
+                            | ValueExpr::GetElementPtr { index, .. } => {
+                                if let Some((dims, strides)) =
+                                    crate::vectorize::VectorizePass::analyze_index_strides(
+                                        func, *index,
+                                    )
+                                {
+                                    strided_indices.insert(*index);
+                                    if dims > detected_dims {
+                                        detected_dims = dims;
+                                        detected_strides = strides;
+                                    }
+                                }
+                            }
+                            ValueExpr::SliceStrided { stride, .. } => {
+                                if let Some(&(c, _)) = known_consts.get(stride) {
+                                    if c > 0 {
+                                        detected_dims = detected_dims.max(2);
+                                        detected_strides.0 = c as u32;
+                                    }
+                                } else {
+                                    detected_dims = detected_dims.max(2);
+                                }
+                            }
+                            ValueExpr::Binary { op, .. } => {
+                                if *op == BinaryOp::Mul {
+                                    has_mul = true;
+                                } else if *op == BinaryOp::Add {
+                                    has_add = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            let is_convolution = (has_mul && has_add) || detected_dims >= 2;
+            if detected_dims < 2 || !is_convolution {
+                continue;
+            }
+
+            let is_3d = detected_dims >= 3;
+            let is_2d = detected_dims == 2;
+
+            // Statically eliminate bounds checks on strided indices
+            let mut bounds_eliminated = 0;
+            for &b_id in &loop_info.blocks {
+                if let Some(block) = func.get_block_mut(b_id) {
+                    for inst in &mut block.instructions {
+                        match &mut inst.expr {
+                            ValueExpr::BoundsCheck {
+                                redundant, index, ..
+                            } if !*redundant
+                                && (strided_indices.contains(index)
+                                    || known_consts.contains_key(index)) =>
+                            {
+                                *redundant = true;
+                                bounds_eliminated += 1;
+                            }
+                            ValueExpr::SliceBoundsCheck { redundant, .. }
+                            | ValueExpr::SliceStridedBoundsCheck { redundant, .. }
+                                if !*redundant =>
+                            {
+                                *redundant = true;
+                                bounds_eliminated += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            if bounds_eliminated > 0 {
+                self.stats.strided_bounds_eliminated += bounds_eliminated;
+            }
+
+            let mut hint = LoopVectorHint::new(8, 8, true)
+                .with_convolution(true)
+                .with_reduction(ReductionKind::Dot)
+                .with_contiguous_reduction(true)
+                .with_disjoint_slices(true)
+                .with_predicate_enable(true)
+                .with_unroll_and_jam(true)
+                .with_zero_copy(true);
+
+            if is_3d {
+                hint = hint.with_strided_conv3d(detected_strides);
+                self.stats.strided_conv3d_specialized += 1;
+            } else if is_2d {
+                hint = hint.with_strided_conv2d((detected_strides.0, detected_strides.1));
+                self.stats.strided_conv2d_specialized += 1;
+            }
+            self.stats.zero_copy_convolutions_specialized += 1;
+            self.stats.convolutions_vectorized += 1;
+
+            if let Some(header_bb) = func.get_block_mut(loop_info.header) {
+                header_bb.set_vector_hint(hint);
             }
         }
     }

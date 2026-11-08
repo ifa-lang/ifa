@@ -1045,7 +1045,8 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 Some(payload)
             }
 
-            ValueExpr::SliceSub { base, start, .. } => {
+            ValueExpr::SliceSub { base, start, .. }
+            | ValueExpr::SliceStrided { base, start, .. } => {
                 let base_addr = self.value_map[base];
                 let start_idx = self.value_map[start];
                 let elem_size = self.builder.ins().iconst(self.ptr_type, 8);
@@ -1053,6 +1054,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let sub_addr = self.builder.ins().iadd(base_addr, offset);
                 Some(sub_addr)
             }
+            ValueExpr::SliceStridedBoundsCheck { .. } => None,
 
             ValueExpr::FormatString(parts) => {
                 if parts.is_empty() {

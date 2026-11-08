@@ -198,6 +198,13 @@ pub enum ValueExpr {
         start: ValueId,
         end: ValueId,
     },
+    /// Zero-copy strided subslice view [start..end:stride] over `base` without allocation or memory copying.
+    SliceStrided {
+        base: ValueId,
+        start: ValueId,
+        end: ValueId,
+        stride: ValueId,
+    },
     // Bounds Checking Primitives (BCE)
     BoundsCheck {
         base: ValueId,
@@ -208,6 +215,14 @@ pub enum ValueExpr {
         base: ValueId,
         start: ValueId,
         end: ValueId,
+        redundant: bool,
+    },
+    /// Bounds checking primitive for zero-copy strided slices.
+    SliceStridedBoundsCheck {
+        base: ValueId,
+        start: ValueId,
+        end: ValueId,
+        stride: ValueId,
         redundant: bool,
     },
     StructPushField {
@@ -335,10 +350,23 @@ impl ValueExpr {
             ValueExpr::ArrayPush { array, val } => vec![*array, *val],
             ValueExpr::ArrayLen { array } => vec![*array],
             ValueExpr::SliceSub { base, start, end } => vec![*base, *start, *end],
+            ValueExpr::SliceStrided {
+                base,
+                start,
+                end,
+                stride,
+            } => vec![*base, *start, *end, *stride],
             ValueExpr::BoundsCheck { base, index, .. } => vec![*base, *index],
             ValueExpr::SliceBoundsCheck {
                 base, start, end, ..
             } => vec![*base, *start, *end],
+            ValueExpr::SliceStridedBoundsCheck {
+                base,
+                start,
+                end,
+                stride,
+                ..
+            } => vec![*base, *start, *end, *stride],
             ValueExpr::StructPushField { base, val, .. } => vec![*base, *val],
             ValueExpr::CoWMakeUnique { val }
             | ValueExpr::CoWCheckShared { val }
@@ -505,6 +533,10 @@ pub struct LoopVectorHint {
     pub is_swap: bool,
     pub is_bipartite_matrix_reduction: bool,
     pub is_tripartite_matrix_reduction: bool,
+    pub is_strided_conv2d: bool,
+    pub is_strided_conv3d: bool,
+    pub conv_strides: Option<(u32, u32, u32)>,
+    pub is_zero_copy: bool,
 }
 
 impl LoopVectorHint {
@@ -531,6 +563,10 @@ impl LoopVectorHint {
             is_swap: false,
             is_bipartite_matrix_reduction: false,
             is_tripartite_matrix_reduction: false,
+            is_strided_conv2d: false,
+            is_strided_conv3d: false,
+            conv_strides: None,
+            is_zero_copy: false,
         }
     }
 
@@ -629,6 +665,30 @@ impl LoopVectorHint {
     /// Mark the loop as executing a tripartite multidimensional matrix reduction over disjoint windows.
     pub fn with_tripartite_matrix_reduction(mut self, enabled: bool) -> Self {
         self.is_tripartite_matrix_reduction = enabled;
+        self
+    }
+
+    /// Mark the loop as executing a 2D zero-copy strided convolution with specified row/column strides.
+    pub fn with_strided_conv2d(mut self, strides: (u32, u32)) -> Self {
+        self.is_strided_conv2d = true;
+        self.conv_strides = Some((strides.0, strides.1, 1));
+        self.is_convolution = true;
+        self.unroll_and_jam = true;
+        self
+    }
+
+    /// Mark the loop as executing a 3D zero-copy strided convolution with specified depth/row/column strides.
+    pub fn with_strided_conv3d(mut self, strides: (u32, u32, u32)) -> Self {
+        self.is_strided_conv3d = true;
+        self.conv_strides = Some(strides);
+        self.is_convolution = true;
+        self.unroll_and_jam = true;
+        self
+    }
+
+    /// Mark the convolution/slice accesses as operating strictly zero-copy on direct buffers.
+    pub fn with_zero_copy(mut self, zero_copy: bool) -> Self {
+        self.is_zero_copy = zero_copy;
         self
     }
 }

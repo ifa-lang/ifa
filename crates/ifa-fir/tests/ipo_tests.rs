@@ -1379,3 +1379,62 @@ fn test_ipo_noalias_propagation_and_nested_struct_disambiguation() {
         callee.params[1].noalias
     );
 }
+
+#[test]
+fn test_ipo_pass_strided_conv2d_specialization_and_bounds_elimination() {
+    let src = r#"
+        fn conv2d_kernel(
+            inout out: Slice<f32>,
+            img: Slice<f32>,
+            kern: Slice<f32>,
+            h: i64,
+            w: i64,
+            stride_y: i64,
+            stride_x: i64,
+            img_w: i64
+        ) {
+            let mut y: i64 = 0;
+            while y < h {
+                let mut x: i64 = 0;
+                while x < w {
+                    let in_idx = (y * stride_y) * img_w + (x * stride_x);
+                    let out_idx = y * w + x;
+                    out[out_idx] = out[out_idx] + img[in_idx] * kern[0];
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+        }
+
+        pub fn caller_entry(inout out: Slice<f32>, img: Slice<f32>, kern: Slice<f32>) {
+            conv2d_kernel(out, img, kern, 16, 16, 2, 2, 64);
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("conv2d_ipo.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut ipo_pass = IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    let stats = ipo_pass.stats();
+    assert!(
+        stats.strided_conv2d_specialized >= 1,
+        "2D strided convolution must be specialized via IPO: {:?}",
+        stats
+    );
+    assert!(
+        stats.zero_copy_convolutions_specialized >= 1,
+        "Zero-copy convolution must be specialized: {:?}",
+        stats
+    );
+}

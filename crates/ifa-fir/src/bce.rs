@@ -203,6 +203,27 @@ impl BcePass {
                                     slice_lengths.insert(res, cap);
                                 }
                             }
+                            ValueExpr::SliceStrided {
+                                base,
+                                start,
+                                end,
+                                stride,
+                            } => {
+                                if let (Some(&s), Some(&e), Some(&st)) = (
+                                    constants.get(start),
+                                    constants.get(end),
+                                    constants.get(stride),
+                                ) {
+                                    if e >= s && s >= 0 && st > 0 {
+                                        slice_lengths.insert(res, ((e - s + st - 1) / st) as usize);
+                                    }
+                                } else if let Some(&cap) = array_capacities
+                                    .get(base)
+                                    .or_else(|| slice_lengths.get(base))
+                                {
+                                    slice_lengths.insert(res, cap);
+                                }
+                            }
                             ValueExpr::Binary { op, lhs, rhs } => {
                                 if let (Some(&l), Some(&r)) =
                                     (constants.get(lhs), constants.get(rhs))
