@@ -2099,3 +2099,598 @@ pub fn main() -> i64 {
         "Inout struct destructuring must mutate struct fields in place (10 + 4 + 30 + 8 = 52)"
     );
 }
+
+#[test]
+fn test_cranelift_jit_multi_arena_strided_dot_reduction_i64() {
+    use ifa_codegen_cranelift::jit::JitEngine;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+
+    // 1. Mark call arena
+    let mark_val = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(mark_val),
+        ValueExpr::CallArenaMark,
+        Span::DUMMY,
+    ));
+
+    // 2. Allocate arena 1 (src1) with 6 elements of i64
+    let src1 = ValueId(2);
+    bb0.instructions.push(Instruction::new(
+        Some(src1),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Array(Box::new(FirType::Int(ifa_sema::types::IntType::I64)), 6),
+        },
+        Span::DUMMY,
+    ));
+
+    // 3. Allocate arena 2 (src2) with 7 elements of i64
+    let src2 = ValueId(3);
+    bb0.instructions.push(Instruction::new(
+        Some(src2),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Array(Box::new(FirType::Int(ifa_sema::types::IntType::I64)), 7),
+        },
+        Span::DUMMY,
+    ));
+
+    // Populate src1: index 0 -> 2, index 2 -> 4, index 4 -> 6 (stride1 = 2)
+    let pairs1 = [(0usize, 2i64), (2, 4), (4, 6)];
+    for (i, (idx, val)) in pairs1.iter().enumerate() {
+        let v_id = ValueId(10 + i as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(v_id),
+            ValueExpr::Constant(ConstantValue::Int(
+                *val as i128,
+                ifa_sema::types::IntType::I64,
+            )),
+            Span::DUMMY,
+        ));
+        let idx_id = ValueId(20 + i as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(idx_id),
+            ValueExpr::Constant(ConstantValue::Int(
+                *idx as i128,
+                ifa_sema::types::IntType::I64,
+            )),
+            Span::DUMMY,
+        ));
+        bb0.instructions.push(Instruction::new(
+            None,
+            ValueExpr::SetElement {
+                base: src1,
+                index: idx_id,
+                val: v_id,
+            },
+            Span::DUMMY,
+        ));
+    }
+
+    // Populate src2: index 0 -> 3, index 3 -> 5, index 6 -> 7 (stride2 = 3)
+    let pairs2 = [(0usize, 3i64), (3, 5), (6, 7)];
+    for (i, (idx, val)) in pairs2.iter().enumerate() {
+        let v_id = ValueId(30 + i as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(v_id),
+            ValueExpr::Constant(ConstantValue::Int(
+                *val as i128,
+                ifa_sema::types::IntType::I64,
+            )),
+            Span::DUMMY,
+        ));
+        let idx_id = ValueId(40 + i as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(idx_id),
+            ValueExpr::Constant(ConstantValue::Int(
+                *idx as i128,
+                ifa_sema::types::IntType::I64,
+            )),
+            Span::DUMMY,
+        ));
+        bb0.instructions.push(Instruction::new(
+            None,
+            ValueExpr::SetElement {
+                base: src2,
+                index: idx_id,
+                val: v_id,
+            },
+            Span::DUMMY,
+        ));
+    }
+
+    // Arguments: len = 3, stride1 = 2, stride2 = 3
+    let len_c = ValueId(50);
+    bb0.instructions.push(Instruction::new(
+        Some(len_c),
+        ValueExpr::Constant(ConstantValue::Int(3, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    let stride1_c = ValueId(51);
+    bb0.instructions.push(Instruction::new(
+        Some(stride1_c),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    let stride2_c = ValueId(52);
+    bb0.instructions.push(Instruction::new(
+        Some(stride2_c),
+        ValueExpr::Constant(ConstantValue::Int(3, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    // Invoke lowered ifa_simd_multi_arena_slice_dot_i64
+    let dot_res = ValueId(53);
+    bb0.instructions.push(Instruction::new(
+        Some(dot_res),
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("ifa_simd_multi_arena_slice_dot_i64"),
+            args: vec![src1, src2, len_c, stride1_c, stride2_c],
+        },
+        Span::DUMMY,
+    ));
+
+    // Rewind arena
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::CallArenaRewind { mark: mark_val },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(dot_res)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("multi_arena_dot_jit_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile FIR with multi-arena strided dot reduction to Cranelift JIT");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 68,
+        "Multi-arena strided dot reduction must compute 2*3 + 4*5 + 6*7 = 6 + 20 + 42 = 68"
+    );
+}
+
+#[test]
+fn test_cranelift_jit_strided_slice_prod_and_min_max_reductions() {
+    use ifa_codegen_cranelift::jit::JitEngine;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+
+    // 1. Mark call arena
+    let mark_val = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(mark_val),
+        ValueExpr::CallArenaMark,
+        Span::DUMMY,
+    ));
+
+    // 2. Allocate buffer for 8 elements of i64
+    let src = ValueId(2);
+    bb0.instructions.push(Instruction::new(
+        Some(src),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Array(Box::new(FirType::Int(ifa_sema::types::IntType::I64)), 8),
+        },
+        Span::DUMMY,
+    ));
+
+    // Store values at stride 2: index 0 -> 2, index 2 -> 3, index 4 -> 4, index 6 -> 5
+    let pairs = [(0usize, 2i64), (2, 3), (4, 4), (6, 5)];
+    for (i, (idx, val)) in pairs.iter().enumerate() {
+        let v_id = ValueId(10 + i as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(v_id),
+            ValueExpr::Constant(ConstantValue::Int(
+                *val as i128,
+                ifa_sema::types::IntType::I64,
+            )),
+            Span::DUMMY,
+        ));
+        let idx_id = ValueId(20 + i as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(idx_id),
+            ValueExpr::Constant(ConstantValue::Int(
+                *idx as i128,
+                ifa_sema::types::IntType::I64,
+            )),
+            Span::DUMMY,
+        ));
+        bb0.instructions.push(Instruction::new(
+            None,
+            ValueExpr::SetElement {
+                base: src,
+                index: idx_id,
+                val: v_id,
+            },
+            Span::DUMMY,
+        ));
+    }
+
+    let len_val = ValueId(30);
+    bb0.instructions.push(Instruction::new(
+        Some(len_val),
+        ValueExpr::Constant(ConstantValue::Int(4, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    let stride_val = ValueId(31);
+    bb0.instructions.push(Instruction::new(
+        Some(stride_val),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    // Strided product: 2 * 3 * 4 * 5 = 120
+    let prod_res = ValueId(40);
+    bb0.instructions.push(Instruction::new(
+        Some(prod_res),
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("ifa_simd_strided_slice_prod_i64"),
+            args: vec![src, len_val, stride_val],
+        },
+        Span::DUMMY,
+    ));
+
+    // Strided min: min(2, 3, 4, 5) = 2
+    let min_res = ValueId(41);
+    bb0.instructions.push(Instruction::new(
+        Some(min_res),
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("ifa_simd_strided_slice_min_i64"),
+            args: vec![src, len_val, stride_val],
+        },
+        Span::DUMMY,
+    ));
+
+    // Strided max: max(2, 3, 4, 5) = 5
+    let max_res = ValueId(42);
+    bb0.instructions.push(Instruction::new(
+        Some(max_res),
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("ifa_simd_strided_slice_max_i64"),
+            args: vec![src, len_val, stride_val],
+        },
+        Span::DUMMY,
+    ));
+
+    // Result = prod - (min + max) = 120 - (2 + 5) = 113
+    let sum_min_max = ValueId(43);
+    bb0.instructions.push(Instruction::new(
+        Some(sum_min_max),
+        ValueExpr::Binary {
+            op: ifa_fir::BinaryOp::Add,
+            lhs: min_res,
+            rhs: max_res,
+        },
+        Span::DUMMY,
+    ));
+
+    let final_res = ValueId(44);
+    bb0.instructions.push(Instruction::new(
+        Some(final_res),
+        ValueExpr::Binary {
+            op: ifa_fir::BinaryOp::Sub,
+            lhs: prod_res,
+            rhs: sum_min_max,
+        },
+        Span::DUMMY,
+    ));
+
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::CallArenaRewind { mark: mark_val },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(final_res)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("strided_prod_min_max_jit_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile FIR with strided prod/min/max reductions");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 113,
+        "Strided prod (120) - (min 2 + max 5) must be 113"
+    );
+}
+
+#[test]
+fn test_cranelift_jit_strided_count_if_reduction() {
+    use ifa_codegen_cranelift::jit::JitEngine;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+
+    let mark_val = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(mark_val),
+        ValueExpr::CallArenaMark,
+        Span::DUMMY,
+    ));
+
+    // Allocate buffer for 10 elements of i32
+    let src = ValueId(2);
+    bb0.instructions.push(Instruction::new(
+        Some(src),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Array(Box::new(FirType::Int(ifa_sema::types::IntType::I32)), 10),
+        },
+        Span::DUMMY,
+    ));
+
+    // Populate elements at stride 2:
+    // index 0 -> 5
+    // index 2 -> 12
+    // index 4 -> 3
+    // index 6 -> 18
+    // index 8 -> 9
+    let values = [5i32, 12, 3, 18, 9];
+    for (i, &v) in values.iter().enumerate() {
+        let val_id = ValueId(10 + i as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(val_id),
+            ValueExpr::Constant(ConstantValue::Int(v as i128, ifa_sema::types::IntType::I32)),
+            Span::DUMMY,
+        ));
+        let idx_id = ValueId(20 + i as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(idx_id),
+            ValueExpr::Constant(ConstantValue::Int(
+                (i * 2) as i128,
+                ifa_sema::types::IntType::I64,
+            )),
+            Span::DUMMY,
+        ));
+        bb0.instructions.push(Instruction::new(
+            None,
+            ValueExpr::SetElement {
+                base: src,
+                index: idx_id,
+                val: val_id,
+            },
+            Span::DUMMY,
+        ));
+    }
+
+    let len_val = ValueId(30);
+    bb0.instructions.push(Instruction::new(
+        Some(len_val),
+        ValueExpr::Constant(ConstantValue::Int(5, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    let stride_val = ValueId(31);
+    bb0.instructions.push(Instruction::new(
+        Some(stride_val),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    let thresh_val = ValueId(32);
+    bb0.instructions.push(Instruction::new(
+        Some(thresh_val),
+        ValueExpr::Constant(ConstantValue::Int(8, ifa_sema::types::IntType::I32)),
+        Span::DUMMY,
+    ));
+
+    // Count elements > 8: 12, 18, 9 -> 3 elements
+    let count_res = ValueId(33);
+    bb0.instructions.push(Instruction::new(
+        Some(count_res),
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("ifa_simd_strided_slice_count_if_gt_i32"),
+            args: vec![src, len_val, stride_val, thresh_val],
+        },
+        Span::DUMMY,
+    ));
+
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::CallArenaRewind { mark: mark_val },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(count_res)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("strided_count_if_jit_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile FIR with strided count-if reduction");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 3,
+        "Strided count-if (>8) on [5, 12, 3, 18, 9] must return 3"
+    );
+}
+
+#[test]
+fn test_cranelift_jit_contiguous_simd128_vector_sum_and_dot() {
+    use ifa_codegen_cranelift::jit::JitEngine;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+
+    let mark_val = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(mark_val),
+        ValueExpr::CallArenaMark,
+        Span::DUMMY,
+    ));
+
+    // Allocate 7 contiguous elements of i64
+    let src = ValueId(2);
+    bb0.instructions.push(Instruction::new(
+        Some(src),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Array(Box::new(FirType::Int(ifa_sema::types::IntType::I64)), 7),
+        },
+        Span::DUMMY,
+    ));
+
+    // Store contiguous values 1..=7: sum = 28
+    for i in 0..7i64 {
+        let v = ValueId(10 + i as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(v),
+            ValueExpr::Constant(ConstantValue::Int(
+                (i + 1) as i128,
+                ifa_sema::types::IntType::I64,
+            )),
+            Span::DUMMY,
+        ));
+        let idx_id = ValueId(20 + i as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(idx_id),
+            ValueExpr::Constant(ConstantValue::Int(i as i128, ifa_sema::types::IntType::I64)),
+            Span::DUMMY,
+        ));
+        bb0.instructions.push(Instruction::new(
+            None,
+            ValueExpr::SetElement {
+                base: src,
+                index: idx_id,
+                val: v,
+            },
+            Span::DUMMY,
+        ));
+    }
+
+    let len_val = ValueId(30);
+    bb0.instructions.push(Instruction::new(
+        Some(len_val),
+        ValueExpr::Constant(ConstantValue::Int(7, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    // Lower contiguous ifa_simd_slice_sum_i64 (uses 128-bit vector loop + tail)
+    let sum_res = ValueId(31);
+    bb0.instructions.push(Instruction::new(
+        Some(sum_res),
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("ifa_simd_slice_sum_i64"),
+            args: vec![src, len_val],
+        },
+        Span::DUMMY,
+    ));
+
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::CallArenaRewind { mark: mark_val },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(sum_res)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("contiguous_simd_jit_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile FIR with contiguous SIMD vector sum");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 28,
+        "Contiguous 128-bit SIMD vector sum on 1..=7 must compute 28"
+    );
+}

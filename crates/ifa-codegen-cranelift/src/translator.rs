@@ -11,7 +11,7 @@ use ifa_ast::ParamMode;
 use ifa_fir::{
     BinaryOp, BlockId, ConstantValue, FirFunction, FirType, Terminator, UnaryOp, ValueExpr, ValueId,
 };
-use ifa_sema::types::IntType;
+use ifa_sema::types::{FloatType, IntType};
 use ifa_span::{Symbol, INTERNER};
 use std::collections::{HashMap, HashSet};
 
@@ -22,6 +22,15 @@ fn is_slice_or_slice_ptr(ty: Option<&FirType>) -> bool {
         Some(FirType::Pointer(inner)) => matches!(&**inner, FirType::Slice(_)),
         _ => false,
     }
+}
+
+/// Comparison predicate used for vectorized slice counting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CountPred {
+    Gt,
+    Lt,
+    Eq,
+    Ne,
 }
 
 /// Translates a single FIR function into Cranelift IR using FunctionBuilder.
@@ -1498,7 +1507,37 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     base_addr
                 };
                 let idx = self.value_map[index];
-                let elem_scale = self.strided_slices.get(base).copied().unwrap_or(1) * 8;
+                let (elem_ty, elem_bytes) = match base_ty {
+                    Some(FirType::Array(elem, _)) | Some(FirType::Slice(elem)) => match &**elem {
+                        FirType::Int(IntType::I8 | IntType::U8) | FirType::Bool => {
+                            (types::I8, 1i64)
+                        }
+                        FirType::Int(IntType::I16 | IntType::U16) => (types::I16, 2i64),
+                        FirType::Int(IntType::I32 | IntType::U32) | FirType::Char => {
+                            (types::I32, 4i64)
+                        }
+                        FirType::Float(FloatType::F32) => (types::F32, 4i64),
+                        FirType::Float(FloatType::F64) => (types::F64, 8i64),
+                        _ => (types::I64, 8i64),
+                    },
+                    Some(FirType::Pointer(inner)) => match &**inner {
+                        FirType::Array(elem, _) | FirType::Slice(elem) => match &**elem {
+                            FirType::Int(IntType::I8 | IntType::U8) | FirType::Bool => {
+                                (types::I8, 1i64)
+                            }
+                            FirType::Int(IntType::I16 | IntType::U16) => (types::I16, 2i64),
+                            FirType::Int(IntType::I32 | IntType::U32) | FirType::Char => {
+                                (types::I32, 4i64)
+                            }
+                            FirType::Float(FloatType::F32) => (types::F32, 4i64),
+                            FirType::Float(FloatType::F64) => (types::F64, 8i64),
+                            _ => (types::I64, 8i64),
+                        },
+                        _ => (types::I64, 8i64),
+                    },
+                    _ => (types::I64, 8i64),
+                };
+                let elem_scale = self.strided_slices.get(base).copied().unwrap_or(1) * elem_bytes;
                 let offset = if elem_scale > 0 && (elem_scale as u64).is_power_of_two() {
                     let shift = elem_scale.trailing_zeros() as i64;
                     self.builder.ins().ishl_imm_u(idx, shift)
@@ -1509,7 +1548,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 Some(
                     self.builder
                         .ins()
-                        .load(types::I64, MemFlagsData::trusted(), addr, 0),
+                        .load(elem_ty, MemFlagsData::trusted(), addr, 0),
                 )
             }
 
@@ -1526,7 +1565,41 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 };
                 let idx = self.value_map[index];
                 let v = self.value_map[val];
-                let elem_scale = self.strided_slices.get(base).copied().unwrap_or(1) * 8;
+                let elem_bytes = match base_ty {
+                    Some(FirType::Array(elem, _)) | Some(FirType::Slice(elem)) => match &**elem {
+                        FirType::Int(IntType::I8 | IntType::U8) | FirType::Bool => 1i64,
+                        FirType::Int(IntType::I16 | IntType::U16) => 2i64,
+                        FirType::Int(IntType::I32 | IntType::U32) | FirType::Char => 4i64,
+                        FirType::Float(FloatType::F32) => 4i64,
+                        FirType::Float(FloatType::F64) => 8i64,
+                        _ => 8i64,
+                    },
+                    Some(FirType::Pointer(inner)) => match &**inner {
+                        FirType::Array(elem, _) | FirType::Slice(elem) => match &**elem {
+                            FirType::Int(IntType::I8 | IntType::U8) | FirType::Bool => 1i64,
+                            FirType::Int(IntType::I16 | IntType::U16) => 2i64,
+                            FirType::Int(IntType::I32 | IntType::U32) | FirType::Char => 4i64,
+                            FirType::Float(FloatType::F32) => 4i64,
+                            FirType::Float(FloatType::F64) => 8i64,
+                            _ => 8i64,
+                        },
+                        _ => match self.value_types.get(val) {
+                            Some(FirType::Int(IntType::I32 | IntType::U32) | FirType::Char) => 4i64,
+                            Some(FirType::Float(FloatType::F32)) => 4i64,
+                            Some(FirType::Int(IntType::I16 | IntType::U16)) => 2i64,
+                            Some(FirType::Int(IntType::I8 | IntType::U8) | FirType::Bool) => 1i64,
+                            _ => 8i64,
+                        },
+                    },
+                    _ => match self.value_types.get(val) {
+                        Some(FirType::Int(IntType::I32 | IntType::U32) | FirType::Char) => 4i64,
+                        Some(FirType::Float(FloatType::F32)) => 4i64,
+                        Some(FirType::Int(IntType::I16 | IntType::U16)) => 2i64,
+                        Some(FirType::Int(IntType::I8 | IntType::U8) | FirType::Bool) => 1i64,
+                        _ => 8i64,
+                    },
+                };
+                let elem_scale = self.strided_slices.get(base).copied().unwrap_or(1) * elem_bytes;
                 let offset = if elem_scale > 0 && (elem_scale as u64).is_power_of_two() {
                     let shift = elem_scale.trailing_zeros() as i64;
                     self.builder.ins().ishl_imm_u(idx, shift)
@@ -2322,86 +2395,1049 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
     /// Try to directly lower SIMD strided and contiguous slice reductions into native Cranelift IR loops without runtime calls.
     fn try_lower_simd_reduction(&mut self, fn_name: &str, args: &[ValueId]) -> Option<ClValue> {
         match fn_name {
-            "ifa_simd_strided_slice_sum_f32" if args.len() >= 3 => {
-                let src = self.ensure_ptr(self.value_map[&args[0]]);
-                let len = self.ensure_i64(self.value_map[&args[1]]);
-                let stride = self.ensure_i64(self.value_map[&args[2]]);
-                self.lower_strided_slice_sum(types::F32, true, 4, src, len, stride)
+            // Multi-arena dot product (with independent strides per arena operand)
+            "ifa_simd_multi_arena_slice_dot_f32" if args.len() >= 5 => {
+                let src1 = self.ensure_ptr(self.value_map[&args[0]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[1]]);
+                let len = self.ensure_i64(self.value_map[&args[2]]);
+                let stride1 = self.ensure_i64(self.value_map[&args[3]]);
+                let stride2 = self.ensure_i64(self.value_map[&args[4]]);
+                self.lower_multi_arena_slice_dot(
+                    types::F32,
+                    true,
+                    4,
+                    src1,
+                    src2,
+                    len,
+                    stride1,
+                    stride2,
+                    false,
+                )
             }
-            "ifa_simd_strided_slice_sum_f64" if args.len() >= 3 => {
-                let src = self.ensure_ptr(self.value_map[&args[0]]);
-                let len = self.ensure_i64(self.value_map[&args[1]]);
-                let stride = self.ensure_i64(self.value_map[&args[2]]);
-                self.lower_strided_slice_sum(types::F64, true, 8, src, len, stride)
+            "ifa_simd_multi_arena_slice_dot_f64" if args.len() >= 5 => {
+                let src1 = self.ensure_ptr(self.value_map[&args[0]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[1]]);
+                let len = self.ensure_i64(self.value_map[&args[2]]);
+                let stride1 = self.ensure_i64(self.value_map[&args[3]]);
+                let stride2 = self.ensure_i64(self.value_map[&args[4]]);
+                self.lower_multi_arena_slice_dot(
+                    types::F64,
+                    true,
+                    8,
+                    src1,
+                    src2,
+                    len,
+                    stride1,
+                    stride2,
+                    false,
+                )
             }
-            "ifa_simd_strided_slice_sum_i32" if args.len() >= 3 => {
-                let src = self.ensure_ptr(self.value_map[&args[0]]);
-                let len = self.ensure_i64(self.value_map[&args[1]]);
-                let stride = self.ensure_i64(self.value_map[&args[2]]);
-                self.lower_strided_slice_sum(types::I32, false, 4, src, len, stride)
+            "ifa_simd_multi_arena_slice_dot_i32" if args.len() >= 5 => {
+                let src1 = self.ensure_ptr(self.value_map[&args[0]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[1]]);
+                let len = self.ensure_i64(self.value_map[&args[2]]);
+                let stride1 = self.ensure_i64(self.value_map[&args[3]]);
+                let stride2 = self.ensure_i64(self.value_map[&args[4]]);
+                self.lower_multi_arena_slice_dot(
+                    types::I32,
+                    false,
+                    4,
+                    src1,
+                    src2,
+                    len,
+                    stride1,
+                    stride2,
+                    false,
+                )
             }
-            "ifa_simd_strided_slice_sum_i64" if args.len() >= 3 => {
-                let src = self.ensure_ptr(self.value_map[&args[0]]);
-                let len = self.ensure_i64(self.value_map[&args[1]]);
-                let stride = self.ensure_i64(self.value_map[&args[2]]);
-                self.lower_strided_slice_sum(types::I64, false, 8, src, len, stride)
+            "ifa_simd_multi_arena_slice_dot_i64" if args.len() >= 5 => {
+                let src1 = self.ensure_ptr(self.value_map[&args[0]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[1]]);
+                let len = self.ensure_i64(self.value_map[&args[2]]);
+                let stride1 = self.ensure_i64(self.value_map[&args[3]]);
+                let stride2 = self.ensure_i64(self.value_map[&args[4]]);
+                self.lower_multi_arena_slice_dot(
+                    types::I64,
+                    false,
+                    8,
+                    src1,
+                    src2,
+                    len,
+                    stride1,
+                    stride2,
+                    false,
+                )
             }
+
+            // Multi-arena tripartite reductions (dst[i*s_dst] += src1[i*s1] * src2[i*s2])
+            "ifa_simd_multi_arena_tripartite_f32" if args.len() >= 7 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let src1 = self.ensure_ptr(self.value_map[&args[1]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[2]]);
+                let len = self.ensure_i64(self.value_map[&args[3]]);
+                let s_dst = self.ensure_i64(self.value_map[&args[4]]);
+                let s1 = self.ensure_i64(self.value_map[&args[5]]);
+                let s2 = self.ensure_i64(self.value_map[&args[6]]);
+                self.lower_multi_arena_tripartite(
+                    types::F32,
+                    true,
+                    4,
+                    dst,
+                    src1,
+                    src2,
+                    len,
+                    s_dst,
+                    s1,
+                    s2,
+                    false,
+                )
+            }
+            "ifa_simd_multi_arena_tripartite_f64" if args.len() >= 7 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let src1 = self.ensure_ptr(self.value_map[&args[1]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[2]]);
+                let len = self.ensure_i64(self.value_map[&args[3]]);
+                let s_dst = self.ensure_i64(self.value_map[&args[4]]);
+                let s1 = self.ensure_i64(self.value_map[&args[5]]);
+                let s2 = self.ensure_i64(self.value_map[&args[6]]);
+                self.lower_multi_arena_tripartite(
+                    types::F64,
+                    true,
+                    8,
+                    dst,
+                    src1,
+                    src2,
+                    len,
+                    s_dst,
+                    s1,
+                    s2,
+                    false,
+                )
+            }
+            "ifa_simd_multi_arena_tripartite_i32" if args.len() >= 7 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let src1 = self.ensure_ptr(self.value_map[&args[1]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[2]]);
+                let len = self.ensure_i64(self.value_map[&args[3]]);
+                let s_dst = self.ensure_i64(self.value_map[&args[4]]);
+                let s1 = self.ensure_i64(self.value_map[&args[5]]);
+                let s2 = self.ensure_i64(self.value_map[&args[6]]);
+                self.lower_multi_arena_tripartite(
+                    types::I32,
+                    false,
+                    4,
+                    dst,
+                    src1,
+                    src2,
+                    len,
+                    s_dst,
+                    s1,
+                    s2,
+                    false,
+                )
+            }
+            "ifa_simd_multi_arena_tripartite_i64" if args.len() >= 7 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let src1 = self.ensure_ptr(self.value_map[&args[1]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[2]]);
+                let len = self.ensure_i64(self.value_map[&args[3]]);
+                let s_dst = self.ensure_i64(self.value_map[&args[4]]);
+                let s1 = self.ensure_i64(self.value_map[&args[5]]);
+                let s2 = self.ensure_i64(self.value_map[&args[6]]);
+                self.lower_multi_arena_tripartite(
+                    types::I64,
+                    false,
+                    8,
+                    dst,
+                    src1,
+                    src2,
+                    len,
+                    s_dst,
+                    s1,
+                    s2,
+                    false,
+                )
+            }
+            "ifa_simd_strided_tripartite_f32" if args.len() >= 5 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let src1 = self.ensure_ptr(self.value_map[&args[1]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[2]]);
+                let len = self.ensure_i64(self.value_map[&args[3]]);
+                let stride = self.ensure_i64(self.value_map[&args[4]]);
+                self.lower_multi_arena_tripartite(
+                    types::F32,
+                    true,
+                    4,
+                    dst,
+                    src1,
+                    src2,
+                    len,
+                    stride,
+                    stride,
+                    stride,
+                    false,
+                )
+            }
+            "ifa_simd_strided_tripartite_f64" if args.len() >= 5 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let src1 = self.ensure_ptr(self.value_map[&args[1]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[2]]);
+                let len = self.ensure_i64(self.value_map[&args[3]]);
+                let stride = self.ensure_i64(self.value_map[&args[4]]);
+                self.lower_multi_arena_tripartite(
+                    types::F64,
+                    true,
+                    8,
+                    dst,
+                    src1,
+                    src2,
+                    len,
+                    stride,
+                    stride,
+                    stride,
+                    false,
+                )
+            }
+            "ifa_simd_slice_tripartite_f32" | "ifa_simd_arena_slice_tripartite_f32"
+                if args.len() >= 4 =>
+            {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let src1 = self.ensure_ptr(self.value_map[&args[1]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[2]]);
+                let len = self.ensure_i64(self.value_map[&args[3]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_multi_arena_tripartite(
+                    types::F32,
+                    true,
+                    4,
+                    dst,
+                    src1,
+                    src2,
+                    len,
+                    stride,
+                    stride,
+                    stride,
+                    true,
+                )
+            }
+            "ifa_simd_slice_tripartite_f64" | "ifa_simd_arena_slice_tripartite_f64"
+                if args.len() >= 4 =>
+            {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let src1 = self.ensure_ptr(self.value_map[&args[1]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[2]]);
+                let len = self.ensure_i64(self.value_map[&args[3]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_multi_arena_tripartite(
+                    types::F64,
+                    true,
+                    8,
+                    dst,
+                    src1,
+                    src2,
+                    len,
+                    stride,
+                    stride,
+                    stride,
+                    true,
+                )
+            }
+
+            // Strided & Contiguous Dot Product
             "ifa_simd_strided_slice_dot_f32" if args.len() >= 4 => {
                 let src1 = self.ensure_ptr(self.value_map[&args[0]]);
                 let src2 = self.ensure_ptr(self.value_map[&args[1]]);
                 let len = self.ensure_i64(self.value_map[&args[2]]);
                 let stride = self.ensure_i64(self.value_map[&args[3]]);
-                self.lower_strided_slice_dot(types::F32, 4, src1, src2, len, stride)
+                self.lower_multi_arena_slice_dot(
+                    types::F32,
+                    true,
+                    4,
+                    src1,
+                    src2,
+                    len,
+                    stride,
+                    stride,
+                    false,
+                )
             }
             "ifa_simd_strided_slice_dot_f64" if args.len() >= 4 => {
                 let src1 = self.ensure_ptr(self.value_map[&args[0]]);
                 let src2 = self.ensure_ptr(self.value_map[&args[1]]);
                 let len = self.ensure_i64(self.value_map[&args[2]]);
                 let stride = self.ensure_i64(self.value_map[&args[3]]);
-                self.lower_strided_slice_dot(types::F64, 8, src1, src2, len, stride)
+                self.lower_multi_arena_slice_dot(
+                    types::F64,
+                    true,
+                    8,
+                    src1,
+                    src2,
+                    len,
+                    stride,
+                    stride,
+                    false,
+                )
             }
-            "ifa_simd_slice_sum_f32" | "ifa_simd_arena_slice_sum_f32" if args.len() >= 2 => {
-                let src = self.ensure_ptr(self.value_map[&args[0]]);
-                let len = self.ensure_i64(self.value_map[&args[1]]);
-                let stride = self.builder.ins().iconst(types::I64, 1);
-                self.lower_strided_slice_sum(types::F32, true, 4, src, len, stride)
+            "ifa_simd_strided_slice_dot_i32" if args.len() >= 4 => {
+                let src1 = self.ensure_ptr(self.value_map[&args[0]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[1]]);
+                let len = self.ensure_i64(self.value_map[&args[2]]);
+                let stride = self.ensure_i64(self.value_map[&args[3]]);
+                self.lower_multi_arena_slice_dot(
+                    types::I32,
+                    false,
+                    4,
+                    src1,
+                    src2,
+                    len,
+                    stride,
+                    stride,
+                    false,
+                )
             }
-            "ifa_simd_slice_sum_f64" | "ifa_simd_arena_slice_sum_f64" if args.len() >= 2 => {
-                let src = self.ensure_ptr(self.value_map[&args[0]]);
-                let len = self.ensure_i64(self.value_map[&args[1]]);
-                let stride = self.builder.ins().iconst(types::I64, 1);
-                self.lower_strided_slice_sum(types::F64, true, 8, src, len, stride)
-            }
-            "ifa_simd_slice_sum_i32" | "ifa_simd_arena_slice_sum_i32" if args.len() >= 2 => {
-                let src = self.ensure_ptr(self.value_map[&args[0]]);
-                let len = self.ensure_i64(self.value_map[&args[1]]);
-                let stride = self.builder.ins().iconst(types::I64, 1);
-                self.lower_strided_slice_sum(types::I32, false, 4, src, len, stride)
-            }
-            "ifa_simd_slice_sum_i64" | "ifa_simd_arena_slice_sum_i64" if args.len() >= 2 => {
-                let src = self.ensure_ptr(self.value_map[&args[0]]);
-                let len = self.ensure_i64(self.value_map[&args[1]]);
-                let stride = self.builder.ins().iconst(types::I64, 1);
-                self.lower_strided_slice_sum(types::I64, false, 8, src, len, stride)
+            "ifa_simd_strided_slice_dot_i64" if args.len() >= 4 => {
+                let src1 = self.ensure_ptr(self.value_map[&args[0]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[1]]);
+                let len = self.ensure_i64(self.value_map[&args[2]]);
+                let stride = self.ensure_i64(self.value_map[&args[3]]);
+                self.lower_multi_arena_slice_dot(
+                    types::I64,
+                    false,
+                    8,
+                    src1,
+                    src2,
+                    len,
+                    stride,
+                    stride,
+                    false,
+                )
             }
             "ifa_simd_slice_dot_f32" | "ifa_simd_arena_slice_dot_f32" if args.len() >= 3 => {
                 let src1 = self.ensure_ptr(self.value_map[&args[0]]);
                 let src2 = self.ensure_ptr(self.value_map[&args[1]]);
                 let len = self.ensure_i64(self.value_map[&args[2]]);
                 let stride = self.builder.ins().iconst(types::I64, 1);
-                self.lower_strided_slice_dot(types::F32, 4, src1, src2, len, stride)
+                self.lower_multi_arena_slice_dot(
+                    types::F32,
+                    true,
+                    4,
+                    src1,
+                    src2,
+                    len,
+                    stride,
+                    stride,
+                    true,
+                )
             }
             "ifa_simd_slice_dot_f64" | "ifa_simd_arena_slice_dot_f64" if args.len() >= 3 => {
                 let src1 = self.ensure_ptr(self.value_map[&args[0]]);
                 let src2 = self.ensure_ptr(self.value_map[&args[1]]);
                 let len = self.ensure_i64(self.value_map[&args[2]]);
                 let stride = self.builder.ins().iconst(types::I64, 1);
-                self.lower_strided_slice_dot(types::F64, 8, src1, src2, len, stride)
+                self.lower_multi_arena_slice_dot(
+                    types::F64,
+                    true,
+                    8,
+                    src1,
+                    src2,
+                    len,
+                    stride,
+                    stride,
+                    true,
+                )
             }
+            "ifa_simd_slice_dot_i32" | "ifa_simd_arena_slice_dot_i32" if args.len() >= 3 => {
+                let src1 = self.ensure_ptr(self.value_map[&args[0]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[1]]);
+                let len = self.ensure_i64(self.value_map[&args[2]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_multi_arena_slice_dot(
+                    types::I32,
+                    false,
+                    4,
+                    src1,
+                    src2,
+                    len,
+                    stride,
+                    stride,
+                    true,
+                )
+            }
+            "ifa_simd_slice_dot_i64" | "ifa_simd_arena_slice_dot_i64" if args.len() >= 3 => {
+                let src1 = self.ensure_ptr(self.value_map[&args[0]]);
+                let src2 = self.ensure_ptr(self.value_map[&args[1]]);
+                let len = self.ensure_i64(self.value_map[&args[2]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_multi_arena_slice_dot(
+                    types::I64,
+                    false,
+                    8,
+                    src1,
+                    src2,
+                    len,
+                    stride,
+                    stride,
+                    true,
+                )
+            }
+
+            // Strided & Contiguous Sum Reductions
+            "ifa_simd_strided_slice_sum_f32" | "ifa_simd_multi_arena_slice_sum_f32"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_sum(types::F32, true, 4, src, len, stride, false)
+            }
+            "ifa_simd_strided_slice_sum_f64" | "ifa_simd_multi_arena_slice_sum_f64"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_sum(types::F64, true, 8, src, len, stride, false)
+            }
+            "ifa_simd_strided_slice_sum_i32" | "ifa_simd_multi_arena_slice_sum_i32"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_sum(types::I32, false, 4, src, len, stride, false)
+            }
+            "ifa_simd_strided_slice_sum_i64" | "ifa_simd_multi_arena_slice_sum_i64"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_sum(types::I64, false, 8, src, len, stride, false)
+            }
+            "ifa_simd_slice_sum_f32" | "ifa_simd_arena_slice_sum_f32" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_sum(types::F32, true, 4, src, len, stride, true)
+            }
+            "ifa_simd_slice_sum_f64" | "ifa_simd_arena_slice_sum_f64" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_sum(types::F64, true, 8, src, len, stride, true)
+            }
+            "ifa_simd_slice_sum_i32" | "ifa_simd_arena_slice_sum_i32" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_sum(types::I32, false, 4, src, len, stride, true)
+            }
+            "ifa_simd_slice_sum_i64" | "ifa_simd_arena_slice_sum_i64" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_sum(types::I64, false, 8, src, len, stride, true)
+            }
+
+            // Strided & Contiguous Product Reductions
+            "ifa_simd_strided_slice_prod_f32" | "ifa_simd_multi_arena_slice_prod_f32"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_prod(types::F32, true, 4, src, len, stride)
+            }
+            "ifa_simd_strided_slice_prod_f64" | "ifa_simd_multi_arena_slice_prod_f64"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_prod(types::F64, true, 8, src, len, stride)
+            }
+            "ifa_simd_strided_slice_prod_i32" | "ifa_simd_multi_arena_slice_prod_i32"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_prod(types::I32, false, 4, src, len, stride)
+            }
+            "ifa_simd_strided_slice_prod_i64" | "ifa_simd_multi_arena_slice_prod_i64"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_prod(types::I64, false, 8, src, len, stride)
+            }
+            "ifa_simd_slice_prod_f32" | "ifa_simd_arena_slice_prod_f32" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_prod(types::F32, true, 4, src, len, stride)
+            }
+            "ifa_simd_slice_prod_f64" | "ifa_simd_arena_slice_prod_f64" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_prod(types::F64, true, 8, src, len, stride)
+            }
+            "ifa_simd_slice_prod_i32" | "ifa_simd_arena_slice_prod_i32" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_prod(types::I32, false, 4, src, len, stride)
+            }
+            "ifa_simd_slice_prod_i64" | "ifa_simd_arena_slice_prod_i64" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_prod(types::I64, false, 8, src, len, stride)
+            }
+
+            // Strided & Contiguous Min Reductions
+            "ifa_simd_strided_slice_min_f32" | "ifa_simd_multi_arena_slice_min_f32"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_min(types::F32, true, 4, src, len, stride)
+            }
+            "ifa_simd_strided_slice_min_f64" | "ifa_simd_multi_arena_slice_min_f64"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_min(types::F64, true, 8, src, len, stride)
+            }
+            "ifa_simd_strided_slice_min_i32" | "ifa_simd_multi_arena_slice_min_i32"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_min(types::I32, false, 4, src, len, stride)
+            }
+            "ifa_simd_strided_slice_min_i64" | "ifa_simd_multi_arena_slice_min_i64"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_min(types::I64, false, 8, src, len, stride)
+            }
+            "ifa_simd_slice_min_f32" | "ifa_simd_arena_slice_min_f32" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_min(types::F32, true, 4, src, len, stride)
+            }
+            "ifa_simd_slice_min_f64" | "ifa_simd_arena_slice_min_f64" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_min(types::F64, true, 8, src, len, stride)
+            }
+            "ifa_simd_slice_min_i32" | "ifa_simd_arena_slice_min_i32" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_min(types::I32, false, 4, src, len, stride)
+            }
+            "ifa_simd_slice_min_i64" | "ifa_simd_arena_slice_min_i64" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_min(types::I64, false, 8, src, len, stride)
+            }
+
+            // Strided & Contiguous Max Reductions
+            "ifa_simd_strided_slice_max_f32" | "ifa_simd_multi_arena_slice_max_f32"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_max(types::F32, true, 4, src, len, stride)
+            }
+            "ifa_simd_strided_slice_max_f64" | "ifa_simd_multi_arena_slice_max_f64"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_max(types::F64, true, 8, src, len, stride)
+            }
+            "ifa_simd_strided_slice_max_i32" | "ifa_simd_multi_arena_slice_max_i32"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_max(types::I32, false, 4, src, len, stride)
+            }
+            "ifa_simd_strided_slice_max_i64" | "ifa_simd_multi_arena_slice_max_i64"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                self.lower_strided_slice_max(types::I64, false, 8, src, len, stride)
+            }
+            "ifa_simd_slice_max_f32" | "ifa_simd_arena_slice_max_f32" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_max(types::F32, true, 4, src, len, stride)
+            }
+            "ifa_simd_slice_max_f64" | "ifa_simd_arena_slice_max_f64" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_max(types::F64, true, 8, src, len, stride)
+            }
+            "ifa_simd_slice_max_i32" | "ifa_simd_arena_slice_max_i32" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_max(types::I32, false, 4, src, len, stride)
+            }
+            "ifa_simd_slice_max_i64" | "ifa_simd_arena_slice_max_i64" if args.len() >= 2 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_strided_slice_max(types::I64, false, 8, src, len, stride)
+            }
+
+            // Count-If Reductions
+            "ifa_simd_arena_slice_count_if_gt_f32" | "ifa_simd_slice_count_if_gt_f32"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let threshold = self.ensure_f32(self.value_map[&args[2]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_slice_count_if(
+                    types::F32,
+                    true,
+                    4,
+                    src,
+                    len,
+                    stride,
+                    threshold,
+                    CountPred::Gt,
+                )
+            }
+            "ifa_simd_arena_slice_count_if_gt_f64" | "ifa_simd_slice_count_if_gt_f64"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let threshold = self.ensure_f64(self.value_map[&args[2]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_slice_count_if(
+                    types::F64,
+                    true,
+                    8,
+                    src,
+                    len,
+                    stride,
+                    threshold,
+                    CountPred::Gt,
+                )
+            }
+            "ifa_simd_arena_slice_count_if_gt_i32" | "ifa_simd_slice_count_if_gt_i32"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let threshold = self.ensure_i32(self.value_map[&args[2]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_slice_count_if(
+                    types::I32,
+                    false,
+                    4,
+                    src,
+                    len,
+                    stride,
+                    threshold,
+                    CountPred::Gt,
+                )
+            }
+            "ifa_simd_arena_slice_count_if_gt_i64" | "ifa_simd_slice_count_if_gt_i64"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let threshold = self.ensure_i64(self.value_map[&args[2]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_slice_count_if(
+                    types::I64,
+                    false,
+                    8,
+                    src,
+                    len,
+                    stride,
+                    threshold,
+                    CountPred::Gt,
+                )
+            }
+            "ifa_simd_arena_slice_count_if_lt_i32" | "ifa_simd_slice_count_if_lt_i32"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let threshold = self.ensure_i32(self.value_map[&args[2]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_slice_count_if(
+                    types::I32,
+                    false,
+                    4,
+                    src,
+                    len,
+                    stride,
+                    threshold,
+                    CountPred::Lt,
+                )
+            }
+            "ifa_simd_arena_slice_count_if_eq_i32" | "ifa_simd_slice_count_if_eq_i32"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let threshold = self.ensure_i32(self.value_map[&args[2]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_slice_count_if(
+                    types::I32,
+                    false,
+                    4,
+                    src,
+                    len,
+                    stride,
+                    threshold,
+                    CountPred::Eq,
+                )
+            }
+            "ifa_simd_arena_slice_count_if_ne_i32" | "ifa_simd_slice_count_if_ne_i32"
+                if args.len() >= 3 =>
+            {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let threshold = self.ensure_i32(self.value_map[&args[2]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_slice_count_if(
+                    types::I32,
+                    false,
+                    4,
+                    src,
+                    len,
+                    stride,
+                    threshold,
+                    CountPred::Ne,
+                )
+            }
+            "ifa_simd_strided_slice_count_if_gt_i32" if args.len() >= 4 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                let threshold = self.ensure_i32(self.value_map[&args[3]]);
+                self.lower_slice_count_if(
+                    types::I32,
+                    false,
+                    4,
+                    src,
+                    len,
+                    stride,
+                    threshold,
+                    CountPred::Gt,
+                )
+            }
+            "ifa_simd_strided_slice_count_if_gt_f32" if args.len() >= 4 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let len = self.ensure_i64(self.value_map[&args[1]]);
+                let stride = self.ensure_i64(self.value_map[&args[2]]);
+                let threshold = self.ensure_f32(self.value_map[&args[3]]);
+                self.lower_slice_count_if(
+                    types::F32,
+                    true,
+                    4,
+                    src,
+                    len,
+                    stride,
+                    threshold,
+                    CountPred::Gt,
+                )
+            }
+
+            // Clamp / Elementwise Projections
+            "ifa_simd_arena_slice_clamp_f32" | "ifa_simd_slice_clamp_f32" if args.len() >= 5 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let dst = self.ensure_ptr(self.value_map[&args[1]]);
+                let len = self.ensure_i64(self.value_map[&args[2]]);
+                let min_val = self.ensure_f32(self.value_map[&args[3]]);
+                let max_val = self.ensure_f32(self.value_map[&args[4]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_slice_clamp(types::F32, true, 4, src, dst, len, stride, min_val, max_val)
+            }
+            "ifa_simd_arena_slice_clamp_i32" | "ifa_simd_slice_clamp_i32" if args.len() >= 5 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let dst = self.ensure_ptr(self.value_map[&args[1]]);
+                let len = self.ensure_i64(self.value_map[&args[2]]);
+                let min_val = self.ensure_i32(self.value_map[&args[3]]);
+                let max_val = self.ensure_i32(self.value_map[&args[4]]);
+                let stride = self.builder.ins().iconst(types::I64, 1);
+                self.lower_slice_clamp(
+                    types::I32,
+                    false,
+                    4,
+                    src,
+                    dst,
+                    len,
+                    stride,
+                    min_val,
+                    max_val,
+                )
+            }
+            "ifa_simd_strided_slice_clamp_f32" if args.len() >= 6 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let dst = self.ensure_ptr(self.value_map[&args[1]]);
+                let len = self.ensure_i64(self.value_map[&args[2]]);
+                let stride = self.ensure_i64(self.value_map[&args[3]]);
+                let min_val = self.ensure_f32(self.value_map[&args[4]]);
+                let max_val = self.ensure_f32(self.value_map[&args[5]]);
+                self.lower_slice_clamp(types::F32, true, 4, src, dst, len, stride, min_val, max_val)
+            }
+            "ifa_simd_strided_slice_clamp_i32" if args.len() >= 6 => {
+                let src = self.ensure_ptr(self.value_map[&args[0]]);
+                let dst = self.ensure_ptr(self.value_map[&args[1]]);
+                let len = self.ensure_i64(self.value_map[&args[2]]);
+                let stride = self.ensure_i64(self.value_map[&args[3]]);
+                let min_val = self.ensure_i32(self.value_map[&args[4]]);
+                let max_val = self.ensure_i32(self.value_map[&args[5]]);
+                self.lower_slice_clamp(
+                    types::I32,
+                    false,
+                    4,
+                    src,
+                    dst,
+                    len,
+                    stride,
+                    min_val,
+                    max_val,
+                )
+            }
+
             _ => None,
         }
     }
 
+    /// Contiguous 128-bit SIMD vector loop lowering for slice sums.
+    fn lower_contiguous_slice_sum(
+        &mut self,
+        elem_ty: types::Type,
+        is_float: bool,
+        elem_size: i64,
+        src: ClValue,
+        len: ClValue,
+    ) -> Option<ClValue> {
+        let (vec_ty, lane_count, unroll_mask) = if elem_ty == types::F32 {
+            (types::F32X4, 4i64, -4i64)
+        } else if elem_ty == types::I32 {
+            (types::I32X4, 4i64, -4i64)
+        } else if elem_ty == types::F64 {
+            (types::F64X2, 2i64, -2i64)
+        } else {
+            (types::I64X2, 2i64, -2i64)
+        };
+
+        let mask_val = self.builder.ins().iconst(types::I64, unroll_mask);
+        let unroll_len = self.builder.ins().band(len, mask_val);
+
+        let initial_vec = if is_float {
+            if elem_ty == types::F32 {
+                let zero = self.builder.ins().f32const(0.0);
+                self.builder.ins().splat(vec_ty, zero)
+            } else {
+                let zero = self.builder.ins().f64const(0.0);
+                self.builder.ins().splat(vec_ty, zero)
+            }
+        } else {
+            let zero = self.builder.ins().iconst(elem_ty, 0);
+            self.builder.ins().splat(vec_ty, zero)
+        };
+
+        let vec_header = self.builder.create_block();
+        let vec_body = self.builder.create_block();
+        let vec_exit = self.builder.create_block();
+        let tail_header = self.builder.create_block();
+        let tail_body = self.builder.create_block();
+        let cont_block = self.builder.create_block();
+
+        self.builder.append_block_param(vec_header, types::I64);
+        self.builder.append_block_param(vec_header, self.ptr_type);
+        self.builder.append_block_param(vec_header, vec_ty);
+
+        self.builder.append_block_param(vec_exit, types::I64);
+        self.builder.append_block_param(vec_exit, self.ptr_type);
+        self.builder.append_block_param(vec_exit, vec_ty);
+
+        self.builder.append_block_param(tail_header, types::I64);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+        self.builder.append_block_param(tail_header, elem_ty);
+
+        self.builder.append_block_param(cont_block, elem_ty);
+
+        let initial_i = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().jump(
+            vec_header,
+            &[
+                BlockArg::from(initial_i),
+                BlockArg::from(src),
+                BlockArg::from(initial_vec),
+            ],
+        );
+
+        // Vector Loop Header
+        self.builder.switch_to_block(vec_header);
+        let cur_i = self.builder.block_params(vec_header)[0];
+        let cur_ptr = self.builder.block_params(vec_header)[1];
+        let cur_vec = self.builder.block_params(vec_header)[2];
+
+        let has_vec = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_i, unroll_len);
+        self.builder.ins().brif(
+            has_vec,
+            vec_body,
+            &[],
+            vec_exit,
+            &[
+                BlockArg::from(cur_i),
+                BlockArg::from(cur_ptr),
+                BlockArg::from(cur_vec),
+            ],
+        );
+
+        // Vector Loop Body
+        self.builder.switch_to_block(vec_body);
+        let v = self
+            .builder
+            .ins()
+            .load(vec_ty, MemFlagsData::trusted(), cur_ptr, 0);
+        let next_vec = if is_float {
+            self.builder.ins().fadd(cur_vec, v)
+        } else {
+            self.builder.ins().iadd(cur_vec, v)
+        };
+        let step_bytes = 16i64;
+        let next_ptr = self.builder.ins().iadd_imm_s(cur_ptr, step_bytes);
+        let next_i = self.builder.ins().iadd_imm_s(cur_i, lane_count);
+        self.builder.ins().jump(
+            vec_header,
+            &[
+                BlockArg::from(next_i),
+                BlockArg::from(next_ptr),
+                BlockArg::from(next_vec),
+            ],
+        );
+
+        // Vector Exit: Horizontal reduction of lanes
+        self.builder.switch_to_block(vec_exit);
+        let exit_i = self.builder.block_params(vec_exit)[0];
+        let exit_ptr = self.builder.block_params(vec_exit)[1];
+        let final_vec = self.builder.block_params(vec_exit)[2];
+
+        let scalar_acc = if lane_count == 4 {
+            let l0 = self.builder.ins().extractlane(final_vec, 0);
+            let l1 = self.builder.ins().extractlane(final_vec, 1);
+            let l2 = self.builder.ins().extractlane(final_vec, 2);
+            let l3 = self.builder.ins().extractlane(final_vec, 3);
+            let s01 = if is_float {
+                self.builder.ins().fadd(l0, l1)
+            } else {
+                self.builder.ins().iadd(l0, l1)
+            };
+            let s23 = if is_float {
+                self.builder.ins().fadd(l2, l3)
+            } else {
+                self.builder.ins().iadd(l2, l3)
+            };
+            if is_float {
+                self.builder.ins().fadd(s01, s23)
+            } else {
+                self.builder.ins().iadd(s01, s23)
+            }
+        } else {
+            let l0 = self.builder.ins().extractlane(final_vec, 0);
+            let l1 = self.builder.ins().extractlane(final_vec, 1);
+            if is_float {
+                self.builder.ins().fadd(l0, l1)
+            } else {
+                self.builder.ins().iadd(l0, l1)
+            }
+        };
+
+        self.builder.ins().jump(
+            tail_header,
+            &[
+                BlockArg::from(exit_i),
+                BlockArg::from(exit_ptr),
+                BlockArg::from(scalar_acc),
+            ],
+        );
+
+        // Tail Loop Header
+        self.builder.switch_to_block(tail_header);
+        let cur_tail_i = self.builder.block_params(tail_header)[0];
+        let cur_tail_ptr = self.builder.block_params(tail_header)[1];
+        let cur_tail_acc = self.builder.block_params(tail_header)[2];
+
+        let has_tail = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_tail_i, len);
+        self.builder.ins().brif(
+            has_tail,
+            tail_body,
+            &[],
+            cont_block,
+            &[BlockArg::from(cur_tail_acc)],
+        );
+
+        // Tail Loop Body
+        self.builder.switch_to_block(tail_body);
+        let tail_val = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), cur_tail_ptr, 0);
+        let next_tail_acc = if is_float {
+            self.builder.ins().fadd(cur_tail_acc, tail_val)
+        } else {
+            self.builder.ins().iadd(cur_tail_acc, tail_val)
+        };
+        let next_tail_ptr = self.builder.ins().iadd_imm_s(cur_tail_ptr, elem_size);
+        let next_tail_i = self.builder.ins().iadd_imm_s(cur_tail_i, 1);
+        self.builder.ins().jump(
+            tail_header,
+            &[
+                BlockArg::from(next_tail_i),
+                BlockArg::from(next_tail_ptr),
+                BlockArg::from(next_tail_acc),
+            ],
+        );
+
+        self.builder.switch_to_block(cont_block);
+        let final_res = self.builder.block_params(cont_block)[0];
+        Some(final_res)
+    }
+
+    /// Lower strided or contiguous slice sums with strength-reduced address calculation and 4-way unrolling.
+    #[allow(clippy::too_many_arguments)]
     fn lower_strided_slice_sum(
         &mut self,
         elem_ty: types::Type,
@@ -2410,16 +3446,54 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         src: ClValue,
         len: ClValue,
         stride: ClValue,
+        known_contiguous: bool,
     ) -> Option<ClValue> {
-        let loop_header = self.builder.create_block();
-        let loop_body = self.builder.create_block();
-        let cont_block = self.builder.create_block();
+        if known_contiguous {
+            return self.lower_contiguous_slice_sum(elem_ty, is_float, elem_size, src, len);
+        }
 
-        self.builder.append_block_param(loop_header, types::I64);
-        self.builder.append_block_param(loop_header, elem_ty);
+        let cont_block = self.builder.create_block();
         self.builder.append_block_param(cont_block, elem_ty);
 
-        let initial_i = self.builder.ins().iconst(types::I64, 0);
+        let contig_block = self.builder.create_block();
+        let strided_block = self.builder.create_block();
+
+        let one = self.builder.ins().iconst(types::I64, 1);
+        let is_stride_one = self.builder.ins().icmp(IntCC::Equal, stride, one);
+        self.builder
+            .ins()
+            .brif(is_stride_one, contig_block, &[], strided_block, &[]);
+
+        // Contiguous fast-path
+        self.builder.switch_to_block(contig_block);
+        if let Some(c_res) = self.lower_contiguous_slice_sum(elem_ty, is_float, elem_size, src, len)
+        {
+            self.builder
+                .ins()
+                .jump(cont_block, &[BlockArg::from(c_res)]);
+        } else {
+            let zero = if is_float {
+                if elem_ty == types::F32 {
+                    self.builder.ins().f32const(0.0)
+                } else {
+                    self.builder.ins().f64const(0.0)
+                }
+            } else {
+                self.builder.ins().iconst(elem_ty, 0)
+            };
+            self.builder.ins().jump(cont_block, &[BlockArg::from(zero)]);
+        }
+
+        // Strided 4-way unrolled strength-reduced path
+        self.builder.switch_to_block(strided_block);
+        let step_bytes = self.builder.ins().imul_imm_s(stride, elem_size);
+        let step2_bytes = self.builder.ins().iadd(step_bytes, step_bytes);
+        let step3_bytes = self.builder.ins().iadd(step2_bytes, step_bytes);
+        let step4_bytes = self.builder.ins().iadd(step2_bytes, step2_bytes);
+
+        let mask_val = self.builder.ins().iconst(types::I64, -4);
+        let unroll_len = self.builder.ins().band(len, mask_val);
+
         let initial_acc = if is_float {
             if elem_ty == types::F32 {
                 self.builder.ins().f32const(0.0)
@@ -2430,42 +3504,146 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             self.builder.ins().iconst(elem_ty, 0)
         };
 
+        let unroll_header = self.builder.create_block();
+        let unroll_body = self.builder.create_block();
+        let tail_header = self.builder.create_block();
+        let tail_body = self.builder.create_block();
+
+        self.builder.append_block_param(unroll_header, types::I64);
+        self.builder
+            .append_block_param(unroll_header, self.ptr_type);
+        self.builder.append_block_param(unroll_header, elem_ty);
+
+        self.builder.append_block_param(tail_header, types::I64);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+        self.builder.append_block_param(tail_header, elem_ty);
+
+        let initial_i = self.builder.ins().iconst(types::I64, 0);
         self.builder.ins().jump(
-            loop_header,
-            &[BlockArg::from(initial_i), BlockArg::from(initial_acc)],
+            unroll_header,
+            &[
+                BlockArg::from(initial_i),
+                BlockArg::from(src),
+                BlockArg::from(initial_acc),
+            ],
         );
 
-        self.builder.switch_to_block(loop_header);
-        let cur_i = self.builder.block_params(loop_header)[0];
-        let cur_acc = self.builder.block_params(loop_header)[1];
+        // Unroll Loop Header
+        self.builder.switch_to_block(unroll_header);
+        let cur_i = self.builder.block_params(unroll_header)[0];
+        let cur_ptr = self.builder.block_params(unroll_header)[1];
+        let cur_acc = self.builder.block_params(unroll_header)[2];
 
-        let has_more = self.builder.ins().icmp(IntCC::UnsignedLessThan, cur_i, len);
-        self.builder.ins().brif(
-            has_more,
-            loop_body,
-            &[],
-            cont_block,
-            &[BlockArg::from(cur_acc)],
-        );
-
-        self.builder.switch_to_block(loop_body);
-        let elem_idx = self.builder.ins().imul(cur_i, stride);
-        let byte_offset = self.builder.ins().imul_imm_s(elem_idx, elem_size);
-        let addr = self.builder.ins().iadd(src, byte_offset);
-        let elem_val = self
+        let has_unroll = self
             .builder
             .ins()
-            .load(elem_ty, MemFlagsData::trusted(), addr, 0);
+            .icmp(IntCC::UnsignedLessThan, cur_i, unroll_len);
+        self.builder.ins().brif(
+            has_unroll,
+            unroll_body,
+            &[],
+            tail_header,
+            &[
+                BlockArg::from(cur_i),
+                BlockArg::from(cur_ptr),
+                BlockArg::from(cur_acc),
+            ],
+        );
 
-        let next_acc = if is_float {
-            self.builder.ins().fadd(cur_acc, elem_val)
+        // Unroll Loop Body: 4-way pipelined loads + tree accumulation
+        self.builder.switch_to_block(unroll_body);
+        let p0 = cur_ptr;
+        let p1 = self.builder.ins().iadd(cur_ptr, step_bytes);
+        let p2 = self.builder.ins().iadd(cur_ptr, step2_bytes);
+        let p3 = self.builder.ins().iadd(cur_ptr, step3_bytes);
+
+        let v0 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p0, 0);
+        let v1 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p1, 0);
+        let v2 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p2, 0);
+        let v3 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p3, 0);
+
+        let s01 = if is_float {
+            self.builder.ins().fadd(v0, v1)
         } else {
-            self.builder.ins().iadd(cur_acc, elem_val)
+            self.builder.ins().iadd(v0, v1)
         };
-        let next_i = self.builder.ins().iadd_imm_s(cur_i, 1);
+        let s23 = if is_float {
+            self.builder.ins().fadd(v2, v3)
+        } else {
+            self.builder.ins().iadd(v2, v3)
+        };
+        let s03 = if is_float {
+            self.builder.ins().fadd(s01, s23)
+        } else {
+            self.builder.ins().iadd(s01, s23)
+        };
+        let next_acc = if is_float {
+            self.builder.ins().fadd(cur_acc, s03)
+        } else {
+            self.builder.ins().iadd(cur_acc, s03)
+        };
+
+        let next_ptr = self.builder.ins().iadd(cur_ptr, step4_bytes);
+        let next_i = self.builder.ins().iadd_imm_s(cur_i, 4);
         self.builder.ins().jump(
-            loop_header,
-            &[BlockArg::from(next_i), BlockArg::from(next_acc)],
+            unroll_header,
+            &[
+                BlockArg::from(next_i),
+                BlockArg::from(next_ptr),
+                BlockArg::from(next_acc),
+            ],
+        );
+
+        // Tail Loop Header
+        self.builder.switch_to_block(tail_header);
+        let cur_tail_i = self.builder.block_params(tail_header)[0];
+        let cur_tail_ptr = self.builder.block_params(tail_header)[1];
+        let cur_tail_acc = self.builder.block_params(tail_header)[2];
+
+        let has_tail = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_tail_i, len);
+        self.builder.ins().brif(
+            has_tail,
+            tail_body,
+            &[],
+            cont_block,
+            &[BlockArg::from(cur_tail_acc)],
+        );
+
+        // Tail Loop Body
+        self.builder.switch_to_block(tail_body);
+        let tail_val = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), cur_tail_ptr, 0);
+        let next_tail_acc = if is_float {
+            self.builder.ins().fadd(cur_tail_acc, tail_val)
+        } else {
+            self.builder.ins().iadd(cur_tail_acc, tail_val)
+        };
+        let next_tail_ptr = self.builder.ins().iadd(cur_tail_ptr, step_bytes);
+        let next_tail_i = self.builder.ins().iadd_imm_s(cur_tail_i, 1);
+        self.builder.ins().jump(
+            tail_header,
+            &[
+                BlockArg::from(next_tail_i),
+                BlockArg::from(next_tail_ptr),
+                BlockArg::from(next_tail_acc),
+            ],
         );
 
         self.builder.switch_to_block(cont_block);
@@ -2473,72 +3651,1713 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         Some(final_res)
     }
 
-    fn lower_strided_slice_dot(
+    /// Contiguous 128-bit SIMD vector loop lowering for dot products.
+    fn lower_contiguous_slice_dot(
         &mut self,
         elem_ty: types::Type,
+        is_float: bool,
         elem_size: i64,
         src1: ClValue,
         src2: ClValue,
         len: ClValue,
-        stride: ClValue,
     ) -> Option<ClValue> {
-        let loop_header = self.builder.create_block();
-        let loop_body = self.builder.create_block();
+        let (vec_ty, lane_count, unroll_mask) = if elem_ty == types::F32 {
+            (types::F32X4, 4i64, -4i64)
+        } else if elem_ty == types::I32 {
+            (types::I32X4, 4i64, -4i64)
+        } else if elem_ty == types::F64 {
+            (types::F64X2, 2i64, -2i64)
+        } else {
+            (types::I64X2, 2i64, -2i64)
+        };
+
+        let mask_val = self.builder.ins().iconst(types::I64, unroll_mask);
+        let unroll_len = self.builder.ins().band(len, mask_val);
+
+        let initial_vec = if is_float {
+            if elem_ty == types::F32 {
+                let zero = self.builder.ins().f32const(0.0);
+                self.builder.ins().splat(vec_ty, zero)
+            } else {
+                let zero = self.builder.ins().f64const(0.0);
+                self.builder.ins().splat(vec_ty, zero)
+            }
+        } else {
+            let zero = self.builder.ins().iconst(elem_ty, 0);
+            self.builder.ins().splat(vec_ty, zero)
+        };
+
+        let vec_header = self.builder.create_block();
+        let vec_body = self.builder.create_block();
+        let vec_exit = self.builder.create_block();
+        let tail_header = self.builder.create_block();
+        let tail_body = self.builder.create_block();
         let cont_block = self.builder.create_block();
 
-        self.builder.append_block_param(loop_header, types::I64);
-        self.builder.append_block_param(loop_header, elem_ty);
+        self.builder.append_block_param(vec_header, types::I64);
+        self.builder.append_block_param(vec_header, self.ptr_type);
+        self.builder.append_block_param(vec_header, self.ptr_type);
+        self.builder.append_block_param(vec_header, vec_ty);
+
+        self.builder.append_block_param(vec_exit, types::I64);
+        self.builder.append_block_param(vec_exit, self.ptr_type);
+        self.builder.append_block_param(vec_exit, self.ptr_type);
+        self.builder.append_block_param(vec_exit, vec_ty);
+
+        self.builder.append_block_param(tail_header, types::I64);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+        self.builder.append_block_param(tail_header, elem_ty);
+
         self.builder.append_block_param(cont_block, elem_ty);
 
         let initial_i = self.builder.ins().iconst(types::I64, 0);
-        let initial_acc = if elem_ty == types::F32 {
-            self.builder.ins().f32const(0.0)
+        self.builder.ins().jump(
+            vec_header,
+            &[
+                BlockArg::from(initial_i),
+                BlockArg::from(src1),
+                BlockArg::from(src2),
+                BlockArg::from(initial_vec),
+            ],
+        );
+
+        // Vector Loop Header
+        self.builder.switch_to_block(vec_header);
+        let cur_i = self.builder.block_params(vec_header)[0];
+        let cur_ptr1 = self.builder.block_params(vec_header)[1];
+        let cur_ptr2 = self.builder.block_params(vec_header)[2];
+        let cur_vec = self.builder.block_params(vec_header)[3];
+
+        let has_vec = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_i, unroll_len);
+        self.builder.ins().brif(
+            has_vec,
+            vec_body,
+            &[],
+            vec_exit,
+            &[
+                BlockArg::from(cur_i),
+                BlockArg::from(cur_ptr1),
+                BlockArg::from(cur_ptr2),
+                BlockArg::from(cur_vec),
+            ],
+        );
+
+        // Vector Loop Body
+        self.builder.switch_to_block(vec_body);
+        let v1 = self
+            .builder
+            .ins()
+            .load(vec_ty, MemFlagsData::trusted(), cur_ptr1, 0);
+        let v2 = self
+            .builder
+            .ins()
+            .load(vec_ty, MemFlagsData::trusted(), cur_ptr2, 0);
+        let prod = if is_float {
+            self.builder.ins().fmul(v1, v2)
         } else {
-            self.builder.ins().f64const(0.0)
+            self.builder.ins().imul(v1, v2)
+        };
+        let next_vec = if is_float {
+            self.builder.ins().fadd(cur_vec, prod)
+        } else {
+            self.builder.ins().iadd(cur_vec, prod)
+        };
+        let step_bytes = 16i64;
+        let next_ptr1 = self.builder.ins().iadd_imm_s(cur_ptr1, step_bytes);
+        let next_ptr2 = self.builder.ins().iadd_imm_s(cur_ptr2, step_bytes);
+        let next_i = self.builder.ins().iadd_imm_s(cur_i, lane_count);
+        self.builder.ins().jump(
+            vec_header,
+            &[
+                BlockArg::from(next_i),
+                BlockArg::from(next_ptr1),
+                BlockArg::from(next_ptr2),
+                BlockArg::from(next_vec),
+            ],
+        );
+
+        // Vector Exit
+        self.builder.switch_to_block(vec_exit);
+        let exit_i = self.builder.block_params(vec_exit)[0];
+        let exit_ptr1 = self.builder.block_params(vec_exit)[1];
+        let exit_ptr2 = self.builder.block_params(vec_exit)[2];
+        let final_vec = self.builder.block_params(vec_exit)[3];
+
+        let scalar_acc = if lane_count == 4 {
+            let l0 = self.builder.ins().extractlane(final_vec, 0);
+            let l1 = self.builder.ins().extractlane(final_vec, 1);
+            let l2 = self.builder.ins().extractlane(final_vec, 2);
+            let l3 = self.builder.ins().extractlane(final_vec, 3);
+            let s01 = if is_float {
+                self.builder.ins().fadd(l0, l1)
+            } else {
+                self.builder.ins().iadd(l0, l1)
+            };
+            let s23 = if is_float {
+                self.builder.ins().fadd(l2, l3)
+            } else {
+                self.builder.ins().iadd(l2, l3)
+            };
+            if is_float {
+                self.builder.ins().fadd(s01, s23)
+            } else {
+                self.builder.ins().iadd(s01, s23)
+            }
+        } else {
+            let l0 = self.builder.ins().extractlane(final_vec, 0);
+            let l1 = self.builder.ins().extractlane(final_vec, 1);
+            if is_float {
+                self.builder.ins().fadd(l0, l1)
+            } else {
+                self.builder.ins().iadd(l0, l1)
+            }
         };
 
         self.builder.ins().jump(
-            loop_header,
-            &[BlockArg::from(initial_i), BlockArg::from(initial_acc)],
+            tail_header,
+            &[
+                BlockArg::from(exit_i),
+                BlockArg::from(exit_ptr1),
+                BlockArg::from(exit_ptr2),
+                BlockArg::from(scalar_acc),
+            ],
         );
 
-        self.builder.switch_to_block(loop_header);
-        let cur_i = self.builder.block_params(loop_header)[0];
-        let cur_acc = self.builder.block_params(loop_header)[1];
+        // Tail Loop Header
+        self.builder.switch_to_block(tail_header);
+        let cur_tail_i = self.builder.block_params(tail_header)[0];
+        let cur_tail_p1 = self.builder.block_params(tail_header)[1];
+        let cur_tail_p2 = self.builder.block_params(tail_header)[2];
+        let cur_tail_acc = self.builder.block_params(tail_header)[3];
 
-        let has_more = self.builder.ins().icmp(IntCC::UnsignedLessThan, cur_i, len);
+        let has_tail = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_tail_i, len);
         self.builder.ins().brif(
-            has_more,
-            loop_body,
+            has_tail,
+            tail_body,
             &[],
             cont_block,
-            &[BlockArg::from(cur_acc)],
+            &[BlockArg::from(cur_tail_acc)],
         );
 
-        self.builder.switch_to_block(loop_body);
-        let elem_idx = self.builder.ins().imul(cur_i, stride);
-        let byte_offset = self.builder.ins().imul_imm_s(elem_idx, elem_size);
-        let addr1 = self.builder.ins().iadd(src1, byte_offset);
-        let addr2 = self.builder.ins().iadd(src2, byte_offset);
-        let val1 = self
+        // Tail Loop Body
+        self.builder.switch_to_block(tail_body);
+        let tv1 = self
             .builder
             .ins()
-            .load(elem_ty, MemFlagsData::trusted(), addr1, 0);
-        let val2 = self
+            .load(elem_ty, MemFlagsData::trusted(), cur_tail_p1, 0);
+        let tv2 = self
             .builder
             .ins()
-            .load(elem_ty, MemFlagsData::trusted(), addr2, 0);
-        let prod = self.builder.ins().fmul(val1, val2);
-        let next_acc = self.builder.ins().fadd(cur_acc, prod);
-        let next_i = self.builder.ins().iadd_imm_s(cur_i, 1);
+            .load(elem_ty, MemFlagsData::trusted(), cur_tail_p2, 0);
+        let prod = if is_float {
+            self.builder.ins().fmul(tv1, tv2)
+        } else {
+            self.builder.ins().imul(tv1, tv2)
+        };
+        let next_tail_acc = if is_float {
+            self.builder.ins().fadd(cur_tail_acc, prod)
+        } else {
+            self.builder.ins().iadd(cur_tail_acc, prod)
+        };
+        let next_tail_p1 = self.builder.ins().iadd_imm_s(cur_tail_p1, elem_size);
+        let next_tail_p2 = self.builder.ins().iadd_imm_s(cur_tail_p2, elem_size);
+        let next_tail_i = self.builder.ins().iadd_imm_s(cur_tail_i, 1);
         self.builder.ins().jump(
-            loop_header,
-            &[BlockArg::from(next_i), BlockArg::from(next_acc)],
+            tail_header,
+            &[
+                BlockArg::from(next_tail_i),
+                BlockArg::from(next_tail_p1),
+                BlockArg::from(next_tail_p2),
+                BlockArg::from(next_tail_acc),
+            ],
         );
 
         self.builder.switch_to_block(cont_block);
         let final_res = self.builder.block_params(cont_block)[0];
         Some(final_res)
+    }
+
+    /// Lower multi-arena dot products with independent non-unit strides and 4-way unrolling.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_multi_arena_slice_dot(
+        &mut self,
+        elem_ty: types::Type,
+        is_float: bool,
+        elem_size: i64,
+        src1: ClValue,
+        src2: ClValue,
+        len: ClValue,
+        stride1: ClValue,
+        stride2: ClValue,
+        known_contiguous: bool,
+    ) -> Option<ClValue> {
+        if known_contiguous {
+            return self.lower_contiguous_slice_dot(elem_ty, is_float, elem_size, src1, src2, len);
+        }
+
+        let cont_block = self.builder.create_block();
+        self.builder.append_block_param(cont_block, elem_ty);
+
+        let contig_block = self.builder.create_block();
+        let strided_block = self.builder.create_block();
+
+        let one = self.builder.ins().iconst(types::I64, 1);
+        let is_s1_one = self.builder.ins().icmp(IntCC::Equal, stride1, one);
+        let is_s2_one = self.builder.ins().icmp(IntCC::Equal, stride2, one);
+        let both_contig = self.builder.ins().band(is_s1_one, is_s2_one);
+        self.builder
+            .ins()
+            .brif(both_contig, contig_block, &[], strided_block, &[]);
+
+        // Contiguous fast path
+        self.builder.switch_to_block(contig_block);
+        if let Some(c_res) =
+            self.lower_contiguous_slice_dot(elem_ty, is_float, elem_size, src1, src2, len)
+        {
+            self.builder
+                .ins()
+                .jump(cont_block, &[BlockArg::from(c_res)]);
+        } else {
+            let zero = if is_float {
+                if elem_ty == types::F32 {
+                    self.builder.ins().f32const(0.0)
+                } else {
+                    self.builder.ins().f64const(0.0)
+                }
+            } else {
+                self.builder.ins().iconst(elem_ty, 0)
+            };
+            self.builder.ins().jump(cont_block, &[BlockArg::from(zero)]);
+        }
+
+        // Strided 4-way unrolled strength-reduced multi-arena path
+        self.builder.switch_to_block(strided_block);
+        let step1_bytes = self.builder.ins().imul_imm_s(stride1, elem_size);
+        let step2_bytes = self.builder.ins().imul_imm_s(stride2, elem_size);
+        let step1_2 = self.builder.ins().iadd(step1_bytes, step1_bytes);
+        let step1_3 = self.builder.ins().iadd(step1_2, step1_bytes);
+        let step1_4 = self.builder.ins().iadd(step1_2, step1_2);
+
+        let step2_2 = self.builder.ins().iadd(step2_bytes, step2_bytes);
+        let step2_3 = self.builder.ins().iadd(step2_2, step2_bytes);
+        let step2_4 = self.builder.ins().iadd(step2_2, step2_2);
+
+        let mask_val = self.builder.ins().iconst(types::I64, -4);
+        let unroll_len = self.builder.ins().band(len, mask_val);
+
+        let initial_acc = if is_float {
+            if elem_ty == types::F32 {
+                self.builder.ins().f32const(0.0)
+            } else {
+                self.builder.ins().f64const(0.0)
+            }
+        } else {
+            self.builder.ins().iconst(elem_ty, 0)
+        };
+
+        let unroll_header = self.builder.create_block();
+        let unroll_body = self.builder.create_block();
+        let tail_header = self.builder.create_block();
+        let tail_body = self.builder.create_block();
+
+        self.builder.append_block_param(unroll_header, types::I64);
+        self.builder
+            .append_block_param(unroll_header, self.ptr_type);
+        self.builder
+            .append_block_param(unroll_header, self.ptr_type);
+        self.builder.append_block_param(unroll_header, elem_ty);
+
+        self.builder.append_block_param(tail_header, types::I64);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+        self.builder.append_block_param(tail_header, elem_ty);
+
+        let initial_i = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().jump(
+            unroll_header,
+            &[
+                BlockArg::from(initial_i),
+                BlockArg::from(src1),
+                BlockArg::from(src2),
+                BlockArg::from(initial_acc),
+            ],
+        );
+
+        // Unroll Loop Header
+        self.builder.switch_to_block(unroll_header);
+        let cur_i = self.builder.block_params(unroll_header)[0];
+        let cur_p1 = self.builder.block_params(unroll_header)[1];
+        let cur_p2 = self.builder.block_params(unroll_header)[2];
+        let cur_acc = self.builder.block_params(unroll_header)[3];
+
+        let has_unroll = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_i, unroll_len);
+        self.builder.ins().brif(
+            has_unroll,
+            unroll_body,
+            &[],
+            tail_header,
+            &[
+                BlockArg::from(cur_i),
+                BlockArg::from(cur_p1),
+                BlockArg::from(cur_p2),
+                BlockArg::from(cur_acc),
+            ],
+        );
+
+        // Unroll Loop Body: 4 pairs of parallel loads + products + tree accumulation
+        self.builder.switch_to_block(unroll_body);
+        let p1_0 = cur_p1;
+        let p1_1 = self.builder.ins().iadd(cur_p1, step1_bytes);
+        let p1_2 = self.builder.ins().iadd(cur_p1, step1_2);
+        let p1_3 = self.builder.ins().iadd(cur_p1, step1_3);
+
+        let p2_0 = cur_p2;
+        let p2_1 = self.builder.ins().iadd(cur_p2, step2_bytes);
+        let p2_2 = self.builder.ins().iadd(cur_p2, step2_2);
+        let p2_3 = self.builder.ins().iadd(cur_p2, step2_3);
+
+        let v1_0 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p1_0, 0);
+        let v2_0 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p2_0, 0);
+        let v1_1 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p1_1, 0);
+        let v2_1 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p2_1, 0);
+        let v1_2 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p1_2, 0);
+        let v2_2 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p2_2, 0);
+        let v1_3 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p1_3, 0);
+        let v2_3 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p2_3, 0);
+
+        let prod0 = if is_float {
+            self.builder.ins().fmul(v1_0, v2_0)
+        } else {
+            self.builder.ins().imul(v1_0, v2_0)
+        };
+        let prod1 = if is_float {
+            self.builder.ins().fmul(v1_1, v2_1)
+        } else {
+            self.builder.ins().imul(v1_1, v2_1)
+        };
+        let prod2 = if is_float {
+            self.builder.ins().fmul(v1_2, v2_2)
+        } else {
+            self.builder.ins().imul(v1_2, v2_2)
+        };
+        let prod3 = if is_float {
+            self.builder.ins().fmul(v1_3, v2_3)
+        } else {
+            self.builder.ins().imul(v1_3, v2_3)
+        };
+
+        let s01 = if is_float {
+            self.builder.ins().fadd(prod0, prod1)
+        } else {
+            self.builder.ins().iadd(prod0, prod1)
+        };
+        let s23 = if is_float {
+            self.builder.ins().fadd(prod2, prod3)
+        } else {
+            self.builder.ins().iadd(prod2, prod3)
+        };
+        let s03 = if is_float {
+            self.builder.ins().fadd(s01, s23)
+        } else {
+            self.builder.ins().iadd(s01, s23)
+        };
+        let next_acc = if is_float {
+            self.builder.ins().fadd(cur_acc, s03)
+        } else {
+            self.builder.ins().iadd(cur_acc, s03)
+        };
+
+        let next_p1 = self.builder.ins().iadd(cur_p1, step1_4);
+        let next_p2 = self.builder.ins().iadd(cur_p2, step2_4);
+        let next_i = self.builder.ins().iadd_imm_s(cur_i, 4);
+        self.builder.ins().jump(
+            unroll_header,
+            &[
+                BlockArg::from(next_i),
+                BlockArg::from(next_p1),
+                BlockArg::from(next_p2),
+                BlockArg::from(next_acc),
+            ],
+        );
+
+        // Tail Loop Header
+        self.builder.switch_to_block(tail_header);
+        let cur_tail_i = self.builder.block_params(tail_header)[0];
+        let cur_tail_p1 = self.builder.block_params(tail_header)[1];
+        let cur_tail_p2 = self.builder.block_params(tail_header)[2];
+        let cur_tail_acc = self.builder.block_params(tail_header)[3];
+
+        let has_tail = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_tail_i, len);
+        self.builder.ins().brif(
+            has_tail,
+            tail_body,
+            &[],
+            cont_block,
+            &[BlockArg::from(cur_tail_acc)],
+        );
+
+        // Tail Loop Body
+        self.builder.switch_to_block(tail_body);
+        let tv1 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), cur_tail_p1, 0);
+        let tv2 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), cur_tail_p2, 0);
+        let prod = if is_float {
+            self.builder.ins().fmul(tv1, tv2)
+        } else {
+            self.builder.ins().imul(tv1, tv2)
+        };
+        let next_tail_acc = if is_float {
+            self.builder.ins().fadd(cur_tail_acc, prod)
+        } else {
+            self.builder.ins().iadd(cur_tail_acc, prod)
+        };
+        let next_tail_p1 = self.builder.ins().iadd(cur_tail_p1, step1_bytes);
+        let next_tail_p2 = self.builder.ins().iadd(cur_tail_p2, step2_bytes);
+        let next_tail_i = self.builder.ins().iadd_imm_s(cur_tail_i, 1);
+        self.builder.ins().jump(
+            tail_header,
+            &[
+                BlockArg::from(next_tail_i),
+                BlockArg::from(next_tail_p1),
+                BlockArg::from(next_tail_p2),
+                BlockArg::from(next_tail_acc),
+            ],
+        );
+
+        self.builder.switch_to_block(cont_block);
+        let final_res = self.builder.block_params(cont_block)[0];
+        Some(final_res)
+    }
+
+    /// Lower multi-arena tripartite matrix/tensor fused multiply-accumulate:
+    /// `dst[i * stride_dst] += src1[i * stride1] * src2[i * stride2]`
+    #[allow(clippy::too_many_arguments)]
+    fn lower_multi_arena_tripartite(
+        &mut self,
+        elem_ty: types::Type,
+        is_float: bool,
+        elem_size: i64,
+        dst: ClValue,
+        src1: ClValue,
+        src2: ClValue,
+        len: ClValue,
+        stride_dst: ClValue,
+        stride1: ClValue,
+        stride2: ClValue,
+        _known_contiguous: bool,
+    ) -> Option<ClValue> {
+        let step_dst = self.builder.ins().imul_imm_s(stride_dst, elem_size);
+        let step1 = self.builder.ins().imul_imm_s(stride1, elem_size);
+        let step2 = self.builder.ins().imul_imm_s(stride2, elem_size);
+
+        let step_dst_2 = self.builder.ins().iadd(step_dst, step_dst);
+        let step_dst_3 = self.builder.ins().iadd(step_dst_2, step_dst);
+        let step_dst_4 = self.builder.ins().iadd(step_dst_2, step_dst_2);
+
+        let step1_2 = self.builder.ins().iadd(step1, step1);
+        let step1_3 = self.builder.ins().iadd(step1_2, step1);
+        let step1_4 = self.builder.ins().iadd(step1_2, step1_2);
+
+        let step2_2 = self.builder.ins().iadd(step2, step2);
+        let step2_3 = self.builder.ins().iadd(step2_2, step2);
+        let step2_4 = self.builder.ins().iadd(step2_2, step2_2);
+
+        let mask_val = self.builder.ins().iconst(types::I64, -4);
+        let unroll_len = self.builder.ins().band(len, mask_val);
+
+        let unroll_header = self.builder.create_block();
+        let unroll_body = self.builder.create_block();
+        let tail_header = self.builder.create_block();
+        let tail_body = self.builder.create_block();
+        let cont_block = self.builder.create_block();
+
+        self.builder.append_block_param(unroll_header, types::I64);
+        self.builder
+            .append_block_param(unroll_header, self.ptr_type);
+        self.builder
+            .append_block_param(unroll_header, self.ptr_type);
+        self.builder
+            .append_block_param(unroll_header, self.ptr_type);
+
+        self.builder.append_block_param(tail_header, types::I64);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+
+        let initial_i = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().jump(
+            unroll_header,
+            &[
+                BlockArg::from(initial_i),
+                BlockArg::from(dst),
+                BlockArg::from(src1),
+                BlockArg::from(src2),
+            ],
+        );
+
+        // Unroll Loop Header
+        self.builder.switch_to_block(unroll_header);
+        let cur_i = self.builder.block_params(unroll_header)[0];
+        let cur_pd = self.builder.block_params(unroll_header)[1];
+        let cur_p1 = self.builder.block_params(unroll_header)[2];
+        let cur_p2 = self.builder.block_params(unroll_header)[3];
+
+        let has_unroll = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_i, unroll_len);
+        self.builder.ins().brif(
+            has_unroll,
+            unroll_body,
+            &[],
+            tail_header,
+            &[
+                BlockArg::from(cur_i),
+                BlockArg::from(cur_pd),
+                BlockArg::from(cur_p1),
+                BlockArg::from(cur_p2),
+            ],
+        );
+
+        // Unroll Loop Body: 4 multiply-accumulates with in-place store
+        self.builder.switch_to_block(unroll_body);
+        let pd_0 = cur_pd;
+        let pd_1 = self.builder.ins().iadd(cur_pd, step_dst);
+        let pd_2 = self.builder.ins().iadd(cur_pd, step_dst_2);
+        let pd_3 = self.builder.ins().iadd(cur_pd, step_dst_3);
+
+        let p1_0 = cur_p1;
+        let p1_1 = self.builder.ins().iadd(cur_p1, step1);
+        let p1_2 = self.builder.ins().iadd(cur_p1, step1_2);
+        let p1_3 = self.builder.ins().iadd(cur_p1, step1_3);
+
+        let p2_0 = cur_p2;
+        let p2_1 = self.builder.ins().iadd(cur_p2, step2);
+        let p2_2 = self.builder.ins().iadd(cur_p2, step2_2);
+        let p2_3 = self.builder.ins().iadd(cur_p2, step2_3);
+
+        let vd_0 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), pd_0, 0);
+        let vd_1 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), pd_1, 0);
+        let vd_2 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), pd_2, 0);
+        let vd_3 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), pd_3, 0);
+
+        let v1_0 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p1_0, 0);
+        let v2_0 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p2_0, 0);
+        let v1_1 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p1_1, 0);
+        let v2_1 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p2_1, 0);
+        let v1_2 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p1_2, 0);
+        let v2_2 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p2_2, 0);
+        let v1_3 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p1_3, 0);
+        let v2_3 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p2_3, 0);
+
+        let prod0 = if is_float {
+            self.builder.ins().fmul(v1_0, v2_0)
+        } else {
+            self.builder.ins().imul(v1_0, v2_0)
+        };
+        let prod1 = if is_float {
+            self.builder.ins().fmul(v1_1, v2_1)
+        } else {
+            self.builder.ins().imul(v1_1, v2_1)
+        };
+        let prod2 = if is_float {
+            self.builder.ins().fmul(v1_2, v2_2)
+        } else {
+            self.builder.ins().imul(v1_2, v2_2)
+        };
+        let prod3 = if is_float {
+            self.builder.ins().fmul(v1_3, v2_3)
+        } else {
+            self.builder.ins().imul(v1_3, v2_3)
+        };
+
+        let res0 = if is_float {
+            self.builder.ins().fadd(vd_0, prod0)
+        } else {
+            self.builder.ins().iadd(vd_0, prod0)
+        };
+        let res1 = if is_float {
+            self.builder.ins().fadd(vd_1, prod1)
+        } else {
+            self.builder.ins().iadd(vd_1, prod1)
+        };
+        let res2 = if is_float {
+            self.builder.ins().fadd(vd_2, prod2)
+        } else {
+            self.builder.ins().iadd(vd_2, prod2)
+        };
+        let res3 = if is_float {
+            self.builder.ins().fadd(vd_3, prod3)
+        } else {
+            self.builder.ins().iadd(vd_3, prod3)
+        };
+
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), res0, pd_0, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), res1, pd_1, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), res2, pd_2, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), res3, pd_3, 0);
+
+        let next_pd = self.builder.ins().iadd(cur_pd, step_dst_4);
+        let next_p1 = self.builder.ins().iadd(cur_p1, step1_4);
+        let next_p2 = self.builder.ins().iadd(cur_p2, step2_4);
+        let next_i = self.builder.ins().iadd_imm_s(cur_i, 4);
+        self.builder.ins().jump(
+            unroll_header,
+            &[
+                BlockArg::from(next_i),
+                BlockArg::from(next_pd),
+                BlockArg::from(next_p1),
+                BlockArg::from(next_p2),
+            ],
+        );
+
+        // Tail Loop Header
+        self.builder.switch_to_block(tail_header);
+        let cur_tail_i = self.builder.block_params(tail_header)[0];
+        let cur_tail_pd = self.builder.block_params(tail_header)[1];
+        let cur_tail_p1 = self.builder.block_params(tail_header)[2];
+        let cur_tail_p2 = self.builder.block_params(tail_header)[3];
+
+        let has_tail = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_tail_i, len);
+        self.builder
+            .ins()
+            .brif(has_tail, tail_body, &[], cont_block, &[]);
+
+        // Tail Loop Body
+        self.builder.switch_to_block(tail_body);
+        let vd = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), cur_tail_pd, 0);
+        let v1 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), cur_tail_p1, 0);
+        let v2 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), cur_tail_p2, 0);
+        let prod = if is_float {
+            self.builder.ins().fmul(v1, v2)
+        } else {
+            self.builder.ins().imul(v1, v2)
+        };
+        let res = if is_float {
+            self.builder.ins().fadd(vd, prod)
+        } else {
+            self.builder.ins().iadd(vd, prod)
+        };
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), res, cur_tail_pd, 0);
+
+        let next_tail_pd = self.builder.ins().iadd(cur_tail_pd, step_dst);
+        let next_tail_p1 = self.builder.ins().iadd(cur_tail_p1, step1);
+        let next_tail_p2 = self.builder.ins().iadd(cur_tail_p2, step2);
+        let next_tail_i = self.builder.ins().iadd_imm_s(cur_tail_i, 1);
+        self.builder.ins().jump(
+            tail_header,
+            &[
+                BlockArg::from(next_tail_i),
+                BlockArg::from(next_tail_pd),
+                BlockArg::from(next_tail_p1),
+                BlockArg::from(next_tail_p2),
+            ],
+        );
+
+        self.builder.switch_to_block(cont_block);
+        Some(self.builder.ins().iconst(types::I64, 0))
+    }
+
+    /// Lower strided or contiguous slice product reduction.
+    fn lower_strided_slice_prod(
+        &mut self,
+        elem_ty: types::Type,
+        is_float: bool,
+        elem_size: i64,
+        src: ClValue,
+        len: ClValue,
+        stride: ClValue,
+    ) -> Option<ClValue> {
+        let step_bytes = self.builder.ins().imul_imm_s(stride, elem_size);
+        let step2_bytes = self.builder.ins().iadd(step_bytes, step_bytes);
+        let step3_bytes = self.builder.ins().iadd(step2_bytes, step_bytes);
+        let step4_bytes = self.builder.ins().iadd(step2_bytes, step2_bytes);
+
+        let mask_val = self.builder.ins().iconst(types::I64, -4);
+        let unroll_len = self.builder.ins().band(len, mask_val);
+
+        let initial_acc = if is_float {
+            if elem_ty == types::F32 {
+                self.builder.ins().f32const(1.0)
+            } else {
+                self.builder.ins().f64const(1.0)
+            }
+        } else {
+            self.builder.ins().iconst(elem_ty, 1)
+        };
+
+        let unroll_header = self.builder.create_block();
+        let unroll_body = self.builder.create_block();
+        let tail_header = self.builder.create_block();
+        let tail_body = self.builder.create_block();
+        let cont_block = self.builder.create_block();
+
+        self.builder.append_block_param(unroll_header, types::I64);
+        self.builder
+            .append_block_param(unroll_header, self.ptr_type);
+        self.builder.append_block_param(unroll_header, elem_ty);
+
+        self.builder.append_block_param(tail_header, types::I64);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+        self.builder.append_block_param(tail_header, elem_ty);
+
+        self.builder.append_block_param(cont_block, elem_ty);
+
+        let initial_i = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().jump(
+            unroll_header,
+            &[
+                BlockArg::from(initial_i),
+                BlockArg::from(src),
+                BlockArg::from(initial_acc),
+            ],
+        );
+
+        self.builder.switch_to_block(unroll_header);
+        let cur_i = self.builder.block_params(unroll_header)[0];
+        let cur_ptr = self.builder.block_params(unroll_header)[1];
+        let cur_acc = self.builder.block_params(unroll_header)[2];
+
+        let has_unroll = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_i, unroll_len);
+        self.builder.ins().brif(
+            has_unroll,
+            unroll_body,
+            &[],
+            tail_header,
+            &[
+                BlockArg::from(cur_i),
+                BlockArg::from(cur_ptr),
+                BlockArg::from(cur_acc),
+            ],
+        );
+
+        self.builder.switch_to_block(unroll_body);
+        let p0 = cur_ptr;
+        let p1 = self.builder.ins().iadd(cur_ptr, step_bytes);
+        let p2 = self.builder.ins().iadd(cur_ptr, step2_bytes);
+        let p3 = self.builder.ins().iadd(cur_ptr, step3_bytes);
+
+        let v0 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p0, 0);
+        let v1 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p1, 0);
+        let v2 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p2, 0);
+        let v3 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p3, 0);
+
+        let p01 = if is_float {
+            self.builder.ins().fmul(v0, v1)
+        } else {
+            self.builder.ins().imul(v0, v1)
+        };
+        let p23 = if is_float {
+            self.builder.ins().fmul(v2, v3)
+        } else {
+            self.builder.ins().imul(v2, v3)
+        };
+        let p03 = if is_float {
+            self.builder.ins().fmul(p01, p23)
+        } else {
+            self.builder.ins().imul(p01, p23)
+        };
+        let next_acc = if is_float {
+            self.builder.ins().fmul(cur_acc, p03)
+        } else {
+            self.builder.ins().imul(cur_acc, p03)
+        };
+
+        let next_ptr = self.builder.ins().iadd(cur_ptr, step4_bytes);
+        let next_i = self.builder.ins().iadd_imm_s(cur_i, 4);
+        self.builder.ins().jump(
+            unroll_header,
+            &[
+                BlockArg::from(next_i),
+                BlockArg::from(next_ptr),
+                BlockArg::from(next_acc),
+            ],
+        );
+
+        self.builder.switch_to_block(tail_header);
+        let cur_tail_i = self.builder.block_params(tail_header)[0];
+        let cur_tail_ptr = self.builder.block_params(tail_header)[1];
+        let cur_tail_acc = self.builder.block_params(tail_header)[2];
+
+        let has_tail = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_tail_i, len);
+        self.builder.ins().brif(
+            has_tail,
+            tail_body,
+            &[],
+            cont_block,
+            &[BlockArg::from(cur_tail_acc)],
+        );
+
+        self.builder.switch_to_block(tail_body);
+        let tail_val = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), cur_tail_ptr, 0);
+        let next_tail_acc = if is_float {
+            self.builder.ins().fmul(cur_tail_acc, tail_val)
+        } else {
+            self.builder.ins().imul(cur_tail_acc, tail_val)
+        };
+        let next_tail_ptr = self.builder.ins().iadd(cur_tail_ptr, step_bytes);
+        let next_tail_i = self.builder.ins().iadd_imm_s(cur_tail_i, 1);
+        self.builder.ins().jump(
+            tail_header,
+            &[
+                BlockArg::from(next_tail_i),
+                BlockArg::from(next_tail_ptr),
+                BlockArg::from(next_tail_acc),
+            ],
+        );
+
+        self.builder.switch_to_block(cont_block);
+        let final_res = self.builder.block_params(cont_block)[0];
+        Some(final_res)
+    }
+
+    /// Lower strided or contiguous slice minimum reduction.
+    fn lower_strided_slice_min(
+        &mut self,
+        elem_ty: types::Type,
+        is_float: bool,
+        elem_size: i64,
+        src: ClValue,
+        len: ClValue,
+        stride: ClValue,
+    ) -> Option<ClValue> {
+        let step_bytes = self.builder.ins().imul_imm_s(stride, elem_size);
+        let step2_bytes = self.builder.ins().iadd(step_bytes, step_bytes);
+        let step3_bytes = self.builder.ins().iadd(step2_bytes, step_bytes);
+        let step4_bytes = self.builder.ins().iadd(step2_bytes, step2_bytes);
+
+        let mask_val = self.builder.ins().iconst(types::I64, -4);
+        let unroll_len = self.builder.ins().band(len, mask_val);
+
+        let initial_acc = if is_float {
+            if elem_ty == types::F32 {
+                self.builder.ins().f32const(f32::INFINITY)
+            } else {
+                self.builder.ins().f64const(f64::INFINITY)
+            }
+        } else if elem_ty == types::I32 {
+            self.builder.ins().iconst(elem_ty, i32::MAX as i64)
+        } else {
+            self.builder.ins().iconst(elem_ty, i64::MAX)
+        };
+
+        let unroll_header = self.builder.create_block();
+        let unroll_body = self.builder.create_block();
+        let tail_header = self.builder.create_block();
+        let tail_body = self.builder.create_block();
+        let cont_block = self.builder.create_block();
+
+        self.builder.append_block_param(unroll_header, types::I64);
+        self.builder
+            .append_block_param(unroll_header, self.ptr_type);
+        self.builder.append_block_param(unroll_header, elem_ty);
+
+        self.builder.append_block_param(tail_header, types::I64);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+        self.builder.append_block_param(tail_header, elem_ty);
+
+        self.builder.append_block_param(cont_block, elem_ty);
+
+        let initial_i = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().jump(
+            unroll_header,
+            &[
+                BlockArg::from(initial_i),
+                BlockArg::from(src),
+                BlockArg::from(initial_acc),
+            ],
+        );
+
+        self.builder.switch_to_block(unroll_header);
+        let cur_i = self.builder.block_params(unroll_header)[0];
+        let cur_ptr = self.builder.block_params(unroll_header)[1];
+        let cur_acc = self.builder.block_params(unroll_header)[2];
+
+        let has_unroll = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_i, unroll_len);
+        self.builder.ins().brif(
+            has_unroll,
+            unroll_body,
+            &[],
+            tail_header,
+            &[
+                BlockArg::from(cur_i),
+                BlockArg::from(cur_ptr),
+                BlockArg::from(cur_acc),
+            ],
+        );
+
+        self.builder.switch_to_block(unroll_body);
+        let p0 = cur_ptr;
+        let p1 = self.builder.ins().iadd(cur_ptr, step_bytes);
+        let p2 = self.builder.ins().iadd(cur_ptr, step2_bytes);
+        let p3 = self.builder.ins().iadd(cur_ptr, step3_bytes);
+
+        let v0 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p0, 0);
+        let v1 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p1, 0);
+        let v2 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p2, 0);
+        let v3 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p3, 0);
+
+        let m01 = if is_float {
+            self.builder.ins().fmin(v0, v1)
+        } else {
+            self.builder.ins().smin(v0, v1)
+        };
+        let m23 = if is_float {
+            self.builder.ins().fmin(v2, v3)
+        } else {
+            self.builder.ins().smin(v2, v3)
+        };
+        let m03 = if is_float {
+            self.builder.ins().fmin(m01, m23)
+        } else {
+            self.builder.ins().smin(m01, m23)
+        };
+        let next_acc = if is_float {
+            self.builder.ins().fmin(cur_acc, m03)
+        } else {
+            self.builder.ins().smin(cur_acc, m03)
+        };
+
+        let next_ptr = self.builder.ins().iadd(cur_ptr, step4_bytes);
+        let next_i = self.builder.ins().iadd_imm_s(cur_i, 4);
+        self.builder.ins().jump(
+            unroll_header,
+            &[
+                BlockArg::from(next_i),
+                BlockArg::from(next_ptr),
+                BlockArg::from(next_acc),
+            ],
+        );
+
+        self.builder.switch_to_block(tail_header);
+        let cur_tail_i = self.builder.block_params(tail_header)[0];
+        let cur_tail_ptr = self.builder.block_params(tail_header)[1];
+        let cur_tail_acc = self.builder.block_params(tail_header)[2];
+
+        let has_tail = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_tail_i, len);
+        self.builder.ins().brif(
+            has_tail,
+            tail_body,
+            &[],
+            cont_block,
+            &[BlockArg::from(cur_tail_acc)],
+        );
+
+        self.builder.switch_to_block(tail_body);
+        let tail_val = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), cur_tail_ptr, 0);
+        let next_tail_acc = if is_float {
+            self.builder.ins().fmin(cur_tail_acc, tail_val)
+        } else {
+            self.builder.ins().smin(cur_tail_acc, tail_val)
+        };
+        let next_tail_ptr = self.builder.ins().iadd(cur_tail_ptr, step_bytes);
+        let next_tail_i = self.builder.ins().iadd_imm_s(cur_tail_i, 1);
+        self.builder.ins().jump(
+            tail_header,
+            &[
+                BlockArg::from(next_tail_i),
+                BlockArg::from(next_tail_ptr),
+                BlockArg::from(next_tail_acc),
+            ],
+        );
+
+        self.builder.switch_to_block(cont_block);
+        let final_res = self.builder.block_params(cont_block)[0];
+        Some(final_res)
+    }
+
+    /// Lower strided or contiguous slice maximum reduction.
+    fn lower_strided_slice_max(
+        &mut self,
+        elem_ty: types::Type,
+        is_float: bool,
+        elem_size: i64,
+        src: ClValue,
+        len: ClValue,
+        stride: ClValue,
+    ) -> Option<ClValue> {
+        let step_bytes = self.builder.ins().imul_imm_s(stride, elem_size);
+        let step2_bytes = self.builder.ins().iadd(step_bytes, step_bytes);
+        let step3_bytes = self.builder.ins().iadd(step2_bytes, step_bytes);
+        let step4_bytes = self.builder.ins().iadd(step2_bytes, step2_bytes);
+
+        let mask_val = self.builder.ins().iconst(types::I64, -4);
+        let unroll_len = self.builder.ins().band(len, mask_val);
+
+        let initial_acc = if is_float {
+            if elem_ty == types::F32 {
+                self.builder.ins().f32const(f32::NEG_INFINITY)
+            } else {
+                self.builder.ins().f64const(f64::NEG_INFINITY)
+            }
+        } else if elem_ty == types::I32 {
+            self.builder.ins().iconst(elem_ty, i32::MIN as i64)
+        } else {
+            self.builder.ins().iconst(elem_ty, i64::MIN)
+        };
+
+        let unroll_header = self.builder.create_block();
+        let unroll_body = self.builder.create_block();
+        let tail_header = self.builder.create_block();
+        let tail_body = self.builder.create_block();
+        let cont_block = self.builder.create_block();
+
+        self.builder.append_block_param(unroll_header, types::I64);
+        self.builder
+            .append_block_param(unroll_header, self.ptr_type);
+        self.builder.append_block_param(unroll_header, elem_ty);
+
+        self.builder.append_block_param(tail_header, types::I64);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+        self.builder.append_block_param(tail_header, elem_ty);
+
+        self.builder.append_block_param(cont_block, elem_ty);
+
+        let initial_i = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().jump(
+            unroll_header,
+            &[
+                BlockArg::from(initial_i),
+                BlockArg::from(src),
+                BlockArg::from(initial_acc),
+            ],
+        );
+
+        self.builder.switch_to_block(unroll_header);
+        let cur_i = self.builder.block_params(unroll_header)[0];
+        let cur_ptr = self.builder.block_params(unroll_header)[1];
+        let cur_acc = self.builder.block_params(unroll_header)[2];
+
+        let has_unroll = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_i, unroll_len);
+        self.builder.ins().brif(
+            has_unroll,
+            unroll_body,
+            &[],
+            tail_header,
+            &[
+                BlockArg::from(cur_i),
+                BlockArg::from(cur_ptr),
+                BlockArg::from(cur_acc),
+            ],
+        );
+
+        self.builder.switch_to_block(unroll_body);
+        let p0 = cur_ptr;
+        let p1 = self.builder.ins().iadd(cur_ptr, step_bytes);
+        let p2 = self.builder.ins().iadd(cur_ptr, step2_bytes);
+        let p3 = self.builder.ins().iadd(cur_ptr, step3_bytes);
+
+        let v0 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p0, 0);
+        let v1 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p1, 0);
+        let v2 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p2, 0);
+        let v3 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p3, 0);
+
+        let m01 = if is_float {
+            self.builder.ins().fmax(v0, v1)
+        } else {
+            self.builder.ins().smax(v0, v1)
+        };
+        let m23 = if is_float {
+            self.builder.ins().fmax(v2, v3)
+        } else {
+            self.builder.ins().smax(v2, v3)
+        };
+        let m03 = if is_float {
+            self.builder.ins().fmax(m01, m23)
+        } else {
+            self.builder.ins().smax(m01, m23)
+        };
+        let next_acc = if is_float {
+            self.builder.ins().fmax(cur_acc, m03)
+        } else {
+            self.builder.ins().smax(cur_acc, m03)
+        };
+
+        let next_ptr = self.builder.ins().iadd(cur_ptr, step4_bytes);
+        let next_i = self.builder.ins().iadd_imm_s(cur_i, 4);
+        self.builder.ins().jump(
+            unroll_header,
+            &[
+                BlockArg::from(next_i),
+                BlockArg::from(next_ptr),
+                BlockArg::from(next_acc),
+            ],
+        );
+
+        self.builder.switch_to_block(tail_header);
+        let cur_tail_i = self.builder.block_params(tail_header)[0];
+        let cur_tail_ptr = self.builder.block_params(tail_header)[1];
+        let cur_tail_acc = self.builder.block_params(tail_header)[2];
+
+        let has_tail = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_tail_i, len);
+        self.builder.ins().brif(
+            has_tail,
+            tail_body,
+            &[],
+            cont_block,
+            &[BlockArg::from(cur_tail_acc)],
+        );
+
+        self.builder.switch_to_block(tail_body);
+        let tail_val = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), cur_tail_ptr, 0);
+        let next_tail_acc = if is_float {
+            self.builder.ins().fmax(cur_tail_acc, tail_val)
+        } else {
+            self.builder.ins().smax(cur_tail_acc, tail_val)
+        };
+        let next_tail_ptr = self.builder.ins().iadd(cur_tail_ptr, step_bytes);
+        let next_tail_i = self.builder.ins().iadd_imm_s(cur_tail_i, 1);
+        self.builder.ins().jump(
+            tail_header,
+            &[
+                BlockArg::from(next_tail_i),
+                BlockArg::from(next_tail_ptr),
+                BlockArg::from(next_tail_acc),
+            ],
+        );
+
+        self.builder.switch_to_block(cont_block);
+        let final_res = self.builder.block_params(cont_block)[0];
+        Some(final_res)
+    }
+
+    /// Lower predicated slice counting (Count-If) with 4-way branchless tree accumulation.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_slice_count_if(
+        &mut self,
+        elem_ty: types::Type,
+        is_float: bool,
+        elem_size: i64,
+        src: ClValue,
+        len: ClValue,
+        stride: ClValue,
+        threshold: ClValue,
+        pred: CountPred,
+    ) -> Option<ClValue> {
+        let step_bytes = self.builder.ins().imul_imm_s(stride, elem_size);
+        let step2_bytes = self.builder.ins().iadd(step_bytes, step_bytes);
+        let step3_bytes = self.builder.ins().iadd(step2_bytes, step_bytes);
+        let step4_bytes = self.builder.ins().iadd(step2_bytes, step2_bytes);
+
+        let mask_val = self.builder.ins().iconst(types::I64, -4);
+        let unroll_len = self.builder.ins().band(len, mask_val);
+
+        let initial_count = self.builder.ins().iconst(types::I64, 0);
+
+        let unroll_header = self.builder.create_block();
+        let unroll_body = self.builder.create_block();
+        let tail_header = self.builder.create_block();
+        let tail_body = self.builder.create_block();
+        let cont_block = self.builder.create_block();
+
+        self.builder.append_block_param(unroll_header, types::I64);
+        self.builder
+            .append_block_param(unroll_header, self.ptr_type);
+        self.builder.append_block_param(unroll_header, types::I64);
+
+        self.builder.append_block_param(tail_header, types::I64);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+        self.builder.append_block_param(tail_header, types::I64);
+
+        self.builder.append_block_param(cont_block, types::I64);
+
+        let initial_i = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().jump(
+            unroll_header,
+            &[
+                BlockArg::from(initial_i),
+                BlockArg::from(src),
+                BlockArg::from(initial_count),
+            ],
+        );
+
+        self.builder.switch_to_block(unroll_header);
+        let cur_i = self.builder.block_params(unroll_header)[0];
+        let cur_ptr = self.builder.block_params(unroll_header)[1];
+        let cur_cnt = self.builder.block_params(unroll_header)[2];
+
+        let has_unroll = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_i, unroll_len);
+        self.builder.ins().brif(
+            has_unroll,
+            unroll_body,
+            &[],
+            tail_header,
+            &[
+                BlockArg::from(cur_i),
+                BlockArg::from(cur_ptr),
+                BlockArg::from(cur_cnt),
+            ],
+        );
+
+        self.builder.switch_to_block(unroll_body);
+        let p0 = cur_ptr;
+        let p1 = self.builder.ins().iadd(cur_ptr, step_bytes);
+        let p2 = self.builder.ins().iadd(cur_ptr, step2_bytes);
+        let p3 = self.builder.ins().iadd(cur_ptr, step3_bytes);
+
+        let v0 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p0, 0);
+        let v1 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p1, 0);
+        let v2 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p2, 0);
+        let v3 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), p3, 0);
+
+        let cmp_helper =
+            |builder: &mut FunctionBuilder, val: ClValue, is_fl: bool, pr: CountPred| -> ClValue {
+                let cond = if is_fl {
+                    let cc = match pr {
+                        CountPred::Gt => FloatCC::GreaterThan,
+                        CountPred::Lt => FloatCC::LessThan,
+                        CountPred::Eq => FloatCC::Equal,
+                        CountPred::Ne => FloatCC::NotEqual,
+                    };
+                    builder.ins().fcmp(cc, val, threshold)
+                } else {
+                    let cc = match pr {
+                        CountPred::Gt => IntCC::SignedGreaterThan,
+                        CountPred::Lt => IntCC::SignedLessThan,
+                        CountPred::Eq => IntCC::Equal,
+                        CountPred::Ne => IntCC::NotEqual,
+                    };
+                    builder.ins().icmp(cc, val, threshold)
+                };
+                builder.ins().uextend(types::I64, cond)
+            };
+
+        let c0 = cmp_helper(&mut self.builder, v0, is_float, pred);
+        let c1 = cmp_helper(&mut self.builder, v1, is_float, pred);
+        let c2 = cmp_helper(&mut self.builder, v2, is_float, pred);
+        let c3 = cmp_helper(&mut self.builder, v3, is_float, pred);
+
+        let s01 = self.builder.ins().iadd(c0, c1);
+        let s23 = self.builder.ins().iadd(c2, c3);
+        let s03 = self.builder.ins().iadd(s01, s23);
+        let next_cnt = self.builder.ins().iadd(cur_cnt, s03);
+
+        let next_ptr = self.builder.ins().iadd(cur_ptr, step4_bytes);
+        let next_i = self.builder.ins().iadd_imm_s(cur_i, 4);
+        self.builder.ins().jump(
+            unroll_header,
+            &[
+                BlockArg::from(next_i),
+                BlockArg::from(next_ptr),
+                BlockArg::from(next_cnt),
+            ],
+        );
+
+        self.builder.switch_to_block(tail_header);
+        let cur_tail_i = self.builder.block_params(tail_header)[0];
+        let cur_tail_ptr = self.builder.block_params(tail_header)[1];
+        let cur_tail_cnt = self.builder.block_params(tail_header)[2];
+
+        let has_tail = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_tail_i, len);
+        self.builder.ins().brif(
+            has_tail,
+            tail_body,
+            &[],
+            cont_block,
+            &[BlockArg::from(cur_tail_cnt)],
+        );
+
+        self.builder.switch_to_block(tail_body);
+        let tail_val = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), cur_tail_ptr, 0);
+        let cond = if is_float {
+            let cc = match pred {
+                CountPred::Gt => FloatCC::GreaterThan,
+                CountPred::Lt => FloatCC::LessThan,
+                CountPred::Eq => FloatCC::Equal,
+                CountPred::Ne => FloatCC::NotEqual,
+            };
+            self.builder.ins().fcmp(cc, tail_val, threshold)
+        } else {
+            let cc = match pred {
+                CountPred::Gt => IntCC::SignedGreaterThan,
+                CountPred::Lt => IntCC::SignedLessThan,
+                CountPred::Eq => IntCC::Equal,
+                CountPred::Ne => IntCC::NotEqual,
+            };
+            self.builder.ins().icmp(cc, tail_val, threshold)
+        };
+        let cond_ext = self.builder.ins().uextend(types::I64, cond);
+        let next_tail_cnt = self.builder.ins().iadd(cur_tail_cnt, cond_ext);
+        let next_tail_ptr = self.builder.ins().iadd(cur_tail_ptr, step_bytes);
+        let next_tail_i = self.builder.ins().iadd_imm_s(cur_tail_i, 1);
+        self.builder.ins().jump(
+            tail_header,
+            &[
+                BlockArg::from(next_tail_i),
+                BlockArg::from(next_tail_ptr),
+                BlockArg::from(next_tail_cnt),
+            ],
+        );
+
+        self.builder.switch_to_block(cont_block);
+        let final_res = self.builder.block_params(cont_block)[0];
+        Some(final_res)
+    }
+
+    /// Lower elementwise slice clamping: `dst[i] = min(max(src[i], min_val), max_val)`.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_slice_clamp(
+        &mut self,
+        elem_ty: types::Type,
+        is_float: bool,
+        elem_size: i64,
+        src: ClValue,
+        dst: ClValue,
+        len: ClValue,
+        stride: ClValue,
+        min_val: ClValue,
+        max_val: ClValue,
+    ) -> Option<ClValue> {
+        let step_bytes = self.builder.ins().imul_imm_s(stride, elem_size);
+        let step2_bytes = self.builder.ins().iadd(step_bytes, step_bytes);
+        let step3_bytes = self.builder.ins().iadd(step2_bytes, step_bytes);
+        let step4_bytes = self.builder.ins().iadd(step2_bytes, step2_bytes);
+
+        let mask_val = self.builder.ins().iconst(types::I64, -4);
+        let unroll_len = self.builder.ins().band(len, mask_val);
+
+        let unroll_header = self.builder.create_block();
+        let unroll_body = self.builder.create_block();
+        let tail_header = self.builder.create_block();
+        let tail_body = self.builder.create_block();
+        let cont_block = self.builder.create_block();
+
+        self.builder.append_block_param(unroll_header, types::I64);
+        self.builder
+            .append_block_param(unroll_header, self.ptr_type);
+        self.builder
+            .append_block_param(unroll_header, self.ptr_type);
+
+        self.builder.append_block_param(tail_header, types::I64);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+        self.builder.append_block_param(tail_header, self.ptr_type);
+
+        let initial_i = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().jump(
+            unroll_header,
+            &[
+                BlockArg::from(initial_i),
+                BlockArg::from(src),
+                BlockArg::from(dst),
+            ],
+        );
+
+        self.builder.switch_to_block(unroll_header);
+        let cur_i = self.builder.block_params(unroll_header)[0];
+        let cur_ps = self.builder.block_params(unroll_header)[1];
+        let cur_pd = self.builder.block_params(unroll_header)[2];
+
+        let has_unroll = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_i, unroll_len);
+        self.builder.ins().brif(
+            has_unroll,
+            unroll_body,
+            &[],
+            tail_header,
+            &[
+                BlockArg::from(cur_i),
+                BlockArg::from(cur_ps),
+                BlockArg::from(cur_pd),
+            ],
+        );
+
+        self.builder.switch_to_block(unroll_body);
+        let ps_0 = cur_ps;
+        let ps_1 = self.builder.ins().iadd(cur_ps, step_bytes);
+        let ps_2 = self.builder.ins().iadd(cur_ps, step2_bytes);
+        let ps_3 = self.builder.ins().iadd(cur_ps, step3_bytes);
+
+        let pd_0 = cur_pd;
+        let pd_1 = self.builder.ins().iadd(cur_pd, step_bytes);
+        let pd_2 = self.builder.ins().iadd(cur_pd, step2_bytes);
+        let pd_3 = self.builder.ins().iadd(cur_pd, step3_bytes);
+
+        let v0 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), ps_0, 0);
+        let v1 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), ps_1, 0);
+        let v2 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), ps_2, 0);
+        let v3 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), ps_3, 0);
+
+        let clamp_one = |builder: &mut FunctionBuilder, v: ClValue, is_fl: bool| -> ClValue {
+            if is_fl {
+                let clamped_low = builder.ins().fmax(v, min_val);
+                builder.ins().fmin(clamped_low, max_val)
+            } else {
+                let clamped_low = builder.ins().smax(v, min_val);
+                builder.ins().smin(clamped_low, max_val)
+            }
+        };
+
+        let c0 = clamp_one(&mut self.builder, v0, is_float);
+        let c1 = clamp_one(&mut self.builder, v1, is_float);
+        let c2 = clamp_one(&mut self.builder, v2, is_float);
+        let c3 = clamp_one(&mut self.builder, v3, is_float);
+
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), c0, pd_0, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), c1, pd_1, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), c2, pd_2, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), c3, pd_3, 0);
+
+        let next_ps = self.builder.ins().iadd(cur_ps, step4_bytes);
+        let next_pd = self.builder.ins().iadd(cur_pd, step4_bytes);
+        let next_i = self.builder.ins().iadd_imm_s(cur_i, 4);
+        self.builder.ins().jump(
+            unroll_header,
+            &[
+                BlockArg::from(next_i),
+                BlockArg::from(next_ps),
+                BlockArg::from(next_pd),
+            ],
+        );
+
+        self.builder.switch_to_block(tail_header);
+        let cur_tail_i = self.builder.block_params(tail_header)[0];
+        let cur_tail_ps = self.builder.block_params(tail_header)[1];
+        let cur_tail_pd = self.builder.block_params(tail_header)[2];
+
+        let has_tail = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_tail_i, len);
+        self.builder
+            .ins()
+            .brif(has_tail, tail_body, &[], cont_block, &[]);
+
+        self.builder.switch_to_block(tail_body);
+        let tv = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), cur_tail_ps, 0);
+        let clamped = if is_float {
+            let clamped_low = self.builder.ins().fmax(tv, min_val);
+            self.builder.ins().fmin(clamped_low, max_val)
+        } else {
+            let clamped_low = self.builder.ins().smax(tv, min_val);
+            self.builder.ins().smin(clamped_low, max_val)
+        };
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), clamped, cur_tail_pd, 0);
+
+        let next_tail_ps = self.builder.ins().iadd(cur_tail_ps, step_bytes);
+        let next_tail_pd = self.builder.ins().iadd(cur_tail_pd, step_bytes);
+        let next_tail_i = self.builder.ins().iadd_imm_s(cur_tail_i, 1);
+        self.builder.ins().jump(
+            tail_header,
+            &[
+                BlockArg::from(next_tail_i),
+                BlockArg::from(next_tail_ps),
+                BlockArg::from(next_tail_pd),
+            ],
+        );
+
+        self.builder.switch_to_block(cont_block);
+        Some(self.builder.ins().iconst(types::I64, 0))
     }
 
     fn ensure_i64(&mut self, v: ClValue) -> ClValue {
@@ -2549,6 +5368,39 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             self.builder.ins().sextend(types::I64, v)
         } else {
             self.builder.ins().ireduce(types::I64, v)
+        }
+    }
+
+    fn ensure_i32(&mut self, v: ClValue) -> ClValue {
+        let cur_ty = self.builder.func.dfg.value_type(v);
+        if cur_ty == types::I32 {
+            v
+        } else if cur_ty.bits() < 32 {
+            self.builder.ins().sextend(types::I32, v)
+        } else {
+            self.builder.ins().ireduce(types::I32, v)
+        }
+    }
+
+    fn ensure_f32(&mut self, v: ClValue) -> ClValue {
+        let cur_ty = self.builder.func.dfg.value_type(v);
+        if cur_ty == types::F32 {
+            v
+        } else if cur_ty == types::F64 {
+            self.builder.ins().fdemote(types::F32, v)
+        } else {
+            v
+        }
+    }
+
+    fn ensure_f64(&mut self, v: ClValue) -> ClValue {
+        let cur_ty = self.builder.func.dfg.value_type(v);
+        if cur_ty == types::F64 {
+            v
+        } else if cur_ty == types::F32 {
+            self.builder.ins().fpromote(types::F64, v)
+        } else {
+            v
         }
     }
 
