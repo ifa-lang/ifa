@@ -1062,6 +1062,17 @@ impl AotCompiler {
                 .map(|s| (s.name, s.fields.clone()))
                 .collect();
 
+        let fn_param_types: HashMap<String, Vec<ifa_fir::FirType>> = fir_module
+            .functions
+            .iter()
+            .map(|f| {
+                (
+                    INTERNER.resolve(&f.name).to_string(),
+                    f.params.iter().map(|p| p.ty.clone()).collect(),
+                )
+            })
+            .collect();
+
         // 2. Translate and define functions
         for fir_func in &fir_module.functions {
             if fir_func.blocks.is_empty() {
@@ -1096,6 +1107,7 @@ impl AotCompiler {
                         ptr_type,
                         &struct_defs,
                         &coro_funcs,
+                        &fn_param_types,
                     );
                     translator.translate_coroutine_resume(fir_func)?;
                 }
@@ -1128,6 +1140,7 @@ impl AotCompiler {
                         ptr_type,
                         &struct_defs,
                         &coro_funcs,
+                        &fn_param_types,
                     );
                     translator.translate_coroutine_factory(fir_func, &resume_name)?;
                 }
@@ -1159,6 +1172,7 @@ impl AotCompiler {
                         ptr_type,
                         &struct_defs,
                         &coro_funcs,
+                        &fn_param_types,
                     );
                     translator.translate(fir_func)?;
                 }

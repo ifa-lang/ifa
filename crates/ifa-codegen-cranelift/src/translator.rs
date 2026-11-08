@@ -15,6 +15,15 @@ use ifa_sema::types::IntType;
 use ifa_span::{Symbol, INTERNER};
 use std::collections::{HashMap, HashSet};
 
+#[inline]
+fn is_slice_or_slice_ptr(ty: Option<&FirType>) -> bool {
+    match ty {
+        Some(FirType::Slice(_)) => true,
+        Some(FirType::Pointer(inner)) => matches!(&**inner, FirType::Slice(_)),
+        _ => false,
+    }
+}
+
 /// Translates a single FIR function into Cranelift IR using FunctionBuilder.
 pub struct FunctionTranslator<'a, M: Module> {
     builder: FunctionBuilder<'a>,
@@ -23,8 +32,11 @@ pub struct FunctionTranslator<'a, M: Module> {
     ptr_type: types::Type,
     struct_defs: &'a HashMap<Symbol, Vec<(Symbol, FirType)>>,
     coro_funcs: &'a HashSet<Symbol>,
+    fn_param_types: &'a HashMap<String, Vec<FirType>>,
     block_map: HashMap<BlockId, ClBlock>,
     value_map: HashMap<ValueId, ClValue>,
+    value_types: HashMap<ValueId, FirType>,
+    slice_lens: HashMap<ValueId, ClValue>,
     pointer_types: HashMap<ValueId, types::Type>,
     pointer_fir_types: HashMap<ValueId, FirType>,
     constant_ints: HashMap<ValueId, i64>,
@@ -39,6 +51,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         ptr_type: types::Type,
         struct_defs: &'a HashMap<Symbol, Vec<(Symbol, FirType)>>,
         coro_funcs: &'a HashSet<Symbol>,
+        fn_param_types: &'a HashMap<String, Vec<FirType>>,
     ) -> Self {
         Self {
             builder,
@@ -47,8 +60,11 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             ptr_type,
             struct_defs,
             coro_funcs,
+            fn_param_types,
             block_map: HashMap::new(),
             value_map: HashMap::new(),
+            value_types: HashMap::new(),
+            slice_lens: HashMap::new(),
             pointer_types: HashMap::new(),
             pointer_fir_types: HashMap::new(),
             constant_ints: HashMap::new(),
@@ -56,8 +72,200 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         }
     }
 
+    /// Precompute FIR types of all SSA values in the function.
+    fn compute_value_types(
+        func: &FirFunction,
+        struct_defs: &HashMap<Symbol, Vec<(Symbol, FirType)>>,
+    ) -> HashMap<ValueId, FirType> {
+        let mut value_types: HashMap<ValueId, FirType> = HashMap::new();
+        for p in &func.params {
+            if p.mode == ParamMode::InOut {
+                value_types.insert(p.val, FirType::Pointer(Box::new(p.ty.clone())));
+            } else {
+                value_types.insert(p.val, p.ty.clone());
+            }
+        }
+        for block in &func.blocks {
+            for (p_id, p_ty) in &block.params {
+                value_types.insert(*p_id, p_ty.clone());
+            }
+            for inst in &block.instructions {
+                if let Some(res) = inst.result {
+                    let ty = match &inst.expr {
+                        ValueExpr::Constant(ConstantValue::Float(_, f_ty)) => FirType::Float(*f_ty),
+                        ValueExpr::Constant(ConstantValue::Int(_, i_ty)) => FirType::Int(*i_ty),
+                        ValueExpr::Constant(ConstantValue::Bool(_)) => FirType::Bool,
+                        ValueExpr::Constant(ConstantValue::Char(_)) => FirType::Char,
+                        ValueExpr::Constant(ConstantValue::String(_)) => FirType::Str,
+                        ValueExpr::FormatString(_) => FirType::String,
+                        ValueExpr::Constant(ConstantValue::Function(_)) => {
+                            FirType::Pointer(Box::new(FirType::Unit))
+                        }
+                        ValueExpr::Constant(ConstantValue::Null) => FirType::Int(IntType::I64),
+                        ValueExpr::Binary { op, lhs, .. } => match op {
+                            BinaryOp::Eq
+                            | BinaryOp::Ne
+                            | BinaryOp::Lt
+                            | BinaryOp::Le
+                            | BinaryOp::Gt
+                            | BinaryOp::Ge
+                            | BinaryOp::And
+                            | BinaryOp::Or => FirType::Bool,
+                            _ => value_types
+                                .get(lhs)
+                                .cloned()
+                                .unwrap_or(FirType::Int(IntType::I64)),
+                        },
+                        ValueExpr::Unary { op, val } => match op {
+                            UnaryOp::Not => FirType::Bool,
+                            UnaryOp::Neg => value_types
+                                .get(val)
+                                .cloned()
+                                .unwrap_or(FirType::Int(IntType::I64)),
+                        },
+                        ValueExpr::Alloca { ty, .. } => FirType::Pointer(Box::new(ty.clone())),
+                        ValueExpr::Load { ptr } => match value_types.get(ptr) {
+                            Some(FirType::Pointer(inner)) => (**inner).clone(),
+                            _ => FirType::Int(IntType::I64),
+                        },
+                        ValueExpr::GetElement { base, .. } => match value_types.get(base) {
+                            Some(FirType::Array(inner, _)) | Some(FirType::Slice(inner)) => {
+                                (**inner).clone()
+                            }
+                            Some(FirType::Pointer(inner)) => match &**inner {
+                                FirType::Array(elem, _) | FirType::Slice(elem) => (**elem).clone(),
+                                _ => FirType::Int(IntType::I64),
+                            },
+                            _ => FirType::Int(IntType::I64),
+                        },
+                        ValueExpr::GetField {
+                            base, field_idx, ..
+                        } => match value_types.get(base) {
+                            Some(FirType::Struct(name, fields)) => {
+                                if let Some((_, fty)) = fields.get(*field_idx) {
+                                    fty.clone()
+                                } else if let Some(s_fields) = struct_defs.get(name) {
+                                    s_fields
+                                        .get(*field_idx)
+                                        .map(|(_, ty)| ty.clone())
+                                        .unwrap_or(FirType::Int(IntType::I64))
+                                } else {
+                                    FirType::Int(IntType::I64)
+                                }
+                            }
+                            Some(FirType::Pointer(inner)) => match &**inner {
+                                FirType::Struct(name, fields) => {
+                                    if let Some((_, fty)) = fields.get(*field_idx) {
+                                        fty.clone()
+                                    } else if let Some(s_fields) = struct_defs.get(name) {
+                                        s_fields
+                                            .get(*field_idx)
+                                            .map(|(_, ty)| ty.clone())
+                                            .unwrap_or(FirType::Int(IntType::I64))
+                                    } else {
+                                        FirType::Int(IntType::I64)
+                                    }
+                                }
+                                _ => FirType::Int(IntType::I64),
+                            },
+                            _ => FirType::Int(IntType::I64),
+                        },
+                        ValueExpr::SliceSub { base, .. } | ValueExpr::SliceStrided { base, .. } => {
+                            match value_types.get(base) {
+                                Some(FirType::Array(inner, _)) | Some(FirType::Slice(inner)) => {
+                                    FirType::Slice(inner.clone())
+                                }
+                                Some(FirType::Pointer(inner)) => match &**inner {
+                                    FirType::Array(elem, _) | FirType::Slice(elem) => {
+                                        FirType::Slice(elem.clone())
+                                    }
+                                    _ => FirType::Slice(Box::new(FirType::Int(IntType::I64))),
+                                },
+                                _ => FirType::Slice(Box::new(FirType::Int(IntType::I64))),
+                            }
+                        }
+                        ValueExpr::ArrayInit(elements) => {
+                            let elem_ty = elements
+                                .first()
+                                .and_then(|e| value_types.get(e))
+                                .cloned()
+                                .unwrap_or(FirType::Int(IntType::I64));
+                            FirType::Pointer(Box::new(FirType::Array(
+                                Box::new(elem_ty),
+                                elements.len() as u32,
+                            )))
+                        }
+                        ValueExpr::StructInit { name, fields } => {
+                            let st_fields = struct_defs.get(name).cloned().unwrap_or_else(|| {
+                                fields
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, f)| {
+                                        (
+                                            INTERNER.intern(&format!("f{}", i)),
+                                            value_types
+                                                .get(f)
+                                                .cloned()
+                                                .unwrap_or(FirType::Int(IntType::I64)),
+                                        )
+                                    })
+                                    .collect()
+                            });
+                            FirType::Struct(*name, st_fields)
+                        }
+                        ValueExpr::EnumInit { enum_name, .. } => {
+                            FirType::Enum(*enum_name, Vec::new())
+                        }
+                        ValueExpr::EnumGetPayload { payload_ty, .. } => payload_ty.clone(),
+                        ValueExpr::GenRef { ptr } => match value_types.get(ptr) {
+                            Some(inner) => FirType::GenerationalRef(Box::new(inner.clone())),
+                            None => FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
+                        },
+                        ValueExpr::GenDeref { ref_val } => match value_types.get(ref_val) {
+                            Some(FirType::GenerationalRef(inner)) => (**inner).clone(),
+                            _ => FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
+                        },
+                        ValueExpr::CallArenaAlloc { ty } => FirType::Pointer(Box::new(ty.clone())),
+                        ValueExpr::GenAlloc { ty, .. } => FirType::Pointer(Box::new(ty.clone())),
+                        ValueExpr::GetFieldPtr {
+                            base, field_idx, ..
+                        } => match value_types.get(base) {
+                            Some(FirType::Pointer(inner)) => match &**inner {
+                                FirType::Struct(_, fields) if *field_idx < fields.len() => {
+                                    FirType::Pointer(Box::new(fields[*field_idx].1.clone()))
+                                }
+                                _ => FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
+                            },
+                            Some(FirType::Struct(_, fields)) if *field_idx < fields.len() => {
+                                FirType::Pointer(Box::new(fields[*field_idx].1.clone()))
+                            }
+                            _ => FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
+                        },
+                        ValueExpr::GetElementPtr { base, .. } => match value_types.get(base) {
+                            Some(FirType::Array(inner, _)) | Some(FirType::Slice(inner)) => {
+                                FirType::Pointer(inner.clone())
+                            }
+                            Some(FirType::Pointer(inner)) => match &**inner {
+                                FirType::Array(elem, _) | FirType::Slice(elem) => {
+                                    FirType::Pointer(elem.clone())
+                                }
+                                _ => FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
+                            },
+                            _ => FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
+                        },
+                        _ => FirType::Int(IntType::I64),
+                    };
+                    value_types.insert(res, ty);
+                }
+            }
+        }
+        value_types
+    }
+
     /// Translate the entire FIR function into Cranelift IR.
     pub fn translate(mut self, fir_func: &FirFunction) -> Result<(), CodegenError> {
+        self.value_types = Self::compute_value_types(fir_func, self.struct_defs);
+
         // 1. Create a Cranelift block for each basic block in the FIR function
         for block in &fir_func.blocks {
             let cl_block = self.builder.create_block();
@@ -147,6 +355,8 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         mut self,
         fir_func: &FirFunction,
     ) -> Result<(), CodegenError> {
+        self.value_types = Self::compute_value_types(fir_func, self.struct_defs);
+
         // 1. Entry block receiving the frame pointer
         let entry_cl_block = self.builder.create_block();
         self.builder
@@ -471,6 +681,8 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         fir_func: &FirFunction,
         resume_fn_name: &str,
     ) -> Result<(), CodegenError> {
+        self.value_types = Self::compute_value_types(fir_func, self.struct_defs);
+
         let entry_cl_block = self.builder.create_block();
         self.builder
             .append_block_params_for_function_params(entry_cl_block);
@@ -808,9 +1020,44 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                         .declare_func_in_func(callee_id, self.builder.func);
                     let sig_ref = self.builder.func.dfg.ext_funcs[local_func].signature;
                     let expected_params = self.builder.func.dfg.signatures[sig_ref].params.clone();
+                    let expected_fir_params = self.fn_param_types.get(&fn_name);
                     let mut arg_vals = Vec::with_capacity(args.len());
                     for (i, a) in args.iter().enumerate() {
                         let mut v = self.value_map[a];
+                        let arg_fir_ty = self.value_types.get(a);
+                        let exp_fir_ty = expected_fir_params.and_then(|p| p.get(i));
+
+                        // Coerce Array to Slice if the callee expects a Slice
+                        if matches!(exp_fir_ty, Some(FirType::Slice(_))) {
+                            let is_already_slice = is_slice_or_slice_ptr(arg_fir_ty);
+                            if !is_already_slice {
+                                let arr_len = match arg_fir_ty {
+                                    Some(FirType::Array(_, len)) => *len as i64,
+                                    Some(FirType::Pointer(inner)) => match &**inner {
+                                        FirType::Array(_, len) => *len as i64,
+                                        _ => 0,
+                                    },
+                                    _ => 0,
+                                };
+                                let slot = self.builder.create_sized_stack_slot(
+                                    StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 3),
+                                );
+                                let slice_addr =
+                                    self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+                                let len_c = self.builder.ins().iconst(types::I64, arr_len);
+                                self.builder
+                                    .ins()
+                                    .store(MemFlagsData::trusted(), v, slice_addr, 0);
+                                self.builder.ins().store(
+                                    MemFlagsData::trusted(),
+                                    len_c,
+                                    slice_addr,
+                                    8,
+                                );
+                                v = slice_addr;
+                            }
+                        }
+
                         if let Some(param) = expected_params.get(i) {
                             let cur_ty = self.builder.func.dfg.value_type(v);
                             let exp_ty = param.value_type;
@@ -932,7 +1179,16 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             }
 
             ValueExpr::GetElementPtr { base, index } => {
-                let p = self.value_map[base];
+                let base_ty = self.value_types.get(base);
+                let base_addr = self.value_map[base];
+                let is_base_slice = is_slice_or_slice_ptr(base_ty);
+                let p = if is_base_slice {
+                    self.builder
+                        .ins()
+                        .load(self.ptr_type, MemFlagsData::trusted(), base_addr, 0)
+                } else {
+                    base_addr
+                };
                 let idx = self.value_map[index];
                 let scaled = self.builder.ins().imul_imm_s(idx, 8);
                 Some(self.builder.ins().iadd(p, scaled))
@@ -1097,7 +1353,53 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 None
             }
 
-            ValueExpr::BoundsCheck { .. } => None,
+            ValueExpr::BoundsCheck {
+                base,
+                index,
+                redundant,
+            } => {
+                if !redundant {
+                    let base_ty = self.value_types.get(base);
+                    let len_val = if let Some(&slen) = self.slice_lens.get(base) {
+                        Some(slen)
+                    } else if is_slice_or_slice_ptr(base_ty) {
+                        let slice_addr = self.value_map[base];
+                        Some(self.builder.ins().load(
+                            types::I64,
+                            MemFlagsData::trusted(),
+                            slice_addr,
+                            8,
+                        ))
+                    } else {
+                        match base_ty {
+                            Some(FirType::Array(_, len)) => {
+                                Some(self.builder.ins().iconst(types::I64, *len as i64))
+                            }
+                            Some(FirType::Pointer(inner)) => {
+                                if let FirType::Array(_, len) = &**inner {
+                                    Some(self.builder.ins().iconst(types::I64, *len as i64))
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    };
+
+                    if let Some(lim) = len_val {
+                        let idx = self.ensure_i64(self.value_map[index]);
+                        let lim_i64 = self.ensure_i64(lim);
+                        let is_in_bounds =
+                            self.builder
+                                .ins()
+                                .icmp(IntCC::UnsignedLessThan, idx, lim_i64);
+                        self.builder
+                            .ins()
+                            .trapz(is_in_bounds, TrapCode::unwrap_user(2));
+                    }
+                }
+                None
+            }
 
             ValueExpr::SliceBoundsCheck {
                 start,
@@ -1157,7 +1459,16 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             }
 
             ValueExpr::GetElement { base, index } => {
-                let p = self.value_map[base];
+                let base_ty = self.value_types.get(base);
+                let base_addr = self.value_map[base];
+                let is_base_slice = is_slice_or_slice_ptr(base_ty);
+                let p = if is_base_slice {
+                    self.builder
+                        .ins()
+                        .load(self.ptr_type, MemFlagsData::trusted(), base_addr, 0)
+                } else {
+                    base_addr
+                };
                 let idx = self.value_map[index];
                 let elem_scale = self.strided_slices.get(base).copied().unwrap_or(1) * 8;
                 let offset = if elem_scale > 0 && (elem_scale as u64).is_power_of_two() {
@@ -1175,7 +1486,16 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             }
 
             ValueExpr::SetElement { base, index, val } => {
-                let p = self.value_map[base];
+                let base_ty = self.value_types.get(base);
+                let base_addr = self.value_map[base];
+                let is_base_slice = is_slice_or_slice_ptr(base_ty);
+                let p = if is_base_slice {
+                    self.builder
+                        .ins()
+                        .load(self.ptr_type, MemFlagsData::trusted(), base_addr, 0)
+                } else {
+                    base_addr
+                };
                 let idx = self.value_map[index];
                 let v = self.value_map[val];
                 let elem_scale = self.strided_slices.get(base).copied().unwrap_or(1) * 8;
@@ -1561,8 +1881,31 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             }
 
             ValueExpr::ArrayLen { array } => {
-                let _ = array;
-                Some(self.builder.ins().iconst(types::I64, 0))
+                if let Some(len_val) = self.slice_lens.get(array).copied() {
+                    Some(len_val)
+                } else if is_slice_or_slice_ptr(self.value_types.get(array)) {
+                    let slice_addr = self.value_map[array];
+                    let len_val =
+                        self.builder
+                            .ins()
+                            .load(types::I64, MemFlagsData::trusted(), slice_addr, 8);
+                    Some(len_val)
+                } else {
+                    let arr_ty = self.value_types.get(array);
+                    match arr_ty {
+                        Some(FirType::Array(_, len)) => {
+                            Some(self.builder.ins().iconst(types::I64, *len as i64))
+                        }
+                        Some(FirType::Pointer(inner)) => {
+                            if let FirType::Array(_, len) = &**inner {
+                                Some(self.builder.ins().iconst(types::I64, *len as i64))
+                            } else {
+                                Some(self.builder.ins().iconst(types::I64, 0))
+                            }
+                        }
+                        _ => Some(self.builder.ins().iconst(types::I64, 0)),
+                    }
+                }
             }
 
             ValueExpr::EnumInit {
@@ -1613,13 +1956,57 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 Some(payload)
             }
 
-            ValueExpr::SliceSub { base, start, .. } => {
+            ValueExpr::SliceSub { base, start, end } => {
+                let base_ty = self.value_types.get(base).cloned();
                 let base_addr = self.value_map[base];
-                let start_idx = self.value_map[start];
-                let elem_size = self.builder.ins().iconst(self.ptr_type, 8);
-                let offset = self.builder.ins().imul(start_idx, elem_size);
-                let sub_addr = self.builder.ins().iadd(base_addr, offset);
-                Some(sub_addr)
+                let start_idx = self.ensure_i64(self.value_map[start]);
+                let end_idx = self.ensure_i64(self.value_map[end]);
+
+                let is_base_slice = is_slice_or_slice_ptr(base_ty.as_ref());
+
+                let data_ptr = if is_base_slice {
+                    self.builder
+                        .ins()
+                        .load(self.ptr_type, MemFlagsData::trusted(), base_addr, 0)
+                } else {
+                    base_addr
+                };
+
+                let elem_size = match &base_ty {
+                    Some(FirType::Array(elem, _)) | Some(FirType::Slice(elem)) => {
+                        crate::types::fir_type_byte_size(elem).max(8) as i64
+                    }
+                    Some(FirType::Pointer(inner)) => match &**inner {
+                        FirType::Array(elem, _) | FirType::Slice(elem) => {
+                            crate::types::fir_type_byte_size(elem).max(8) as i64
+                        }
+                        _ => 8,
+                    },
+                    _ => 8,
+                };
+
+                let offset = self.builder.ins().imul_imm_s(start_idx, elem_size);
+                let sub_data_ptr = self.builder.ins().iadd(data_ptr, offset);
+                let sub_len = self.builder.ins().isub(end_idx, start_idx);
+
+                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    16,
+                    3,
+                ));
+                let slice_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), sub_data_ptr, slice_addr, 0);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), sub_len, slice_addr, 8);
+
+                if let Some(res_id) = result {
+                    self.slice_lens.insert(res_id, sub_len);
+                }
+
+                Some(slice_addr)
             }
 
             ValueExpr::SliceStrided {
@@ -1628,11 +2015,20 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 stride,
                 ..
             } => {
+                let base_ty = self.value_types.get(base).cloned();
                 let base_addr = self.value_map[base];
-                let start_idx = self.value_map[start];
+                let is_base_slice = is_slice_or_slice_ptr(base_ty.as_ref());
+                let data_ptr = if is_base_slice {
+                    self.builder
+                        .ins()
+                        .load(self.ptr_type, MemFlagsData::trusted(), base_addr, 0)
+                } else {
+                    base_addr
+                };
+                let start_idx = self.ensure_i64(self.value_map[start]);
                 let elem_size = self.builder.ins().iconst(self.ptr_type, 8);
                 let offset = self.builder.ins().imul(start_idx, elem_size);
-                let sub_addr = self.builder.ins().iadd(base_addr, offset);
+                let sub_addr = self.builder.ins().iadd(data_ptr, offset);
                 if let Some(res_val) = result {
                     let st = self.constant_ints.get(stride).copied().unwrap_or(1);
                     self.strided_slices.insert(res_val, st);

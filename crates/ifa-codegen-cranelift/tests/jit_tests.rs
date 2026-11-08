@@ -906,6 +906,60 @@ fn test_cranelift_slice_pattern_matching_jit() {
 }
 
 #[test]
+fn test_cranelift_slice_pattern_matching_dynamic_tail_offset() {
+    let src = r#"
+        fn classify_slice_tail(s: Slice<i64>) -> i64 {
+            return match s {
+                [head, ..mid, penultimate, tail] => head * 1000 + penultimate * 100 + tail,
+                [first, ..rest, last] => first * 10 + last,
+                [single] => single,
+                _ => 0,
+            };
+        }
+
+        pub fn main() -> i64 {
+            let ledger: [i64; 5] = [5, 1, 2, 7, 9];
+            let window: Slice<i64> = ledger[..];
+            let val4 = classify_slice_tail(window); // 5 * 1000 + 7 * 100 + 9 = 5709
+
+            let duo: [i64; 2] = [3, 8];
+            let val2 = classify_slice_tail(duo[..]); // 3 * 10 + 8 = 38
+
+            let single: [i64; 1] = [42];
+            let val1 = classify_slice_tail(single[..]); // 42
+
+            let empty: [i64; 0] = [];
+            let val0 = classify_slice_tail(empty[..]); // 0
+
+            if val4 == 5709 && val2 == 38 && val1 == 42 && val0 == 0 {
+                return 42;
+            }
+            return 1;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("cranelift_slice_pattern_tail.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let fir_module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&fir_module)
+        .expect("Failed to compile FIR to Cranelift");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(result, 42);
+}
+
+#[test]
 fn test_cranelift_inout_pattern_destructuring() {
     let src = r#"
         struct Coord {

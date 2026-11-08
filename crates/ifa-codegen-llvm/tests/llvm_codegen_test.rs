@@ -5264,3 +5264,79 @@ fn test_llvm_strided_loop_vectorization_metadata_and_compilation() {
         let _ = std::fs::remove_file(obj_path);
     }
 }
+
+#[test]
+fn test_llvm_aot_slice_pattern_matching_dynamic_tail_offset() {
+    let src = r#"
+fn classify_slice_tail(s: Slice<i64>) -> i64 {
+    return match s {
+        [head, ..mid, penultimate, tail] => head * 1000 + penultimate * 100 + tail,
+        [first, ..rest, last] => first * 10 + last,
+        [single] => single,
+        _ => 0,
+    };
+}
+
+pub fn main() -> i64 {
+    let ledger: [i64; 5] = [5, 1, 2, 7, 9];
+    let window: Slice<i64> = ledger[..];
+    let val4 = classify_slice_tail(window); // 5 * 1000 + 7 * 100 + 9 = 5709
+
+    let duo: [i64; 2] = [3, 8];
+    let val2 = classify_slice_tail(duo[..]); // 3 * 10 + 8 = 38
+
+    let single: [i64; 1] = [42];
+    let val1 = classify_slice_tail(single[..]); // 42
+
+    let empty: [i64; 0] = [];
+    let val0 = classify_slice_tail(empty[..]); // 0
+
+    if val4 == 5709 && val2 == 38 && val1 == 42 && val0 == 0 {
+        return 42;
+    }
+    return 1;
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("slice_pattern_tail.ifa", src);
+    let tokens = tokenize(fid, src);
+    let (prog, diags) = parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let temp_dir = std::env::temp_dir().join(format!("llvm_slice_pat_tail_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("slice_tail.o");
+    let bin_path = temp_dir.join("slice_tail_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "Native binary output exit code must be 42"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
