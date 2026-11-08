@@ -274,7 +274,10 @@ fn test_concurrent_coroutines_mn_reactor_io() {
     // Process all completions concurrently
     GLOBAL_REACTOR.poll_and_wake();
     for (fid, coro) in fids {
-        GLOBAL_SCHEDULER.join_timeout(fid, Duration::from_millis(500));
+        assert!(
+            GLOBAL_SCHEDULER.join_timeout(fid, Duration::from_millis(2000)),
+            "Fiber timed out waiting for completion in M:N reactor test"
+        );
         ifa_runtime::ffi::ifa_rt_coro_destroy(coro);
     }
 

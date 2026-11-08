@@ -378,7 +378,7 @@ pub extern "C" fn ifa_rt_coro_spawn(coro: *mut IfaCoroutine) -> u64 {
             CoroStatus::Completed
         } else if res == CoroStatus::WaitingIo as i32 {
             let rc = unsafe { &mut *raw_coro };
-            let token = rc.pending_io_token.unwrap_or(0);
+            let token = rc.pending_io_token.take().unwrap_or(0);
             let slot = rc.pending_result_slot.take();
             crate::fiber::set_current_fiber_io_token(token);
             crate::fiber::set_current_fiber_result_slot(slot);
