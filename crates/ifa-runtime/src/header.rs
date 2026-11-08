@@ -224,4 +224,14 @@ impl GenRef {
                 && (header.allocation_flags & FLAG_EPOCH_1) == (self._reserved & FLAG_EPOCH_1)
         }
     }
+
+    /// Dereference the reference with full validation (active state, absence of quarantine, generation and epoch match).
+    #[inline(always)]
+    pub fn deref_checked(&self) -> Option<*mut u8> {
+        if self.is_valid() {
+            Some(self.ptr)
+        } else {
+            None
+        }
+    }
 }

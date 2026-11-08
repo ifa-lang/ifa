@@ -1395,3 +1395,184 @@ fn test_slice_and_strided_bounds_check_ffi() {
     assert_eq!(res_oob, IfaPanicKind::OutOfBounds as i32);
     ifa_rt_clear_last_panic();
 }
+
+#[test]
+fn test_voluminous_slab_allocation_cycles_and_generational_quarantine() {
+    use ifa_runtime::allocator::GLOBAL_ALLOCATOR;
+    use ifa_runtime::ffi::ifa_rt_epoch_quarantined_count;
+    use ifa_runtime::header::{GenHeader, GenRef, FLAG_EPOCH_1};
+    use std::collections::HashSet;
+
+    let test_classes = [16, 32, 64, 128, 256, 512, 1024];
+    let slots_per_class = 20;
+    let initial_quarantined = GLOBAL_ALLOCATOR.epoch_stats().quarantined_slots;
+
+    let mut all_slots: Vec<(*mut u8, usize)> = Vec::new();
+    let mut quarantined_addrs: HashSet<usize> = HashSet::new();
+    let mut stale_refs: Vec<GenRef> = Vec::new();
+
+    // 1. Initial voluminous allocation cycle across all slab size classes
+    for &size in &test_classes {
+        for _ in 0..slots_per_class {
+            let ptr = GLOBAL_ALLOCATOR.alloc(size, 8, 0);
+            assert!(!ptr.is_null());
+            all_slots.push((ptr, size));
+        }
+    }
+
+    // 2. Select a subset of slots (one per class) to undergo two full generational lifecycles to quarantine
+    let mut target_slots = Vec::new();
+    for &size in &test_classes {
+        if let Some(pos) = all_slots.iter().position(|(_, s)| *s == size) {
+            target_slots.push(all_slots.remove(pos));
+        }
+    }
+
+    let mut expected_quarantined = 0;
+
+    for (ptr, size) in target_slots {
+        unsafe {
+            let header = (ptr as *mut GenHeader).sub(1);
+            assert!((*header).is_active());
+            assert_eq!((*header).epoch_id(), 0);
+
+            // Record a valid reference before free
+            stale_refs.push(GenRef {
+                ptr,
+                remembered_gen: (*header).generation_counter,
+                arena_id: (*header).arena_id,
+                _reserved: 0,
+            });
+
+            // Force 32-bit counter overflow to Epoch 1
+            (*header).generation_counter = u32::MAX;
+        }
+
+        // Free slot -> must transition to Epoch 1
+        GLOBAL_ALLOCATOR.free(ptr);
+
+        // Reallocate from cache -> verify preserved epoch bit
+        let realloc_ptr = GLOBAL_ALLOCATOR.alloc(size, 8, 0);
+        assert!(!realloc_ptr.is_null());
+
+        unsafe {
+            let header2 = (realloc_ptr as *mut GenHeader).sub(1);
+            assert!((*header2).is_active());
+            assert_eq!((*header2).epoch_id(), 1);
+            assert_eq!((*header2).allocation_flags & FLAG_EPOCH_1, FLAG_EPOCH_1);
+
+            // Force secondary overflow on Epoch 1 -> permanent quarantine
+            (*header2).generation_counter = u32::MAX;
+            quarantined_addrs.insert(realloc_ptr as usize);
+        }
+
+        // Free slot -> secondary overflow permanently quarantines the slot
+        GLOBAL_ALLOCATOR.free(realloc_ptr);
+        expected_quarantined += 1;
+    }
+
+    // 3. Verify exact quarantine statistics in allocator and global FFI counter
+    let final_quarantined = GLOBAL_ALLOCATOR.epoch_stats().quarantined_slots;
+    assert_eq!(
+        final_quarantined,
+        initial_quarantined + expected_quarantined,
+        "Total quarantined slots must match expected count"
+    );
+    assert_eq!(
+        ifa_rt_epoch_quarantined_count(),
+        final_quarantined,
+        "FFI quarantined count must match global stats"
+    );
+
+    // 4. Stale references captured before the free MUST fail dereference validation
+    for stale_ref in &stale_refs {
+        assert!(
+            stale_ref.deref_checked().is_none(),
+            "Stale GenRef must return None upon deref_checked"
+        );
+    }
+
+    // 5. Stress test: allocate a massive burst of new slots across all classes
+    // and verify that NO newly allocated slot ever reuses a quarantined memory address!
+    let mut burst_slots = Vec::new();
+    for &size in &test_classes {
+        for _ in 0..slots_per_class * 2 {
+            let fresh_ptr = GLOBAL_ALLOCATOR.alloc(size, 8, 0);
+            assert!(!fresh_ptr.is_null());
+            assert!(
+                !quarantined_addrs.contains(&(fresh_ptr as usize)),
+                "Quarantined slot {:p} was illegally reallocated from pool!",
+                fresh_ptr
+            );
+            burst_slots.push(fresh_ptr);
+        }
+    }
+
+    // 6. Clean up active slots
+    for (ptr, _) in all_slots {
+        GLOBAL_ALLOCATOR.free(ptr);
+    }
+    for ptr in burst_slots {
+        GLOBAL_ALLOCATOR.free(ptr);
+    }
+}
+
+#[test]
+fn test_concurrent_multithreaded_slab_allocation_quarantine_cycles() {
+    use ifa_runtime::allocator::GLOBAL_ALLOCATOR;
+    use ifa_runtime::header::GenHeader;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    const NUM_THREADS: usize = 6;
+    const CYCLES_PER_THREAD: usize = 10;
+    let initial_quarantined = GLOBAL_ALLOCATOR.epoch_stats().quarantined_slots;
+    let quarantined_counter = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..NUM_THREADS {
+        let q_cnt = Arc::clone(&quarantined_counter);
+        handles.push(thread::spawn(move || {
+            let sizes = [32, 64, 128, 256];
+            for i in 0..CYCLES_PER_THREAD {
+                let size = sizes[i % sizes.len()];
+                // 1. Allocate slot
+                let ptr = GLOBAL_ALLOCATOR.alloc(size, 8, 0);
+                assert!(!ptr.is_null());
+
+                // 2. Force Epoch 1 overflow
+                unsafe {
+                    let header = (ptr as *mut GenHeader).sub(1);
+                    (*header).generation_counter = u32::MAX;
+                }
+                GLOBAL_ALLOCATOR.free(ptr);
+
+                // 3. Reallocate and force quarantine
+                let ptr2 = GLOBAL_ALLOCATOR.alloc(size, 8, 0);
+                assert!(!ptr2.is_null());
+
+                unsafe {
+                    let header2 = (ptr2 as *mut GenHeader).sub(1);
+                    (*header2).generation_counter = u32::MAX;
+                }
+                GLOBAL_ALLOCATOR.free(ptr2);
+                q_cnt.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join()
+            .expect("Worker thread panicked during concurrent quarantine cycle");
+    }
+
+    let final_quarantined = GLOBAL_ALLOCATOR.epoch_stats().quarantined_slots;
+    let threads_quarantined = quarantined_counter.load(Ordering::Relaxed);
+    assert!(
+        final_quarantined >= initial_quarantined + threads_quarantined,
+        "Final quarantined count {} must account for all thread retirements {}",
+        final_quarantined,
+        threads_quarantined
+    );
+}

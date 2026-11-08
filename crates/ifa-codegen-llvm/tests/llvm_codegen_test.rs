@@ -4782,3 +4782,191 @@ fn test_strided_bounds_check_and_simd_reductions_llvm() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_coroutine_generator_stream_licm_gen_check_elimination() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BlockId, FirFunction, FirModule, FirParam, FirType, Instruction, LicmPass, ParamMode,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+    use std::fs;
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let fn_name = INTERNER.intern("coro_stream_licm_gen");
+    let param = FirParam {
+        name: INTERNER.intern("buffer_ref"),
+        val: ValueId(0),
+        ty: FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
+        mode: ParamMode::In,
+        noalias: true,
+    };
+
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![param],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+
+    let b_entry = BlockId(0);
+    let b_preheader = func.alloc_block();
+    let b_header = func.alloc_block();
+    let b_body = func.alloc_block();
+    let b_exit = func.alloc_block();
+
+    func.get_block_mut(b_entry)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_preheader,
+            args: Vec::new(),
+        });
+    func.get_block_mut(b_preheader)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_header,
+            args: Vec::new(),
+        });
+
+    let v_cond = func.alloc_value();
+    func.get_block_mut(b_header)
+        .unwrap()
+        .set_terminator(Terminator::BranchCond {
+            cond: v_cond,
+            then_block: b_body,
+            then_args: Vec::new(),
+            else_block: b_exit,
+            else_args: Vec::new(),
+        });
+
+    let v_gen_ref = func.alloc_value();
+    let v_deref = func.alloc_value();
+    let v_load = func.alloc_value();
+
+    let body_bb = func.get_block_mut(b_body).unwrap();
+    // Invariant GenRef and GenCheck in coroutine loop
+    body_bb.push_instruction(Instruction::new(
+        Some(v_gen_ref),
+        ValueExpr::GenRef { ptr: ValueId(0) },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: v_gen_ref,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        Some(v_deref),
+        ValueExpr::GenDeref { ref_val: v_gen_ref },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        Some(v_load),
+        ValueExpr::Load { ptr: v_deref },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::YieldValue { val: v_load },
+        Span::DUMMY,
+    ));
+    body_bb.set_terminator(Terminator::Branch {
+        target: b_header,
+        args: Vec::new(),
+    });
+
+    func.get_block_mut(b_exit)
+        .unwrap()
+        .set_terminator(Terminator::Return(None));
+
+    // Run LICM pass on the coroutine function
+    let mut licm = LicmPass::new();
+    licm.run_on_function(&mut func);
+
+    let stats = licm.stats();
+    assert_eq!(
+        stats.hoisted_gen_checks, 1,
+        "GenCheck must be hoisted into preheader: {:?}",
+        stats
+    );
+    assert_eq!(
+        stats.hoisted_gen_refs, 1,
+        "GenRef must be hoisted into preheader: {:?}",
+        stats
+    );
+
+    let module = FirModule {
+        name: INTERNER.intern("coro_licm_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    // 1. Verify LLVM Coroutine Intrinsics are declared and used
+    assert!(
+        ir.contains("call token @llvm.coro.id("),
+        "Must call @llvm.coro.id:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("call ptr @llvm.coro.begin("),
+        "Must call @llvm.coro.begin:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("call i8 @llvm.coro.suspend("),
+        "Must call @llvm.coro.suspend:\n{}",
+        ir
+    );
+
+    // 2. Verify that in the loop preheader (bb1), the hoisted check @ifa_rt_gen_check is emitted
+    assert!(
+        ir.contains("call void @ifa_rt_gen_check("),
+        "LLVM IR must contain @ifa_rt_gen_check in the preheader:\n{}",
+        ir
+    );
+
+    // 3. Verify that the loop body block where suspension occurs does NOT contain dynamic gen_check
+    if let Some(b3_idx) = ir.find("bb3:") {
+        let after_b3 = &ir[b3_idx..];
+        let b3_end = after_b3.find("br label %bb2").unwrap_or(after_b3.len());
+        let b3_body = &after_b3[..b3_end];
+        assert!(
+            !b3_body.contains("@ifa_rt_gen_check"),
+            "Coroutine loop body must NOT contain dynamic @ifa_rt_gen_check call after LICM hoisting:\n{}",
+            b3_body
+        );
+    }
+
+    // 4. Verify native compilation to object file succeeds
+    let temp_dir = std::env::temp_dir().join(format!("llvm_coro_licm_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("coro_licm.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        res.is_ok(),
+        "Native compilation of coroutine with LICM-eliminated gen_check failed: {:?}",
+        res.err()
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

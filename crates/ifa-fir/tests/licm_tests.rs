@@ -990,3 +990,317 @@ fn test_licm_disjoint_symbolic_subslice_hoisting() {
         .unwrap();
     assert_eq!(res, FirValue::Int(210));
 }
+
+#[test]
+fn test_licm_coroutine_loop_hoists_gen_ref_and_gen_check() {
+    use ifa_ast::ParamMode;
+    use ifa_fir::ir::*;
+    use ifa_fir::types::FirType;
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("coro_stream_generator");
+    let param = FirParam {
+        name: INTERNER.intern("base_ptr"),
+        val: ValueId(0),
+        ty: FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
+        mode: ParamMode::In,
+        noalias: true,
+    };
+
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![param],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+
+    let b_entry = BlockId(0);
+    let b_preheader = func.alloc_block();
+    let b_header = func.alloc_block();
+    let b_body = func.alloc_block();
+    let b_exit = func.alloc_block();
+
+    func.get_block_mut(b_entry)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_preheader,
+            args: Vec::new(),
+        });
+    func.get_block_mut(b_preheader)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_header,
+            args: Vec::new(),
+        });
+
+    let v_cond = func.alloc_value();
+    func.get_block_mut(b_header)
+        .unwrap()
+        .set_terminator(Terminator::BranchCond {
+            cond: v_cond,
+            then_block: b_body,
+            then_args: Vec::new(),
+            else_block: b_exit,
+            else_args: Vec::new(),
+        });
+
+    let v_gen_ref = func.alloc_value();
+    let v_deref = func.alloc_value();
+    let v_load = func.alloc_value();
+
+    let body_bb = func.get_block_mut(b_body).unwrap();
+    // 1. Invariant GenRef on base_ptr
+    body_bb.push_instruction(Instruction::new(
+        Some(v_gen_ref),
+        ValueExpr::GenRef { ptr: ValueId(0) },
+        Span::DUMMY,
+    ));
+    // 2. Invariant GenCheck on v_gen_ref
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: v_gen_ref,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    // 3. Dereference and load
+    body_bb.push_instruction(Instruction::new(
+        Some(v_deref),
+        ValueExpr::GenDeref { ref_val: v_gen_ref },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        Some(v_load),
+        ValueExpr::Load { ptr: v_deref },
+        Span::DUMMY,
+    ));
+    // 4. Yield value (coroutine suspension)
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::YieldValue { val: v_load },
+        Span::DUMMY,
+    ));
+    body_bb.set_terminator(Terminator::Branch {
+        target: b_header,
+        args: Vec::new(),
+    });
+
+    func.get_block_mut(b_exit)
+        .unwrap()
+        .set_terminator(Terminator::Return(None));
+
+    let mut licm = LicmPass::new();
+    licm.run_on_function(&mut func);
+
+    let stats = licm.stats();
+    assert_eq!(
+        stats.hoisted_gen_refs, 1,
+        "GenRef must be hoisted out of coroutine loop: {:?}",
+        stats
+    );
+    assert_eq!(
+        stats.hoisted_gen_checks, 1,
+        "GenCheck must be hoisted out of coroutine loop into preheader: {:?}",
+        stats
+    );
+    assert_eq!(
+        stats.hoisted_loads, 1,
+        "Load must be hoisted out of coroutine loop across yields: {:?}",
+        stats
+    );
+    assert!(
+        stats.loops_optimized >= 1,
+        "Coroutine loop must be marked as optimized: {:?}",
+        stats
+    );
+
+    // Verify preheader contains hoisted GenRef and GenCheck
+    let preheader = func.get_block(b_preheader).unwrap();
+    let has_hoisted_ref = preheader
+        .instructions
+        .iter()
+        .any(|i| matches!(i.expr, ValueExpr::GenRef { .. }));
+    let has_hoisted_chk = preheader.instructions.iter().any(|i| {
+        matches!(
+            i.expr,
+            ValueExpr::GenCheck {
+                redundant: false,
+                ..
+            }
+        )
+    });
+    assert!(
+        has_hoisted_ref,
+        "Preheader must contain hoisted GenRef: {:?}",
+        preheader.instructions
+    );
+    assert!(
+        has_hoisted_chk,
+        "Preheader must contain hoisted GenCheck: {:?}",
+        preheader.instructions
+    );
+
+    // Verify loop body contains NO active GenCheck
+    let body = func.get_block(b_body).unwrap();
+    let active_check_in_body = body.instructions.iter().any(|i| {
+        matches!(
+            i.expr,
+            ValueExpr::GenCheck {
+                redundant: false,
+                ..
+            }
+        )
+    });
+    assert!(
+        !active_check_in_body,
+        "Coroutine loop body must contain zero active GenCheck instructions: {:?}",
+        body.instructions
+    );
+}
+
+#[test]
+fn test_licm_coroutine_generator_stream_multiple_checks_deduplication() {
+    use ifa_ast::ParamMode;
+    use ifa_fir::ir::*;
+    use ifa_fir::types::FirType;
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("coro_multi_chk_stream");
+    let param = FirParam {
+        name: INTERNER.intern("stream_ref"),
+        val: ValueId(0),
+        ty: FirType::GenerationalRef(Box::new(FirType::Int(IntType::I64))),
+        mode: ParamMode::In,
+        noalias: true,
+    };
+
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![param],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+
+    let b_entry = BlockId(0);
+    let b_preheader = func.alloc_block();
+    let b_header = func.alloc_block();
+    let b_body = func.alloc_block();
+    let b_exit = func.alloc_block();
+
+    func.get_block_mut(b_entry)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_preheader,
+            args: Vec::new(),
+        });
+    func.get_block_mut(b_preheader)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_header,
+            args: Vec::new(),
+        });
+
+    let v_cond = func.alloc_value();
+    func.get_block_mut(b_header)
+        .unwrap()
+        .set_terminator(Terminator::BranchCond {
+            cond: v_cond,
+            then_block: b_body,
+            then_args: Vec::new(),
+            else_block: b_exit,
+            else_args: Vec::new(),
+        });
+
+    let body_bb = func.get_block_mut(b_body).unwrap();
+    // Two redundant checks on invariant parameter stream_ref in generator loop
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: ValueId(0),
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: ValueId(0),
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_bb.set_terminator(Terminator::Branch {
+        target: b_header,
+        args: Vec::new(),
+    });
+
+    func.get_block_mut(b_exit)
+        .unwrap()
+        .set_terminator(Terminator::Return(None));
+
+    let mut licm = LicmPass::new();
+    licm.run_on_function(&mut func);
+
+    let stats = licm.stats();
+    assert!(
+        stats.hoisted_gen_checks >= 1,
+        "At least one GenCheck must be hoisted: {:?}",
+        stats
+    );
+
+    // Preheader must have exactly 1 hoisted GenCheck
+    let preheader = func.get_block(b_preheader).unwrap();
+    let chk_count = preheader
+        .instructions
+        .iter()
+        .filter(|i| {
+            matches!(
+                i.expr,
+                ValueExpr::GenCheck {
+                    redundant: false,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        chk_count, 1,
+        "Preheader must contain exactly 1 hoisted GenCheck: {:?}",
+        preheader.instructions
+    );
+
+    // Loop body must have 0 active GenChecks
+    let body = func.get_block(b_body).unwrap();
+    let active_checks = body
+        .instructions
+        .iter()
+        .filter(|i| {
+            matches!(
+                i.expr,
+                ValueExpr::GenCheck {
+                    redundant: false,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        active_checks, 0,
+        "Loop body must have 0 active checks: {:?}",
+        body.instructions
+    );
+}

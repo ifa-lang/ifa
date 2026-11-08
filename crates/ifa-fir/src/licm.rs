@@ -18,6 +18,8 @@ pub struct LicmStats {
     pub hoisted_allocs: usize,
     /// Total number of invariant generational reference instructions hoisted out of loops.
     pub hoisted_gen_refs: usize,
+    /// Total number of invariant generational check instructions hoisted out of loops.
+    pub hoisted_gen_checks: usize,
     /// Total number of partial aliases eliminated on disjoint composite paths.
     pub eliminated_partial_aliases: usize,
     /// Total number of pure invariant arithmetic operations hoisted out of loops.
@@ -37,6 +39,7 @@ impl LicmStats {
             + self.hoisted_bounds_checks
             + self.hoisted_allocs
             + self.hoisted_gen_refs
+            + self.hoisted_gen_checks
             + self.eliminated_partial_aliases
             + self.hoisted_pure_ops
             + self.inter_loop_hoisted
@@ -377,6 +380,9 @@ fn resolve_access_path(
                 path.segments.push(FirPathSegment::Deref);
                 return path;
             }
+            ValueExpr::GenRef { ptr } => {
+                return resolve_access_path(*ptr, inst_defs, constants, depth + 1);
+            }
             _ => {}
         }
     }
@@ -574,10 +580,12 @@ impl LicmPass {
                                 }
                                 ValueExpr::Call { .. }
                                 | ValueExpr::BlockingCallDirect { .. }
-                                | ValueExpr::Spawn { .. }
-                                | ValueExpr::Yield
-                                | ValueExpr::YieldValue { .. } => {
+                                | ValueExpr::Spawn { .. } => {
                                     has_impure_call = true;
+                                }
+                                ValueExpr::Yield | ValueExpr::YieldValue { .. } => {
+                                    // Coroutine cooperative suspension point: state is suspended/resumed
+                                    // without writing to arbitrary heap memory paths or freeing allocations.
                                 }
                                 _ => {}
                             }
@@ -1002,6 +1010,26 @@ impl LicmPass {
                                                 break;
                                             }
                                         }
+                                        ValueExpr::GenCheck { ref_val, redundant }
+                                            if !*redundant && func.is_coroutine() =>
+                                        {
+                                            let ref_path = resolve_access_path(
+                                                *ref_val, &inst_defs, &constants, 0,
+                                            );
+                                            let interfering_free = loop_has_gen_free
+                                                && written_paths
+                                                    .iter()
+                                                    .any(|w| ref_path.overlaps(w));
+                                            let is_safe_ref = !has_impure_call
+                                                && !interfering_free
+                                                && !written_paths
+                                                    .iter()
+                                                    .any(|w| ref_path.overlaps(w));
+                                            if is_safe_ref {
+                                                to_hoist.push((b_id, i_idx, inst.clone()));
+                                                break;
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -1046,6 +1074,7 @@ impl LicmPass {
                             &inst.expr,
                             ValueExpr::BoundsCheck { .. } | ValueExpr::SliceBoundsCheck { .. }
                         );
+                        let is_gen_check = matches!(&inst.expr, ValueExpr::GenCheck { .. });
 
                         let is_from_nested_loop = natural_loops.iter().any(|other| {
                             other.header != loop_info.header && other.blocks.contains(&src_block_id)
@@ -1106,6 +1135,52 @@ impl LicmPass {
                                     self.stats.matrix_kernels_hoisted += 1;
                                 }
                                 loop_optimized = true;
+                            }
+                        } else if is_gen_check {
+                            if let ValueExpr::GenCheck { ref_val, .. } = &inst.expr {
+                                let already_in_preheader =
+                                    func.get_block(preheader_id).is_some_and(|pb| {
+                                        pb.instructions.iter().any(|existing| {
+                                            matches!(
+                                                &existing.expr,
+                                                ValueExpr::GenCheck { ref_val: r, .. } if r == ref_val
+                                            )
+                                        })
+                                    });
+
+                                if !already_in_preheader {
+                                    if let Some(pre_b) = func.get_block_mut(preheader_id) {
+                                        pre_b.instructions.push(inst.clone());
+                                        self.stats.hoisted_gen_checks += 1;
+                                        if is_inter_loop {
+                                            self.stats.inter_loop_hoisted += 1;
+                                        }
+                                        loop_optimized = true;
+                                    }
+                                } else {
+                                    self.stats.hoisted_gen_checks += 1;
+                                    if is_inter_loop {
+                                        self.stats.inter_loop_hoisted += 1;
+                                    }
+                                    loop_optimized = true;
+                                }
+
+                                // Mark any matching GenCheck in loop blocks as redundant
+                                for &b in &loop_info.blocks {
+                                    if let Some(blk) = func.get_block_mut(b) {
+                                        for in_i in &mut blk.instructions {
+                                            if let ValueExpr::GenCheck {
+                                                ref_val: r,
+                                                redundant,
+                                            } = &mut in_i.expr
+                                            {
+                                                if r == ref_val {
+                                                    *redundant = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         } else if let Some(pre_b) = func.get_block_mut(preheader_id) {
                             pre_b.instructions.push(inst);
