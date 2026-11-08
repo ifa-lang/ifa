@@ -616,6 +616,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static PANIC_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_bare_metal_stack_trace_capture() {
@@ -643,6 +646,7 @@ mod tests {
 
     #[test]
     fn test_catch_panic_uaf_interception() {
+        let _guard = PANIC_TEST_MUTEX.lock().unwrap();
         let res = catch_panic(|| {
             let rec = IfaPanicRecord::new_uaf(0x1000, 10, 11, 1);
             dispatch_panic(rec);
@@ -659,6 +663,7 @@ mod tests {
 
     #[test]
     fn test_catch_panic_double_free_interception() {
+        let _guard = PANIC_TEST_MUTEX.lock().unwrap();
         let res = catch_panic(|| {
             let rec = IfaPanicRecord::new_double_free(0x2000, 2);
             dispatch_panic(rec);
@@ -673,6 +678,7 @@ mod tests {
 
     #[test]
     fn test_catch_panic_epoch_mismatch_interception() {
+        let _guard = PANIC_TEST_MUTEX.lock().unwrap();
         let res = catch_panic(|| {
             let rec = IfaPanicRecord::new_epoch_mismatch(0x3000, 0x0000, 0x0020, 3);
             dispatch_panic(rec);
@@ -700,6 +706,7 @@ mod tests {
 
     #[test]
     fn test_custom_panic_handler_hook() {
+        let _guard = PANIC_TEST_MUTEX.lock().unwrap();
         set_panic_handler(Some(custom_hook));
         HOOK_CALLED.store(false, Ordering::SeqCst);
         HOOK_KIND.store(0, Ordering::SeqCst);
