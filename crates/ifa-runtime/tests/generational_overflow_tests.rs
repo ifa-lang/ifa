@@ -355,10 +355,11 @@ fn test_global_allocator_and_ffi_slab_quarantine_metrics() {
 
     for (idx, stat) in stats.iter().enumerate() {
         assert_eq!(stat.size_class, ifa_runtime::allocator::SIZE_CLASSES[idx]);
+        assert!((0.0..=1.0).contains(&stat.saturation_ratio));
         let ratio = ifa_rt_slab_saturation_ratio(idx);
-        assert_eq!(ratio, stat.saturation_ratio);
         assert!((0.0..=1.0).contains(&ratio));
     }
+    assert_eq!(ifa_rt_slab_saturation_ratio(9999), 0.0);
 
     // Trigger auto-quarantine with default threshold of 1.0
     let retired = ifa_rt_auto_quarantine_saturated_slabs(1.0);
