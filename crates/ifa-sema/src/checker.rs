@@ -151,6 +151,7 @@ impl<'a> SemanticAnalyzer<'a> {
         self.check_program_bodies(program);
 
         self.symbols.expr_types = self.expr_types;
+        self.symbols.close_generic_struct_instances();
 
         (self.symbols, self.diagnostics)
     }
@@ -520,7 +521,52 @@ impl<'a> SemanticAnalyzer<'a> {
         let known_structs = self.get_known_struct_types();
         let known_enums = self.get_known_enum_types();
 
-        let target_ty = match Type::from_ast(&im.target_ty, &known_structs, &known_enums) {
+        let mut impl_generics = im.generics.clone();
+        if let ifa_ast::TypeKind::Generic(_, ref args) = im.target_ty.kind {
+            for arg in args {
+                if let ifa_ast::TypeKind::Named(s) = arg.kind {
+                    let s_str = INTERNER.resolve(&s);
+                    let is_primitive = matches!(
+                        s_str.as_str(),
+                        "bool"
+                            | "u8"
+                            | "u16"
+                            | "u32"
+                            | "u64"
+                            | "usize"
+                            | "i8"
+                            | "i16"
+                            | "i32"
+                            | "i64"
+                            | "isize"
+                            | "f32"
+                            | "f64"
+                            | "char"
+                            | "str"
+                            | "String"
+                            | "void"
+                    );
+                    if !is_primitive
+                        && !known_structs.contains_key(&s)
+                        && !known_enums.contains_key(&s)
+                        && !impl_generics.iter().any(|g| g.name == s)
+                    {
+                        impl_generics.push(ifa_ast::GenericParam {
+                            name: s,
+                            bounds: Vec::new(),
+                            span: arg.span,
+                        });
+                    }
+                }
+            }
+        }
+
+        let target_ty = match Type::from_ast_with_generics(
+            &im.target_ty,
+            &known_structs,
+            &known_enums,
+            &impl_generics,
+        ) {
             Ok(t) => t,
             Err(d) => {
                 self.diagnostics.push(d);
@@ -530,6 +576,7 @@ impl<'a> SemanticAnalyzer<'a> {
 
         let target_sym = match &im.target_ty.kind {
             ifa_ast::TypeKind::Named(s) => Some(*s),
+            ifa_ast::TypeKind::Generic(s, _) => Some(*s),
             _ => match &target_ty {
                 Type::Struct { name, .. } => Some(*name),
                 Type::Generic { name, .. } => Some(*name),
@@ -538,23 +585,42 @@ impl<'a> SemanticAnalyzer<'a> {
         };
 
         if let Some(tr_name) = im.trait_name {
-            self.symbols.register_trait_impl(tr_name, target_ty);
+            self.symbols.register_trait_impl(tr_name, target_ty.clone());
         }
 
         // Register each method in impl block into symbol table
         for f in &im.methods {
+            let mut combined_generics = impl_generics.clone();
+            for g in &f.generics {
+                if !combined_generics.iter().any(|cg| cg.name == g.name) {
+                    combined_generics.push(g.clone());
+                }
+            }
+
             let mut params = Vec::new();
             for p in &f.params {
-                let ty = match Type::from_ast_with_generics(
-                    &p.ty,
-                    &known_structs,
-                    &known_enums,
-                    &f.generics,
-                ) {
-                    Ok(t) => t,
-                    Err(d) => {
-                        self.diagnostics.push(d);
-                        Type::Unknown
+                let is_self = INTERNER.resolve(&p.name) == "self";
+                let is_auto = match &p.ty.kind {
+                    ifa_ast::TypeKind::Named(s) => {
+                        let name = INTERNER.resolve(s);
+                        name == "auto" || name == "Self"
+                    }
+                    _ => false,
+                };
+                let ty = if is_self && is_auto {
+                    target_ty.clone()
+                } else {
+                    match Type::from_ast_with_generics(
+                        &p.ty,
+                        &known_structs,
+                        &known_enums,
+                        &combined_generics,
+                    ) {
+                        Ok(t) => t,
+                        Err(d) => {
+                            self.diagnostics.push(d);
+                            Type::Unknown
+                        }
                     }
                 };
                 params.push(ParamSymbol {
@@ -566,13 +632,13 @@ impl<'a> SemanticAnalyzer<'a> {
             }
 
             let ret_ty = if let Some(ret) = &f.ret_ty {
-                Type::from_ast_with_generics(ret, &known_structs, &known_enums, &f.generics)
+                Type::from_ast_with_generics(ret, &known_structs, &known_enums, &combined_generics)
                     .unwrap_or(Type::Unit)
             } else {
                 Type::Unit
             };
 
-            if f.generics.is_empty() {
+            if combined_generics.is_empty() {
                 for p in &params {
                     self.symbols.register_type_if_generic_instance(&p.ty);
                 }
@@ -585,7 +651,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 is_strict: f.is_strict,
                 is_comptime: f.is_comptime,
                 is_extern: f.is_extern.clone(),
-                generics: f.generics.clone(),
+                generics: combined_generics.clone(),
                 params: params.clone(),
                 ret_ty: ret_ty.clone(),
                 span: f.span,
@@ -604,7 +670,7 @@ impl<'a> SemanticAnalyzer<'a> {
                     is_strict: f.is_strict,
                     is_comptime: f.is_comptime,
                     is_extern: f.is_extern.clone(),
-                    generics: f.generics.clone(),
+                    generics: combined_generics.clone(),
                     params,
                     ret_ty,
                     span: f.span,
@@ -637,8 +703,63 @@ impl<'a> SemanticAnalyzer<'a> {
                 Item::Function(f) => self.check_function(f),
                 Item::Const(c) => self.check_const(c),
                 Item::Impl(im) => {
+                    let known_structs = self.get_known_struct_types();
+                    let known_enums = self.get_known_enum_types();
+                    let mut impl_generics = im.generics.clone();
+                    if let ifa_ast::TypeKind::Generic(_, ref args) = im.target_ty.kind {
+                        for arg in args {
+                            if let ifa_ast::TypeKind::Named(s) = arg.kind {
+                                let s_str = INTERNER.resolve(&s);
+                                let is_primitive = matches!(
+                                    s_str.as_str(),
+                                    "bool"
+                                        | "u8"
+                                        | "u16"
+                                        | "u32"
+                                        | "u64"
+                                        | "usize"
+                                        | "i8"
+                                        | "i16"
+                                        | "i32"
+                                        | "i64"
+                                        | "isize"
+                                        | "f32"
+                                        | "f64"
+                                        | "char"
+                                        | "str"
+                                        | "String"
+                                        | "void"
+                                );
+                                if !is_primitive
+                                    && !known_structs.contains_key(&s)
+                                    && !known_enums.contains_key(&s)
+                                    && !impl_generics.iter().any(|g| g.name == s)
+                                {
+                                    impl_generics.push(ifa_ast::GenericParam {
+                                        name: s,
+                                        bounds: Vec::new(),
+                                        span: arg.span,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    let target_ty = Type::from_ast_with_generics(
+                        &im.target_ty,
+                        &known_structs,
+                        &known_enums,
+                        &impl_generics,
+                    )
+                    .unwrap_or(Type::Unknown);
+
                     for m in &im.methods {
-                        self.check_function(m);
+                        let mut combined_generics = impl_generics.clone();
+                        for g in &m.generics {
+                            if !combined_generics.iter().any(|cg| cg.name == g.name) {
+                                combined_generics.push(g.clone());
+                            }
+                        }
+                        self.check_method(m, &target_ty, &combined_generics);
                     }
                 }
                 _ => {}
@@ -728,6 +849,93 @@ impl<'a> SemanticAnalyzer<'a> {
                 let ty =
                     Type::from_ast_with_generics(&p.ty, &known_structs, &known_enums, &f.generics)
                         .unwrap_or(Type::Unknown);
+                ParamSymbol {
+                    mode: p.mode,
+                    name: p.name,
+                    ty,
+                    span: p.span,
+                }
+            })
+            .collect();
+
+        for p in fn_params {
+            let is_mut = matches!(p.mode, ParamMode::Mut | ParamMode::InOut);
+            self.expr_types.insert(p.span, p.ty.clone());
+            if let Err(diag) =
+                self.symbols
+                    .define_variable(p.name, p.ty, is_mut, true, Some(p.mode), p.span)
+            {
+                self.diagnostics.push(diag);
+            }
+        }
+
+        // Check function body if present
+        if let Some(body) = &f.body {
+            self.check_block(body, Some(&ret_ty));
+        }
+
+        self.symbols.exit_scope();
+        self.current_func_ret_ty = prev_ret;
+        self.current_func_is_strict = prev_strict;
+        self.moved_vars = prev_moved;
+        self.current_func_generics = prev_generics;
+    }
+
+    fn check_method(
+        &mut self,
+        f: &Function,
+        target_ty: &Type,
+        combined_generics: &[ifa_ast::GenericParam],
+    ) {
+        // Run escape analysis on this function
+        let mut escape_analyzer = EscapeAnalyzer::new(&self.symbols, f.is_strict, f.span);
+        escape_analyzer.check_function(f);
+        self.diagnostics.extend(escape_analyzer.diagnostics);
+
+        let known_structs = self.get_known_struct_types();
+        let known_enums = self.get_known_enum_types();
+        let ret_ty = if let Some(ret) = &f.ret_ty {
+            Type::from_ast_with_generics(ret, &known_structs, &known_enums, combined_generics)
+                .unwrap_or(Type::Unit)
+        } else {
+            Type::Unit
+        };
+
+        let prev_ret = self.current_func_ret_ty.take();
+        let prev_strict = self.current_func_is_strict;
+        let prev_moved = std::mem::take(&mut self.moved_vars);
+        let prev_generics =
+            std::mem::replace(&mut self.current_func_generics, combined_generics.to_vec());
+        self.current_func_ret_ty = Some(ret_ty.clone());
+        self.current_func_is_strict = f.is_strict;
+
+        // Enter function root scope
+        self.symbols.enter_scope(false, true);
+
+        // Register parameters as variables in the function scope
+        let fn_params: Vec<ParamSymbol> = f
+            .params
+            .iter()
+            .map(|p| {
+                let is_self = INTERNER.resolve(&p.name) == "self";
+                let is_auto = match &p.ty.kind {
+                    ifa_ast::TypeKind::Named(s) => {
+                        let name = INTERNER.resolve(s);
+                        name == "auto" || name == "Self"
+                    }
+                    _ => false,
+                };
+                let ty = if is_self && is_auto {
+                    target_ty.clone()
+                } else {
+                    Type::from_ast_with_generics(
+                        &p.ty,
+                        &known_structs,
+                        &known_enums,
+                        combined_generics,
+                    )
+                    .unwrap_or(Type::Unknown)
+                };
                 ParamSymbol {
                     mode: p.mode,
                     name: p.name,
@@ -4666,17 +4874,81 @@ impl<'a> SemanticAnalyzer<'a> {
 
         if let Some(st_sym) = rec_struct_sym {
             if let Some(f) = self.symbols.lookup_type_method(&st_sym, &method).cloned() {
-                let mangled_name = INTERNER.intern(&format!(
-                    "{}__{}",
-                    INTERNER.resolve(&st_sym),
-                    INTERNER.resolve(&method)
-                ));
-                self.symbols.method_resolutions.insert(span, mangled_name);
+                let (target_call_name, type_subst_for_method) =
+                    if let Type::Generic { name: _, ref args } = cur_ty {
+                        let mangled_st = crate::types::mangle_instantiation_symbol(
+                            &INTERNER.resolve(&st_sym),
+                            args,
+                        );
+                        let specialized_name = INTERNER.intern(&format!(
+                            "{}__{}",
+                            INTERNER.resolve(&mangled_st),
+                            INTERNER.resolve(&method)
+                        ));
+
+                        let mut subst = HashMap::new();
+                        if let Some(st_def) = self.symbols.lookup_struct(&st_sym) {
+                            for (g, concrete) in st_def.generics.iter().zip(args.iter()) {
+                                subst.insert(g.name, concrete.clone());
+                            }
+                        }
+
+                        let base_mangled_method = INTERNER.intern(&format!(
+                            "{}__{}",
+                            INTERNER.resolve(&st_sym),
+                            INTERNER.resolve(&method)
+                        ));
+                        self.symbols
+                            .record_generic_function_instance(base_mangled_method, args.clone());
+
+                        (specialized_name, subst)
+                    } else {
+                        let mangled_name = INTERNER.intern(&format!(
+                            "{}__{}",
+                            INTERNER.resolve(&st_sym),
+                            INTERNER.resolve(&method)
+                        ));
+                        (mangled_name, HashMap::new())
+                    };
+
+                self.symbols
+                    .method_resolutions
+                    .insert(span, target_call_name);
+
+                let substituted_f = if !type_subst_for_method.is_empty() {
+                    FunctionSymbol {
+                        name: f.name,
+                        is_pub: f.is_pub,
+                        is_strict: f.is_strict,
+                        is_comptime: f.is_comptime,
+                        is_extern: f.is_extern.clone(),
+                        generics: f
+                            .generics
+                            .iter()
+                            .filter(|g| !type_subst_for_method.contains_key(&g.name))
+                            .cloned()
+                            .collect(),
+                        params: f
+                            .params
+                            .iter()
+                            .map(|p| ParamSymbol {
+                                mode: p.mode,
+                                name: p.name,
+                                ty: p.ty.substitute(&type_subst_for_method),
+                                span: p.span,
+                            })
+                            .collect(),
+                        ret_ty: f.ret_ty.substitute(&type_subst_for_method),
+                        span: f.span,
+                    }
+                } else {
+                    f
+                };
 
                 let mut full_args = Vec::with_capacity(args.len() + 1);
                 full_args.push(Arg::positional(receiver.clone()));
                 full_args.extend_from_slice(args);
-                let ret = self.check_function_call(&f, &full_args, safe, span);
+                let ret = self.check_function_call(&substituted_f, &full_args, safe, span);
                 return wrap_optional(ret);
             }
         }

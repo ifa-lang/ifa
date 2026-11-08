@@ -932,6 +932,57 @@ impl<'a> FunctionLoweringContext<'a> {
         }
     }
 
+    fn is_method_receiver_inout(&self, receiver: &Expr, method: Symbol, span: Span) -> bool {
+        let target_fn_name = self.resolve_method_call_target(receiver, method, span);
+
+        if let Some(fn_sym) = self.symbols.lookup_function(&target_fn_name) {
+            if let Some(first_p) = fn_sym.params.first() {
+                return first_p.mode == ifa_ast::ParamMode::InOut;
+            }
+        }
+
+        if let Some(fn_sym) = self.symbols.lookup_function(&method) {
+            if let Some(first_p) = fn_sym.params.first() {
+                return first_p.mode == ifa_ast::ParamMode::InOut;
+            }
+        }
+
+        let rec_fir_ty = self.infer_expr_fir_type(receiver);
+        if let Some(mut cur) = rec_fir_ty.as_ref() {
+            while let FirType::GenerationalRef(inner)
+            | FirType::Pointer(inner)
+            | FirType::Optional(inner) = cur
+            {
+                cur = inner;
+            }
+            if let FirType::Struct(name, _) = cur {
+                let name_str = INTERNER.resolve(name);
+                let base_name = name_str.split("__").next().unwrap_or(&name_str);
+                let base_sym = INTERNER.intern(base_name);
+
+                if let Some(fn_sym) = self.symbols.lookup_type_method(&base_sym, &method) {
+                    if let Some(first_p) = fn_sym.params.first() {
+                        return first_p.mode == ifa_ast::ParamMode::InOut;
+                    }
+                }
+                if let Some(fn_sym) = self.symbols.lookup_type_method(name, &method) {
+                    if let Some(first_p) = fn_sym.params.first() {
+                        return first_p.mode == ifa_ast::ParamMode::InOut;
+                    }
+                }
+                let mangled_base =
+                    INTERNER.intern(&format!("{}__{}", base_name, INTERNER.resolve(&method)));
+                if let Some(fn_sym) = self.symbols.lookup_function(&mangled_base) {
+                    if let Some(first_p) = fn_sym.params.first() {
+                        return first_p.mode == ifa_ast::ParamMode::InOut;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     fn is_expr_null(&self, expr: &Expr) -> bool {
         match &expr.kind {
             ExprKind::Lit(Lit::Null) => true,
@@ -3041,12 +3092,18 @@ impl<'a> FunctionLoweringContext<'a> {
                         self.emit(Some(r), ValueExpr::ArrayLen { array: lhs }, span);
                         r
                     } else {
-                        let mut arg_vals = vec![lhs];
+                        let target_fn_name =
+                            self.resolve_method_call_target(receiver, *method, span);
+                        let is_inout = self.is_method_receiver_inout(receiver, *method, span);
+                        let rec_val = if is_inout {
+                            self.lower_lvalue_ptr(receiver, span)
+                        } else {
+                            lhs
+                        };
+                        let mut arg_vals = vec![rec_val];
                         for a in args {
                             arg_vals.push(self.lower_expr(&a.value));
                         }
-                        let target_fn_name =
-                            self.resolve_method_call_target(receiver, *method, span);
 
                         let r = self.alloc_value();
                         self.emit(
@@ -3143,11 +3200,17 @@ impl<'a> FunctionLoweringContext<'a> {
                     self.emit(Some(res), ValueExpr::ArrayLen { array: base_id }, span);
                     res
                 } else {
-                    let mut arg_vals = vec![self.lower_expr(receiver)];
+                    let target_fn_name = self.resolve_method_call_target(receiver, *method, span);
+                    let is_inout = self.is_method_receiver_inout(receiver, *method, span);
+                    let rec_val = if is_inout {
+                        self.lower_lvalue_ptr(receiver, span)
+                    } else {
+                        self.lower_expr(receiver)
+                    };
+                    let mut arg_vals = vec![rec_val];
                     for a in args {
                         arg_vals.push(self.lower_expr(&a.value));
                     }
-                    let target_fn_name = self.resolve_method_call_target(receiver, *method, span);
 
                     let is_target_blocking =
                         INTERNER.resolve(&target_fn_name).starts_with("blocking_");
@@ -5769,28 +5832,40 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
     }
 
     // 3. Collect all functions (free functions and methods in impl blocks)
-    let mut all_functions: HashMap<Symbol, &ifa_ast::Function> = HashMap::new();
-    let mut impl_methods: Vec<(Symbol, &ifa_ast::Function)> = Vec::new();
+    let mut all_functions: HashMap<Symbol, ifa_ast::Function> = HashMap::new();
+    let mut impl_methods: Vec<(Symbol, Symbol)> = Vec::new();
+    let mut impl_method_struct_map: HashMap<Symbol, (Symbol, Symbol)> = HashMap::new();
 
     for item in &program.items {
         match item {
             Item::Function(f) => {
-                all_functions.insert(f.name, f);
+                all_functions.insert(f.name, f.clone());
             }
             Item::Impl(im) => {
                 let target_name = match &im.target_ty.kind {
                     ifa_ast::TypeKind::Named(s) => *s,
+                    ifa_ast::TypeKind::Generic(s, _) => *s,
                     _ => INTERNER.intern("Type"),
                 };
                 for f in &im.methods {
+                    let mut combined_generics = im.generics.clone();
+                    for g in &f.generics {
+                        if !combined_generics.iter().any(|cg| cg.name == g.name) {
+                            combined_generics.push(g.clone());
+                        }
+                    }
+                    let mut specialized_ast = f.clone();
+                    specialized_ast.generics = combined_generics;
+
                     let mangled_name = INTERNER.intern(&format!(
                         "{}__{}",
                         INTERNER.resolve(&target_name),
                         INTERNER.resolve(&f.name)
                     ));
-                    impl_methods.push((mangled_name, f));
-                    all_functions.insert(mangled_name, f);
-                    all_functions.entry(f.name).or_insert(f);
+                    impl_methods.push((mangled_name, f.name));
+                    impl_method_struct_map.insert(mangled_name, (target_name, f.name));
+                    all_functions.insert(mangled_name, specialized_ast.clone());
+                    all_functions.entry(f.name).or_insert(specialized_ast);
                 }
             }
             _ => {}
@@ -5802,7 +5877,7 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
     for (fn_name, func_ast) in &all_functions {
         // Skip bare aliases for impl methods so we don't emit duplicates
         if !impl_methods.iter().any(|(m, _)| m == fn_name)
-            && impl_methods.iter().any(|(_, f)| &f.name == fn_name)
+            && impl_methods.iter().any(|(_, f_name)| f_name == fn_name)
         {
             continue;
         }
@@ -5851,8 +5926,20 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
 
     let mut generated_instances = std::collections::HashSet::new();
     while let Some((orig_name, type_args)) = worklist.pop() {
-        let mangled_name =
-            crate::types::mangle_instantiation_symbol(&INTERNER.resolve(&orig_name), &type_args);
+        let mangled_name = if let Some((st_name, method_name)) =
+            impl_method_struct_map.get(&orig_name)
+        {
+            let mangled_st =
+                crate::types::mangle_instantiation_symbol(&INTERNER.resolve(st_name), &type_args);
+            INTERNER.intern(&format!(
+                "{}__{}",
+                INTERNER.resolve(&mangled_st),
+                INTERNER.resolve(method_name)
+            ))
+        } else {
+            crate::types::mangle_instantiation_symbol(&INTERNER.resolve(&orig_name), &type_args)
+        };
+
         if !generated_instances.insert(mangled_name) {
             continue;
         }

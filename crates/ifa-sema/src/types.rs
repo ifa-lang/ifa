@@ -73,7 +73,7 @@ impl fmt::Display for FloatType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Unit,
     Bool,
@@ -701,4 +701,56 @@ impl fmt::Display for Type {
             Type::Unknown => write!(f, "{{unknown}}"),
         }
     }
+}
+
+/// Mangles a semantic type into a deterministic, valid identifier token for monomorphization.
+pub fn mangle_sema_type(ty: &Type) -> String {
+    match ty {
+        Type::Unit => "unit".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::Int(int_ty) => match int_ty {
+            IntType::I8 => "i8".to_string(),
+            IntType::I16 => "i16".to_string(),
+            IntType::I32 => "i32".to_string(),
+            IntType::I64 => "i64".to_string(),
+            IntType::U8 => "u8".to_string(),
+            IntType::U16 => "u16".to_string(),
+            IntType::U32 => "u32".to_string(),
+            IntType::U64 => "u64".to_string(),
+            IntType::ISize => "isize".to_string(),
+            IntType::USize => "usize".to_string(),
+        },
+        Type::Float(float_ty) => match float_ty {
+            FloatType::F32 => "f32".to_string(),
+            FloatType::F64 => "f64".to_string(),
+        },
+        Type::Char => "char".to_string(),
+        Type::Str => "str".to_string(),
+        Type::String => "string".to_string(),
+        Type::Ref(inner) => format!("ref_{}", mangle_sema_type(inner)),
+        Type::Array(inner, n) => format!("arr{}_{}", n, mangle_sema_type(inner)),
+        Type::Slice(inner) => format!("slice_{}", mangle_sema_type(inner)),
+        Type::Optional(inner) => format!("opt_{}", mangle_sema_type(inner)),
+        Type::ErrorUnion { err, ok } => {
+            format!("err_{}_{}", mangle_sema_type(err), mangle_sema_type(ok))
+        }
+        Type::Struct { name, .. } | Type::Enum { name, .. } => INTERNER.resolve(name),
+        Type::Generic { name, args } => {
+            let base = INTERNER.resolve(name);
+            let args_str: Vec<String> = args.iter().map(mangle_sema_type).collect();
+            format!("{}_{}", base, args_str.join("_"))
+        }
+        Type::TypeParam(sym) => INTERNER.resolve(sym),
+        _ => "val".to_string(),
+    }
+}
+
+/// Computes the specialized symbol name for a monomorphized function or struct.
+pub fn mangle_instantiation_symbol(base: &str, type_args: &[Type]) -> Symbol {
+    if type_args.is_empty() {
+        return INTERNER.intern(base);
+    }
+    let mangled_args: Vec<String> = type_args.iter().map(mangle_sema_type).collect();
+    let full = format!("{}__{}", base, mangled_args.join("_"));
+    INTERNER.intern(&full)
 }

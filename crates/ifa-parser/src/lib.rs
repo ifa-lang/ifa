@@ -694,6 +694,7 @@ impl Parser {
 
     fn parse_impl(&mut self) -> Result<Impl, Diagnostic> {
         let impl_tok = self.expect(TokenKind::Impl)?;
+        let mut generics = self.parse_generic_params()?;
         let first_ty = self.parse_type()?;
         let (trait_name, target_ty) = if self.match_token(&TokenKind::For) {
             let tr_name = match &first_ty.kind {
@@ -711,6 +712,45 @@ impl Parser {
             (None, first_ty)
         };
 
+        // If generics were not explicitly specified on `impl<T>`, inspect target_ty
+        // to discover implicit type parameters for generic struct implementations (e.g. `impl Box<T>`)
+        if generics.is_empty() {
+            if let TypeKind::Generic(_, ref args) = target_ty.kind {
+                for arg in args {
+                    if let TypeKind::Named(g_sym) = arg.kind {
+                        let g_str = INTERNER.resolve(&g_sym);
+                        let is_primitive = matches!(
+                            g_str.as_str(),
+                            "bool"
+                                | "u8"
+                                | "u16"
+                                | "u32"
+                                | "u64"
+                                | "usize"
+                                | "i8"
+                                | "i16"
+                                | "i32"
+                                | "i64"
+                                | "isize"
+                                | "f32"
+                                | "f64"
+                                | "char"
+                                | "str"
+                                | "String"
+                                | "void"
+                        );
+                        if !is_primitive && !generics.iter().any(|g| g.name == g_sym) {
+                            generics.push(GenericParam {
+                                name: g_sym,
+                                bounds: Vec::new(),
+                                span: arg.span,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         self.expect(TokenKind::OpenBrace)?;
         let mut methods = Vec::new();
         while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
@@ -720,6 +760,7 @@ impl Parser {
         let close = self.expect(TokenKind::CloseBrace)?;
 
         Ok(Impl {
+            generics,
             trait_name,
             target_ty,
             methods,

@@ -18,7 +18,7 @@ pub enum Item {
     Impl(Impl),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParamMode {
     In,       // Default: read-only projection
     InOut,    // Mutation exclusive on-place
@@ -148,6 +148,7 @@ pub struct Trait {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Impl {
+    pub generics: Vec<GenericParam>,
     pub trait_name: Option<Symbol>,
     pub target_ty: Type,
     pub methods: Vec<Function>,

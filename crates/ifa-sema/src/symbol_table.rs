@@ -362,6 +362,56 @@ impl SymbolTable {
         }
     }
 
+    /// Computes the transitive closure of all concrete generic struct instantiations.
+    /// Traverses fields of instantiated generic structs to find nested generic structs
+    /// (e.g. `Container<Box<i64>>` or recursive structures) and ensures they are recorded
+    /// for static specialization.
+    pub fn close_generic_struct_instances(&mut self) {
+        let mut changed = true;
+        let mut processed: std::collections::HashSet<(Symbol, Vec<Type>)> =
+            std::collections::HashSet::new();
+
+        while changed {
+            changed = false;
+            let current_instances: Vec<(Symbol, Vec<Type>)> = self
+                .generic_struct_instances
+                .iter()
+                .flat_map(|(name, insts)| insts.iter().map(move |args| (*name, args.clone())))
+                .collect();
+
+            for (st_name, type_args) in current_instances {
+                if !processed.insert((st_name, type_args.clone())) {
+                    continue;
+                }
+
+                if let Some(st) = self.structs.get(&st_name).cloned() {
+                    let mut type_subst = HashMap::new();
+                    for (g, concrete) in st.generics.iter().zip(type_args.iter()) {
+                        type_subst.insert(g.name, concrete.clone());
+                    }
+
+                    for field in &st.fields {
+                        let concrete_ty = field.ty.substitute(&type_subst);
+                        let before_len: usize = self
+                            .generic_struct_instances
+                            .values()
+                            .map(|v| v.len())
+                            .sum();
+                        self.register_type_if_generic_instance(&concrete_ty);
+                        let after_len: usize = self
+                            .generic_struct_instances
+                            .values()
+                            .map(|v| v.len())
+                            .sum();
+                        if after_len > before_len {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn init_builtins(&mut self) {
         let dummy = Span::dummy();
 
