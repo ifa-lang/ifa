@@ -4431,3 +4431,72 @@ fn test_matrix_kernel_tiling_unroll_and_jam_metadata_and_compilation() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_inout_swap_disjoint_slices_simd_metadata_and_execution() {
+    let src = r#"
+        pub strict fn swap_disjoint_slices(inout a: Slice<i64>, inout b: Slice<i64>, n: i64) {
+            let mut i: i64 = 0;
+            while i < n {
+                let tmp = a[i];
+                a[i] = b[i];
+                b[i] = tmp;
+                i = i + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("llvm_swap_disjoint.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let llvm_ir = emitter.emit_module(&module).unwrap();
+
+    // Verify LLVM IR contains the specialized disjoint swap metadata !41 (for i64 / 4 lanes)
+    assert!(
+        llvm_ir.contains("!llvm.loop !41"),
+        "Loop branch must reference in-place disjoint swap metadata !41:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("!40 = distinct !{!40, !2, !3, !4, !5, !12, !13, !24, !44}"),
+        "Metadata table must contain !40 8-lane swap node:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("!41 = distinct !{!41, !2, !7, !4, !5, !12, !13, !24, !44}"),
+        "Metadata table must contain !41 4-lane swap node:\n{}",
+        llvm_ir
+    );
+    assert!(
+        llvm_ir.contains("!44 = !{!\"llvm.loop.unroll.count\", i32 4}"),
+        "Unroll count metadata !44 must be defined for SIMD swap saturation:\n{}",
+        llvm_ir
+    );
+
+    // Verify native object compilation succeeds
+    let temp_dir = std::env::temp_dir().join(format!("ifa_swap_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("swap_disjoint.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation to object with SIMD swap metadata failed: {:?}",
+        compile_res.err()
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

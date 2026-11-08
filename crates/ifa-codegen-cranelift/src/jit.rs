@@ -54,6 +54,18 @@ impl JitEngine {
             "ifa_rt_call_arena_reset",
             ifa_rt_call_arena_reset as *const u8,
         );
+        builder.symbol(
+            "ifa_rt_call_arena_capacity",
+            ifa_rt_call_arena_capacity as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_call_arena_high_water_mark",
+            ifa_rt_call_arena_high_water_mark as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_call_arena_shrink_to_fit",
+            ifa_rt_call_arena_shrink_to_fit as *const u8,
+        );
         builder.symbol("ifa_rt_fiber_yield", ifa_rt_fiber_yield as *const u8);
         builder.symbol("ifa_rt_channel_create", ifa_rt_channel_create as *const u8);
         builder.symbol(

@@ -498,6 +498,25 @@ struct ThreadLocalSlabCache {
 /// Initial capacity for the thread-local call arena (64 KiB).
 pub const CALL_ARENA_INITIAL_CAPACITY: usize = 65536;
 
+/// Statistics of thread-local call arena usage across multi-stage compilation and runtime execution pipelines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CallArenaStats {
+    /// Active allocated buffer capacity in bytes.
+    pub capacity: usize,
+    /// Current bump allocation offset in bytes.
+    pub current_offset: usize,
+    /// Peak bump allocation offset reached across scopes.
+    pub high_water_mark: usize,
+    /// Current monotonic generation counter.
+    pub generation: u32,
+    /// Total allocation operations performed.
+    pub total_allocations: usize,
+    /// Total scope rewind operations performed.
+    pub total_rewinds: usize,
+    /// Cumulative bytes reclaimed and reused across rewinds.
+    pub reused_bytes: usize,
+}
+
 /// Fast thread-local bump allocation arena for bounded closure environments and call blocks.
 /// Guarantees zero system locks, zero kernel syscalls, and O(1) bump allocation with
 /// mark/rewind scope resets in CPU L1/L2 cache.
@@ -506,6 +525,10 @@ pub struct ThreadLocalCallArena {
     offset: usize,
     generation_counter: u32,
     epoch_flags: u16,
+    high_water_mark: usize,
+    total_allocations: usize,
+    total_rewinds: usize,
+    reused_bytes: usize,
 }
 
 impl Default for ThreadLocalCallArena {
@@ -522,6 +545,10 @@ impl ThreadLocalCallArena {
             offset: 0,
             generation_counter: 1,
             epoch_flags: 0,
+            high_water_mark: 0,
+            total_allocations: 0,
+            total_rewinds: 0,
+            reused_bytes: 0,
         }
     }
 
@@ -540,6 +567,11 @@ impl ThreadLocalCallArena {
         if total_needed > self.buffer.len() {
             let new_cap = (total_needed * 2).max(self.buffer.len() * 2);
             self.buffer.resize(new_cap, 0);
+        }
+
+        self.total_allocations += 1;
+        if total_needed > self.high_water_mark {
+            self.high_water_mark = total_needed;
         }
 
         // Monotonically allocate generation for this call arena slot
@@ -582,6 +614,8 @@ impl ThreadLocalCallArena {
     #[inline(always)]
     pub fn rewind(&mut self, mark: usize) {
         if mark < self.offset {
+            self.reused_bytes += self.offset - mark;
+            self.total_rewinds += 1;
             // Advancing generation on rewind ensures any subsequent allocation at the same offset
             // receives a strictly higher generation counter, preventing ABA and Use-After-Scope reference collisions.
             self.generation_counter = self.generation_counter.saturating_add(1);
@@ -593,9 +627,35 @@ impl ThreadLocalCallArena {
     #[inline(always)]
     pub fn reset(&mut self) {
         if self.offset > 0 {
+            self.reused_bytes += self.offset;
+            self.total_rewinds += 1;
             self.generation_counter = self.generation_counter.saturating_add(1);
         }
         self.offset = 0;
+    }
+
+    /// Return statistics describing arena usage and consolidation.
+    pub fn stats(&self) -> CallArenaStats {
+        CallArenaStats {
+            capacity: self.buffer.len(),
+            current_offset: self.offset,
+            high_water_mark: self.high_water_mark,
+            generation: self.generation_counter,
+            total_allocations: self.total_allocations,
+            total_rewinds: self.total_rewinds,
+            reused_bytes: self.reused_bytes,
+        }
+    }
+
+    /// Consolidate and shrink the arena buffer if idle and larger than the maximum idle capacity.
+    pub fn shrink_to_fit_if_idle(&mut self, max_idle_capacity: usize) {
+        if self.offset == 0 {
+            let target_cap = CALL_ARENA_INITIAL_CAPACITY.max(max_idle_capacity);
+            if self.buffer.len() > target_cap {
+                self.buffer.truncate(target_cap);
+                self.buffer.shrink_to_fit();
+            }
+        }
     }
 
     /// Check if a pointer address falls within the current call arena memory buffer.
@@ -630,6 +690,62 @@ pub fn call_arena_rewind(mark: usize) {
 /// Reset the active thread's call arena.
 pub fn call_arena_reset() {
     CALL_ARENA.with(|arena| arena.borrow_mut().reset())
+}
+
+/// Retrieve call arena usage and consolidation statistics.
+pub fn call_arena_stats() -> CallArenaStats {
+    CALL_ARENA.with(|arena| arena.borrow().stats())
+}
+
+/// Retrieve the high water mark reached by the active thread's call arena.
+pub fn call_arena_high_water_mark() -> usize {
+    CALL_ARENA.with(|arena| arena.borrow().high_water_mark)
+}
+
+/// Retrieve current buffer capacity of the active thread's call arena.
+pub fn call_arena_capacity() -> usize {
+    CALL_ARENA.with(|arena| arena.borrow().buffer.len())
+}
+
+/// Consolidate and shrink the active thread's call arena if currently idle.
+pub fn call_arena_shrink_to_fit(max_idle_capacity: usize) {
+    CALL_ARENA.with(|arena| arena.borrow_mut().shrink_to_fit_if_idle(max_idle_capacity))
+}
+
+/// RAII Scope Guard automatically rewinding the call arena on exit.
+pub struct CallArenaGuard {
+    mark: usize,
+}
+
+impl CallArenaGuard {
+    /// Create a new call arena guard capturing the active offset.
+    pub fn new() -> Self {
+        Self {
+            mark: call_arena_mark(),
+        }
+    }
+
+    /// Retrieve the captured mark offset.
+    pub fn mark(&self) -> usize {
+        self.mark
+    }
+}
+
+impl Default for CallArenaGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for CallArenaGuard {
+    fn drop(&mut self) {
+        call_arena_rewind(self.mark);
+    }
+}
+
+/// Create a new RAII CallArenaGuard for the current scope.
+pub fn call_arena_guard() -> CallArenaGuard {
+    CallArenaGuard::new()
 }
 
 /// Global thread-safe generational allocator instance.

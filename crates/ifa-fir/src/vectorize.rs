@@ -64,6 +64,8 @@ pub struct VectorizeStats {
     pub sliding_window_loops_vectorized: usize,
     /// Number of bare-metal convolution loops vectorized.
     pub convolutions_vectorized: usize,
+    /// Number of in-place zero-copy swap loops across provably disjoint slices vectorized.
+    pub disjoint_swap_loops_vectorized: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -165,12 +167,18 @@ impl VectorizePass {
             let mut had_eliminated_bounds = false;
             let mut slice_read_bases: HashSet<ValueId> = HashSet::new();
             let mut slice_write_bases: HashSet<ValueId> = HashSet::new();
+            let mut elem_ptrs: HashMap<ValueId, (ValueId, ValueId)> = HashMap::new();
+            let mut elem_reads: Vec<(ValueId, ValueId, ValueId)> = Vec::new();
+            let mut elem_writes: Vec<(ValueId, ValueId, ValueId)> = Vec::new();
 
             for &b_id in &loop_info.blocks {
                 if let Some(block) = func.get_block(b_id) {
                     for inst in &block.instructions {
                         match &inst.expr {
-                            ValueExpr::GetElement { base, .. } => {
+                            ValueExpr::GetElement { base, index } => {
+                                if let Some(res) = inst.result {
+                                    elem_reads.push((*base, *index, res));
+                                }
                                 if let Some(elem_ty) =
                                     Self::get_aggregate_elem_type(&value_types, *base)
                                 {
@@ -186,7 +194,8 @@ impl VectorizePass {
                                     }
                                 }
                             }
-                            ValueExpr::SetElement { base, .. } => {
+                            ValueExpr::SetElement { base, index, val } => {
+                                elem_writes.push((*base, *index, *val));
                                 if let Some(elem_ty) =
                                     Self::get_aggregate_elem_type(&value_types, *base)
                                 {
@@ -202,7 +211,10 @@ impl VectorizePass {
                                     }
                                 }
                             }
-                            ValueExpr::GetElementPtr { base, .. } => {
+                            ValueExpr::GetElementPtr { base, index } => {
+                                if let Some(res) = inst.result {
+                                    elem_ptrs.insert(res, (*base, *index));
+                                }
                                 if let Some(elem_ty) =
                                     Self::get_aggregate_elem_type(&value_types, *base)
                                 {
@@ -215,6 +227,18 @@ impl VectorizePass {
                                             array_elements += 1;
                                         }
                                     }
+                                }
+                            }
+                            ValueExpr::Load { ptr } => {
+                                if let Some(res) = inst.result {
+                                    if let Some(&(base, idx)) = elem_ptrs.get(ptr) {
+                                        elem_reads.push((base, idx, res));
+                                    }
+                                }
+                            }
+                            ValueExpr::Store { ptr, val } => {
+                                if let Some(&(base, idx)) = elem_ptrs.get(ptr) {
+                                    elem_writes.push((base, idx, *val));
                                 }
                             }
                             ValueExpr::BoundsCheck {
@@ -365,6 +389,41 @@ impl VectorizePass {
                     }
                 }
 
+                // 3. Detect in-place zero-copy swap operations across provably disjoint slices
+                let mut is_disjoint_swap = false;
+                for w1 in &elem_writes {
+                    for w2 in &elem_writes {
+                        if w1.0 != w2.0 {
+                            let root_w1 = Self::trace_slice_root(func, w1.0);
+                            let root_w2 = Self::trace_slice_root(func, w2.0);
+                            if root_w1 != root_w2 {
+                                let w1_reads_w2 = elem_reads.iter().any(|r| {
+                                    r.2 == w1.2 && Self::trace_slice_root(func, r.0) == root_w2
+                                });
+                                let w2_reads_w1 = elem_reads.iter().any(|r| {
+                                    r.2 == w2.2 && Self::trace_slice_root(func, r.0) == root_w1
+                                });
+                                if w1_reads_w2
+                                    && w2_reads_w1
+                                    && Self::are_slice_roots_disjoint(&root_w1, &root_w2)
+                                {
+                                    is_disjoint_swap = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if is_disjoint_swap {
+                        break;
+                    }
+                }
+
+                if is_disjoint_swap {
+                    disjoint_slices = true;
+                    self.stats.disjoint_swap_loops_vectorized += 1;
+                    self.stats.disjoint_slices_vectorized += 2;
+                }
+
                 // Recognize scalar dot product reductions (fmul + fadd / mul + add with multiple reads)
                 if has_mul
                     && has_add
@@ -386,8 +445,10 @@ impl VectorizePass {
 
                 let predicated_scatter_gather =
                     (write_elements > 0 && has_internal_filter) || has_filter_call;
-                let predicate_enable =
-                    slice_elements > 0 || has_internal_filter || predicated_scatter_gather;
+                let predicate_enable = slice_elements > 0
+                    || has_internal_filter
+                    || predicated_scatter_gather
+                    || is_disjoint_swap;
                 let is_strict_slice_loop = func.is_strict && slice_elements > 0;
                 let is_reduction = write_elements == 0 && read_elements > 0 && has_reduction_op;
                 let contiguous_reduction = is_reduction && (slice_elements > 0);
@@ -464,6 +525,7 @@ impl VectorizePass {
                     tile_size,
                     unroll_and_jam,
                     is_fused,
+                    is_swap: is_disjoint_swap,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)

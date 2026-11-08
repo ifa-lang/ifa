@@ -129,6 +129,21 @@ void ifa_rt_call_arena_rewind(size_t mark);
  */
 void ifa_rt_call_arena_reset(void);
 
+/**
+ * Retrieve the active thread's call arena capacity in bytes.
+ */
+size_t ifa_rt_call_arena_capacity(void);
+
+/**
+ * Retrieve the active thread's peak bump allocation offset (high-water mark).
+ */
+size_t ifa_rt_call_arena_high_water_mark(void);
+
+/**
+ * Consolidate and shrink the active thread's call arena buffer if currently idle.
+ */
+void ifa_rt_call_arena_shrink_to_fit(size_t max_idle_capacity);
+
 /* --- Zero-Copy Slices & Buffers API --- */
 
 /**

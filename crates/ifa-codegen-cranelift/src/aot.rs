@@ -225,6 +225,18 @@ void ifa_rt_call_arena_reset(void) {
     ifa_rt_call_arena_off = 0;
 }
 
+size_t ifa_rt_call_arena_capacity(void) {
+    return sizeof(ifa_rt_call_arena_buf);
+}
+
+size_t ifa_rt_call_arena_high_water_mark(void) {
+    return ifa_rt_call_arena_off;
+}
+
+void ifa_rt_call_arena_shrink_to_fit(size_t max_idle_capacity) {
+    (void)max_idle_capacity;
+}
+
 ifa_slice_t ifa_rt_slice_from_raw(const char* ptr, size_t len) {
     ifa_slice_t s;
     s.ptr = ptr;

@@ -14,9 +14,11 @@ pub mod string;
 pub mod wasi;
 
 pub use allocator::{
-    call_arena_alloc, call_arena_mark, call_arena_reset, call_arena_rewind, EpochGuard,
-    EpochManager, EpochStats, GenArena, GlobalGenAllocator, ThreadLocalCallArena,
-    CALL_ARENA_INITIAL_CAPACITY, GLOBAL_ALLOCATOR,
+    call_arena_alloc, call_arena_capacity, call_arena_guard, call_arena_high_water_mark,
+    call_arena_mark, call_arena_reset, call_arena_rewind, call_arena_shrink_to_fit,
+    call_arena_stats, CallArenaGuard, CallArenaStats, EpochGuard, EpochManager, EpochStats,
+    GenArena, GlobalGenAllocator, ThreadLocalCallArena, CALL_ARENA_INITIAL_CAPACITY,
+    GLOBAL_ALLOCATOR,
 };
 pub use benchmarks::{
     profile_allocator_engine, run_allocator_multithread_suite, run_generational_benchmark_suite,

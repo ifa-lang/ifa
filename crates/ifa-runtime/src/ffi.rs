@@ -315,6 +315,24 @@ pub extern "C" fn ifa_rt_call_arena_reset() {
     crate::allocator::call_arena_reset();
 }
 
+/// Retrieve the active thread's call arena allocated capacity.
+#[no_mangle]
+pub extern "C" fn ifa_rt_call_arena_capacity() -> usize {
+    crate::allocator::call_arena_capacity()
+}
+
+/// Retrieve the peak bump offset (high water mark) reached by the active thread's call arena.
+#[no_mangle]
+pub extern "C" fn ifa_rt_call_arena_high_water_mark() -> usize {
+    crate::allocator::call_arena_high_water_mark()
+}
+
+/// Consolidate and shrink the active thread's call arena buffer if currently idle.
+#[no_mangle]
+pub extern "C" fn ifa_rt_call_arena_shrink_to_fit(max_idle_capacity: usize) {
+    crate::allocator::call_arena_shrink_to_fit(max_idle_capacity);
+}
+
 /// Spawn a new colorless fiber running an `extern "C"` function pointer with argument.
 #[no_mangle]
 pub extern "C" fn ifa_rt_fiber_spawn(entry: extern "C-unwind" fn(*mut u8), arg: *mut u8) -> u64 {

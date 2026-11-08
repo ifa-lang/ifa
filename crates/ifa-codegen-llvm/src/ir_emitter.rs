@@ -1471,6 +1471,12 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("!37 = !{!\"llvm.loop.unroll_and_jam.enable\"}\n");
         out.push_str("!38 = !{!\"llvm.loop.unroll_and_jam.count\", i32 4}\n");
         out.push_str("!39 = !{!\"llvm.loop.unroll_and_jam.count\", i32 8}\n");
+        // Specialized in-place zero-copy swap vectorization hints on provably disjoint slices
+        out.push_str("!40 = distinct !{!40, !2, !3, !4, !5, !12, !13, !24, !44}\n");
+        out.push_str("!41 = distinct !{!41, !2, !7, !4, !5, !12, !13, !24, !44}\n");
+        out.push_str("!42 = distinct !{!42, !2, !9, !4, !5, !12, !13, !24, !44}\n");
+        out.push_str("!43 = distinct !{!43, !2, !11, !4, !5, !12, !13, !24, !44}\n");
+        out.push_str("!44 = !{!\"llvm.loop.unroll.count\", i32 4}\n");
 
         Ok(out)
     }
@@ -4407,7 +4413,14 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             Terminator::Branch { target, .. } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = if hint.is_matrix_kernel || hint.is_tiled || hint.unroll_and_jam {
+                    let meta_id = if hint.is_swap {
+                        match hint.vector_width {
+                            2 => 43,
+                            4 => 41,
+                            16 | 32 => 42,
+                            _ => 40,
+                        }
+                    } else if hint.is_matrix_kernel || hint.is_tiled || hint.unroll_and_jam {
                         match hint.vector_width {
                             2 => 36,
                             4 => 34,
@@ -4470,7 +4483,14 @@ impl<'a> LlvmIrEmitter<'a> {
                 ..
             } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = if hint.is_matrix_kernel || hint.is_tiled || hint.unroll_and_jam {
+                    let meta_id = if hint.is_swap {
+                        match hint.vector_width {
+                            2 => 43,
+                            4 => 41,
+                            16 | 32 => 42,
+                            _ => 40,
+                        }
+                    } else if hint.is_matrix_kernel || hint.is_tiled || hint.unroll_and_jam {
                         match hint.vector_width {
                             2 => 36,
                             4 => 34,

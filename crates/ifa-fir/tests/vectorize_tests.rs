@@ -1235,3 +1235,52 @@ fn test_vectorize_pass_multidimensional_projection_disjoint() {
     assert_eq!(stats.disjoint_slice_loops, 1);
     assert!(stats.multidim_projections_vectorized >= 1);
 }
+
+#[test]
+fn test_vectorize_pass_inout_swap_disjoint_slices() {
+    let src = r#"
+        pub strict fn swap_disjoint_slices(inout a: Slice<i64>, inout b: Slice<i64>, n: i64) {
+            let mut i: i64 = 0;
+            while i < n {
+                let tmp = a[i];
+                a[i] = b[i];
+                b[i] = tmp;
+                i = i + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("swap_disjoint.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [is_swap: true]"),
+        "Formatted FIR must contain is_swap hint:\n{}",
+        formatted
+    );
+    assert!(
+        formatted.contains("// [disjoint_slices: true]"),
+        "Formatted FIR must contain disjoint_slices hint:\n{}",
+        formatted
+    );
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.disjoint_swap_loops_vectorized, 1);
+    assert!(stats.disjoint_slices_vectorized >= 2);
+}

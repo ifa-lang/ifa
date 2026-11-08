@@ -1288,3 +1288,66 @@ fn test_call_arena_stale_reference_invalidation() {
     }
     ifa_rt_clear_last_panic();
 }
+
+#[test]
+fn test_thread_local_call_arena_multistage_pipeline_block_reuse_and_consolidation() {
+    use ifa_runtime::{
+        call_arena_alloc, call_arena_capacity, call_arena_guard, call_arena_high_water_mark,
+        call_arena_reset, call_arena_shrink_to_fit, call_arena_stats,
+    };
+
+    call_arena_reset();
+    let initial_cap = call_arena_capacity();
+    assert!(initial_cap >= 65536);
+
+    let base_ptr_stage1;
+    // Stage 1: Lexing / Parsing context allocation
+    {
+        let _guard = call_arena_guard();
+        let ptr1 = call_arena_alloc(4096, 16);
+        assert!(!ptr1.is_null());
+        base_ptr_stage1 = ptr1 as usize;
+        unsafe {
+            std::ptr::write_bytes(ptr1, 0xAA, 4096);
+        }
+    } // _guard rewinds arena offset to 0
+
+    // Stage 2: Type checking / SEMA context allocation (must reuse the same block offset)
+    let base_ptr_stage2;
+    {
+        let _guard = call_arena_guard();
+        let ptr2 = call_arena_alloc(8192, 16);
+        assert!(!ptr2.is_null());
+        base_ptr_stage2 = ptr2 as usize;
+        assert_eq!(
+            base_ptr_stage1, base_ptr_stage2,
+            "Stage 2 must reuse the exact same initial memory block offset in L1/L2 cache"
+        );
+        unsafe {
+            std::ptr::write_bytes(ptr2, 0xBB, 8192);
+        }
+    } // rewound
+
+    // Stage 3: FIR SSA / JIT code buffer allocation
+    {
+        let _guard = call_arena_guard();
+        let ptr3 = call_arena_alloc(16384, 16);
+        assert!(!ptr3.is_null());
+        assert_eq!(
+            base_ptr_stage1, ptr3 as usize,
+            "Stage 3 must reuse the exact same initial memory block offset"
+        );
+    }
+
+    let stats = call_arena_stats();
+    assert_eq!(stats.current_offset, 0);
+    assert!(stats.total_allocations >= 3);
+    assert!(stats.total_rewinds >= 3);
+    assert!(stats.reused_bytes >= 4096 + 8192 + 16384);
+    assert!(stats.high_water_mark >= 16384);
+    assert_eq!(call_arena_high_water_mark(), stats.high_water_mark);
+
+    // Test consolidation and shrink
+    call_arena_shrink_to_fit(stats.capacity);
+    assert_eq!(call_arena_capacity(), stats.capacity);
+}

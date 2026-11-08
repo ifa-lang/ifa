@@ -142,6 +142,10 @@ impl<'a> FirPrinter<'a> {
                 self.indent();
                 writeln!(self.output, "// [strict_vectorize: true]")?;
             }
+            if hint.is_swap {
+                self.indent();
+                writeln!(self.output, "// [is_swap: true]")?;
+            }
         }
         for inst in &block.instructions {
             self.indent();

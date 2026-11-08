@@ -502,6 +502,7 @@ pub struct LoopVectorHint {
     pub tile_size: Option<u32>,
     pub unroll_and_jam: bool,
     pub is_fused: bool,
+    pub is_swap: bool,
 }
 
 impl LoopVectorHint {
@@ -525,6 +526,7 @@ impl LoopVectorHint {
             tile_size: None,
             unroll_and_jam: false,
             is_fused: false,
+            is_swap: false,
         }
     }
 
@@ -605,6 +607,12 @@ impl LoopVectorHint {
     /// Mark the loop as resulting from loop fusion across adjacent pipeline stages.
     pub fn with_fused(mut self, is_fused: bool) -> Self {
         self.is_fused = is_fused;
+        self
+    }
+
+    /// Mark the loop as executing an in-place zero-copy swap across provably disjoint slices.
+    pub fn with_swap(mut self, is_swap: bool) -> Self {
+        self.is_swap = is_swap;
         self
     }
 }
