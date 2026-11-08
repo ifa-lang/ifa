@@ -548,6 +548,11 @@ pub fn clear_last_panic() {
     }
 }
 
+/// Set the thread-local last panic record.
+pub fn set_thread_last_panic(record: IfaPanicRecord) {
+    THREAD_LAST_PANIC.with(|tl| *tl.borrow_mut() = Some(record));
+}
+
 /// Dispatch a deterministic runtime panic with bare-metal diagnostics.
 pub fn dispatch_panic(record: IfaPanicRecord) -> ! {
     // 1. Invoke custom panic hook if registered
@@ -594,7 +599,7 @@ where
     match res {
         Ok(val) => Ok(val),
         Err(_) => {
-            let captured = THREAD_LAST_PANIC.with(|tl| tl.borrow_mut().take());
+            let captured = THREAD_LAST_PANIC.with(|tl| *tl.borrow());
             if let Some(rec) = captured {
                 Err(rec)
             } else {

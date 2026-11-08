@@ -1,7 +1,11 @@
 use ifa_runtime::*;
+use std::sync::Mutex;
+
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn test_uaf_interception_via_catch_panic() {
+    let _guard = TEST_LOCK.lock().unwrap();
     unsafe {
         let ptr = ifa_rt_gen_alloc(64, 8, 1);
         assert!(!ptr.is_null());
@@ -44,6 +48,7 @@ fn test_uaf_interception_via_catch_panic() {
 
 #[test]
 fn test_double_free_interception_via_catch_panic() {
+    let _guard = TEST_LOCK.lock().unwrap();
     unsafe {
         let ptr = ifa_rt_gen_alloc(32, 8, 2);
         assert!(!ptr.is_null());
@@ -75,6 +80,7 @@ fn test_double_free_interception_via_catch_panic() {
 
 #[test]
 fn test_null_ref_interception() {
+    let _guard = TEST_LOCK.lock().unwrap();
     extern "C-unwind" fn trigger_null(_arg: *mut u8) {
         ifa_rt_gen_check(std::ptr::null(), 42);
     }
@@ -93,6 +99,7 @@ fn test_null_ref_interception() {
 
 #[test]
 fn test_epoch_mismatch_interception() {
+    let _guard = TEST_LOCK.lock().unwrap();
     unsafe {
         let ptr = ifa_rt_gen_alloc(48, 8, 3);
         assert!(!ptr.is_null());
@@ -125,6 +132,7 @@ fn test_epoch_mismatch_interception() {
 
 #[test]
 fn test_bounds_check_interception() {
+    let _guard = TEST_LOCK.lock().unwrap();
     extern "C-unwind" fn trigger_oob(_arg: *mut u8) {
         ifa_rt_bounds_check(10, 5, std::ptr::null());
     }
