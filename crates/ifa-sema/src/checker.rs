@@ -4168,7 +4168,20 @@ impl<'a> SemanticAnalyzer<'a> {
         let fn_match = match &callee.kind {
             ExprKind::Ident(sym) => self.symbols.lookup_function(sym).cloned(),
             ExprKind::Path(path) => {
-                if let Some(last) = path.last() {
+                if path.len() >= 2 {
+                    let type_sym = path[path.len() - 2];
+                    let m_sym = path[path.len() - 1];
+                    let mangled = INTERNER.intern(&format!(
+                        "{}__{}",
+                        INTERNER.resolve(&type_sym),
+                        INTERNER.resolve(&m_sym)
+                    ));
+                    self.symbols
+                        .lookup_function(&mangled)
+                        .cloned()
+                        .or_else(|| self.symbols.lookup_type_method(&type_sym, &m_sym).cloned())
+                        .or_else(|| self.symbols.lookup_function(&m_sym).cloned())
+                } else if let Some(last) = path.last() {
                     self.symbols.lookup_function(last).cloned()
                 } else {
                     None
@@ -4943,7 +4956,7 @@ impl<'a> SemanticAnalyzer<'a> {
 
                 let substituted_f = if !type_subst_for_method.is_empty() {
                     FunctionSymbol {
-                        name: f.name,
+                        name: target_call_name,
                         is_pub: f.is_pub,
                         is_strict: f.is_strict,
                         is_comptime: f.is_comptime,
@@ -4968,7 +4981,9 @@ impl<'a> SemanticAnalyzer<'a> {
                         span: f.span,
                     }
                 } else {
-                    f
+                    let mut sf = f;
+                    sf.name = target_call_name;
+                    sf
                 };
 
                 let mut full_args = Vec::with_capacity(args.len() + 1);

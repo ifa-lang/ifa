@@ -132,7 +132,23 @@ pub struct InterproceduralAccessMap {
 impl InterproceduralAccessMap {
     /// Retrieve the inter-procedural access summary for a named function if available.
     pub fn get_summary(&self, name: &Symbol) -> Option<&FunctionAccessSummary> {
-        self.summaries.get(name)
+        if let Some(s) = self.summaries.get(name) {
+            return Some(s);
+        }
+        let name_str = INTERNER.resolve(name);
+        if let Some((st_part, rest)) = name_str.split_once("__") {
+            if let Some(m_part) = rest.rsplit("__").next() {
+                let base_sym = INTERNER.intern(&format!("{}__{}", st_part, m_part));
+                if let Some(s) = self.summaries.get(&base_sym) {
+                    return Some(s);
+                }
+            }
+            let short_sym = INTERNER.intern(rest);
+            if let Some(s) = self.summaries.get(&short_sym) {
+                return Some(s);
+            }
+        }
+        None
     }
 
     /// Computes inter-procedural access path summaries for all functions declared in the AST.
@@ -148,11 +164,16 @@ impl InterproceduralAccessMap {
         for item in &program.items {
             match item {
                 Item::Function(func) => {
-                    Self::analyze_single_func(func, &mut map, &mut call_edges);
+                    Self::analyze_single_func(func, None, &mut map, &mut call_edges);
                 }
                 Item::Impl(imp) => {
+                    let target_sym = match &imp.target_ty.kind {
+                        ifa_ast::TypeKind::Named(s) => Some(*s),
+                        ifa_ast::TypeKind::Generic(s, _) => Some(*s),
+                        _ => None,
+                    };
                     for method in &imp.methods {
-                        Self::analyze_single_func(method, &mut map, &mut call_edges);
+                        Self::analyze_single_func(method, target_sym, &mut map, &mut call_edges);
                     }
                 }
                 _ => {}
@@ -254,6 +275,7 @@ impl InterproceduralAccessMap {
 
     fn analyze_single_func(
         func: &Function,
+        target_sym: Option<Symbol>,
         map: &mut InterproceduralAccessMap,
         call_edges: &mut Vec<CallPropagationEdge>,
     ) {
@@ -271,15 +293,30 @@ impl InterproceduralAccessMap {
             initial_summary.params.push(p_sum);
         }
 
+        let mangled_sym = target_sym.map(|st| {
+            INTERNER.intern(&format!(
+                "{}__{}",
+                INTERNER.resolve(&st),
+                INTERNER.resolve(&func.name)
+            ))
+        });
+        let effective_caller_sym = mangled_sym.unwrap_or(func.name);
+        let self_sym = INTERNER.intern("self");
+
         if let Some(body) = &func.body {
             let mut collector = AccessCollector {
                 param_indices: &param_indices,
                 summary: initial_summary,
-                caller_sym: func.name,
+                caller_sym: effective_caller_sym,
+                enclosing_struct: target_sym,
+                self_sym,
                 call_edges,
             };
             collector.visit_block(body);
-            map.summaries.insert(func.name, collector.summary);
+            if let Some(m_sym) = mangled_sym {
+                map.summaries.insert(m_sym, collector.summary.clone());
+            }
+            map.summaries.entry(func.name).or_insert(collector.summary);
         } else {
             // Function without body (e.g. extern): mark all inout parameters with full write `[]`
             for (idx, p) in func.params.iter().enumerate() {
@@ -289,7 +326,10 @@ impl InterproceduralAccessMap {
                     initial_summary.params[idx].reads.push(Vec::new());
                 }
             }
-            map.summaries.insert(func.name, initial_summary);
+            if let Some(m_sym) = mangled_sym {
+                map.summaries.insert(m_sym, initial_summary.clone());
+            }
+            map.summaries.entry(func.name).or_insert(initial_summary);
         }
     }
 }
@@ -298,6 +338,8 @@ struct AccessCollector<'a> {
     param_indices: &'a HashMap<Symbol, usize>,
     summary: FunctionAccessSummary,
     caller_sym: Symbol,
+    enclosing_struct: Option<Symbol>,
+    self_sym: Symbol,
     call_edges: &'a mut Vec<CallPropagationEdge>,
 }
 
@@ -462,13 +504,31 @@ impl<'a> AccessCollector<'a> {
                 args,
                 ..
             } => {
+                let callee_method_sym = if let Some(st) = self.enclosing_struct {
+                    if let Some(path) = extract_access_path(receiver) {
+                        if path.root == self.self_sym {
+                            INTERNER.intern(&format!(
+                                "{}__{}",
+                                INTERNER.resolve(&st),
+                                INTERNER.resolve(method)
+                            ))
+                        } else {
+                            *method
+                        }
+                    } else {
+                        *method
+                    }
+                } else {
+                    *method
+                };
+
                 // Receiver corresponds to parameter 0
                 if let Some(path) = extract_access_path(receiver) {
                     if let Some(&p_idx) = self.param_indices.get(&path.root) {
                         self.call_edges.push(CallPropagationEdge {
                             caller_sym: self.caller_sym,
                             caller_param_idx: p_idx,
-                            callee_sym: *method,
+                            callee_sym: callee_method_sym,
                             callee_param_idx: 0,
                             rel_prefix: path.segments,
                             is_inout: true,
@@ -505,7 +565,7 @@ impl<'a> AccessCollector<'a> {
                             self.call_edges.push(CallPropagationEdge {
                                 caller_sym: self.caller_sym,
                                 caller_param_idx: p_idx,
-                                callee_sym: *method,
+                                callee_sym: callee_method_sym,
                                 callee_param_idx: arg_idx + 1,
                                 rel_prefix: path.segments,
                                 is_inout,

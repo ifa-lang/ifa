@@ -3779,3 +3779,167 @@ fn test_nested_struct_exclusivity_overlapping_paths_rejected() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_struct_method_exclusivity_disjoint_fields_allowed() {
+    let code = r#"
+        struct Coordinate {
+            x: i64,
+            y: i64,
+        }
+
+        impl Coordinate {
+            fn set_x(inout self, v: i64) {
+                self.x = v;
+            }
+
+            fn set_y(inout self, v: i64) {
+                self.y = v;
+            }
+
+            fn set_x_and_touch_other(inout self, v: i64, inout other: i64) {
+                self.x = v;
+                other = other + 10;
+            }
+        }
+
+        struct Shape {
+            origin: Coordinate,
+            color: i64,
+        }
+
+        impl Shape {
+            fn move_origin_and_recolor(inout self, new_x: i64, new_color: i64) {
+                self.origin.set_x(new_x);
+                self.color = new_color;
+            }
+        }
+
+        pub fn test_disjoint_method_borrows() {
+            mut coord = Coordinate(x: 10, y: 20);
+            // Proven disjoint: method only writes self.x, second argument writes coord.y
+            coord.set_x_and_touch_other(100, inout coord.y);
+
+            mut s = Shape(origin: Coordinate(x: 1, y: 2), color: 255);
+            s.move_origin_and_recolor(42, 128);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Disjoint struct method inout borrows must be allowed without error: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_struct_method_exclusivity_overlapping_paths_rejected() {
+    let code = r#"
+        struct Coordinate {
+            x: i64,
+            y: i64,
+        }
+
+        impl Coordinate {
+            fn set_x_and_touch_other(inout self, v: i64, inout other: i64) {
+                self.x = v;
+                other = other + 10;
+            }
+
+            fn touch_whole_and_other(inout self, inout other: Coordinate) {
+                self.x = other.x;
+                other = Coordinate(x: 0, y: 0);
+            }
+        }
+
+        pub fn test_overlap_same_field() {
+            mut coord = Coordinate(x: 10, y: 20);
+            // Overlapping: method mutates self.x, other is also coord.x
+            coord.set_x_and_touch_other(100, inout coord.x);
+        }
+
+        pub fn test_overlap_receiver_and_arg() {
+            mut coord = Coordinate(x: 10, y: 20);
+            // Overlapping: receiver is whole coord, other is also whole coord
+            coord.touch_whole_and_other(inout coord);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Overlapping struct method inout paths must be rejected with E0011: {:?}",
+        res.diagnostics
+    );
+    let e0011_count = res
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.as_deref() == Some("E0011"))
+        .count();
+    assert_eq!(
+        e0011_count, 2,
+        "Expected exactly 2 E0011 exclusivity errors for overlapping method calls, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_associated_function_path_call_resolution() {
+    let code = r#"
+        struct Calculator {
+            mode: i64,
+        }
+
+        impl Calculator {
+            fn compute_sum(a: i64, b: i64) -> i64 {
+                a + b
+            }
+        }
+
+        pub fn test_calc() -> i64 {
+            Calculator::compute_sum(10, 25)
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Associated function call Calculator::compute_sum must resolve cleanly: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_struct_method_exclusivity_read_write_conflict_rejected() {
+    let code = r#"
+        struct Coordinate {
+            x: i64,
+            y: i64,
+        }
+
+        impl Coordinate {
+            fn set_x_from_ref(inout self, other: ref Coordinate) {
+                self.x = other.x;
+            }
+        }
+
+        pub fn test_rw_conflict() {
+            mut coord = Coordinate(x: 10, y: 20);
+            // Conflict: self mutates coord.x (inout) while other reads coord (ref)
+            coord.set_x_from_ref(ref coord);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Simultaneous inout mutation and ref read must be rejected with E0012: {:?}",
+        res.diagnostics
+    );
+    let has_e0012 = res
+        .diagnostics
+        .iter()
+        .any(|d| d.code.as_deref() == Some("E0012"));
+    assert!(
+        has_e0012,
+        "Expected E0012 read-write exclusivity conflict error, got: {:?}",
+        res.diagnostics
+    );
+}
