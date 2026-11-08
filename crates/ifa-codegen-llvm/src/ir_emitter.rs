@@ -810,7 +810,7 @@ impl<'a> LlvmIrEmitter<'a> {
         let mut type_to_methods: HashMap<String, Vec<String>> = HashMap::new();
         for func in &module.functions {
             let fn_name = INTERNER.resolve(&func.name);
-            if let Some((type_prefix, method_name)) = fn_name.split_once("__") {
+            if let Some((type_prefix, method_name)) = fn_name.rsplit_once("__") {
                 if !type_prefix.is_empty() && !method_name.is_empty() {
                     type_to_methods
                         .entry(type_prefix.to_string())

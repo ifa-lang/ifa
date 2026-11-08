@@ -186,6 +186,15 @@ pub struct CapturedVariable {
     pub span: Span,
 }
 
+/// Represents a generic trait implementation (e.g. `impl<T: Display> Printable for Container<T>`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenericTraitImplSymbol {
+    pub trait_name: Symbol,
+    pub target_ty: Type,
+    pub generics: Vec<ifa_ast::GenericParam>,
+    pub methods: HashMap<Symbol, FunctionSymbol>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SymbolTable {
     pub scopes: Vec<Scope>,
@@ -195,6 +204,7 @@ pub struct SymbolTable {
     pub consts: HashMap<Symbol, ConstSymbol>,
     pub traits: HashMap<Symbol, TraitSymbol>,
     pub trait_impls: HashMap<Symbol, Vec<Type>>,
+    pub generic_trait_impls: Vec<GenericTraitImplSymbol>,
     pub type_methods: HashMap<Symbol, HashMap<Symbol, FunctionSymbol>>,
     pub trait_impl_methods: HashMap<(Symbol, Symbol), HashMap<Symbol, FunctionSymbol>>,
     pub method_resolutions: HashMap<Span, Symbol>,
@@ -222,6 +232,7 @@ impl SymbolTable {
             consts: HashMap::new(),
             traits: HashMap::new(),
             trait_impls: HashMap::new(),
+            generic_trait_impls: Vec::new(),
             type_methods: HashMap::new(),
             trait_impl_methods: HashMap::new(),
             method_resolutions: HashMap::new(),
@@ -1378,10 +1389,61 @@ impl SymbolTable {
             .or_else(|| self.lookup_type_method(type_name, method_name))
     }
 
-    pub fn type_implements_trait(&self, ty: &Type, trait_name: &Symbol) -> bool {
+    pub fn register_generic_trait_impl(
+        &mut self,
+        trait_name: Symbol,
+        target_ty: Type,
+        generics: Vec<ifa_ast::GenericParam>,
+        methods: HashMap<Symbol, FunctionSymbol>,
+    ) {
+        self.generic_trait_impls.push(GenericTraitImplSymbol {
+            trait_name,
+            target_ty,
+            generics,
+            methods,
+        });
+    }
+
+    pub fn lookup_generic_trait_impl(
+        &self,
+        trait_name: &Symbol,
+        target_ty: &Type,
+    ) -> Option<(&GenericTraitImplSymbol, HashMap<Symbol, Type>)> {
+        let mut cur = target_ty;
+        while let Type::Ref(inner) = cur {
+            cur = inner;
+        }
+
+        for g_impl in &self.generic_trait_impls {
+            if g_impl.trait_name == *trait_name {
+                let mut subst = HashMap::new();
+                if match_generic_type_pattern(cur, &g_impl.target_ty, &mut subst) {
+                    return Some((g_impl, subst));
+                }
+            }
+        }
+        None
+    }
+
+    pub fn type_implements_trait_with_bounds(
+        &self,
+        ty: &Type,
+        trait_name: &Symbol,
+        context_generics: &[ifa_ast::GenericParam],
+    ) -> bool {
         // Unknown suppresses cascading errors
         if matches!(ty, Type::Unknown) {
             return true;
+        }
+
+        // Caller bounded generic parameter (e.g. `T: Display`)
+        if let Type::TypeParam(caller_p) = ty {
+            if context_generics
+                .iter()
+                .any(|cg| cg.name == *caller_p && cg.bounds.contains(trait_name))
+            {
+                return true;
+            }
         }
 
         // Direct explicit registration
@@ -1393,12 +1455,43 @@ impl SymbolTable {
             }
         }
 
-        // Extract concrete type symbol if struct
-        let mut type_sym = None;
+        // Generic trait implementations (e.g. `impl<T: Display> Printable for Container<T>`)
         let mut cur = ty;
         while let Type::Ref(inner) = cur {
             cur = inner;
         }
+
+        for g_impl in &self.generic_trait_impls {
+            if g_impl.trait_name == *trait_name {
+                let mut subst = HashMap::new();
+                if match_generic_type_pattern(cur, &g_impl.target_ty, &mut subst) {
+                    let mut all_bounds_satisfied = true;
+                    for gp in &g_impl.generics {
+                        if let Some(concrete_ty) = subst.get(&gp.name) {
+                            for bound in &gp.bounds {
+                                if !self.type_implements_trait_with_bounds(
+                                    concrete_ty,
+                                    bound,
+                                    context_generics,
+                                ) {
+                                    all_bounds_satisfied = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !all_bounds_satisfied {
+                            break;
+                        }
+                    }
+                    if all_bounds_satisfied {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Extract concrete type symbol if struct
+        let mut type_sym = None;
         if let Type::Struct { name, .. } = cur {
             type_sym = Some(*name);
         } else if let Type::Generic { name, .. } = cur {
@@ -1415,8 +1508,40 @@ impl SymbolTable {
                 let mut found = false;
                 // Check if concrete type has an associated method
                 if let Some(st_name) = type_sym {
-                    if self.lookup_type_method(&st_name, &req_m.name).is_some() {
-                        found = true;
+                    if let Some(m_sym) = self.lookup_type_method(&st_name, &req_m.name) {
+                        if !m_sym.generics.is_empty() {
+                            if let Type::Generic { ref args, .. } = cur {
+                                let mut subst = HashMap::new();
+                                if let Some(st_def) = self.lookup_struct(&st_name) {
+                                    for (g, concrete) in st_def.generics.iter().zip(args.iter()) {
+                                        subst.insert(g.name, concrete.clone());
+                                    }
+                                }
+                                let mut bounds_ok = true;
+                                for g in &m_sym.generics {
+                                    if let Some(concrete_ty) = subst.get(&g.name) {
+                                        for bound in &g.bounds {
+                                            if !self.type_implements_trait_with_bounds(
+                                                concrete_ty,
+                                                bound,
+                                                context_generics,
+                                            ) {
+                                                bounds_ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if !bounds_ok {
+                                        break;
+                                    }
+                                }
+                                if bounds_ok {
+                                    found = true;
+                                }
+                            }
+                        } else {
+                            found = true;
+                        }
                     }
                 }
                 if !found {
@@ -1439,6 +1564,67 @@ impl SymbolTable {
         }
 
         false
+    }
+
+    pub fn type_implements_trait(&self, ty: &Type, trait_name: &Symbol) -> bool {
+        self.type_implements_trait_with_bounds(ty, trait_name, &[])
+    }
+}
+
+/// Matches a concrete type against a generic type pattern, collecting parameter substitutions.
+pub fn match_generic_type_pattern(
+    concrete: &Type,
+    pattern: &Type,
+    subst: &mut HashMap<Symbol, Type>,
+) -> bool {
+    if let Type::TypeParam(p) = pattern {
+        if let Some(existing) = subst.get(p) {
+            return existing == concrete || concrete.is_assignable_to(existing);
+        } else {
+            subst.insert(*p, concrete.clone());
+            return true;
+        }
+    }
+
+    match (concrete, pattern) {
+        (
+            Type::Generic {
+                name: c_name,
+                args: c_args,
+            },
+            Type::Generic {
+                name: p_name,
+                args: p_args,
+            },
+        ) => {
+            if c_name != p_name || c_args.len() != p_args.len() {
+                return false;
+            }
+            for (c_arg, p_arg) in c_args.iter().zip(p_args.iter()) {
+                if !match_generic_type_pattern(c_arg, p_arg, subst) {
+                    return false;
+                }
+            }
+            true
+        }
+        (Type::Ref(c_inner), Type::Ref(p_inner)) => {
+            match_generic_type_pattern(c_inner, p_inner, subst)
+        }
+        (Type::Optional(c_inner), Type::Optional(p_inner)) => {
+            match_generic_type_pattern(c_inner, p_inner, subst)
+        }
+        (Type::Slice(c_inner), Type::Slice(p_inner)) => {
+            match_generic_type_pattern(c_inner, p_inner, subst)
+        }
+        (Type::Array(c_elem, c_len), Type::Array(p_elem, p_len)) => {
+            if c_len != p_len {
+                return false;
+            }
+            match_generic_type_pattern(c_elem, p_elem, subst)
+        }
+        (Type::Struct { name: c_name, .. }, Type::Struct { name: p_name, .. }) => c_name == p_name,
+        (Type::Enum { name: c_name, .. }, Type::Enum { name: p_name, .. }) => c_name == p_name,
+        (c, p) => c == p || c.is_assignable_to(p),
     }
 }
 

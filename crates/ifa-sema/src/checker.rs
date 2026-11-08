@@ -584,9 +584,7 @@ impl<'a> SemanticAnalyzer<'a> {
             },
         };
 
-        if let Some(tr_name) = im.trait_name {
-            self.symbols.register_trait_impl(tr_name, target_ty.clone());
-        }
+        let mut methods_map = HashMap::new();
 
         // Register each method in impl block into symbol table
         for f in &im.methods {
@@ -688,7 +686,22 @@ impl<'a> SemanticAnalyzer<'a> {
 
             // Define fallback in functions table only if no conflict exists
             if self.symbols.lookup_function(&f.name).is_none() {
-                let _ = self.symbols.define_function(fn_sym);
+                let _ = self.symbols.define_function(fn_sym.clone());
+            }
+
+            methods_map.insert(f.name, fn_sym);
+        }
+
+        if let Some(tr_name) = im.trait_name {
+            if impl_generics.is_empty() && !matches!(target_ty, Type::Generic { .. }) {
+                self.symbols.register_trait_impl(tr_name, target_ty);
+            } else {
+                self.symbols.register_generic_trait_impl(
+                    tr_name,
+                    target_ty,
+                    impl_generics,
+                    methods_map,
+                );
             }
         }
     }
@@ -2315,17 +2328,8 @@ impl<'a> SemanticAnalyzer<'a> {
                             for g in &st.generics {
                                 if let Some(concrete_ty) = type_param_map.get(&g.name) {
                                     for bound in &g.bounds {
-                                        let is_satisfied = match concrete_ty {
-                                            Type::TypeParam(caller_p) => {
-                                                self.current_func_generics.iter().any(|cg| {
-                                                    cg.name == *caller_p
-                                                        && cg.bounds.contains(bound)
-                                                })
-                                            }
-                                            _ => self
-                                                .symbols
-                                                .type_implements_trait(concrete_ty, bound),
-                                        };
+                                        let is_satisfied =
+                                            self.check_type_implements_trait(concrete_ty, bound);
 
                                         if !is_satisfied {
                                             let bound_name = INTERNER.resolve(bound);
@@ -4420,13 +4424,7 @@ impl<'a> SemanticAnalyzer<'a> {
             for g in &st.generics {
                 if let Some(concrete_ty) = type_param_map.get(&g.name) {
                     for bound in &g.bounds {
-                        let is_satisfied = match concrete_ty {
-                            Type::TypeParam(caller_p) => self
-                                .current_func_generics
-                                .iter()
-                                .any(|cg| cg.name == *caller_p && cg.bounds.contains(bound)),
-                            _ => self.symbols.type_implements_trait(concrete_ty, bound),
-                        };
+                        let is_satisfied = self.check_type_implements_trait(concrete_ty, bound);
 
                         if !is_satisfied {
                             let bound_name = INTERNER.resolve(bound);
@@ -4668,13 +4666,7 @@ impl<'a> SemanticAnalyzer<'a> {
             for g in &f.generics {
                 if let Some(concrete_ty) = type_param_map.get(&g.name) {
                     for bound in &g.bounds {
-                        let is_satisfied = match concrete_ty {
-                            Type::TypeParam(caller_p) => self
-                                .current_func_generics
-                                .iter()
-                                .any(|cg| cg.name == *caller_p && cg.bounds.contains(bound)),
-                            _ => self.symbols.type_implements_trait(concrete_ty, bound),
-                        };
+                        let is_satisfied = self.check_type_implements_trait(concrete_ty, bound);
 
                         if !is_satisfied {
                             let bound_name = INTERNER.resolve(bound);
@@ -4725,6 +4717,12 @@ impl<'a> SemanticAnalyzer<'a> {
         } else {
             f.ret_ty.substitute(&type_param_map)
         }
+    }
+
+    /// Verifies whether a type satisfies a given trait bound, considering enclosing generic context.
+    fn check_type_implements_trait(&self, ty: &Type, bound: &Symbol) -> bool {
+        self.symbols
+            .type_implements_trait_with_bounds(ty, bound, &self.current_func_generics)
     }
 
     fn check_method_call_expr(
@@ -4910,6 +4908,34 @@ impl<'a> SemanticAnalyzer<'a> {
                         ));
                         (mangled_name, HashMap::new())
                     };
+
+                // Enforce generic bounds on receiver method instantiation
+                for g in &f.generics {
+                    if let Some(concrete_ty) = type_subst_for_method.get(&g.name) {
+                        for bound in &g.bounds {
+                            if !self.check_type_implements_trait(concrete_ty, bound) {
+                                let bound_name = INTERNER.resolve(bound);
+                                let ty_str = format!("{}", concrete_ty);
+                                let method_name = INTERNER.resolve(&method);
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "le type '{}' ne satisfait pas la contrainte de trait '{}' requise par la méthode '{}'",
+                                        ty_str, bound_name, method_name
+                                    ))
+                                    .with_code("E0030")
+                                    .with_primary_label(
+                                        span,
+                                        format!(
+                                            "le type '{}' n'implémente pas le contrat '{}'",
+                                            ty_str, bound_name
+                                        ),
+                                    ),
+                                );
+                                return Type::Unknown;
+                            }
+                        }
+                    }
+                }
 
                 self.symbols
                     .method_resolutions

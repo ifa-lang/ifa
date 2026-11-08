@@ -3308,3 +3308,179 @@ fn test_interprocedural_access_path_recursive_graph() {
     // The test validates that the fixed-point analysis on recursive call graphs terminates and computes clean summaries.
     assert!(res.diagnostics.len() <= 1);
 }
+
+#[test]
+fn test_generic_trait_impl_with_combined_trait_bounds() {
+    let code = r#"
+        trait Show {
+            fn show(self) -> String;
+        }
+
+        struct Item {
+            code: String,
+        }
+
+        impl Show for Item {
+            fn show(i: Item) -> String {
+                return i.code;
+            }
+        }
+
+        trait Output {
+            fn output(self) -> String;
+        }
+
+        struct Wrapper<T> {
+            val: T,
+        }
+
+        impl<T: Show> Output for Wrapper<T> {
+            fn output(w: Wrapper<T>) -> String {
+                return w.val.show();
+            }
+        }
+
+        fn print_out<U: Output>(item: U) -> String {
+            return item.output();
+        }
+
+        pub fn main() {
+            let it = Item(code: "IFA-9900");
+            let wrap = Wrapper(val: it);
+
+            let s1 = wrap.output();
+            let s2 = print_out(wrap);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Generic trait implementation for generic struct with satisfied trait bound must succeed: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_generic_trait_impl_unfulfilled_bound_rejected() {
+    let code = r#"
+        trait Show {
+            fn show(self) -> String;
+        }
+
+        struct Unshowable {
+            id: i64,
+        }
+
+        trait Output {
+            fn output(self) -> String;
+        }
+
+        struct Wrapper<T> {
+            val: T,
+        }
+
+        impl<T: Show> Output for Wrapper<T> {
+            fn output(w: Wrapper<T>) -> String {
+                return w.val.show();
+            }
+        }
+
+        fn print_out<U: Output>(item: U) -> String {
+            return item.output();
+        }
+
+        pub fn main() {
+            let u = Unshowable(id: 123);
+            let wrap = Wrapper(val: u);
+
+            // Must be rejected: Unshowable does not implement Show
+            let s = print_out(wrap);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        res.has_errors(),
+        "Generic trait impl with unfulfilled bound must be rejected"
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0030")),
+        "Expected E0030 diagnostic, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_generic_struct_nested_access_path_exclusivity() {
+    let code = r#"
+        struct Box<T> {
+            elem: T,
+        }
+
+        struct Dual<T> {
+            left: Box<T>,
+            right: Box<T>,
+        }
+
+        fn modify_two(inout a: i64, inout b: i64) {
+            a = a + 1;
+            b = b + 1;
+        }
+
+        pub fn main() {
+            let mut d = Dual(
+                left: Box(elem: 100),
+                right: Box(elem: 200),
+            );
+
+            // Disjoint paths: d.left.elem and d.right.elem
+            modify_two(inout d.left.elem, inout d.right.elem);
+        }
+    "#;
+    let res = run_analysis(code);
+    assert!(
+        !res.has_errors(),
+        "Disjoint nested field paths on generic struct must succeed without exclusivity error: {:?}",
+        res.diagnostics
+    );
+
+    let err_code = r#"
+        struct Box<T> {
+            elem: T,
+        }
+
+        struct Dual<T> {
+            left: Box<T>,
+            right: Box<T>,
+        }
+
+        fn modify_two(inout a: i64, inout b: i64) {
+            a = a + 1;
+            b = b + 1;
+        }
+
+        pub fn main() {
+            let mut d = Dual(
+                left: Box(elem: 100),
+                right: Box(elem: 200),
+            );
+
+            // Overlapping paths: d.left.elem and d.left.elem
+            modify_two(inout d.left.elem, inout d.left.elem);
+        }
+    "#;
+    let err_res = run_analysis(err_code);
+    assert!(
+        err_res.has_errors(),
+        "Overlapping nested field paths must trigger exclusivity diagnostic"
+    );
+    assert!(
+        err_res
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0011")),
+        "Expected E0011 exclusivity error, got: {:?}",
+        err_res.diagnostics
+    );
+}

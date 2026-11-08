@@ -898,13 +898,17 @@ impl<'a> FunctionLoweringContext<'a> {
         }
 
         if let Some(st_name) = rec_struct_name {
-            let specialized = INTERNER.intern(&format!(
-                "{}__{}",
-                INTERNER.resolve(&st_name),
-                INTERNER.resolve(&method)
-            ));
+            let name_str = INTERNER.resolve(&st_name);
+            let base_name = name_str.split("__").next().unwrap_or(&name_str);
+            let base_sym = INTERNER.intern(base_name);
+            let specialized =
+                INTERNER.intern(&format!("{}__{}", name_str, INTERNER.resolve(&method)));
             if self.symbols.lookup_function(&specialized).is_some()
                 || self.symbols.lookup_type_method(&st_name, &method).is_some()
+                || self
+                    .symbols
+                    .lookup_type_method(&base_sym, &method)
+                    .is_some()
             {
                 return specialized;
             }
@@ -5921,6 +5925,27 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
     for (fn_name, instances) in &symbols.generic_function_instances {
         for type_args in instances {
             worklist.push((*fn_name, type_args.clone()));
+        }
+    }
+
+    // Automatically enqueue monomorphic instances of methods for all instantiated generic structs
+    for (st_name, instances) in &symbols.generic_struct_instances {
+        for type_args in instances {
+            if let Some(methods) = symbols.type_methods.get(st_name) {
+                for m_name in methods.keys() {
+                    let base_mangled_method = INTERNER.intern(&format!(
+                        "{}__{}",
+                        INTERNER.resolve(st_name),
+                        INTERNER.resolve(m_name)
+                    ));
+                    if !worklist
+                        .iter()
+                        .any(|(sym, args)| sym == &base_mangled_method && args == type_args)
+                    {
+                        worklist.push((base_mangled_method, type_args.clone()));
+                    }
+                }
+            }
         }
     }
 
