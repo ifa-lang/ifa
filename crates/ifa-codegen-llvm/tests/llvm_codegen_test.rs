@@ -790,6 +790,116 @@ fn test_llvm_aot_monomorphic_trait_specialization() {
 }
 
 #[test]
+fn test_llvm_generic_trait_impl_devirtualization_and_native_execution() {
+    let src = r#"
+        trait Metric {
+            fn score(self: Metric) -> i64;
+        }
+
+        struct Sensor {
+            raw: i64,
+        }
+
+        impl Metric for Sensor {
+            fn score(s: Sensor) -> i64 {
+                return s.raw;
+            }
+        }
+
+        struct Box<T> {
+            val: T,
+        }
+
+        impl<T: Metric> Metric for Box<T> {
+            fn score(b: Box<T>) -> i64 {
+                return b.val.score() * 2;
+            }
+        }
+
+        fn evaluate<U: Metric>(item: U) -> i64 {
+            return item.score();
+        }
+
+        pub fn main() -> i64 {
+            let s = Sensor(raw: 21);
+            let b = Box(val: s);
+            return evaluate(b);
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("generic_trait_llvm.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).expect("FIR lowering failed");
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&module).expect("Emission failed");
+
+    // 1. Verify VTables for both implementors (Sensor and monomorphized Box__Sensor)
+    assert!(
+        ir.contains("@__ifa_vtable_Sensor"),
+        "IR must contain @__ifa_vtable_Sensor: {}",
+        ir
+    );
+    assert!(
+        ir.contains("@__ifa_vtable_Box__Sensor"),
+        "IR must contain @__ifa_vtable_Box__Sensor: {}",
+        ir
+    );
+
+    // 2. Verify devirtualized direct static calls
+    assert!(
+        ir.contains("call i64 @Box__Sensor__score"),
+        "Call must be devirtualized to @Box__Sensor__score: {}",
+        ir
+    );
+    assert!(
+        ir.contains("call i64 @Sensor__score"),
+        "Call must be devirtualized to @Sensor__score: {}",
+        ir
+    );
+
+    // 3. Verify compilation to native executable and actual execution produces 42 (21 * 2)
+    let temp_dir =
+        std::env::temp_dir().join(format!("llvm_generic_trait_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("gen_trait.o");
+    let bin_path = temp_dir.join("gen_trait_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "Native binary output exit code must be 42 (21 * 2)"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
 fn test_llvm_adt_tagged_union_emission_and_native_execution() {
     let src = r#"
 enum Event {

@@ -13,13 +13,21 @@ pub struct LicmStats {
     pub hoisted_loads: usize,
     /// Total number of invariant bounds check instructions hoisted out of loops.
     pub hoisted_bounds_checks: usize,
+    /// Total number of invariant allocation instructions hoisted out of loops.
+    pub hoisted_allocs: usize,
+    /// Total number of invariant generational reference instructions hoisted out of loops.
+    pub hoisted_gen_refs: usize,
     /// Total number of loops optimized.
     pub loops_optimized: usize,
 }
 
 impl LicmStats {
     pub fn total_hoisted(&self) -> usize {
-        self.hoisted_projections + self.hoisted_loads + self.hoisted_bounds_checks
+        self.hoisted_projections
+            + self.hoisted_loads
+            + self.hoisted_bounds_checks
+            + self.hoisted_allocs
+            + self.hoisted_gen_refs
     }
 }
 
@@ -120,7 +128,8 @@ fn resolve_access_path(
 /// Detects natural loops and hoists:
 /// 1. Invariant struct projections (`GetField`, `GetFieldPtr`, `GenDeref`, `GetElement`, `GetElementPtr`, `ArrayLen`)
 /// 2. Invariant bounds checks (`BoundsCheck`, `SliceBoundsCheck`)
-/// 3. Invariant memory loads (`Load`)
+/// 3. Invariant memory allocations (`Alloca`) and generational references (`GenRef`, `GenCheck`)
+/// 4. Invariant memory loads (`Load`)
 ///
 /// Integrates path-sensitive exclusivity analysis (`FirAccessPath`) to prove disjointness
 /// between field modifications (e.g. `outer.second`) and invariant projections/loads (e.g. `outer.first`).
@@ -213,6 +222,7 @@ impl LicmPass {
             // Compute written memory paths and side-effect calls within loop blocks
             let mut written_paths: Vec<FirAccessPath> = Vec::new();
             let mut has_impure_call = false;
+            let mut loop_has_gen_free = false;
 
             for &b_id in &loop_info.blocks {
                 if let Some(b) = func.get_block(b_id) {
@@ -250,6 +260,7 @@ impl LicmPass {
                                     .push(resolve_access_path(*base, &inst_defs, &constants, 0));
                             }
                             ValueExpr::GenFree { ptr } => {
+                                loop_has_gen_free = true;
                                 written_paths
                                     .push(resolve_access_path(*ptr, &inst_defs, &constants, 0));
                             }
@@ -305,7 +316,7 @@ impl LicmPass {
                             }
 
                             if let Some(res_val) = inst.result {
-                                // Category 1: Invariant projection or memory load
+                                // Category 1: Invariant projection, allocation, or memory load
                                 let is_projection = matches!(
                                     &inst.expr,
                                     ValueExpr::GetField { .. }
@@ -315,6 +326,22 @@ impl LicmPass {
                                         | ValueExpr::GenDeref { .. }
                                         | ValueExpr::ArrayLen { .. }
                                 );
+
+                                let is_alloca = matches!(&inst.expr, ValueExpr::Alloca { .. });
+
+                                let is_gen_ref = match &inst.expr {
+                                    ValueExpr::GenRef { ptr } => {
+                                        if has_impure_call || loop_has_gen_free {
+                                            false
+                                        } else {
+                                            let ref_path = resolve_access_path(
+                                                *ptr, &inst_defs, &constants, 0,
+                                            );
+                                            !written_paths.iter().any(|w| ref_path.overlaps(w))
+                                        }
+                                    }
+                                    _ => false,
+                                };
 
                                 let is_safe_load = match &inst.expr {
                                     ValueExpr::Load { ptr } => {
@@ -330,13 +357,13 @@ impl LicmPass {
                                     _ => false,
                                 };
 
-                                if is_projection || is_safe_load {
+                                if is_projection || is_alloca || is_gen_ref || is_safe_load {
                                     to_hoist.push((b_id, i_idx, inst.clone()));
                                     def_block.insert(res_val, preheader_id);
                                     break; // Hoist one candidate per block per sub-iteration
                                 }
                             } else {
-                                // Category 2: Invariant array / slice bounds check (BCE)
+                                // Category 2: Invariant array / slice bounds check (BCE) or generational check
                                 match &inst.expr {
                                     ValueExpr::BoundsCheck {
                                         base, redundant, ..
@@ -383,6 +410,8 @@ impl LicmPass {
 
                     // 2. Insert into preheader
                     let is_load = matches!(&inst.expr, ValueExpr::Load { .. });
+                    let is_alloca = matches!(&inst.expr, ValueExpr::Alloca { .. });
+                    let is_gen_ref = matches!(&inst.expr, ValueExpr::GenRef { .. });
                     let is_bounds_check = matches!(
                         &inst.expr,
                         ValueExpr::BoundsCheck { .. } | ValueExpr::SliceBoundsCheck { .. }
@@ -438,6 +467,10 @@ impl LicmPass {
                         pre_b.instructions.push(inst);
                         if is_load {
                             self.stats.hoisted_loads += 1;
+                        } else if is_alloca {
+                            self.stats.hoisted_allocs += 1;
+                        } else if is_gen_ref {
+                            self.stats.hoisted_gen_refs += 1;
                         } else {
                             self.stats.hoisted_projections += 1;
                         }

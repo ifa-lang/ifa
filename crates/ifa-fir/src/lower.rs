@@ -92,19 +92,44 @@ impl<'a> FunctionLoweringContext<'a> {
     ) -> Self {
         let effective_name = func_name_override.unwrap_or(func_ast.name);
 
-        let sema_fn = symbols
-            .lookup_function(&effective_name)
-            .or_else(|| symbols.lookup_function(&func_ast.name));
+        let mut sema_fn = symbols.lookup_function(&effective_name);
+        if sema_fn.is_none() {
+            let eff_str = INTERNER.resolve(&effective_name);
+            if let Some((type_prefix, method_name)) = eff_str.rsplit_once("__") {
+                let base_type = type_prefix.split("__").next().unwrap_or(type_prefix);
+                let base_type_sym = INTERNER.intern(base_type);
+                let method_sym = INTERNER.intern(method_name);
+                sema_fn = symbols
+                    .lookup_type_method(&base_type_sym, &method_sym)
+                    .or_else(|| {
+                        symbols.lookup_function(
+                            &INTERNER.intern(&format!("{}__{}", base_type, method_name)),
+                        )
+                    });
+            }
+        }
+        if sema_fn.is_none() {
+            sema_fn = symbols.lookup_function(&func_ast.name);
+        }
 
         let ret_ty = func_ast
             .ret_ty
             .as_ref()
-            .map(|_t| {
+            .map(|ast_ret| {
                 if let Some(sema_ty) = sema_fn {
                     let substituted = sema_ty.ret_ty.substitute(&type_subst);
                     FirType::from_sema_type(&substituted)
                 } else {
-                    FirType::Unit
+                    let known_structs = HashMap::new();
+                    let known_enums = HashMap::new();
+                    ifa_sema::types::Type::from_ast_with_generics(
+                        ast_ret,
+                        &known_structs,
+                        &known_enums,
+                        &func_ast.generics,
+                    )
+                    .map(|t| FirType::from_sema_type(&t.substitute(&type_subst)))
+                    .unwrap_or(FirType::Unit)
                 }
             })
             .unwrap_or(FirType::Unit);
@@ -127,16 +152,26 @@ impl<'a> FunctionLoweringContext<'a> {
                     .unwrap_or_else(|| {
                         let known_structs = HashMap::new();
                         let known_enums = HashMap::new();
-                        ifa_sema::types::Type::from_ast(&p.ty, &known_structs, &known_enums)
-                            .map(|t| FirType::from_sema_type(&t.substitute(&type_subst)))
-                            .unwrap_or(FirType::Unit)
+                        ifa_sema::types::Type::from_ast_with_generics(
+                            &p.ty,
+                            &known_structs,
+                            &known_enums,
+                            &func_ast.generics,
+                        )
+                        .map(|t| FirType::from_sema_type(&t.substitute(&type_subst)))
+                        .unwrap_or(FirType::Unit)
                     })
             } else {
                 let known_structs = HashMap::new();
                 let known_enums = HashMap::new();
-                ifa_sema::types::Type::from_ast(&p.ty, &known_structs, &known_enums)
-                    .map(|t| FirType::from_sema_type(&t.substitute(&type_subst)))
-                    .unwrap_or(FirType::Unit)
+                ifa_sema::types::Type::from_ast_with_generics(
+                    &p.ty,
+                    &known_structs,
+                    &known_enums,
+                    &func_ast.generics,
+                )
+                .map(|t| FirType::from_sema_type(&t.substitute(&type_subst)))
+                .unwrap_or(FirType::Unit)
             };
             params.push(FirParam {
                 name: p.name,
@@ -913,6 +948,11 @@ impl<'a> FunctionLoweringContext<'a> {
                     .symbols
                     .lookup_type_method(&base_sym, &method)
                     .is_some()
+                || self
+                    .symbols
+                    .trait_impl_methods
+                    .iter()
+                    .any(|((_, t), m)| (t == &st_name || t == &base_sym) && m.contains_key(&method))
             {
                 return specialized;
             }
@@ -2797,7 +2837,26 @@ impl<'a> FunctionLoweringContext<'a> {
                             Some(*fn_name)
                         }
                     }
-                    ExprKind::Path(path) => path.last().copied(),
+                    ExprKind::Path(path) => {
+                        if path.len() >= 2 {
+                            let type_sym = path[path.len() - 2];
+                            let m_sym = path[path.len() - 1];
+                            let mangled = INTERNER.intern(&format!(
+                                "{}__{}",
+                                INTERNER.resolve(&type_sym),
+                                INTERNER.resolve(&m_sym)
+                            ));
+                            if self.symbols.lookup_function(&mangled).is_some()
+                                || self.symbols.lookup_type_method(&type_sym, &m_sym).is_some()
+                            {
+                                Some(mangled)
+                            } else {
+                                path.last().copied()
+                            }
+                        } else {
+                            path.last().copied()
+                        }
+                    }
                     ExprKind::FieldAccess { field, .. } => Some(*field),
                     _ => None,
                 };
@@ -2916,8 +2975,20 @@ impl<'a> FunctionLoweringContext<'a> {
 
                 if let Some(fn_name) = direct_name {
                     let target_fn_name = if let Some(fn_sym) =
-                        self.symbols.lookup_function(&fn_name)
-                    {
+                        self.symbols.lookup_function(&fn_name).or_else(|| {
+                            if let ExprKind::Path(path) = &callee.kind {
+                                if path.len() >= 2 {
+                                    self.symbols.lookup_type_method(
+                                        &path[path.len() - 2],
+                                        &path[path.len() - 1],
+                                    )
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }) {
                         if !fn_sym.generics.is_empty() {
                             if let Some(call_args) = self.symbols.call_instantiations.get(&span) {
                                 let concrete_args: Vec<_> = call_args

@@ -1215,6 +1215,11 @@ impl<'a> LlvmIrEmitter<'a> {
                                 ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                             }
                         }
+                        ValueExpr::StructInit { name, .. } => {
+                            let st_def = module.structs.iter().find(|s| s.name == *name);
+                            let fields = st_def.map(|s| s.fields.clone()).unwrap_or_default();
+                            ifa_fir::FirType::Struct(*name, fields)
+                        }
                         ValueExpr::EnumInit { enum_name, .. } => {
                             let en_def = module.enums.iter().find(|e| e.name == *enum_name);
                             let variants = en_def.map(|e| e.variants.clone()).unwrap_or_default();
@@ -2149,13 +2154,17 @@ impl<'a> LlvmIrEmitter<'a> {
                     res_id, s_name
                 ));
                 for (idx, field_val) in fields.iter().enumerate() {
+                    let f_ty_str = value_types
+                        .get(field_val)
+                        .and_then(|ty| fir_to_llvm_type(ty).ok())
+                        .unwrap_or_else(|| "i64".to_string());
                     out.push_str(&format!(
                         "  %field_ptr_{}_{} = getelementptr inbounds %struct.{}, ptr %st_alloc_{}, i32 0, i32 {}\n",
                         res_id, idx, s_name, res_id, idx
                     ));
                     out.push_str(&format!(
-                        "  store i64 %v{}, ptr %field_ptr_{}_{}, align 8\n",
-                        field_val.0, res_id, idx
+                        "  store {} %v{}, ptr %field_ptr_{}_{}, align 8\n",
+                        f_ty_str, field_val.0, res_id, idx
                     ));
                 }
                 out.push_str(&format!(

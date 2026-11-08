@@ -362,3 +362,241 @@ fn test_licm_nested_struct_array_bounds_check_hoisting() {
         .unwrap();
     assert_eq!(res, FirValue::Int(165));
 }
+
+#[test]
+fn test_licm_hoists_alloca_and_gen_ref_cascade() {
+    use ifa_ast::ParamMode;
+    use ifa_fir::ir::*;
+    use ifa_fir::types::FirType;
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("hoist_alloc_gen_loop");
+    let param = FirParam {
+        name: INTERNER.intern("base_ptr"),
+        val: ValueId(0),
+        ty: FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
+        mode: ParamMode::In,
+    };
+
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![param],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    // b0: entry
+    let b_entry = BlockId(0);
+    let b_preheader = func.alloc_block(); // b1
+    let b_header = func.alloc_block(); // b2
+    let b_body = func.alloc_block(); // b3
+    let b_exit = func.alloc_block(); // b4
+
+    func.get_block_mut(b_entry)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_preheader,
+            args: Vec::new(),
+        });
+
+    func.get_block_mut(b_preheader)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_header,
+            args: Vec::new(),
+        });
+
+    let v_cond = func.alloc_value();
+    func.get_block_mut(b_header)
+        .unwrap()
+        .set_terminator(Terminator::BranchCond {
+            cond: v_cond,
+            then_block: b_body,
+            then_args: Vec::new(),
+            else_block: b_exit,
+            else_args: Vec::new(),
+        });
+
+    // Body contains:
+    // 1. Alloca (no uses, stack allocation)
+    let v_alloca = func.alloc_value();
+    // 2. GenRef referencing parameter base_ptr ValueId(0)
+    let v_gen_ref = func.alloc_value();
+    // 3. GenDeref of v_gen_ref
+    let v_deref = func.alloc_value();
+    // 4. Invariant Load of v_deref
+    let v_load = func.alloc_value();
+
+    let body_bb = func.get_block_mut(b_body).unwrap();
+    body_bb.push_instruction(Instruction::new(
+        Some(v_alloca),
+        ValueExpr::Alloca {
+            ty: FirType::Int(IntType::I64),
+            name: None,
+        },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        Some(v_gen_ref),
+        ValueExpr::GenRef { ptr: ValueId(0) },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        Some(v_deref),
+        ValueExpr::GenDeref { ref_val: v_gen_ref },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        Some(v_load),
+        ValueExpr::Load { ptr: v_deref },
+        Span::DUMMY,
+    ));
+    body_bb.set_terminator(Terminator::Branch {
+        target: b_header,
+        args: Vec::new(),
+    });
+
+    func.get_block_mut(b_exit)
+        .unwrap()
+        .set_terminator(Terminator::Return(Some(v_load)));
+
+    let mut licm = LicmPass::new();
+    licm.run_on_function(&mut func);
+
+    let stats = licm.stats();
+    assert_eq!(
+        stats.hoisted_allocs, 1,
+        "Expected 1 hoisted alloca: {:?}",
+        stats
+    );
+    assert_eq!(
+        stats.hoisted_gen_refs, 1,
+        "Expected 1 hoisted gen_ref: {:?}",
+        stats
+    );
+    assert_eq!(
+        stats.hoisted_projections, 1,
+        "Expected 1 hoisted GenDeref projection: {:?}",
+        stats
+    );
+    assert_eq!(
+        stats.hoisted_loads, 1,
+        "Expected 1 hoisted load: {:?}",
+        stats
+    );
+    assert_eq!(stats.total_hoisted(), 4);
+
+    // Verify all 4 instructions were placed into the preheader (b_preheader = b1)
+    let preheader = func.get_block(b_preheader).unwrap();
+    assert_eq!(preheader.instructions.len(), 4);
+
+    // Body should now have 0 hoisted instructions
+    let body = func.get_block(b_body).unwrap();
+    assert_eq!(body.instructions.len(), 0);
+}
+
+#[test]
+fn test_licm_preserves_gen_ref_when_loop_frees_memory() {
+    use ifa_ast::ParamMode;
+    use ifa_fir::ir::*;
+    use ifa_fir::types::FirType;
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("free_prevents_hoisting");
+    let param = FirParam {
+        name: INTERNER.intern("base_ptr"),
+        val: ValueId(0),
+        ty: FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
+        mode: ParamMode::In,
+    };
+
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![param],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let b_entry = BlockId(0);
+    let b_preheader = func.alloc_block();
+    let b_header = func.alloc_block();
+    let b_body = func.alloc_block();
+    let b_exit = func.alloc_block();
+
+    func.get_block_mut(b_entry)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_preheader,
+            args: Vec::new(),
+        });
+    func.get_block_mut(b_preheader)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_header,
+            args: Vec::new(),
+        });
+
+    let v_cond = func.alloc_value();
+    func.get_block_mut(b_header)
+        .unwrap()
+        .set_terminator(Terminator::BranchCond {
+            cond: v_cond,
+            then_block: b_body,
+            then_args: Vec::new(),
+            else_block: b_exit,
+            else_args: Vec::new(),
+        });
+
+    let v_alloca = func.alloc_value();
+    let v_gen_ref = func.alloc_value();
+
+    let body_bb = func.get_block_mut(b_body).unwrap();
+    // Alloca is invariant and unaffected by frees
+    body_bb.push_instruction(Instruction::new(
+        Some(v_alloca),
+        ValueExpr::Alloca {
+            ty: FirType::Int(IntType::I64),
+            name: None,
+        },
+        Span::DUMMY,
+    ));
+    // GenFree occurs in loop body!
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenFree { ptr: ValueId(0) },
+        Span::DUMMY,
+    ));
+    // GenRef should NOT be hoisted because memory is freed inside the loop
+    body_bb.push_instruction(Instruction::new(
+        Some(v_gen_ref),
+        ValueExpr::GenRef { ptr: ValueId(0) },
+        Span::DUMMY,
+    ));
+    body_bb.set_terminator(Terminator::Branch {
+        target: b_header,
+        args: Vec::new(),
+    });
+
+    func.get_block_mut(b_exit)
+        .unwrap()
+        .set_terminator(Terminator::Return(None));
+
+    let mut licm = LicmPass::new();
+    licm.run_on_function(&mut func);
+
+    let stats = licm.stats();
+    // Alloca is safely hoisted
+    assert_eq!(stats.hoisted_allocs, 1);
+    // GenRef MUST NOT be hoisted due to GenFree in loop
+    assert_eq!(stats.hoisted_gen_refs, 0);
+}
