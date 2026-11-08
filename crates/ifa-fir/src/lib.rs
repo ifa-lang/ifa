@@ -32,7 +32,7 @@ pub use gen_opt::{GenOptStats, GenerationalOptPass, NaturalLoop};
 pub use interp::{FirInterpreter, FirValue, GenHeader, GenHeap, InterpError};
 pub use ipo::{
     FunctionMemorySummary, InterproceduralMemoryMap, IpoCallGraph, IpoPass, IpoStats, MemoryEffect,
-    ParamMemorySummary,
+    ParamMemorySummary, PathRoot, StructAccessPath,
 };
 pub use ir::*;
 pub use layout_opt::{CacheLayoutPass, CacheLayoutStats, CACHE_LINE_SIZE};

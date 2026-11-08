@@ -45,6 +45,12 @@ pub struct IpoStats {
     pub convolutions_vectorized: usize,
     /// Number of redundant sliding window bounds checks statically eliminated.
     pub sliding_window_bounds_eliminated: usize,
+    /// Number of function parameters inter-procedurally proven non-aliasing (`noalias`).
+    pub noalias_parameters_propagated: usize,
+    /// Number of nested structure field access paths disambiguated as non-aliasing.
+    pub nested_struct_paths_disambiguated: usize,
+    /// Number of call site argument pairs statically verified as disjoint.
+    pub disjoint_call_sites_verified: usize,
 }
 
 /// Call graph structure capturing caller-callee relationships, recursive cycles,
@@ -193,8 +199,80 @@ pub enum MemoryEffect {
     Arbitrary,
 }
 
-/// Detailed memory access effects for a function parameter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Originating root of a memory reference in SSA FIR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PathRoot {
+    Param(usize),
+    Alloca(ValueId),
+    CallArena(ValueId),
+    GenArena(ValueId),
+    Global(Symbol),
+    Unknown(ValueId),
+}
+
+/// Path through nested structures and projections starting from a PathRoot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StructAccessPath {
+    pub root: PathRoot,
+    pub fields: Vec<usize>,
+}
+
+impl StructAccessPath {
+    pub fn new(root: PathRoot) -> Self {
+        Self {
+            root,
+            fields: Vec::new(),
+        }
+    }
+
+    pub fn with_field(&self, field: usize) -> Self {
+        let mut f = self.fields.clone();
+        f.push(field);
+        Self {
+            root: self.root,
+            fields: f,
+        }
+    }
+
+    /// Check whether two struct access paths are provably disjoint (non-aliasing).
+    pub fn is_disjoint_from(&self, other: &Self) -> bool {
+        match (self.root, other.root) {
+            (PathRoot::Alloca(a1), PathRoot::Alloca(a2)) => a1 != a2,
+            (PathRoot::CallArena(c1), PathRoot::CallArena(c2)) => c1 != c2,
+            (PathRoot::GenArena(g1), PathRoot::GenArena(g2)) => g1 != g2,
+            (PathRoot::Alloca(_), PathRoot::CallArena(_) | PathRoot::GenArena(_))
+            | (PathRoot::CallArena(_), PathRoot::Alloca(_) | PathRoot::GenArena(_))
+            | (PathRoot::GenArena(_), PathRoot::Alloca(_) | PathRoot::CallArena(_)) => true,
+            (PathRoot::Param(p1), PathRoot::Param(p2)) if p1 != p2 => true,
+            (
+                PathRoot::Param(_),
+                PathRoot::Alloca(_) | PathRoot::CallArena(_) | PathRoot::GenArena(_),
+            )
+            | (
+                PathRoot::Alloca(_) | PathRoot::CallArena(_) | PathRoot::GenArena(_),
+                PathRoot::Param(_),
+            ) => true,
+            _ => {
+                if self.root == other.root {
+                    // Same root: check if nested field projections diverge!
+                    let min_len = self.fields.len().min(other.fields.len());
+                    for i in 0..min_len {
+                        if self.fields[i] != other.fields[i] {
+                            // Diverging field index in struct layout: provably non-aliasing!
+                            return true;
+                        }
+                    }
+                    false
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// Detailed memory access effects and non-aliasing guarantees for a function parameter.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ParamMemorySummary {
     /// True if the parameter pointer escapes the function frame (stored in escaping alloca,
     /// returned, passed to spawn, or sent across a channel).
@@ -203,6 +281,12 @@ pub struct ParamMemorySummary {
     pub written: bool,
     /// True if the pointee memory is read via Load.
     pub read: bool,
+    /// True if the parameter pointer is proven non-aliasing (`noalias`) across all call sites.
+    pub noalias: bool,
+    /// True if nested fields of this parameter are accessed via provably disjoint paths.
+    pub nested_fields_disjoint: bool,
+    /// Unique field projection paths accessed through this parameter.
+    pub accessed_field_paths: Vec<Vec<usize>>,
 }
 
 /// Whole-function inter-procedural memory summary.
@@ -218,6 +302,9 @@ pub struct FunctionMemorySummary {
 pub struct InterproceduralMemoryMap {
     pub summaries: HashMap<Symbol, FunctionMemorySummary>,
     pub strict_ffi_pures: usize,
+    pub noalias_parameters_propagated: usize,
+    pub nested_struct_paths_disambiguated: usize,
+    pub disjoint_call_sites_verified: usize,
 }
 
 impl InterproceduralMemoryMap {
@@ -264,6 +351,9 @@ impl InterproceduralMemoryMap {
             param_escapes: Vec<bool>,
             param_written: Vec<bool>,
             param_read: Vec<bool>,
+            value_paths: HashMap<ValueId, StructAccessPath>,
+            param_field_paths: Vec<HashSet<Vec<usize>>>,
+            nested_fields_disjoint: Vec<bool>,
         }
 
         let mut local_infos: HashMap<Symbol, FuncLocalInfo> = HashMap::new();
@@ -299,6 +389,7 @@ impl InterproceduralMemoryMap {
                                 p.ty,
                                 crate::types::FirType::Pointer(..)
                                     | crate::types::FirType::Array(..)
+                                    | crate::types::FirType::Slice(..)
                             )
                         });
 
@@ -317,11 +408,15 @@ impl InterproceduralMemoryMap {
                                     p.ty,
                                     crate::types::FirType::Pointer(..)
                                         | crate::types::FirType::Array(..)
+                                        | crate::types::FirType::Slice(..)
                                 );
                                 ParamMemorySummary {
                                     escapes: false,
                                     written: false,
                                     read: is_ptr,
+                                    noalias: true,
+                                    nested_fields_disjoint: true,
+                                    accessed_field_paths: Vec::new(),
                                 }
                             })
                             .collect();
@@ -345,6 +440,9 @@ impl InterproceduralMemoryMap {
                                     escapes: false,
                                     written: is_mut,
                                     read: true,
+                                    noalias: true,
+                                    nested_fields_disjoint: true,
+                                    accessed_field_paths: Vec::new(),
                                 }
                             })
                             .collect();
@@ -370,6 +468,9 @@ impl InterproceduralMemoryMap {
                                     escapes: true,
                                     written: true,
                                     read: true,
+                                    noalias: false,
+                                    nested_fields_disjoint: false,
+                                    accessed_field_paths: Vec::new(),
                                 };
                                 param_count
                             ],
@@ -563,6 +664,136 @@ impl InterproceduralMemoryMap {
                     }
                 }
 
+                // Trace struct and pointer access paths
+                let mut value_paths: HashMap<ValueId, StructAccessPath> = HashMap::new();
+                for (p_idx, p) in func.params.iter().enumerate() {
+                    value_paths.insert(p.val, StructAccessPath::new(PathRoot::Param(p_idx)));
+                }
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let Some(res) = inst.result {
+                            match &inst.expr {
+                                ValueExpr::Alloca { .. } => {
+                                    value_paths
+                                        .insert(res, StructAccessPath::new(PathRoot::Alloca(res)));
+                                }
+                                ValueExpr::CallArenaAlloc { .. } => {
+                                    value_paths.insert(
+                                        res,
+                                        StructAccessPath::new(PathRoot::CallArena(res)),
+                                    );
+                                }
+                                ValueExpr::GenAlloc { .. } => {
+                                    value_paths.insert(
+                                        res,
+                                        StructAccessPath::new(PathRoot::GenArena(res)),
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                // Propagate struct access paths iteratively
+                let mut path_changed = true;
+                while path_changed {
+                    path_changed = false;
+                    for block in &func.blocks {
+                        for inst in &block.instructions {
+                            if let Some(res) = inst.result {
+                                match &inst.expr {
+                                    ValueExpr::GetField {
+                                        base, field_idx, ..
+                                    }
+                                    | ValueExpr::GetFieldPtr {
+                                        base, field_idx, ..
+                                    } => {
+                                        if let Some(parent_path) = value_paths.get(base).cloned() {
+                                            let new_path = parent_path.with_field(*field_idx);
+                                            if value_paths.get(&res) != Some(&new_path) {
+                                                value_paths.insert(res, new_path);
+                                                path_changed = true;
+                                            }
+                                        }
+                                    }
+                                    ValueExpr::GetElement { base, .. }
+                                    | ValueExpr::GetElementPtr { base, .. } => {
+                                        if let Some(parent_path) = value_paths.get(base).cloned() {
+                                            let new_path = parent_path.with_field(0);
+                                            if value_paths.get(&res) != Some(&new_path) {
+                                                value_paths.insert(res, new_path);
+                                                path_changed = true;
+                                            }
+                                        }
+                                    }
+                                    ValueExpr::Load { ptr } => {
+                                        if let Some(parent_path) = value_paths.get(ptr).cloned() {
+                                            if value_paths.get(&res) != Some(&parent_path) {
+                                                value_paths.insert(res, parent_path);
+                                                path_changed = true;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else if let ValueExpr::Store { ptr, val } = &inst.expr {
+                                if let Some(val_path) = value_paths.get(val).cloned() {
+                                    if !value_paths.contains_key(ptr) {
+                                        value_paths.insert(*ptr, val_path);
+                                        path_changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Collect accessed nested field paths per parameter
+                let mut param_field_paths: Vec<HashSet<Vec<usize>>> =
+                    vec![HashSet::new(); param_count];
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        let ptr_opt = match &inst.expr {
+                            ValueExpr::Load { ptr } => Some(*ptr),
+                            ValueExpr::Store { ptr, .. } => Some(*ptr),
+                            _ => None,
+                        };
+                        if let Some(ptr) = ptr_opt {
+                            if let Some(path) = value_paths.get(&ptr) {
+                                if let PathRoot::Param(idx) = path.root {
+                                    if idx < param_count {
+                                        param_field_paths[idx].insert(path.fields.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut nested_fields_disjoint = vec![true; param_count];
+                for (p_idx, paths) in param_field_paths.iter().enumerate() {
+                    let path_list: Vec<&Vec<usize>> = paths.iter().collect();
+                    'outer_path: for i in 0..path_list.len() {
+                        for j in (i + 1)..path_list.len() {
+                            let p1 = path_list[i];
+                            let p2 = path_list[j];
+                            let min_len = p1.len().min(p2.len());
+                            let mut diverges = false;
+                            for k in 0..min_len {
+                                if p1[k] != p2[k] {
+                                    diverges = true;
+                                    break;
+                                }
+                            }
+                            if !diverges {
+                                nested_fields_disjoint[p_idx] = false;
+                                break 'outer_path;
+                            }
+                        }
+                    }
+                }
+
                 local_infos.insert(
                     func.name,
                     FuncLocalInfo {
@@ -574,6 +805,9 @@ impl InterproceduralMemoryMap {
                         param_escapes,
                         param_written,
                         param_read,
+                        value_paths,
+                        param_field_paths,
+                        nested_fields_disjoint,
                     },
                 );
             }
@@ -585,10 +819,14 @@ impl InterproceduralMemoryMap {
                 let info = &local_infos[&func.name];
                 let mut initial_params = Vec::with_capacity(func.params.len());
                 for i in 0..func.params.len() {
+                    let is_noalias = func.is_strict;
                     initial_params.push(ParamMemorySummary {
                         escapes: info.param_escapes[i],
                         written: info.param_written[i],
                         read: info.param_read[i],
+                        noalias: is_noalias,
+                        nested_fields_disjoint: info.nested_fields_disjoint[i],
+                        accessed_field_paths: info.param_field_paths[i].iter().cloned().collect(),
                     });
                 }
                 FunctionMemorySummary {
@@ -707,9 +945,162 @@ impl InterproceduralMemoryMap {
             }
         }
 
+        // Fixed-point inter-procedural propagation for parameter non-aliasing (noalias)
+        let mut nested_struct_paths_disambiguated = 0;
+        let mut disjoint_call_sites_verified = 0;
+
+        for info in local_infos.values() {
+            for (p_idx, paths) in info.param_field_paths.iter().enumerate() {
+                if paths.len() > 1 && info.nested_fields_disjoint[p_idx] {
+                    nested_struct_paths_disambiguated += paths.len();
+                }
+            }
+        }
+
+        // Map callee -> Vec<(caller_symbol, arguments)>
+        let mut call_sites_by_callee: HashMap<Symbol, Vec<(Symbol, Vec<ValueId>)>> = HashMap::new();
+        for func in &module.functions {
+            if let Some(info) = local_infos.get(&func.name) {
+                for (callee_sym, args) in &info.call_sites {
+                    call_sites_by_callee
+                        .entry(*callee_sym)
+                        .or_default()
+                        .push((func.name, args.clone()));
+                }
+            }
+        }
+
+        let mut noalias_changed = true;
+        let mut noalias_iters = 0;
+        while noalias_changed && noalias_iters < 16 {
+            noalias_changed = false;
+            noalias_iters += 1;
+
+            for func in &module.functions {
+                if func.is_strict {
+                    if let Some(sum) = summaries.get_mut(&func.name) {
+                        for p in &mut sum.params {
+                            if !p.noalias {
+                                p.noalias = true;
+                                noalias_changed = true;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if let Some(incoming_calls) = call_sites_by_callee.get(&func.name) {
+                    if incoming_calls.is_empty() {
+                        continue;
+                    }
+
+                    for k in 0..func.params.len() {
+                        let already_noalias = summaries
+                            .get(&func.name)
+                            .and_then(|s| s.params.get(k))
+                            .map(|p| p.noalias)
+                            .unwrap_or(false);
+
+                        if already_noalias {
+                            continue;
+                        }
+
+                        let mut all_calls_disjoint = true;
+                        for (caller_sym, args) in incoming_calls {
+                            if k >= args.len() {
+                                all_calls_disjoint = false;
+                                break;
+                            }
+
+                            let arg_k = args[k];
+                            let caller_info = match local_infos.get(caller_sym) {
+                                Some(ci) => ci,
+                                None => {
+                                    all_calls_disjoint = false;
+                                    break;
+                                }
+                            };
+
+                            let path_k = caller_info.value_paths.get(&arg_k);
+
+                            // Verify disjointness against every other argument at this call site
+                            for (m, &arg_m) in args.iter().enumerate() {
+                                if m == k {
+                                    continue;
+                                }
+                                let path_m = caller_info.value_paths.get(&arg_m);
+
+                                match (path_k, path_m) {
+                                    (Some(pk), Some(pm)) => {
+                                        let is_disjoint = match (pk.root, pm.root) {
+                                            (PathRoot::Param(p1), PathRoot::Param(p2))
+                                                if p1 != p2 =>
+                                            {
+                                                summaries
+                                                    .get(caller_sym)
+                                                    .map(|cs| {
+                                                        cs.params
+                                                            .get(p1)
+                                                            .map(|p| p.noalias)
+                                                            .unwrap_or(false)
+                                                            && cs
+                                                                .params
+                                                                .get(p2)
+                                                                .map(|p| p.noalias)
+                                                                .unwrap_or(false)
+                                                    })
+                                                    .unwrap_or(false)
+                                            }
+                                            _ => pk.is_disjoint_from(pm),
+                                        };
+
+                                        if is_disjoint {
+                                            disjoint_call_sites_verified += 1;
+                                            if pk.root == pm.root && pk.fields != pm.fields {
+                                                nested_struct_paths_disambiguated += 1;
+                                            }
+                                        } else {
+                                            all_calls_disjoint = false;
+                                            break;
+                                        }
+                                    }
+                                    _ => {
+                                        disjoint_call_sites_verified += 1;
+                                    }
+                                }
+                            }
+
+                            if !all_calls_disjoint {
+                                break;
+                            }
+                        }
+
+                        if all_calls_disjoint {
+                            if let Some(sum) = summaries.get_mut(&func.name) {
+                                if let Some(param) = sum.params.get_mut(k) {
+                                    if !param.escapes && !param.noalias {
+                                        param.noalias = true;
+                                        noalias_changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let noalias_parameters_propagated = summaries
+            .values()
+            .map(|s| s.params.iter().filter(|p| p.noalias).count())
+            .sum();
+
         Self {
             summaries,
             strict_ffi_pures,
+            noalias_parameters_propagated,
+            nested_struct_paths_disambiguated,
+            disjoint_call_sites_verified,
         }
     }
 }
@@ -761,6 +1152,23 @@ impl IpoPass {
 
         let pure_functions = mem_map.pure_function_symbols();
         self.stats.pure_functions = pure_functions.len();
+
+        self.stats.noalias_parameters_propagated = mem_map.noalias_parameters_propagated;
+        self.stats.nested_struct_paths_disambiguated = mem_map.nested_struct_paths_disambiguated;
+        self.stats.disjoint_call_sites_verified = mem_map.disjoint_call_sites_verified;
+
+        // Apply propagated noalias guarantees directly to function parameters
+        for func in &mut module.functions {
+            if let Some(sum) = mem_map.get_summary(&func.name) {
+                for (idx, p) in func.params.iter_mut().enumerate() {
+                    if let Some(param_sum) = sum.params.get(idx) {
+                        if param_sum.noalias {
+                            p.noalias = true;
+                        }
+                    }
+                }
+            }
+        }
 
         // 3. Eliminate redundant pure function calls within basic blocks (Pure Call CSE)
         self.eliminate_redundant_pure_calls(module, &pure_functions);

@@ -891,6 +891,7 @@ fn test_vectorize_pass_direct_reduction_call_specialization() {
         ty: FirType::Slice(Box::new(FirType::Float(FloatType::F32))),
         val: ValueId(0),
         mode: ParamMode::In,
+        noalias: false,
     };
     let mut func = FirFunction::new(
         fn_sym,
@@ -1057,6 +1058,7 @@ fn test_vectorize_pass_direct_count_if_and_filter_specialization() {
         ty: FirType::Slice(Box::new(FirType::Int(IntType::I32))),
         val: ValueId(0),
         mode: ParamMode::In,
+        noalias: false,
     };
     let mut func = FirFunction::new(
         fn_sym,
@@ -1283,4 +1285,100 @@ fn test_vectorize_pass_inout_swap_disjoint_slices() {
     assert_eq!(stats.loops_vectorized, 1);
     assert_eq!(stats.disjoint_swap_loops_vectorized, 1);
     assert!(stats.disjoint_slices_vectorized >= 2);
+}
+
+#[test]
+fn test_vectorize_pass_bipartite_matrix_reduction_disjoint_windows() {
+    let src = r#"
+        pub strict fn matrix_bipartite_reduction(row_a: Slice<f32>, row_b: Slice<f32>, n: i64) -> f32 {
+            let mut sum: f32 = 0.0;
+            let mut i: i64 = 0;
+            while i < n {
+                sum = sum + row_a[i] * row_b[i];
+                i = i + 1;
+            }
+            return sum;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("bipartite_reduction.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [bipartite_matrix_reduction: true]"),
+        "Formatted FIR must contain bipartite_matrix_reduction hint:\n{}",
+        formatted
+    );
+    assert!(
+        formatted.contains("// [disjoint_slices: true]"),
+        "Formatted FIR must contain disjoint_slices hint:\n{}",
+        formatted
+    );
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.bipartite_matrix_reductions_vectorized, 1);
+    assert_eq!(stats.multidim_matrix_reductions_vectorized, 1);
+}
+
+#[test]
+fn test_vectorize_pass_tripartite_matrix_reduction_disjoint_windows() {
+    let src = r#"
+        pub strict fn matrix_tripartite_reduction(inout acc: Slice<f32>, row_a: Slice<f32>, col_b: Slice<f32>, n: i64) {
+            let mut i: i64 = 0;
+            while i < n {
+                acc[i] = acc[i] + row_a[i] * col_b[i];
+                i = i + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("tripartite_reduction.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let func = &module.functions[0];
+    let formatted = format_function(func);
+    assert!(
+        formatted.contains("// [tripartite_matrix_reduction: true]"),
+        "Formatted FIR must contain tripartite_matrix_reduction hint:\n{}",
+        formatted
+    );
+    assert!(
+        formatted.contains("// [disjoint_slices: true]"),
+        "Formatted FIR must contain disjoint_slices hint:\n{}",
+        formatted
+    );
+
+    let mut pass = VectorizePass::new();
+    let mut mod_clone = module.clone();
+    pass.run_on_module(&mut mod_clone);
+
+    let stats = pass.stats();
+    assert_eq!(stats.loops_vectorized, 1);
+    assert_eq!(stats.tripartite_matrix_reductions_vectorized, 1);
+    assert_eq!(stats.multidim_matrix_reductions_vectorized, 1);
 }

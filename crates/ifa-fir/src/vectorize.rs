@@ -66,6 +66,12 @@ pub struct VectorizeStats {
     pub convolutions_vectorized: usize,
     /// Number of in-place zero-copy swap loops across provably disjoint slices vectorized.
     pub disjoint_swap_loops_vectorized: usize,
+    /// Number of multidimensional matrix reduction loops with bipartite disjoint windows vectorized.
+    pub bipartite_matrix_reductions_vectorized: usize,
+    /// Number of multidimensional matrix reduction loops with tripartite disjoint windows vectorized.
+    pub tripartite_matrix_reductions_vectorized: usize,
+    /// Total number of multidimensional matrix reduction loops vectorized.
+    pub multidim_matrix_reductions_vectorized: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -466,18 +472,6 @@ impl VectorizePass {
                     }
                 }
 
-                let interleave_count = if local_arena && contiguous_reduction {
-                    match primary_ty {
-                        FirType::Float(FloatType::F32)
-                        | FirType::Int(IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8) => {
-                            8
-                        }
-                        _ => 4,
-                    }
-                } else {
-                    4
-                };
-
                 let existing_hint = func.get_block(loop_info.header).and_then(|b| b.vector_hint);
                 let sliding_window_size = existing_hint.and_then(|h| h.sliding_window_size);
                 let is_convolution = existing_hint.map(|h| h.is_convolution).unwrap_or(false)
@@ -491,17 +485,129 @@ impl VectorizePass {
                     self.stats.convolutions_vectorized += 1;
                 }
 
-                let effective_interleave = if let Some(w) = sliding_window_size {
-                    w.min(8)
-                } else {
-                    interleave_count
-                };
-
                 let is_matrix_kernel = existing_hint.map(|h| h.is_matrix_kernel).unwrap_or(false);
                 let is_tiled = existing_hint.map(|h| h.is_tiled).unwrap_or(false);
                 let tile_size = existing_hint.and_then(|h| h.tile_size);
-                let unroll_and_jam = existing_hint.map(|h| h.unroll_and_jam).unwrap_or(false);
+                let mut unroll_and_jam = existing_hint.map(|h| h.unroll_and_jam).unwrap_or(false);
                 let is_fused = existing_hint.map(|h| h.is_fused).unwrap_or(false);
+
+                // 4. Detect multidimensional matrix reduction operations with bipartite or tripartite disjoint windows
+                let mut distinct_roots: Vec<SliceRoot> = Vec::new();
+                for &b in slice_read_bases.iter().chain(slice_write_bases.iter()) {
+                    let r = Self::trace_slice_root(func, b);
+                    if !distinct_roots.contains(&r) && !matches!(r, SliceRoot::Unknown(_)) {
+                        distinct_roots.push(r);
+                    }
+                }
+                for (b, _, _) in &elem_reads {
+                    let r = Self::trace_slice_root(func, *b);
+                    if !distinct_roots.contains(&r) && !matches!(r, SliceRoot::Unknown(_)) {
+                        distinct_roots.push(r);
+                    }
+                }
+                for (b, _, _) in &elem_writes {
+                    let r = Self::trace_slice_root(func, *b);
+                    if !distinct_roots.contains(&r) && !matches!(r, SliceRoot::Unknown(_)) {
+                        distinct_roots.push(r);
+                    }
+                }
+
+                let has_multidim = distinct_roots.iter().any(|r| r.has_projection())
+                    || is_matrix_kernel
+                    || is_tiled
+                    || (slice_read_bases.len() >= 2 && (has_mul || has_add));
+
+                let is_reduction_op = is_reduction
+                    || (write_elements > 0
+                        && has_add
+                        && elem_writes.iter().any(|w| {
+                            let rw = Self::trace_slice_root(func, w.0);
+                            elem_reads.iter().any(|r| {
+                                r.0 == w.0
+                                    || (!matches!(rw, SliceRoot::Unknown(_))
+                                        && rw == Self::trace_slice_root(func, r.0))
+                            })
+                        }));
+                let mut is_bipartite = false;
+                let mut is_tripartite = false;
+
+                if has_multidim && is_reduction_op {
+                    // Check for tripartite disjoint windows (3 mutually disjoint roots)
+                    if distinct_roots.len() >= 3 {
+                        'tripartite_search: for i in 0..distinct_roots.len() {
+                            for j in (i + 1)..distinct_roots.len() {
+                                for k in (j + 1)..distinct_roots.len() {
+                                    if Self::are_slice_roots_disjoint(
+                                        &distinct_roots[i],
+                                        &distinct_roots[j],
+                                    ) && Self::are_slice_roots_disjoint(
+                                        &distinct_roots[i],
+                                        &distinct_roots[k],
+                                    ) && Self::are_slice_roots_disjoint(
+                                        &distinct_roots[j],
+                                        &distinct_roots[k],
+                                    ) {
+                                        is_tripartite = true;
+                                        break 'tripartite_search;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Check for bipartite disjoint windows (2 disjoint roots) if not already tripartite
+                    if !is_tripartite && distinct_roots.len() >= 2 {
+                        'bipartite_search: for i in 0..distinct_roots.len() {
+                            for j in (i + 1)..distinct_roots.len() {
+                                if Self::are_slice_roots_disjoint(
+                                    &distinct_roots[i],
+                                    &distinct_roots[j],
+                                ) {
+                                    is_bipartite = true;
+                                    break 'bipartite_search;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if is_tripartite {
+                    disjoint_slices = true;
+                    unroll_and_jam = true;
+                    self.stats.tripartite_matrix_reductions_vectorized += 1;
+                    self.stats.multidim_matrix_reductions_vectorized += 1;
+                    self.stats.disjoint_slices_vectorized += 3;
+                } else if is_bipartite {
+                    disjoint_slices = true;
+                    unroll_and_jam = true;
+                    self.stats.bipartite_matrix_reductions_vectorized += 1;
+                    self.stats.multidim_matrix_reductions_vectorized += 1;
+                    self.stats.disjoint_slices_vectorized += 2;
+                }
+
+                let effective_interleave = if is_tripartite {
+                    8
+                } else if is_bipartite {
+                    match primary_ty {
+                        FirType::Float(FloatType::F32)
+                        | FirType::Int(IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8) => {
+                            8
+                        }
+                        _ => 4,
+                    }
+                } else if let Some(w) = sliding_window_size {
+                    w.min(8)
+                } else if local_arena && contiguous_reduction {
+                    match primary_ty {
+                        FirType::Float(FloatType::F32)
+                        | FirType::Int(IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8) => {
+                            8
+                        }
+                        _ => 4,
+                    }
+                } else {
+                    4
+                };
 
                 let hint = LoopVectorHint {
                     vector_width,
@@ -526,6 +632,8 @@ impl VectorizePass {
                     unroll_and_jam,
                     is_fused,
                     is_swap: is_disjoint_swap,
+                    is_bipartite_matrix_reduction: is_bipartite,
+                    is_tripartite_matrix_reduction: is_tripartite,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)
@@ -1106,6 +1214,20 @@ impl VectorizePass {
                 }
             }
             (other, SliceRoot::Projection { parent: p2, .. }) => {
+                if other == &**p2 {
+                    false
+                } else {
+                    Self::are_slice_roots_disjoint(other, p2)
+                }
+            }
+            (SliceRoot::Field(p1, _), other) => {
+                if &**p1 == other {
+                    false
+                } else {
+                    Self::are_slice_roots_disjoint(p1, other)
+                }
+            }
+            (other, SliceRoot::Field(p2, _)) => {
                 if other == &**p2 {
                     false
                 } else {

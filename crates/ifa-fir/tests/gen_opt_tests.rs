@@ -266,6 +266,7 @@ fn test_loop_with_explicit_free_refuses_hoisting() {
         val: ValueId(0),
         ty: FirType::GenerationalRef(Box::new(FirType::Int(IntType::I64))),
         mode: ParamMode::In,
+        noalias: false,
     };
 
     let mut func = FirFunction::new(
@@ -831,6 +832,7 @@ fn test_loop_invariant_check_hoisting_with_disjoint_arena_free() {
         val: ValueId(0),
         ty: FirType::GenerationalRef(Box::new(FirType::Int(IntType::I64))),
         mode: ParamMode::In,
+        noalias: false,
     };
 
     let mut func = FirFunction::new(
@@ -963,6 +965,7 @@ fn test_loop_with_mixed_arenas_selective_hoisting() {
         val: ValueId(0),
         ty: FirType::GenerationalRef(Box::new(FirType::Int(IntType::I64))),
         mode: ParamMode::In,
+        noalias: false,
     };
 
     let mut func = FirFunction::new(

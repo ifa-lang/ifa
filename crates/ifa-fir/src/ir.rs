@@ -503,6 +503,8 @@ pub struct LoopVectorHint {
     pub unroll_and_jam: bool,
     pub is_fused: bool,
     pub is_swap: bool,
+    pub is_bipartite_matrix_reduction: bool,
+    pub is_tripartite_matrix_reduction: bool,
 }
 
 impl LoopVectorHint {
@@ -527,6 +529,8 @@ impl LoopVectorHint {
             unroll_and_jam: false,
             is_fused: false,
             is_swap: false,
+            is_bipartite_matrix_reduction: false,
+            is_tripartite_matrix_reduction: false,
         }
     }
 
@@ -615,6 +619,18 @@ impl LoopVectorHint {
         self.is_swap = is_swap;
         self
     }
+
+    /// Mark the loop as executing a bipartite multidimensional matrix reduction over disjoint windows.
+    pub fn with_bipartite_matrix_reduction(mut self, enabled: bool) -> Self {
+        self.is_bipartite_matrix_reduction = enabled;
+        self
+    }
+
+    /// Mark the loop as executing a tripartite multidimensional matrix reduction over disjoint windows.
+    pub fn with_tripartite_matrix_reduction(mut self, enabled: bool) -> Self {
+        self.is_tripartite_matrix_reduction = enabled;
+        self
+    }
 }
 
 /// Basic block containing sequential instructions and ending with a terminator.
@@ -666,6 +682,26 @@ pub struct FirParam {
     pub val: ValueId,
     pub ty: FirType,
     pub mode: ParamMode,
+    pub noalias: bool,
+}
+
+impl FirParam {
+    /// Construct a new FIR function parameter with default non-aliasing status (false).
+    pub fn new(name: Symbol, val: ValueId, ty: FirType, mode: ParamMode) -> Self {
+        Self {
+            name,
+            val,
+            ty,
+            mode,
+            noalias: false,
+        }
+    }
+
+    /// Set whether this parameter is guaranteed non-aliasing (noalias).
+    pub fn with_noalias(mut self, noalias: bool) -> Self {
+        self.noalias = noalias;
+        self
+    }
 }
 
 /// A function in SSA FIR.

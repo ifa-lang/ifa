@@ -1477,6 +1477,16 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("!42 = distinct !{!42, !2, !9, !4, !5, !12, !13, !24, !44}\n");
         out.push_str("!43 = distinct !{!43, !2, !11, !4, !5, !12, !13, !24, !44}\n");
         out.push_str("!44 = !{!\"llvm.loop.unroll.count\", i32 4}\n");
+        // Specialized bipartite disjoint window matrix reduction vectorization hints (unroll-and-jam, parallel accesses, noalias)
+        out.push_str("!45 = distinct !{!45, !2, !3, !4, !5, !12, !13, !24, !37, !38}\n");
+        out.push_str("!46 = distinct !{!46, !2, !7, !4, !5, !12, !13, !24, !37, !38}\n");
+        out.push_str("!47 = distinct !{!47, !2, !9, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!48 = distinct !{!48, !2, !11, !4, !5, !12, !13, !24, !37, !38}\n");
+        // Specialized tripartite disjoint window matrix reduction vectorization hints (unroll-and-jam 8x, parallel accesses, noalias)
+        out.push_str("!49 = distinct !{!49, !2, !3, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!50 = distinct !{!50, !2, !7, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!51 = distinct !{!51, !2, !9, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!52 = distinct !{!52, !2, !11, !4, !5, !12, !13, !24, !37, !39}\n");
 
         Ok(out)
     }
@@ -1518,7 +1528,7 @@ impl<'a> LlvmIrEmitter<'a> {
                     ifa_fir::FirType::Array(..) => "ptr".to_string(),
                     _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "ptr".to_string()),
                 };
-                if (func.is_strict || fn_name.contains("__"))
+                if (func.is_strict || p.noalias || fn_name.contains("__"))
                     && ty == "ptr"
                     && fn_name != "main"
                     && !fn_name.starts_with("ifa_rt_")
@@ -4413,7 +4423,21 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             Terminator::Branch { target, .. } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = if hint.is_swap {
+                    let meta_id = if hint.is_tripartite_matrix_reduction {
+                        match hint.vector_width {
+                            2 => 52,
+                            4 => 50,
+                            16 | 32 => 51,
+                            _ => 49,
+                        }
+                    } else if hint.is_bipartite_matrix_reduction {
+                        match hint.vector_width {
+                            2 => 48,
+                            4 => 46,
+                            16 | 32 => 47,
+                            _ => 45,
+                        }
+                    } else if hint.is_swap {
                         match hint.vector_width {
                             2 => 43,
                             4 => 41,
@@ -4483,7 +4507,21 @@ impl<'a> LlvmIrEmitter<'a> {
                 ..
             } => {
                 if let Some(hint) = vector_hint {
-                    let meta_id = if hint.is_swap {
+                    let meta_id = if hint.is_tripartite_matrix_reduction {
+                        match hint.vector_width {
+                            2 => 52,
+                            4 => 50,
+                            16 | 32 => 51,
+                            _ => 49,
+                        }
+                    } else if hint.is_bipartite_matrix_reduction {
+                        match hint.vector_width {
+                            2 => 48,
+                            4 => 46,
+                            16 | 32 => 47,
+                            _ => 45,
+                        }
+                    } else if hint.is_swap {
                         match hint.vector_width {
                             2 => 43,
                             4 => 41,

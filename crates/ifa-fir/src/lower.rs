@@ -178,6 +178,7 @@ impl<'a> FunctionLoweringContext<'a> {
                 val,
                 ty,
                 mode: p.mode,
+                noalias: false,
             });
         }
 
@@ -4189,6 +4190,7 @@ impl<'a> FunctionLoweringContext<'a> {
                         ty: env_param_ty.clone(),
                         mode: ifa_ast::ParamMode::In,
                         val: ValueId(0),
+                        noalias: false,
                     });
                 }
 
@@ -4222,6 +4224,7 @@ impl<'a> FunctionLoweringContext<'a> {
                         ty: p_fir_ty,
                         mode: p.mode,
                         val: val_id,
+                        noalias: false,
                     });
                 }
 

@@ -2822,12 +2822,14 @@ fn test_llvm_blocking_ffi_isolation_and_thunk_lowering() {
             val: ValueId(1),
             ty: FirType::Int(IntType::I64),
             mode: ifa_fir::ParamMode::In,
+            noalias: false,
         },
         FirParam {
             name: INTERNER.intern("b"),
             val: ValueId(2),
             ty: FirType::Int(IntType::I64),
             mode: ifa_fir::ParamMode::In,
+            noalias: false,
         },
     ];
     let mut ext_func = FirFunction::new(
@@ -3285,6 +3287,7 @@ fn test_llvm_colorless_coroutine_direct_synchronous_call_specialization() {
             val: ifa_fir::ValueId(0),
             ty: FirType::Int(ifa_sema::types::IntType::I64),
             mode: ParamMode::In,
+            noalias: false,
         }],
         FirType::Int(ifa_sema::types::IntType::I64),
         false,
@@ -3442,12 +3445,14 @@ fn test_strict_fn_streaming_pipeline_noalias_emission() {
                 ty: FirType::Pointer(Box::new(FirType::Int(IntType::U8))),
                 val: ValueId(0),
                 mode: ParamMode::In,
+                noalias: false,
             },
             FirParam {
                 name: INTERNER.intern("in_buf"),
                 ty: FirType::Pointer(Box::new(FirType::Int(IntType::U8))),
                 val: ValueId(1),
                 mode: ParamMode::In,
+                noalias: false,
             },
         ],
         FirType::Unit,
@@ -3744,6 +3749,7 @@ fn test_llvm_aot_loop_invariant_disjoint_arena_generation_check_hoisting() {
         val: ValueId(0),
         ty: FirType::GenerationalRef(Box::new(FirType::Int(IntType::I64))),
         mode: ParamMode::In,
+        noalias: false,
     };
 
     let mut func = FirFunction::new(

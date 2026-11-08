@@ -377,6 +377,7 @@ fn test_licm_hoists_alloca_and_gen_ref_cascade() {
         val: ValueId(0),
         ty: FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
         mode: ParamMode::In,
+        noalias: false,
     };
 
     let mut func = FirFunction::new(
@@ -514,6 +515,7 @@ fn test_licm_preserves_gen_ref_when_loop_frees_memory() {
         val: ValueId(0),
         ty: FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
         mode: ParamMode::In,
+        noalias: false,
     };
 
     let mut func = FirFunction::new(
@@ -617,6 +619,7 @@ fn test_streaming_pipeline_disjoint_arena_load_hoisting() {
             ty: FirType::Int(IntType::I64),
             val: ValueId(0),
             mode: ParamMode::In,
+            noalias: false,
         }],
         FirType::Unit,
         true,

@@ -13,6 +13,7 @@ fn test_fir_function_and_block_creation() {
         val: ValueId(0),
         ty: FirType::Int(IntType::I64),
         mode: ParamMode::In,
+        noalias: false,
     };
 
     let mut func = FirFunction::new(
@@ -58,12 +59,14 @@ fn test_fir_pretty_printer() {
         val: ValueId(0),
         ty: FirType::Int(IntType::I64),
         mode: ParamMode::In,
+        noalias: false,
     };
     let p2 = FirParam {
         name: INTERNER.intern("b"),
         val: ValueId(1),
         ty: FirType::Int(IntType::I64),
         mode: ParamMode::InOut,
+        noalias: false,
     };
 
     let mut func = FirFunction::new(

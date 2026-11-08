@@ -786,18 +786,21 @@ fn test_interprocedural_symbolic_constant_propagation_sliding_window() {
         ty: f32_slice.clone(),
         val: p_sig,
         mode: ifa_ast::ParamMode::In,
+        noalias: false,
     });
     f_callee.params.push(FirParam {
         name: INTERNER.intern("kern"),
         ty: f32_slice.clone(),
         val: p_kern,
         mode: ifa_ast::ParamMode::In,
+        noalias: false,
     });
     f_callee.params.push(FirParam {
         name: INTERNER.intern("window_size"),
         ty: i64_ty.clone(),
         val: p_w,
         mode: ifa_ast::ParamMode::In,
+        noalias: false,
     });
 
     let bb_entry = f_callee.entry_block;
@@ -1066,12 +1069,14 @@ fn test_polymorphic_sliding_window_specialization() {
         ty: f32_slice.clone(),
         val: p_sig,
         mode: ifa_ast::ParamMode::In,
+        noalias: false,
     });
     f_callee.params.push(FirParam {
         name: INTERNER.intern("window_size"),
         ty: i64_ty.clone(),
         val: p_w,
         mode: ifa_ast::ParamMode::In,
+        noalias: false,
     });
 
     let bb_entry = f_callee.entry_block;
@@ -1232,5 +1237,145 @@ fn test_polymorphic_sliding_window_specialization() {
         c2_target,
         Some(w5_sym),
         "Caller 2 must be retargeted to sliding_filter_w5"
+    );
+}
+
+#[test]
+fn test_ipo_noalias_propagation_and_nested_struct_disambiguation() {
+    use ifa_fir::ir::*;
+    use ifa_fir::FirType;
+    use ifa_sema::types::IntType;
+    use ifa_span::Span;
+
+    let callee_name = INTERNER.intern("callee_compute");
+    let caller_name = INTERNER.intern("caller_entry");
+
+    let ptr_i64 = FirType::Pointer(Box::new(FirType::Int(IntType::I64)));
+    let i64_ty = FirType::Int(IntType::I64);
+
+    let mut f_callee = FirFunction::new(
+        callee_name,
+        Vec::new(),
+        i64_ty.clone(),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let p_a = f_callee.alloc_value();
+    let p_b = f_callee.alloc_value();
+    f_callee.params.push(FirParam {
+        name: INTERNER.intern("a"),
+        ty: ptr_i64.clone(),
+        val: p_a,
+        mode: ifa_ast::ParamMode::In,
+        noalias: false,
+    });
+    f_callee.params.push(FirParam {
+        name: INTERNER.intern("b"),
+        ty: ptr_i64.clone(),
+        val: p_b,
+        mode: ifa_ast::ParamMode::In,
+        noalias: false,
+    });
+    let v_la = f_callee.alloc_value();
+    let v_lb = f_callee.alloc_value();
+    let v_sum = f_callee.alloc_value();
+    let entry_callee = f_callee.get_block_mut(f_callee.entry_block).unwrap();
+    entry_callee.push_instruction(Instruction::new(
+        Some(v_la),
+        ValueExpr::Load { ptr: p_a },
+        Span::DUMMY,
+    ));
+    entry_callee.push_instruction(Instruction::new(
+        Some(v_lb),
+        ValueExpr::Load { ptr: p_b },
+        Span::DUMMY,
+    ));
+    entry_callee.push_instruction(Instruction::new(
+        Some(v_sum),
+        ValueExpr::Binary {
+            op: BinaryOp::Add,
+            lhs: v_la,
+            rhs: v_lb,
+        },
+        Span::DUMMY,
+    ));
+    entry_callee.set_terminator(Terminator::Return(Some(v_sum)));
+
+    let mut f_caller = FirFunction::new(
+        caller_name,
+        Vec::new(),
+        i64_ty.clone(),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let alloc_x = f_caller.alloc_value();
+    let alloc_y = f_caller.alloc_value();
+    let res_call = f_caller.alloc_value();
+    let entry_caller = f_caller.get_block_mut(f_caller.entry_block).unwrap();
+    entry_caller.push_instruction(Instruction::new(
+        Some(alloc_x),
+        ValueExpr::Alloca {
+            ty: i64_ty.clone(),
+            name: Some(INTERNER.intern("x")),
+        },
+        Span::DUMMY,
+    ));
+    entry_caller.push_instruction(Instruction::new(
+        Some(alloc_y),
+        ValueExpr::Alloca {
+            ty: i64_ty.clone(),
+            name: Some(INTERNER.intern("y")),
+        },
+        Span::DUMMY,
+    ));
+    entry_caller.push_instruction(Instruction::new(
+        Some(res_call),
+        ValueExpr::CallDirect {
+            name: callee_name,
+            args: vec![alloc_x, alloc_y],
+        },
+        Span::DUMMY,
+    ));
+    entry_caller.set_terminator(Terminator::Return(Some(res_call)));
+
+    let mut module = FirModule {
+        name: INTERNER.intern("test_noalias_module"),
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+        functions: vec![f_callee, f_caller],
+    };
+
+    let mut ipo_pass = IpoPass::new();
+    ipo_pass.run_on_module(&mut module);
+
+    let stats = ipo_pass.stats();
+    assert!(
+        stats.disjoint_call_sites_verified >= 1,
+        "Disjoint call sites should be verified: got {}",
+        stats.disjoint_call_sites_verified
+    );
+    assert!(
+        stats.noalias_parameters_propagated >= 1,
+        "Noalias parameters should be propagated: got {}",
+        stats.noalias_parameters_propagated
+    );
+
+    let callee = module
+        .functions
+        .iter()
+        .find(|f| f.name == callee_name)
+        .unwrap();
+    assert!(
+        callee.params[0].noalias && callee.params[1].noalias,
+        "Both parameters of callee_compute must be marked noalias: p0={}, p1={}",
+        callee.params[0].noalias,
+        callee.params[1].noalias
     );
 }

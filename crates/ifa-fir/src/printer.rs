@@ -146,6 +146,14 @@ impl<'a> FirPrinter<'a> {
                 self.indent();
                 writeln!(self.output, "// [is_swap: true]")?;
             }
+            if hint.is_bipartite_matrix_reduction {
+                self.indent();
+                writeln!(self.output, "// [bipartite_matrix_reduction: true]")?;
+            }
+            if hint.is_tripartite_matrix_reduction {
+                self.indent();
+                writeln!(self.output, "// [tripartite_matrix_reduction: true]")?;
+            }
         }
         for inst in &block.instructions {
             self.indent();

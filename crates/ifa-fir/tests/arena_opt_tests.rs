@@ -237,6 +237,7 @@ fn test_deep_recursive_chain_access_barrier_elimination() {
             val: ValueId(0),
             ty: FirType::GenerationalRef(Box::new(node_ty.clone())),
             mode: ParamMode::In,
+            noalias: false,
         }],
         FirType::Int(IntType::I64),
         false,
@@ -795,6 +796,7 @@ fn test_interprocedural_nested_streaming_pipeline_arena_fusion() {
         ty: FirType::GenerationalRef(Box::new(chunk_ty.clone())),
         val: p_c,
         mode: ParamMode::In,
+        noalias: false,
     });
     let e2 = f_wrap.entry_block;
     let v_pkt = f_wrap.alloc_value();
@@ -935,6 +937,7 @@ fn test_interprocedural_streaming_access_barrier_elimination() {
         ty: FirType::GenerationalRef(Box::new(chunk_ty.clone())),
         val: p_b,
         mode: ParamMode::In,
+        noalias: false,
     });
     let e1 = f_consume.entry_block;
     let v_field = f_consume.alloc_value();
