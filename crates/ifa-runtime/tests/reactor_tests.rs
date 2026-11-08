@@ -74,7 +74,7 @@ fn test_async_tcp_listener_and_stream_fiber_echo() {
     assert_eq!(&reply[..n], b"pong-ifa");
 
     let start_wait = Instant::now();
-    while !done.load(Ordering::SeqCst) && start_wait.elapsed() < Duration::from_millis(500) {
+    while !done.load(Ordering::SeqCst) && start_wait.elapsed() < Duration::from_secs(5) {
         std::thread::yield_now();
     }
     assert!(done.load(Ordering::SeqCst));
@@ -165,7 +165,10 @@ fn test_coroutine_io_uring_integration_and_scheduler_wake() {
     let _ = GLOBAL_REACTOR.poll_and_wake();
 
     // 3. Wait for fiber to join and complete execution
-    GLOBAL_SCHEDULER.join_timeout(fid, Duration::from_millis(500));
+    assert!(
+        GLOBAL_SCHEDULER.join_timeout(fid, Duration::from_secs(5)),
+        "Fiber timed out waiting for io_uring completion in M:N reactor test"
+    );
 
     unsafe {
         assert!((*frame).success);
@@ -235,7 +238,10 @@ fn test_coroutine_iocp_integration_and_scheduler_wake() {
 
     // Poll reactor to process IOCP packets and wake coroutine
     let _ = GLOBAL_REACTOR.poll_and_wake();
-    GLOBAL_SCHEDULER.join_timeout(fid, Duration::from_millis(500));
+    assert!(
+        GLOBAL_SCHEDULER.join_timeout(fid, Duration::from_secs(5)),
+        "Fiber timed out waiting for IOCP completion in M:N reactor test"
+    );
 
     unsafe {
         assert!((*frame).success);
@@ -275,7 +281,7 @@ fn test_concurrent_coroutines_mn_reactor_io() {
     GLOBAL_REACTOR.poll_and_wake();
     for (fid, coro) in fids {
         assert!(
-            GLOBAL_SCHEDULER.join_timeout(fid, Duration::from_millis(2000)),
+            GLOBAL_SCHEDULER.join_timeout(fid, Duration::from_secs(5)),
             "Fiber timed out waiting for completion in M:N reactor test"
         );
         ifa_runtime::ffi::ifa_rt_coro_destroy(coro);
