@@ -821,6 +821,10 @@ impl VectorizePass {
                     is_strided_loop,
                     loop_stride,
                     is_strided_multidim,
+                    is_multi_arena_matrix: false,
+                    is_elementwise_fused: false,
+                    adaptive_tile_size: None,
+                    multi_arena_operands: 0,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)

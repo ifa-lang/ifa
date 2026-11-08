@@ -5754,3 +5754,92 @@ fn test_llvm_strict_coroutine_arena_frame_and_slice_exchange() {
     assert!(obj_path.exists());
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_multi_arena_matrix_kernel_elementwise_fused_llvm_emission() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{
+        BasicBlock, BlockId, FirFunction, FirModule, FirType, LoopVectorHint, Terminator,
+    };
+    use ifa_span::{Span, INTERNER};
+
+    let target = LlvmTargetConfig::x86_64();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let fn_name = INTERNER.intern("kernel_gemm_multi_arena_fused");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Unit,
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let b0 = BlockId(0);
+    let b1 = BlockId(1);
+
+    let mut bb0 = BasicBlock::new(b0);
+    bb0.terminator = Some(Terminator::Branch {
+        target: b1,
+        args: vec![],
+    });
+
+    let mut bb1 = BasicBlock::new(b1);
+    // Multi-arena matrix kernel with 4 lanes and elementwise fusion
+    let hint = LoopVectorHint::new(4, 4, true)
+        .with_multi_arena_matrix(3)
+        .with_elementwise_fused(true)
+        .with_adaptive_tiling(32);
+    bb1.set_vector_hint(hint);
+    bb1.terminator = Some(Terminator::Branch {
+        target: b1,
+        args: vec![],
+    });
+
+    func.blocks.push(bb0);
+    func.blocks.push(bb1);
+
+    let module = FirModule {
+        name: INTERNER.intern("test_llvm_multi_arena_fused_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    assert!(
+        ir.contains("!llvm.loop !70"),
+        "Must attach metadata !70 for 4-lane multi-arena elementwise fused kernel:\n{}",
+        ir
+    );
+    assert!(
+        ir.contains("!69 = distinct !{!69, !2, !3, !4, !5, !12, !13, !24, !37, !39}"),
+        "Must declare metadata !69"
+    );
+    assert!(
+        ir.contains("!70 = distinct !{!70, !2, !7, !4, !5, !12, !13, !24, !37, !39}"),
+        "Must declare metadata !70"
+    );
+
+    let temp_dir = std::env::temp_dir().join(format!("llvm_multi_arena_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("multi_arena.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        res.is_ok(),
+        "Compilation to object must succeed: {:?}",
+        res.err()
+    );
+    assert!(obj_path.exists());
+    let _ = fs::remove_dir_all(&temp_dir);
+}

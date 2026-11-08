@@ -269,3 +269,109 @@ fn test_strict_zero_heap_matrix_kernel_tiling_and_compilation() {
     // 3 * (6 * 6) = 3 * 36 = 108
     assert_eq!(res, FirValue::Int(108));
 }
+
+#[test]
+fn test_multi_arena_matrix_kernel_adaptive_cache_tiling_and_elementwise_fusion() {
+    let src = r#"
+        pub strict fn tensor_gemm_bias_scale(dim: i64, factor: i64) -> i64 {
+            mut acc = 0;
+            mut i = 0;
+            while i < dim {
+                mut j = 0;
+                while j < dim {
+                    acc = acc + factor * 3;
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            return acc;
+        }
+    "#;
+
+    let mut sm = ifa_span::SourceMap::new();
+    let fid = sm.add_file("gemm_bias_scale.ifa", src);
+    let tokens = ifa_lexer::tokenize(fid, src);
+    let (prog, diags) = ifa_parser::parse(fid, tokens);
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+
+    let analysis = ifa_sema::analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut module = lower_program(&prog, &analysis.symbols);
+    let mut sroa = ifa_fir::SroaPass::new();
+    sroa.run_on_module(&mut module);
+
+    let mut loop_opt = LoopOptPass::new();
+    loop_opt.run_on_module(&mut module);
+
+    let stats = loop_opt.stats();
+    assert!(
+        stats.matrix_kernels_tiled >= 1,
+        "Matrix kernels must be tiled: {:?}",
+        stats
+    );
+    assert!(
+        stats.tensor_loops_optimized >= 1,
+        "Tensor loops must be optimized: {:?}",
+        stats
+    );
+    assert!(
+        stats.adaptive_tiles_computed >= 1,
+        "Adaptive cache tile sizes must be computed: {:?}",
+        stats
+    );
+    assert!(
+        stats.multi_arena_kernels_specialized >= 1,
+        "Multi-arena kernel specialization must be identified: {:?}",
+        stats
+    );
+    assert!(
+        stats.elementwise_fusions >= 1,
+        "Elementary operations (bias/scale) must be fused: {:?}",
+        stats
+    );
+
+    let func = module
+        .functions
+        .iter()
+        .find(|f| ifa_span::INTERNER.resolve(&f.name) == "tensor_gemm_bias_scale")
+        .expect("tensor_gemm_bias_scale must exist");
+
+    // Verify outer loop header vector hint
+    let mut found_hint = false;
+    for block in &func.blocks {
+        if let Some(hint) = &block.vector_hint {
+            if hint.is_matrix_kernel && hint.is_tiled {
+                assert!(hint.is_multi_arena_matrix, "Must be tagged multi-arena");
+                assert!(
+                    hint.is_elementwise_fused,
+                    "Must be tagged elementwise fused"
+                );
+                assert!(
+                    hint.adaptive_tile_size.is_some(),
+                    "Adaptive tile size must be attached"
+                );
+                found_hint = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        found_hint,
+        "Tiled vector hint with adaptive tiling must be attached to loop header"
+    );
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp
+        .execute_function(
+            "tensor_gemm_bias_scale",
+            vec![FirValue::Int(4), FirValue::Int(2)],
+        )
+        .unwrap();
+    // (4 * 4) * (2 * 3) = 16 * 6 = 96
+    assert_eq!(res, FirValue::Int(96));
+}

@@ -224,3 +224,45 @@ fn test_comptime_constant_folding() {
         panic!("Pliage n'a pas produit de littéral Int");
     }
 }
+
+#[test]
+fn test_comptime_recursive_structure_cycle_validation() {
+    let fid = ifa_span::FileId(0);
+    let span = ifa_span::Span::new(fid, ifa_span::BytePos(0), ifa_span::BytePos(0));
+
+    // Valid non-recursive structure with depth 2
+    let val_ok = Value::Struct {
+        name: sym("Point"),
+        fields: vec![(sym("x"), Value::Int(10)), (sym("y"), Value::Int(20))],
+    };
+    assert!(val_ok.validate_no_cycles(0, 10, span).is_ok());
+
+    // Deeply nested structure exceeding max depth (e.g. max_depth = 3)
+    let deep = Value::Struct {
+        name: sym("Node1"),
+        fields: vec![(
+            sym("next"),
+            Value::Struct {
+                name: sym("Node2"),
+                fields: vec![(
+                    sym("next"),
+                    Value::Struct {
+                        name: sym("Node3"),
+                        fields: vec![(
+                            sym("next"),
+                            Value::Struct {
+                                name: sym("Node4"),
+                                fields: vec![(sym("val"), Value::Int(100))],
+                            },
+                        )],
+                    },
+                )],
+            },
+        )],
+    };
+    let err = deep.validate_no_cycles(0, 3, span).unwrap_err();
+    assert!(matches!(
+        err.kind,
+        ComptimeErrorKind::RecursiveStructureEscape { .. }
+    ));
+}

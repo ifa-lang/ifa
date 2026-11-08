@@ -816,7 +816,8 @@ impl<'a> SemanticAnalyzer<'a> {
 
     fn check_function(&mut self, f: &Function) {
         // Run escape analysis on this function
-        let mut escape_analyzer = EscapeAnalyzer::new(&self.symbols, f.is_strict, f.span);
+        let mut escape_analyzer =
+            EscapeAnalyzer::new(&self.symbols, f.is_strict, f.span).with_comptime(f.is_comptime);
         escape_analyzer.check_function(f);
         self.diagnostics.extend(escape_analyzer.diagnostics);
 
@@ -903,7 +904,8 @@ impl<'a> SemanticAnalyzer<'a> {
         combined_generics: &[ifa_ast::GenericParam],
     ) {
         // Run escape analysis on this function
-        let mut escape_analyzer = EscapeAnalyzer::new(&self.symbols, f.is_strict, f.span);
+        let mut escape_analyzer =
+            EscapeAnalyzer::new(&self.symbols, f.is_strict, f.span).with_comptime(f.is_comptime);
         escape_analyzer.check_function(f);
         self.diagnostics.extend(escape_analyzer.diagnostics);
 

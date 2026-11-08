@@ -50,6 +50,13 @@ pub enum ComptimeErrorKind {
     },
     InvalidAssignmentTarget,
     ArrayRepeatNegativeCount(i64),
+    RecursiveStructureEscape {
+        struct_name: String,
+    },
+    MutableClosureArenaEscape {
+        closure_name: String,
+        arena_name: String,
+    },
 }
 
 impl fmt::Display for ComptimeErrorKind {
@@ -162,6 +169,23 @@ impl fmt::Display for ComptimeErrorKind {
                     c
                 )
             }
+            ComptimeErrorKind::RecursiveStructureEscape { struct_name } => {
+                write!(
+                    f,
+                    "violation d'évasion comptime : tentative d'évasion de la structure récursive '{}' allouée dans l'arène isolée hors du contexte comptime",
+                    struct_name
+                )
+            }
+            ComptimeErrorKind::MutableClosureArenaEscape {
+                closure_name,
+                arena_name,
+            } => {
+                write!(
+                    f,
+                    "violation d'évasion comptime : tentative d'évasion d'une fermeture mutable '{}' capturant l'arène isolée '{}' hors du contexte comptime",
+                    closure_name, arena_name
+                )
+            }
         }
     }
 }
@@ -181,6 +205,8 @@ impl ComptimeError {
     /// Converts this compile-time evaluation error into an Ariadne diagnostic report.
     pub fn to_diagnostic(&self) -> Diagnostic {
         let code = match &self.kind {
+            ComptimeErrorKind::RecursiveStructureEscape { .. } => "E0028",
+            ComptimeErrorKind::MutableClosureArenaEscape { .. } => "E0029",
             ComptimeErrorKind::DivisionByZero | ComptimeErrorKind::ModuloByZero => "E0030",
             ComptimeErrorKind::IndexOutOfBounds { .. } => "E0031",
             ComptimeErrorKind::FieldNotFound { .. } => "E0032",

@@ -187,6 +187,21 @@ final class NativeFintechEngine
 }
 ```
 
+### 5.3. Noyaux Matriciels Multi-Arènes, Pavage Adaptatif et Sûreté Comptime
+
+Le compilateur IFA intègre des optimisations spécialisées de bout en bout pour le calcul matriciel et tensoriel haute performance dans `ifa-fir` et `ifa-codegen-llvm` :
+
+1. **Pavage Adaptatif de Cache L1** :
+   Le compilateur calcule dynamiquement la taille optimale des tuiles de cache en fonction de l'empreinte mémoire des éléments ($T \le \lfloor\sqrt{C_{L1} / (3 \times \text{elem\_size})}\rfloor$, avec un budget standard L1 de 32 Ko). Les boucles imbriquées de dimensions connues sont automatiquement alignées sur les puissances de deux ou les multiples exacts de dimensions pour éliminer les surcoûts d'épluchage de bordures (*loop peeling*).
+
+2. **Fusion d'Opérations Élémentaires (Post-GEMM Fusion)** :
+   Les pipelines de traitement matriciel intégrant consécutivement une multiplication/contraction et des opérations élémentaires (addition de biais, mise à l'échelle scalaire, activation) sont fusionnés au sein de la boucle de réduction sans écriture intermédiaire en mémoire. Les directives vectorielles LLVM (`llvm.loop.unroll_and_jam`, `llvm.loop.parallel_accesses`) maximisent la localité des registres vectoriels SIMD.
+
+3. **Vérification d'Échappement Comptime pour Arènes Isolées** :
+   Durant l'évaluation statique `comptime`, toute mémoire allouée dans une arène est confinée au cadre d'exécution de la compilation. Le vérificateur d'échappement (`ifa-sema`) rejette statiquement :
+   - L'évasion de structures récursives ou auto-référentielles allouées en arène isolée (`E0028`).
+   - L'évasion de fermetures mutables capturant une arène isolée hors de la frontière comptime (`E0029`).
+
 ---
 
 ## 6. Outillage Développeur et Commandes CLI

@@ -22,6 +22,46 @@ pub fn type_contains_ref(ty: &Type) -> bool {
     }
 }
 
+/// Determines if a type contains a self-referential or recursive definition.
+pub fn is_recursive_type(
+    ty: &Type,
+    target_struct: Option<Symbol>,
+    visited: &mut HashSet<Symbol>,
+) -> bool {
+    match ty {
+        Type::Struct { name, fields } => {
+            if let Some(target) = target_struct {
+                if *name == target {
+                    return true;
+                }
+            }
+            if !visited.insert(*name) {
+                return true;
+            }
+            let target = target_struct.unwrap_or(*name);
+            let recursive = fields
+                .iter()
+                .any(|(_, fty)| is_recursive_type(fty, Some(target), visited));
+            visited.remove(name);
+            recursive
+        }
+        Type::Ref(inner) | Type::Optional(inner) | Type::Slice(inner) | Type::Array(inner, _) => {
+            is_recursive_type(inner, target_struct, visited)
+        }
+        Type::Tuple(elems) => elems
+            .iter()
+            .any(|e| is_recursive_type(e, target_struct, visited)),
+        Type::Generic { args, .. } => args
+            .iter()
+            .any(|a| is_recursive_type(a, target_struct, visited)),
+        Type::ErrorUnion { err, ok } => {
+            is_recursive_type(err, target_struct, visited)
+                || is_recursive_type(ok, target_struct, visited)
+        }
+        _ => false,
+    }
+}
+
 /// Identifies the root variable of an expression, traversing field accesses, array indices,
 /// chained method calls, and unary operators (inout, sink, ref).
 pub fn extract_escape_root(expr: &Expr) -> Option<(Symbol, Span)> {
@@ -140,6 +180,14 @@ pub fn is_arena_expr(expr: &Expr) -> bool {
             let name = INTERNER.resolve(method);
             name.contains("arena") || name.contains("Arena")
         }
+        ExprKind::StructInit { name, .. } => {
+            if let Some(sym) = name.last() {
+                let n = INTERNER.resolve(sym);
+                n.contains("arena") || n.contains("Arena")
+            } else {
+                false
+            }
+        }
         _ => false,
     }
 }
@@ -225,6 +273,7 @@ pub struct ConcurrentAccess {
 pub struct EscapeAnalyzer<'a> {
     pub symbols: &'a SymbolTable,
     pub current_func_is_strict: bool,
+    pub current_func_is_comptime: bool,
     pub current_func_span: Span,
     pub var_info: HashMap<Symbol, VarEscapeInfo>,
     pub ref_dependencies: HashMap<Symbol, Vec<Symbol>>,
@@ -232,6 +281,10 @@ pub struct EscapeAnalyzer<'a> {
     pub stack_arrays: HashMap<Symbol, Span>,
     pub arena_capturing_closures: HashMap<Symbol, Symbol>,
     pub arena_lambda_spans: HashMap<Span, Symbol>,
+    pub comptime_isolated_arenas: HashSet<Symbol>,
+    pub comptime_recursive_structs: HashMap<Symbol, Symbol>,
+    pub comptime_mutable_arena_closures: HashMap<Symbol, Symbol>,
+    pub var_struct_type: HashMap<Symbol, Symbol>,
     pub spawn_depth: usize,
     pub spawn_counter: usize,
     pub current_spawn_id: Option<usize>,
@@ -244,6 +297,7 @@ impl<'a> EscapeAnalyzer<'a> {
         Self {
             symbols,
             current_func_is_strict: is_strict,
+            current_func_is_comptime: false,
             current_func_span: func_span,
             var_info: HashMap::new(),
             ref_dependencies: HashMap::new(),
@@ -251,12 +305,35 @@ impl<'a> EscapeAnalyzer<'a> {
             stack_arrays: HashMap::new(),
             arena_capturing_closures: HashMap::new(),
             arena_lambda_spans: HashMap::new(),
+            comptime_isolated_arenas: HashSet::new(),
+            comptime_recursive_structs: HashMap::new(),
+            comptime_mutable_arena_closures: HashMap::new(),
+            var_struct_type: HashMap::new(),
             spawn_depth: 0,
             spawn_counter: 0,
             current_spawn_id: None,
             concurrent_accesses: Vec::new(),
             diagnostics: Vec::new(),
         }
+    }
+
+    pub fn with_comptime(mut self, is_comptime: bool) -> Self {
+        self.current_func_is_comptime = is_comptime;
+        self
+    }
+
+    /// Checks if a struct definition contains recursive self-referential fields.
+    pub fn is_recursive_struct_symbol(&self, struct_name: Symbol) -> bool {
+        if let Some(st_def) = self.symbols.lookup_struct(&struct_name) {
+            let mut visited = HashSet::new();
+            visited.insert(struct_name);
+            for f in &st_def.fields {
+                if is_recursive_type(&f.ty, Some(struct_name), &mut visited) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn record_local_var(&mut self, var: Symbol, span: Span) {
@@ -878,6 +955,37 @@ impl<'a> EscapeAnalyzer<'a> {
                             }
                         }
                     }
+
+                    if let Some(init_expr) = init {
+                        if let ExprKind::StructInit { name, .. } = &init_expr.kind {
+                            if let Some(&st_sym) = name.last() {
+                                for (b, _) in &bound {
+                                    self.var_struct_type.insert(*b, st_sym);
+                                }
+                            }
+                        }
+                    }
+
+                    if self.current_func_is_comptime {
+                        for (bound_sym, _) in &bound {
+                            if is_arena || is_arena_symbol(bound_sym, self.symbols) {
+                                self.comptime_isolated_arenas.insert(*bound_sym);
+                            }
+                            if let Some(var_sym) = self.symbols.lookup_variable(bound_sym) {
+                                if is_recursive_type(&var_sym.ty, None, &mut HashSet::new()) {
+                                    if let Some(e) = init {
+                                        if is_arena_expr(e) {
+                                            let arena_sym = extract_escape_root(e)
+                                                .map(|(s, _)| s)
+                                                .unwrap_or(*bound_sym);
+                                            self.comptime_recursive_structs
+                                                .insert(*bound_sym, arena_sym);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 if let Some(eb) = else_block {
                     for s in &eb.stmts {
@@ -951,6 +1059,16 @@ impl<'a> EscapeAnalyzer<'a> {
                     if let Some((root_sym, _)) = extract_escape_root(target) {
                         if let Some(info) = self.var_info.get_mut(&root_sym) {
                             info.alloc_kind = AllocKind::ArenaScoped;
+                        }
+                        if self.current_func_is_comptime {
+                            if let Some(var_sym) = self.symbols.lookup_variable(&root_sym) {
+                                if is_recursive_type(&var_sym.ty, None, &mut HashSet::new()) {
+                                    let arena_sym = extract_escape_root(val)
+                                        .map(|(s, _)| s)
+                                        .unwrap_or(root_sym);
+                                    self.comptime_recursive_structs.insert(root_sym, arena_sym);
+                                }
+                            }
                         }
                     }
                 }
@@ -1766,6 +1884,91 @@ impl<'a> EscapeAnalyzer<'a> {
 
     fn check_return_expr(&mut self, expr: &Expr) {
         self.check_expr(expr);
+
+        // Comptime Escape Checks: isolated arena escape for recursive structures and mutable closures
+        if self.current_func_is_comptime {
+            // 1. Direct return of lambda capturing isolated arena
+            if let Some(&arena_sym) = self.arena_lambda_spans.get(&expr.span) {
+                let arena_name = INTERNER.resolve(&arena_sym);
+                self.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "violation d'évasion comptime : tentative d'évasion d'une fermeture mutable capturant l'arène isolée '{}' hors du contexte comptime",
+                        arena_name
+                    ))
+                    .with_code("E0029")
+                    .with_primary_label(
+                        expr.span,
+                        format!("retour d'une fermeture mutable liée à l'arène isolée '{}' interdite en comptime", arena_name),
+                    )
+                    .with_note("Les arènes isolées à la compilation sont détruites à la fin de l'évaluation comptime.")
+                    .with_help("Appliquez la fermeture directement au sein du contexte comptime ou retournez une valeur pure sérialisable."),
+                );
+            }
+
+            // 2. Return of variable holding a closure capturing isolated arena
+            if let ExprKind::Ident(sym) = &expr.kind {
+                if let Some(&arena_sym) = self.arena_capturing_closures.get(sym) {
+                    let closure_name = INTERNER.resolve(sym);
+                    let arena_name = INTERNER.resolve(&arena_sym);
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "violation d'évasion comptime : tentative d'évasion d'une fermeture mutable '{}' capturant l'arène isolée '{}' hors du contexte comptime",
+                            closure_name, arena_name
+                        ))
+                        .with_code("E0029")
+                        .with_primary_label(
+                            expr.span,
+                            format!("retour de la fermeture mutable '{}' liée à l'arène isolée '{}' interdite en comptime", closure_name, arena_name),
+                        )
+                        .with_note("Les arènes isolées et les fermetures mutables qui les capturent ne peuvent pas franchir la frontière de l'évaluation comptime.")
+                        .with_help("Appliquez la fermeture directement au sein du contexte comptime ou retournez une valeur pure sérialisable."),
+                    );
+                }
+            }
+
+            // 3. Return of recursive structure allocated in isolated arena
+            if let Some((root_sym, _)) = extract_escape_root(expr) {
+                let is_recursive = self
+                    .symbols
+                    .lookup_variable(&root_sym)
+                    .map(|v| is_recursive_type(&v.ty, None, &mut HashSet::new()))
+                    .unwrap_or(false)
+                    || self
+                        .var_struct_type
+                        .get(&root_sym)
+                        .is_some_and(|&st| self.is_recursive_struct_symbol(st));
+                let is_arena_allocated = self
+                    .var_info
+                    .get(&root_sym)
+                    .map(|v| v.alloc_kind == AllocKind::ArenaScoped)
+                    .unwrap_or(false)
+                    || self.comptime_recursive_structs.contains_key(&root_sym)
+                    || !self.comptime_isolated_arenas.is_empty();
+
+                if is_recursive && is_arena_allocated {
+                    let struct_name = INTERNER.resolve(&root_sym);
+                    let arena_name = self
+                        .comptime_recursive_structs
+                        .get(&root_sym)
+                        .or_else(|| self.comptime_isolated_arenas.iter().next())
+                        .map(|s| INTERNER.resolve(s))
+                        .unwrap_or_else(|| "isolée".to_string());
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "violation d'évasion comptime : tentative d'évasion de la structure récursive '{}' allouée dans l'arène isolée '{}' hors du contexte comptime",
+                            struct_name, arena_name
+                        ))
+                        .with_code("E0028")
+                        .with_primary_label(
+                            expr.span,
+                            format!("retour de la structure récursive '{}' liée à l'arène isolée '{}' interdite en comptime", struct_name, arena_name),
+                        )
+                        .with_note("Les arènes isolées à la compilation sont détruites à l'issue de l'évaluation comptime. Les structures récursives contenant des pointeurs vers une arène isolée ne peuvent pas franchir la frontière comptime/runtime.")
+                        .with_help("Copiez la structure par valeur dans un type sans pointeurs ou évaluez-la dynamiquement à l'exécution."),
+                    );
+                }
+            }
+        }
 
         // Strict Mode: Check for illegal heap promotion, arena closure escape, or slice escape
         if self.current_func_is_strict {

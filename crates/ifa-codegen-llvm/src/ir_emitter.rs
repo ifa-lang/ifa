@@ -1597,6 +1597,11 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("!66 = distinct !{!66, !2, !7, !4, !5, !12, !13, !24, !37, !38}\n");
         out.push_str("!67 = distinct !{!67, !2, !9, !4, !5, !12, !13, !24, !37, !39}\n");
         out.push_str("!68 = distinct !{!68, !2, !11, !4, !5, !12, !13, !24, !37, !38}\n");
+        // Specialized multi-arena matrix/tensor and elementwise fused kernel hints (unroll-and-jam 8x, parallel accesses, noalias, vector width)
+        out.push_str("!69 = distinct !{!69, !2, !3, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!70 = distinct !{!70, !2, !7, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!71 = distinct !{!71, !2, !9, !4, !5, !12, !13, !24, !37, !39}\n");
+        out.push_str("!72 = distinct !{!72, !2, !11, !4, !5, !12, !13, !24, !37, !39}\n");
 
         Ok(out)
     }
@@ -5218,6 +5223,13 @@ impl<'a> LlvmIrEmitter<'a> {
                             16 | 32 => 42,
                             _ => 40,
                         }
+                    } else if hint.is_multi_arena_matrix || hint.is_elementwise_fused {
+                        match hint.vector_width {
+                            2 => 72,
+                            4 => 70,
+                            16 | 32 => 71,
+                            _ => 69,
+                        }
                     } else if hint.is_matrix_kernel || hint.is_tiled || hint.unroll_and_jam {
                         match hint.vector_width {
                             2 => 36,
@@ -5329,6 +5341,13 @@ impl<'a> LlvmIrEmitter<'a> {
                             4 => 41,
                             16 | 32 => 42,
                             _ => 40,
+                        }
+                    } else if hint.is_multi_arena_matrix || hint.is_elementwise_fused {
+                        match hint.vector_width {
+                            2 => 72,
+                            4 => 70,
+                            16 | 32 => 71,
+                            _ => 69,
                         }
                     } else if hint.is_matrix_kernel || hint.is_tiled || hint.unroll_and_jam {
                         match hint.vector_width {

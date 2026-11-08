@@ -1467,3 +1467,104 @@ pub strict fn closure_with_stack_arr() -> i64 {
         analysis.diagnostics
     );
 }
+
+#[test]
+fn test_comptime_recursive_struct_arena_escape_rejected() {
+    let src = r#"
+struct Arena {
+    capacity: i64,
+}
+
+struct Node {
+    val: i64,
+    next: ?ref Node,
+}
+
+pub comptime fn make_recursive_list() -> Node {
+    let arena_mem = Arena { capacity: 4096 }
+    let node1 = Node { val: 42, next: nil }
+    return node1
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("comptime_rec_escape.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Returning recursive structure allocated in comptime isolated arena must be rejected"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0028")),
+        "Expected E0028 diagnostic code for recursive structure escape: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_comptime_mutable_closure_isolated_arena_escape_rejected() {
+    let src = r#"
+struct Arena {
+    capacity: i64,
+}
+
+pub comptime fn make_arena_closure() -> fn(i64) -> i64 {
+    let arena_mem = Arena(capacity: 2048)
+    let f = fn(x: i64) -> i64 {
+        arena_mem.capacity + x
+    }
+    return f
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("comptime_closure_escape.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Returning closure capturing comptime isolated arena must be rejected"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0029")),
+        "Expected E0029 diagnostic code for mutable closure arena escape: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_comptime_isolated_arena_scalar_evaluation_allowed() {
+    let src = r#"
+struct Arena {
+    capacity: i64,
+}
+
+pub comptime fn compute_arena_scalar() -> i64 {
+    let arena_mem = Arena(capacity: 1024)
+    return arena_mem.capacity * 2
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("comptime_scalar_ok.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Scalar evaluation with isolated arena in comptime fn must succeed: {:?}",
+        analysis.diagnostics
+    );
+}

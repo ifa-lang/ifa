@@ -556,6 +556,10 @@ pub struct LoopVectorHint {
     pub is_strided_loop: bool,
     pub loop_stride: Option<i64>,
     pub is_strided_multidim: bool,
+    pub is_multi_arena_matrix: bool,
+    pub is_elementwise_fused: bool,
+    pub adaptive_tile_size: Option<u32>,
+    pub multi_arena_operands: u32,
 }
 
 impl LoopVectorHint {
@@ -589,6 +593,10 @@ impl LoopVectorHint {
             is_strided_loop: false,
             loop_stride: None,
             is_strided_multidim: false,
+            is_multi_arena_matrix: false,
+            is_elementwise_fused: false,
+            adaptive_tile_size: None,
+            multi_arena_operands: 0,
         }
     }
 
@@ -724,6 +732,29 @@ impl LoopVectorHint {
     pub fn with_strided_loop(mut self, stride: i64) -> Self {
         self.is_strided_loop = true;
         self.loop_stride = Some(stride);
+        self
+    }
+
+    /// Mark the loop as executing a specialized multi-arena matrix or tensor kernel.
+    pub fn with_multi_arena_matrix(mut self, operands: u32) -> Self {
+        self.is_multi_arena_matrix = true;
+        self.multi_arena_operands = operands;
+        self.disjoint_slices = true;
+        self
+    }
+
+    /// Mark the loop as executing a fused elementary operation (bias add, activation, or scaling).
+    pub fn with_elementwise_fused(mut self, fused: bool) -> Self {
+        self.is_elementwise_fused = fused;
+        self
+    }
+
+    /// Set an adaptively computed cache tile size.
+    pub fn with_adaptive_tiling(mut self, tile_size: u32) -> Self {
+        self.is_tiled = true;
+        self.tile_size = Some(tile_size);
+        self.adaptive_tile_size = Some(tile_size);
+        self.unroll_and_jam = true;
         self
     }
 }

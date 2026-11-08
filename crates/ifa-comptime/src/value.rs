@@ -241,6 +241,50 @@ impl Value {
         }
     }
 
+    /// Recursively validates that a comptime value does not contain circular references
+    /// or exceed maximum nesting depth, preventing recursive structure escape from isolated arenas.
+    pub fn validate_no_cycles(
+        &self,
+        current_depth: usize,
+        max_depth: usize,
+        span: Span,
+    ) -> Result<(), ComptimeError> {
+        if current_depth > max_depth {
+            let name = match self {
+                Value::Struct { name, .. } => INTERNER.resolve(name),
+                Value::EnumVariant { variant, .. } => INTERNER.resolve(variant),
+                _ => "structure".to_string(),
+            };
+            return Err(ComptimeError::new(
+                ComptimeErrorKind::RecursiveStructureEscape { struct_name: name },
+                span,
+            ));
+        }
+
+        match self {
+            Value::Array(items) | Value::Tuple(items) => {
+                for item in items {
+                    item.validate_no_cycles(current_depth + 1, max_depth, span)?;
+                }
+            }
+            Value::Struct { fields, .. } => {
+                for (_, val) in fields {
+                    val.validate_no_cycles(current_depth + 1, max_depth, span)?;
+                }
+            }
+            Value::EnumVariant {
+                payload: Some(p), ..
+            } => {
+                p.validate_no_cycles(current_depth + 1, max_depth, span)?;
+            }
+            Value::Option(Some(p)) | Value::Error(p) => {
+                p.validate_no_cycles(current_depth + 1, max_depth, span)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     // =========================================================================
     // Arithmetic operations
     // =========================================================================

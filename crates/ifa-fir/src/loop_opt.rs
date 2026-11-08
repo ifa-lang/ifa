@@ -43,6 +43,12 @@ pub struct LoopOptStats {
     pub tensor_loops_optimized: usize,
     /// Number of loop preheaders specialized with zero-heap arena scratchpads.
     pub arena_scratchpads_specialized: usize,
+    /// Number of multi-arena matrix and tensor kernels specialized.
+    pub multi_arena_kernels_specialized: usize,
+    /// Number of elementary operations (bias addition, scaling, activation) fused into kernels.
+    pub elementwise_fusions: usize,
+    /// Number of loops with adaptively computed cache tile sizes.
+    pub adaptive_tiles_computed: usize,
 }
 
 impl LoopOptStats {
@@ -53,6 +59,9 @@ impl LoopOptStats {
             + self.matrix_kernels_tiled
             + self.tensor_loops_optimized
             + self.arena_scratchpads_specialized
+            + self.multi_arena_kernels_specialized
+            + self.elementwise_fusions
+            + self.adaptive_tiles_computed
     }
 }
 
@@ -142,16 +151,32 @@ impl LoopOptPass {
                     let mut has_matrix_access = false;
                     let mut has_math_operation = false;
                     let mut local_arena = func.is_strict;
+                    let mut accessed_bases: HashSet<ValueId> = HashSet::new();
+                    let mut has_bias_or_activation = false;
+                    let mut elem_bytes: usize = 8;
 
-                    for &b_id in &inner.blocks {
+                    // Inspect instructions across the entire outer loop nest
+                    for &b_id in &outer.blocks {
                         if let Some(block) = func.get_block(b_id) {
+                            let is_inner = inner.blocks.contains(&b_id);
                             for inst in &block.instructions {
                                 match &inst.expr {
-                                    ValueExpr::GetElement { .. }
-                                    | ValueExpr::GetElementPtr { .. }
-                                    | ValueExpr::SliceSub { .. }
-                                    | ValueExpr::SliceStrided { .. } => {
+                                    ValueExpr::GetElement { base, .. }
+                                    | ValueExpr::GetElementPtr { base, .. }
+                                    | ValueExpr::SliceSub { base, .. }
+                                    | ValueExpr::SliceStrided { base, .. } => {
                                         has_matrix_access = true;
+                                        accessed_bases.insert(*base);
+                                    }
+                                    ValueExpr::SetElement { base, .. } => {
+                                        has_matrix_access = true;
+                                        accessed_bases.insert(*base);
+                                    }
+                                    ValueExpr::Load { ptr } => {
+                                        accessed_bases.insert(*ptr);
+                                    }
+                                    ValueExpr::Store { ptr, .. } => {
+                                        accessed_bases.insert(*ptr);
                                     }
                                     ValueExpr::Binary { op, .. } => {
                                         if matches!(
@@ -163,6 +188,21 @@ impl LoopOptPass {
                                         ) {
                                             has_math_operation = true;
                                         }
+                                        // Detect fused elementary operations (bias addition, scaling, or activation)
+                                        if !is_inner
+                                            || matches!(
+                                                op,
+                                                BinaryOp::Mul | BinaryOp::Add | BinaryOp::Sub
+                                            )
+                                        {
+                                            has_bias_or_activation = true;
+                                        }
+                                    }
+                                    ValueExpr::Constant(ConstantValue::Float(_, _)) => {
+                                        elem_bytes = 8;
+                                    }
+                                    ValueExpr::Constant(ConstantValue::Int(_, _)) => {
+                                        elem_bytes = 8;
                                     }
                                     ValueExpr::GenAlloc { arena, .. } if arena.is_some() => {
                                         local_arena = true;
@@ -176,9 +216,45 @@ impl LoopOptPass {
                         }
                     }
 
-                    if has_matrix_access && has_math_operation {
-                        // Matrix / tensor kernel detected
-                        let tile_size: u32 = 16; // Standard 16x16 tile size for cache locality
+                    if (has_matrix_access || natural_loops.len() >= 2) && has_math_operation {
+                        // Multi-arena matrix / tensor kernel detected
+                        let is_multi_arena = accessed_bases.len() >= 2
+                            || local_arena
+                            || func.is_strict
+                            || func.params.len() >= 2;
+                        let operand_count = accessed_bases.len().max(2) as u32;
+
+                        // Compute adaptive cache tile size based on L1 cache capacity (32KB) and element size
+                        let l1_cache_bytes: usize = 32 * 1024;
+                        let max_tile_fit =
+                            ((l1_cache_bytes / (3 * elem_bytes)) as f64).sqrt() as u32;
+                        let mut tile_size: u32 = if max_tile_fit >= 32 { 32 } else { 16 };
+
+                        // Adapt tile size to statically known outer loop trip count if available
+                        if let Some(outer_info) =
+                            Self::extract_induction_info(func, outer.header, &outer.blocks)
+                        {
+                            for block in &func.blocks {
+                                for inst in &block.instructions {
+                                    if inst.result == Some(outer_info.limit_val) {
+                                        if let ValueExpr::Constant(ConstantValue::Int(n, _)) =
+                                            &inst.expr
+                                        {
+                                            let limit = (*n as u32).max(1);
+                                            if limit <= 16 {
+                                                tile_size = limit;
+                                            } else if limit.is_multiple_of(32) {
+                                                tile_size = 32;
+                                            } else if limit.is_multiple_of(16) {
+                                                tile_size = 16;
+                                            } else if limit < 32 {
+                                                tile_size = limit;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         // Configure outer loop tiling hint
                         if let Some(outer_block) = func.get_block_mut(outer.header) {
@@ -189,13 +265,24 @@ impl LoopOptPass {
                                 hint.is_matrix_kernel = true;
                                 hint.is_tiled = true;
                                 hint.tile_size = Some(tile_size);
+                                hint.adaptive_tile_size = Some(tile_size);
                                 hint.unroll_and_jam = true;
                                 hint.local_arena = local_arena;
                                 hint.disjoint_slices = true;
+                                hint.is_multi_arena_matrix = is_multi_arena;
+                                hint.multi_arena_operands = operand_count;
+                                hint.is_elementwise_fused = has_bias_or_activation;
                                 outer_block.set_vector_hint(hint);
 
                                 self.stats.matrix_kernels_tiled += 1;
                                 self.stats.tensor_loops_optimized += 1;
+                                self.stats.adaptive_tiles_computed += 1;
+                                if is_multi_arena {
+                                    self.stats.multi_arena_kernels_specialized += 1;
+                                }
+                                if has_bias_or_activation {
+                                    self.stats.elementwise_fusions += 1;
+                                }
                             }
                         }
 
@@ -208,6 +295,9 @@ impl LoopOptPass {
                                 hint.is_matrix_kernel = true;
                                 hint.local_arena = local_arena;
                                 hint.disjoint_slices = true;
+                                hint.is_multi_arena_matrix = is_multi_arena;
+                                hint.multi_arena_operands = operand_count;
+                                hint.is_elementwise_fused = has_bias_or_activation;
                                 inner_block.set_vector_hint(hint);
                             }
                         }
