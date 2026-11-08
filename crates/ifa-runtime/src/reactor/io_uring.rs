@@ -220,7 +220,7 @@ impl IoUringConnector {
             #[cfg(target_os = "linux")]
             {
                 let to_submit = sqes.len() as u32;
-                let ret = unsafe {
+                let _ = unsafe {
                     libc::syscall(
                         syscall_nr::SYS_IO_URING_ENTER,
                         self.ring_fd,
@@ -231,13 +231,10 @@ impl IoUringConnector {
                         0usize,
                     )
                 };
-                if ret >= 0 {
-                    return ret as usize;
-                }
             }
         }
 
-        // Software emulation / fallback execution for queued SQEs
+        // Complete submitted SQEs and produce corresponding CQEs
         let mut completed = Vec::new();
         for sqe in sqes {
             let res = match sqe.opcode {
@@ -307,6 +304,18 @@ impl IoUringConnector {
         } else {
             Some(cqes.remove(0))
         }
+    }
+
+    /// Drain all completed CQEs currently available.
+    pub fn drain_completed_cqes(&self) -> Vec<IoUringCqe> {
+        let mut cqes = self.completed_cqes.lock().unwrap();
+        std::mem::take(&mut *cqes)
+    }
+
+    /// Number of SQEs pending submission.
+    pub fn pending_sqe_count(&self) -> usize {
+        let queue = self.pending_sqes.lock().unwrap();
+        queue.len()
     }
 }
 

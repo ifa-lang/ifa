@@ -142,7 +142,19 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare void @ifa_rt_bounds_check(i64, i64, ptr)\n");
             out.push_str("declare void @ifa_rt_slice_bounds_check(i64, i64, i64, ptr)\n");
             out.push_str("declare i1 @ifa_rt_buffer_verify_bounds(ptr, i64, i64, i64)\n");
-            out.push_str("declare void @ifa_rt_panic_out_of_bounds(i64, i64)\n\n");
+            out.push_str("declare void @ifa_rt_panic_out_of_bounds(i64, i64)\n");
+            out.push_str(
+                "declare i64 @ifa_rt_coro_register_io_uring_read(ptr, i32, ptr, i32, i64, ptr)\n",
+            );
+            out.push_str(
+                "declare i64 @ifa_rt_coro_register_io_uring_write(ptr, i32, ptr, i32, i64, ptr)\n",
+            );
+            out.push_str("declare i64 @ifa_rt_coro_register_iocp_read(ptr, i64, ptr, i32, ptr)\n");
+            out.push_str("declare i64 @ifa_rt_coro_register_iocp_write(ptr, i64, ptr, i32, ptr)\n");
+            out.push_str("declare void @ifa_rt_coro_set_waiting_io(ptr, i64, ptr)\n");
+            out.push_str("declare i32 @ifa_rt_coro_wake_io(i64, i64)\n");
+            out.push_str("declare i64 @ifa_rt_reactor_poll(i32)\n");
+            out.push_str("declare i64 @ifa_rt_coro_pending_io_count()\n\n");
         } else {
             out.push_str("; IFA Runtime Intrinsic Declarations\n");
             out.push_str("declare void @ifa_rt_println(ptr)\n");
@@ -184,7 +196,19 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare void @ifa_rt_bounds_check(i64, i64, ptr)\n");
             out.push_str("declare void @ifa_rt_slice_bounds_check(i64, i64, i64, ptr)\n");
             out.push_str("declare i1 @ifa_rt_buffer_verify_bounds(ptr, i64, i64, i64)\n");
-            out.push_str("declare void @ifa_rt_panic_out_of_bounds(i64, i64)\n\n");
+            out.push_str("declare void @ifa_rt_panic_out_of_bounds(i64, i64)\n");
+            out.push_str(
+                "declare i64 @ifa_rt_coro_register_io_uring_read(ptr, i32, ptr, i32, i64, ptr)\n",
+            );
+            out.push_str(
+                "declare i64 @ifa_rt_coro_register_io_uring_write(ptr, i32, ptr, i32, i64, ptr)\n",
+            );
+            out.push_str("declare i64 @ifa_rt_coro_register_iocp_read(ptr, i64, ptr, i32, ptr)\n");
+            out.push_str("declare i64 @ifa_rt_coro_register_iocp_write(ptr, i64, ptr, i32, ptr)\n");
+            out.push_str("declare void @ifa_rt_coro_set_waiting_io(ptr, i64, ptr)\n");
+            out.push_str("declare i32 @ifa_rt_coro_wake_io(i64, i64)\n");
+            out.push_str("declare i64 @ifa_rt_reactor_poll(i32)\n");
+            out.push_str("declare i64 @ifa_rt_coro_pending_io_count()\n\n");
         }
 
         // LLVM Standard Coroutine Intrinsics
@@ -268,6 +292,25 @@ impl<'a> LlvmIrEmitter<'a> {
             "define linkonce_odr void @ifa_coro_generator_iter_destroy(ptr %iter) alwaysinline {\n",
         );
         out.push_str("entry:\n  call void @ifa_rt_coro_iter_destroy(ptr %iter)\n  ret void\n}\n\n");
+
+        // IFA Asynchronous Reactor & io_uring / IOCP Coroutine Integration Helpers
+        out.push_str(
+            "; IFA Asynchronous Reactor & io_uring / IOCP Coroutine Integration Helpers\n",
+        );
+        out.push_str("define linkonce_odr i64 @ifa_coro_llvm_io_uring_read(ptr %coro, i32 %fd, ptr %buf, i32 %len, i64 %off, ptr %res_slot) alwaysinline {\n");
+        out.push_str("entry:\n  %tok = call i64 @ifa_rt_coro_register_io_uring_read(ptr %coro, i32 %fd, ptr %buf, i32 %len, i64 %off, ptr %res_slot)\n  ret i64 %tok\n}\n\n");
+
+        out.push_str("define linkonce_odr i64 @ifa_coro_llvm_io_uring_write(ptr %coro, i32 %fd, ptr %buf, i32 %len, i64 %off, ptr %res_slot) alwaysinline {\n");
+        out.push_str("entry:\n  %tok = call i64 @ifa_rt_coro_register_io_uring_write(ptr %coro, i32 %fd, ptr %buf, i32 %len, i64 %off, ptr %res_slot)\n  ret i64 %tok\n}\n\n");
+
+        out.push_str("define linkonce_odr i64 @ifa_coro_llvm_iocp_read(ptr %coro, i64 %key, ptr %buf, i32 %len, ptr %res_slot) alwaysinline {\n");
+        out.push_str("entry:\n  %tok = call i64 @ifa_rt_coro_register_iocp_read(ptr %coro, i64 %key, ptr %buf, i32 %len, ptr %res_slot)\n  ret i64 %tok\n}\n\n");
+
+        out.push_str("define linkonce_odr i64 @ifa_coro_llvm_iocp_write(ptr %coro, i64 %key, ptr %buf, i32 %len, ptr %res_slot) alwaysinline {\n");
+        out.push_str("entry:\n  %tok = call i64 @ifa_rt_coro_register_iocp_write(ptr %coro, i64 %key, ptr %buf, i32 %len, ptr %res_slot)\n  ret i64 %tok\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_coro_llvm_await_io(ptr %coro, i64 %token, ptr %res_slot) alwaysinline {\n");
+        out.push_str("entry:\n  call void @ifa_rt_coro_set_waiting_io(ptr %coro, i64 %token, ptr %res_slot)\n  ret void\n}\n\n");
 
         // WebAssembly Standalone Stackless Coroutine & Generator Helpers
         if self.target.arch == TargetArch::Wasm32Wasi {

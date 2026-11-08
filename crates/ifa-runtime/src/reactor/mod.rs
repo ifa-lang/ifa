@@ -16,7 +16,7 @@ pub use iocp::{IocpCompletionPacket, IocpConnector, IocpOpCode};
 pub use nonblocking::{AsyncTcpListener, AsyncTcpStream, AsyncTimer};
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Unified Async Reactor coordinating kernel completion drivers and fibers.
@@ -24,6 +24,7 @@ pub struct AsyncReactor {
     io_uring: IoUringConnector,
     iocp: IocpConnector,
     next_handle_id: AtomicI32,
+    next_token_id: AtomicU64,
     listeners: Mutex<HashMap<i32, AsyncTcpListener>>,
     streams: Mutex<HashMap<i32, AsyncTcpStream>>,
 }
@@ -34,6 +35,7 @@ impl AsyncReactor {
             io_uring: IoUringConnector::new(256),
             iocp: IocpConnector::new(2),
             next_handle_id: AtomicI32::new(1000),
+            next_token_id: AtomicU64::new(1),
             listeners: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
         }
@@ -47,6 +49,152 @@ impl AsyncReactor {
     /// Access Windows IOCP connector.
     pub fn iocp(&self) -> &IocpConnector {
         &self.iocp
+    }
+
+    /// Generate a unique 64-bit event token for tracking asynchronous I/O completion.
+    pub fn next_token(&self) -> u64 {
+        self.next_token_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Submit an asynchronous io_uring read request with the specified event token.
+    pub fn submit_io_uring_read(&self, fd: i32, buf: *mut u8, len: u32, offset: u64, token: u64) {
+        let sqe = IoUringSqe {
+            opcode: io_uring::opcodes::IORING_OP_READ,
+            fd,
+            addr: buf as u64,
+            len,
+            off: offset,
+            user_data: token,
+            ..Default::default()
+        };
+        self.io_uring.submit_sqe(sqe);
+    }
+
+    /// Submit an asynchronous io_uring write request with the specified event token.
+    pub fn submit_io_uring_write(
+        &self,
+        fd: i32,
+        buf: *const u8,
+        len: u32,
+        offset: u64,
+        token: u64,
+    ) {
+        let sqe = IoUringSqe {
+            opcode: io_uring::opcodes::IORING_OP_WRITE,
+            fd,
+            addr: buf as u64,
+            len,
+            off: offset,
+            user_data: token,
+            ..Default::default()
+        };
+        self.io_uring.submit_sqe(sqe);
+    }
+
+    /// Submit an asynchronous Windows IOCP read completion event.
+    pub fn submit_iocp_read(&self, port_key: usize, _buf: *mut u8, len: u32, token: u64) {
+        let _ = self.iocp.post_completion(port_key, len, token, 0);
+    }
+
+    /// Submit an asynchronous Windows IOCP write completion event.
+    pub fn submit_iocp_write(&self, port_key: usize, _buf: *const u8, len: u32, token: u64) {
+        let _ = self.iocp.post_completion(port_key, len, token, 0);
+    }
+
+    /// Poll kernel completion queues (io_uring CQEs & IOCP packets) without blocking,
+    /// waking all matching suspended fibers in the global M:N scheduler.
+    pub fn poll_and_wake(&self) -> usize {
+        let mut total_woken = 0;
+
+        // 1. Flush io_uring submission ring and collect CQEs
+        let _ = self.io_uring.enter(0);
+        for cqe in self.io_uring.drain_completed_cqes() {
+            if cqe.user_data != 0
+                && crate::fiber::GLOBAL_SCHEDULER.wake_io(cqe.user_data, cqe.res as i64)
+            {
+                total_woken += 1;
+            }
+        }
+
+        // 2. Collect IOCP packets
+        for packet in self.iocp.drain_completed_packets() {
+            if packet.user_data != 0 {
+                let res = if packet.status == 0 {
+                    packet.bytes_transferred as i64
+                } else {
+                    -(packet.status as i64)
+                };
+                if crate::fiber::GLOBAL_SCHEDULER.wake_io(packet.user_data, res) {
+                    total_woken += 1;
+                }
+            }
+        }
+
+        while let Some(packet) = self.iocp.poll_completion(0) {
+            if packet.user_data != 0 {
+                let res = if packet.status == 0 {
+                    packet.bytes_transferred as i64
+                } else {
+                    -(packet.status as i64)
+                };
+                if crate::fiber::GLOBAL_SCHEDULER.wake_io(packet.user_data, res) {
+                    total_woken += 1;
+                }
+            }
+        }
+
+        total_woken
+    }
+
+    /// Wait with timeout for asynchronous completions from io_uring or IOCP, waking fibers.
+    pub fn wait_and_wake(&self, timeout: std::time::Duration) -> usize {
+        let mut total = self.poll_and_wake();
+        if total > 0 {
+            return total;
+        }
+
+        #[cfg(target_os = "linux")]
+        if self.io_uring.is_available() {
+            let _ = self.io_uring.enter(1);
+            for cqe in self.io_uring.drain_completed_cqes() {
+                if cqe.user_data != 0
+                    && crate::fiber::GLOBAL_SCHEDULER.wake_io(cqe.user_data, cqe.res as i64)
+                {
+                    total += 1;
+                }
+            }
+            if total > 0 {
+                return total;
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        if self.iocp.is_active() {
+            let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+            if let Some(packet) = self.iocp.poll_completion(timeout_ms) {
+                if packet.user_data != 0 {
+                    let res = if packet.status == 0 {
+                        packet.bytes_transferred as i64
+                    } else {
+                        -(packet.status as i64)
+                    };
+                    if crate::fiber::GLOBAL_SCHEDULER.wake_io(packet.user_data, res) {
+                        total += 1;
+                    }
+                }
+            }
+            if total > 0 {
+                return total;
+            }
+        }
+
+        let start = std::time::Instant::now();
+        while total == 0 && start.elapsed() < timeout {
+            std::thread::sleep(std::time::Duration::from_micros(100));
+            total += self.poll_and_wake();
+        }
+
+        total
     }
 
     /// Bind a new async TCP listener.

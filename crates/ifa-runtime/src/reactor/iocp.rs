@@ -132,6 +132,12 @@ impl IocpConnector {
             Some(queue.remove(0))
         }
     }
+
+    /// Drain all completed IOCP packets currently queued in software emulation or local ring.
+    pub fn drain_completed_packets(&self) -> Vec<IocpCompletionPacket> {
+        let mut queue = self.completion_queue.lock().unwrap();
+        std::mem::take(&mut *queue)
+    }
 }
 
 impl Drop for IocpConnector {

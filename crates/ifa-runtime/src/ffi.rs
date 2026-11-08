@@ -282,6 +282,8 @@ pub struct IfaCoroutine {
     pub status: CoroStatus,
     pub fiber_id: Option<FiberId>,
     pub owns_frame: bool,
+    pub pending_io_token: Option<u64>,
+    pub pending_result_slot: Option<*mut i64>,
 }
 
 unsafe impl Send for IfaCoroutine {}
@@ -306,6 +308,8 @@ pub extern "C" fn ifa_rt_coro_create(
         status: CoroStatus::Suspended,
         fiber_id: None,
         owns_frame: true,
+        pending_io_token: None,
+        pending_result_slot: None,
     });
     Box::into_raw(coro)
 }
@@ -324,12 +328,14 @@ pub extern "C" fn ifa_rt_coro_create_custom(
         status: CoroStatus::Suspended,
         fiber_id: None,
         owns_frame: false,
+        pending_io_token: None,
+        pending_result_slot: None,
     });
     Box::into_raw(coro)
 }
 
 /// Resume execution of a stackless coroutine for one cooperative step.
-/// Returns CoroStatus as i32 (0 = Suspended, 1 = Completed, 2 = Panicked).
+/// Returns CoroStatus as i32 (0 = Suspended, 1 = Completed, 2 = Panicked, 3 = WaitingIo).
 #[no_mangle]
 pub extern "C" fn ifa_rt_coro_resume(coro: *mut IfaCoroutine) -> i32 {
     if coro.is_null() {
@@ -340,8 +346,14 @@ pub extern "C" fn ifa_rt_coro_resume(coro: *mut IfaCoroutine) -> i32 {
         return CoroStatus::Completed as i32;
     }
     let res = (c.resume_fn)(c.frame);
+    if c.pending_io_token.is_some() {
+        c.status = CoroStatus::WaitingIo;
+        return CoroStatus::WaitingIo as i32;
+    }
     if res == CoroStatus::Completed as i32 {
         c.status = CoroStatus::Completed;
+    } else if res == CoroStatus::WaitingIo as i32 {
+        c.status = CoroStatus::WaitingIo;
     } else if res == CoroStatus::Suspended as i32 {
         c.status = CoroStatus::Suspended;
     } else {
@@ -364,6 +376,13 @@ pub extern "C" fn ifa_rt_coro_spawn(coro: *mut IfaCoroutine) -> u64 {
         let res = ifa_rt_coro_resume(raw_coro);
         if res == CoroStatus::Completed as i32 {
             CoroStatus::Completed
+        } else if res == CoroStatus::WaitingIo as i32 {
+            let rc = unsafe { &mut *raw_coro };
+            let token = rc.pending_io_token.unwrap_or(0);
+            let slot = rc.pending_result_slot.take();
+            crate::fiber::set_current_fiber_io_token(token);
+            crate::fiber::set_current_fiber_result_slot(slot);
+            CoroStatus::WaitingIo
         } else if res == CoroStatus::Suspended as i32 {
             CoroStatus::Suspended
         } else {
@@ -511,6 +530,159 @@ pub extern "C" fn ifa_rt_coro_iter_destroy(iter: *mut IfaCoroIterator) {
             }
         }
     }
+}
+
+/// Register an asynchronous io_uring read request on the global reactor and bind to the coroutine.
+/// Returns the allocated I/O event token.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_register_io_uring_read(
+    coro: *mut IfaCoroutine,
+    fd: i32,
+    buf: *mut u8,
+    len: u32,
+    offset: u64,
+    out_result: *mut i64,
+) -> u64 {
+    let token = crate::reactor::GLOBAL_REACTOR.next_token();
+    crate::reactor::GLOBAL_REACTOR.submit_io_uring_read(fd, buf, len, offset, token);
+    if !coro.is_null() {
+        let c = unsafe { &mut *coro };
+        c.pending_io_token = Some(token);
+        c.pending_result_slot = if out_result.is_null() {
+            None
+        } else {
+            Some(out_result)
+        };
+        c.status = CoroStatus::WaitingIo;
+    }
+    crate::fiber::set_current_fiber_io_token(token);
+    token
+}
+
+/// Register an asynchronous io_uring write request on the global reactor and bind to the coroutine.
+/// Returns the allocated I/O event token.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_register_io_uring_write(
+    coro: *mut IfaCoroutine,
+    fd: i32,
+    buf: *const u8,
+    len: u32,
+    offset: u64,
+    out_result: *mut i64,
+) -> u64 {
+    let token = crate::reactor::GLOBAL_REACTOR.next_token();
+    crate::reactor::GLOBAL_REACTOR.submit_io_uring_write(fd, buf, len, offset, token);
+    if !coro.is_null() {
+        let c = unsafe { &mut *coro };
+        c.pending_io_token = Some(token);
+        c.pending_result_slot = if out_result.is_null() {
+            None
+        } else {
+            Some(out_result)
+        };
+        c.status = CoroStatus::WaitingIo;
+    }
+    crate::fiber::set_current_fiber_io_token(token);
+    token
+}
+
+/// Register an asynchronous Windows IOCP read request on the global reactor and bind to the coroutine.
+/// Returns the allocated I/O event token.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_register_iocp_read(
+    coro: *mut IfaCoroutine,
+    key: usize,
+    buf: *mut u8,
+    len: u32,
+    out_result: *mut i64,
+) -> u64 {
+    let token = crate::reactor::GLOBAL_REACTOR.next_token();
+    crate::reactor::GLOBAL_REACTOR.submit_iocp_read(key, buf, len, token);
+    if !coro.is_null() {
+        let c = unsafe { &mut *coro };
+        c.pending_io_token = Some(token);
+        c.pending_result_slot = if out_result.is_null() {
+            None
+        } else {
+            Some(out_result)
+        };
+        c.status = CoroStatus::WaitingIo;
+    }
+    crate::fiber::set_current_fiber_io_token(token);
+    token
+}
+
+/// Register an asynchronous Windows IOCP write request on the global reactor and bind to the coroutine.
+/// Returns the allocated I/O event token.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_register_iocp_write(
+    coro: *mut IfaCoroutine,
+    key: usize,
+    buf: *const u8,
+    len: u32,
+    out_result: *mut i64,
+) -> u64 {
+    let token = crate::reactor::GLOBAL_REACTOR.next_token();
+    crate::reactor::GLOBAL_REACTOR.submit_iocp_write(key, buf, len, token);
+    if !coro.is_null() {
+        let c = unsafe { &mut *coro };
+        c.pending_io_token = Some(token);
+        c.pending_result_slot = if out_result.is_null() {
+            None
+        } else {
+            Some(out_result)
+        };
+        c.status = CoroStatus::WaitingIo;
+    }
+    crate::fiber::set_current_fiber_io_token(token);
+    token
+}
+
+/// Manually mark a coroutine as waiting for an I/O token with optional result slot.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_set_waiting_io(
+    coro: *mut IfaCoroutine,
+    token: u64,
+    out_result: *mut i64,
+) {
+    if !coro.is_null() {
+        let c = unsafe { &mut *coro };
+        c.pending_io_token = Some(token);
+        c.pending_result_slot = if out_result.is_null() {
+            None
+        } else {
+            Some(out_result)
+        };
+        c.status = CoroStatus::WaitingIo;
+    }
+    crate::fiber::set_current_fiber_io_token(token);
+}
+
+/// Manually wake an I/O event token across the scheduler.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_wake_io(token: u64, result: i64) -> i32 {
+    if GLOBAL_SCHEDULER.wake_io(token, result) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Poll the global async reactor for completed io_uring and IOCP events and wake waiting fibers.
+#[no_mangle]
+pub extern "C" fn ifa_rt_reactor_poll(timeout_ms: u32) -> usize {
+    if timeout_ms == 0 {
+        crate::reactor::GLOBAL_REACTOR.poll_and_wake()
+    } else {
+        crate::reactor::GLOBAL_REACTOR
+            .wait_and_wake(std::time::Duration::from_millis(timeout_ms as u64))
+    }
+}
+
+/// Number of fibers currently parked waiting for asynchronous I/O completion.
+#[no_mangle]
+pub extern "C" fn ifa_rt_coro_pending_io_count() -> usize {
+    GLOBAL_SCHEDULER.pending_io_count()
 }
 
 /// Print a null-terminated UTF-8 string.

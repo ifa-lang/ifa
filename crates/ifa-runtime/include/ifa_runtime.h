@@ -151,9 +151,10 @@ void ifa_rt_fiber_join(uint64_t fiber_id);
 
 /* --- Stackless Native Coroutines & Continuous Fibers API --- */
 
-#define IFA_CORO_STATUS_SUSPENDED 0
-#define IFA_CORO_STATUS_COMPLETED 1
-#define IFA_CORO_STATUS_PANICKED  2
+#define IFA_CORO_STATUS_SUSPENDED  0
+#define IFA_CORO_STATUS_COMPLETED  1
+#define IFA_CORO_STATUS_PANICKED   2
+#define IFA_CORO_STATUS_WAITING_IO 3
 
 typedef int32_t (*ifa_coro_resume_fn)(void* frame);
 typedef void (*ifa_coro_destroy_fn)(void* frame);
@@ -270,6 +271,15 @@ int32_t ifa_rt_async_tcp_connect(const char* host, uint16_t port);
 intptr_t ifa_rt_async_read(int32_t stream_fd, uint8_t* buf, size_t len);
 intptr_t ifa_rt_async_write(int32_t stream_fd, const uint8_t* buf, size_t len);
 int32_t ifa_rt_async_close(int32_t handle_fd);
+
+uint64_t ifa_rt_coro_register_io_uring_read(ifa_coroutine_t* coro, int32_t fd, uint8_t* buf, uint32_t len, uint64_t offset, int64_t* out_result);
+uint64_t ifa_rt_coro_register_io_uring_write(ifa_coroutine_t* coro, int32_t fd, const uint8_t* buf, uint32_t len, uint64_t offset, int64_t* out_result);
+uint64_t ifa_rt_coro_register_iocp_read(ifa_coroutine_t* coro, size_t key, uint8_t* buf, uint32_t len, int64_t* out_result);
+uint64_t ifa_rt_coro_register_iocp_write(ifa_coroutine_t* coro, size_t key, const uint8_t* buf, uint32_t len, int64_t* out_result);
+void ifa_rt_coro_set_waiting_io(ifa_coroutine_t* coro, uint64_t token, int64_t* out_result);
+int32_t ifa_rt_coro_wake_io(uint64_t token, int64_t result);
+size_t ifa_rt_reactor_poll(uint32_t timeout_ms);
+size_t ifa_rt_coro_pending_io_count(void);
 
 /* --- Isolated Blocking FFI Worker Pool API --- */
 

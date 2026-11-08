@@ -3035,3 +3035,89 @@ fn test_llvm_inlined_generational_check_with_quarantine_and_liveness() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_coroutine_io_uring_iocp_reactor_lowering_and_native_compile() {
+    use ifa_codegen_llvm::compiler::LlvmCompiler;
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_codegen_llvm::target::LlvmTargetConfig;
+    use ifa_fir::{BlockId, FirFunction, FirModule, Instruction, Terminator, ValueExpr};
+    use ifa_span::{Span, INTERNER};
+    use std::fs;
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let coro_name = INTERNER.intern("async_io_coroutine");
+    let mut func = FirFunction::new(
+        coro_name,
+        vec![],
+        ifa_fir::types::FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let b_entry = BlockId(0);
+    let entry_bb = func.get_block_mut(b_entry).unwrap();
+    // Two suspension points in the coroutine representing async I/O yields
+    entry_bb.push_instruction(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    entry_bb.push_instruction(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    entry_bb.set_terminator(Terminator::Return(None));
+
+    assert!(func.is_coroutine());
+
+    let module = FirModule {
+        name: INTERNER.intern("async_coro_reactor_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).expect("Emission failed");
+
+    // 1. Verify standard LLVM coroutine intrinsics and presplitcoroutine attribute
+    assert!(ir.contains("define dso_local ptr @async_io_coroutine() presplitcoroutine"));
+    assert!(ir.contains("call token @llvm.coro.id("));
+    assert!(ir.contains("call ptr @llvm.coro.begin("));
+    assert!(ir.contains("call i8 @llvm.coro.suspend("));
+    assert!(ir.contains("call ptr @llvm.coro.free("));
+    assert!(ir.contains("call i1 @llvm.coro.end("));
+
+    // 2. Verify io_uring and IOCP reactor integration declarations and adapters
+    assert!(ir
+        .contains("declare i64 @ifa_rt_coro_register_io_uring_read(ptr, i32, ptr, i32, i64, ptr)"));
+    assert!(ir.contains(
+        "declare i64 @ifa_rt_coro_register_io_uring_write(ptr, i32, ptr, i32, i64, ptr)"
+    ));
+    assert!(ir.contains("declare i64 @ifa_rt_coro_register_iocp_read(ptr, i64, ptr, i32, ptr)"));
+    assert!(ir.contains("declare i64 @ifa_rt_coro_register_iocp_write(ptr, i64, ptr, i32, ptr)"));
+    assert!(ir.contains("declare void @ifa_rt_coro_set_waiting_io(ptr, i64, ptr)"));
+    assert!(ir.contains("declare i64 @ifa_rt_reactor_poll(i32)"));
+
+    // 3. Verify inlined LLVM coroutine helpers for io_uring and IOCP
+    assert!(ir.contains("define linkonce_odr i64 @ifa_coro_llvm_io_uring_read("));
+    assert!(ir.contains("define linkonce_odr i64 @ifa_coro_llvm_io_uring_write("));
+    assert!(ir.contains("define linkonce_odr i64 @ifa_coro_llvm_iocp_read("));
+    assert!(ir.contains("define linkonce_odr i64 @ifa_coro_llvm_iocp_write("));
+    assert!(ir.contains("define linkonce_odr void @ifa_coro_llvm_await_io("));
+
+    // 4. Verify native compilation to object with Clang
+    let temp_dir = std::env::temp_dir().join(format!("llvm_coro_io_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("coro_io.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

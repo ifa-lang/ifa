@@ -88,3 +88,201 @@ fn test_global_reactor_ffi_calls() {
     assert!(listen_id >= 1000);
     assert!(GLOBAL_REACTOR.close(listen_id));
 }
+
+#[repr(C)]
+struct CoroIoTestFrame {
+    stage: i32,
+    result_slot: i64,
+    buf: [u8; 32],
+    coro_ptr: *mut ifa_runtime::ffi::IfaCoroutine,
+    fd_read: i32,
+    success: bool,
+}
+
+extern "C" fn coro_io_uring_test_resume(frame_ptr: *mut u8) -> i32 {
+    let frame = unsafe { &mut *(frame_ptr as *mut CoroIoTestFrame) };
+    match frame.stage {
+        0 => {
+            frame.stage = 1;
+            let _token = ifa_runtime::ffi::ifa_rt_coro_register_io_uring_read(
+                frame.coro_ptr,
+                frame.fd_read,
+                frame.buf.as_mut_ptr(),
+                15,
+                0,
+                &mut frame.result_slot,
+            );
+            // Coroutine suspends waiting for io_uring completion
+            ifa_runtime::CoroStatus::WaitingIo as i32
+        }
+        1 => {
+            frame.stage = 2;
+            assert_eq!(frame.result_slot, 15);
+            assert_eq!(&frame.buf[..15], b"ifa_coro_io_ok!");
+            frame.success = true;
+            ifa_runtime::CoroStatus::Completed as i32
+        }
+        _ => ifa_runtime::CoroStatus::Completed as i32,
+    }
+}
+
+#[test]
+fn test_coroutine_io_uring_integration_and_scheduler_wake() {
+    let mut pipe_fds = [0i32; 2];
+    #[cfg(unix)]
+    unsafe {
+        assert_eq!(libc::pipe(pipe_fds.as_mut_ptr()), 0);
+        let msg = b"ifa_coro_io_ok!";
+        assert_eq!(
+            libc::write(pipe_fds[1], msg.as_ptr() as *const libc::c_void, msg.len()),
+            msg.len() as isize
+        );
+    }
+
+    let frame = Box::into_raw(Box::new(CoroIoTestFrame {
+        stage: 0,
+        result_slot: -1,
+        buf: [0u8; 32],
+        coro_ptr: std::ptr::null_mut(),
+        fd_read: pipe_fds[0],
+        success: false,
+    }));
+
+    let coro = ifa_runtime::ffi::ifa_rt_coro_create_custom(
+        frame as *mut u8,
+        coro_io_uring_test_resume,
+        None,
+    );
+    unsafe {
+        (*frame).coro_ptr = coro;
+    }
+
+    // 1. Spawn coroutine directly into global M:N scheduler
+    let fid = ifa_runtime::ffi::ifa_rt_coro_spawn(coro);
+    assert!(fid > 0);
+
+    // 2. Drive reactor: harvest io_uring CQE and wake the waiting coroutine
+    let _ = GLOBAL_REACTOR.poll_and_wake();
+
+    // 3. Wait for fiber to join and complete execution
+    GLOBAL_SCHEDULER.join_timeout(fid, Duration::from_millis(500));
+
+    unsafe {
+        assert!((*frame).success);
+        assert_eq!((*frame).result_slot, 15);
+        let _ = Box::from_raw(frame);
+    }
+    ifa_runtime::ffi::ifa_rt_coro_destroy(coro);
+
+    #[cfg(unix)]
+    unsafe {
+        libc::close(pipe_fds[0]);
+        libc::close(pipe_fds[1]);
+    }
+}
+
+#[repr(C)]
+struct CoroIocpTestFrame {
+    stage: i32,
+    result_slot: i64,
+    buf: [u8; 16],
+    coro_ptr: *mut ifa_runtime::ffi::IfaCoroutine,
+    success: bool,
+}
+
+extern "C" fn coro_iocp_test_resume(frame_ptr: *mut u8) -> i32 {
+    let frame = unsafe { &mut *(frame_ptr as *mut CoroIocpTestFrame) };
+    match frame.stage {
+        0 => {
+            frame.stage = 1;
+            let _token = ifa_runtime::ffi::ifa_rt_coro_register_iocp_write(
+                frame.coro_ptr,
+                100,
+                frame.buf.as_ptr(),
+                16,
+                &mut frame.result_slot,
+            );
+            ifa_runtime::CoroStatus::WaitingIo as i32
+        }
+        1 => {
+            frame.stage = 2;
+            assert_eq!(frame.result_slot, 16);
+            frame.success = true;
+            ifa_runtime::CoroStatus::Completed as i32
+        }
+        _ => ifa_runtime::CoroStatus::Completed as i32,
+    }
+}
+
+#[test]
+fn test_coroutine_iocp_integration_and_scheduler_wake() {
+    let frame = Box::into_raw(Box::new(CoroIocpTestFrame {
+        stage: 0,
+        result_slot: -1,
+        buf: *b"1234567890abcdef",
+        coro_ptr: std::ptr::null_mut(),
+        success: false,
+    }));
+
+    let coro =
+        ifa_runtime::ffi::ifa_rt_coro_create_custom(frame as *mut u8, coro_iocp_test_resume, None);
+    unsafe {
+        (*frame).coro_ptr = coro;
+    }
+
+    let fid = ifa_runtime::ffi::ifa_rt_coro_spawn(coro);
+    assert!(fid > 0);
+
+    // Poll reactor to process IOCP packets and wake coroutine
+    let _ = GLOBAL_REACTOR.poll_and_wake();
+    GLOBAL_SCHEDULER.join_timeout(fid, Duration::from_millis(500));
+
+    unsafe {
+        assert!((*frame).success);
+        assert_eq!((*frame).result_slot, 16);
+        let _ = Box::from_raw(frame);
+    }
+    ifa_runtime::ffi::ifa_rt_coro_destroy(coro);
+}
+
+#[test]
+fn test_concurrent_coroutines_mn_reactor_io() {
+    let mut fids = Vec::new();
+    let mut frames = Vec::new();
+
+    for i in 0..10 {
+        let frame = Box::into_raw(Box::new(CoroIocpTestFrame {
+            stage: 0,
+            result_slot: -1,
+            buf: [i as u8; 16],
+            coro_ptr: std::ptr::null_mut(),
+            success: false,
+        }));
+        let coro = ifa_runtime::ffi::ifa_rt_coro_create_custom(
+            frame as *mut u8,
+            coro_iocp_test_resume,
+            None,
+        );
+        unsafe {
+            (*frame).coro_ptr = coro;
+        }
+        let fid = ifa_runtime::ffi::ifa_rt_coro_spawn(coro);
+        fids.push((fid, coro));
+        frames.push(frame);
+    }
+
+    // Process all completions concurrently
+    GLOBAL_REACTOR.poll_and_wake();
+    for (fid, coro) in fids {
+        GLOBAL_SCHEDULER.join_timeout(fid, Duration::from_millis(500));
+        ifa_runtime::ffi::ifa_rt_coro_destroy(coro);
+    }
+
+    for frame in frames {
+        unsafe {
+            assert!((*frame).success);
+            assert_eq!((*frame).result_slot, 16);
+            let _ = Box::from_raw(frame);
+        }
+    }
+}
