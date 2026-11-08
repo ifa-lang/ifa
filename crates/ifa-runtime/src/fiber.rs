@@ -327,11 +327,11 @@ impl FiberScheduler {
                                 work_notif.notify_one();
                             }
                             FiberStepResult::WaitingIo(token, slot) => {
-                                let early_res = {
-                                    let mut cr = completed_io.lock().unwrap();
-                                    cr.remove(&token)
-                                };
-                                if let Some(res) = early_res {
+                                let mut wm = waiting_io.lock().unwrap();
+                                let mut cr = completed_io.lock().unwrap();
+                                if let Some(res) = cr.remove(&token) {
+                                    drop(cr);
+                                    drop(wm);
                                     if let Some(s) = slot {
                                         if !s.is_null() {
                                             unsafe {
@@ -344,7 +344,7 @@ impl FiberScheduler {
                                     q.push_back(fiber);
                                     work_notif.notify_one();
                                 } else {
-                                    let mut wm = waiting_io.lock().unwrap();
+                                    fiber.state = FiberState::WaitingIo(token);
                                     wm.insert(
                                         token,
                                         IoWaitEntry {
@@ -503,11 +503,11 @@ impl FiberScheduler {
     /// Wake a fiber waiting for the specified asynchronous I/O completion token.
     /// Injects `result` into the fiber's result slot if configured, and reschedules the fiber.
     pub fn wake_io(&self, token: u64, result: i64) -> bool {
-        let entry = {
-            let mut wm = self.waiting_io_fibers.lock().unwrap();
-            wm.remove(&token)
-        };
-        if let Some(mut entry) = entry {
+        let mut wm = self.waiting_io_fibers.lock().unwrap();
+        let mut cr = self.completed_io_results.lock().unwrap();
+        if let Some(mut entry) = wm.remove(&token) {
+            drop(cr);
+            drop(wm);
             if let Some(slot) = entry.result_slot {
                 if !slot.is_null() {
                     unsafe {
@@ -523,7 +523,6 @@ impl FiberScheduler {
             self.work_notifier.notify_one();
             true
         } else {
-            let mut cr = self.completed_io_results.lock().unwrap();
             cr.insert(token, result);
             true
         }
@@ -545,11 +544,11 @@ impl FiberScheduler {
 
     /// Park a fiber directly into the waiting I/O table.
     pub fn park_fiber_for_io(&self, token: u64, mut fiber: Fiber, result_slot: Option<*mut i64>) {
-        let early_res = {
-            let mut cr = self.completed_io_results.lock().unwrap();
-            cr.remove(&token)
-        };
-        if let Some(res) = early_res {
+        let mut wm = self.waiting_io_fibers.lock().unwrap();
+        let mut cr = self.completed_io_results.lock().unwrap();
+        if let Some(res) = cr.remove(&token) {
+            drop(cr);
+            drop(wm);
             if let Some(slot) = result_slot {
                 if !slot.is_null() {
                     unsafe {
@@ -563,7 +562,6 @@ impl FiberScheduler {
             self.work_notifier.notify_one();
         } else {
             fiber.state = FiberState::WaitingIo(token);
-            let mut wm = self.waiting_io_fibers.lock().unwrap();
             wm.insert(token, IoWaitEntry { fiber, result_slot });
         }
     }
@@ -598,11 +596,11 @@ impl FiberScheduler {
                     return true;
                 }
                 FiberStepResult::WaitingIo(token, slot) => {
-                    let early_res = {
-                        let mut cr = self.completed_io_results.lock().unwrap();
-                        cr.remove(&token)
-                    };
-                    if let Some(res) = early_res {
+                    let mut wm = self.waiting_io_fibers.lock().unwrap();
+                    let mut cr = self.completed_io_results.lock().unwrap();
+                    if let Some(res) = cr.remove(&token) {
+                        drop(cr);
+                        drop(wm);
                         if let Some(s) = slot {
                             if !s.is_null() {
                                 unsafe {
@@ -616,7 +614,7 @@ impl FiberScheduler {
                         self.work_notifier.notify_one();
                         return true;
                     }
-                    let mut wm = self.waiting_io_fibers.lock().unwrap();
+                    fiber.state = FiberState::WaitingIo(token);
                     wm.insert(
                         token,
                         IoWaitEntry {
