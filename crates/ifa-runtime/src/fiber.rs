@@ -295,7 +295,10 @@ impl FiberScheduler {
                                     std::hint::spin_loop();
                                     lock = queue.lock().unwrap();
                                 } else {
-                                    lock = work_notif.wait(lock).unwrap();
+                                    let (new_lock, _) = work_notif
+                                        .wait_timeout(lock, Duration::from_millis(5))
+                                        .unwrap();
+                                    lock = new_lock;
                                     spins = 0;
                                 }
                             }
@@ -747,6 +750,11 @@ impl FiberScheduler {
     /// Check if scheduler is running.
     pub fn is_running(&self) -> bool {
         self.is_running.load(Ordering::Acquire)
+    }
+
+    /// Explicitly wake an idle worker thread to service pending tasks or reactor completions.
+    pub fn notify_work(&self) {
+        self.work_notifier.notify_one();
     }
 
     /// Gracefully shutdown all background worker threads and clear pending fibers.

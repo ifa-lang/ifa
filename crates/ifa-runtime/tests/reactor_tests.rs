@@ -280,8 +280,14 @@ fn test_concurrent_coroutines_mn_reactor_io() {
     // Process all completions concurrently
     GLOBAL_REACTOR.poll_and_wake();
     for (fid, coro) in fids {
+        let mut completed = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !completed && std::time::Instant::now() < deadline {
+            GLOBAL_REACTOR.poll_and_wake();
+            completed = GLOBAL_SCHEDULER.join_timeout(fid, Duration::from_millis(50));
+        }
         assert!(
-            GLOBAL_SCHEDULER.join_timeout(fid, Duration::from_secs(15)),
+            completed,
             "Fiber timed out waiting for completion in M:N reactor test"
         );
         ifa_runtime::ffi::ifa_rt_coro_destroy(coro);

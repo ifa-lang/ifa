@@ -94,11 +94,13 @@ impl AsyncReactor {
     /// Submit an asynchronous Windows IOCP read completion event.
     pub fn submit_iocp_read(&self, port_key: usize, _buf: *mut u8, len: u32, token: u64) {
         let _ = self.iocp.post_completion(port_key, len, token, 0);
+        crate::fiber::GLOBAL_SCHEDULER.notify_work();
     }
 
     /// Submit an asynchronous Windows IOCP write completion event.
     pub fn submit_iocp_write(&self, port_key: usize, _buf: *const u8, len: u32, token: u64) {
         let _ = self.iocp.post_completion(port_key, len, token, 0);
+        crate::fiber::GLOBAL_SCHEDULER.notify_work();
     }
 
     /// Poll kernel completion queues (io_uring CQEs & IOCP packets) without blocking,
