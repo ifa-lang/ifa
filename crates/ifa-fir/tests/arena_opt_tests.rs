@@ -1038,3 +1038,325 @@ fn test_interprocedural_streaming_access_barrier_elimination() {
         "consume_buffer's GenCheck must be marked redundant across call boundary"
     );
 }
+
+#[test]
+fn test_intermediate_call_arena_fusion_in_filter_projection_pipeline() {
+    use ifa_fir::{ConstantValue, Instruction};
+
+    let arr_ty = FirType::Array(Box::new(FirType::Int(IntType::I64)), 16);
+    let mut func = FirFunction::new(
+        INTERNER.intern("filter_project_pipeline"),
+        Vec::new(),
+        FirType::Pointer(Box::new(arr_ty.clone())),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let entry_b = func.entry_block;
+    let v_buf1 = func.alloc_value();
+    let v_c0 = func.alloc_value();
+    let v_val = func.alloc_value();
+    let v_buf2 = func.alloc_value();
+    let v_elem = func.alloc_value();
+
+    let bb = func.get_block_mut(entry_b).unwrap();
+    // 1. First stage: allocate intermediate filter buffer in call arena
+    bb.push_instruction(Instruction::new(
+        Some(v_buf1),
+        ValueExpr::CallArenaAlloc { ty: arr_ty.clone() },
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(v_c0),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(v_val),
+        ValueExpr::Constant(ConstantValue::Int(100, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::SetElement {
+            base: v_buf1,
+            index: v_c0,
+            val: v_val,
+        },
+        Span::DUMMY,
+    ));
+
+    // 2. Second stage: allocate second buffer in call arena and project elements from buf1
+    bb.push_instruction(Instruction::new(
+        Some(v_buf2),
+        ValueExpr::CallArenaAlloc { ty: arr_ty.clone() },
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(v_elem),
+        ValueExpr::GetElement {
+            base: v_buf1,
+            index: v_c0,
+        },
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::SetElement {
+            base: v_buf2,
+            index: v_c0,
+            val: v_elem,
+        },
+        Span::DUMMY,
+    ));
+    bb.set_terminator(Terminator::Return(Some(v_buf2)));
+
+    let mut module = FirModule {
+        name: INTERNER.intern("call_arena_pipeline_mod"),
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+        functions: vec![func],
+    };
+
+    let mut pass = ArenaFusionPass::new();
+    let stats = pass.run_on_module(&mut module);
+
+    assert_eq!(
+        stats.call_arenas_fused, 1,
+        "Intermediate CallArenaAlloc must be fused: {:?}",
+        stats
+    );
+
+    let opt_fn = &module.functions[0];
+    let call_alloc_count = opt_fn.blocks[0]
+        .instructions
+        .iter()
+        .filter(|i| matches!(&i.expr, ValueExpr::CallArenaAlloc { .. }))
+        .count();
+
+    assert_eq!(
+        call_alloc_count, 1,
+        "Redundant CallArenaAlloc must be eliminated from pipeline block"
+    );
+    assert_eq!(
+        opt_fn.blocks[0].terminator,
+        Some(Terminator::Return(Some(v_buf1))),
+        "Return must be updated to fused buffer"
+    );
+}
+
+#[test]
+fn test_call_arena_scope_consolidation_and_mark_elimination() {
+    let mut func = FirFunction::new(
+        INTERNER.intern("call_arena_scope_consolidation"),
+        Vec::new(),
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let entry_b = func.entry_block;
+    let m1 = func.alloc_value();
+    let m2 = func.alloc_value();
+    let buf = func.alloc_value();
+
+    let bb = func.get_block_mut(entry_b).unwrap();
+    // Consecutive marks without allocation
+    bb.push_instruction(Instruction::new(
+        Some(m1),
+        ValueExpr::CallArenaMark,
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(m2),
+        ValueExpr::CallArenaMark,
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(buf),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Int(IntType::I64),
+        },
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::CallArenaRewind { mark: m2 },
+        Span::DUMMY,
+    ));
+    bb.set_terminator(Terminator::Return(None));
+
+    let mut module = FirModule {
+        name: INTERNER.intern("call_arena_scope_mod"),
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+        functions: vec![func],
+    };
+
+    let mut pass = ArenaFusionPass::new();
+    let stats = pass.run_on_module(&mut module);
+
+    assert_eq!(
+        stats.call_arena_scopes_coalesced, 1,
+        "Redundant mark must be coalesced: {:?}",
+        stats
+    );
+
+    let opt_fn = &module.functions[0];
+    let mark_count = opt_fn.blocks[0]
+        .instructions
+        .iter()
+        .filter(|i| matches!(&i.expr, ValueExpr::CallArenaMark))
+        .count();
+
+    assert_eq!(mark_count, 1, "Only single canonical mark must remain");
+
+    let rewind_mark = opt_fn.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|i| match &i.expr {
+            ValueExpr::CallArenaRewind { mark } => Some(*mark),
+            _ => None,
+        });
+
+    assert_eq!(
+        rewind_mark,
+        Some(m1),
+        "Rewind must reference canonical m1 mark"
+    );
+}
+
+#[test]
+fn test_multidim_strided_projections_folding() {
+    use ifa_fir::ConstantValue;
+
+    let mut func = FirFunction::new(
+        INTERNER.intern("multidim_stencil_projection"),
+        Vec::new(),
+        FirType::Slice(Box::new(FirType::Int(IntType::I64))),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let entry_b = func.entry_block;
+    let v_base = func.alloc_value();
+    let v_s1_start = func.alloc_value();
+    let v_s1_end = func.alloc_value();
+    let v_s1_stride = func.alloc_value();
+    let v_s1 = func.alloc_value();
+
+    let v_s2_start = func.alloc_value();
+    let v_s2_end = func.alloc_value();
+    let v_s2_stride = func.alloc_value();
+    let v_s2 = func.alloc_value();
+
+    let bb = func.get_block_mut(entry_b).unwrap();
+    // Buffer allocation
+    bb.push_instruction(Instruction::new(
+        Some(v_base),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Array(Box::new(FirType::Int(IntType::I64)), 128),
+        },
+        Span::DUMMY,
+    ));
+
+    // Slice 1: start=4, end=64, stride=2
+    bb.push_instruction(Instruction::new(
+        Some(v_s1_start),
+        ValueExpr::Constant(ConstantValue::Int(4, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(v_s1_end),
+        ValueExpr::Constant(ConstantValue::Int(64, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(v_s1_stride),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(v_s1),
+        ValueExpr::SliceStrided {
+            base: v_base,
+            start: v_s1_start,
+            end: v_s1_end,
+            stride: v_s1_stride,
+        },
+        Span::DUMMY,
+    ));
+
+    // Slice 2 on top of Slice 1: start=3, end=15, stride=2
+    bb.push_instruction(Instruction::new(
+        Some(v_s2_start),
+        ValueExpr::Constant(ConstantValue::Int(3, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(v_s2_end),
+        ValueExpr::Constant(ConstantValue::Int(15, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(v_s2_stride),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb.push_instruction(Instruction::new(
+        Some(v_s2),
+        ValueExpr::SliceStrided {
+            base: v_s1,
+            start: v_s2_start,
+            end: v_s2_end,
+            stride: v_s2_stride,
+        },
+        Span::DUMMY,
+    ));
+
+    bb.set_terminator(Terminator::Return(Some(v_s2)));
+
+    let mut module = FirModule {
+        name: INTERNER.intern("multidim_proj_mod"),
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+        functions: vec![func],
+    };
+
+    let mut pass = ArenaFusionPass::new();
+    let stats = pass.run_on_module(&mut module);
+
+    assert_eq!(
+        stats.multidim_projections_fused, 1,
+        "Multidim projection must be folded: {:?}",
+        stats
+    );
+
+    let opt_fn = &module.functions[0];
+    let folded_slice = opt_fn.blocks[0]
+        .instructions
+        .iter()
+        .find(|i| i.result == Some(v_s2))
+        .unwrap();
+
+    if let ValueExpr::SliceStrided { base, .. } = &folded_slice.expr {
+        assert_eq!(
+            *base, v_base,
+            "Folded slice base must directly reference root buffer"
+        );
+    } else {
+        panic!("Expected SliceStrided instruction: {:?}", folded_slice);
+    }
+}

@@ -28,8 +28,10 @@
 use crate::cfg::ControlFlowGraph;
 use crate::dominance::DominanceTree;
 use crate::ir::*;
+use crate::sroa::SroaPass;
 use crate::types::FirType;
-use ifa_span::Symbol;
+use ifa_sema::types::IntType;
+use ifa_span::{Span, Symbol};
 use std::collections::{HashMap, HashSet};
 
 /// Statistics tracking the generational arena coalescing and access barrier elimination pass.
@@ -53,6 +55,28 @@ pub struct ArenaFusionStats {
     pub interprocedural_fusions: usize,
     /// Total interprocedural redundant access barriers eliminated across call boundaries.
     pub interprocedural_barriers_eliminated: usize,
+    /// Total intermediate call arena allocations (`CallArenaAlloc`) fused or coalesced across filter/projection stages.
+    pub call_arenas_fused: usize,
+    /// Total redundant call arena marks/rewinds eliminated across pipeline boundaries.
+    pub call_arena_scopes_coalesced: usize,
+    /// Total multi-dimensional projection intermediate buffers forwarded and eliminated.
+    pub multidim_projections_fused: usize,
+}
+
+impl ArenaFusionStats {
+    pub fn total_optimizations(&self) -> usize {
+        self.arenas_merged
+            + self.allocations_fused
+            + self.access_barriers_eliminated
+            + self.recursive_projections_verified
+            + self.streaming_arenas_fused
+            + self.zero_copy_pipelines_optimized
+            + self.interprocedural_fusions
+            + self.interprocedural_barriers_eliminated
+            + self.call_arenas_fused
+            + self.call_arena_scopes_coalesced
+            + self.multidim_projections_fused
+    }
 }
 
 /// Context for interprocedural analysis and propagation across call sites.
@@ -252,6 +276,12 @@ impl ArenaFusionPass {
 
         // Step 2: Static Access Barrier Elimination for Recursive & Streaming Structures
         self.eliminate_access_barriers(func, recursive_structs, struct_map, ctx.verified_params);
+
+        // Step 3: Intermediate Call Arena Coalescing & Scope Consolidation
+        self.optimize_call_arenas_in_pipeline(func);
+
+        // Step 4: Multi-dimensional Projection Folding & Strided Stencil Fusion
+        self.optimize_multidim_projections(func);
     }
 
     /// Coalesces allocations of recursive structures and streaming pipelines into unified generational arenas.
@@ -855,6 +885,308 @@ impl ArenaFusionPass {
 
             if self.stats.interprocedural_fusions == before_fusions {
                 break;
+            }
+        }
+    }
+
+    /// Coalesces intermediate call arena allocations (`CallArenaAlloc`) and consolidates redundant `CallArenaMark` / `CallArenaRewind` scopes.
+    fn optimize_call_arenas_in_pipeline(&mut self, func: &mut FirFunction) {
+        // Phase 1: Mark & Rewind scope consolidation
+        let mut mark_replacements: HashMap<ValueId, ValueId> = HashMap::new();
+        let mut redundant_mark_insts: HashSet<ValueId> = HashSet::new();
+
+        for block in &func.blocks {
+            let mut last_mark: Option<ValueId> = None;
+            for inst in &block.instructions {
+                match &inst.expr {
+                    ValueExpr::CallArenaMark => {
+                        if let Some(res) = inst.result {
+                            if let Some(prev) = last_mark {
+                                mark_replacements.insert(res, prev);
+                                redundant_mark_insts.insert(res);
+                                self.stats.call_arena_scopes_coalesced += 1;
+                            } else {
+                                last_mark = Some(res);
+                            }
+                        }
+                    }
+                    ValueExpr::CallArenaAlloc { .. } => {
+                        last_mark = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Apply mark replacements on rewinds and remove redundant mark instructions
+        if !mark_replacements.is_empty() {
+            for block in &mut func.blocks {
+                block.instructions.retain(|i| {
+                    if let Some(r) = i.result {
+                        !redundant_mark_insts.contains(&r)
+                    } else {
+                        true
+                    }
+                });
+                for inst in &mut block.instructions {
+                    if let ValueExpr::CallArenaRewind { mark } = &mut inst.expr {
+                        if let Some(&canon) = mark_replacements.get(mark) {
+                            *mark = canon;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Intermediate CallArenaAlloc buffer coalescing and reuse across filter/projection stages
+        let mut call_allocs: Vec<(BlockId, usize, ValueId, FirType)> = Vec::new();
+        for block in &func.blocks {
+            for (idx, inst) in block.instructions.iter().enumerate() {
+                if let (Some(res), ValueExpr::CallArenaAlloc { ty }) = (inst.result, &inst.expr) {
+                    call_allocs.push((block.id, idx, res, ty.clone()));
+                }
+            }
+        }
+
+        if call_allocs.len() < 2 {
+            return;
+        }
+
+        // Compute uses and defs of all values
+        let mut loads_from: HashMap<ValueId, ValueId> = HashMap::new();
+        let mut stores_to: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+        let mut set_elements: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+        let mut escaped_values: HashSet<ValueId> = HashSet::new();
+
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match &inst.expr {
+                    ValueExpr::Load { ptr } => {
+                        if let Some(res) = inst.result {
+                            loads_from.insert(res, *ptr);
+                        }
+                    }
+                    ValueExpr::GetElement { base, .. } | ValueExpr::GetElementPtr { base, .. } => {
+                        if let Some(res) = inst.result {
+                            loads_from.insert(res, *base);
+                        }
+                    }
+                    ValueExpr::SliceStrided { base, .. } | ValueExpr::SliceSub { base, .. } => {
+                        if let Some(res) = inst.result {
+                            loads_from.insert(res, *base);
+                        }
+                    }
+                    ValueExpr::Store { ptr, val } => {
+                        stores_to.entry(*ptr).or_default().push(*val);
+                    }
+                    ValueExpr::SetElement { base, val, .. } => {
+                        set_elements.entry(*base).or_default().push(*val);
+                    }
+                    ValueExpr::Call { args, .. } | ValueExpr::CallDirect { args, .. } => {
+                        for a in args {
+                            escaped_values.insert(*a);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(term) = &block.terminator {
+                for u in term.uses() {
+                    escaped_values.insert(u);
+                }
+            }
+        }
+
+        let mut fused_buffers: HashMap<ValueId, ValueId> = HashMap::new();
+        let mut eliminated_allocs: HashSet<ValueId> = HashSet::new();
+
+        for i in 0..call_allocs.len() {
+            let (_, _, buf1, _) = call_allocs[i];
+            if eliminated_allocs.contains(&buf1) || escaped_values.contains(&buf1) {
+                continue;
+            }
+
+            for &(_, _, buf2, _) in call_allocs.iter().skip(i + 1) {
+                if eliminated_allocs.contains(&buf2) {
+                    continue;
+                }
+
+                let reads_buf1: HashSet<ValueId> = loads_from
+                    .iter()
+                    .filter(|(_, &base)| base == buf1)
+                    .map(|(&res, _)| res)
+                    .collect();
+
+                let mut buf2_fed_from_buf1 = false;
+                if let Some(stored) = stores_to.get(&buf2) {
+                    if stored.iter().any(|v| reads_buf1.contains(v)) {
+                        buf2_fed_from_buf1 = true;
+                    }
+                }
+                if let Some(elems) = set_elements.get(&buf2) {
+                    if elems.iter().any(|v| reads_buf1.contains(v)) {
+                        buf2_fed_from_buf1 = true;
+                    }
+                }
+
+                if loads_from.get(&buf2) == Some(&buf1) {
+                    buf2_fed_from_buf1 = true;
+                }
+
+                if buf2_fed_from_buf1 {
+                    fused_buffers.insert(buf2, buf1);
+                    eliminated_allocs.insert(buf2);
+                    self.stats.call_arenas_fused += 1;
+                    break;
+                }
+            }
+        }
+
+        if !fused_buffers.is_empty() {
+            for block in &mut func.blocks {
+                block.instructions.retain(|inst| {
+                    if let Some(res) = inst.result {
+                        !eliminated_allocs.contains(&res)
+                    } else {
+                        true
+                    }
+                });
+
+                for inst in &mut block.instructions {
+                    SroaPass::substitute_instruction_operands(inst, &fused_buffers);
+                }
+                if let Some(term) = &mut block.terminator {
+                    SroaPass::substitute_terminator_operands(term, &fused_buffers);
+                }
+            }
+        }
+    }
+
+    /// Folds multi-dimensional projections (`SliceStrided`, `SliceSub`) and collapses intermediate stencil steps.
+    fn optimize_multidim_projections(&mut self, func: &mut FirFunction) {
+        let mut int_constants: HashMap<ValueId, i64> = HashMap::new();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let (Some(res), ValueExpr::Constant(ConstantValue::Int(v, _))) =
+                    (inst.result, &inst.expr)
+                {
+                    int_constants.insert(res, *v as i64);
+                }
+            }
+        }
+
+        // res -> (base, start_val, end_val, stride_val)
+        let mut strided_projections: HashMap<ValueId, (ValueId, i64, i64, i64)> = HashMap::new();
+
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Some(res) = inst.result {
+                    match &inst.expr {
+                        ValueExpr::SliceStrided {
+                            base,
+                            start,
+                            end,
+                            stride,
+                        } => {
+                            if let (Some(&s_val), Some(&e_val), Some(&strd_val)) = (
+                                int_constants.get(start),
+                                int_constants.get(end),
+                                int_constants.get(stride),
+                            ) {
+                                strided_projections.insert(res, (*base, s_val, e_val, strd_val));
+                            }
+                        }
+                        ValueExpr::SliceSub { base, start, end } => {
+                            if let (Some(&s_val), Some(&e_val)) =
+                                (int_constants.get(start), int_constants.get(end))
+                            {
+                                strided_projections.insert(res, (*base, s_val, e_val, 1));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Search for chained projections: SliceStrided / SliceSub on top of an existing SliceStrided
+        let mut folded_projections: HashMap<ValueId, (ValueId, i64, i64, i64)> = HashMap::new();
+        for (&res, &(parent_base, parent_start, parent_end, parent_stride)) in &strided_projections
+        {
+            if let Some(&(grand_base, grand_start, _grand_end, grand_stride)) =
+                strided_projections.get(&parent_base)
+            {
+                let combined_stride = grand_stride * parent_stride;
+                let combined_start = grand_start + parent_start * grand_stride;
+                let parent_len = (parent_end - parent_start).max(0);
+                let combined_end = combined_start + parent_len * grand_stride;
+                folded_projections.insert(
+                    res,
+                    (grand_base, combined_start, combined_end, combined_stride),
+                );
+            }
+        }
+
+        if folded_projections.is_empty() {
+            return;
+        }
+
+        let entry_b = func.entry_block;
+        let mut new_const_insts = Vec::new();
+        let mut resolved_const_ids: HashMap<i64, ValueId> = HashMap::new();
+
+        // Pre-allocate and emit all necessary constant values at entry to guarantee dominance
+        for &(_, comb_start, comb_end, comb_stride) in folded_projections.values() {
+            for &c_val in &[comb_start, comb_end, comb_stride] {
+                if resolved_const_ids.contains_key(&c_val) {
+                    continue;
+                }
+                let vid = func.alloc_value();
+                resolved_const_ids.insert(c_val, vid);
+                new_const_insts.push(Instruction::new(
+                    Some(vid),
+                    ValueExpr::Constant(ConstantValue::Int(c_val as i128, IntType::I64)),
+                    Span::DUMMY,
+                ));
+            }
+        }
+
+        for block in &mut func.blocks {
+            for inst in &mut block.instructions {
+                if let Some(res) = inst.result {
+                    if let Some(&(root_base, comb_start, comb_end, comb_stride)) =
+                        folded_projections.get(&res)
+                    {
+                        let v_start = resolved_const_ids[&comb_start];
+                        let v_end = resolved_const_ids[&comb_end];
+
+                        if comb_stride == 1 {
+                            inst.expr = ValueExpr::SliceSub {
+                                base: root_base,
+                                start: v_start,
+                                end: v_end,
+                            };
+                        } else {
+                            let v_stride = resolved_const_ids[&comb_stride];
+                            inst.expr = ValueExpr::SliceStrided {
+                                base: root_base,
+                                start: v_start,
+                                end: v_end,
+                                stride: v_stride,
+                            };
+                        }
+                        self.stats.multidim_projections_fused += 1;
+                    }
+                }
+            }
+        }
+
+        if !new_const_insts.is_empty() {
+            if let Some(entry) = func.get_block_mut(entry_b) {
+                // Prepend all new constants at the very start of entry block
+                for (idx, inst) in new_const_insts.into_iter().enumerate() {
+                    entry.instructions.insert(idx, inst);
+                }
             }
         }
     }

@@ -167,6 +167,9 @@ impl LoopOptPass {
                                     ValueExpr::GenAlloc { arena, .. } if arena.is_some() => {
                                         local_arena = true;
                                     }
+                                    ValueExpr::CallArenaAlloc { .. } => {
+                                        local_arena = true;
+                                    }
                                     _ => {}
                                 }
                             }
