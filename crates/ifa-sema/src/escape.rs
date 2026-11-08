@@ -162,11 +162,20 @@ pub struct VarEscapeInfo {
     pub contained_refs: Vec<ContainedRef>,
 }
 
+/// Nature of an access performed within a concurrent fiber or borrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrentAccessKind {
+    Read,
+    Write,
+    Sink,
+}
+
 /// An access to a structured path performed within a concurrent fiber (`spawn`).
 #[derive(Debug, Clone)]
 pub struct ConcurrentAccess {
     pub path: AccessPath,
     pub is_write: bool,
+    pub kind: ConcurrentAccessKind,
     pub spawn_id: usize,
     pub span: Span,
 }
@@ -243,18 +252,18 @@ impl<'a> EscapeAnalyzer<'a> {
         }
     }
 
-    /// Determines whether the method receiver is passed by `inout`.
-    fn is_method_receiver_inout(&self, receiver: &Expr, method: Symbol, span: Span) -> bool {
+    /// Determines the parameter passing mode for a method receiver.
+    fn method_receiver_mode(&self, receiver: &Expr, method: Symbol, span: Span) -> ParamMode {
         if let Some(&resolved) = self.symbols.method_resolutions.get(&span) {
             if let Some(fn_sym) = self.symbols.lookup_function(&resolved) {
                 if let Some(first_p) = fn_sym.params.first() {
-                    return first_p.mode == ParamMode::InOut;
+                    return first_p.mode;
                 }
             }
         }
         if let Some(fn_sym) = self.symbols.lookup_function(&method) {
             if let Some(first_p) = fn_sym.params.first() {
-                return first_p.mode == ParamMode::InOut;
+                return first_p.mode;
             }
         }
         if let Some((root_sym, _)) = extract_escape_root(receiver) {
@@ -266,22 +275,48 @@ impl<'a> EscapeAnalyzer<'a> {
                 if let Some(t_sym) = type_sym {
                     if let Some(fn_sym) = self.symbols.lookup_type_method(&t_sym, &method) {
                         if let Some(first_p) = fn_sym.params.first() {
-                            return first_p.mode == ParamMode::InOut;
+                            return first_p.mode;
                         }
                     }
                 }
             }
         }
-        false
+        ParamMode::In
     }
 
-    /// Checks and records an `inout` borrow within a `spawn` fiber,
-    /// permitting provably disjoint slice or field projections across concurrent fibers.
-    fn check_concurrent_inout(&mut self, inner: &Expr, arg_span: Span) -> bool {
+    /// Determines whether the method receiver is passed by `inout`.
+    #[allow(dead_code)]
+    pub(crate) fn is_method_receiver_inout(
+        &self,
+        receiver: &Expr,
+        method: Symbol,
+        span: Span,
+    ) -> bool {
+        self.method_receiver_mode(receiver, method, span) == ParamMode::InOut
+    }
+
+    /// Checks and records an access (`inout`, `ref`, or `sink`) within a `spawn` fiber,
+    /// permitting provably disjoint slice or field projections across concurrent fibers
+    /// while statically detecting and blocking all overlapping data races.
+    fn check_concurrent_arg(
+        &mut self,
+        inner: &Expr,
+        arg_span: Span,
+        kind: ConcurrentAccessKind,
+    ) -> bool {
         let cur_spawn = match self.current_spawn_id {
             Some(id) => id,
             None => return true,
         };
+
+        if self
+            .concurrent_accesses
+            .iter()
+            .any(|a| a.span == arg_span && a.spawn_id == cur_spawn)
+        {
+            return true;
+        }
+
         if let Some((root_sym, root_span)) = extract_escape_root(inner) {
             if self.var_info.contains_key(&root_sym) {
                 let var_name = INTERNER.resolve(&root_sym);
@@ -290,7 +325,7 @@ impl<'a> EscapeAnalyzer<'a> {
                         matches!(seg, PathSegment::SliceConst { .. } | PathSegment::Field(_))
                     });
 
-                    if !has_slice_or_field {
+                    if kind == ConcurrentAccessKind::Write && !has_slice_or_field {
                         let is_projection = !matches!(&inner.kind, ExprKind::Ident(_));
                         let inner_repr = format_projection_expr(inner);
 
@@ -330,24 +365,70 @@ impl<'a> EscapeAnalyzer<'a> {
 
                     for other in &self.concurrent_accesses {
                         if other.spawn_id != cur_spawn && other.path.overlaps(&path) {
-                            self.diagnostics.push(
-                                Diagnostic::error(format!(
-                                    "mutation concurrente interdite : l'argument 'inout' sur la projection '{}' dans une fibre 'spawn' chevauche l'accès concurrent sur '{}' dans une autre fibre (data race statique)",
-                                    path.display, other.path.display
-                                ))
-                                .with_code("E0025")
-                                .with_primary_label(arg_span, format!("passage inout en conflit sur '{}'", path.display))
-                                .with_secondary_label(other.span, format!("accès concurrent actif ici sur '{}'", other.path.display))
-                                .with_note("Deux fibres concurrentes ne peuvent pas emprunter simultanément des projections mémoires chevauchantes.")
-                                .with_help("Partitionnez vos tranches de façon strictement disjointe (ex: '[0..3]' et '[3..6]') ou utilisez un 'Channel'."),
+                            let conflict = !matches!(
+                                (kind, other.kind),
+                                (ConcurrentAccessKind::Read, ConcurrentAccessKind::Read)
                             );
-                            return false;
+
+                            if conflict {
+                                let (err_msg, primary_lbl, secondary_lbl, help_msg) =
+                                    match (kind, other.kind) {
+                                        (ConcurrentAccessKind::Write, ConcurrentAccessKind::Write) => (
+                                            format!(
+                                                "mutation concurrente interdite : l'argument 'inout' sur la projection '{}' dans une fibre 'spawn' chevauche l'accès concurrent sur '{}' dans une autre fibre (data race statique)",
+                                                path.display, other.path.display
+                                            ),
+                                            format!("passage inout en conflit sur '{}'", path.display),
+                                            format!("accès concurrent actif ici sur '{}'", other.path.display),
+                                            "Partitionnez vos tranches de façon strictement disjointe (ex: '[0..3]' et '[3..6]') ou utilisez un 'Channel'."
+                                        ),
+                                        (ConcurrentAccessKind::Write, ConcurrentAccessKind::Read) => (
+                                            format!(
+                                                "conflit d'accès concurrent : la mutation 'inout' sur la projection '{}' dans une fibre 'spawn' chevauche la lecture concurrente ('ref') sur '{}' dans une autre fibre (data race statique)",
+                                                path.display, other.path.display
+                                            ),
+                                            format!("mutation inout en conflit avec la lecture concurrente sur '{}'", path.display),
+                                            format!("lecture concurrente active ici sur '{}'", other.path.display),
+                                            "Synchronisez l'accès via un canal 'Channel' ou séparez les champs accédés de façon disjointe."
+                                        ),
+                                        (ConcurrentAccessKind::Read, ConcurrentAccessKind::Write) => (
+                                            format!(
+                                                "conflit d'accès concurrent : la référence de lecture ('ref') sur la projection '{}' dans une fibre 'spawn' chevauche la mutation concurrente ('inout') sur '{}' dans une autre fibre (data race statique)",
+                                                path.display, other.path.display
+                                            ),
+                                            format!("lecture 'ref' en conflit avec la mutation concurrente sur '{}'", path.display),
+                                            format!("mutation concurrente active ici sur '{}'", other.path.display),
+                                            "Synchronisez l'accès via un canal 'Channel' ou séparez les champs accédés de façon disjointe."
+                                        ),
+                                        (ConcurrentAccessKind::Sink, _) | (_, ConcurrentAccessKind::Sink) => (
+                                            format!(
+                                                "transfert concurrent interdit : le transfert de propriété ('sink') sur la projection '{}' dans une fibre 'spawn' chevauche l'accès concurrent sur '{}' dans une autre fibre",
+                                                path.display, other.path.display
+                                            ),
+                                            format!("transfert 'sink' en conflit sur '{}'", path.display),
+                                            format!("accès concurrent actif ici sur '{}'", other.path.display),
+                                            "Une valeur transférée par 'sink' ne peut être accédée simultanément par une autre fibre."
+                                        ),
+                                        _ => unreachable!(),
+                                    };
+
+                                self.diagnostics.push(
+                                    Diagnostic::error(err_msg)
+                                        .with_code("E0025")
+                                        .with_primary_label(arg_span, primary_lbl)
+                                        .with_secondary_label(other.span, secondary_lbl)
+                                        .with_note("Deux fibres concurrentes ne peuvent pas emprunter simultanément des projections mémoires chevauchantes.")
+                                        .with_help(help_msg),
+                                );
+                                return false;
+                            }
                         }
                     }
 
                     self.concurrent_accesses.push(ConcurrentAccess {
                         path,
-                        is_write: true,
+                        is_write: kind == ConcurrentAccessKind::Write,
+                        kind,
                         spawn_id: cur_spawn,
                         span: arg_span,
                     });
@@ -356,6 +437,12 @@ impl<'a> EscapeAnalyzer<'a> {
             }
         }
         true
+    }
+
+    /// Checks and records an `inout` borrow within a `spawn` fiber.
+    #[allow(dead_code)]
+    pub(crate) fn check_concurrent_inout(&mut self, inner: &Expr, arg_span: Span) -> bool {
+        self.check_concurrent_arg(inner, arg_span, ConcurrentAccessKind::Write)
     }
 
     /// Recursively collects reference targets embedded in an expression.
@@ -762,8 +849,31 @@ impl<'a> EscapeAnalyzer<'a> {
                             }
                         }
                     }
+                    self.check_concurrent_arg(inner, expr.span, ConcurrentAccessKind::Read);
                 }
                 self.handle_ref_creation(inner, expr.span);
+                self.check_expr(inner);
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Sink,
+                expr: inner,
+            } => {
+                if self.spawn_depth > 0 {
+                    self.check_concurrent_arg(inner, expr.span, ConcurrentAccessKind::Sink);
+                }
+                self.check_expr(inner);
+            }
+            ExprKind::Unary {
+                op: UnaryOp::InOut,
+                expr: inner,
+            } => {
+                if self.spawn_depth > 0 {
+                    self.check_concurrent_arg(inner, expr.span, ConcurrentAccessKind::Write);
+                }
+                self.check_expr(inner);
+            }
+            ExprKind::Unary { expr: inner, .. } => {
+                self.check_expr(inner);
             }
             ExprKind::Call { callee, args } => {
                 self.check_expr(callee);
@@ -789,12 +899,38 @@ impl<'a> EscapeAnalyzer<'a> {
                             }
                         }
 
-                        if let ExprKind::Unary {
-                            op: UnaryOp::InOut,
-                            expr: inner,
-                        } = &arg.value.kind
-                        {
-                            self.check_concurrent_inout(inner, arg.value.span);
+                        match &arg.value.kind {
+                            ExprKind::Unary {
+                                op: UnaryOp::InOut,
+                                expr: inner,
+                            } => {
+                                self.check_concurrent_arg(
+                                    inner,
+                                    arg.value.span,
+                                    ConcurrentAccessKind::Write,
+                                );
+                            }
+                            ExprKind::Unary {
+                                op: UnaryOp::Sink,
+                                expr: inner,
+                            } => {
+                                self.check_concurrent_arg(
+                                    inner,
+                                    arg.value.span,
+                                    ConcurrentAccessKind::Sink,
+                                );
+                            }
+                            ExprKind::Unary {
+                                op: UnaryOp::Ref,
+                                expr: inner,
+                            } => {
+                                self.check_concurrent_arg(
+                                    inner,
+                                    arg.value.span,
+                                    ConcurrentAccessKind::Read,
+                                );
+                            }
+                            _ => {}
                         }
                     }
                     self.check_expr(&arg.value);
@@ -806,10 +942,21 @@ impl<'a> EscapeAnalyzer<'a> {
                 args,
                 ..
             } => {
-                if self.spawn_depth > 0
-                    && self.is_method_receiver_inout(receiver, *method, expr.span)
-                {
-                    self.check_concurrent_inout(receiver, receiver.span);
+                if self.spawn_depth > 0 {
+                    let rx_mode = self.method_receiver_mode(receiver, *method, expr.span);
+                    if rx_mode == ParamMode::InOut {
+                        self.check_concurrent_arg(
+                            receiver,
+                            receiver.span,
+                            ConcurrentAccessKind::Write,
+                        );
+                    } else if rx_mode == ParamMode::Sink {
+                        self.check_concurrent_arg(
+                            receiver,
+                            receiver.span,
+                            ConcurrentAccessKind::Sink,
+                        );
+                    }
                 }
                 self.check_expr(receiver);
                 for arg in args {
@@ -833,12 +980,38 @@ impl<'a> EscapeAnalyzer<'a> {
                             }
                         }
 
-                        if let ExprKind::Unary {
-                            op: UnaryOp::InOut,
-                            expr: inner,
-                        } = &arg.value.kind
-                        {
-                            self.check_concurrent_inout(inner, arg.value.span);
+                        match &arg.value.kind {
+                            ExprKind::Unary {
+                                op: UnaryOp::InOut,
+                                expr: inner,
+                            } => {
+                                self.check_concurrent_arg(
+                                    inner,
+                                    arg.value.span,
+                                    ConcurrentAccessKind::Write,
+                                );
+                            }
+                            ExprKind::Unary {
+                                op: UnaryOp::Sink,
+                                expr: inner,
+                            } => {
+                                self.check_concurrent_arg(
+                                    inner,
+                                    arg.value.span,
+                                    ConcurrentAccessKind::Sink,
+                                );
+                            }
+                            ExprKind::Unary {
+                                op: UnaryOp::Ref,
+                                expr: inner,
+                            } => {
+                                self.check_concurrent_arg(
+                                    inner,
+                                    arg.value.span,
+                                    ConcurrentAccessKind::Read,
+                                );
+                            }
+                            _ => {}
                         }
                     }
                     self.check_expr(&arg.value);

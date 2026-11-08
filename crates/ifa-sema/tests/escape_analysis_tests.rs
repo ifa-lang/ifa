@@ -15,7 +15,7 @@ pub fn escape_local() -> ref i64 {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("escape.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -36,7 +36,7 @@ pub strict fn compute(x: i64) -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("strict_ref.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -66,7 +66,7 @@ pub strict fn make_cycle() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("cycle_strict.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -90,7 +90,7 @@ pub fn spawn_race() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("spawn_race.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -118,7 +118,7 @@ pub fn spawn_inout() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("spawn_inout.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -147,7 +147,7 @@ pub fn spawn_read() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("spawn_read.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(!analysis.has_errors());
@@ -174,7 +174,7 @@ pub fn make_transitive_cycle() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("transitive_cycle.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(!analysis.has_errors());
@@ -197,7 +197,7 @@ pub fn leak_field() -> ref i64 {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("leak_field.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -225,7 +225,7 @@ pub fn leak_container() -> Container<ref i64> {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("leak_container.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -253,7 +253,7 @@ pub fn leak_projection_val() -> ref i64 {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("leak_proj_val.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -275,7 +275,7 @@ pub fn leak_array_elem() -> ref i64 {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("leak_arr.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -301,7 +301,7 @@ pub strict fn strict_container() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("strict_box.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -327,7 +327,7 @@ pub strict fn compute_box() -> i64 {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("compute_box.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(!analysis.has_errors());
@@ -352,7 +352,7 @@ pub fn spawn_field_race() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("spawn_field_race.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -376,7 +376,7 @@ pub fn spawn_arr_race() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("spawn_arr_race.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -401,7 +401,7 @@ pub fn return_param_ref(in c: Container<i64>) -> ref i64 {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("return_param_ref.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -434,7 +434,7 @@ pub fn leak_nested() -> Pair<Box<ref i64>, i64> {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("leak_nested.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -463,7 +463,7 @@ pub strict fn make_generic_cycle() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("generic_cycle_strict.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -490,7 +490,7 @@ pub strict fn process_strict() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("strict_pattern_ref.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -522,7 +522,7 @@ pub fn leak_pattern_ref() -> ref i64 {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("leak_pattern_ref.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -555,7 +555,7 @@ pub fn spawn_pattern_ref() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("spawn_pattern_ref.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -580,7 +580,7 @@ pub strict fn format_error_code(code: i64) -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("strict_interp.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -605,7 +605,7 @@ pub strict fn concat_strings() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("strict_concat.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -632,7 +632,7 @@ pub strict fn run_concurrent_task() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("strict_spawn.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -657,7 +657,7 @@ pub strict fn run_dynamic_list() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("strict_list.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -682,7 +682,7 @@ pub strict fn get_dynamic_name() -> String {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("strict_ret_string.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(analysis.has_errors());
@@ -717,7 +717,7 @@ pub fn spawn_disjoint_slices() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("disjoint_spawns.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(
@@ -748,7 +748,7 @@ pub fn spawn_overlapping_slices() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("overlapping_spawns.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(
@@ -791,7 +791,7 @@ pub fn spawn_disjoint_fields() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("disjoint_field_spawns.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(
@@ -827,7 +827,7 @@ pub fn spawn_overlapping_fields() -> () {
     let mut sm = SourceMap::new();
     let fid = sm.add_file("overlapping_field_spawns.ifa".to_string(), src);
     let (prog, parse_diags) = parse(fid, tokenize(fid, src));
-    assert!(parse_diags.is_empty());
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
 
     let analysis = analyze(&sm, &prog);
     assert!(
@@ -840,6 +840,256 @@ pub fn spawn_overlapping_fields() -> () {
             .iter()
             .any(|d| d.code.as_deref() == Some("E0025")),
         "Expected E0025 for overlapping field spawns: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_concurrent_read_write_field_spawns_conflict() {
+    let src = r#"
+struct Node {
+    lhs: i64,
+    rhs: i64,
+}
+
+fn mutate_field(inout f: i64) -> () {
+    f = f + 1
+}
+
+fn inspect_field(f: ref i64) -> i64 {
+    let _ = f
+    42
+}
+
+pub fn spawn_rw_conflict() -> () {
+    mut node = Node(lhs: 10, rhs: 20)
+    spawn {
+        mutate_field(inout node.lhs)
+    }
+    spawn {
+        let _ = inspect_field(ref node.lhs)
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("rw_conflict.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Concurrent read-write on same struct field must trigger E0025"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0025")),
+        "Expected E0025 for read-write conflict on same field: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_concurrent_disjoint_field_read_write_spawns_allowed() {
+    let src = r#"
+struct Node {
+    lhs: i64,
+    rhs: i64,
+}
+
+fn mutate_field(inout f: i64) -> () {
+    f = f + 1
+}
+
+fn inspect_field(f: ref i64) -> i64 {
+    let _ = f
+    42
+}
+
+pub fn spawn_rw_disjoint() -> () {
+    mut node = Node(lhs: 10, rhs: 20)
+    spawn {
+        mutate_field(inout node.lhs)
+    }
+    spawn {
+        let _ = inspect_field(ref node.rhs)
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("rw_disjoint.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Concurrent read and write on provably disjoint struct fields must be allowed: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_concurrent_multi_reader_field_spawns_allowed() {
+    let src = r#"
+struct Node {
+    lhs: i64,
+    rhs: i64,
+}
+
+fn inspect_field(f: ref i64) -> i64 {
+    let _ = f
+    42
+}
+
+pub fn spawn_multi_readers() -> () {
+    let node = Node(lhs: 10, rhs: 20)
+    spawn {
+        let _ = inspect_field(ref node.lhs)
+    }
+    spawn {
+        let _ = inspect_field(ref node.lhs)
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("multi_readers.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Concurrent multiple readers on the same field must be allowed without race: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_concurrent_sink_conflict_spawns_rejected() {
+    let src = r#"
+struct Node {
+    lhs: i64,
+    rhs: i64,
+}
+
+fn consume_field(sink f: i64) -> () {
+    let _ = f
+}
+
+fn mutate_field(inout f: i64) -> () {
+    f = f + 1
+}
+
+pub fn spawn_sink_conflict() -> () {
+    mut node = Node(lhs: 10, rhs: 20)
+    spawn {
+        consume_field(sink node.lhs)
+    }
+    spawn {
+        mutate_field(inout node.lhs)
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("sink_conflict.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Concurrent sink and write on same struct field must trigger E0025"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0025")),
+        "Expected E0025 for sink conflict: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_concurrent_slice_read_write_disjoint_allowed() {
+    let src = r#"
+fn mutate_slice(inout s: Slice<i64>) -> () {
+    s[0] = 42
+}
+
+fn inspect_slice(s: Slice<i64>) -> () {
+    let _ = s[0]
+}
+
+pub fn spawn_slice_disjoint() -> () {
+    mut buf = [1, 2, 3, 4, 5, 6, 7, 8]
+    spawn {
+        inspect_slice(ref buf[0..4])
+    }
+    spawn {
+        mutate_slice(inout buf[4..8])
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("slice_disjoint.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Disjoint slice read-write across concurrent spawns must be allowed: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn test_concurrent_slice_read_write_overlapping_rejected() {
+    let src = r#"
+fn mutate_slice(inout s: Slice<i64>) -> () {
+    s[0] = 42
+}
+
+fn inspect_slice(s: Slice<i64>) -> () {
+    let _ = s[0]
+}
+
+pub fn spawn_slice_overlapping() -> () {
+    mut buf = [1, 2, 3, 4, 5, 6, 7, 8]
+    spawn {
+        inspect_slice(ref buf[2..6])
+    }
+    spawn {
+        mutate_slice(inout buf[4..8])
+    }
+}
+"#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("slice_overlapping.ifa".to_string(), src);
+    let (prog, parse_diags) = parse(fid, tokenize(fid, src));
+    assert!(parse_diags.is_empty(), "parse_diags: {:?}", parse_diags);
+
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        analysis.has_errors(),
+        "Overlapping slice read-write across concurrent spawns must trigger E0025"
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("E0025")),
+        "Expected E0025 for overlapping slice read-write conflict: {:?}",
         analysis.diagnostics
     );
 }
