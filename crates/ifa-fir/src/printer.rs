@@ -436,11 +436,19 @@ impl<'a> FirPrinter<'a> {
             ValueExpr::ChanSelect {
                 channels,
                 has_default,
+                timeout,
+                priorities,
             } => {
                 write!(self.output, "chan.select [")?;
                 for (i, c) in channels.iter().enumerate() {
                     if i > 0 {
                         write!(self.output, ", ")?;
+                    }
+                    if let Some(&prio) = priorities.get(i) {
+                        if prio != 0 {
+                            write!(self.output, "{}:prio({})", c, prio)?;
+                            continue;
+                        }
                     }
                     write!(self.output, "{}", c)?;
                 }
@@ -448,7 +456,11 @@ impl<'a> FirPrinter<'a> {
                     self.output,
                     "]{}",
                     if *has_default { " (default)" } else { "" }
-                )
+                )?;
+                if let Some(t) = timeout {
+                    write!(self.output, " (timeout={})", t)?;
+                }
+                Ok(())
             }
             ValueExpr::EnumInit {
                 enum_name,

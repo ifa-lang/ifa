@@ -93,6 +93,15 @@ impl JitEngine {
             ifa_rt_channel_capacity as *const u8,
         );
         builder.symbol("ifa_rt_channel_select", ifa_rt_channel_select as *const u8);
+        builder.symbol(
+            "ifa_rt_channel_select_prioritized",
+            ifa_rt_channel_select_prioritized as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_channel_select_timed",
+            ifa_rt_channel_select_timed as *const u8,
+        );
+        builder.symbol("ifa_rt_now_ns", ifa_rt_now_ns as *const u8);
         builder.symbol("ifa_rt_string_concat", ifa_rt_string_concat as *const u8);
         builder.symbol(
             "ifa_rt_string_from_i64",
@@ -334,6 +343,26 @@ impl JitEngine {
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids
             .insert("ifa_rt_channel_select".into(), chan_select_id);
+
+        let mut chan_select_timed_sig = Signature::new(call_conv);
+        chan_select_timed_sig.params.push(AbiParam::new(ptr_type));
+        chan_select_timed_sig.params.push(AbiParam::new(ptr_type));
+        chan_select_timed_sig.params.push(AbiParam::new(ptr_type));
+        chan_select_timed_sig.params.push(AbiParam::new(types::I64));
+        chan_select_timed_sig.params.push(AbiParam::new(types::I32));
+        chan_select_timed_sig
+            .returns
+            .push(AbiParam::new(types::I64));
+        let chan_select_timed_id = self
+            .module
+            .declare_function(
+                "ifa_rt_channel_select_timed",
+                Linkage::Import,
+                &chan_select_timed_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_select_timed".into(), chan_select_timed_id);
 
         let mut str_concat_sig = Signature::new(call_conv);
         str_concat_sig.params.push(AbiParam::new(ptr_type));

@@ -2280,19 +2280,32 @@ impl<'a> FirInterpreter<'a> {
             ValueExpr::ChanSelect {
                 channels,
                 has_default,
+                timeout,
+                priorities,
             } => {
+                let mut best_arm: Option<(usize, i32)> = None;
                 for (idx, c) in channels.iter().enumerate() {
                     let cid = match env.get(c) {
                         Some(FirValue::Int(id)) => *id as u64,
                         _ => 0,
                     };
+                    let prio = priorities.get(idx).copied().unwrap_or(0);
                     if let Some(q) = self.channels.get_mut(&cid) {
                         if !q.is_empty() {
-                            return Ok(FirValue::Int(idx as i128));
+                            match best_arm {
+                                None => best_arm = Some((idx, prio)),
+                                Some((_, best_prio)) if prio > best_prio => {
+                                    best_arm = Some((idx, prio));
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
-                if *has_default {
+                if let Some((best_idx, _)) = best_arm {
+                    return Ok(FirValue::Int(best_idx as i128));
+                }
+                if *has_default || timeout.is_some() {
                     Ok(FirValue::Int(channels.len() as i128))
                 } else {
                     Ok(FirValue::Int(0))

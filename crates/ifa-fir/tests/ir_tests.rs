@@ -763,6 +763,8 @@ fn test_fir_channel_select_execution() {
         ValueExpr::ChanSelect {
             channels: vec![v_chan1, v_chan2],
             has_default: false,
+            timeout: None,
+            priorities: vec![0, 0],
         },
         Span::DUMMY,
     ));
@@ -781,6 +783,94 @@ fn test_fir_channel_select_execution() {
     let mut interp = FirInterpreter::new(&module);
     let res = interp.execute_function("select_test", vec![]).unwrap();
     assert_eq!(res, FirValue::Int(100));
+}
+
+#[test]
+fn test_fir_channel_select_priority_and_timeout() {
+    let fn_name = INTERNER.intern("prio_select_test");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let v_c1 = func.alloc_value();
+    let v_c2 = func.alloc_value();
+    let v_val1 = func.alloc_value();
+    let v_val2 = func.alloc_value();
+    let v_sel = func.alloc_value();
+
+    let entry = func.get_block_mut(func.entry_block).unwrap();
+    entry.push_instruction(Instruction::new(
+        Some(v_c1),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+    entry.push_instruction(Instruction::new(
+        Some(v_c2),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+
+    entry.push_instruction(Instruction::new(
+        Some(v_val1),
+        ValueExpr::Constant(ConstantValue::Int(11, IntType::I64)),
+        Span::DUMMY,
+    ));
+    entry.push_instruction(Instruction::new(
+        Some(v_val2),
+        ValueExpr::Constant(ConstantValue::Int(22, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    // Send to both channels
+    entry.push_instruction(Instruction::new(
+        None,
+        ValueExpr::ChanSend {
+            chan: v_c1,
+            val: v_val1,
+        },
+        Span::DUMMY,
+    ));
+    entry.push_instruction(Instruction::new(
+        None,
+        ValueExpr::ChanSend {
+            chan: v_c2,
+            val: v_val2,
+        },
+        Span::DUMMY,
+    ));
+
+    // Select with priorities: c1 has prio 10, c2 has prio 100 -> c2 must win (index 1)
+    entry.push_instruction(Instruction::new(
+        Some(v_sel),
+        ValueExpr::ChanSelect {
+            channels: vec![v_c1, v_c2],
+            has_default: false,
+            timeout: None,
+            priorities: vec![10, 100],
+        },
+        Span::DUMMY,
+    ));
+    entry.set_terminator(Terminator::Return(Some(v_sel)));
+
+    let mut module = FirModule::new(INTERNER.intern("prio_mod"));
+    module.functions.push(func);
+
+    let mut interp = FirInterpreter::new(&module);
+    let res = interp.execute_function("prio_select_test", vec![]).unwrap();
+    assert_eq!(res, FirValue::Int(1)); // Index 1 won due to higher priority
 }
 
 #[test]

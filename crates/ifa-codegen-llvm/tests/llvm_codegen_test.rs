@@ -2393,6 +2393,8 @@ fn test_llvm_coroutine_channel_untyped_and_select_multiplexing() {
         ValueExpr::ChanSelect {
             channels: vec![ch1, ch2],
             has_default: false,
+            timeout: None,
+            priorities: vec![0, 0],
         },
         Span::DUMMY,
     ));
@@ -3677,6 +3679,8 @@ fn test_llvm_channel_select_wait_table_non_coro_and_default() {
         ValueExpr::ChanSelect {
             channels: vec![ch1, ch2],
             has_default: false,
+            timeout: None,
+            priorities: vec![0, 0],
         },
         Span::DUMMY,
     ));
@@ -3688,6 +3692,8 @@ fn test_llvm_channel_select_wait_table_non_coro_and_default() {
         ValueExpr::ChanSelect {
             channels: vec![ch1, ch2],
             has_default: true,
+            timeout: None,
+            priorities: vec![0, 0],
         },
         Span::DUMMY,
     ));
@@ -3706,8 +3712,10 @@ fn test_llvm_channel_select_wait_table_non_coro_and_default() {
     let ir = emitter.emit_module(&module).unwrap();
 
     // Verify zero-allocation wait table struct definitions
-    assert!(ir.contains("%struct.ifa_select_wait_entry = type { ptr, i32, i32, ptr }"));
-    assert!(ir.contains("%struct.ifa_select_wait_table = type { ptr, i64, i32 }"));
+    assert!(
+        ir.contains("%struct.ifa_select_wait_entry = type { ptr, i32, i32, ptr, i32, i32, i64 }")
+    );
+    assert!(ir.contains("%struct.ifa_select_wait_table = type { ptr, i64, i32, i32, i64 }"));
 
     // Verify stack alloca for entry table and wait table descriptor
     assert!(ir.contains("%select_entries_4 = alloca [2 x %struct.ifa_select_wait_entry], align 8"));
@@ -3727,6 +3735,116 @@ fn test_llvm_channel_select_wait_table_non_coro_and_default() {
     assert!(
         compile_res.is_ok(),
         "Native compilation of select wait table module failed: {:?}",
+        compile_res.err()
+    );
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_llvm_channel_select_priority_and_timeout_zero_heap() {
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let fn_name = INTERNER.intern("prio_timed_worker");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+
+    let ch1 = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(ch1),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+
+    let ch2 = ValueId(2);
+    bb0.instructions.push(Instruction::new(
+        Some(ch2),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+
+    let timeout_val = ValueId(3);
+    bb0.instructions.push(Instruction::new(
+        Some(timeout_val),
+        ValueExpr::Constant(ConstantValue::Int(25_000_000, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    // Select with priorities: ch1 has prio 20, ch2 has prio 80, and timeout clause
+    let sel_res = ValueId(4);
+    bb0.instructions.push(Instruction::new(
+        Some(sel_res),
+        ValueExpr::ChanSelect {
+            channels: vec![ch1, ch2],
+            has_default: false,
+            timeout: Some(timeout_val),
+            priorities: vec![20, 80],
+        },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(sel_res)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("prio_timed_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    // Verify 3 entries alloca (2 channels + 1 timeout)
+    assert!(ir.contains("%select_entries_4 = alloca [3 x %struct.ifa_select_wait_entry], align 8"));
+    assert!(ir.contains("%select_table_4 = alloca %struct.ifa_select_wait_table, align 8"));
+
+    // Verify priorities are stored in entry slots
+    assert!(ir.contains("store i32 20, ptr %select_prio_slot_4_0, align 4"));
+    assert!(ir.contains("store i32 80, ptr %select_prio_slot_4_1, align 4"));
+
+    // Verify timeout arm configuration
+    assert!(ir.contains("store i32 2, ptr %select_op_slot_4_2, align 4")); // IFA_SELECT_OP_TIMEOUT
+    assert!(ir.contains("store i64 %v3, ptr %select_timeout_slot_4_2, align 8"));
+
+    // Verify table size and start timestamp initialization
+    assert!(ir.contains("store i64 3, ptr %select_tbl_cnt_4, align 8"));
+    assert!(ir.contains("store i64 -1, ptr %select_tbl_start_4, align 8"));
+
+    // Verify Native Clang compilation
+    let temp_dir = std::env::temp_dir().join(format!("llvm_prio_timed_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("prio_timed.o");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Native Clang compilation of prioritized timed select failed: {:?}",
         compile_res.err()
     );
     let _ = fs::remove_dir_all(&temp_dir);

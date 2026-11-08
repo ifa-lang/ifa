@@ -1373,27 +1373,46 @@ pub extern "C" fn ifa_rt_channel_capacity(chan: *mut IfaChannelHandle) -> i64 {
     handle.0.capacity() as i64
 }
 
+/// Monotonic time base reference for zero-allocation nanosecond clocks.
+static MONOTONIC_BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Return current monotonic timestamp in nanoseconds since runtime initialization.
+#[no_mangle]
+pub extern "C" fn ifa_rt_now_ns() -> u64 {
+    let base = MONOTONIC_BASE.get_or_init(std::time::Instant::now);
+    base.elapsed().as_nanos() as u64
+}
+
 /// Operation mode for a zero-allocation select wait entry.
 pub const IFA_SELECT_OP_RECV: u32 = 0;
 pub const IFA_SELECT_OP_SEND: u32 = 1;
+pub const IFA_SELECT_OP_TIMEOUT: u32 = 2;
+pub const IFA_SELECT_OP_DEADLINE: u32 = 3;
 
 /// Readiness status for a zero-allocation select wait entry.
 pub const IFA_SELECT_STATUS_PENDING: u32 = 0;
 pub const IFA_SELECT_STATUS_READY: u32 = 1;
 pub const IFA_SELECT_STATUS_CLOSED: u32 = 2;
+pub const IFA_SELECT_STATUS_TIMED_OUT: u32 = 3;
 
 /// A single wait entry in a zero-allocation select wait table.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IfaSelectWaitEntry {
-    /// Pointer to the IFA channel handle.
+    /// Pointer to the IFA channel handle (or null for timeout/deadline arm).
     pub chan: *mut IfaChannelHandle,
-    /// Operation to wait for: 0 = RECV, 1 = SEND.
+    /// Operation to wait for: 0 = RECV, 1 = SEND, 2 = TIMEOUT, 3 = DEADLINE.
     pub op: u32,
-    /// Status: 0 = PENDING, 1 = READY, 2 = CLOSED.
+    /// Status: 0 = PENDING, 1 = READY, 2 = CLOSED, 3 = TIMED_OUT.
     pub status: u32,
     /// Payload pointer (transferred value or target buffer).
     pub val: *mut u8,
+    /// Priority weight for deterministic selection (higher value = preferred).
+    pub priority: i32,
+    /// Alignment padding.
+    pub _pad: u32,
+    /// Timeout duration in nanoseconds (or absolute monotonic deadline).
+    pub timeout_ns: u64,
 }
 
 /// A zero-allocation descriptor table representing multiple channel operations to multiplex.
@@ -1406,14 +1425,18 @@ pub struct IfaSelectWaitTable {
     pub count: usize,
     /// Non-zero if a default fallback branch is present.
     pub has_default: i32,
+    /// Alignment padding.
+    pub _pad: i32,
+    /// Start timestamp in nanoseconds recorded at table initialization or first poll (-1 if uninitialized).
+    pub start_ns: i64,
 }
 
-/// Zero-allocation non-blocking multiplexing evaluation of a select wait table.
+/// Zero-allocation non-blocking multiplexing evaluation of a select wait table with priority and timeout.
 ///
 /// Returns:
-/// - index >= 0: the index of the first satisfied entry (marked READY)
+/// - index >= 0: the index of the satisfied entry with highest priority (marked READY)
 /// - table.count: if `has_default != 0` and no entry is ready
-/// - -2: if all monitored channels are closed
+/// - -2: if all monitored channels are closed and no timeout is pending
 /// - -1: if no entry is ready and `has_default == 0` (signals coroutine suspension)
 #[no_mangle]
 pub extern "C" fn ifa_rt_channel_select_table(table: *mut IfaSelectWaitTable) -> i64 {
@@ -1425,25 +1448,36 @@ pub extern "C" fn ifa_rt_channel_select_table(table: *mut IfaSelectWaitTable) ->
         return if t.has_default != 0 { 0 } else { -2 };
     }
 
+    if t.start_ns < 0 {
+        t.start_ns = ifa_rt_now_ns() as i64;
+    }
+    let now_ns = ifa_rt_now_ns() as i64;
+
     let entries = unsafe { std::slice::from_raw_parts_mut(t.entries, t.count) };
     let mut any_open = false;
+    let mut best_ready: Option<(usize, i32)> = None;
 
     for (idx, entry) in entries.iter_mut().enumerate() {
-        if entry.chan.is_null() {
-            continue;
-        }
-        let handle = unsafe { &*entry.chan };
-        let is_closed = handle.0.is_closed();
-
-        if !is_closed {
-            any_open = true;
-        }
-
         match entry.op {
             IFA_SELECT_OP_RECV => {
+                if entry.chan.is_null() {
+                    continue;
+                }
+                let handle = unsafe { &*entry.chan };
+                let is_closed = handle.0.is_closed();
+                if !is_closed {
+                    any_open = true;
+                }
+
                 if !handle.0.is_empty() {
                     entry.status = IFA_SELECT_STATUS_READY;
-                    return idx as i64;
+                    match best_ready {
+                        None => best_ready = Some((idx, entry.priority)),
+                        Some((_, best_prio)) if entry.priority > best_prio => {
+                            best_ready = Some((idx, entry.priority));
+                        }
+                        _ => {}
+                    }
                 } else if is_closed {
                     entry.status = IFA_SELECT_STATUS_CLOSED;
                 } else {
@@ -1451,22 +1485,80 @@ pub extern "C" fn ifa_rt_channel_select_table(table: *mut IfaSelectWaitTable) ->
                 }
             }
             IFA_SELECT_OP_SEND => {
+                if entry.chan.is_null() {
+                    continue;
+                }
+                let handle = unsafe { &*entry.chan };
+                let is_closed = handle.0.is_closed();
+                if !is_closed {
+                    any_open = true;
+                }
+
                 if !handle.0.is_full() && !is_closed {
                     entry.status = IFA_SELECT_STATUS_READY;
-                    return idx as i64;
+                    match best_ready {
+                        None => best_ready = Some((idx, entry.priority)),
+                        Some((_, best_prio)) if entry.priority > best_prio => {
+                            best_ready = Some((idx, entry.priority));
+                        }
+                        _ => {}
+                    }
                 } else if is_closed {
                     entry.status = IFA_SELECT_STATUS_CLOSED;
                 } else {
                     entry.status = IFA_SELECT_STATUS_PENDING;
                 }
             }
-            _ => {
-                if !handle.0.is_empty() {
+            IFA_SELECT_OP_TIMEOUT => {
+                any_open = true;
+                if now_ns - t.start_ns >= entry.timeout_ns as i64 {
                     entry.status = IFA_SELECT_STATUS_READY;
-                    return idx as i64;
+                    match best_ready {
+                        None => best_ready = Some((idx, entry.priority)),
+                        Some((_, best_prio)) if entry.priority > best_prio => {
+                            best_ready = Some((idx, entry.priority));
+                        }
+                        _ => {}
+                    }
+                } else {
+                    entry.status = IFA_SELECT_STATUS_PENDING;
+                }
+            }
+            IFA_SELECT_OP_DEADLINE => {
+                any_open = true;
+                if now_ns >= entry.timeout_ns as i64 {
+                    entry.status = IFA_SELECT_STATUS_READY;
+                    match best_ready {
+                        None => best_ready = Some((idx, entry.priority)),
+                        Some((_, best_prio)) if entry.priority > best_prio => {
+                            best_ready = Some((idx, entry.priority));
+                        }
+                        _ => {}
+                    }
+                } else {
+                    entry.status = IFA_SELECT_STATUS_PENDING;
+                }
+            }
+            _ => {
+                if !entry.chan.is_null() {
+                    let handle = unsafe { &*entry.chan };
+                    if !handle.0.is_empty() {
+                        entry.status = IFA_SELECT_STATUS_READY;
+                        match best_ready {
+                            None => best_ready = Some((idx, entry.priority)),
+                            Some((_, best_prio)) if entry.priority > best_prio => {
+                                best_ready = Some((idx, entry.priority));
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
+    }
+
+    if let Some((best_idx, _)) = best_ready {
+        return best_idx as i64;
     }
 
     if t.has_default != 0 {
@@ -1481,7 +1573,7 @@ pub extern "C" fn ifa_rt_channel_select_table(table: *mut IfaSelectWaitTable) ->
 }
 
 /// Zero-allocation blocking/cooperative multiplexing evaluation of a select wait table.
-/// Cooperatively yields the calling fiber or spins until an entry is satisfied.
+/// Cooperatively yields the calling fiber or spins until an entry is satisfied or timeout elapses.
 #[no_mangle]
 pub extern "C" fn ifa_rt_channel_select_wait_table(table: *mut IfaSelectWaitTable) -> i64 {
     if table.is_null() {
@@ -1505,6 +1597,111 @@ pub extern "C" fn ifa_rt_channel_select_wait_table(table: *mut IfaSelectWaitTabl
     }
 }
 
+/// Non-blocking or cooperative select over channels with priority weights and optional timeout.
+/// If `timeout_ns > 0`, waits at most `timeout_ns` nanoseconds before selecting the timeout branch (index `num_channels`).
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_select_timed(
+    channels: *const *mut IfaChannelHandle,
+    priorities: *const i32,
+    num_channels: usize,
+    timeout_ns: u64,
+    has_default: i32,
+) -> i64 {
+    if (channels.is_null() && timeout_ns == 0) || (num_channels == 0 && timeout_ns == 0) {
+        return if has_default != 0 { 0 } else { -2 };
+    }
+
+    let chan_slice = if !channels.is_null() && num_channels > 0 {
+        unsafe { std::slice::from_raw_parts(channels, num_channels) }
+    } else {
+        &[]
+    };
+    let prio_slice = if !priorities.is_null() && num_channels > 0 {
+        unsafe { std::slice::from_raw_parts(priorities, num_channels) }
+    } else {
+        &[]
+    };
+
+    let total_entries = num_channels + if timeout_ns > 0 { 1 } else { 0 };
+
+    let mut stack_entries = [IfaSelectWaitEntry {
+        chan: std::ptr::null_mut(),
+        op: IFA_SELECT_OP_RECV,
+        status: IFA_SELECT_STATUS_PENDING,
+        val: std::ptr::null_mut(),
+        priority: 0,
+        _pad: 0,
+        timeout_ns: 0,
+    }; 32];
+
+    if total_entries <= 32 {
+        for (idx, &handle_ptr) in chan_slice.iter().enumerate() {
+            stack_entries[idx].chan = handle_ptr;
+            stack_entries[idx].priority = prio_slice.get(idx).copied().unwrap_or(0);
+        }
+        if timeout_ns > 0 {
+            stack_entries[num_channels].chan = std::ptr::null_mut();
+            stack_entries[num_channels].op = IFA_SELECT_OP_TIMEOUT;
+            stack_entries[num_channels].status = IFA_SELECT_STATUS_PENDING;
+            stack_entries[num_channels].val = std::ptr::null_mut();
+            stack_entries[num_channels].priority = i32::MIN;
+            stack_entries[num_channels].timeout_ns = timeout_ns;
+        }
+        let mut table = IfaSelectWaitTable {
+            entries: stack_entries.as_mut_ptr(),
+            count: total_entries,
+            has_default,
+            _pad: 0,
+            start_ns: -1,
+        };
+        ifa_rt_channel_select_wait_table(&mut table)
+    } else {
+        let mut dynamic_entries: Vec<IfaSelectWaitEntry> = chan_slice
+            .iter()
+            .enumerate()
+            .map(|(idx, &ch)| IfaSelectWaitEntry {
+                chan: ch,
+                op: IFA_SELECT_OP_RECV,
+                status: IFA_SELECT_STATUS_PENDING,
+                val: std::ptr::null_mut(),
+                priority: prio_slice.get(idx).copied().unwrap_or(0),
+                _pad: 0,
+                timeout_ns: 0,
+            })
+            .collect();
+        if timeout_ns > 0 {
+            dynamic_entries.push(IfaSelectWaitEntry {
+                chan: std::ptr::null_mut(),
+                op: IFA_SELECT_OP_TIMEOUT,
+                status: IFA_SELECT_STATUS_PENDING,
+                val: std::ptr::null_mut(),
+                priority: i32::MIN,
+                _pad: 0,
+                timeout_ns,
+            });
+        }
+        let mut table = IfaSelectWaitTable {
+            entries: dynamic_entries.as_mut_ptr(),
+            count: total_entries,
+            has_default,
+            _pad: 0,
+            start_ns: -1,
+        };
+        ifa_rt_channel_select_wait_table(&mut table)
+    }
+}
+
+/// Non-blocking or cooperative select over an array of channels with explicit priorities.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_select_prioritized(
+    channels: *const *mut IfaChannelHandle,
+    priorities: *const i32,
+    num_channels: usize,
+    has_default: i32,
+) -> i64 {
+    ifa_rt_channel_select_timed(channels, priorities, num_channels, 0, has_default)
+}
+
 /// Non-blocking or cooperative select over an array of channels.
 ///
 /// Returns:
@@ -1517,45 +1714,7 @@ pub extern "C" fn ifa_rt_channel_select(
     num_channels: usize,
     has_default: i32,
 ) -> i64 {
-    if channels.is_null() || num_channels == 0 {
-        return if has_default != 0 { 0 } else { -2 };
-    }
-
-    let chan_slice = unsafe { std::slice::from_raw_parts(channels, num_channels) };
-    let mut stack_entries = [IfaSelectWaitEntry {
-        chan: std::ptr::null_mut(),
-        op: IFA_SELECT_OP_RECV,
-        status: IFA_SELECT_STATUS_PENDING,
-        val: std::ptr::null_mut(),
-    }; 32];
-
-    if num_channels <= 32 {
-        for (idx, &handle_ptr) in chan_slice.iter().enumerate() {
-            stack_entries[idx].chan = handle_ptr;
-        }
-        let mut table = IfaSelectWaitTable {
-            entries: stack_entries.as_mut_ptr(),
-            count: num_channels,
-            has_default,
-        };
-        ifa_rt_channel_select_wait_table(&mut table)
-    } else {
-        let mut dynamic_entries: Vec<IfaSelectWaitEntry> = chan_slice
-            .iter()
-            .map(|&ch| IfaSelectWaitEntry {
-                chan: ch,
-                op: IFA_SELECT_OP_RECV,
-                status: IFA_SELECT_STATUS_PENDING,
-                val: std::ptr::null_mut(),
-            })
-            .collect();
-        let mut table = IfaSelectWaitTable {
-            entries: dynamic_entries.as_mut_ptr(),
-            count: num_channels,
-            has_default,
-        };
-        ifa_rt_channel_select_wait_table(&mut table)
-    }
+    ifa_rt_channel_select_timed(channels, std::ptr::null(), num_channels, 0, has_default)
 }
 
 /// 1-cycle CPU static and dynamic bounds verification for universal C-ABI foreign buffer access.

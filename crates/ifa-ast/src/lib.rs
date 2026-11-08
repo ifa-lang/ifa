@@ -349,6 +349,8 @@ pub struct SelectArm {
     pub pattern: Option<Pattern>,
     pub channel: Option<Expr>,
     pub is_default: bool,
+    pub timeout: Option<Expr>,
+    pub priority: Option<Expr>,
     pub body: Expr,
     pub span: Span,
 }

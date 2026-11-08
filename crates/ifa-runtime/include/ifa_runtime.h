@@ -295,33 +295,46 @@ int64_t ifa_rt_channel_capacity(ifa_channel_handle_t* chan);
 
 #define IFA_SELECT_OP_RECV 0
 #define IFA_SELECT_OP_SEND 1
+#define IFA_SELECT_OP_TIMEOUT 2
+#define IFA_SELECT_OP_DEADLINE 3
 
 #define IFA_SELECT_STATUS_PENDING 0
 #define IFA_SELECT_STATUS_READY 1
 #define IFA_SELECT_STATUS_CLOSED 2
+#define IFA_SELECT_STATUS_TIMED_OUT 3
 
 /**
- * A single wait entry for zero-allocation multi-channel multiplexing.
+ * Return current monotonic timestamp in nanoseconds since runtime initialization.
+ */
+uint64_t ifa_rt_now_ns(void);
+
+/**
+ * A single wait entry for zero-allocation multi-channel multiplexing with priority and timeout.
  */
 typedef struct ifa_select_wait_entry {
     ifa_channel_handle_t* chan;
     uint32_t op;
     uint32_t status;
     void* val;
+    int32_t priority;
+    uint32_t _pad;
+    uint64_t timeout_ns;
 } ifa_select_wait_entry_t;
 
 /**
- * Zero-allocation select wait table descriptor.
+ * Zero-allocation select wait table descriptor with timeout tracking.
  */
 typedef struct ifa_select_wait_table {
     ifa_select_wait_entry_t* entries;
     size_t count;
     int32_t has_default;
+    int32_t _pad;
+    int64_t start_ns;
 } ifa_select_wait_table_t;
 
 /**
  * Zero-allocation non-blocking multiplexing evaluation of a select wait table.
- * Returns index >= 0 if ready, count if has_default, -2 if closed, -1 if waiting (coroutine suspend).
+ * Returns index >= 0 if ready (highest priority), count if has_default, -2 if closed, -1 if waiting (coroutine suspend).
  */
 int64_t ifa_rt_channel_select_table(ifa_select_wait_table_t* table);
 
@@ -335,6 +348,16 @@ int64_t ifa_rt_channel_select_wait_table(ifa_select_wait_table_t* table);
  * Returns the index of the ready channel, num_channels if has_default and none ready, or -2 if all closed.
  */
 int64_t ifa_rt_channel_select(ifa_channel_handle_t** channels, size_t num_channels, int32_t has_default);
+
+/**
+ * Multiplex multiple channels with priority weights.
+ */
+int64_t ifa_rt_channel_select_prioritized(ifa_channel_handle_t** channels, const int32_t* priorities, size_t num_channels, int32_t has_default);
+
+/**
+ * Multiplex multiple channels with priority weights and timeout duration in nanoseconds.
+ */
+int64_t ifa_rt_channel_select_timed(ifa_channel_handle_t** channels, const int32_t* priorities, size_t num_channels, uint64_t timeout_ns, int32_t has_default);
 
 /* --- Stream I/O API --- */
 

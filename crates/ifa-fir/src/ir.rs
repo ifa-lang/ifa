@@ -303,6 +303,8 @@ pub enum ValueExpr {
     ChanSelect {
         channels: Vec<ValueId>,
         has_default: bool,
+        timeout: Option<ValueId>,
+        priorities: Vec<i32>,
     },
 
     // Algebraic Data Types (Enums / Tagged Unions) Primitives
@@ -390,7 +392,15 @@ impl ValueExpr {
             ValueExpr::ChanRecv { chan }
             | ValueExpr::ChanTryRecv { chan }
             | ValueExpr::ChanClose { chan } => vec![*chan],
-            ValueExpr::ChanSelect { channels, .. } => channels.clone(),
+            ValueExpr::ChanSelect {
+                channels, timeout, ..
+            } => {
+                let mut u = channels.clone();
+                if let Some(t) = timeout {
+                    u.push(*t);
+                }
+                u
+            }
             ValueExpr::EnumInit { payload, .. } => payload.iter().copied().collect(),
             ValueExpr::EnumGetDiscriminant { base } => vec![*base],
             ValueExpr::EnumGetPayload { base, .. } => vec![*base],

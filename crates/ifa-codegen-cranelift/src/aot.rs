@@ -225,6 +225,36 @@ int64_t ifa_rt_channel_select(void** channels, size_t num_channels, int32_t has_
     return -1;
 }
 
+int64_t ifa_rt_channel_select_prioritized(void** channels, const int32_t* priorities, size_t num_channels, int32_t has_default) {
+    if (!channels || num_channels == 0) return has_default ? 0 : -2;
+    int any_open = 0;
+    int64_t best_idx = -1;
+    int32_t best_prio = -2147483647;
+    for (size_t i = 0; i < num_channels; i++) {
+        if (!channels[i]) continue;
+        ifa_channel_sync_t* c = (ifa_channel_sync_t*)channels[i];
+        int32_t prio = priorities ? priorities[i] : 0;
+        if (atomic_load(&c->count) > 0) {
+            if (best_idx == -1 || prio > best_prio) {
+                best_idx = (int64_t)i;
+                best_prio = prio;
+            }
+        }
+        if (atomic_load(&c->state) != IFA_CHAN_STATE_CLOSED) any_open = 1;
+    }
+    if (best_idx != -1) return best_idx;
+    if (has_default) return (int64_t)num_channels;
+    if (!any_open) return -2;
+    return -1;
+}
+
+int64_t ifa_rt_channel_select_timed(void** channels, const int32_t* priorities, size_t num_channels, uint64_t timeout_ns, int32_t has_default) {
+    int64_t res = ifa_rt_channel_select_prioritized(channels, priorities, num_channels, has_default);
+    if (res != -1) return res;
+    if (timeout_ns > 0) return (int64_t)num_channels;
+    return -1;
+}
+
 typedef struct {
     const char* ptr;
     size_t len;
@@ -701,6 +731,42 @@ impl AotCompiler {
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids
             .insert("ifa_rt_channel_select".into(), chan_select_id);
+
+        let mut chan_select_timed_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        chan_select_timed_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_select_timed_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_select_timed_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        chan_select_timed_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        chan_select_timed_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+        chan_select_timed_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        let chan_select_timed_id = self
+            .module
+            .declare_function(
+                "ifa_rt_channel_select_timed",
+                Linkage::Import,
+                &chan_select_timed_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_channel_select_timed".into(), chan_select_timed_id);
 
         let mut str_concat_sig = cranelift_codegen::ir::Signature::new(call_conv);
         str_concat_sig

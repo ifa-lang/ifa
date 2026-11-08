@@ -529,6 +529,8 @@ fn test_cranelift_jit_channel_select_operations() {
         ValueExpr::ChanSelect {
             channels: vec![v_chan1, v_chan2],
             has_default: false,
+            timeout: None,
+            priorities: vec![0, 0],
         },
         Span::DUMMY,
     ));
@@ -544,6 +546,104 @@ fn test_cranelift_jit_channel_select_operations() {
         .expect("Failed to compile select operations to Cranelift");
 
     let result = jit.run_main().expect("Failed to run select JIT");
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn test_cranelift_jit_channel_select_prioritized_execution() {
+    use ifa_fir::{
+        ConstantValue, FirFunction, FirModule, FirType, Instruction, Terminator, ValueExpr,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+
+    let v_ch1 = func.alloc_value();
+    let v_ch2 = func.alloc_value();
+    let v_v1 = func.alloc_value();
+    let v_v2 = func.alloc_value();
+    let v_sel = func.alloc_value();
+
+    let entry = func.get_block_mut(func.entry_block).unwrap();
+    entry.push_instruction(Instruction::new(
+        Some(v_ch1),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+    entry.push_instruction(Instruction::new(
+        Some(v_ch2),
+        ValueExpr::ChanCreate {
+            elem_ty: FirType::Int(IntType::I64),
+            capacity: None,
+        },
+        Span::DUMMY,
+    ));
+
+    entry.push_instruction(Instruction::new(
+        Some(v_v1),
+        ValueExpr::Constant(ConstantValue::Int(111, IntType::I64)),
+        Span::DUMMY,
+    ));
+    entry.push_instruction(Instruction::new(
+        Some(v_v2),
+        ValueExpr::Constant(ConstantValue::Int(222, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    entry.push_instruction(Instruction::new(
+        None,
+        ValueExpr::ChanSend {
+            chan: v_ch1,
+            val: v_v1,
+        },
+        Span::DUMMY,
+    ));
+    entry.push_instruction(Instruction::new(
+        None,
+        ValueExpr::ChanSend {
+            chan: v_ch2,
+            val: v_v2,
+        },
+        Span::DUMMY,
+    ));
+
+    // Channel 1 has prio 10, Channel 2 has prio 90 -> channel 2 must be chosen (index 1)
+    entry.push_instruction(Instruction::new(
+        Some(v_sel),
+        ValueExpr::ChanSelect {
+            channels: vec![v_ch1, v_ch2],
+            has_default: false,
+            timeout: None,
+            priorities: vec![10, 90],
+        },
+        Span::DUMMY,
+    ));
+    entry.set_terminator(Terminator::Return(Some(v_sel)));
+
+    let mut module = FirModule::new(INTERNER.intern("prio_jit_mod"));
+    module.functions.push(func);
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT");
+    jit.compile_module(&module)
+        .expect("Failed to compile prioritized select module");
+
+    let result = jit
+        .run_main()
+        .expect("Failed to run prioritized select JIT");
     assert_eq!(result, 1);
 }
 

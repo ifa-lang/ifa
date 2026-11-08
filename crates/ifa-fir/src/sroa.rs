@@ -1024,9 +1024,14 @@ impl SroaPass {
             | ValueExpr::ChanClose { chan } => {
                 replace(chan);
             }
-            ValueExpr::ChanSelect { channels, .. } => {
+            ValueExpr::ChanSelect {
+                channels, timeout, ..
+            } => {
                 for c in channels {
                     replace(c);
+                }
+                if let Some(t) = timeout {
+                    replace(t);
                 }
             }
             ValueExpr::EnumInit { payload, .. } => {

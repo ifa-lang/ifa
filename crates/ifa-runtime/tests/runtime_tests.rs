@@ -410,12 +410,18 @@ fn test_channel_select_wait_table_zero_allocation() {
             op: IFA_SELECT_OP_RECV,
             status: IFA_SELECT_STATUS_PENDING,
             val: std::ptr::null_mut(),
+            priority: 0,
+            _pad: 0,
+            timeout_ns: 0,
         },
         IfaSelectWaitEntry {
             chan: ch2,
             op: IFA_SELECT_OP_RECV,
             status: IFA_SELECT_STATUS_PENDING,
             val: std::ptr::null_mut(),
+            priority: 0,
+            _pad: 0,
+            timeout_ns: 0,
         },
     ];
 
@@ -424,6 +430,8 @@ fn test_channel_select_wait_table_zero_allocation() {
         entries: entries.as_mut_ptr(),
         count: 2,
         has_default: 0,
+        _pad: 0,
+        start_ns: -1,
     };
     assert_eq!(ifa_rt_channel_select_table(&mut table_no_def), -1);
 
@@ -432,6 +440,8 @@ fn test_channel_select_wait_table_zero_allocation() {
         entries: entries.as_mut_ptr(),
         count: 2,
         has_default: 1,
+        _pad: 0,
+        start_ns: -1,
     };
     assert_eq!(ifa_rt_channel_select_table(&mut table_with_def), 2);
 
@@ -455,11 +465,16 @@ fn test_channel_select_wait_table_zero_allocation() {
         op: IFA_SELECT_OP_SEND,
         status: IFA_SELECT_STATUS_PENDING,
         val: 0x9999 as *mut u8,
+        priority: 0,
+        _pad: 0,
+        timeout_ns: 0,
     }];
     let mut send_table = IfaSelectWaitTable {
         entries: send_entries.as_mut_ptr(),
         count: 1,
         has_default: 0,
+        _pad: 0,
+        start_ns: -1,
     };
     // ch3 is empty so SEND capacity is ready
     assert_eq!(ifa_rt_channel_select_table(&mut send_table), 0);
@@ -473,11 +488,16 @@ fn test_channel_select_wait_table_zero_allocation() {
             op: IFA_SELECT_OP_RECV,
             status: IFA_SELECT_STATUS_PENDING,
             val: std::ptr::null_mut(),
+            priority: 0,
+            _pad: 0,
+            timeout_ns: 0,
         }];
         let mut bg_table = IfaSelectWaitTable {
             entries: bg_entries.as_mut_ptr(),
             count: 1,
             has_default: 0,
+            _pad: 0,
+            start_ns: -1,
         };
         ifa_rt_channel_select_wait_table(&mut bg_table)
     });
@@ -502,18 +522,26 @@ fn test_channel_select_wait_table_zero_allocation() {
             op: IFA_SELECT_OP_RECV,
             status: IFA_SELECT_STATUS_PENDING,
             val: std::ptr::null_mut(),
+            priority: 0,
+            _pad: 0,
+            timeout_ns: 0,
         },
         IfaSelectWaitEntry {
             chan: ch2,
             op: IFA_SELECT_OP_RECV,
             status: IFA_SELECT_STATUS_PENDING,
             val: std::ptr::null_mut(),
+            priority: 0,
+            _pad: 0,
+            timeout_ns: 0,
         },
     ];
     let mut closed_table = IfaSelectWaitTable {
         entries: closed_entries.as_mut_ptr(),
         count: 2,
         has_default: 0,
+        _pad: 0,
+        start_ns: -1,
     };
     assert_eq!(ifa_rt_channel_select_table(&mut closed_table), -2);
     assert_eq!(closed_entries[0].status, IFA_SELECT_STATUS_CLOSED);
@@ -522,6 +550,155 @@ fn test_channel_select_wait_table_zero_allocation() {
     ifa_rt_channel_destroy(ch1);
     ifa_rt_channel_destroy(ch2);
     ifa_rt_channel_destroy(ch3);
+}
+
+#[test]
+fn test_channel_select_priority_arbitration() {
+    use ifa_runtime::ffi::{
+        ifa_rt_channel_create, ifa_rt_channel_destroy, ifa_rt_channel_recv,
+        ifa_rt_channel_select_prioritized, ifa_rt_channel_select_table, ifa_rt_channel_send,
+        IfaSelectWaitEntry, IfaSelectWaitTable, IFA_SELECT_OP_RECV, IFA_SELECT_STATUS_PENDING,
+        IFA_SELECT_STATUS_READY,
+    };
+
+    let ch_low = ifa_rt_channel_create(4);
+    let ch_mid = ifa_rt_channel_create(4);
+    let ch_high = ifa_rt_channel_create(4);
+
+    // Populate messages in both ch_low and ch_high
+    let val_low = 0x1010 as *mut u8;
+    let val_high = 0x9090 as *mut u8;
+    assert_eq!(ifa_rt_channel_send(ch_low, val_low), 0);
+    assert_eq!(ifa_rt_channel_send(ch_high, val_high), 0);
+
+    // Create table with priorities: low=10, mid=50, high=100
+    let mut entries = [
+        IfaSelectWaitEntry {
+            chan: ch_low,
+            op: IFA_SELECT_OP_RECV,
+            status: IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+            priority: 10,
+            _pad: 0,
+            timeout_ns: 0,
+        },
+        IfaSelectWaitEntry {
+            chan: ch_mid,
+            op: IFA_SELECT_OP_RECV,
+            status: IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+            priority: 50,
+            _pad: 0,
+            timeout_ns: 0,
+        },
+        IfaSelectWaitEntry {
+            chan: ch_high,
+            op: IFA_SELECT_OP_RECV,
+            status: IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+            priority: 100,
+            _pad: 0,
+            timeout_ns: 0,
+        },
+    ];
+
+    let mut table = IfaSelectWaitTable {
+        entries: entries.as_mut_ptr(),
+        count: 3,
+        has_default: 0,
+        _pad: 0,
+        start_ns: -1,
+    };
+
+    // Even though ch_low is at index 0, ch_high (index 2, prio 100) must win deterministically!
+    let sel_idx = ifa_rt_channel_select_table(&mut table);
+    assert_eq!(sel_idx, 2);
+    assert_eq!(entries[2].status, IFA_SELECT_STATUS_READY);
+
+    // Consume from ch_high
+    let mut out: *mut u8 = std::ptr::null_mut();
+    assert_eq!(ifa_rt_channel_recv(ch_high, &mut out), 0);
+    assert_eq!(out, val_high);
+
+    // Test C-ABI helper ifa_rt_channel_select_prioritized
+    let channels = [ch_low, ch_mid];
+    let prios = [10, 50];
+    let c_sel = ifa_rt_channel_select_prioritized(channels.as_ptr(), prios.as_ptr(), 2, 0);
+    assert_eq!(c_sel, 0); // ch_low has data
+
+    let mut out_low: *mut u8 = std::ptr::null_mut();
+    assert_eq!(ifa_rt_channel_recv(ch_low, &mut out_low), 0);
+    assert_eq!(out_low, val_low);
+
+    ifa_rt_channel_destroy(ch_low);
+    ifa_rt_channel_destroy(ch_mid);
+    ifa_rt_channel_destroy(ch_high);
+}
+
+#[test]
+fn test_channel_select_timeout_deadline_zero_allocation() {
+    use ifa_runtime::ffi::{
+        ifa_rt_channel_create, ifa_rt_channel_destroy, ifa_rt_channel_select_table,
+        ifa_rt_channel_select_timed, ifa_rt_channel_select_wait_table, IfaSelectWaitEntry,
+        IfaSelectWaitTable, IFA_SELECT_OP_RECV, IFA_SELECT_OP_TIMEOUT, IFA_SELECT_STATUS_PENDING,
+        IFA_SELECT_STATUS_READY,
+    };
+
+    let ch = ifa_rt_channel_create(2);
+
+    // Table with 1 empty channel and a 15ms timeout clause
+    let mut entries = [
+        IfaSelectWaitEntry {
+            chan: ch,
+            op: IFA_SELECT_OP_RECV,
+            status: IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+            priority: 0,
+            _pad: 0,
+            timeout_ns: 0,
+        },
+        IfaSelectWaitEntry {
+            chan: std::ptr::null_mut(),
+            op: IFA_SELECT_OP_TIMEOUT,
+            status: IFA_SELECT_STATUS_PENDING,
+            val: std::ptr::null_mut(),
+            priority: i32::MIN,
+            _pad: 0,
+            timeout_ns: 15_000_000, // 15ms
+        },
+    ];
+
+    let mut table = IfaSelectWaitTable {
+        entries: entries.as_mut_ptr(),
+        count: 2,
+        has_default: 0,
+        _pad: 0,
+        start_ns: -1,
+    };
+
+    // First non-blocking poll: channel empty and timeout not expired -> returns -1
+    let poll_res = ifa_rt_channel_select_table(&mut table);
+    assert_eq!(poll_res, -1);
+    assert_eq!(entries[1].status, IFA_SELECT_STATUS_PENDING);
+
+    // Cooperative wait: must block/yield until timeout expires and return timeout index (1)
+    let wait_res = ifa_rt_channel_select_wait_table(&mut table);
+    assert_eq!(wait_res, 1);
+    assert_eq!(entries[1].status, IFA_SELECT_STATUS_READY);
+
+    // Test C-ABI ifa_rt_channel_select_timed with empty channel and timeout
+    let chan_arr = [ch];
+    let prio_arr = [0];
+    let timed_res = ifa_rt_channel_select_timed(
+        chan_arr.as_ptr(),
+        prio_arr.as_ptr(),
+        1,
+        10_000_000, // 10ms
+        0,
+    );
+    assert_eq!(timed_res, 1); // Timeout arm selected (num_channels = 1)
+
+    ifa_rt_channel_destroy(ch);
 }
 
 #[test]

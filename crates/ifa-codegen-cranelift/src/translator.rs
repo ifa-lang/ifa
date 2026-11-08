@@ -991,15 +991,17 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             ValueExpr::ChanSelect {
                 channels,
                 has_default,
+                timeout,
+                priorities,
             } => {
                 let n = channels.len();
-                let total_size = (n.max(1) * 8) as u32;
-                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                let chan_size = (n.max(1) * 8) as u32;
+                let chan_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
-                    total_size,
+                    chan_size,
                     3,
                 ));
-                let arr_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+                let arr_addr = self.builder.ins().stack_addr(self.ptr_type, chan_slot, 0);
                 for (idx, ch_id) in channels.iter().enumerate() {
                     let ch_val = self.value_map[ch_id];
                     let offset = (idx * 8) as i32;
@@ -1007,12 +1009,45 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                         .ins()
                         .store(MemFlagsData::trusted(), ch_val, arr_addr, offset);
                 }
+
+                let prio_size = (n.max(1) * 4) as u32;
+                let prio_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    prio_size,
+                    2,
+                ));
+                let prio_addr = self.builder.ins().stack_addr(self.ptr_type, prio_slot, 0);
+                for idx in 0..n {
+                    let prio = priorities.get(idx).copied().unwrap_or(0);
+                    let prio_val = self.builder.ins().iconst(types::I32, prio as i64);
+                    let offset = (idx * 4) as i32;
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), prio_val, prio_addr, offset);
+                }
+
                 let n_val = self.builder.ins().iconst(self.ptr_type, n as i64);
                 let def_val = self
                     .builder
                     .ins()
                     .iconst(types::I32, if *has_default { 1 } else { 0 });
-                if let Some(func_id) = self.func_ids.get("ifa_rt_channel_select") {
+                let timeout_val = if let Some(t_id) = timeout {
+                    self.value_map[t_id]
+                } else {
+                    self.builder.ins().iconst(types::I64, 0)
+                };
+
+                if let Some(func_id) = self.func_ids.get("ifa_rt_channel_select_timed") {
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    let call = self.builder.ins().call(
+                        local_func,
+                        &[arr_addr, prio_addr, n_val, timeout_val, def_val],
+                    );
+                    let results = self.builder.inst_results(call);
+                    results.first().copied()
+                } else if let Some(func_id) = self.func_ids.get("ifa_rt_channel_select") {
                     let local_func = self
                         .module
                         .declare_func_in_func(*func_id, self.builder.func);

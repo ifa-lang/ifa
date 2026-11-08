@@ -4724,19 +4724,35 @@ impl<'a> FunctionLoweringContext<'a> {
                 );
 
                 let mut chan_arms = Vec::new();
+                let mut timeout_arm: Option<(&SelectArm, ValueId)> = None;
                 let mut default_arm: Option<&SelectArm> = None;
+                let mut priorities = Vec::new();
 
                 for arm in arms {
+                    let prio = if let Some(p_expr) = &arm.priority {
+                        match &p_expr.kind {
+                            ExprKind::Lit(Lit::Int(s)) => s.as_str().parse().unwrap_or(0),
+                            _ => 0,
+                        }
+                    } else {
+                        0
+                    };
+
                     if arm.is_default {
                         default_arm = Some(arm);
+                    } else if let Some(t_expr) = &arm.timeout {
+                        let t_val = self.lower_expr(t_expr);
+                        timeout_arm = Some((arm, t_val));
                     } else if let Some(chan_expr) = &arm.channel {
                         let chan_val = self.lower_expr(chan_expr);
                         chan_arms.push((arm, chan_val));
+                        priorities.push(prio);
                     }
                 }
 
                 let has_default = default_arm.is_some();
                 let channel_vals: Vec<ValueId> = chan_arms.iter().map(|(_, c)| *c).collect();
+                let timeout_val = timeout_arm.as_ref().map(|(_, t)| *t);
 
                 let select_idx = self.alloc_value();
                 self.emit(
@@ -4744,6 +4760,8 @@ impl<'a> FunctionLoweringContext<'a> {
                     ValueExpr::ChanSelect {
                         channels: channel_vals,
                         has_default,
+                        timeout: timeout_val,
+                        priorities,
                     },
                     span,
                 );
@@ -4824,6 +4842,60 @@ impl<'a> FunctionLoweringContext<'a> {
                             val: arm_res,
                         },
                         arm.span,
+                    );
+                    if let Some(b) = self.func.get_block(self.current_block) {
+                        if !b.is_terminated() {
+                            self.set_terminator(Terminator::Branch {
+                                target: exit_block,
+                                args: Vec::new(),
+                            });
+                        }
+                    }
+                }
+
+                // Timeout arm if present
+                if let Some((t_arm, _)) = timeout_arm {
+                    let cur_check_block = next_arm_check;
+                    let timeout_body_block = self.alloc_block();
+                    next_arm_check = self.alloc_block();
+
+                    self.current_block = cur_check_block;
+                    let timeout_idx_val = self.alloc_value();
+                    self.emit(
+                        Some(timeout_idx_val),
+                        ValueExpr::Constant(ConstantValue::Int(
+                            chan_arms.len() as i128,
+                            IntType::I64,
+                        )),
+                        t_arm.span,
+                    );
+                    let is_timeout_match = self.alloc_value();
+                    self.emit(
+                        Some(is_timeout_match),
+                        ValueExpr::Binary {
+                            op: BinaryOp::Eq,
+                            lhs: select_idx,
+                            rhs: timeout_idx_val,
+                        },
+                        t_arm.span,
+                    );
+                    self.set_terminator(Terminator::BranchCond {
+                        cond: is_timeout_match,
+                        then_block: timeout_body_block,
+                        then_args: Vec::new(),
+                        else_block: next_arm_check,
+                        else_args: Vec::new(),
+                    });
+
+                    self.current_block = timeout_body_block;
+                    let timeout_res = self.lower_expr(&t_arm.body);
+                    self.emit(
+                        None,
+                        ValueExpr::Store {
+                            ptr: res_ptr,
+                            val: timeout_res,
+                        },
+                        t_arm.span,
                     );
                     if let Some(b) = self.func.get_block(self.current_block) {
                         if !b.is_terminated() {

@@ -1757,6 +1757,20 @@ impl Parser {
                 while !self.check(&TokenKind::CloseBrace) && !self.check(&TokenKind::Eof) {
                     let arm_start = self.current().span.start;
 
+                    // Optional priority prefix: priority(10) or prio(10)
+                    let mut arm_prio = None;
+                    if let TokenKind::Ident(s) = self.current().kind {
+                        if (s.as_str() == "priority" || s.as_str() == "prio")
+                            && self.peek().kind == TokenKind::OpenParen
+                        {
+                            self.advance();
+                            self.expect(TokenKind::OpenParen)?;
+                            let prio_expr = self.parse_expr()?;
+                            self.expect(TokenKind::CloseParen)?;
+                            arm_prio = Some(prio_expr);
+                        }
+                    }
+
                     // Optional 'case' keyword
                     if let TokenKind::Ident(s) = self.current().kind {
                         if s.as_str() == "case" {
@@ -1772,9 +1786,84 @@ impl Parser {
                             pattern: None,
                             channel: None,
                             is_default: true,
+                            timeout: None,
+                            priority: arm_prio,
                             body,
                             span: arm_span,
                         });
+                    } else if let TokenKind::Ident(s) = self.current().kind {
+                        if (s.as_str() == "timeout"
+                            || s.as_str() == "after"
+                            || s.as_str() == "deadline")
+                            && self.peek().kind == TokenKind::OpenParen
+                        {
+                            self.advance();
+                            self.expect(TokenKind::OpenParen)?;
+                            let time_expr = self.parse_expr()?;
+                            self.expect(TokenKind::CloseParen)?;
+                            self.expect(TokenKind::FatArrow)?;
+                            let body = self.parse_expr()?;
+                            let arm_span = Span::new(self.file_id, arm_start, body.span.end);
+                            arms.push(SelectArm {
+                                pattern: None,
+                                channel: None,
+                                is_default: false,
+                                timeout: Some(time_expr),
+                                priority: arm_prio,
+                                body,
+                                span: arm_span,
+                            });
+                        } else if self.match_token(&TokenKind::Let) {
+                            let pattern = self.parse_pattern()?;
+                            self.expect(TokenKind::Eq)?;
+                            let channel = self.parse_expr()?;
+                            self.expect(TokenKind::FatArrow)?;
+                            let body = self.parse_expr()?;
+                            let arm_span = Span::new(self.file_id, arm_start, body.span.end);
+                            arms.push(SelectArm {
+                                pattern: Some(pattern),
+                                channel: Some(channel),
+                                is_default: false,
+                                timeout: None,
+                                priority: arm_prio,
+                                body,
+                                span: arm_span,
+                            });
+                        } else {
+                            let expr = self.parse_expr()?;
+                            if self.match_token(&TokenKind::Eq) {
+                                let channel = self.parse_expr()?;
+                                self.expect(TokenKind::FatArrow)?;
+                                let body = self.parse_expr()?;
+                                let arm_span = Span::new(self.file_id, arm_start, body.span.end);
+                                let pat = match expr.kind {
+                                    ExprKind::Ident(sym) => Pattern::Ident(sym, expr.span),
+                                    _ => Pattern::Wildcard(expr.span),
+                                };
+                                arms.push(SelectArm {
+                                    pattern: Some(pat),
+                                    channel: Some(channel),
+                                    is_default: false,
+                                    timeout: None,
+                                    priority: arm_prio,
+                                    body,
+                                    span: arm_span,
+                                });
+                            } else {
+                                self.expect(TokenKind::FatArrow)?;
+                                let body = self.parse_expr()?;
+                                let arm_span = Span::new(self.file_id, arm_start, body.span.end);
+                                arms.push(SelectArm {
+                                    pattern: None,
+                                    channel: Some(expr),
+                                    is_default: false,
+                                    timeout: None,
+                                    priority: arm_prio,
+                                    body,
+                                    span: arm_span,
+                                });
+                            }
+                        }
                     } else if self.match_token(&TokenKind::Let) {
                         let pattern = self.parse_pattern()?;
                         self.expect(TokenKind::Eq)?;
@@ -1786,6 +1875,8 @@ impl Parser {
                             pattern: Some(pattern),
                             channel: Some(channel),
                             is_default: false,
+                            timeout: None,
+                            priority: arm_prio,
                             body,
                             span: arm_span,
                         });
@@ -1804,6 +1895,8 @@ impl Parser {
                                 pattern: Some(pat),
                                 channel: Some(channel),
                                 is_default: false,
+                                timeout: None,
+                                priority: arm_prio,
                                 body,
                                 span: arm_span,
                             });
@@ -1815,6 +1908,8 @@ impl Parser {
                                 pattern: None,
                                 channel: Some(expr),
                                 is_default: false,
+                                timeout: None,
+                                priority: arm_prio,
                                 body,
                                 span: arm_span,
                             });
@@ -3382,6 +3477,47 @@ mod tests {
                 }
             } else {
                 panic!("Expected for loop stmt");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_select_with_priority_and_timeout() {
+        let src = r#"
+            fn worker(ch1: Channel, ch2: Channel) {
+                select {
+                    priority(10) x = ch1 => 1,
+                    priority(50) y = ch2 => 2,
+                    timeout(100) => 3,
+                    default => 4,
+                }
+            }
+        "#;
+        let fid = FileId(0);
+        let tokens = tokenize(fid, src);
+        let (prog, diags) = parse(fid, tokens);
+        assert!(diags.is_empty(), "Parse diagnostics: {:?}", diags);
+        assert_eq!(prog.items.len(), 1);
+        if let Item::Function(f) = &prog.items[0] {
+            let body = f.body.as_ref().unwrap();
+            let expr = body
+                .expr
+                .as_deref()
+                .or_else(|| {
+                    body.stmts.first().and_then(|s| match s {
+                        Stmt::Expr(e) => Some(e),
+                        _ => None,
+                    })
+                })
+                .expect("expected select expression");
+            if let ExprKind::Select { arms } = &expr.kind {
+                assert_eq!(arms.len(), 4);
+                assert!(arms[0].priority.is_some());
+                assert!(arms[1].priority.is_some());
+                assert!(arms[2].timeout.is_some());
+                assert!(arms[3].is_default);
+            } else {
+                panic!("Expected ExprKind::Select");
             }
         }
     }
