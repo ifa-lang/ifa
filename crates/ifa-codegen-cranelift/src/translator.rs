@@ -914,8 +914,9 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
 
             ValueExpr::ArrayPush { .. }
             | ValueExpr::StructPushField { .. }
-            | ValueExpr::CoWCheckShared { .. }
-            | ValueExpr::Spawn { .. } => Some(self.builder.ins().iconst(types::I64, 0)),
+            | ValueExpr::CoWCheckShared { .. } => Some(self.builder.ins().iconst(types::I64, 0)),
+
+            ValueExpr::Spawn { .. } => Some(self.builder.ins().iconst(types::I64, 1)),
 
             ValueExpr::Call { callee, args } => {
                 if let Some(&callee_val) = self.value_map.get(callee) {

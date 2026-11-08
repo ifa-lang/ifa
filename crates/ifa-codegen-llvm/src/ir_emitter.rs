@@ -1264,10 +1264,17 @@ impl<'a> LlvmIrEmitter<'a> {
                             } else if let Some(target_fn) =
                                 module.functions.iter().find(|f| f.name == *name)
                             {
-                                target_fn.ret_ty.clone()
+                                if target_fn.is_coroutine() {
+                                    ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Unit))
+                                } else {
+                                    target_fn.ret_ty.clone()
+                                }
                             } else {
                                 ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                             }
+                        }
+                        ValueExpr::Spawn { .. } => {
+                            ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                         }
                         ValueExpr::StructInit { name, .. } => {
                             let st_def = module.structs.iter().find(|s| s.name == *name);
@@ -1821,7 +1828,11 @@ impl<'a> LlvmIrEmitter<'a> {
                     let (ret_ty_str, param_types) = if let Some(target_fn) =
                         module.functions.iter().find(|f| f.name == *name)
                     {
-                        let ret_ty = fir_to_llvm_type(&target_fn.ret_ty)?;
+                        let ret_ty = if target_fn.is_coroutine() {
+                            "ptr".to_string()
+                        } else {
+                            fir_to_llvm_type(&target_fn.ret_ty)?
+                        };
                         let params: Vec<String> = target_fn
                             .params
                             .iter()
@@ -2446,12 +2457,29 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             ValueExpr::Spawn { target, args } => {
                 let callee = INTERNER.resolve(target);
-                let is_target_coro = module
-                    .functions
-                    .iter()
-                    .find(|f| f.name == *target)
-                    .map(|f| f.is_coroutine())
-                    .unwrap_or(false);
+                let target_fn = module.functions.iter().find(|f| f.name == *target);
+                let is_target_coro = target_fn.map(|f| f.is_coroutine()).unwrap_or(false);
+
+                let param_types = if let Some(tf) = target_fn {
+                    tf.params
+                        .iter()
+                        .map(|p| match &p.ty {
+                            ifa_fir::FirType::Array(..) => "ptr".to_string(),
+                            _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()),
+                        })
+                        .collect()
+                } else {
+                    vec!["i64".to_string(); args.len()]
+                };
+
+                let args_str = Self::emit_call_args(
+                    &format!("spawn_arg_{}", res_id),
+                    args,
+                    &param_types,
+                    value_types,
+                    array_allocas,
+                    out,
+                );
 
                 if is_target_coro {
                     if args.is_empty() {
@@ -2460,13 +2488,11 @@ impl<'a> LlvmIrEmitter<'a> {
                             res_id, callee
                         ));
                     } else {
-                        let args_llvm: Vec<String> =
-                            args.iter().map(|a| format!("i64 %v{}", a.0)).collect();
                         out.push_str(&format!(
                             "  %coro_hdl_{} = call ptr @{}({})\n",
                             res_id,
                             callee,
-                            args_llvm.join(", ")
+                            args_str.join(", ")
                         ));
                     }
                     out.push_str(&format!(
@@ -2480,13 +2506,32 @@ impl<'a> LlvmIrEmitter<'a> {
                     ));
                 } else if args.len() == 1 {
                     let arg = args[0];
+                    let arg_ty_str = value_types
+                        .get(&arg)
+                        .and_then(|t| fir_to_llvm_type(t).ok())
+                        .unwrap_or_else(|| "i64".to_string());
+                    let ptr_val = if arg_ty_str == "ptr" || array_allocas.contains_key(&arg) {
+                        format!("%v{}", arg.0)
+                    } else if arg_ty_str.starts_with("%struct.") {
+                        out.push_str(&format!(
+                            "  %spawn_struct_buf_{} = alloca {}, align 8\n",
+                            res_id, arg_ty_str
+                        ));
+                        out.push_str(&format!(
+                            "  store {} %v{}, ptr %spawn_struct_buf_{}, align 8\n",
+                            arg_ty_str, arg.0, res_id
+                        ));
+                        format!("%spawn_struct_buf_{}", res_id)
+                    } else {
+                        out.push_str(&format!(
+                            "  %spawn_arg_ptr_{} = inttoptr i64 %v{} to ptr\n",
+                            res_id, arg.0
+                        ));
+                        format!("%spawn_arg_ptr_{}", res_id)
+                    };
                     out.push_str(&format!(
-                        "  %spawn_arg_ptr_{} = inttoptr i64 %v{} to ptr\n",
-                        res_id, arg.0
-                    ));
-                    out.push_str(&format!(
-                        "  %v{} = call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr %spawn_arg_ptr_{})\n",
-                        res_id, callee, res_id
+                        "  %v{} = call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr {})\n",
+                        res_id, callee, ptr_val
                     ));
                 } else {
                     let buf_size = args.len() * 8;
@@ -2495,13 +2540,40 @@ impl<'a> LlvmIrEmitter<'a> {
                         res_id, buf_size
                     ));
                     for (i, arg) in args.iter().enumerate() {
+                        let arg_ty_str = value_types
+                            .get(arg)
+                            .and_then(|t| fir_to_llvm_type(t).ok())
+                            .unwrap_or_else(|| "i64".to_string());
+                        let val_i64 = if arg_ty_str == "ptr" || array_allocas.contains_key(arg) {
+                            out.push_str(&format!(
+                                "  %spawn_cast_{}_{} = ptrtoint ptr %v{} to i64\n",
+                                res_id, i, arg.0
+                            ));
+                            format!("%spawn_cast_{}_{}", res_id, i)
+                        } else if arg_ty_str.starts_with("%struct.") {
+                            out.push_str(&format!(
+                                "  %spawn_struct_buf_{}_{} = alloca {}, align 8\n",
+                                res_id, i, arg_ty_str
+                            ));
+                            out.push_str(&format!(
+                                "  store {} %v{}, ptr %spawn_struct_buf_{}_{}, align 8\n",
+                                arg_ty_str, arg.0, res_id, i
+                            ));
+                            out.push_str(&format!(
+                                "  %spawn_cast_{}_{} = ptrtoint ptr %spawn_struct_buf_{}_{} to i64\n",
+                                res_id, i, res_id, i
+                            ));
+                            format!("%spawn_cast_{}_{}", res_id, i)
+                        } else {
+                            format!("%v{}", arg.0)
+                        };
                         out.push_str(&format!(
                             "  %spawn_slot_{}_{} = getelementptr inbounds i64, ptr %spawn_arg_buf_{}, i32 {}\n",
                             res_id, i, res_id, i
                         ));
                         out.push_str(&format!(
-                            "  store i64 %v{}, ptr %spawn_slot_{}_{}, align 8\n",
-                            arg.0, res_id, i
+                            "  store i64 {}, ptr %spawn_slot_{}_{}, align 8\n",
+                            val_i64, res_id, i
                         ));
                     }
                     out.push_str(&format!(
@@ -2892,7 +2964,11 @@ impl<'a> LlvmIrEmitter<'a> {
                     let (ret_ty_str, param_types) = if let Some(target_fn) =
                         module.functions.iter().find(|f| f.name == *name)
                     {
-                        let ret_ty = fir_to_llvm_type(&target_fn.ret_ty)?;
+                        let ret_ty = if target_fn.is_coroutine() {
+                            "ptr".to_string()
+                        } else {
+                            fir_to_llvm_type(&target_fn.ret_ty)?
+                        };
                         let params: Vec<String> = target_fn
                             .params
                             .iter()
@@ -3302,26 +3378,48 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             ValueExpr::Spawn { target, args } => {
                 let callee = INTERNER.resolve(target);
-                let is_target_coro = module
-                    .functions
-                    .iter()
-                    .find(|f| f.name == *target)
-                    .map(|f| f.is_coroutine())
-                    .unwrap_or(false);
+                let target_fn = module.functions.iter().find(|f| f.name == *target);
+                let is_target_coro = target_fn.map(|f| f.is_coroutine()).unwrap_or(false);
+
+                let param_types = if let Some(tf) = target_fn {
+                    tf.params
+                        .iter()
+                        .map(|p| match &p.ty {
+                            ifa_fir::FirType::Array(..) => "ptr".to_string(),
+                            _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()),
+                        })
+                        .collect()
+                } else {
+                    vec!["i64".to_string(); args.len()]
+                };
+
+                let args_str = Self::emit_call_args(
+                    &format!("spawn_eff_arg_{}", eff_idx),
+                    args,
+                    &param_types,
+                    value_types,
+                    array_allocas,
+                    out,
+                );
 
                 if is_target_coro {
                     if args.is_empty() {
-                        out.push_str(&format!("  %coro_eff_hdl = call ptr @{}()\n", callee));
-                    } else {
-                        let args_llvm: Vec<String> =
-                            args.iter().map(|a| format!("i64 %v{}", a.0)).collect();
                         out.push_str(&format!(
-                            "  %coro_eff_hdl = call ptr @{}({})\n",
+                            "  %coro_eff_hdl_{} = call ptr @{}()\n",
+                            eff_idx, callee
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  %coro_eff_hdl_{} = call ptr @{}({})\n",
+                            eff_idx,
                             callee,
-                            args_llvm.join(", ")
+                            args_str.join(", ")
                         ));
                     }
-                    out.push_str("  call i64 @ifa_coro_llvm_spawn(ptr %coro_eff_hdl)\n");
+                    out.push_str(&format!(
+                        "  call i64 @ifa_coro_llvm_spawn(ptr %coro_eff_hdl_{})\n",
+                        eff_idx
+                    ));
                 } else if args.is_empty() {
                     out.push_str(&format!(
                         "  call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr null)\n",
@@ -3329,34 +3427,79 @@ impl<'a> LlvmIrEmitter<'a> {
                     ));
                 } else if args.len() == 1 {
                     let arg = args[0];
+                    let arg_ty_str = value_types
+                        .get(&arg)
+                        .and_then(|t| fir_to_llvm_type(t).ok())
+                        .unwrap_or_else(|| "i64".to_string());
+                    let ptr_val = if arg_ty_str == "ptr" || array_allocas.contains_key(&arg) {
+                        format!("%v{}", arg.0)
+                    } else if arg_ty_str.starts_with("%struct.") {
+                        out.push_str(&format!(
+                            "  %spawn_eff_struct_buf_{} = alloca {}, align 8\n",
+                            eff_idx, arg_ty_str
+                        ));
+                        out.push_str(&format!(
+                            "  store {} %v{}, ptr %spawn_eff_struct_buf_{}, align 8\n",
+                            arg_ty_str, arg.0, eff_idx
+                        ));
+                        format!("%spawn_eff_struct_buf_{}", eff_idx)
+                    } else {
+                        out.push_str(&format!(
+                            "  %spawn_eff_ptr_{} = inttoptr i64 %v{} to ptr\n",
+                            eff_idx, arg.0
+                        ));
+                        format!("%spawn_eff_ptr_{}", eff_idx)
+                    };
                     out.push_str(&format!(
-                        "  %spawn_arg_ptr_{} = inttoptr i64 %v{} to ptr\n",
-                        arg.0, arg.0
-                    ));
-                    out.push_str(&format!(
-                        "  call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr %spawn_arg_ptr_{})\n",
-                        callee, arg.0
+                        "  call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr {})\n",
+                        callee, ptr_val
                     ));
                 } else {
                     let buf_size = args.len() * 8;
-                    let first_arg = args[0].0;
                     out.push_str(&format!(
-                        "  %spawn_arg_buf_{} = call ptr @ifa_rt_gen_alloc(i64 {}, i64 8, i16 0)\n",
-                        first_arg, buf_size
+                        "  %spawn_eff_buf_{} = call ptr @ifa_rt_gen_alloc(i64 {}, i64 8, i16 0)\n",
+                        eff_idx, buf_size
                     ));
                     for (i, arg) in args.iter().enumerate() {
+                        let arg_ty_str = value_types
+                            .get(arg)
+                            .and_then(|t| fir_to_llvm_type(t).ok())
+                            .unwrap_or_else(|| "i64".to_string());
+                        let val_i64 = if arg_ty_str == "ptr" || array_allocas.contains_key(arg) {
+                            out.push_str(&format!(
+                                "  %spawn_eff_cast_{}_{} = ptrtoint ptr %v{} to i64\n",
+                                eff_idx, i, arg.0
+                            ));
+                            format!("%spawn_eff_cast_{}_{}", eff_idx, i)
+                        } else if arg_ty_str.starts_with("%struct.") {
+                            out.push_str(&format!(
+                                "  %spawn_eff_struct_{}_{} = alloca {}, align 8\n",
+                                eff_idx, i, arg_ty_str
+                            ));
+                            out.push_str(&format!(
+                                "  store {} %v{}, ptr %spawn_eff_struct_{}_{}, align 8\n",
+                                arg_ty_str, arg.0, eff_idx, i
+                            ));
+                            out.push_str(&format!(
+                                "  %spawn_eff_cast_{}_{} = ptrtoint ptr %spawn_eff_struct_{}_{} to i64\n",
+                                eff_idx, i, eff_idx, i
+                            ));
+                            format!("%spawn_eff_cast_{}_{}", eff_idx, i)
+                        } else {
+                            format!("%v{}", arg.0)
+                        };
                         out.push_str(&format!(
-                            "  %spawn_slot_{}_{} = getelementptr inbounds i64, ptr %spawn_arg_buf_{}, i32 {}\n",
-                            first_arg, i, first_arg, i
+                            "  %spawn_eff_slot_{}_{} = getelementptr inbounds i64, ptr %spawn_eff_buf_{}, i32 {}\n",
+                            eff_idx, i, eff_idx, i
                         ));
                         out.push_str(&format!(
-                            "  store i64 %v{}, ptr %spawn_slot_{}_{}, align 8\n",
-                            arg.0, first_arg, i
+                            "  store i64 {}, ptr %spawn_eff_slot_{}_{}, align 8\n",
+                            val_i64, eff_idx, i
                         ));
                     }
                     out.push_str(&format!(
-                        "  call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr %spawn_arg_buf_{})\n",
-                        callee, first_arg
+                        "  call i64 @ifa_rt_fiber_spawn(ptr @{}, ptr %spawn_eff_buf_{})\n",
+                        callee, eff_idx
                     ));
                 }
             }

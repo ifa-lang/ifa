@@ -63,6 +63,41 @@ void ifa_rt_gen_check(const void* ptr, uint32_t remembered_gen) {
 
 void ifa_rt_fiber_yield(void) {}
 
+uint64_t ifa_rt_fiber_spawn(void (*entry)(void*), void* arg) {
+    if (entry) {
+        entry(arg);
+    }
+    return 1;
+}
+
+void ifa_rt_fiber_join(uint64_t fid) {
+    (void)fid;
+}
+
+uint64_t ifa_rt_coro_spawn(void* coro) {
+    (void)coro;
+    return 1;
+}
+
+void* ifa_rt_coro_create(size_t frame_size, void* resume_fn, void* destroy_fn) {
+    (void)frame_size; (void)resume_fn; (void)destroy_fn;
+    return (void*)1;
+}
+
+void* ifa_rt_coro_create_custom(void* frame, void* resume_fn, void* destroy_fn) {
+    (void)frame; (void)resume_fn; (void)destroy_fn;
+    return frame ? frame : (void*)1;
+}
+
+int32_t ifa_rt_coro_resume(void* coro) { (void)coro; return 1; }
+int32_t ifa_rt_coro_is_done(void* coro) { (void)coro; return 1; }
+void ifa_rt_coro_destroy(void* coro) { (void)coro; }
+void* ifa_rt_coro_frame(void* coro) { return coro; }
+void* ifa_rt_coro_iter_create(void* coro, void* slot, size_t size) { (void)coro; (void)slot; (void)size; return (void*)1; }
+int32_t ifa_rt_coro_iter_next(void* iter, void* out) { (void)iter; (void)out; return 0; }
+int32_t ifa_rt_coro_iter_is_done(void* iter) { (void)iter; return 1; }
+void ifa_rt_coro_iter_destroy(void* iter) { (void)iter; }
+
 typedef struct ifa_channel_stub {
     void* val;
     int has_val;

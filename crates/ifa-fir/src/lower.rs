@@ -808,6 +808,7 @@ impl<'a> FunctionLoweringContext<'a> {
                         .as_ref()
                         .and_then(|e| self.infer_expr_fir_type(e))
                 }),
+            ExprKind::Spawn(_) => Some(FirType::Int(IntType::I64)),
             _ => None,
         }
     }
@@ -3926,16 +3927,198 @@ impl<'a> FunctionLoweringContext<'a> {
             ExprKind::Spawn(e) => {
                 let res = self.alloc_value();
                 let (target_sym, arg_vals) = match &e.kind {
-                    ExprKind::Call { callee, args } => {
-                        let target = match &callee.kind {
-                            ExprKind::Ident(sym) => *sym,
-                            _ => INTERNER.intern("task"),
+                    ExprKind::MethodCall {
+                        receiver,
+                        method,
+                        args,
+                        ..
+                    } => {
+                        let target_fn_name =
+                            self.resolve_method_call_target(receiver, *method, span);
+                        let is_inout = self.is_method_receiver_inout(receiver, *method, span);
+                        let rec_val = if is_inout {
+                            self.lower_lvalue_ptr(receiver, span)
+                        } else {
+                            self.lower_expr(receiver)
                         };
-                        let lowered_args: Vec<ValueId> =
-                            args.iter().map(|arg| self.lower_expr(&arg.value)).collect();
-                        (target, lowered_args)
+                        let mut arg_vals = vec![rec_val];
+                        for a in args {
+                            arg_vals.push(self.lower_expr(&a.value));
+                        }
+                        (target_fn_name, arg_vals)
                     }
-                    ExprKind::Ident(sym) => (*sym, Vec::new()),
+                    ExprKind::Call { callee, args } => {
+                        let closure_target = match &callee.kind {
+                            ExprKind::Ident(fn_name) => self.var_lambda_names.get(fn_name).copied(),
+                            ExprKind::Lambda { .. } => {
+                                let _ = self.lower_expr(callee);
+                                let lambda_id = self
+                                    .symbols
+                                    .lambda_ids
+                                    .get(&callee.span)
+                                    .copied()
+                                    .unwrap_or(callee.span.start.0);
+                                Some(INTERNER.intern(&format!("__ifa_lambda_{}", lambda_id)))
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(lambda_fn_name) = closure_target {
+                            let has_env_param = self
+                                .lifted_functions
+                                .iter()
+                                .find(|f| f.name == lambda_fn_name)
+                                .is_some_and(|f| {
+                                    !f.params.is_empty()
+                                        && INTERNER.resolve(&f.params[0].name) == "__env"
+                                });
+                            let full_args = if has_env_param {
+                                let closure_val = self.lower_expr(callee);
+                                let env_val = self.alloc_value();
+                                self.emit(
+                                    Some(env_val),
+                                    ValueExpr::GetField {
+                                        base: closure_val,
+                                        field_idx: 1,
+                                        field_name: INTERNER.intern("__ifa_env"),
+                                    },
+                                    span,
+                                );
+                                let mut fa = vec![env_val];
+                                for a in args {
+                                    fa.push(self.lower_expr(&a.value));
+                                }
+                                fa
+                            } else {
+                                let mut fa = Vec::with_capacity(args.len());
+                                for a in args {
+                                    fa.push(self.lower_expr(&a.value));
+                                }
+                                fa
+                            };
+                            (lambda_fn_name, full_args)
+                        } else {
+                            let target = match &callee.kind {
+                                ExprKind::Ident(sym) => {
+                                    if let Some(fn_sym) = self.symbols.lookup_function(sym) {
+                                        if !fn_sym.generics.is_empty() {
+                                            if let Some(call_args) =
+                                                self.symbols.call_instantiations.get(&span)
+                                            {
+                                                let concrete_args: Vec<_> = call_args
+                                                    .iter()
+                                                    .map(|t| t.substitute(&self.type_subst))
+                                                    .collect();
+                                                crate::types::mangle_instantiation_symbol(
+                                                    &INTERNER.resolve(sym),
+                                                    &concrete_args,
+                                                )
+                                            } else {
+                                                *sym
+                                            }
+                                        } else {
+                                            *sym
+                                        }
+                                    } else {
+                                        *sym
+                                    }
+                                }
+                                ExprKind::Path(path) => {
+                                    if path.len() >= 2 {
+                                        let type_sym = path[path.len() - 2];
+                                        let m_sym = path[path.len() - 1];
+                                        let mangled = INTERNER.intern(&format!(
+                                            "{}__{}",
+                                            INTERNER.resolve(&type_sym),
+                                            INTERNER.resolve(&m_sym)
+                                        ));
+                                        if self.symbols.lookup_function(&mangled).is_some()
+                                            || self
+                                                .symbols
+                                                .lookup_type_method(&type_sym, &m_sym)
+                                                .is_some()
+                                        {
+                                            mangled
+                                        } else {
+                                            *path.last().unwrap()
+                                        }
+                                    } else {
+                                        *path.last().unwrap()
+                                    }
+                                }
+                                _ => INTERNER.intern("task"),
+                            };
+                            let lowered_args: Vec<ValueId> =
+                                args.iter().map(|arg| self.lower_expr(&arg.value)).collect();
+                            (target, lowered_args)
+                        }
+                    }
+                    ExprKind::Lambda { .. } => {
+                        let closure_val = self.lower_expr(e);
+                        let lambda_id = self
+                            .symbols
+                            .lambda_ids
+                            .get(&e.span)
+                            .copied()
+                            .unwrap_or(e.span.start.0);
+                        let lambda_fn_name =
+                            INTERNER.intern(&format!("__ifa_lambda_{}", lambda_id));
+                        let has_env_param = self
+                            .lifted_functions
+                            .iter()
+                            .find(|f| f.name == lambda_fn_name)
+                            .is_some_and(|f| {
+                                !f.params.is_empty()
+                                    && INTERNER.resolve(&f.params[0].name) == "__env"
+                            });
+                        let full_args = if has_env_param {
+                            let env_val = self.alloc_value();
+                            self.emit(
+                                Some(env_val),
+                                ValueExpr::GetField {
+                                    base: closure_val,
+                                    field_idx: 1,
+                                    field_name: INTERNER.intern("__ifa_env"),
+                                },
+                                span,
+                            );
+                            vec![env_val]
+                        } else {
+                            Vec::new()
+                        };
+                        (lambda_fn_name, full_args)
+                    }
+                    ExprKind::Ident(sym) => {
+                        if let Some(lambda_fn_name) = self.var_lambda_names.get(sym).copied() {
+                            let closure_val = self.lower_expr(e);
+                            let has_env_param = self
+                                .lifted_functions
+                                .iter()
+                                .find(|f| f.name == lambda_fn_name)
+                                .is_some_and(|f| {
+                                    !f.params.is_empty()
+                                        && INTERNER.resolve(&f.params[0].name) == "__env"
+                                });
+                            let full_args = if has_env_param {
+                                let env_val = self.alloc_value();
+                                self.emit(
+                                    Some(env_val),
+                                    ValueExpr::GetField {
+                                        base: closure_val,
+                                        field_idx: 1,
+                                        field_name: INTERNER.intern("__ifa_env"),
+                                    },
+                                    span,
+                                );
+                                vec![env_val]
+                            } else {
+                                Vec::new()
+                            };
+                            (lambda_fn_name, full_args)
+                        } else {
+                            (*sym, Vec::new())
+                        }
+                    }
                     _ => {
                         let _ = self.lower_expr(e);
                         (INTERNER.intern("task"), Vec::new())

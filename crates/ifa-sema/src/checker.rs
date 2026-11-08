@@ -2538,7 +2538,7 @@ impl<'a> SemanticAnalyzer<'a> {
                     );
                 }
                 self.infer_expr(inner);
-                Type::Unit
+                Type::Int(IntType::I64)
             }
             ExprKind::Comptime(inner) => {
                 let ty = self.check_expr(inner, expected);

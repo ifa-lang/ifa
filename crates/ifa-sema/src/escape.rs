@@ -243,6 +243,38 @@ impl<'a> EscapeAnalyzer<'a> {
         }
     }
 
+    /// Determines whether the method receiver is passed by `inout`.
+    fn is_method_receiver_inout(&self, receiver: &Expr, method: Symbol, span: Span) -> bool {
+        if let Some(&resolved) = self.symbols.method_resolutions.get(&span) {
+            if let Some(fn_sym) = self.symbols.lookup_function(&resolved) {
+                if let Some(first_p) = fn_sym.params.first() {
+                    return first_p.mode == ParamMode::InOut;
+                }
+            }
+        }
+        if let Some(fn_sym) = self.symbols.lookup_function(&method) {
+            if let Some(first_p) = fn_sym.params.first() {
+                return first_p.mode == ParamMode::InOut;
+            }
+        }
+        if let Some((root_sym, _)) = extract_escape_root(receiver) {
+            if let Some(var) = self.symbols.lookup_variable(&root_sym) {
+                let type_sym = match &var.ty {
+                    Type::Struct { name, .. } | Type::Generic { name, .. } => Some(*name),
+                    _ => None,
+                };
+                if let Some(t_sym) = type_sym {
+                    if let Some(fn_sym) = self.symbols.lookup_type_method(&t_sym, &method) {
+                        if let Some(first_p) = fn_sym.params.first() {
+                            return first_p.mode == ParamMode::InOut;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Checks and records an `inout` borrow within a `spawn` fiber,
     /// permitting provably disjoint slice or field projections across concurrent fibers.
     fn check_concurrent_inout(&mut self, inner: &Expr, arg_span: Span) -> bool {
@@ -768,8 +800,15 @@ impl<'a> EscapeAnalyzer<'a> {
                     self.check_expr(&arg.value);
                 }
             }
-            ExprKind::MethodCall { receiver, args, .. } => {
-                if self.spawn_depth > 0 {
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+                ..
+            } => {
+                if self.spawn_depth > 0
+                    && self.is_method_receiver_inout(receiver, *method, expr.span)
+                {
                     self.check_concurrent_inout(receiver, receiver.span);
                 }
                 self.check_expr(receiver);

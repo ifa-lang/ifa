@@ -3121,3 +3121,103 @@ fn test_llvm_coroutine_io_uring_iocp_reactor_lowering_and_native_compile() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_aot_monomorphic_async_traits_and_stream_specialization() {
+    let src = r#"
+        trait AsyncWorker {
+            fn work(self: AsyncWorker) -> i64;
+        }
+
+        struct TaskUnit {
+            multiplier: i64,
+            value: i64,
+        }
+
+        impl AsyncWorker for TaskUnit {
+            fn work(t: TaskUnit) -> i64 {
+                return t.multiplier * t.value;
+            }
+        }
+
+        fn dispatch_worker<W: AsyncWorker>(worker: W) -> i64 {
+            let fid = spawn worker.work();
+            return fid;
+        }
+
+        pub fn main() -> i64 {
+            let task = TaskUnit(multiplier: 6, value: 7);
+            let fid = dispatch_worker(task);
+            if fid > 0 {
+                return 42;
+            }
+            return 0;
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("async_trait_spawn.ifa".to_string(), src);
+    let (prog, _) = parse(fid, tokenize(fid, src));
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).expect("FIR lowering failed");
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+    let ir = emitter.emit_module(&module).expect("Emission failed");
+    println!("=== EMITTED IR ===\n{}", ir);
+
+    // 1. Verify AOT monomorphic trait method and dispatch were specialized
+    assert!(
+        ir.contains("@TaskUnit__work"),
+        "IR must contain @TaskUnit__work: {}",
+        ir
+    );
+    assert!(
+        ir.contains("@dispatch_worker__TaskUnit"),
+        "IR must contain @dispatch_worker__TaskUnit: {}",
+        ir
+    );
+    // 2. Verify spawn lowered directly to fiber runtime spawn with receiver pointer
+    assert!(
+        ir.contains("@ifa_rt_fiber_spawn(ptr @TaskUnit__work"),
+        "Spawn must call @ifa_rt_fiber_spawn with @TaskUnit__work: {}",
+        ir
+    );
+
+    // 3. Verify compilation to native executable and actual execution produces 42
+    let temp_dir =
+        std::env::temp_dir().join(format!("llvm_async_trait_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("async_trait.o");
+    let bin_path = temp_dir.join("async_trait_exec");
+
+    let compiler = LlvmCompiler::new(LlvmTargetConfig::host());
+    let compile_res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        compile_res.is_ok(),
+        "Object compilation failed: {:?}",
+        compile_res.err()
+    );
+    assert!(obj_path.exists());
+
+    let link_res = LlvmCompiler::link_executable(&obj_path, &bin_path);
+    assert!(link_res.is_ok(), "Native link failed: {:?}", link_res.err());
+    assert!(bin_path.exists());
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("Failed to execute native binary");
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "Native binary output exit code must be 42"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
