@@ -114,6 +114,7 @@ impl GenerationalOptPass {
             global_aliases: HashMap<ValueId, ValueId>,
             checks_by_block: HashMap<BlockId, HashSet<ValueId>>,
             gen_creations: HashMap<ValueId, BlockId>,
+            recursive_projections: HashMap<ValueId, ValueId>,
         }
 
         let mut func_analyses: HashMap<Symbol, FuncAnalysis> = HashMap::new();
@@ -125,6 +126,8 @@ impl GenerationalOptPass {
             let mut alloca_values = HashSet::new();
             let mut gen_creations = HashMap::new();
             let mut checks_by_block: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
+            let mut deref_roots: HashMap<ValueId, ValueId> = HashMap::new();
+            let mut recursive_projections: HashMap<ValueId, ValueId> = HashMap::new();
 
             for block in &func.blocks {
                 for inst in &block.instructions {
@@ -140,6 +143,17 @@ impl GenerationalOptPass {
                         ValueExpr::GenRef { .. } | ValueExpr::GenAlloc { .. } => {
                             if let Some(res) = inst.result {
                                 gen_creations.insert(res, block.id);
+                            }
+                        }
+                        ValueExpr::GenDeref { ref_val } => {
+                            if let Some(res) = inst.result {
+                                deref_roots.insert(res, *ref_val);
+                            }
+                        }
+                        ValueExpr::GetField { base, .. } | ValueExpr::GetFieldPtr { base, .. } => {
+                            if let Some(res) = inst.result {
+                                let root = deref_roots.get(base).copied().unwrap_or(*base);
+                                recursive_projections.insert(res, root);
                             }
                         }
                         ValueExpr::GenCheck { ref_val, .. } => {
@@ -187,6 +201,7 @@ impl GenerationalOptPass {
                     global_aliases,
                     checks_by_block,
                     gen_creations,
+                    recursive_projections,
                 },
             );
         }
@@ -345,6 +360,48 @@ impl GenerationalOptPass {
                                             }
                                             if check_dominates {
                                                 return true;
+                                            }
+
+                                            // 5. Recursive child projection from a safe root reference
+                                            if let Some(&root_ref) = analysis
+                                                .recursive_projections
+                                                .get(&arg_val)
+                                                .or_else(|| {
+                                                    analysis.recursive_projections.get(&canon)
+                                                })
+                                            {
+                                                let canon_root = canonical_ref(
+                                                    root_ref,
+                                                    &analysis.global_aliases,
+                                                );
+                                                if let Some(caller_fn) = module
+                                                    .functions
+                                                    .iter()
+                                                    .find(|f| f.name == *caller_name)
+                                                {
+                                                    for (c_idx, c_p) in
+                                                        caller_fn.params.iter().enumerate()
+                                                    {
+                                                        if (c_p.val == root_ref
+                                                            || c_p.val == canon_root)
+                                                            && safe_params
+                                                                .contains(&(*caller_name, c_idx))
+                                                        {
+                                                            return true;
+                                                        }
+                                                    }
+                                                }
+                                                for (&chk_b, chk_vals) in &analysis.checks_by_block
+                                                {
+                                                    if (chk_vals.contains(&root_ref)
+                                                        || chk_vals.contains(&canon_root))
+                                                        && analysis
+                                                            .dom_tree
+                                                            .dominates(chk_b, *block_id)
+                                                    {
+                                                        return true;
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -857,12 +914,29 @@ impl GenerationalOptPass {
 
             // Local store-to-load reference alias tracking
             let mut ptr_aliases: HashMap<ValueId, ValueId> = HashMap::new();
+            let mut deref_roots: HashMap<ValueId, ValueId> = HashMap::new();
 
             if let Some(block) = func.get_block_mut(block_id) {
                 for inst in &mut block.instructions {
                     match &mut inst.expr {
                         ValueExpr::Store { ptr, val } => {
                             ptr_aliases.insert(*ptr, *val);
+                        }
+                        ValueExpr::GenDeref { ref_val } => {
+                            if let Some(res) = inst.result {
+                                deref_roots.insert(res, *ref_val);
+                            }
+                        }
+                        ValueExpr::GetField { base, .. } | ValueExpr::GetFieldPtr { base, .. } => {
+                            if let Some(res) = inst.result {
+                                let root = deref_roots.get(base).copied().unwrap_or(*base);
+                                let canon_root = canonical_ref(root, cx.aliases);
+                                if available.contains(&root) || available.contains(&canon_root) {
+                                    // Recursive child projection derived from verified root reference
+                                    available.insert(res);
+                                    available.insert(canonical_ref(res, cx.aliases));
+                                }
+                            }
                         }
                         ValueExpr::Load { ptr } => {
                             if let Some(res) = inst.result {

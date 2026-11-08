@@ -1,3 +1,4 @@
+pub mod arena_opt;
 pub mod bce;
 pub mod cfg;
 pub mod closure_opt;
@@ -18,6 +19,7 @@ pub mod types;
 pub mod vectorize;
 pub mod verify;
 
+pub use arena_opt::{ArenaFusionPass, ArenaFusionStats};
 pub use bce::{BcePass, BceStats};
 pub use cfg::ControlFlowGraph;
 pub use closure_opt::{ClosureAllocationKind, ClosureEscapeStats, ClosureOptPass};
@@ -91,6 +93,9 @@ pub fn compile_to_fir_with_opts(
     }
 
     if opt_gen {
+        let mut arena_pass = ArenaFusionPass::new();
+        arena_pass.run_on_module(&mut module);
+
         let mut gen_pass = GenerationalOptPass::new();
         gen_pass.run_on_module(&mut module);
     }
@@ -109,6 +114,9 @@ pub fn compile_to_fir_with_opts(
         sroa_pass3.run_on_module(&mut module);
 
         if opt_gen {
+            let mut post_arena_pass = ArenaFusionPass::new();
+            post_arena_pass.run_on_module(&mut module);
+
             let mut post_ipo_gen_pass = GenerationalOptPass::new();
             post_ipo_gen_pass.run_on_module(&mut module);
         }
