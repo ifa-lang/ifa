@@ -166,6 +166,18 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             self.block_map.insert(block.id, cl_block);
         }
 
+        // Set up block arguments for non-entry blocks
+        for block in &fir_func.blocks {
+            if block.id == fir_func.entry_block {
+                continue;
+            }
+            let cl_block = self.block_map[&block.id];
+            for (_param_val_id, param_ty) in &block.params {
+                let cl_ty = fir_type_to_cranelift(param_ty, self.ptr_type).unwrap_or(self.ptr_type);
+                let _ = self.builder.append_block_param(cl_block, cl_ty);
+            }
+        }
+
         let first_body_block = self.block_map[&fir_func.entry_block];
         let completed_block = self.builder.create_block();
 
@@ -236,6 +248,23 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
 
         // 5. Translate instructions in RPO
         let cfg = ifa_fir::ControlFlowGraph::build(fir_func);
+        let dom_tree = ifa_fir::DominanceTree::build(&cfg);
+
+        let mut def_block: HashMap<ValueId, BlockId> = HashMap::new();
+        for p in &fir_func.params {
+            def_block.insert(p.val, fir_func.entry_block);
+        }
+        for b in &fir_func.blocks {
+            for (p_val, _) in &b.params {
+                def_block.insert(*p_val, b.id);
+            }
+            for inst in &b.instructions {
+                if let Some(res) = inst.result {
+                    def_block.insert(res, b.id);
+                }
+            }
+        }
+
         let rpo_order = cfg.reverse_post_order();
         let mut ordered_blocks: Vec<&ifa_fir::BasicBlock> =
             Vec::with_capacity(fir_func.blocks.len());
@@ -253,11 +282,26 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         }
 
         let mut current_yield_idx = 0usize;
+        let mut block_entry_maps: HashMap<BlockId, HashMap<ValueId, ClValue>> = HashMap::new();
+        block_entry_maps.insert(fir_func.entry_block, self.value_map.clone());
 
         for block in ordered_blocks {
             let cl_block = self.block_map[&block.id];
             if block.id != fir_func.entry_block {
                 self.builder.switch_to_block(cl_block);
+
+                // Inherit SSA value map from immediate dominator
+                if let Some(idom_id) = dom_tree.immediate_dominator(block.id) {
+                    if let Some(parent_map) = block_entry_maps.get(&idom_id) {
+                        self.value_map = parent_map.clone();
+                    }
+                }
+
+                // Bind block parameters to Cranelift block params
+                for (i, (param_val_id, _)) in block.params.iter().enumerate() {
+                    let cl_param = self.builder.block_params(cl_block)[i];
+                    self.value_map.insert(*param_val_id, cl_param);
+                }
             }
 
             for inst in &block.instructions {
@@ -283,9 +327,16 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                             }
                         }
 
-                        // Save all active SSA values in value_map into frame
+                        // Save only active SSA values in value_map that dominate this suspension point
                         let mut saved_keys: Vec<(ValueId, types::Type, i32)> = Vec::new();
                         for (&v_id, &v_val) in &self.value_map {
+                            let dominates_suspension = def_block.get(&v_id).is_some_and(|&d_b| {
+                                d_b == block.id || dom_tree.dominates(d_b, block.id)
+                            });
+                            if !dominates_suspension {
+                                continue;
+                            }
+
                             let slot_offset =
                                 (16 + 8 * (fir_func.params.len() + v_id.0 as usize)) as i32;
                             let v_ty = self.builder.func.dfg.value_type(v_val);
@@ -400,6 +451,8 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let status_done = self.builder.ins().iconst(types::I32, 1);
                 self.builder.ins().return_(&[status_done]);
             }
+
+            block_entry_maps.insert(block.id, self.value_map.clone());
         }
 
         self.builder.seal_all_blocks();

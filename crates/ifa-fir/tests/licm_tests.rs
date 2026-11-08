@@ -1304,3 +1304,527 @@ fn test_licm_coroutine_generator_stream_multiple_checks_deduplication() {
         body.instructions
     );
 }
+
+#[test]
+fn test_licm_async_channel_stream_barrier_elimination_with_interprocedural_pure_helper() {
+    use ifa_ast::ParamMode;
+    use ifa_fir::ir::*;
+    use ifa_fir::types::FirType;
+    use ifa_fir::{FirModule, LicmPass};
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let mut module = FirModule::new(INTERNER.intern("async_stream_mod"));
+
+    // 1. Pure helper function: `compute_hash(v: i64) -> i64`
+    let helper_name = INTERNER.intern("compute_hash");
+    let p_val = FirParam {
+        name: INTERNER.intern("v"),
+        val: ValueId(0),
+        ty: FirType::Int(IntType::I64),
+        mode: ParamMode::In,
+        noalias: true,
+    };
+    let mut helper_fn = FirFunction::new(
+        helper_name,
+        vec![p_val],
+        FirType::Int(IntType::I64),
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let h_entry = BlockId(0);
+    let v_one = helper_fn.alloc_value();
+    let v_res = helper_fn.alloc_value();
+    let h_bb = helper_fn.get_block_mut(h_entry).unwrap();
+    h_bb.push_instruction(Instruction::new(
+        Some(v_one),
+        ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+        Span::DUMMY,
+    ));
+    h_bb.push_instruction(Instruction::new(
+        Some(v_res),
+        ValueExpr::Binary {
+            op: BinaryOp::Add,
+            lhs: ValueId(0),
+            rhs: v_one,
+        },
+        Span::DUMMY,
+    ));
+    h_bb.set_terminator(Terminator::Return(Some(v_res)));
+    module.functions.push(helper_fn);
+
+    // 2. Colorless asynchronous stream loop function: `stream_worker(rx: chan, cfg_ref: ref i64)`
+    let worker_name = INTERNER.intern("stream_worker");
+    let p_chan = FirParam {
+        name: INTERNER.intern("rx"),
+        val: ValueId(0),
+        ty: FirType::Channel(Box::new(FirType::Int(IntType::I64))),
+        mode: ParamMode::In,
+        noalias: true,
+    };
+    let p_cfg = FirParam {
+        name: INTERNER.intern("cfg_ref"),
+        val: ValueId(1),
+        ty: FirType::GenerationalRef(Box::new(FirType::Int(IntType::I64))),
+        mode: ParamMode::In,
+        noalias: true,
+    };
+    let mut worker_fn = FirFunction::new(
+        worker_name,
+        vec![p_chan, p_cfg],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    worker_fn.next_value_id = 2;
+
+    let b_entry = BlockId(0);
+    let b_pre = worker_fn.alloc_block();
+    let b_hdr = worker_fn.alloc_block();
+    let b_body = worker_fn.alloc_block();
+    let b_exit = worker_fn.alloc_block();
+
+    worker_fn
+        .get_block_mut(b_entry)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_pre,
+            args: Vec::new(),
+        });
+    worker_fn
+        .get_block_mut(b_pre)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_hdr,
+            args: Vec::new(),
+        });
+
+    let v_cond = worker_fn.alloc_value();
+    let recv_val = worker_fn.alloc_value();
+    let hash_val = worker_fn.alloc_value();
+    let load_val = worker_fn.alloc_value();
+
+    worker_fn
+        .get_block_mut(b_hdr)
+        .unwrap()
+        .set_terminator(Terminator::BranchCond {
+            cond: v_cond,
+            then_block: b_body,
+            then_args: Vec::new(),
+            else_block: b_exit,
+            else_args: Vec::new(),
+        });
+
+    let body_bb = worker_fn.get_block_mut(b_body).unwrap();
+    // A: Invariant GenCheck on cfg_ref before channel receive
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: ValueId(1),
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    // B: Channel receive suspension point
+    body_bb.push_instruction(Instruction::new(
+        Some(recv_val),
+        ValueExpr::ChanRecv { chan: ValueId(0) },
+        Span::DUMMY,
+    ));
+    // C: Second GenCheck following channel receive
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: ValueId(1),
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    // D: Interprocedural direct call to pure helper
+    body_bb.push_instruction(Instruction::new(
+        Some(hash_val),
+        ValueExpr::CallDirect {
+            name: helper_name,
+            args: vec![recv_val],
+        },
+        Span::DUMMY,
+    ));
+    // E: Invariant Load on cfg_ref
+    body_bb.push_instruction(Instruction::new(
+        Some(load_val),
+        ValueExpr::Load { ptr: ValueId(1) },
+        Span::DUMMY,
+    ));
+    // F: Coroutine yield suspension point
+    body_bb.push_instruction(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    body_bb.set_terminator(Terminator::Branch {
+        target: b_hdr,
+        args: Vec::new(),
+    });
+
+    worker_fn
+        .get_block_mut(b_exit)
+        .unwrap()
+        .set_terminator(Terminator::Return(None));
+    module.functions.push(worker_fn);
+
+    let mut licm = LicmPass::new();
+    licm.run_on_module(&mut module);
+    let stats = licm.stats();
+
+    assert!(
+        stats.hoisted_gen_checks >= 1,
+        "Invariant GenCheck must be hoisted out of channel stream loop: {:?}",
+        stats
+    );
+    assert!(
+        stats.coroutine_sync_barriers_eliminated >= 1,
+        "Superfluous sync barriers across ChanRecv must be eliminated: {:?}",
+        stats
+    );
+    assert!(
+        stats.interprocedural_calls_analyzed >= 1,
+        "Pure helper call must be analyzed inter-procedurally: {:?}",
+        stats
+    );
+    assert!(
+        stats.hoisted_loads >= 1,
+        "Invariant Load across pure helper and channel recv must be hoisted: {:?}",
+        stats
+    );
+
+    // Verify optimized worker function
+    let opt_worker = module
+        .functions
+        .iter()
+        .find(|f| f.name == worker_name)
+        .unwrap();
+    let pre_b = opt_worker.get_block(b_pre).unwrap();
+    let pre_has_gen_chk = pre_b.instructions.iter().any(|i| {
+        matches!(
+            i.expr,
+            ValueExpr::GenCheck {
+                redundant: false,
+                ref_val,
+            } if ref_val == ValueId(1)
+        )
+    });
+    let pre_has_load = pre_b
+        .instructions
+        .iter()
+        .any(|i| matches!(i.expr, ValueExpr::Load { .. }));
+    assert!(
+        pre_has_gen_chk,
+        "Preheader must contain hoisted GenCheck: {:?}",
+        pre_b.instructions
+    );
+    assert!(
+        pre_has_load,
+        "Preheader must contain hoisted Load: {:?}",
+        pre_b.instructions
+    );
+
+    // Loop body must have ZERO active GenCheck instructions
+    let opt_body = opt_worker.get_block(b_body).unwrap();
+    let active_chks = opt_body
+        .instructions
+        .iter()
+        .filter(|i| {
+            matches!(
+                i.expr,
+                ValueExpr::GenCheck {
+                    redundant: false,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        active_chks, 0,
+        "Stream loop body must contain 0 active GenChecks: {:?}",
+        opt_body.instructions
+    );
+}
+
+#[test]
+fn test_licm_intra_loop_dominance_barrier_elimination_across_yield_and_recv() {
+    use ifa_fir::ir::*;
+    use ifa_fir::types::FirType;
+    use ifa_fir::LicmPass;
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("local_barrier_coro");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.is_coroutine = true;
+
+    let b_entry = BlockId(0);
+    let b_hdr = func.alloc_block();
+    let b_body = func.alloc_block();
+    let b_exit = func.alloc_block();
+
+    func.get_block_mut(b_entry)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_hdr,
+            args: Vec::new(),
+        });
+
+    let v_cond = func.alloc_value();
+    let local_alloc = func.alloc_value();
+    let local_ref = func.alloc_value();
+
+    func.get_block_mut(b_hdr)
+        .unwrap()
+        .set_terminator(Terminator::BranchCond {
+            cond: v_cond,
+            then_block: b_body,
+            then_args: Vec::new(),
+            else_block: b_exit,
+            else_args: Vec::new(),
+        });
+
+    let body_bb = func.get_block_mut(b_body).unwrap();
+    body_bb.push_instruction(Instruction::new(
+        Some(local_alloc),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(3),
+        },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(
+        Some(local_ref),
+        ValueExpr::GenRef { ptr: local_alloc },
+        Span::DUMMY,
+    ));
+    // Initial barrier before suspension
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: local_ref,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    // Asynchronous suspension
+    body_bb.push_instruction(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    // Superfluous barrier post-suspension
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: local_ref,
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_bb.set_terminator(Terminator::Branch {
+        target: b_hdr,
+        args: Vec::new(),
+    });
+
+    func.get_block_mut(b_exit)
+        .unwrap()
+        .set_terminator(Terminator::Return(None));
+
+    let mut licm = LicmPass::new();
+    licm.run_on_function(&mut func);
+    let stats = licm.stats();
+
+    assert!(
+        stats.coroutine_sync_barriers_eliminated >= 1,
+        "Post-yield superfluous check on local ref must be eliminated: {:?}",
+        stats
+    );
+
+    let opt_body = func.get_block(b_body).unwrap();
+    let gen_checks: Vec<bool> = opt_body
+        .instructions
+        .iter()
+        .filter_map(|i| {
+            if let ValueExpr::GenCheck { redundant, .. } = i.expr {
+                Some(redundant)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(
+        gen_checks.len(),
+        2,
+        "Expected 2 GenCheck instructions in body"
+    );
+    // The second GenCheck must be marked redundant!
+    assert!(
+        gen_checks[1],
+        "Second GenCheck after yield must be marked redundant: {:?}",
+        gen_checks
+    );
+}
+
+#[test]
+fn test_licm_disjoint_arena_free_callee_does_not_block_gen_check_hoisting() {
+    use ifa_ast::ParamMode;
+    use ifa_fir::ir::*;
+    use ifa_fir::types::FirType;
+    use ifa_fir::{FirModule, LicmPass};
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let mut module = FirModule::new(INTERNER.intern("disjoint_free_mod"));
+
+    // 1. Callee freeing memory in disjoint arena 9: `clean_temp_arena()`
+    let clean_fn_name = INTERNER.intern("clean_temp_arena");
+    let mut clean_fn = FirFunction::new(
+        clean_fn_name,
+        vec![],
+        FirType::Unit,
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let c_entry = BlockId(0);
+    let temp_ptr = clean_fn.alloc_value();
+    let c_bb = clean_fn.get_block_mut(c_entry).unwrap();
+    c_bb.push_instruction(Instruction::new(
+        Some(temp_ptr),
+        ValueExpr::GenAlloc {
+            ty: FirType::Int(IntType::I64),
+            arena: Some(9),
+        },
+        Span::DUMMY,
+    ));
+    c_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenFree { ptr: temp_ptr },
+        Span::DUMMY,
+    ));
+    c_bb.set_terminator(Terminator::Return(None));
+    module.functions.push(clean_fn);
+
+    // 2. Caller with loop operating on arena 1 reference
+    let caller_name = INTERNER.intern("arena1_stream_worker");
+    let p_ref = FirParam {
+        name: INTERNER.intern("persistent_ref"),
+        val: ValueId(0),
+        ty: FirType::GenerationalRef(Box::new(FirType::Int(IntType::I64))),
+        mode: ParamMode::In,
+        noalias: true,
+    };
+    let mut caller_fn = FirFunction::new(
+        caller_name,
+        vec![p_ref],
+        FirType::Unit,
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    caller_fn.is_coroutine = true;
+
+    let b_entry = BlockId(0);
+    let b_pre = caller_fn.alloc_block();
+    let b_hdr = caller_fn.alloc_block();
+    let b_body = caller_fn.alloc_block();
+    let b_exit = caller_fn.alloc_block();
+
+    caller_fn
+        .get_block_mut(b_entry)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_pre,
+            args: Vec::new(),
+        });
+    caller_fn
+        .get_block_mut(b_pre)
+        .unwrap()
+        .set_terminator(Terminator::Branch {
+            target: b_hdr,
+            args: Vec::new(),
+        });
+
+    let v_cond = caller_fn.alloc_value();
+    caller_fn
+        .get_block_mut(b_hdr)
+        .unwrap()
+        .set_terminator(Terminator::BranchCond {
+            cond: v_cond,
+            then_block: b_body,
+            then_args: Vec::new(),
+            else_block: b_exit,
+            else_args: Vec::new(),
+        });
+
+    let body_bb = caller_fn.get_block_mut(b_body).unwrap();
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: ValueId(0),
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    // Calling clean_temp_arena (which frees in arena 9, distinct from persistent_ref in arena 1)
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::CallDirect {
+            name: clean_fn_name,
+            args: vec![],
+        },
+        Span::DUMMY,
+    ));
+    body_bb.push_instruction(Instruction::new(None, ValueExpr::Yield, Span::DUMMY));
+    // Superfluous barrier post-suspension across disjoint free
+    body_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::GenCheck {
+            ref_val: ValueId(0),
+            redundant: false,
+        },
+        Span::DUMMY,
+    ));
+    body_bb.set_terminator(Terminator::Branch {
+        target: b_hdr,
+        args: Vec::new(),
+    });
+
+    caller_fn
+        .get_block_mut(b_exit)
+        .unwrap()
+        .set_terminator(Terminator::Return(None));
+    module.functions.push(caller_fn);
+
+    let mut licm = LicmPass::new();
+    licm.run_on_module(&mut module);
+    let stats = licm.stats();
+
+    assert!(
+        stats.hoisted_gen_checks >= 1,
+        "GenCheck must be hoisted despite disjoint arena free in callee: {:?}",
+        stats
+    );
+    assert!(
+        stats.coroutine_sync_barriers_eliminated >= 1,
+        "Sync barrier must be eliminated: {:?}",
+        stats
+    );
+}

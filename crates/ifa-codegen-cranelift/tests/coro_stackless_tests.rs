@@ -298,3 +298,229 @@ fn test_cranelift_jit_spawn_coroutine_scheduler() {
         .expect("Failed to run main spawning coroutine");
     assert!(fid > 0, "Spawn must return a positive FiberId");
 }
+
+#[test]
+fn test_cranelift_jit_stackless_coroutine_branching_with_yield() {
+    let mut module = FirModule::new(INTERNER.intern("coro_branch_mod"));
+    let gen_name = INTERNER.intern("branching_generator");
+
+    let p_flag = ValueId(0);
+    let mut func = FirFunction::new(
+        gen_name,
+        vec![FirParam {
+            name: INTERNER.intern("flag"),
+            ty: FirType::Bool,
+            val: p_flag,
+            mode: ifa_ast::ParamMode::In,
+            noalias: false,
+        }],
+        FirType::Int(IntType::I64),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.next_value_id = 1;
+
+    let b_entry = BlockId(0);
+    let b_then = func.alloc_block();
+    let b_else = func.alloc_block();
+    let b_merge = func.alloc_block();
+
+    let entry_bb = func.get_block_mut(b_entry).unwrap();
+    entry_bb.set_terminator(Terminator::BranchCond {
+        cond: p_flag,
+        then_block: b_then,
+        then_args: Vec::new(),
+        else_block: b_else,
+        else_args: Vec::new(),
+    });
+
+    // Then branch: define v_then = 42, yield 42, jump to merge
+    let v_then = func.alloc_value();
+    let then_bb = func.get_block_mut(b_then).unwrap();
+    then_bb.push_instruction(Instruction::new(
+        Some(v_then),
+        ValueExpr::Constant(ConstantValue::Int(42, IntType::I64)),
+        Span::DUMMY,
+    ));
+    then_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::YieldValue { val: v_then },
+        Span::DUMMY,
+    ));
+    then_bb.set_terminator(Terminator::Branch {
+        target: b_merge,
+        args: vec![v_then],
+    });
+
+    // Else branch: define v_else = 99, yield 99, jump to merge
+    let v_else = func.alloc_value();
+    let else_bb = func.get_block_mut(b_else).unwrap();
+    else_bb.push_instruction(Instruction::new(
+        Some(v_else),
+        ValueExpr::Constant(ConstantValue::Int(99, IntType::I64)),
+        Span::DUMMY,
+    ));
+    else_bb.push_instruction(Instruction::new(
+        None,
+        ValueExpr::YieldValue { val: v_else },
+        Span::DUMMY,
+    ));
+    else_bb.set_terminator(Terminator::Branch {
+        target: b_merge,
+        args: vec![v_else],
+    });
+
+    // Merge block: receives result, returns result + 1
+    let v_param = func.alloc_value();
+    let v_one = func.alloc_value();
+    let v_res = func.alloc_value();
+    let merge_bb = func.get_block_mut(b_merge).unwrap();
+    merge_bb.params.push((v_param, FirType::Int(IntType::I64)));
+    merge_bb.push_instruction(Instruction::new(
+        Some(v_one),
+        ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+        Span::DUMMY,
+    ));
+    merge_bb.push_instruction(Instruction::new(
+        Some(v_res),
+        ValueExpr::Binary {
+            op: ifa_fir::BinaryOp::Add,
+            lhs: v_param,
+            rhs: v_one,
+        },
+        Span::DUMMY,
+    ));
+    merge_bb.set_terminator(Terminator::Return(Some(v_res)));
+
+    assert!(func.is_coroutine());
+    module.functions.push(func);
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile branching coroutine to Cranelift machine code");
+
+    // Test with true branch (flag = true)
+    let caller_true = INTERNER.intern("call_true");
+    let mut c_true = FirFunction::new(
+        caller_true,
+        vec![],
+        FirType::Pointer(Box::new(FirType::Unit)),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let v_true = c_true.alloc_value();
+    let c_true_inst = c_true.alloc_value();
+    let c_true_bb = c_true.get_block_mut(BlockId(0)).unwrap();
+    c_true_bb.push_instruction(Instruction::new(
+        Some(v_true),
+        ValueExpr::Constant(ConstantValue::Bool(true)),
+        Span::DUMMY,
+    ));
+    c_true_bb.push_instruction(Instruction::new(
+        Some(c_true_inst),
+        ValueExpr::CallDirect {
+            name: gen_name,
+            args: vec![v_true],
+        },
+        Span::DUMMY,
+    ));
+    c_true_bb.set_terminator(Terminator::Return(Some(c_true_inst)));
+
+    let mut jit_true = JitEngine::new().expect("Failed to initialize JIT");
+    let mut mod_true = module.clone();
+    mod_true.functions.push(c_true);
+    jit_true
+        .compile_module(&mod_true)
+        .expect("Failed to compile true module");
+
+    let hdl_res = jit_true
+        .run_function("call_true")
+        .expect("Failed to call call_true");
+    let coro_ptr = hdl_res as *mut IfaCoroutine;
+    assert!(!coro_ptr.is_null());
+
+    unsafe {
+        let frame = ifa_rt_coro_frame(coro_ptr);
+        // Step 1: YieldValue 42
+        let s1 = ifa_rt_coro_resume(coro_ptr);
+        assert_eq!(s1, 0, "Should suspend at then yield");
+        let val1 = *(frame.add(8) as *const i64);
+        assert_eq!(val1, 42, "Then yield value must be 42");
+
+        // Step 2: Merge Return 42 + 1 = 43
+        let s2 = ifa_rt_coro_resume(coro_ptr);
+        assert_eq!(s2, 1, "Should complete at return");
+        let val2 = *(frame.add(8) as *const i64);
+        assert_eq!(val2, 43, "Merged return value must be 43");
+        assert_eq!(ifa_rt_coro_is_done(coro_ptr), 1);
+
+        ifa_rt_coro_destroy(coro_ptr);
+    }
+
+    // Test with false branch (flag = false)
+    let caller_false = INTERNER.intern("call_false");
+    let mut c_false = FirFunction::new(
+        caller_false,
+        vec![],
+        FirType::Pointer(Box::new(FirType::Unit)),
+        false,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    let v_false = c_false.alloc_value();
+    let c_false_inst = c_false.alloc_value();
+    let c_false_bb = c_false.get_block_mut(BlockId(0)).unwrap();
+    c_false_bb.push_instruction(Instruction::new(
+        Some(v_false),
+        ValueExpr::Constant(ConstantValue::Bool(false)),
+        Span::DUMMY,
+    ));
+    c_false_bb.push_instruction(Instruction::new(
+        Some(c_false_inst),
+        ValueExpr::CallDirect {
+            name: gen_name,
+            args: vec![v_false],
+        },
+        Span::DUMMY,
+    ));
+    c_false_bb.set_terminator(Terminator::Return(Some(c_false_inst)));
+
+    let mut jit_false = JitEngine::new().expect("Failed to initialize JIT");
+    let mut mod_false = module.clone();
+    mod_false.functions.push(c_false);
+    jit_false
+        .compile_module(&mod_false)
+        .expect("Failed to compile false module");
+
+    let hdl_res_false = jit_false
+        .run_function("call_false")
+        .expect("Failed to call call_false");
+    let coro_ptr_false = hdl_res_false as *mut IfaCoroutine;
+    assert!(!coro_ptr_false.is_null());
+
+    unsafe {
+        let frame = ifa_rt_coro_frame(coro_ptr_false);
+        // Step 1: YieldValue 99
+        let s1 = ifa_rt_coro_resume(coro_ptr_false);
+        assert_eq!(s1, 0, "Should suspend at else yield");
+        let val1 = *(frame.add(8) as *const i64);
+        assert_eq!(val1, 99, "Else yield value must be 99");
+
+        // Step 2: Merge Return 99 + 1 = 100
+        let s2 = ifa_rt_coro_resume(coro_ptr_false);
+        assert_eq!(s2, 1, "Should complete at return");
+        let val2 = *(frame.add(8) as *const i64);
+        assert_eq!(val2, 100, "Merged return value must be 100");
+        assert_eq!(ifa_rt_coro_is_done(coro_ptr_false), 1);
+
+        ifa_rt_coro_destroy(coro_ptr_false);
+    }
+}

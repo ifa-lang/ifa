@@ -36,7 +36,10 @@ pub use ipo::{
 };
 pub use ir::*;
 pub use layout_opt::{CacheLayoutPass, CacheLayoutStats, CACHE_LINE_SIZE};
-pub use licm::{FirPathAliasKind, LicmPass, LicmStats};
+pub use licm::{
+    FirAccessPath, FirPathAliasKind, FirPathSegment, InterproceduralFunctionSummary,
+    InterproceduralLicmContext, LicmPass, LicmStats,
+};
 pub use loop_opt::{LoopOptPass, LoopOptStats};
 pub use lower::lower_program;
 pub use printer::{format_function, format_module, FirPrinter};
