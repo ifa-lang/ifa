@@ -2222,3 +2222,166 @@ fn test_multi_arena_depthwise_pointwise_conv_and_batch_norm() {
     // Ch 0, pixel 0: (2.0 - 5.0) / sqrt(5.00001) * 1.0 + 0.0 = -3.0 / 2.2360679 ~= -1.34164
     assert!((bn_dst[0] - (-1.34164)).abs() < 1e-3);
 }
+
+#[test]
+fn test_multi_arena_gemm_and_normalizations() {
+    use ifa_runtime::ffi::{
+        ifa_simd_multi_arena_gemm_f32, ifa_simd_multi_arena_gemm_f64,
+        ifa_simd_multi_arena_gemm_i64, ifa_simd_multi_arena_layer_norm_f32,
+        ifa_simd_multi_arena_layer_norm_f64, ifa_simd_multi_arena_rmsnorm_f32,
+        ifa_simd_multi_arena_rmsnorm_f64,
+    };
+
+    // 1. GEMM (f32): C = alpha * (A @ B) + bias
+    // A: 2x3, B: 3x2, C: 2x2
+    // A = [[1, 2, 3], [4, 5, 6]]
+    // B = [[7, 8], [9, 1], [2, 3]]
+    // A @ B = [[1*7+2*9+3*2, 1*8+2*1+3*3], [4*7+5*9+6*2, 4*8+5*1+6*3]]
+    //       = [[7+18+6, 8+2+9], [28+45+12, 32+5+18]]
+    //       = [[31, 19], [85, 55]]
+    // Bias: [10, 20]
+    // C expected: [[31+10, 19+20], [85+10, 55+20]] = [[41, 39], [95, 75]]
+    let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b = [7.0f32, 8.0, 9.0, 1.0, 2.0, 3.0];
+    let bias = [10.0f32, 20.0];
+    let mut c = [0.0f32; 4];
+
+    unsafe {
+        ifa_simd_multi_arena_gemm_f32(
+            c.as_mut_ptr(),
+            a.as_ptr(),
+            b.as_ptr(),
+            bias.as_ptr(),
+            2,      // M
+            3,      // K
+            2,      // N
+            1.0f32, // alpha
+            0.0f32, // beta
+            0,      // activation: none
+        );
+    }
+    assert_eq!(c, [41.0, 39.0, 95.0, 75.0]);
+
+    // Test GEMM i64
+    let a_i64 = [1i64, 2, 3, 4, 5, 6];
+    let b_i64 = [7i64, 8, 9, 1, 2, 3];
+    let bias_i64 = [10i64, 20];
+    let mut c_i64 = [0i64; 4];
+    unsafe {
+        ifa_simd_multi_arena_gemm_i64(
+            c_i64.as_mut_ptr(),
+            a_i64.as_ptr(),
+            b_i64.as_ptr(),
+            bias_i64.as_ptr(),
+            2,
+            3,
+            2,
+            1,
+            0,
+            0,
+        );
+    }
+    assert_eq!(c_i64, [41, 39, 95, 75]);
+
+    // Test GEMM f64
+    let a_f64 = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b_f64 = [7.0f64, 8.0, 9.0, 1.0, 2.0, 3.0];
+    let bias_f64 = [10.0f64, 20.0];
+    let mut c_f64 = [0.0f64; 4];
+    unsafe {
+        ifa_simd_multi_arena_gemm_f64(
+            c_f64.as_mut_ptr(),
+            a_f64.as_ptr(),
+            b_f64.as_ptr(),
+            bias_f64.as_ptr(),
+            2,
+            3,
+            2,
+            1.0,
+            0.0,
+            0,
+        );
+    }
+    assert_eq!(c_f64, [41.0, 39.0, 95.0, 75.0]);
+
+    // 2. LayerNorm (f32)
+    // Batch: 2, Norm size: 4
+    // Row 0: [2, 4, 6, 8] -> Mean = 5.0, Var = ((9+1+1+9)/4) = 5.0, std = sqrt(5.0) ~= 2.236068
+    // Gamma: [1, 1, 1, 1], Beta: [0, 0, 0, 0]
+    let ln_src = [2.0f32, 4.0, 6.0, 8.0, 1.0, 3.0, 5.0, 7.0];
+    let ln_gamma = [1.0f32; 4];
+    let ln_beta = [0.0f32; 4];
+    let mut ln_dst = [0.0f32; 8];
+
+    unsafe {
+        ifa_simd_multi_arena_layer_norm_f32(
+            ln_dst.as_mut_ptr(),
+            ln_src.as_ptr(),
+            ln_gamma.as_ptr(),
+            ln_beta.as_ptr(),
+            2,
+            4,
+            0.0,
+            0,
+        );
+    }
+    // Row 0 elem 0: (2.0 - 5.0) / sqrt(5.0) = -3 / 2.236068 ~= -1.34164
+    assert!((ln_dst[0] - (-1.34164)).abs() < 1e-4);
+    // Row 0 elem 3: (8.0 - 5.0) / sqrt(5.0) = 3 / 2.236068 ~= 1.34164
+    assert!((ln_dst[3] - 1.34164).abs() < 1e-4);
+
+    // Test LayerNorm f64
+    let ln_src_f64 = [2.0f64, 4.0, 6.0, 8.0];
+    let mut ln_dst_f64 = [0.0f64; 4];
+    unsafe {
+        ifa_simd_multi_arena_layer_norm_f64(
+            ln_dst_f64.as_mut_ptr(),
+            ln_src_f64.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            4,
+            0.0,
+            0,
+        );
+    }
+    assert!((ln_dst_f64[0] - (-1.34164)).abs() < 1e-4);
+
+    // 3. RMSNorm (f32 & f64)
+    let rms_src_f32 = [2.0f32, 2.0, 2.0, 2.0];
+    let rms_gamma_f32 = [2.0f32, 3.0, 4.0, 5.0];
+    let mut rms_dst_f32 = [0.0f32; 4];
+    unsafe {
+        ifa_simd_multi_arena_rmsnorm_f32(
+            rms_dst_f32.as_mut_ptr(),
+            rms_src_f32.as_ptr(),
+            rms_gamma_f32.as_ptr(),
+            1,
+            4,
+            0.0,
+            0,
+        );
+    }
+    assert_eq!(rms_dst_f32, [2.0, 3.0, 4.0, 5.0]);
+
+    // 3. RMSNorm (f64)
+    // Batch: 1, Norm size: 4
+    // Row 0: [2, 2, 2, 2] -> Mean square = 4.0, RMS = 2.0
+    // x / RMS = 1.0
+    let rms_src = [2.0f64, 2.0, 2.0, 2.0];
+    let rms_gamma = [2.0f64, 3.0, 4.0, 5.0];
+    let mut rms_dst = [0.0f64; 4];
+
+    unsafe {
+        ifa_simd_multi_arena_rmsnorm_f64(
+            rms_dst.as_mut_ptr(),
+            rms_src.as_ptr(),
+            rms_gamma.as_ptr(),
+            1,
+            4,
+            0.0,
+            0,
+        );
+    }
+    assert_eq!(rms_dst, [2.0, 3.0, 4.0, 5.0]);
+}

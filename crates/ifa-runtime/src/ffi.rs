@@ -3684,3 +3684,405 @@ pub unsafe extern "C" fn ifa_simd_multi_arena_batch_norm2d_f64(
         }
     }
 }
+
+/// Multi-arena General Matrix Multiply (GEMM) kernel (f32).
+///
+/// Computes `C = beta * C + alpha * (A @ B) + bias` with optional activation.
+///
+/// # Safety
+///
+/// `c`, `a`, `b`, and `bias` must point to valid allocations for matrix dimensions (M, K, N).
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_gemm_f32(
+    c: *mut f32,
+    a: *const f32,
+    b: *const f32,
+    bias: *const f32,
+    m: i64,
+    k: i64,
+    n: i64,
+    alpha: f32,
+    beta: f32,
+    activation: i32,
+) {
+    if c.is_null() || a.is_null() || b.is_null() || m <= 0 || k <= 0 || n <= 0 {
+        return;
+    }
+
+    for i in 0..m {
+        let a_row_off = i * k;
+        let c_row_off = i * n;
+        for j in 0..n {
+            let mut accum = 0.0f32;
+            for p in 0..k {
+                let a_val = *a.offset((a_row_off + p) as isize);
+                let b_val = *b.offset((p * n + j) as isize);
+                accum += a_val * b_val;
+            }
+
+            let c_idx = (c_row_off + j) as isize;
+            let existing_c = if beta != 0.0f32 {
+                *c.offset(c_idx)
+            } else {
+                0.0f32
+            };
+            let bias_val = if !bias.is_null() {
+                *bias.offset(j as isize)
+            } else {
+                0.0f32
+            };
+
+            let mut out_val = (alpha * accum) + (beta * existing_c) + bias_val;
+            if activation == 1 && out_val < 0.0f32 {
+                out_val = 0.0f32;
+            }
+            *c.offset(c_idx) = out_val;
+        }
+    }
+}
+
+/// Multi-arena General Matrix Multiply (GEMM) kernel (f64).
+///
+/// Computes `C = beta * C + alpha * (A @ B) + bias` with optional activation.
+///
+/// # Safety
+///
+/// `c`, `a`, `b`, and `bias` must point to valid allocations for matrix dimensions (M, K, N).
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_gemm_f64(
+    c: *mut f64,
+    a: *const f64,
+    b: *const f64,
+    bias: *const f64,
+    m: i64,
+    k: i64,
+    n: i64,
+    alpha: f64,
+    beta: f64,
+    activation: i32,
+) {
+    if c.is_null() || a.is_null() || b.is_null() || m <= 0 || k <= 0 || n <= 0 {
+        return;
+    }
+
+    for i in 0..m {
+        let a_row_off = i * k;
+        let c_row_off = i * n;
+        for j in 0..n {
+            let mut accum = 0.0f64;
+            for p in 0..k {
+                let a_val = *a.offset((a_row_off + p) as isize);
+                let b_val = *b.offset((p * n + j) as isize);
+                accum += a_val * b_val;
+            }
+
+            let c_idx = (c_row_off + j) as isize;
+            let existing_c = if beta != 0.0f64 {
+                *c.offset(c_idx)
+            } else {
+                0.0f64
+            };
+            let bias_val = if !bias.is_null() {
+                *bias.offset(j as isize)
+            } else {
+                0.0f64
+            };
+
+            let mut out_val = (alpha * accum) + (beta * existing_c) + bias_val;
+            if activation == 1 && out_val < 0.0f64 {
+                out_val = 0.0f64;
+            }
+            *c.offset(c_idx) = out_val;
+        }
+    }
+}
+
+/// Multi-arena General Matrix Multiply (GEMM) kernel (i64).
+///
+/// Computes `C = beta * C + alpha * (A @ B) + bias` with optional activation.
+///
+/// # Safety
+///
+/// `c`, `a`, `b`, and `bias` must point to valid allocations for matrix dimensions (M, K, N).
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_gemm_i64(
+    c: *mut i64,
+    a: *const i64,
+    b: *const i64,
+    bias: *const i64,
+    m: i64,
+    k: i64,
+    n: i64,
+    alpha: i64,
+    beta: i64,
+    activation: i32,
+) {
+    if c.is_null() || a.is_null() || b.is_null() || m <= 0 || k <= 0 || n <= 0 {
+        return;
+    }
+
+    for i in 0..m {
+        let a_row_off = i * k;
+        let c_row_off = i * n;
+        for j in 0..n {
+            let mut accum = 0i64;
+            for p in 0..k {
+                let a_val = *a.offset((a_row_off + p) as isize);
+                let b_val = *b.offset((p * n + j) as isize);
+                accum = accum.wrapping_add(a_val.wrapping_mul(b_val));
+            }
+
+            let c_idx = (c_row_off + j) as isize;
+            let existing_c = if beta != 0 { *c.offset(c_idx) } else { 0 };
+            let bias_val = if !bias.is_null() {
+                *bias.offset(j as isize)
+            } else {
+                0
+            };
+
+            let mut out_val = (alpha.wrapping_mul(accum))
+                .wrapping_add(beta.wrapping_mul(existing_c))
+                .wrapping_add(bias_val);
+            if activation == 1 && out_val < 0 {
+                out_val = 0;
+            }
+            *c.offset(c_idx) = out_val;
+        }
+    }
+}
+
+/// Multi-arena Layer Normalization kernel (f32).
+///
+/// # Safety
+///
+/// `dst` and `src` must point to allocations of length `batch_size * norm_size`.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_layer_norm_f32(
+    dst: *mut f32,
+    src: *const f32,
+    gamma: *const f32,
+    beta: *const f32,
+    batch_size: i64,
+    norm_size: i64,
+    epsilon: f32,
+    activation: i32,
+) {
+    if dst.is_null() || src.is_null() || batch_size <= 0 || norm_size <= 0 {
+        return;
+    }
+
+    let inv_n = 1.0f32 / (norm_size as f32);
+
+    for b in 0..batch_size {
+        let row_off = (b * norm_size) as isize;
+
+        // 1. Mean
+        let mut sum = 0.0f32;
+        for i in 0..norm_size {
+            sum += *src.offset(row_off + i as isize);
+        }
+        let mean = sum * inv_n;
+
+        // 2. Variance
+        let mut sq_diff_sum = 0.0f32;
+        for i in 0..norm_size {
+            let diff = *src.offset(row_off + i as isize) - mean;
+            sq_diff_sum += diff * diff;
+        }
+        let var = sq_diff_sum * inv_n;
+        let inv_std = 1.0f32 / (var + epsilon).sqrt();
+
+        // 3. Normalize & scale/shift
+        for i in 0..norm_size {
+            let idx = row_off + i as isize;
+            let x = *src.offset(idx);
+            let g = if !gamma.is_null() {
+                *gamma.offset(i as isize)
+            } else {
+                1.0f32
+            };
+            let b_val = if !beta.is_null() {
+                *beta.offset(i as isize)
+            } else {
+                0.0f32
+            };
+
+            let x_hat = (x - mean) * inv_std;
+            let mut y = x_hat * g + b_val;
+            if activation == 1 && y < 0.0f32 {
+                y = 0.0f32;
+            }
+            *dst.offset(idx) = y;
+        }
+    }
+}
+
+/// Multi-arena Layer Normalization kernel (f64).
+///
+/// # Safety
+///
+/// `dst` and `src` must point to allocations of length `batch_size * norm_size`.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_layer_norm_f64(
+    dst: *mut f64,
+    src: *const f64,
+    gamma: *const f64,
+    beta: *const f64,
+    batch_size: i64,
+    norm_size: i64,
+    epsilon: f64,
+    activation: i32,
+) {
+    if dst.is_null() || src.is_null() || batch_size <= 0 || norm_size <= 0 {
+        return;
+    }
+
+    let inv_n = 1.0f64 / (norm_size as f64);
+
+    for b in 0..batch_size {
+        let row_off = (b * norm_size) as isize;
+
+        // 1. Mean
+        let mut sum = 0.0f64;
+        for i in 0..norm_size {
+            sum += *src.offset(row_off + i as isize);
+        }
+        let mean = sum * inv_n;
+
+        // 2. Variance
+        let mut sq_diff_sum = 0.0f64;
+        for i in 0..norm_size {
+            let diff = *src.offset(row_off + i as isize) - mean;
+            sq_diff_sum += diff * diff;
+        }
+        let var = sq_diff_sum * inv_n;
+        let inv_std = 1.0f64 / (var + epsilon).sqrt();
+
+        // 3. Normalize & scale/shift
+        for i in 0..norm_size {
+            let idx = row_off + i as isize;
+            let x = *src.offset(idx);
+            let g = if !gamma.is_null() {
+                *gamma.offset(i as isize)
+            } else {
+                1.0f64
+            };
+            let b_val = if !beta.is_null() {
+                *beta.offset(i as isize)
+            } else {
+                0.0f64
+            };
+
+            let x_hat = (x - mean) * inv_std;
+            let mut y = x_hat * g + b_val;
+            if activation == 1 && y < 0.0f64 {
+                y = 0.0f64;
+            }
+            *dst.offset(idx) = y;
+        }
+    }
+}
+
+/// Multi-arena Root Mean Square Normalization (RMSNorm) kernel (f32).
+///
+/// # Safety
+///
+/// `dst` and `src` must point to allocations of length `batch_size * norm_size`.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_rmsnorm_f32(
+    dst: *mut f32,
+    src: *const f32,
+    gamma: *const f32,
+    batch_size: i64,
+    norm_size: i64,
+    epsilon: f32,
+    activation: i32,
+) {
+    if dst.is_null() || src.is_null() || batch_size <= 0 || norm_size <= 0 {
+        return;
+    }
+
+    let inv_n = 1.0f32 / (norm_size as f32);
+
+    for b in 0..batch_size {
+        let row_off = (b * norm_size) as isize;
+
+        // Mean square
+        let mut sq_sum = 0.0f32;
+        for i in 0..norm_size {
+            let x = *src.offset(row_off + i as isize);
+            sq_sum += x * x;
+        }
+        let mean_sq = sq_sum * inv_n;
+        let inv_rms = 1.0f32 / (mean_sq + epsilon).sqrt();
+
+        // Scale
+        for i in 0..norm_size {
+            let idx = row_off + i as isize;
+            let x = *src.offset(idx);
+            let g = if !gamma.is_null() {
+                *gamma.offset(i as isize)
+            } else {
+                1.0f32
+            };
+
+            let mut y = (x * inv_rms) * g;
+            if activation == 1 && y < 0.0f32 {
+                y = 0.0f32;
+            }
+            *dst.offset(idx) = y;
+        }
+    }
+}
+
+/// Multi-arena Root Mean Square Normalization (RMSNorm) kernel (f64).
+///
+/// # Safety
+///
+/// `dst` and `src` must point to allocations of length `batch_size * norm_size`.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_rmsnorm_f64(
+    dst: *mut f64,
+    src: *const f64,
+    gamma: *const f64,
+    batch_size: i64,
+    norm_size: i64,
+    epsilon: f64,
+    activation: i32,
+) {
+    if dst.is_null() || src.is_null() || batch_size <= 0 || norm_size <= 0 {
+        return;
+    }
+
+    let inv_n = 1.0f64 / (norm_size as f64);
+
+    for b in 0..batch_size {
+        let row_off = (b * norm_size) as isize;
+
+        // Mean square
+        let mut sq_sum = 0.0f64;
+        for i in 0..norm_size {
+            let x = *src.offset(row_off + i as isize);
+            sq_sum += x * x;
+        }
+        let mean_sq = sq_sum * inv_n;
+        let inv_rms = 1.0f64 / (mean_sq + epsilon).sqrt();
+
+        // Scale
+        for i in 0..norm_size {
+            let idx = row_off + i as isize;
+            let x = *src.offset(idx);
+            let g = if !gamma.is_null() {
+                *gamma.offset(i as isize)
+            } else {
+                1.0f64
+            };
+
+            let mut y = (x * inv_rms) * g;
+            if activation == 1 && y < 0.0f64 {
+                y = 0.0f64;
+            }
+            *dst.offset(idx) = y;
+        }
+    }
+}
