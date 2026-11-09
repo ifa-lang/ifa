@@ -1,3 +1,4 @@
+pub mod collections;
 pub mod crypto;
 pub mod csv;
 pub mod fmt;
@@ -6,8 +7,10 @@ pub mod http;
 pub mod io;
 pub mod iter;
 pub mod json;
+pub mod process;
 pub mod sync;
 
+pub use collections::{ByteBuffer, List, Map, Set, StringBuilder};
 pub use crypto::{blake3, blake3_hex, sha256, sha256_hex};
 pub use csv::{decode as decode_csv, encode as encode_csv, CsvTable};
 pub use fmt::{
@@ -20,7 +23,9 @@ pub use fs::{
     is_dir as fs_is_dir, is_file as fs_is_file, list_dir as fs_list_dir, metadata as fs_metadata,
     read as fs_read, read_to_string as fs_read_to_string, remove_dir as fs_remove_dir,
     remove_dir_all as fs_remove_dir_all, remove_file as fs_remove_file, rename as fs_rename,
-    write as fs_write, write_string as fs_write_string, FileMetadata,
+    walk_dir as fs_walk_dir, walk_dir_files as fs_walk_dir_files,
+    walk_dir_matching as fs_walk_dir_matching, write as fs_write, write_string as fs_write_string,
+    FileMetadata,
 };
 pub use http::{
     HttpClient, HttpHandler, HttpHeaders, HttpMethod, HttpRequest, HttpResponse, HttpServer,
@@ -30,6 +35,10 @@ pub use io::{BufferedReader, BufferedWriter, MemoryStream};
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};
 pub use json::{
     decode as decode_json, encode as encode_json, encode_pretty as encode_json_pretty, JsonValue,
+};
+pub use process::{
+    find_system_tool, invoke_assembler, invoke_linker, run as process_run,
+    Command as ProcessCommand, ExitStatus as ProcessExitStatus, ProcessOutput,
 };
 pub use sync::{
     bounded, channel, AtomicFlag, AtomicInt, Receiver, RingBuffer, Select, Sender, WaitGroup,
@@ -354,5 +363,103 @@ mod tests {
         assert_eq!(not_found_resp.status, HttpStatus::NOT_FOUND);
 
         server.stop();
+    }
+
+    #[test]
+    fn test_collections_list_map_set() {
+        // List
+        let mut list = List::new();
+        list.push(30);
+        list.push(10);
+        list.push(20);
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0], 30);
+        list.sort();
+        assert_eq!(list.as_slice(), &[10, 20, 30]);
+
+        // Map
+        let mut map = Map::new();
+        map.insert("gamma", 3);
+        map.insert("alpha", 1);
+        map.insert("beta", 2);
+        let keys: Vec<_> = map.keys().copied().collect();
+        assert_eq!(keys, vec!["alpha", "beta", "gamma"]);
+        assert_eq!(map.get(&"beta"), Some(&2));
+
+        // Set
+        let mut set = Set::new();
+        assert!(set.insert(100));
+        assert!(set.insert(50));
+        assert!(set.insert(200));
+        assert!(!set.insert(50)); // duplicate
+        let sorted_elements: Vec<_> = set.iter().copied().collect();
+        assert_eq!(sorted_elements, vec![50, 100, 200]);
+    }
+
+    #[test]
+    fn test_byte_buffer_and_string_builder() {
+        // ByteBuffer
+        let mut buf = ByteBuffer::new();
+        buf.write_u8(0x7F);
+        buf.write_u32_le(0x12345678);
+        buf.write_u64_be(0xDEADBEEFCAFE0011);
+        buf.write_str("IFA_BOOTSTRAP");
+
+        assert_eq!(buf.read_u8(0), Some(0x7F));
+        assert_eq!(buf.read_u32_le(1), Some(0x12345678));
+        assert_eq!(buf.read_u8(buf.len() - 1), Some(b'P'));
+
+        // StringBuilder
+        let mut sb = StringBuilder::new();
+        sb.push_line("define i32 @main() {");
+        sb.indent();
+        sb.push_line("%t0 = add i32 10, 32");
+        sb.push_line("ret i32 %t0");
+        sb.dedent();
+        sb.push_line("}");
+
+        let result = sb.into_string();
+        assert!(result.contains("define i32 @main() {"));
+        assert!(result.contains("    %t0 = add i32 10, 32\n"));
+        assert!(result.contains("    ret i32 %t0\n"));
+        assert!(result.ends_with("}\n"));
+    }
+
+    #[test]
+    fn test_process_command_execution() {
+        let mut cmd = ProcessCommand::new("sh");
+        cmd.arg("-c");
+        cmd.arg("echo 'IFA_STDLIB_PROCESS_OK'");
+        let output = cmd.output().expect("Execute sh command");
+        assert!(output.success());
+        assert_eq!(output.stdout_string().trim(), "IFA_STDLIB_PROCESS_OK");
+
+        let echo_run = process_run("echo", ["test_run"]).expect("process_run echo");
+        assert!(echo_run.success());
+        assert_eq!(echo_run.stdout_string().trim(), "test_run");
+    }
+
+    #[test]
+    fn test_fs_walk_dir() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("ifa_walk_dir_test_{}", std::process::id()));
+        let _ = fs_remove_dir_all(&temp_dir);
+        fs_create_dir_all(temp_dir.join("sub/nested")).unwrap();
+
+        fs_write_string(temp_dir.join("root.txt"), "root").unwrap();
+        fs_write_string(temp_dir.join("sub/a.txt"), "a").unwrap();
+        fs_write_string(temp_dir.join("sub/nested/b.txt"), "b").unwrap();
+
+        let all_files = fs_walk_dir_files(&temp_dir).unwrap();
+        assert_eq!(all_files.len(), 3);
+        let file_names: Vec<_> = all_files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(file_names.contains(&"root.txt".to_string()));
+        assert!(file_names.contains(&"a.txt".to_string()));
+        assert!(file_names.contains(&"b.txt".to_string()));
+
+        let _ = fs_remove_dir_all(&temp_dir);
     }
 }

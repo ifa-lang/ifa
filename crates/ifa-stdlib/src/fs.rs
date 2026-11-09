@@ -117,3 +117,48 @@ pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<FileMetadata> {
         readonly: meta.permissions().readonly(),
     })
 }
+
+/// Recursively walk a directory tree in deterministic lexicographical order.
+///
+/// Returns all paths (directories and files) visited depth-first.
+pub fn walk_dir<P: AsRef<Path>>(root: P) -> io::Result<Vec<PathBuf>> {
+    let mut results = Vec::new();
+    walk_dir_internal(root.as_ref(), &mut results)?;
+    results.sort();
+    Ok(results)
+}
+
+fn walk_dir_internal(dir: &Path, acc: &mut Vec<PathBuf>) -> io::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let mut sub_entries = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        sub_entries.push(entry.path());
+    }
+    sub_entries.sort();
+    for entry_path in sub_entries {
+        let is_directory = entry_path.is_dir();
+        acc.push(entry_path.clone());
+        if is_directory {
+            walk_dir_internal(&entry_path, acc)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively walk a directory tree and return only regular files in deterministic order.
+pub fn walk_dir_files<P: AsRef<Path>>(root: P) -> io::Result<Vec<PathBuf>> {
+    let all = walk_dir(root)?;
+    Ok(all.into_iter().filter(|p| p.is_file()).collect())
+}
+
+/// Recursively walk a directory tree and return entries matching a predicate in deterministic order.
+pub fn walk_dir_matching<P: AsRef<Path>, F: Fn(&Path) -> bool>(
+    root: P,
+    predicate: F,
+) -> io::Result<Vec<PathBuf>> {
+    let all = walk_dir(root)?;
+    Ok(all.into_iter().filter(|p| predicate(p.as_path())).collect())
+}
