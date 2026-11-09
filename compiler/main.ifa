@@ -65,6 +65,33 @@ pub fn test_selfhost_modular_pipeline() -> bool {
         return false;
     }
 
+    // Type alias, tuple, and arena pipeline validation
+    let alias_tokens = lexer::tokenize_type_alias_program();
+    mut cur_al: i64 = 0;
+    let alias_decl = parser::parse_type_alias(inout cur_al, alias_tokens);
+    if alias_decl.name != "NodeId" || alias_decl.target_ty != "i64" {
+        return false;
+    }
+
+    let tuple_tokens = lexer::tokenize_tuple_program();
+    if tuple_tokens.len() != 28 {
+        return false;
+    }
+
+    let arena_tokens = lexer::tokenize_arena_program();
+    mut cur_ar: i64 = 0;
+    let arena_decl = parser::parse_arena_decl(inout cur_ar, arena_tokens);
+    if arena_decl.name != "scratch" {
+        return false;
+    }
+
+    let sema_alias_ok = sema::test_sema_type_alias_resolution();
+    let sema_tuple_ok = sema::test_sema_tuple_operations();
+    let sema_arena_ok = sema::test_sema_arena_allocation();
+    if !sema_alias_ok || !sema_tuple_ok || !sema_arena_ok {
+        return false;
+    }
+
     // Driver orchestration and native pipeline validation
     let cfg = driver::make_default_config("sample.ifa", "sample.ll");
     if !driver::validate_compiler_config(cfg) {

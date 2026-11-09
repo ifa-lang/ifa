@@ -1,8 +1,8 @@
 // Pure IFA Self-Hosting Compiler - Lexer Module (`compiler/lexer.ifa`)
 // Deterministic lexical scanner and token generation for IFA bootstrap compiler.
 
-comptime fn build_keyword_lut() -> [i64; 14] {
-    return [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16];
+comptime fn build_keyword_lut() -> [i64; 16] {
+    return [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 17, 18];
 }
 
 pub const KEYWORD_LUT = comptime build_keyword_lut();
@@ -229,6 +229,97 @@ pub fn tokenize_full_module() -> List<Token> {
     return tokens;
 }
 
+// Tokenize type alias declarations:
+// `pub type NodeId = i64; type Pair = (i64, i64);`
+pub fn tokenize_type_alias_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    // 1. pub type NodeId = i64;
+    advance_token(inout tokens, 15, 0, "pub");
+    advance_token(inout tokens, 17, 0, "type");
+    advance_token(inout tokens, 10, 0, "NodeId");
+    advance_token(inout tokens, 24, 0, "=");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 35, 0, ";");
+
+    // 2. type Pair = (i64, i64);
+    advance_token(inout tokens, 17, 0, "type");
+    advance_token(inout tokens, 10, 0, "Pair");
+    advance_token(inout tokens, 24, 0, "=");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 39, 0, ",");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 35, 0, ";");
+
+    return tokens;
+}
+
+// Tokenize tuple expressions and function return type:
+// `fn make_pair(inout a: i64) -> (i64, i64) { let p = (a, 42); return p; }`
+pub fn tokenize_tuple_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    advance_token(inout tokens, 1, 0, "fn");
+    advance_token(inout tokens, 10, 0, "make_pair");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 5, 0, "inout");
+    advance_token(inout tokens, 10, 0, "a");
+    advance_token(inout tokens, 34, 0, ":");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 36, 0, "->");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 39, 0, ",");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 2, 0, "let");
+    advance_token(inout tokens, 10, 0, "p");
+    advance_token(inout tokens, 24, 0, "=");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 10, 0, "a");
+    advance_token(inout tokens, 39, 0, ",");
+    advance_token(inout tokens, 11, 42, "42");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 4, 0, "return");
+    advance_token(inout tokens, 10, 0, "p");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+
+    return tokens;
+}
+
+// Tokenize explicit arena declaration:
+// `arena scratch; fn build_node(val: i64) -> i64 { return val; }`
+pub fn tokenize_arena_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    advance_token(inout tokens, 18, 0, "arena");
+    advance_token(inout tokens, 10, 0, "scratch");
+    advance_token(inout tokens, 35, 0, ";");
+
+    advance_token(inout tokens, 1, 0, "fn");
+    advance_token(inout tokens, 10, 0, "build_node");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 10, 0, "val");
+    advance_token(inout tokens, 34, 0, ":");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 36, 0, "->");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 4, 0, "return");
+    advance_token(inout tokens, 10, 0, "val");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+
+    return tokens;
+}
+
 // Unit test: Token stream verification and list properties
 pub fn test_lexer_stream() -> bool {
     let tokens = tokenize_sample_program();
@@ -252,7 +343,51 @@ pub fn test_lexer_stream() -> bool {
 
 // Unit test: Comptime keyword LUT validation
 pub fn test_comptime_keyword_lut() -> bool {
-    return KEYWORD_LUT.len() == 14;
+    return KEYWORD_LUT.len() == 16;
+}
+
+// Unit test: Type alias tokenization validation
+pub fn test_lexer_type_alias() -> bool {
+    let tokens = tokenize_type_alias_program();
+    if tokens.len() != 15 {
+        return false;
+    }
+    // 0: pub, 1: type, 2: NodeId, 3: =, 4: i64, 5: ;
+    if tokens[0].kind != 15 || tokens[1].kind != 17 || tokens[2].lexeme != "NodeId" {
+        return false;
+    }
+    // 6: type, 7: Pair
+    if tokens[6].kind != 17 || tokens[7].lexeme != "Pair" {
+        return false;
+    }
+    return true;
+}
+
+// Unit test: Tuple tokenization validation
+pub fn test_lexer_tuples() -> bool {
+    let tokens = tokenize_tuple_program();
+    if tokens.len() != 28 {
+        return false;
+    }
+    // Check let p = (a, 42);
+    // index 18: (, 19: a, 20: ,, 21: 42, 22: )
+    if tokens[18].kind != 30 || tokens[20].kind != 39 || tokens[22].kind != 31 {
+        return false;
+    }
+    return tokens[21].value == 42;
+}
+
+// Unit test: Arena tokenization validation
+pub fn test_lexer_arena() -> bool {
+    let tokens = tokenize_arena_program();
+    if tokens.len() != 17 {
+        return false;
+    }
+    // index 0: arena, index 1: scratch, index 2: ;
+    if tokens[0].kind != 18 || tokens[1].lexeme != "scratch" || tokens[2].kind != 35 {
+        return false;
+    }
+    return true;
 }
 
 pub fn main() {
@@ -260,7 +395,11 @@ pub fn main() {
     let tokens = tokenize_sample_program();
     println("Sample tokens tokenized successfully:", tokens.len());
     let t_ok = test_lexer_stream();
-    if t_ok {
+    let t_lut = test_comptime_keyword_lut();
+    let t_alias = test_lexer_type_alias();
+    let t_tuple = test_lexer_tuples();
+    let t_arena = test_lexer_arena();
+    if t_ok && t_lut && t_alias && t_tuple && t_arena {
         println("Lexer stream test: OK");
     } else {
         println("Lexer stream test: FAILED");

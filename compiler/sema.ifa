@@ -73,6 +73,26 @@ pub fn eval_expression(
             return 0;
         }
     }
+    if k == 4 {
+        // Tuple expression (pair): encode as packed value (left * 1000) + right
+        let left_val = eval_expression(expr?.left, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
+        let right_val = eval_expression(expr?.right, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
+        return (left_val * 1000) + right_val;
+    }
+    if k == 5 {
+        // Tuple index access: tup.0 or tup.1
+        let idx = expr?.val ?? 0;
+        let tup_val = eval_expression(expr?.left, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
+        if idx == 0 {
+            return tup_val / 1000;
+        } else {
+            return tup_val - ((tup_val / 1000) * 1000);
+        }
+    }
+    if k == 6 {
+        // Arena allocation: alloc(val, arena)
+        return eval_expression(expr?.left, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
+    }
     return 0;
 }
 
@@ -258,13 +278,183 @@ pub fn test_sema_pattern_matching() -> bool {
     return res_def == 42;
 }
 
+// Type alias symbol table and resolution
+pub struct TypeAliasTable {
+    names: List<String>,
+    targets: List<String>
+}
+
+pub fn make_type_alias_table() -> TypeAliasTable {
+    return TypeAliasTable(names: List::new(), targets: List::new());
+}
+
+pub fn register_type_alias(inout table: TypeAliasTable, name: String, target: String) {
+    table.names.push(name);
+    table.targets.push(target);
+}
+
+pub fn resolve_type_alias(table: TypeAliasTable, ty: String) -> String {
+    mut i: i64 = 0;
+    while i < table.names.len() {
+        if table.names[i] == ty {
+            let target = table.targets[i];
+            if target != ty {
+                return resolve_type_alias(table, target);
+            }
+            return target;
+        }
+        i = i + 1;
+    }
+    return ty;
+}
+
+// Explicit scoped arena allocator for generational memory management
+pub struct ScopedArena {
+    name: String,
+    capacity: i64,
+    allocated_bytes: i64,
+    active_borrows: i64
+}
+
+pub fn make_scoped_arena(name: String, capacity: i64) -> ScopedArena {
+    return ScopedArena(
+        name: name,
+        capacity: capacity,
+        allocated_bytes: 0,
+        active_borrows: 0
+    );
+}
+
+pub fn arena_allocate(inout arena: ScopedArena, bytes: i64) -> bool {
+    if arena.allocated_bytes + bytes > arena.capacity {
+        return false;
+    }
+    arena.allocated_bytes = arena.allocated_bytes + bytes;
+    return true;
+}
+
+pub fn arena_borrow_exclusive(inout arena: ScopedArena) -> bool {
+    if arena.active_borrows > 0 {
+        return false; // Exclusive borrow violation
+    }
+    arena.active_borrows = 1;
+    return true;
+}
+
+pub fn arena_release_exclusive(inout arena: ScopedArena) {
+    arena.active_borrows = 0;
+}
+
+// Unit test 5: Semantic Type Alias recursive resolution
+pub fn test_sema_type_alias_resolution() -> bool {
+    mut table = make_type_alias_table();
+    register_type_alias(inout table, "NodeId", "i64");
+    register_type_alias(inout table, "VertexId", "NodeId");
+
+    let res1 = resolve_type_alias(table, "NodeId");
+    let res2 = resolve_type_alias(table, "VertexId");
+    let res3 = resolve_type_alias(table, "String");
+
+    if res1 != "i64" {
+        return false;
+    }
+    if res2 != "i64" {
+        return false;
+    }
+    return res3 == "String";
+}
+
+// Unit test 6: Semantic Tuple evaluation and member access
+pub fn test_sema_tuple_operations() -> bool {
+    mut pool: List<AstExpr> = List::new();
+    let elem_left = AstExpr(kind: 1, val: 40, name: "", op: 0, left: None, right: None);
+    pool.push(elem_left);
+    let idx_left = pool.len() - 1;
+
+    let elem_right = AstExpr(kind: 1, val: 2, name: "", op: 0, left: None, right: None);
+    pool.push(elem_right);
+    let idx_right = pool.len() - 1;
+
+    // Tuple literal `(40, 2)` -> encoded as 40002
+    let tuple_expr = AstExpr(
+        kind: 4,
+        val: 2,
+        name: "tuple",
+        op: 0,
+        left: ref pool[idx_left],
+        right: ref pool[idx_right]
+    );
+    pool.push(tuple_expr);
+    let idx_tup = pool.len() - 1;
+
+    // Tuple index 0 access
+    let access_0 = AstExpr(
+        kind: 5,
+        val: 0,
+        name: "tup",
+        op: 0,
+        left: ref pool[idx_tup],
+        right: None
+    );
+
+    // Tuple index 1 access
+    let access_1 = AstExpr(
+        kind: 5,
+        val: 1,
+        name: "tup",
+        op: 0,
+        left: ref pool[idx_tup],
+        right: None
+    );
+
+    let val0 = eval_expression(ref access_0, "", 0, "", 0, "", 0);
+    let val1 = eval_expression(ref access_1, "", 0, "", 0, "", 0);
+
+    if val0 != 40 {
+        return false;
+    }
+    if val1 != 2 {
+        return false;
+    }
+    return val0 + val1 == 42;
+}
+
+// Unit test 7: Explicit arena allocation and exclusive access semantics
+pub fn test_sema_arena_allocation() -> bool {
+    mut arena = make_scoped_arena("scratch", 1024);
+    let ok_alloc = arena_allocate(inout arena, 128);
+    if !ok_alloc {
+        return false;
+    }
+    if arena.allocated_bytes != 128 {
+        return false;
+    }
+
+    // Test exclusive borrow
+    let borrow1 = arena_borrow_exclusive(inout arena);
+    if !borrow1 {
+        return false;
+    }
+    // Second borrow should fail (exclusivity violation check)
+    let borrow2 = arena_borrow_exclusive(inout arena);
+    if borrow2 {
+        return false;
+    }
+    arena_release_exclusive(inout arena);
+
+    return arena_borrow_exclusive(inout arena);
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
     let t2 = test_sema_polymorphic_method();
     let t3 = test_sema_generic_trait_bound();
     let t4 = test_sema_pattern_matching();
-    if t1 && t2 && t3 && t4 {
+    let t5 = test_sema_type_alias_resolution();
+    let t6 = test_sema_tuple_operations();
+    let t7 = test_sema_arena_allocation();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");

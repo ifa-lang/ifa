@@ -95,8 +95,43 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_lexer_type_alias ... ok"),
+        "Modular lexer type alias test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_lexer_tuples ... ok"),
+        "Modular lexer tuples test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_lexer_arena ... ok"),
+        "Modular lexer arena test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_parser_ast_building ... ok"),
         "Modular parser tests missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_type_alias ... ok"),
+        "Modular parser type alias test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_tuple_expression ... ok"),
+        "Modular parser tuple expression test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_tuple_index_access ... ok"),
+        "Modular parser tuple index access test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_arena_declaration ... ok"),
+        "Modular parser arena declaration test missing from output:\n{}",
         stdout
     );
     assert!(
@@ -122,6 +157,21 @@ fn test_modular_compiler_unit_tests() {
     assert!(
         stdout.contains("test test_sema_eval ... ok"),
         "Modular sema tests missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_type_alias_resolution ... ok"),
+        "Modular sema type alias resolution test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_tuple_operations ... ok"),
+        "Modular sema tuple operations test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_arena_allocation ... ok"),
+        "Modular sema arena allocation test missing from output:\n{}",
         stdout
     );
     assert!(
@@ -170,8 +220,8 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("53 passed; 0 failed"),
-        "Expected 53 passed unit tests, got:\n{}",
+        stdout.contains("73 passed; 0 failed"),
+        "Expected 73 passed unit tests, got:\n{}",
         stdout
     );
 }
