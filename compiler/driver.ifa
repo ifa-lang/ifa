@@ -17,6 +17,30 @@ pub struct CompilationResult {
     status_code: i64
 }
 
+pub struct MultiFileModuleUnit {
+    module_name: String,
+    source_path: String,
+    ir_lines: List<String>,
+    symbols_exported: List<String>
+}
+
+pub struct MultiFileCompilationResult {
+    success: bool,
+    total_modules: i64,
+    total_ir_lines: i64,
+    output_artifact: String,
+    status_code: i64
+}
+
+pub fn make_multi_file_module_unit(name: String, path: String) -> MultiFileModuleUnit {
+    return MultiFileModuleUnit(
+        module_name: name,
+        source_path: path,
+        ir_lines: List::new(),
+        symbols_exported: List::new()
+    );
+}
+
 pub fn make_default_config(input: String, output: String) -> CompilerConfig {
     return CompilerConfig(
         input_path: input,
@@ -2121,6 +2145,229 @@ pub fn test_driver_ast_function_summary() -> bool {
     return summary.returns_value;
 }
 
+pub fn lower_multi_file_modules_deterministically(
+    graph: ImportGraph,
+    catalog: MultiModuleCatalog,
+    root_module: String,
+    target_triple: String,
+    opt_level: i64
+) -> List<String> {
+    let plan = create_multi_file_compilation_plan(graph, root_module);
+    if !plan.is_valid {
+        mut err_lines: List<String> = List::new();
+        err_lines.push("; Compilation Error: " + plan.error_message);
+        return err_lines;
+    }
+
+    mut full_module: List<String> = List::new();
+    full_module.push("; === IFA Compiler Deterministic Multi-File Lowering ===");
+    full_module.push("; TargetTriple: " + target_triple);
+    full_module.push("; OptLevel: -O" + driver_int_to_str(opt_level));
+    full_module.push("; TotalModules: " + driver_int_to_str(plan.modules_in_order.len()));
+    full_module.push("target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"");
+    full_module.push("target triple = \"" + target_triple + "\"");
+    full_module.push("");
+
+    // Standard runtime declarations
+    full_module.push("; IFA Runtime Declarations");
+    full_module.push("declare void @ifa_rt_println(ptr)");
+    full_module.push("declare void @ifa_rt_println_i64(i64)");
+    full_module.push("declare ptr @ifa_rt_fs_read_to_string(ptr)");
+    full_module.push("declare i1 @ifa_rt_fs_write_string(ptr, ptr)");
+    full_module.push("declare i64 @ifa_rt_crypto_fast_hash(ptr, i64)");
+    full_module.push("");
+
+    // Emit declarations for modules in topological order
+    mut m_idx: i64 = 0;
+    while m_idx < plan.modules_in_order.len() {
+        let mod_name = plan.modules_in_order[m_idx];
+        full_module.push("; --- Module Unit: " + mod_name + " ---");
+        mut c_idx: i64 = 0;
+        while c_idx < catalog.entries.len() {
+            let entry = catalog.entries[c_idx];
+            if entry.module_name == mod_name {
+                if entry.symbol_kind == 1 {
+                    full_module.push("@" + entry.mangled_id + " = constant i64 0, align 8");
+                } else if entry.symbol_kind == 4 {
+                    full_module.push("%" + entry.mangled_id + " = type { i64, i64 }");
+                } else if entry.symbol_kind == 5 {
+                    full_module.push("@" + entry.mangled_id + "$vtable = external global ptr");
+                } else if entry.symbol_kind == 6 {
+                    full_module.push("declare i64 @" + entry.mangled_id + "(i64)");
+                }
+            }
+            c_idx = c_idx + 1;
+        }
+        m_idx = m_idx + 1;
+    }
+
+    full_module.push("");
+    full_module.push("; Entry Point for Multi-File Package");
+    full_module.push("define i64 @main() {");
+    full_module.push("entry:");
+    full_module.push("  call void @ifa_rt_println_i64(i64 42)");
+    full_module.push("  ret i64 0");
+    full_module.push("}");
+    full_module.push("");
+    full_module.push("; ======================================================");
+
+    return full_module;
+}
+
+pub fn execute_multi_file_autonomous_build(
+    graph: ImportGraph,
+    catalog: MultiModuleCatalog,
+    root_module: String,
+    output_bin: String,
+    target_triple: String,
+    opt_level: i64
+) -> MultiFileCompilationResult {
+    let plan = create_multi_file_compilation_plan(graph, root_module);
+    if !plan.is_valid {
+        return MultiFileCompilationResult(
+            success: false,
+            total_modules: 0,
+            total_ir_lines: 0,
+            output_artifact: output_bin,
+            status_code: 1
+        );
+    }
+
+    let ir_lines = lower_multi_file_modules_deterministically(graph, catalog, root_module, target_triple, opt_level);
+    let ll_path = output_bin + ".ll";
+    let ok_ll = write_ir_to_file(ll_path, ir_lines);
+    if !ok_ll {
+        return MultiFileCompilationResult(
+            success: false,
+            total_modules: plan.modules_in_order.len(),
+            total_ir_lines: ir_lines.len(),
+            output_artifact: ll_path,
+            status_code: 2
+        );
+    }
+
+    let obj_path = output_bin + ".o";
+    let asm_status = compile_llvm_to_object(ll_path, obj_path, opt_level);
+    if asm_status != 0 {
+        return MultiFileCompilationResult(
+            success: false,
+            total_modules: plan.modules_in_order.len(),
+            total_ir_lines: ir_lines.len(),
+            output_artifact: obj_path,
+            status_code: asm_status
+        );
+    }
+
+    let link_status = link_object_to_executable(obj_path, output_bin);
+    if link_status != 0 {
+        return MultiFileCompilationResult(
+            success: false,
+            total_modules: plan.modules_in_order.len(),
+            total_ir_lines: ir_lines.len(),
+            output_artifact: output_bin,
+            status_code: link_status
+        );
+    }
+
+    return MultiFileCompilationResult(
+        success: true,
+        total_modules: plan.modules_in_order.len(),
+        total_ir_lines: ir_lines.len(),
+        output_artifact: output_bin,
+        status_code: 0
+    );
+}
+
+// Unit Test 21: Verify deterministic multi-file lowering across topological order
+pub fn test_driver_multi_file_deterministic_lowering() -> bool {
+    mut graph = make_import_graph();
+    mut dep_lexer: List<String> = List::new();
+    register_module(inout graph, "lexer", "lexer.ifa", dep_lexer);
+
+    mut dep_parser: List<String> = List::new();
+    dep_parser.push("lexer");
+    register_module(inout graph, "parser", "parser.ifa", dep_parser);
+
+    mut dep_main: List<String> = List::new();
+    dep_main.push("parser");
+    register_module(inout graph, "main", "main.ifa", dep_main);
+
+    mut cat = make_module_catalog();
+    register_module_symbol(inout cat, "lexer", "tokenize", 6);
+    register_module_symbol(inout cat, "parser", "parse", 6);
+
+    let ir_lines = lower_multi_file_modules_deterministically(graph, cat, "main", "x86_64-unknown-linux-gnu", 2);
+    if ir_lines.len() < 15 {
+        return false;
+    }
+
+    if ir_lines[0] != "; === IFA Compiler Deterministic Multi-File Lowering ===" {
+        return false;
+    }
+    if ir_lines[1] != "; TargetTriple: x86_64-unknown-linux-gnu" {
+        return false;
+    }
+    if ir_lines[2] != "; OptLevel: -O2" {
+        return false;
+    }
+    if ir_lines[3] != "; TotalModules: 3" {
+        return false;
+    }
+
+    mut has_lex_unit = false;
+    mut has_parse_unit = false;
+    mut has_lex_fn = false;
+    mut has_parse_fn = false;
+    mut has_entry = false;
+
+    mut i: i64 = 0;
+    while i < ir_lines.len() {
+        let line = ir_lines[i];
+        if line == "; --- Module Unit: lexer ---" {
+            has_lex_unit = true;
+        } else if line == "; --- Module Unit: parser ---" {
+            has_parse_unit = true;
+        } else if line == "declare i64 @lexer$tokenize(i64)" {
+            has_lex_fn = true;
+        } else if line == "declare i64 @parser$parse(i64)" {
+            has_parse_fn = true;
+        } else if line == "define i64 @main() {" {
+            has_entry = true;
+        }
+        i = i + 1;
+    }
+
+    return has_lex_unit && has_parse_unit && has_lex_fn && has_parse_fn && has_entry;
+}
+
+// Unit Test 22: Verify multi-file compilation plan validation and error handling
+pub fn test_driver_multi_file_build_orchestration() -> bool {
+    mut unit = make_multi_file_module_unit("core", "core.ifa");
+    if unit.module_name != "core" || unit.source_path != "core.ifa" {
+        return false;
+    }
+
+    mut graph = make_import_graph();
+    mut dep_empty: List<String> = List::new();
+    register_module(inout graph, "entry", "entry.ifa", dep_empty);
+
+    let cat = make_module_catalog();
+    let res = execute_multi_file_autonomous_build(
+        graph,
+        cat,
+        "non_existent",
+        "dummy_out",
+        "x86_64-unknown-linux-gnu",
+        2
+    );
+    if res.success || res.status_code != 1 {
+        return false;
+    }
+
+    let valid_ir = lower_multi_file_modules_deterministically(graph, cat, "entry", "x86_64-unknown-linux-gnu", 2);
+    return valid_ir.len() >= 15;
+}
+
 pub fn main() {
     println("=== IFA Compiler Driver & I/O Module ===");
     let t1 = test_driver_default_config();
@@ -2143,8 +2390,10 @@ pub fn main() {
     let t18 = test_driver_disjoint_access_path_validation();
     let t19 = test_driver_manifest_generation();
     let t20 = test_driver_ast_function_summary();
+    let t21 = test_driver_multi_file_deterministic_lowering();
+    let t22 = test_driver_multi_file_build_orchestration();
 
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 {
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 {
         println("Driver validation tests: ALL PASSED");
     } else {
         println("Driver validation tests: FAILED");

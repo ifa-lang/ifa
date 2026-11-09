@@ -248,6 +248,32 @@ pub struct AstChecksumVerification {
     expected_hash: i64
 }
 
+// AST: Direct jump table dispatch target (computed goto / indirect branch)
+pub struct AstJumpTableTarget {
+    opcode: i64,
+    label: String
+}
+
+// AST: Computed goto dispatch jump table definition
+pub struct AstIndirectJumpTable {
+    table_name: String,
+    function_name: String,
+    targets: List<AstJumpTableTarget>
+}
+
+// AST: Indirect branch instruction (LLVM `indirectbr`, FIR `fir.indirectbr`)
+pub struct AstIndirectBranchStmt {
+    address_var: String,
+    possible_targets: List<String>
+}
+
+// AST: Direct dispatch table address lookup instruction
+pub struct AstDirectDispatchOp {
+    table_name: String,
+    opcode_var: String,
+    target_ptr_var: String
+}
+
 // AST: Thunk definition for zero-allocation stack closures
 pub struct AstThunkDef {
     thunk_name: String,
@@ -4674,6 +4700,89 @@ pub fn emit_fir_checksum_verification(chk: AstChecksumVerification) -> List<Stri
     return lines;
 }
 
+/// Lowers an indirect dispatch jump table (computed gotos) to LLVM IR constant array.
+pub fn emit_llvm_indirect_jump_table(tbl: AstIndirectJumpTable) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut arr = "@" + tbl.table_name + " = private unnamed_addr constant [" + int_to_str(tbl.targets.len()) + " x ptr] [";
+    mut i: i64 = 0;
+    while i < tbl.targets.len() {
+        if i > 0 {
+            arr = arr + ", ";
+        }
+        let t = tbl.targets[i];
+        arr = arr + "ptr blockaddress(@" + tbl.function_name + ", %" + t.label + ")";
+        i = i + 1;
+    }
+    arr = arr + "], align 8";
+    lines.push(arr);
+    return lines;
+}
+
+pub fn emit_fir_indirect_jump_table(tbl: AstIndirectJumpTable) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut s = "fir.jump_table @" + tbl.table_name + " in @" + tbl.function_name + " = [";
+    mut i: i64 = 0;
+    while i < tbl.targets.len() {
+        if i > 0 {
+            s = s + ", ";
+        }
+        let t = tbl.targets[i];
+        s = s + int_to_str(t.opcode) + ": ^" + t.label;
+        i = i + 1;
+    }
+    s = s + "]";
+    lines.push(s);
+    return lines;
+}
+
+/// Lowers an indirect branch statement (computed goto) to LLVM IR indirectbr.
+pub fn emit_llvm_indirect_branch(stmt: AstIndirectBranchStmt) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut s = "  indirectbr ptr %" + stmt.address_var + ", [ ";
+    mut i: i64 = 0;
+    while i < stmt.possible_targets.len() {
+        if i > 0 {
+            s = s + ", ";
+        }
+        s = s + "label %" + stmt.possible_targets[i];
+        i = i + 1;
+    }
+    s = s + " ]";
+    lines.push(s);
+    return lines;
+}
+
+pub fn emit_fir_indirect_branch(stmt: AstIndirectBranchStmt) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut s = "    fir.indirectbr %" + stmt.address_var + ", [ ";
+    mut i: i64 = 0;
+    while i < stmt.possible_targets.len() {
+        if i > 0 {
+            s = s + ", ";
+        }
+        s = s + "^" + stmt.possible_targets[i];
+        i = i + 1;
+    }
+    s = s + " ]";
+    lines.push(s);
+    return lines;
+}
+
+/// Lowers a direct dispatch target address load from a jump table.
+pub fn emit_llvm_direct_dispatch(op: AstDirectDispatchOp, num_targets: i64) -> List<String> {
+    mut lines: List<String> = List::new();
+    let slot_var = "%slot." + op.table_name;
+    lines.push("  " + slot_var + " = getelementptr inbounds [" + int_to_str(num_targets) + " x ptr], ptr @" + op.table_name + ", i64 0, i64 %" + op.opcode_var);
+    lines.push("  %" + op.target_ptr_var + " = load ptr, ptr " + slot_var + ", align 8");
+    return lines;
+}
+
+pub fn emit_fir_direct_dispatch(op: AstDirectDispatchOp) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + op.target_ptr_var + " = fir.load_dispatch_target @" + op.table_name + "[%" + op.opcode_var + "]");
+    return lines;
+}
+
 // Unit test 43: SSA switch and jump table multi-way branching
 pub fn test_codegen_ssa_switch_and_jump_table() -> bool {
     mut cases: List<AstSwitchCase> = List::new();
@@ -4773,6 +4882,76 @@ pub fn test_codegen_checksum_verification() -> bool {
     return fir_chk[1] == "    %hash_code_match = fir.icmp.eq %hash_code, 42";
 }
 
+// Unit test 46: Computed gotos and direct jump table dispatch lowering
+pub fn test_codegen_computed_goto_dispatch_table() -> bool {
+    mut targets: List<AstJumpTableTarget> = List::new();
+    targets.push(AstJumpTableTarget(opcode: 0, label: "op.add"));
+    targets.push(AstJumpTableTarget(opcode: 1, label: "op.sub"));
+    targets.push(AstJumpTableTarget(opcode: 2, label: "op.mul"));
+
+    let tbl = AstIndirectJumpTable(
+        table_name: "eval_dispatch_table",
+        function_name: "eval_ast_loop",
+        targets: targets
+    );
+
+    let llvm_tbl = emit_llvm_indirect_jump_table(tbl);
+    let fir_tbl = emit_fir_indirect_jump_table(tbl);
+
+    if llvm_tbl.len() != 1 || fir_tbl.len() != 1 {
+        return false;
+    }
+    let exp_llvm_tbl = "@eval_dispatch_table = private unnamed_addr constant [3 x ptr] [ptr blockaddress(@eval_ast_loop, %op.add), ptr blockaddress(@eval_ast_loop, %op.sub), ptr blockaddress(@eval_ast_loop, %op.mul)], align 8";
+    if llvm_tbl[0] != exp_llvm_tbl {
+        return false;
+    }
+    if fir_tbl[0] != "fir.jump_table @eval_dispatch_table in @eval_ast_loop = [0: ^op.add, 1: ^op.sub, 2: ^op.mul]" {
+        return false;
+    }
+
+    let disp_op = AstDirectDispatchOp(
+        table_name: "eval_dispatch_table",
+        opcode_var: "opcode",
+        target_ptr_var: "target_block"
+    );
+    let llvm_disp = emit_llvm_direct_dispatch(disp_op, 3);
+    let fir_disp = emit_fir_direct_dispatch(disp_op);
+
+    if llvm_disp.len() != 2 || fir_disp.len() != 1 {
+        return false;
+    }
+    if llvm_disp[0] != "  %slot.eval_dispatch_table = getelementptr inbounds [3 x ptr], ptr @eval_dispatch_table, i64 0, i64 %opcode" {
+        return false;
+    }
+    if llvm_disp[1] != "  %target_block = load ptr, ptr %slot.eval_dispatch_table, align 8" {
+        return false;
+    }
+    if fir_disp[0] != "    %target_block = fir.load_dispatch_target @eval_dispatch_table[%opcode]" {
+        return false;
+    }
+
+    mut branch_targets: List<String> = List::new();
+    branch_targets.push("op.add");
+    branch_targets.push("op.sub");
+    branch_targets.push("op.mul");
+
+    let br = AstIndirectBranchStmt(
+        address_var: "target_block",
+        possible_targets: branch_targets
+    );
+
+    let llvm_br = emit_llvm_indirect_branch(br);
+    let fir_br = emit_fir_indirect_branch(br);
+
+    if llvm_br.len() != 1 || fir_br.len() != 1 {
+        return false;
+    }
+    if llvm_br[0] != "  indirectbr ptr %target_block, [ label %op.add, label %op.sub, label %op.mul ]" {
+        return false;
+    }
+    return fir_br[0] == "    fir.indirectbr %target_block, [ ^op.add, ^op.sub, ^op.mul ]";
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -4822,7 +5001,8 @@ pub fn main() {
     let t43 = test_codegen_ssa_switch_and_jump_table();
     let t44 = test_codegen_symbol_lookup_table();
     let t45 = test_codegen_checksum_verification();
-    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 && t33 && t34 && t35 && t36 && t37 && t38 && t39 && t40 && t41 && t42 && t43 && t44 && t45 {
+    let t46 = test_codegen_computed_goto_dispatch_table();
+    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 && t33 && t34 && t35 && t36 && t37 && t38 && t39 && t40 && t41 && t42 && t43 && t44 && t45 && t46 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");

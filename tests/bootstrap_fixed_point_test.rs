@@ -786,8 +786,23 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("300 passed; 0 failed"),
-        "Expected 300 passed unit tests, got:\n{}",
+        stdout.contains("test test_codegen_computed_goto_dispatch_table ... ok"),
+        "Modular codegen computed goto dispatch table test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_multi_file_deterministic_lowering ... ok"),
+        "Modular driver multi-file deterministic lowering test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_multi_file_build_orchestration ... ok"),
+        "Modular driver multi-file build orchestration test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("306 passed; 0 failed"),
+        "Expected 306 passed unit tests, got:\n{}",
         stdout
     );
 }
@@ -1132,6 +1147,129 @@ fn test_autonomous_selfhost_driver_triple_stage_execution() {
         gen3_out.contains("42"),
         "Expected output 42 from autonomous Gen 3 executable, got: {}",
         gen3_out
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_external_source_compilation_via_ifac() {
+    let _lock = BOOTSTRAP_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let root = get_workspace_root();
+    let kori_bin = get_kori_binary();
+    let manifest_path = root.join("compiler").join("kori.toml");
+    let target_dev_dir = root.join("compiler").join("target").join("dev");
+    let ifac_bin = target_dev_dir.join("ifac");
+
+    // Ensure ifac executable is built and up to date
+    let build = Command::new(&kori_bin)
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .arg("--force")
+        .output()
+        .expect("Build ifac compiler");
+    assert!(
+        build.status.success(),
+        "Failed to build ifac compiler:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "ifa_external_source_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&temp_dir).expect("create external source temp dir");
+
+    let source_path = temp_dir.join("external_sample.ifa");
+    fs::write(
+        &source_path,
+        "pub fn main() {\n    let val: i64 = 42;\n    println(\"External compilation verification: 42\");\n}\n",
+    )
+    .expect("write external sample source");
+
+    // 1. Emit LLVM IR: `ifac -S external_sample.ifa -o external_sample.ll`
+    let ll_path = temp_dir.join("external_sample.ll");
+    let run_ir = Command::new(&ifac_bin)
+        .arg("-S")
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&ll_path)
+        .output()
+        .expect("Run ifac --emit-ir");
+    assert!(
+        run_ir.status.success(),
+        "ifac -S failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run_ir.stdout),
+        String::from_utf8_lossy(&run_ir.stderr)
+    );
+    assert!(ll_path.exists(), "Generated LLVM IR file missing");
+    let ll_content = fs::read_to_string(&ll_path).expect("read generated LLVM IR");
+    assert!(
+        ll_content.contains("target datalayout =") && ll_content.contains("define i32 @main()"),
+        "Generated LLVM IR does not contain valid module header or entry:\n{}",
+        ll_content
+    );
+
+    // 2. Assemble object file: `ifac -c external_sample.ifa -o external_sample.o`
+    let obj_path = temp_dir.join("external_sample.o");
+    let run_obj = Command::new(&ifac_bin)
+        .arg("-c")
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&obj_path)
+        .output()
+        .expect("Run ifac -c");
+    assert!(
+        run_obj.status.success(),
+        "ifac -c failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run_obj.stdout),
+        String::from_utf8_lossy(&run_obj.stderr)
+    );
+    assert!(obj_path.exists(), "Generated object file missing");
+    let obj_bytes = fs::read(&obj_path).expect("read generated object file");
+    // Validate ELF magic bytes: 0x7f, 'E', 'L', 'F'
+    assert!(
+        obj_bytes.len() >= 4 && &obj_bytes[0..4] == b"\x7fELF",
+        "Generated object file is not a valid ELF binary"
+    );
+
+    // 3. Compile full binary executable: `ifac external_sample.ifa -o external_sample.bin`
+    let bin_path = temp_dir.join("external_sample.bin");
+    let run_bin = Command::new(&ifac_bin)
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .output()
+        .expect("Run ifac to produce executable");
+    assert!(
+        run_bin.status.success(),
+        "ifac executable link failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run_bin.stdout),
+        String::from_utf8_lossy(&run_bin.stderr)
+    );
+    assert!(bin_path.exists(), "Generated binary executable missing");
+
+    // 4. Execute the compiled binary and assert expected execution
+    let run_exec = Command::new(&bin_path)
+        .output()
+        .expect("Execute compiled binary");
+    assert!(
+        run_exec.status.success(),
+        "Execution of compiled external binary failed with status: {:?}",
+        run_exec.status
+    );
+    let exec_stdout = String::from_utf8_lossy(&run_exec.stdout);
+    assert!(
+        exec_stdout.contains("42"),
+        "Expected output containing 42, got: {}",
+        exec_stdout
     );
 
     let _ = fs::remove_dir_all(&temp_dir);
