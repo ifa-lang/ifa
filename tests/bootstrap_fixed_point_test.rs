@@ -801,8 +801,28 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("306 passed; 0 failed"),
-        "Expected 306 passed unit tests, got:\n{}",
+        stdout.contains("test test_driver_ipo_callgraph_and_reachability ... ok"),
+        "Modular driver ipo callgraph and reachability test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_intermodule_dead_code_elimination ... ok"),
+        "Modular driver intermodule dead code elimination test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_polymorphic_where_clause_resolution ... ok"),
+        "Modular sema polymorphic where clause resolution test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_trait_impl_completeness_and_method_dispatch ... ok"),
+        "Modular sema trait impl completeness test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("314 passed; 0 failed"),
+        "Expected 314 passed unit tests, got:\n{}",
         stdout
     );
 }

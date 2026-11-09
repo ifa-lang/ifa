@@ -2500,6 +2500,265 @@ pub fn test_sema_concurrent_task_path_exclusivity() -> bool {
     return validate_concurrent_task_exclusivity(read1_paths, read2_paths);
 }
 
+// Polymorphic Type Resolution with Trait Bounds & Where Clauses
+pub struct TraitBoundClause {
+    type_param: String,
+    trait_name: String
+}
+
+pub struct WhereClauseSet {
+    clauses: List<TraitBoundClause>
+}
+
+pub struct TraitImplRecord {
+    trait_name: String,
+    target_type: String,
+    provided_methods: List<String>
+}
+
+pub struct PolymorphicResolutionContext {
+    registered_traits: TraitSymbolTable,
+    impl_records: List<TraitImplRecord>,
+    active_where_clauses: WhereClauseSet
+}
+
+pub fn make_where_clause_set() -> WhereClauseSet {
+    return WhereClauseSet(clauses: List::new());
+}
+
+pub fn add_where_trait_bound(
+    inout set: WhereClauseSet,
+    type_param: String,
+    trait_name: String
+) {
+    set.clauses.push(TraitBoundClause(
+        type_param: type_param,
+        trait_name: trait_name
+    ));
+}
+
+pub fn make_polymorphic_context(traits: TraitSymbolTable) -> PolymorphicResolutionContext {
+    return PolymorphicResolutionContext(
+        registered_traits: traits,
+        impl_records: List::new(),
+        active_where_clauses: make_where_clause_set()
+    );
+}
+
+pub fn register_trait_impl(
+    inout ctx: PolymorphicResolutionContext,
+    trait_name: String,
+    target_ty: String,
+    methods: List<String>
+) {
+    ctx.impl_records.push(TraitImplRecord(
+        trait_name: trait_name,
+        target_type: target_ty,
+        provided_methods: methods
+    ));
+}
+
+pub fn has_trait_impl(
+    ctx: PolymorphicResolutionContext,
+    trait_name: String,
+    target_ty: String
+) -> bool {
+    mut i: i64 = 0;
+    while i < ctx.impl_records.len() {
+        let rec = ctx.impl_records[i];
+        if rec.trait_name == trait_name && rec.target_type == target_ty {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn validate_trait_impl_completeness(
+    ctx: PolymorphicResolutionContext,
+    trait_name: String,
+    target_ty: String
+) -> bool {
+    // 1. Locate impl record
+    mut rec_idx: i64 = -1;
+    mut i: i64 = 0;
+    while i < ctx.impl_records.len() {
+        let rec = ctx.impl_records[i];
+        if rec.trait_name == trait_name && rec.target_type == target_ty {
+            rec_idx = i;
+        }
+        i = i + 1;
+    }
+    if rec_idx < 0 {
+        return false;
+    }
+
+    let impl_rec = ctx.impl_records[rec_idx];
+
+    // 2. Cross-reference all methods required by trait in registered_traits
+    mut t_idx: i64 = 0;
+    while t_idx < ctx.registered_traits.method_traits.len() {
+        if ctx.registered_traits.method_traits[t_idx] == trait_name {
+            let required_method = ctx.registered_traits.method_names[t_idx];
+            // Check if impl provides this required method
+            mut found = false;
+            mut p: i64 = 0;
+            while p < impl_rec.provided_methods.len() {
+                if impl_rec.provided_methods[p] == required_method {
+                    found = true;
+                }
+                p = p + 1;
+            }
+            if !found {
+                return false;
+            }
+        }
+        t_idx = t_idx + 1;
+    }
+    return true;
+}
+
+pub fn resolve_polymorphic_where_constraints(
+    ctx: PolymorphicResolutionContext,
+    type_arg: String,
+    param_name: String
+) -> bool {
+    mut c: i64 = 0;
+    while c < ctx.active_where_clauses.clauses.len() {
+        let clause = ctx.active_where_clauses.clauses[c];
+        if clause.type_param == param_name {
+            // Must have implementation AND implementation must be complete
+            if !has_trait_impl(ctx, clause.trait_name, type_arg) {
+                return false;
+            }
+            if !validate_trait_impl_completeness(ctx, clause.trait_name, type_arg) {
+                return false;
+            }
+        }
+        c = c + 1;
+    }
+    return true;
+}
+
+pub fn infer_polymorphic_method_target(
+    ctx: PolymorphicResolutionContext,
+    type_arg: String,
+    method_name: String
+) -> String {
+    mut i: i64 = 0;
+    while i < ctx.impl_records.len() {
+        let rec = ctx.impl_records[i];
+        if rec.target_type == type_arg {
+            mut m: i64 = 0;
+            while m < rec.provided_methods.len() {
+                if rec.provided_methods[m] == method_name {
+                    return type_arg + "$" + method_name;
+                }
+                m = m + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// Unit test 31: Polymorphic where clause resolution across multiple trait bounds
+pub fn test_sema_polymorphic_where_clause_resolution() -> bool {
+    mut tr_table = make_trait_table();
+    mut p_methods: List<String> = List::new();
+    p_methods.push("to_string");
+    register_trait(inout tr_table, "Printable", p_methods);
+
+    mut s_methods: List<String> = List::new();
+    s_methods.push("serialize");
+    register_trait(inout tr_table, "Serializable", s_methods);
+
+    mut ctx = make_polymorphic_context(tr_table);
+
+    // Register Packet: implements Printable + Serializable
+    mut packet_p: List<String> = List::new();
+    packet_p.push("to_string");
+    register_trait_impl(inout ctx, "Printable", "Packet", packet_p);
+
+    mut packet_s: List<String> = List::new();
+    packet_s.push("serialize");
+    register_trait_impl(inout ctx, "Serializable", "Packet", packet_s);
+
+    // Register RawData: implements ONLY Printable
+    mut raw_p: List<String> = List::new();
+    raw_p.push("to_string");
+    register_trait_impl(inout ctx, "Printable", "RawData", raw_p);
+
+    // Define where clauses: where T: Printable + Serializable
+    add_where_trait_bound(inout ctx.active_where_clauses, "T", "Printable");
+    add_where_trait_bound(inout ctx.active_where_clauses, "T", "Serializable");
+
+    // Case 1: Packet satisfies both Printable and Serializable -> Success!
+    let packet_ok = resolve_polymorphic_where_constraints(ctx, "Packet", "T");
+    if !packet_ok {
+        return false;
+    }
+
+    // Case 2: RawData misses Serializable -> Must reject!
+    let raw_ok = resolve_polymorphic_where_constraints(ctx, "RawData", "T");
+    if raw_ok {
+        return false;
+    }
+
+    // Case 3: Unknown type -> Must reject!
+    let unknown_ok = resolve_polymorphic_where_constraints(ctx, "UnknownType", "T");
+    if unknown_ok {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit test 32: Trait implementation completeness checking and polymorphic method dispatch
+pub fn test_sema_trait_impl_completeness_and_method_dispatch() -> bool {
+    mut tr_table = make_trait_table();
+    mut num_methods: List<String> = List::new();
+    num_methods.push("add");
+    num_methods.push("sub");
+    num_methods.push("mul");
+    register_trait(inout tr_table, "Numeric", num_methods);
+
+    mut ctx = make_polymorphic_context(tr_table);
+
+    // Matrix implements ALL methods: add, sub, mul
+    mut matrix_methods: List<String> = List::new();
+    matrix_methods.push("add");
+    matrix_methods.push("sub");
+    matrix_methods.push("mul");
+    register_trait_impl(inout ctx, "Numeric", "Matrix", matrix_methods);
+
+    // Vector implements only `add` (incomplete impl!)
+    mut vector_methods: List<String> = List::new();
+    vector_methods.push("add");
+    register_trait_impl(inout ctx, "Numeric", "Vector", vector_methods);
+
+    // 1. Matrix completeness: true
+    let matrix_complete = validate_trait_impl_completeness(ctx, "Numeric", "Matrix");
+    if !matrix_complete {
+        return false;
+    }
+
+    // 2. Vector completeness: false (missing sub & mul)
+    let vector_complete = validate_trait_impl_completeness(ctx, "Numeric", "Vector");
+    if vector_complete {
+        return false;
+    }
+
+    // 3. Polymorphic method resolution
+    let target = infer_polymorphic_method_target(ctx, "Matrix", "add");
+    if target != "Matrix$add" {
+        return false;
+    }
+
+    let unimpl_target = infer_polymorphic_method_target(ctx, "Vector", "mul");
+    return unimpl_target == "";
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
@@ -2532,7 +2791,9 @@ pub fn main() {
     let t28 = test_sema_interprocedural_access_path_propagation();
     let t29 = test_sema_transitive_interprocedural_access_path_propagation();
     let t30 = test_sema_concurrent_task_path_exclusivity();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 {
+    let t31 = test_sema_polymorphic_where_clause_resolution();
+    let t32 = test_sema_trait_impl_completeness_and_method_dispatch();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");
