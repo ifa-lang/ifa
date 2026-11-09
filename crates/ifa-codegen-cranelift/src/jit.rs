@@ -127,6 +127,72 @@ impl JitEngine {
         builder.symbol("ifa_rt_coro_frame", ifa_rt_coro_frame as *const u8);
         builder.symbol("ifa_rt_coro_destroy", ifa_rt_coro_destroy as *const u8);
 
+        // Multi-arena SIMD convolution & tensor stencil primitives
+        builder.symbol(
+            "ifa_simd_multi_arena_conv2d_f32",
+            ifa_simd_multi_arena_conv2d_f32 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_conv2d_f64",
+            ifa_simd_multi_arena_conv2d_f64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_conv2d_i64",
+            ifa_simd_multi_arena_conv2d_i64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_conv3d_f32",
+            ifa_simd_multi_arena_conv3d_f32 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_conv3d_f64",
+            ifa_simd_multi_arena_conv3d_f64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_conv3d_i64",
+            ifa_simd_multi_arena_conv3d_i64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_slice_dot_f32",
+            ifa_simd_multi_arena_slice_dot_f32 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_slice_dot_f64",
+            ifa_simd_multi_arena_slice_dot_f64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_slice_dot_i32",
+            ifa_simd_multi_arena_slice_dot_i32 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_slice_dot_i64",
+            ifa_simd_multi_arena_slice_dot_i64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_tripartite_f32",
+            ifa_simd_multi_arena_tripartite_f32 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_tripartite_f64",
+            ifa_simd_multi_arena_tripartite_f64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_arena_slice_count_if_gt_f32",
+            ifa_simd_arena_slice_count_if_gt_f32 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_arena_slice_count_if_gt_f64",
+            ifa_simd_arena_slice_count_if_gt_f64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_arena_slice_count_if_gt_i32",
+            ifa_simd_arena_slice_count_if_gt_i32 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_arena_slice_count_if_gt_i64",
+            ifa_simd_arena_slice_count_if_gt_i64 as *const u8,
+        );
+
         let module = JITModule::new(builder);
 
         Ok(Self {

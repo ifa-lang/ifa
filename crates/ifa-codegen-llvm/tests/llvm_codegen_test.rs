@@ -5941,3 +5941,89 @@ fn test_llvm_multi_arena_fused_convolution_metadata_and_loop_elision() {
     assert!(obj_path.exists());
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_llvm_multi_arena_conv_definitions_and_codegen() {
+    use ifa_codegen_llvm::ir_emitter::LlvmIrEmitter;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_span::{Span, INTERNER};
+
+    let target = LlvmTargetConfig::host();
+    let mut emitter = LlvmIrEmitter::new(&target);
+
+    let fn_name = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+    let zero = ValueId(0);
+    bb0.instructions.push(Instruction::new(
+        Some(zero),
+        ValueExpr::Constant(ConstantValue::Int(0, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.terminator = Some(Terminator::Return(Some(zero)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("multi_arena_conv_defs_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let ir = emitter.emit_module(&module).unwrap();
+
+    assert!(
+        ir.contains("define linkonce_odr void @ifa_simd_multi_arena_conv2d_f32"),
+        "Must emit linkonce_odr definition for ifa_simd_multi_arena_conv2d_f32"
+    );
+    assert!(
+        ir.contains("define linkonce_odr void @ifa_simd_multi_arena_conv2d_f64"),
+        "Must emit linkonce_odr definition for ifa_simd_multi_arena_conv2d_f64"
+    );
+    assert!(
+        ir.contains("define linkonce_odr void @ifa_simd_multi_arena_conv2d_i64"),
+        "Must emit linkonce_odr definition for ifa_simd_multi_arena_conv2d_i64"
+    );
+    assert!(
+        ir.contains("define linkonce_odr void @ifa_simd_multi_arena_conv3d_f32"),
+        "Must emit linkonce_odr definition for ifa_simd_multi_arena_conv3d_f32"
+    );
+    assert!(
+        ir.contains("define linkonce_odr void @ifa_simd_multi_arena_conv3d_f64"),
+        "Must emit linkonce_odr definition for ifa_simd_multi_arena_conv3d_f64"
+    );
+    assert!(
+        ir.contains("define linkonce_odr void @ifa_simd_multi_arena_conv3d_i64"),
+        "Must emit linkonce_odr definition for ifa_simd_multi_arena_conv3d_i64"
+    );
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("llvm_multi_conv_defs_{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+    let obj_path = temp_dir.join("conv_defs.o");
+
+    let compiler = LlvmCompiler::new(target);
+    let res = compiler.compile_to_object(&module, &obj_path);
+    assert!(
+        res.is_ok(),
+        "Compilation to object must succeed with emitted conv definitions: {:?}",
+        res.err()
+    );
+    assert!(obj_path.exists());
+    let _ = fs::remove_dir_all(&temp_dir);
+}

@@ -1760,8 +1760,8 @@ fn test_coroutine_with_arena_and_channel_slice_exchange() {
         ifa_rt_arena_transfer_owner, ifa_rt_channel_create, ifa_rt_channel_destroy,
         ifa_rt_channel_recv_slice, ifa_rt_channel_send_slice, ifa_rt_channel_try_recv_slice,
         ifa_rt_channel_try_send_slice, ifa_rt_coro_arena_id, ifa_rt_coro_create_with_arena,
-        ifa_rt_coro_destroy, ifa_rt_coro_frame, ifa_rt_coro_spawn_with_arena, ifa_rt_slice_alloc,
-        ifa_rt_slice_free, ifa_rt_slice_verify_arena, IfaSlice,
+        ifa_rt_coro_destroy, ifa_rt_coro_frame, ifa_rt_coro_spawn_with_arena, ifa_rt_fiber_join,
+        ifa_rt_slice_alloc, ifa_rt_slice_free, ifa_rt_slice_verify_arena, IfaSlice,
     };
     use ifa_runtime::header::GenHeader;
 
@@ -1839,7 +1839,132 @@ fn test_coroutine_with_arena_and_channel_slice_exchange() {
     let xfer_res = ifa_rt_arena_transfer_owner(target_arena, 8888);
     assert_eq!(xfer_res, 1, "Arena owner transfer must succeed");
 
+    // Join the fiber spawned with arena before destroying the coroutine
+    ifa_rt_fiber_join(fid);
+
     ifa_rt_slice_free(mut_slice);
     ifa_rt_channel_destroy(chan);
     ifa_rt_coro_destroy(coro);
+}
+
+#[test]
+fn test_runtime_multi_arena_conv_and_stencil_kernels() {
+    use ifa_runtime::*;
+
+    // 1. Test 2D Multi-Arena Fused Convolution with ReLU activation
+    let img = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+    let weights = [0.5f64];
+    let bias = [0.1f64];
+    let mut dst2d = [0.0f64; 4];
+
+    unsafe {
+        ifa_simd_multi_arena_conv2d_f64(
+            dst2d.as_mut_ptr(),
+            img.as_ptr(),
+            weights.as_ptr(),
+            bias.as_ptr(),
+            2,
+            2,
+            1,
+            1,
+            3,
+            1, // ReLU
+        );
+    }
+
+    assert!(
+        (dst2d[0] - 0.6).abs() < 1e-6,
+        "dst[0] = 1.0 * 0.5 + 0.1 = 0.6"
+    );
+    assert!(
+        (dst2d[1] - 1.1).abs() < 1e-6,
+        "dst[1] = 2.0 * 0.5 + 0.1 = 1.1"
+    );
+    assert!(
+        (dst2d[2] - 2.1).abs() < 1e-6,
+        "dst[2] = 4.0 * 0.5 + 0.1 = 2.1"
+    );
+    assert!(
+        (dst2d[3] - 2.6).abs() < 1e-6,
+        "dst[3] = 5.0 * 0.5 + 0.1 = 2.6"
+    );
+
+    // 1b. Test 2D Multi-Arena Fused Convolution (i64)
+    let img_i64 = [1i64, 2, 3, 4, 5, 6, 7, 8, 9];
+    let weights_i64 = [2i64];
+    let bias_i64 = [1i64];
+    let mut dst2d_i64 = [0i64; 4];
+    unsafe {
+        ifa_simd_multi_arena_conv2d_i64(
+            dst2d_i64.as_mut_ptr(),
+            img_i64.as_ptr(),
+            weights_i64.as_ptr(),
+            bias_i64.as_ptr(),
+            2,
+            2,
+            1,
+            1,
+            3,
+            1, // ReLU
+        );
+    }
+    assert_eq!(dst2d_i64[0], 3, "1 * 2 + 1 = 3");
+    assert_eq!(dst2d_i64[1], 5, "2 * 2 + 1 = 5");
+    assert_eq!(dst2d_i64[2], 9, "4 * 2 + 1 = 9");
+    assert_eq!(dst2d_i64[3], 11, "5 * 2 + 1 = 11");
+
+    // 2. Test 3D Volumetric Multi-Arena Fused Convolution with ReLU
+    let volume = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let filter = [2.0f64];
+    let bias_neg = [-1.0f64];
+    let mut dst3d = [0.0f64; 8];
+
+    unsafe {
+        ifa_simd_multi_arena_conv3d_f64(
+            dst3d.as_mut_ptr(),
+            volume.as_ptr(),
+            filter.as_ptr(),
+            bias_neg.as_ptr(),
+            2,
+            2,
+            2,
+            1,
+            1,
+            1,
+            4,
+            2,
+            1, // ReLU
+        );
+    }
+
+    assert!(
+        (dst3d[0] - 1.0).abs() < 1e-6,
+        "dst3d[0] = 1.0 * 2.0 - 1.0 = 1.0"
+    );
+    assert!(
+        (dst3d[7] - 15.0).abs() < 1e-6,
+        "dst3d[7] = 8.0 * 2.0 - 1.0 = 15.0"
+    );
+
+    // 3. Test Multi-Arena Dot Product
+    let src1 = [1.0f64, 2.0, 3.0, 4.0];
+    let src2 = [5.0f64, 6.0, 7.0, 8.0];
+    let dot_full =
+        unsafe { ifa_simd_multi_arena_slice_dot_f64(src1.as_ptr(), src2.as_ptr(), 4, 1, 1) };
+    assert!(
+        (dot_full - 70.0).abs() < 1e-6,
+        "Dot product 1*5 + 2*6 + 3*7 + 4*8 = 70.0"
+    );
+
+    let dot_strided =
+        unsafe { ifa_simd_multi_arena_slice_dot_f64(src1.as_ptr(), src2.as_ptr(), 2, 2, 2) };
+    assert!(
+        (dot_strided - 26.0).abs() < 1e-6,
+        "Strided dot 1*5 + 3*7 = 26.0"
+    );
+
+    // 4. Test Arena Count-If Reduction
+    let slice_data = [1.0f64, 5.0, 2.0, 8.0, 3.0];
+    let count = unsafe { ifa_simd_arena_slice_count_if_gt_f64(slice_data.as_ptr(), 5, 2.5) };
+    assert_eq!(count, 3, "Elements > 2.5 must be 3 (5.0, 8.0, 3.0)");
 }

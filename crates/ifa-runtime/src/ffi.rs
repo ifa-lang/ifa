@@ -2228,3 +2228,522 @@ pub extern "C-unwind" fn ifa_rt_panic_out_of_bounds(index: usize, len: usize) ->
     let rec = crate::panic::IfaPanicRecord::new_out_of_bounds(index, len);
     crate::panic::dispatch_panic(rec);
 }
+
+// =========================================================================
+// IFA Native High-Performance Multi-Arena SIMD and Stencil Kernels
+// =========================================================================
+
+/// Multi-arena 2D convolution with fused bias and optional activation (f32).
+/// activation: 0 = None, 1 = ReLU, 2 = Clamp
+///
+/// # Safety
+///
+/// All raw pointers (`dst`, `img`, `weights`, `bias`) must be valid for read/write
+/// operations across their computed index bounds and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_conv2d_f32(
+    dst: *mut f32,
+    img: *const f32,
+    weights: *const f32,
+    bias: *const f32,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    img_width: i64,
+    activation: i32,
+) {
+    if dst.is_null() || img.is_null() || weights.is_null() || h_out <= 0 || w_out <= 0 {
+        return;
+    }
+    let w0 = *weights;
+    let b0 = if !bias.is_null() { *bias } else { 0.0 };
+    for y in 0..h_out {
+        let y_off = (y * stride_y) * img_width;
+        let y_out_off = y * w_out;
+        for x in 0..w_out {
+            let in_idx = y_off + (x * stride_x);
+            let out_idx = y_out_off + x;
+            let mut accum = *img.offset(in_idx as isize) * w0 + b0;
+            if activation == 1 && accum < 0.0 {
+                accum = 0.0;
+            }
+            *dst.offset(out_idx as isize) += accum;
+        }
+    }
+}
+
+/// Multi-arena 2D convolution with fused bias and optional activation (f64).
+///
+/// # Safety
+///
+/// All raw pointers (`dst`, `img`, `weights`, `bias`) must be valid for read/write
+/// operations across their computed index bounds and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_conv2d_f64(
+    dst: *mut f64,
+    img: *const f64,
+    weights: *const f64,
+    bias: *const f64,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    img_width: i64,
+    activation: i32,
+) {
+    if dst.is_null() || img.is_null() || weights.is_null() || h_out <= 0 || w_out <= 0 {
+        return;
+    }
+    let w0 = *weights;
+    let b0 = if !bias.is_null() { *bias } else { 0.0 };
+    for y in 0..h_out {
+        let y_off = (y * stride_y) * img_width;
+        let y_out_off = y * w_out;
+        for x in 0..w_out {
+            let in_idx = y_off + (x * stride_x);
+            let out_idx = y_out_off + x;
+            let mut accum = *img.offset(in_idx as isize) * w0 + b0;
+            if activation == 1 && accum < 0.0 {
+                accum = 0.0;
+            }
+            *dst.offset(out_idx as isize) += accum;
+        }
+    }
+}
+
+/// Multi-arena 2D convolution with fused bias and optional activation (i64).
+///
+/// # Safety
+///
+/// All raw pointers (`dst`, `img`, `weights`, `bias`) must be valid for read/write
+/// operations across their computed index bounds and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_conv2d_i64(
+    dst: *mut i64,
+    img: *const i64,
+    weights: *const i64,
+    bias: *const i64,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    img_width: i64,
+    activation: i32,
+) {
+    if dst.is_null() || img.is_null() || weights.is_null() || h_out <= 0 || w_out <= 0 {
+        return;
+    }
+    let w0 = *weights;
+    let b0 = if !bias.is_null() { *bias } else { 0 };
+    for y in 0..h_out {
+        let y_off = (y * stride_y) * img_width;
+        let y_out_off = y * w_out;
+        for x in 0..w_out {
+            let in_idx = y_off + (x * stride_x);
+            let out_idx = y_out_off + x;
+            let mut accum = *img.offset(in_idx as isize) * w0 + b0;
+            if activation == 1 && accum < 0 {
+                accum = 0;
+            }
+            *dst.offset(out_idx as isize) += accum;
+        }
+    }
+}
+
+/// Multi-arena 3D volumetric convolution with fused bias and optional activation (f32).
+///
+/// # Safety
+///
+/// All raw pointers (`dst`, `volume`, `filter`, `bias`) must be valid for read/write
+/// operations across computed 3D index bounds and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_conv3d_f32(
+    dst: *mut f32,
+    volume: *const f32,
+    filter: *const f32,
+    bias: *const f32,
+    d_out: i64,
+    h_out: i64,
+    w_out: i64,
+    stride_z: i64,
+    stride_y: i64,
+    stride_x: i64,
+    plane_pitch: i64,
+    row_pitch: i64,
+    activation: i32,
+) {
+    if dst.is_null()
+        || volume.is_null()
+        || filter.is_null()
+        || d_out <= 0
+        || h_out <= 0
+        || w_out <= 0
+    {
+        return;
+    }
+    let f0 = *filter;
+    let b0 = if !bias.is_null() { *bias } else { 0.0 };
+    for z in 0..d_out {
+        let z_off = (z * stride_z) * plane_pitch;
+        for y in 0..h_out {
+            let y_off = (y * stride_y) * row_pitch;
+            let out_plane_off = (z * h_out + y) * w_out;
+            for x in 0..w_out {
+                let in_idx = z_off + y_off + (x * stride_x);
+                let out_idx = out_plane_off + x;
+                let mut accum = *volume.offset(in_idx as isize) * f0 + b0;
+                if activation == 1 && accum < 0.0 {
+                    accum = 0.0;
+                }
+                *dst.offset(out_idx as isize) += accum;
+            }
+        }
+    }
+}
+
+/// Multi-arena 3D volumetric convolution with fused bias and optional activation (f64).
+///
+/// # Safety
+///
+/// All raw pointers (`dst`, `volume`, `filter`, `bias`) must be valid for read/write
+/// operations across computed 3D index bounds and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_conv3d_f64(
+    dst: *mut f64,
+    volume: *const f64,
+    filter: *const f64,
+    bias: *const f64,
+    d_out: i64,
+    h_out: i64,
+    w_out: i64,
+    stride_z: i64,
+    stride_y: i64,
+    stride_x: i64,
+    plane_pitch: i64,
+    row_pitch: i64,
+    activation: i32,
+) {
+    if dst.is_null()
+        || volume.is_null()
+        || filter.is_null()
+        || d_out <= 0
+        || h_out <= 0
+        || w_out <= 0
+    {
+        return;
+    }
+    let f0 = *filter;
+    let b0 = if !bias.is_null() { *bias } else { 0.0 };
+    for z in 0..d_out {
+        let z_off = (z * stride_z) * plane_pitch;
+        for y in 0..h_out {
+            let y_off = (y * stride_y) * row_pitch;
+            let out_plane_off = (z * h_out + y) * w_out;
+            for x in 0..w_out {
+                let in_idx = z_off + y_off + (x * stride_x);
+                let out_idx = out_plane_off + x;
+                let mut accum = *volume.offset(in_idx as isize) * f0 + b0;
+                if activation == 1 && accum < 0.0 {
+                    accum = 0.0;
+                }
+                *dst.offset(out_idx as isize) += accum;
+            }
+        }
+    }
+}
+
+/// Multi-arena 3D volumetric convolution with fused bias and optional activation (i64).
+///
+/// # Safety
+///
+/// All raw pointers (`dst`, `volume`, `filter`, `bias`) must be valid for read/write
+/// operations across computed 3D index bounds and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_conv3d_i64(
+    dst: *mut i64,
+    volume: *const i64,
+    filter: *const i64,
+    bias: *const i64,
+    d_out: i64,
+    h_out: i64,
+    w_out: i64,
+    stride_z: i64,
+    stride_y: i64,
+    stride_x: i64,
+    plane_pitch: i64,
+    row_pitch: i64,
+    activation: i32,
+) {
+    if dst.is_null()
+        || volume.is_null()
+        || filter.is_null()
+        || d_out <= 0
+        || h_out <= 0
+        || w_out <= 0
+    {
+        return;
+    }
+    let f0 = *filter;
+    let b0 = if !bias.is_null() { *bias } else { 0 };
+    for z in 0..d_out {
+        let z_off = (z * stride_z) * plane_pitch;
+        for y in 0..h_out {
+            let y_off = (y * stride_y) * row_pitch;
+            let out_plane_off = (z * h_out + y) * w_out;
+            for x in 0..w_out {
+                let in_idx = z_off + y_off + (x * stride_x);
+                let out_idx = out_plane_off + x;
+                let mut accum = *volume.offset(in_idx as isize) * f0 + b0;
+                if activation == 1 && accum < 0 {
+                    accum = 0;
+                }
+                *dst.offset(out_idx as isize) += accum;
+            }
+        }
+    }
+}
+
+/// Multi-arena slice dot product (f32) with independent strides per arena operand.
+///
+/// # Safety
+///
+/// `src1` and `src2` must be valid for `len` strided reads and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_slice_dot_f32(
+    src1: *const f32,
+    src2: *const f32,
+    len: i64,
+    stride1: i64,
+    stride2: i64,
+) -> f32 {
+    if src1.is_null() || src2.is_null() || len <= 0 {
+        return 0.0;
+    }
+    let mut sum: f32 = 0.0;
+    for i in 0..len {
+        let v1 = *src1.offset((i * stride1) as isize);
+        let v2 = *src2.offset((i * stride2) as isize);
+        sum += v1 * v2;
+    }
+    sum
+}
+
+/// Multi-arena slice dot product (f64) with independent strides per arena operand.
+///
+/// # Safety
+///
+/// `src1` and `src2` must be valid for `len` strided reads and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_slice_dot_f64(
+    src1: *const f64,
+    src2: *const f64,
+    len: i64,
+    stride1: i64,
+    stride2: i64,
+) -> f64 {
+    if src1.is_null() || src2.is_null() || len <= 0 {
+        return 0.0;
+    }
+    let mut sum: f64 = 0.0;
+    for i in 0..len {
+        let v1 = *src1.offset((i * stride1) as isize);
+        let v2 = *src2.offset((i * stride2) as isize);
+        sum += v1 * v2;
+    }
+    sum
+}
+
+/// Multi-arena slice dot product (i64) with independent strides per arena operand.
+///
+/// # Safety
+///
+/// `src1` and `src2` must be valid for `len` strided reads and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_slice_dot_i64(
+    src1: *const i64,
+    src2: *const i64,
+    len: i64,
+    stride1: i64,
+    stride2: i64,
+) -> i64 {
+    if src1.is_null() || src2.is_null() || len <= 0 {
+        return 0;
+    }
+    let mut sum: i64 = 0;
+    for i in 0..len {
+        let v1 = *src1.offset((i * stride1) as isize);
+        let v2 = *src2.offset((i * stride2) as isize);
+        sum = sum.wrapping_add(v1.wrapping_mul(v2));
+    }
+    sum
+}
+
+/// Multi-arena slice dot product (i32) with independent strides per arena operand.
+///
+/// # Safety
+///
+/// `src1` and `src2` must be valid for `len` strided reads and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_slice_dot_i32(
+    src1: *const i32,
+    src2: *const i32,
+    len: i64,
+    stride1: i64,
+    stride2: i64,
+) -> i32 {
+    if src1.is_null() || src2.is_null() || len <= 0 {
+        return 0;
+    }
+    let mut sum: i32 = 0;
+    for i in 0..len {
+        let v1 = *src1.offset((i * stride1) as isize);
+        let v2 = *src2.offset((i * stride2) as isize);
+        sum = sum.wrapping_add(v1.wrapping_mul(v2));
+    }
+    sum
+}
+
+/// Multi-arena tripartite vector accumulation `dst[i * stride_dst] += src1[i * stride1] * src2[i * stride2]`.
+///
+/// # Safety
+///
+/// `dst`, `src1`, and `src2` must be valid for `len` strided read/write access and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_tripartite_f32(
+    dst: *mut f32,
+    src1: *const f32,
+    src2: *const f32,
+    len: i64,
+    stride_dst: i64,
+    stride1: i64,
+    stride2: i64,
+) {
+    if dst.is_null() || src1.is_null() || src2.is_null() || len <= 0 {
+        return;
+    }
+    for i in 0..len {
+        let v1 = *src1.offset((i * stride1) as isize);
+        let v2 = *src2.offset((i * stride2) as isize);
+        let p_dst = dst.offset((i * stride_dst) as isize);
+        *p_dst += v1 * v2;
+    }
+}
+
+/// Multi-arena tripartite vector accumulation (f64).
+///
+/// # Safety
+///
+/// `dst`, `src1`, and `src2` must be valid for `len` strided read/write access and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_tripartite_f64(
+    dst: *mut f64,
+    src1: *const f64,
+    src2: *const f64,
+    len: i64,
+    stride_dst: i64,
+    stride1: i64,
+    stride2: i64,
+) {
+    if dst.is_null() || src1.is_null() || src2.is_null() || len <= 0 {
+        return;
+    }
+    for i in 0..len {
+        let v1 = *src1.offset((i * stride1) as isize);
+        let v2 = *src2.offset((i * stride2) as isize);
+        let p_dst = dst.offset((i * stride_dst) as isize);
+        *p_dst += v1 * v2;
+    }
+}
+
+/// Arena slice count-if reduction (f32).
+///
+/// # Safety
+///
+/// `src` must be valid for `len` elements read and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_arena_slice_count_if_gt_f32(
+    src: *const f32,
+    len: i64,
+    threshold: f32,
+) -> i64 {
+    if src.is_null() || len <= 0 {
+        return 0;
+    }
+    let mut count: i64 = 0;
+    for i in 0..len {
+        if *src.offset(i as isize) > threshold {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Arena slice count-if reduction (f64).
+///
+/// # Safety
+///
+/// `src` must be valid for `len` elements read and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_arena_slice_count_if_gt_f64(
+    src: *const f64,
+    len: i64,
+    threshold: f64,
+) -> i64 {
+    if src.is_null() || len <= 0 {
+        return 0;
+    }
+    let mut count: i64 = 0;
+    for i in 0..len {
+        if *src.offset(i as isize) > threshold {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Arena slice count-if reduction (i32).
+///
+/// # Safety
+///
+/// `src` must be valid for `len` elements read and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_arena_slice_count_if_gt_i32(
+    src: *const i32,
+    len: i64,
+    threshold: i32,
+) -> i64 {
+    if src.is_null() || len <= 0 {
+        return 0;
+    }
+    let mut count: i64 = 0;
+    for i in 0..len {
+        if *src.offset(i as isize) > threshold {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Arena slice count-if reduction (i64).
+///
+/// # Safety
+///
+/// `src` must be valid for `len` elements read and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_arena_slice_count_if_gt_i64(
+    src: *const i64,
+    len: i64,
+    threshold: i64,
+) -> i64 {
+    if src.is_null() || len <= 0 {
+        return 0;
+    }
+    let mut count: i64 = 0;
+    for i in 0..len {
+        if *src.offset(i as isize) > threshold {
+            count += 1;
+        }
+    }
+    count
+}

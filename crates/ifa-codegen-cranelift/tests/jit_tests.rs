@@ -2694,3 +2694,617 @@ fn test_cranelift_jit_contiguous_simd128_vector_sum_and_dot() {
         "Contiguous 128-bit SIMD vector sum on 1..=7 must compute 28"
     );
 }
+
+#[test]
+fn test_cranelift_jit_multi_arena_conv2d_i64() {
+    use ifa_codegen_cranelift::jit::JitEngine;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+
+    // Call arena mark
+    let mark_val = ValueId(0);
+    bb0.instructions.push(Instruction::new(
+        Some(mark_val),
+        ValueExpr::CallArenaMark,
+        Span::DUMMY,
+    ));
+
+    // Allocate dst [i64; 4] in call arena
+    let dst = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(dst),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Array(Box::new(FirType::Int(ifa_sema::types::IntType::I64)), 4),
+        },
+        Span::DUMMY,
+    ));
+
+    // Zero-initialize dst elements
+    for i in 0..4 {
+        let idx_id = ValueId(4 + i * 2);
+        let zero_i = ValueId(5 + i * 2);
+        bb0.instructions.push(Instruction::new(
+            Some(zero_i),
+            ValueExpr::Constant(ConstantValue::Int(0, ifa_sema::types::IntType::I64)),
+            Span::DUMMY,
+        ));
+        bb0.instructions.push(Instruction::new(
+            Some(idx_id),
+            ValueExpr::Constant(ConstantValue::Int(i as i128, ifa_sema::types::IntType::I64)),
+            Span::DUMMY,
+        ));
+        bb0.instructions.push(Instruction::new(
+            None,
+            ValueExpr::SetElement {
+                base: dst,
+                index: idx_id,
+                val: zero_i,
+            },
+            Span::DUMMY,
+        ));
+    }
+
+    // Allocate img [i64; 9]
+    let img = ValueId(20);
+    bb0.instructions.push(Instruction::new(
+        Some(img),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Array(Box::new(FirType::Int(ifa_sema::types::IntType::I64)), 9),
+        },
+        Span::DUMMY,
+    ));
+
+    // Populate img with [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    for i in 0..9 {
+        let idx_id = ValueId(23 + i * 2);
+        let val_i = ValueId(24 + i * 2);
+        bb0.instructions.push(Instruction::new(
+            Some(val_i),
+            ValueExpr::Constant(ConstantValue::Int(
+                (i + 1) as i128,
+                ifa_sema::types::IntType::I64,
+            )),
+            Span::DUMMY,
+        ));
+        bb0.instructions.push(Instruction::new(
+            Some(idx_id),
+            ValueExpr::Constant(ConstantValue::Int(i as i128, ifa_sema::types::IntType::I64)),
+            Span::DUMMY,
+        ));
+        bb0.instructions.push(Instruction::new(
+            None,
+            ValueExpr::SetElement {
+                base: img,
+                index: idx_id,
+                val: val_i,
+            },
+            Span::DUMMY,
+        ));
+    }
+
+    // Allocate weights [i64; 1] with 2
+    let weights = ValueId(50);
+    bb0.instructions.push(Instruction::new(
+        Some(weights),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Array(Box::new(FirType::Int(ifa_sema::types::IntType::I64)), 1),
+        },
+        Span::DUMMY,
+    ));
+    let w_idx = ValueId(53);
+    let w_val = ValueId(54);
+    bb0.instructions.push(Instruction::new(
+        Some(w_val),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(w_idx),
+        ValueExpr::Constant(ConstantValue::Int(0, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::SetElement {
+            base: weights,
+            index: w_idx,
+            val: w_val,
+        },
+        Span::DUMMY,
+    ));
+
+    // Allocate bias [i64; 1] with 1
+    let bias = ValueId(60);
+    bb0.instructions.push(Instruction::new(
+        Some(bias),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Array(Box::new(FirType::Int(ifa_sema::types::IntType::I64)), 1),
+        },
+        Span::DUMMY,
+    ));
+    let b_idx = ValueId(63);
+    let b_val = ValueId(64);
+    bb0.instructions.push(Instruction::new(
+        Some(b_val),
+        ValueExpr::Constant(ConstantValue::Int(1, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(b_idx),
+        ValueExpr::Constant(ConstantValue::Int(0, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::SetElement {
+            base: bias,
+            index: b_idx,
+            val: b_val,
+        },
+        Span::DUMMY,
+    ));
+
+    // Parameters: h_out = 2, w_out = 2, stride_y = 1, stride_x = 1, img_width = 3, activation = 1 (ReLU)
+    let h_out = ValueId(70);
+    let w_out = ValueId(71);
+    let stride_y = ValueId(72);
+    let stride_x = ValueId(73);
+    let img_width = ValueId(74);
+    let activation = ValueId(75);
+
+    bb0.instructions.push(Instruction::new(
+        Some(h_out),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(w_out),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(stride_y),
+        ValueExpr::Constant(ConstantValue::Int(1, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(stride_x),
+        ValueExpr::Constant(ConstantValue::Int(1, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(img_width),
+        ValueExpr::Constant(ConstantValue::Int(3, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(activation),
+        ValueExpr::Constant(ConstantValue::Int(1, ifa_sema::types::IntType::I32)),
+        Span::DUMMY,
+    ));
+
+    // Call lowered ifa_simd_multi_arena_conv2d_i64
+    let conv_res = ValueId(80);
+    bb0.instructions.push(Instruction::new(
+        Some(conv_res),
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("ifa_simd_multi_arena_conv2d_i64"),
+            args: vec![
+                dst, img, weights, bias, h_out, w_out, stride_y, stride_x, img_width, activation,
+            ],
+        },
+        Span::DUMMY,
+    ));
+
+    // Read dst[0] (should be 3) and dst[3] (should be 11)
+    let zero_idx = ValueId(81);
+    bb0.instructions.push(Instruction::new(
+        Some(zero_idx),
+        ValueExpr::Constant(ConstantValue::Int(0, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    let three_idx = ValueId(82);
+    bb0.instructions.push(Instruction::new(
+        Some(three_idx),
+        ValueExpr::Constant(ConstantValue::Int(3, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    let v0 = ValueId(83);
+    bb0.instructions.push(Instruction::new(
+        Some(v0),
+        ValueExpr::GetElement {
+            base: dst,
+            index: zero_idx,
+        },
+        Span::DUMMY,
+    ));
+    let v3 = ValueId(84);
+    bb0.instructions.push(Instruction::new(
+        Some(v3),
+        ValueExpr::GetElement {
+            base: dst,
+            index: three_idx,
+        },
+        Span::DUMMY,
+    ));
+
+    // v_sum = v0 + v3 = 3 + 11 = 14
+    let v_sum = ValueId(85);
+    bb0.instructions.push(Instruction::new(
+        Some(v_sum),
+        ValueExpr::Binary {
+            op: ifa_fir::BinaryOp::Add,
+            lhs: v0,
+            rhs: v3,
+        },
+        Span::DUMMY,
+    ));
+
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::CallArenaRewind { mark: mark_val },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(v_sum)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("multi_arena_conv2d_jit_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile FIR with multi-arena conv2d");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 14,
+        "Multi-arena 2D convolution with fused bias and ReLU: dst[0] + dst[3] = 3 + 11 = 14"
+    );
+}
+
+#[test]
+fn test_cranelift_jit_multi_arena_conv3d_i64() {
+    use ifa_codegen_cranelift::jit::JitEngine;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_span::{Span, INTERNER};
+
+    let fn_name = INTERNER.intern("main");
+    let mut func = FirFunction::new(
+        fn_name,
+        vec![],
+        FirType::Int(ifa_sema::types::IntType::I64),
+        false,
+        false,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+
+    // Call arena mark
+    let mark_val = ValueId(0);
+    bb0.instructions.push(Instruction::new(
+        Some(mark_val),
+        ValueExpr::CallArenaMark,
+        Span::DUMMY,
+    ));
+
+    // Allocate dst [i64; 8] in call arena
+    let dst = ValueId(1);
+    bb0.instructions.push(Instruction::new(
+        Some(dst),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Array(Box::new(FirType::Int(ifa_sema::types::IntType::I64)), 8),
+        },
+        Span::DUMMY,
+    ));
+
+    // Zero-initialize dst elements
+    for i in 0..8 {
+        let idx_id = ValueId(2 + i * 2);
+        let zero_i = ValueId(3 + i * 2);
+        bb0.instructions.push(Instruction::new(
+            Some(zero_i),
+            ValueExpr::Constant(ConstantValue::Int(0, ifa_sema::types::IntType::I64)),
+            Span::DUMMY,
+        ));
+        bb0.instructions.push(Instruction::new(
+            Some(idx_id),
+            ValueExpr::Constant(ConstantValue::Int(i as i128, ifa_sema::types::IntType::I64)),
+            Span::DUMMY,
+        ));
+        bb0.instructions.push(Instruction::new(
+            None,
+            ValueExpr::SetElement {
+                base: dst,
+                index: idx_id,
+                val: zero_i,
+            },
+            Span::DUMMY,
+        ));
+    }
+
+    // Allocate volume [i64; 8]
+    let volume = ValueId(20);
+    bb0.instructions.push(Instruction::new(
+        Some(volume),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Array(Box::new(FirType::Int(ifa_sema::types::IntType::I64)), 8),
+        },
+        Span::DUMMY,
+    ));
+
+    // Populate volume with [1, 2, 3, 4, 5, 6, 7, 8]
+    for i in 0..8 {
+        let idx_id = ValueId(21 + i * 2);
+        let val_i = ValueId(22 + i * 2);
+        bb0.instructions.push(Instruction::new(
+            Some(val_i),
+            ValueExpr::Constant(ConstantValue::Int(
+                (i + 1) as i128,
+                ifa_sema::types::IntType::I64,
+            )),
+            Span::DUMMY,
+        ));
+        bb0.instructions.push(Instruction::new(
+            Some(idx_id),
+            ValueExpr::Constant(ConstantValue::Int(i as i128, ifa_sema::types::IntType::I64)),
+            Span::DUMMY,
+        ));
+        bb0.instructions.push(Instruction::new(
+            None,
+            ValueExpr::SetElement {
+                base: volume,
+                index: idx_id,
+                val: val_i,
+            },
+            Span::DUMMY,
+        ));
+    }
+
+    // Allocate filter [i64; 1] with 2
+    let filter = ValueId(50);
+    bb0.instructions.push(Instruction::new(
+        Some(filter),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Array(Box::new(FirType::Int(ifa_sema::types::IntType::I64)), 1),
+        },
+        Span::DUMMY,
+    ));
+    let f_idx = ValueId(53);
+    let f_val = ValueId(54);
+    bb0.instructions.push(Instruction::new(
+        Some(f_val),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(f_idx),
+        ValueExpr::Constant(ConstantValue::Int(0, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::SetElement {
+            base: filter,
+            index: f_idx,
+            val: f_val,
+        },
+        Span::DUMMY,
+    ));
+
+    // Allocate bias [i64; 1] with 1
+    let bias = ValueId(60);
+    bb0.instructions.push(Instruction::new(
+        Some(bias),
+        ValueExpr::CallArenaAlloc {
+            ty: FirType::Array(Box::new(FirType::Int(ifa_sema::types::IntType::I64)), 1),
+        },
+        Span::DUMMY,
+    ));
+    let b_idx = ValueId(63);
+    let b_val = ValueId(64);
+    bb0.instructions.push(Instruction::new(
+        Some(b_val),
+        ValueExpr::Constant(ConstantValue::Int(1, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(b_idx),
+        ValueExpr::Constant(ConstantValue::Int(0, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::SetElement {
+            base: bias,
+            index: b_idx,
+            val: b_val,
+        },
+        Span::DUMMY,
+    ));
+
+    // Parameters: d_out = 2, h_out = 2, w_out = 2, stride_z = 1, stride_y = 1, stride_x = 1, plane_pitch = 4, row_pitch = 2, activation = 1 (ReLU)
+    let d_out = ValueId(70);
+    let h_out = ValueId(71);
+    let w_out = ValueId(72);
+    let stride_z = ValueId(73);
+    let stride_y = ValueId(74);
+    let stride_x = ValueId(75);
+    let plane_pitch = ValueId(76);
+    let row_pitch = ValueId(77);
+    let activation = ValueId(78);
+
+    bb0.instructions.push(Instruction::new(
+        Some(d_out),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(h_out),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(w_out),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(stride_z),
+        ValueExpr::Constant(ConstantValue::Int(1, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(stride_y),
+        ValueExpr::Constant(ConstantValue::Int(1, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(stride_x),
+        ValueExpr::Constant(ConstantValue::Int(1, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(plane_pitch),
+        ValueExpr::Constant(ConstantValue::Int(4, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(row_pitch),
+        ValueExpr::Constant(ConstantValue::Int(2, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    bb0.instructions.push(Instruction::new(
+        Some(activation),
+        ValueExpr::Constant(ConstantValue::Int(1, ifa_sema::types::IntType::I32)),
+        Span::DUMMY,
+    ));
+
+    // Call lowered ifa_simd_multi_arena_conv3d_i64
+    let conv_res = ValueId(80);
+    bb0.instructions.push(Instruction::new(
+        Some(conv_res),
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("ifa_simd_multi_arena_conv3d_i64"),
+            args: vec![
+                dst,
+                volume,
+                filter,
+                bias,
+                d_out,
+                h_out,
+                w_out,
+                stride_z,
+                stride_y,
+                stride_x,
+                plane_pitch,
+                row_pitch,
+                activation,
+            ],
+        },
+        Span::DUMMY,
+    ));
+
+    // Read dst[0] (should be 3) and dst[7] (should be 17)
+    let zero_idx = ValueId(81);
+    bb0.instructions.push(Instruction::new(
+        Some(zero_idx),
+        ValueExpr::Constant(ConstantValue::Int(0, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+    let seven_idx = ValueId(82);
+    bb0.instructions.push(Instruction::new(
+        Some(seven_idx),
+        ValueExpr::Constant(ConstantValue::Int(7, ifa_sema::types::IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    let v0 = ValueId(83);
+    bb0.instructions.push(Instruction::new(
+        Some(v0),
+        ValueExpr::GetElement {
+            base: dst,
+            index: zero_idx,
+        },
+        Span::DUMMY,
+    ));
+    let v7 = ValueId(84);
+    bb0.instructions.push(Instruction::new(
+        Some(v7),
+        ValueExpr::GetElement {
+            base: dst,
+            index: seven_idx,
+        },
+        Span::DUMMY,
+    ));
+
+    // v_sum = v0 + v7 = 3 + 17 = 20
+    let v_sum = ValueId(85);
+    bb0.instructions.push(Instruction::new(
+        Some(v_sum),
+        ValueExpr::Binary {
+            op: ifa_fir::BinaryOp::Add,
+            lhs: v0,
+            rhs: v7,
+        },
+        Span::DUMMY,
+    ));
+
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::CallArenaRewind { mark: mark_val },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(v_sum)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("multi_arena_conv3d_jit_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile FIR with multi-arena conv3d");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 20,
+        "Multi-arena 3D volumetric convolution with fused bias and ReLU: dst[0] + dst[7] = 3 + 17 = 20"
+    );
+}

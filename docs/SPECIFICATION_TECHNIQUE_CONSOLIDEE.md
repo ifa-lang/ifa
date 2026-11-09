@@ -231,6 +231,21 @@ Le pipeline d'optimisation vectorielle FIR (`ifa-fir::vectorize`) et le généra
 3. **Ordonnancement Topologique Intra-Bloc des Instructions SSA** :
    - La fonction `schedule_block_instructions_topologically` rétablit de manière déterministe l'ordre topologique des instructions au sein de chaque bloc basique suite aux hissage d'instructions (LICM) ou substitutions IPO, éliminant tout risque d'utilisation avant définition au sein du même bloc.
 
+### 5.6. Abaissement Direct des Convolutions Multi-Arènes Fusionnées (Cranelift JIT & LLVM AOT)
+
+Les backends Cranelift JIT et LLVM AOT intègrent un abaissement direct des opérations tensorielles et convolutives multi-arènes :
+
+1. **Abaissement Natif Cranelift IR sans Appel Externe** :
+   - Les intrinsèques `ifa_simd_multi_arena_conv2d_f32`, `ifa_simd_multi_arena_conv2d_f64`, `ifa_simd_multi_arena_conv2d_i64` ainsi que leurs variantes 3D volumétriques (`conv3d`) sont directement traduits en boucles Cranelift natives optimisées (`lower_multi_arena_conv2d` / `lower_multi_arena_conv3d`).
+   - Fusion matérielle immédiate de l'addition de biais et de l'activation ReLU branchless via sélection conditionnelle (`fcmp` / `icmp` et `select`), sans branchement divergent.
+
+2. **Émission Inlinée LLVM avec Métadonnées Vectorielles Dédiées** :
+   - Le générateur LLVM émet les définitions `linkonce_odr alwaysinline` dotées des métadonnées de boucle `!llvm.loop !74` (unroll-and-jam 4x) et `!73` (unroll-and-jam 8x avec largeur vectorielle 8 et parallélisme mémoire prouvé).
+   - Aucun contrôle générationnel n'interrompt le flux SIMD grâce à l'élision statique `redundant = true`.
+
+3. **Prise en Charge C-ABI Bare-Metal dans le Runtime IFA** :
+   - Le crate `ifa-runtime` expose l'intégralité des noyaux convolutifs et de réduction multi-arènes sous forme de fonctions universelles `extern "C"` conformes à la spécification C-ABI (`ifa_simd_multi_arena_conv2d_*`, `ifa_simd_multi_arena_conv3d_*`, `ifa_simd_multi_arena_slice_dot_*`), assurant une exécution 100 % déterministe sur la pile et dans les arènes.
+
 ---
 
 ## 6. Outillage Développeur et Commandes CLI

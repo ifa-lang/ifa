@@ -2469,6 +2469,212 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 )
             }
 
+            // Multi-arena 2D / 3D fused convolutions with optional bias and activation
+            "ifa_simd_multi_arena_conv2d_f32" if args.len() >= 9 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let img = self.ensure_ptr(self.value_map[&args[1]]);
+                let weights = self.ensure_ptr(self.value_map[&args[2]]);
+                let bias = self.ensure_ptr(self.value_map[&args[3]]);
+                let h_out = self.ensure_i64(self.value_map[&args[4]]);
+                let w_out = self.ensure_i64(self.value_map[&args[5]]);
+                let stride_y = self.ensure_i64(self.value_map[&args[6]]);
+                let stride_x = self.ensure_i64(self.value_map[&args[7]]);
+                let img_width = self.ensure_i64(self.value_map[&args[8]]);
+                let activation = if args.len() >= 10 {
+                    self.ensure_i32(self.value_map[&args[9]])
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                self.lower_multi_arena_conv2d(
+                    types::F32,
+                    true,
+                    4,
+                    dst,
+                    img,
+                    weights,
+                    bias,
+                    h_out,
+                    w_out,
+                    stride_y,
+                    stride_x,
+                    img_width,
+                    activation,
+                )
+            }
+            "ifa_simd_multi_arena_conv2d_f64" if args.len() >= 9 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let img = self.ensure_ptr(self.value_map[&args[1]]);
+                let weights = self.ensure_ptr(self.value_map[&args[2]]);
+                let bias = self.ensure_ptr(self.value_map[&args[3]]);
+                let h_out = self.ensure_i64(self.value_map[&args[4]]);
+                let w_out = self.ensure_i64(self.value_map[&args[5]]);
+                let stride_y = self.ensure_i64(self.value_map[&args[6]]);
+                let stride_x = self.ensure_i64(self.value_map[&args[7]]);
+                let img_width = self.ensure_i64(self.value_map[&args[8]]);
+                let activation = if args.len() >= 10 {
+                    self.ensure_i32(self.value_map[&args[9]])
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                self.lower_multi_arena_conv2d(
+                    types::F64,
+                    true,
+                    8,
+                    dst,
+                    img,
+                    weights,
+                    bias,
+                    h_out,
+                    w_out,
+                    stride_y,
+                    stride_x,
+                    img_width,
+                    activation,
+                )
+            }
+            "ifa_simd_multi_arena_conv2d_i64" if args.len() >= 9 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let img = self.ensure_ptr(self.value_map[&args[1]]);
+                let weights = self.ensure_ptr(self.value_map[&args[2]]);
+                let bias = self.ensure_ptr(self.value_map[&args[3]]);
+                let h_out = self.ensure_i64(self.value_map[&args[4]]);
+                let w_out = self.ensure_i64(self.value_map[&args[5]]);
+                let stride_y = self.ensure_i64(self.value_map[&args[6]]);
+                let stride_x = self.ensure_i64(self.value_map[&args[7]]);
+                let img_width = self.ensure_i64(self.value_map[&args[8]]);
+                let activation = if args.len() >= 10 {
+                    self.ensure_i32(self.value_map[&args[9]])
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                self.lower_multi_arena_conv2d(
+                    types::I64,
+                    false,
+                    8,
+                    dst,
+                    img,
+                    weights,
+                    bias,
+                    h_out,
+                    w_out,
+                    stride_y,
+                    stride_x,
+                    img_width,
+                    activation,
+                )
+            }
+            "ifa_simd_multi_arena_conv3d_f32" if args.len() >= 12 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let volume = self.ensure_ptr(self.value_map[&args[1]]);
+                let filter = self.ensure_ptr(self.value_map[&args[2]]);
+                let bias = self.ensure_ptr(self.value_map[&args[3]]);
+                let d_out = self.ensure_i64(self.value_map[&args[4]]);
+                let h_out = self.ensure_i64(self.value_map[&args[5]]);
+                let w_out = self.ensure_i64(self.value_map[&args[6]]);
+                let stride_z = self.ensure_i64(self.value_map[&args[7]]);
+                let stride_y = self.ensure_i64(self.value_map[&args[8]]);
+                let stride_x = self.ensure_i64(self.value_map[&args[9]]);
+                let plane_pitch = self.ensure_i64(self.value_map[&args[10]]);
+                let row_pitch = self.ensure_i64(self.value_map[&args[11]]);
+                let activation = if args.len() >= 13 {
+                    self.ensure_i32(self.value_map[&args[12]])
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                self.lower_multi_arena_conv3d(
+                    types::F32,
+                    true,
+                    4,
+                    dst,
+                    volume,
+                    filter,
+                    bias,
+                    d_out,
+                    h_out,
+                    w_out,
+                    stride_z,
+                    stride_y,
+                    stride_x,
+                    plane_pitch,
+                    row_pitch,
+                    activation,
+                )
+            }
+            "ifa_simd_multi_arena_conv3d_f64" if args.len() >= 12 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let volume = self.ensure_ptr(self.value_map[&args[1]]);
+                let filter = self.ensure_ptr(self.value_map[&args[2]]);
+                let bias = self.ensure_ptr(self.value_map[&args[3]]);
+                let d_out = self.ensure_i64(self.value_map[&args[4]]);
+                let h_out = self.ensure_i64(self.value_map[&args[5]]);
+                let w_out = self.ensure_i64(self.value_map[&args[6]]);
+                let stride_z = self.ensure_i64(self.value_map[&args[7]]);
+                let stride_y = self.ensure_i64(self.value_map[&args[8]]);
+                let stride_x = self.ensure_i64(self.value_map[&args[9]]);
+                let plane_pitch = self.ensure_i64(self.value_map[&args[10]]);
+                let row_pitch = self.ensure_i64(self.value_map[&args[11]]);
+                let activation = if args.len() >= 13 {
+                    self.ensure_i32(self.value_map[&args[12]])
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                self.lower_multi_arena_conv3d(
+                    types::F64,
+                    true,
+                    8,
+                    dst,
+                    volume,
+                    filter,
+                    bias,
+                    d_out,
+                    h_out,
+                    w_out,
+                    stride_z,
+                    stride_y,
+                    stride_x,
+                    plane_pitch,
+                    row_pitch,
+                    activation,
+                )
+            }
+            "ifa_simd_multi_arena_conv3d_i64" if args.len() >= 12 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let volume = self.ensure_ptr(self.value_map[&args[1]]);
+                let filter = self.ensure_ptr(self.value_map[&args[2]]);
+                let bias = self.ensure_ptr(self.value_map[&args[3]]);
+                let d_out = self.ensure_i64(self.value_map[&args[4]]);
+                let h_out = self.ensure_i64(self.value_map[&args[5]]);
+                let w_out = self.ensure_i64(self.value_map[&args[6]]);
+                let stride_z = self.ensure_i64(self.value_map[&args[7]]);
+                let stride_y = self.ensure_i64(self.value_map[&args[8]]);
+                let stride_x = self.ensure_i64(self.value_map[&args[9]]);
+                let plane_pitch = self.ensure_i64(self.value_map[&args[10]]);
+                let row_pitch = self.ensure_i64(self.value_map[&args[11]]);
+                let activation = if args.len() >= 13 {
+                    self.ensure_i32(self.value_map[&args[12]])
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                self.lower_multi_arena_conv3d(
+                    types::I64,
+                    false,
+                    8,
+                    dst,
+                    volume,
+                    filter,
+                    bias,
+                    d_out,
+                    h_out,
+                    w_out,
+                    stride_z,
+                    stride_y,
+                    stride_x,
+                    plane_pitch,
+                    row_pitch,
+                    activation,
+                )
+            }
+
             // Multi-arena tripartite reductions (dst[i*s_dst] += src1[i*s1] * src2[i*s2])
             "ifa_simd_multi_arena_tripartite_f32" if args.len() >= 7 => {
                 let dst = self.ensure_ptr(self.value_map[&args[0]]);
@@ -4455,6 +4661,437 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         );
 
         self.builder.switch_to_block(cont_block);
+        Some(self.builder.ins().iconst(types::I64, 0))
+    }
+
+    /// Lower multi-arena 2D convolution with optional fused bias and activation directly into Cranelift loops.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_multi_arena_conv2d(
+        &mut self,
+        elem_ty: types::Type,
+        is_float: bool,
+        elem_size: i64,
+        dst: ClValue,
+        img: ClValue,
+        weights: ClValue,
+        bias: ClValue,
+        h_out: ClValue,
+        w_out: ClValue,
+        stride_y: ClValue,
+        stride_x: ClValue,
+        img_width: ClValue,
+        activation: ClValue,
+    ) -> Option<ClValue> {
+        let y_header = self.builder.create_block();
+        let x_init = self.builder.create_block();
+        let x_header = self.builder.create_block();
+        let x_body = self.builder.create_block();
+        let y_step = self.builder.create_block();
+        let done_block = self.builder.create_block();
+
+        // Load w0 from weights[0]
+        let w0 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), weights, 0);
+
+        // Precompute scalar bias if bias pointer != null
+        let zero_ptr = self.builder.ins().iconst(self.ptr_type, 0);
+        let has_bias = self.builder.ins().icmp(IntCC::NotEqual, bias, zero_ptr);
+        let bias_block = self.builder.create_block();
+        let no_bias_block = self.builder.create_block();
+        let bias_merge = self.builder.create_block();
+        self.builder.append_block_param(bias_merge, elem_ty);
+
+        self.builder
+            .ins()
+            .brif(has_bias, bias_block, &[], no_bias_block, &[]);
+
+        self.builder.switch_to_block(bias_block);
+        let b_val = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), bias, 0);
+        self.builder
+            .ins()
+            .jump(bias_merge, &[BlockArg::from(b_val)]);
+
+        self.builder.switch_to_block(no_bias_block);
+        let zero_elem = if is_float {
+            if elem_ty == types::F32 {
+                self.builder.ins().f32const(0.0)
+            } else {
+                self.builder.ins().f64const(0.0)
+            }
+        } else {
+            self.builder.ins().iconst(elem_ty, 0)
+        };
+        self.builder
+            .ins()
+            .jump(bias_merge, &[BlockArg::from(zero_elem)]);
+
+        self.builder.switch_to_block(bias_merge);
+        let bias_scalar = self.builder.block_params(bias_merge)[0];
+
+        // Start Y loop
+        self.builder.append_block_param(y_header, types::I64);
+        let zero_i64 = self.builder.ins().iconst(types::I64, 0);
+        self.builder
+            .ins()
+            .jump(y_header, &[BlockArg::from(zero_i64)]);
+
+        self.builder.switch_to_block(y_header);
+        let cur_y = self.builder.block_params(y_header)[0];
+        let has_y = self.builder.ins().icmp(IntCC::SignedLessThan, cur_y, h_out);
+        self.builder.ins().brif(has_y, x_init, &[], done_block, &[]);
+
+        // X init: compute row offsets
+        self.builder.switch_to_block(x_init);
+        let y_str = self.builder.ins().imul(cur_y, stride_y);
+        let y_off = self.builder.ins().imul(y_str, img_width);
+        let y_out_off = self.builder.ins().imul(cur_y, w_out);
+
+        self.builder.append_block_param(x_header, types::I64);
+        self.builder.append_block_param(x_header, types::I64);
+        self.builder.append_block_param(x_header, types::I64);
+        self.builder.ins().jump(
+            x_header,
+            &[
+                BlockArg::from(zero_i64),
+                BlockArg::from(y_off),
+                BlockArg::from(y_out_off),
+            ],
+        );
+
+        self.builder.switch_to_block(x_header);
+        let cur_x = self.builder.block_params(x_header)[0];
+        let cur_y_off = self.builder.block_params(x_header)[1];
+        let cur_y_out_off = self.builder.block_params(x_header)[2];
+
+        let has_x = self.builder.ins().icmp(IntCC::SignedLessThan, cur_x, w_out);
+        self.builder.ins().brif(has_x, x_body, &[], y_step, &[]);
+
+        // X body: compute convolution element, add bias, apply activation, mutate dst
+        self.builder.switch_to_block(x_body);
+        let x_str = self.builder.ins().imul(cur_x, stride_x);
+        let in_elem_idx = self.builder.ins().iadd(cur_y_off, x_str);
+        let in_byte_off = self.builder.ins().imul_imm_s(in_elem_idx, elem_size);
+        let in_ptr = self.builder.ins().iadd(img, in_byte_off);
+        let in_val = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), in_ptr, 0);
+
+        let prod = if is_float {
+            self.builder.ins().fmul(in_val, w0)
+        } else {
+            self.builder.ins().imul(in_val, w0)
+        };
+
+        let mut accum = if is_float {
+            self.builder.ins().fadd(prod, bias_scalar)
+        } else {
+            self.builder.ins().iadd(prod, bias_scalar)
+        };
+
+        // ReLU activation: if activation == 1 and accum < 0, accum = 0
+        let act_relu = self.builder.ins().iconst(types::I32, 1);
+        let is_relu = self.builder.ins().icmp(IntCC::Equal, activation, act_relu);
+        let zero_val = if is_float {
+            if elem_ty == types::F32 {
+                self.builder.ins().f32const(0.0)
+            } else {
+                self.builder.ins().f64const(0.0)
+            }
+        } else {
+            self.builder.ins().iconst(elem_ty, 0)
+        };
+        let relu_cand = if is_float {
+            let is_gt = self
+                .builder
+                .ins()
+                .fcmp(FloatCC::GreaterThan, accum, zero_val);
+            self.builder.ins().select(is_gt, accum, zero_val)
+        } else {
+            let is_gt = self
+                .builder
+                .ins()
+                .icmp(IntCC::SignedGreaterThan, accum, zero_val);
+            self.builder.ins().select(is_gt, accum, zero_val)
+        };
+        accum = self.builder.ins().select(is_relu, relu_cand, accum);
+
+        // Store into dst[out_idx] += accum
+        let out_elem_idx = self.builder.ins().iadd(cur_y_out_off, cur_x);
+        let out_byte_off = self.builder.ins().imul_imm_s(out_elem_idx, elem_size);
+        let out_ptr = self.builder.ins().iadd(dst, out_byte_off);
+        let cur_dst = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), out_ptr, 0);
+        let new_dst = if is_float {
+            self.builder.ins().fadd(cur_dst, accum)
+        } else {
+            self.builder.ins().iadd(cur_dst, accum)
+        };
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), new_dst, out_ptr, 0);
+
+        let next_x = self.builder.ins().iadd_imm_s(cur_x, 1);
+        self.builder.ins().jump(
+            x_header,
+            &[
+                BlockArg::from(next_x),
+                BlockArg::from(cur_y_off),
+                BlockArg::from(cur_y_out_off),
+            ],
+        );
+
+        // Y step
+        self.builder.switch_to_block(y_step);
+        let next_y = self.builder.ins().iadd_imm_s(cur_y, 1);
+        self.builder.ins().jump(y_header, &[BlockArg::from(next_y)]);
+
+        self.builder.switch_to_block(done_block);
+        Some(self.builder.ins().iconst(types::I64, 0))
+    }
+
+    /// Lower multi-arena 3D volumetric convolution with optional fused bias and activation into Cranelift loops.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_multi_arena_conv3d(
+        &mut self,
+        elem_ty: types::Type,
+        is_float: bool,
+        elem_size: i64,
+        dst: ClValue,
+        volume: ClValue,
+        filter: ClValue,
+        bias: ClValue,
+        d_out: ClValue,
+        h_out: ClValue,
+        w_out: ClValue,
+        stride_z: ClValue,
+        stride_y: ClValue,
+        stride_x: ClValue,
+        plane_pitch: ClValue,
+        row_pitch: ClValue,
+        activation: ClValue,
+    ) -> Option<ClValue> {
+        let z_header = self.builder.create_block();
+        let y_init = self.builder.create_block();
+        let y_header = self.builder.create_block();
+        let x_init = self.builder.create_block();
+        let x_header = self.builder.create_block();
+        let x_body = self.builder.create_block();
+        let y_step = self.builder.create_block();
+        let z_step = self.builder.create_block();
+        let done_block = self.builder.create_block();
+
+        let f0 = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), filter, 0);
+
+        // Precompute scalar bias if bias pointer != null
+        let zero_ptr = self.builder.ins().iconst(self.ptr_type, 0);
+        let has_bias = self.builder.ins().icmp(IntCC::NotEqual, bias, zero_ptr);
+        let bias_block = self.builder.create_block();
+        let no_bias_block = self.builder.create_block();
+        let bias_merge = self.builder.create_block();
+        self.builder.append_block_param(bias_merge, elem_ty);
+
+        self.builder
+            .ins()
+            .brif(has_bias, bias_block, &[], no_bias_block, &[]);
+
+        self.builder.switch_to_block(bias_block);
+        let b_val = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), bias, 0);
+        self.builder
+            .ins()
+            .jump(bias_merge, &[BlockArg::from(b_val)]);
+
+        self.builder.switch_to_block(no_bias_block);
+        let zero_elem = if is_float {
+            if elem_ty == types::F32 {
+                self.builder.ins().f32const(0.0)
+            } else {
+                self.builder.ins().f64const(0.0)
+            }
+        } else {
+            self.builder.ins().iconst(elem_ty, 0)
+        };
+        self.builder
+            .ins()
+            .jump(bias_merge, &[BlockArg::from(zero_elem)]);
+
+        self.builder.switch_to_block(bias_merge);
+        let bias_scalar = self.builder.block_params(bias_merge)[0];
+
+        // Start Z loop
+        self.builder.append_block_param(z_header, types::I64);
+        let zero_i64 = self.builder.ins().iconst(types::I64, 0);
+        self.builder
+            .ins()
+            .jump(z_header, &[BlockArg::from(zero_i64)]);
+
+        self.builder.switch_to_block(z_header);
+        let cur_z = self.builder.block_params(z_header)[0];
+        let has_z = self.builder.ins().icmp(IntCC::SignedLessThan, cur_z, d_out);
+        self.builder.ins().brif(has_z, y_init, &[], done_block, &[]);
+
+        // Y init: compute plane offsets
+        self.builder.switch_to_block(y_init);
+        let z_str = self.builder.ins().imul(cur_z, stride_z);
+        let z_off = self.builder.ins().imul(z_str, plane_pitch);
+        let z_out_plane = self.builder.ins().imul(cur_z, h_out);
+
+        self.builder.append_block_param(y_header, types::I64);
+        self.builder.append_block_param(y_header, types::I64);
+        self.builder.append_block_param(y_header, types::I64);
+        self.builder.ins().jump(
+            y_header,
+            &[
+                BlockArg::from(zero_i64),
+                BlockArg::from(z_off),
+                BlockArg::from(z_out_plane),
+            ],
+        );
+
+        self.builder.switch_to_block(y_header);
+        let cur_y = self.builder.block_params(y_header)[0];
+        let cur_z_off = self.builder.block_params(y_header)[1];
+        let cur_z_out_plane = self.builder.block_params(y_header)[2];
+
+        let has_y = self.builder.ins().icmp(IntCC::SignedLessThan, cur_y, h_out);
+        self.builder.ins().brif(has_y, x_init, &[], z_step, &[]);
+
+        // X init: compute row offsets
+        self.builder.switch_to_block(x_init);
+        let y_str = self.builder.ins().imul(cur_y, stride_y);
+        let y_off = self.builder.ins().imul(y_str, row_pitch);
+        let zy_in_off = self.builder.ins().iadd(cur_z_off, y_off);
+
+        let zy_out_elem = self.builder.ins().iadd(cur_z_out_plane, cur_y);
+        let zy_out_off = self.builder.ins().imul(zy_out_elem, w_out);
+
+        self.builder.append_block_param(x_header, types::I64);
+        self.builder.append_block_param(x_header, types::I64);
+        self.builder.append_block_param(x_header, types::I64);
+        self.builder.ins().jump(
+            x_header,
+            &[
+                BlockArg::from(zero_i64),
+                BlockArg::from(zy_in_off),
+                BlockArg::from(zy_out_off),
+            ],
+        );
+
+        self.builder.switch_to_block(x_header);
+        let cur_x = self.builder.block_params(x_header)[0];
+        let cur_zy_in_off = self.builder.block_params(x_header)[1];
+        let cur_zy_out_off = self.builder.block_params(x_header)[2];
+
+        let has_x = self.builder.ins().icmp(IntCC::SignedLessThan, cur_x, w_out);
+        self.builder.ins().brif(has_x, x_body, &[], y_step, &[]);
+
+        // X body: load, multiply, bias, activation, accumulate
+        self.builder.switch_to_block(x_body);
+        let x_str = self.builder.ins().imul(cur_x, stride_x);
+        let in_elem_idx = self.builder.ins().iadd(cur_zy_in_off, x_str);
+        let in_byte_off = self.builder.ins().imul_imm_s(in_elem_idx, elem_size);
+        let in_ptr = self.builder.ins().iadd(volume, in_byte_off);
+        let in_val = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), in_ptr, 0);
+
+        let prod = if is_float {
+            self.builder.ins().fmul(in_val, f0)
+        } else {
+            self.builder.ins().imul(in_val, f0)
+        };
+
+        let mut accum = if is_float {
+            self.builder.ins().fadd(prod, bias_scalar)
+        } else {
+            self.builder.ins().iadd(prod, bias_scalar)
+        };
+
+        // ReLU activation
+        let act_relu = self.builder.ins().iconst(types::I32, 1);
+        let is_relu = self.builder.ins().icmp(IntCC::Equal, activation, act_relu);
+        let zero_val = if is_float {
+            if elem_ty == types::F32 {
+                self.builder.ins().f32const(0.0)
+            } else {
+                self.builder.ins().f64const(0.0)
+            }
+        } else {
+            self.builder.ins().iconst(elem_ty, 0)
+        };
+        let relu_cand = if is_float {
+            let is_gt = self
+                .builder
+                .ins()
+                .fcmp(FloatCC::GreaterThan, accum, zero_val);
+            self.builder.ins().select(is_gt, accum, zero_val)
+        } else {
+            let is_gt = self
+                .builder
+                .ins()
+                .icmp(IntCC::SignedGreaterThan, accum, zero_val);
+            self.builder.ins().select(is_gt, accum, zero_val)
+        };
+        accum = self.builder.ins().select(is_relu, relu_cand, accum);
+
+        let out_elem_idx = self.builder.ins().iadd(cur_zy_out_off, cur_x);
+        let out_byte_off = self.builder.ins().imul_imm_s(out_elem_idx, elem_size);
+        let out_ptr = self.builder.ins().iadd(dst, out_byte_off);
+        let cur_dst = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), out_ptr, 0);
+        let new_dst = if is_float {
+            self.builder.ins().fadd(cur_dst, accum)
+        } else {
+            self.builder.ins().iadd(cur_dst, accum)
+        };
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), new_dst, out_ptr, 0);
+
+        let next_x = self.builder.ins().iadd_imm_s(cur_x, 1);
+        self.builder.ins().jump(
+            x_header,
+            &[
+                BlockArg::from(next_x),
+                BlockArg::from(cur_zy_in_off),
+                BlockArg::from(cur_zy_out_off),
+            ],
+        );
+
+        // Y step
+        self.builder.switch_to_block(y_step);
+        let next_y = self.builder.ins().iadd_imm_s(cur_y, 1);
+        self.builder.ins().jump(
+            y_header,
+            &[
+                BlockArg::from(next_y),
+                BlockArg::from(cur_z_off),
+                BlockArg::from(cur_z_out_plane),
+            ],
+        );
+
+        // Z step
+        self.builder.switch_to_block(z_step);
+        let next_z = self.builder.ins().iadd_imm_s(cur_z, 1);
+        self.builder.ins().jump(z_header, &[BlockArg::from(next_z)]);
+
+        self.builder.switch_to_block(done_block);
         Some(self.builder.ins().iconst(types::I64, 0))
     }
 

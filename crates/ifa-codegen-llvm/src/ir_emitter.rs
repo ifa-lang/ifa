@@ -1015,6 +1015,87 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("t_step:\n  %tid = mul i64 %ti, %stride_dst\n  %ti1 = mul i64 %ti, %stride1\n  %ti2 = mul i64 %ti, %stride2\n  %tpd = getelementptr inbounds float, ptr %dst, i64 %tid\n  %tp1 = getelementptr inbounds float, ptr %src1, i64 %ti1\n  %tp2 = getelementptr inbounds float, ptr %src2, i64 %ti2\n  %tvd = load float, ptr %tpd, align 4\n  %tv1 = load float, ptr %tp1, align 4\n  %tv2 = load float, ptr %tp2, align 4\n  %tpr = fmul float %tv1, %tv2\n  %tr = fadd float %tvd, %tpr\n  store float %tr, ptr %tpd, align 4\n  %next_ti = add i64 %ti, 1\n  br label %t_loop\n");
         out.push_str("done:\n  ret void\n}\n\n");
 
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_conv2d_f32(ptr %dst, ptr %img, ptr %weights, ptr %bias, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %img_width, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  %w0 = load float, ptr %weights, align 4\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %b_val = load float, ptr %bias, align 4\n  br label %y_init\n");
+        out.push_str("zero_b:\n  br label %y_init\n");
+        out.push_str("y_init:\n  %bias_scalar = phi float [ %b_val, %load_b ], [ 0.0, %zero_b ]\n  %is_relu = icmp eq i32 %activation, 1\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %y_init ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %done\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_off = mul i64 %y_str, %img_width\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_step ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %x_step, label %y_next\n");
+        out.push_str("x_step:\n  %x_str = mul i64 %x, %stride_x\n  %in_idx = add i64 %y_off, %x_str\n  %out_idx = add i64 %y_out_off, %x\n  %p_in = getelementptr inbounds float, ptr %img, i64 %in_idx\n  %v_in = load float, ptr %p_in, align 4\n  %prod = fmul float %v_in, %w0\n  %accum = fadd float %prod, %bias_scalar\n  %relu_cond = fcmp ogt float %accum, 0.0\n  %relu_val = select i1 %relu_cond, float %accum, float 0.0\n  %act_val = select i1 %is_relu, float %relu_val, float %accum\n  %p_dst = getelementptr inbounds float, ptr %dst, i64 %out_idx\n  %old_dst = load float, ptr %p_dst, align 4\n  %new_dst = fadd float %old_dst, %act_val\n  store float %new_dst, ptr %p_dst, align 4\n  %next_x = add i64 %x, 1\n  br label %x_loop, !llvm.loop !74\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_conv2d_f64(ptr %dst, ptr %img, ptr %weights, ptr %bias, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %img_width, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  %w0 = load double, ptr %weights, align 8\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %b_val = load double, ptr %bias, align 8\n  br label %y_init\n");
+        out.push_str("zero_b:\n  br label %y_init\n");
+        out.push_str("y_init:\n  %bias_scalar = phi double [ %b_val, %load_b ], [ 0.0, %zero_b ]\n  %is_relu = icmp eq i32 %activation, 1\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %y_init ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %done\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_off = mul i64 %y_str, %img_width\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_step ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %x_step, label %y_next\n");
+        out.push_str("x_step:\n  %x_str = mul i64 %x, %stride_x\n  %in_idx = add i64 %y_off, %x_str\n  %out_idx = add i64 %y_out_off, %x\n  %p_in = getelementptr inbounds double, ptr %img, i64 %in_idx\n  %v_in = load double, ptr %p_in, align 8\n  %prod = fmul double %v_in, %w0\n  %accum = fadd double %prod, %bias_scalar\n  %relu_cond = fcmp ogt double %accum, 0.0\n  %relu_val = select i1 %relu_cond, double %accum, double 0.0\n  %act_val = select i1 %is_relu, double %relu_val, double %accum\n  %p_dst = getelementptr inbounds double, ptr %dst, i64 %out_idx\n  %old_dst = load double, ptr %p_dst, align 8\n  %new_dst = fadd double %old_dst, %act_val\n  store double %new_dst, ptr %p_dst, align 8\n  %next_x = add i64 %x, 1\n  br label %x_loop, !llvm.loop !74\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_conv2d_i64(ptr %dst, ptr %img, ptr %weights, ptr %bias, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %img_width, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  %w0 = load i64, ptr %weights, align 8\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %b_val = load i64, ptr %bias, align 8\n  br label %y_init\n");
+        out.push_str("zero_b:\n  br label %y_init\n");
+        out.push_str("y_init:\n  %bias_scalar = phi i64 [ %b_val, %load_b ], [ 0, %zero_b ]\n  %is_relu = icmp eq i32 %activation, 1\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %y_init ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %done\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_off = mul i64 %y_str, %img_width\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_step ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %x_step, label %y_next\n");
+        out.push_str("x_step:\n  %x_str = mul i64 %x, %stride_x\n  %in_idx = add i64 %y_off, %x_str\n  %out_idx = add i64 %y_out_off, %x\n  %p_in = getelementptr inbounds i64, ptr %img, i64 %in_idx\n  %v_in = load i64, ptr %p_in, align 8\n  %prod = mul i64 %v_in, %w0\n  %accum = add i64 %prod, %bias_scalar\n  %relu_cond = icmp sgt i64 %accum, 0\n  %relu_val = select i1 %relu_cond, i64 %accum, i64 0\n  %act_val = select i1 %is_relu, i64 %relu_val, i64 %accum\n  %p_dst = getelementptr inbounds i64, ptr %dst, i64 %out_idx\n  %old_dst = load i64, ptr %p_dst, align 8\n  %new_dst = add i64 %old_dst, %act_val\n  store i64 %new_dst, ptr %p_dst, align 8\n  %next_x = add i64 %x, 1\n  br label %x_loop, !llvm.loop !74\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_conv3d_f32(ptr %dst, ptr %volume, ptr %filter, ptr %bias, i64 %d_out, i64 %h_out, i64 %w_out, i64 %stride_z, i64 %stride_y, i64 %stride_x, i64 %plane_pitch, i64 %row_pitch, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  %f0 = load float, ptr %filter, align 4\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %b_val = load float, ptr %bias, align 4\n  br label %z_init\n");
+        out.push_str("zero_b:\n  br label %z_init\n");
+        out.push_str("z_init:\n  %bias_scalar = phi float [ %b_val, %load_b ], [ 0.0, %zero_b ]\n  %is_relu = icmp eq i32 %activation, 1\n  br label %z_loop\n");
+        out.push_str("z_loop:\n  %z = phi i64 [ 0, %z_init ], [ %next_z, %z_next ]\n  %has_z = icmp ult i64 %z, %d_out\n  br i1 %has_z, label %y_init, label %done\n");
+        out.push_str("y_init:\n  %z_str = mul i64 %z, %stride_z\n  %z_off = mul i64 %z_str, %plane_pitch\n  %z_out_plane = mul i64 %z, %h_out\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %y_init ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %z_next\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_off = mul i64 %y_str, %row_pitch\n  %zy_in_off = add i64 %z_off, %y_off\n  %zy_out_elem = add i64 %z_out_plane, %y\n  %zy_out_off = mul i64 %zy_out_elem, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_step ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %x_step, label %y_next\n");
+        out.push_str("x_step:\n  %x_str = mul i64 %x, %stride_x\n  %in_idx = add i64 %zy_in_off, %x_str\n  %out_idx = add i64 %zy_out_off, %x\n  %p_in = getelementptr inbounds float, ptr %volume, i64 %in_idx\n  %v_in = load float, ptr %p_in, align 4\n  %prod = fmul float %v_in, %f0\n  %accum = fadd float %prod, %bias_scalar\n  %relu_cond = fcmp ogt float %accum, 0.0\n  %relu_val = select i1 %relu_cond, float %accum, float 0.0\n  %act_val = select i1 %is_relu, float %relu_val, float %accum\n  %p_dst = getelementptr inbounds float, ptr %dst, i64 %out_idx\n  %old_dst = load float, ptr %p_dst, align 4\n  %new_dst = fadd float %old_dst, %act_val\n  store float %new_dst, ptr %p_dst, align 4\n  %next_x = add i64 %x, 1\n  br label %x_loop, !llvm.loop !73\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("z_next:\n  %next_z = add i64 %z, 1\n  br label %z_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_conv3d_f64(ptr %dst, ptr %volume, ptr %filter, ptr %bias, i64 %d_out, i64 %h_out, i64 %w_out, i64 %stride_z, i64 %stride_y, i64 %stride_x, i64 %plane_pitch, i64 %row_pitch, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  %f0 = load double, ptr %filter, align 8\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %b_val = load double, ptr %bias, align 8\n  br label %z_init\n");
+        out.push_str("zero_b:\n  br label %z_init\n");
+        out.push_str("z_init:\n  %bias_scalar = phi double [ %b_val, %load_b ], [ 0.0, %zero_b ]\n  %is_relu = icmp eq i32 %activation, 1\n  br label %z_loop\n");
+        out.push_str("z_loop:\n  %z = phi i64 [ 0, %z_init ], [ %next_z, %z_next ]\n  %has_z = icmp ult i64 %z, %d_out\n  br i1 %has_z, label %y_init, label %done\n");
+        out.push_str("y_init:\n  %z_str = mul i64 %z, %stride_z\n  %z_off = mul i64 %z_str, %plane_pitch\n  %z_out_plane = mul i64 %z, %h_out\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %y_init ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %z_next\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_off = mul i64 %y_str, %row_pitch\n  %zy_in_off = add i64 %z_off, %y_off\n  %zy_out_elem = add i64 %z_out_plane, %y\n  %zy_out_off = mul i64 %zy_out_elem, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_step ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %x_step, label %y_next\n");
+        out.push_str("x_step:\n  %x_str = mul i64 %x, %stride_x\n  %in_idx = add i64 %zy_in_off, %x_str\n  %out_idx = add i64 %zy_out_off, %x\n  %p_in = getelementptr inbounds double, ptr %volume, i64 %in_idx\n  %v_in = load double, ptr %p_in, align 8\n  %prod = fmul double %v_in, %f0\n  %accum = fadd double %prod, %bias_scalar\n  %relu_cond = fcmp ogt double %accum, 0.0\n  %relu_val = select i1 %relu_cond, double %accum, double 0.0\n  %act_val = select i1 %is_relu, double %relu_val, double %accum\n  %p_dst = getelementptr inbounds double, ptr %dst, i64 %out_idx\n  %old_dst = load double, ptr %p_dst, align 8\n  %new_dst = fadd double %old_dst, %act_val\n  store double %new_dst, ptr %p_dst, align 8\n  %next_x = add i64 %x, 1\n  br label %x_loop, !llvm.loop !73\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("z_next:\n  %next_z = add i64 %z, 1\n  br label %z_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_conv3d_i64(ptr %dst, ptr %volume, ptr %filter, ptr %bias, i64 %d_out, i64 %h_out, i64 %w_out, i64 %stride_z, i64 %stride_y, i64 %stride_x, i64 %plane_pitch, i64 %row_pitch, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  %f0 = load i64, ptr %filter, align 8\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %b_val = load i64, ptr %bias, align 8\n  br label %z_init\n");
+        out.push_str("zero_b:\n  br label %z_init\n");
+        out.push_str("z_init:\n  %bias_scalar = phi i64 [ %b_val, %load_b ], [ 0, %zero_b ]\n  %is_relu = icmp eq i32 %activation, 1\n  br label %z_loop\n");
+        out.push_str("z_loop:\n  %z = phi i64 [ 0, %z_init ], [ %next_z, %z_next ]\n  %has_z = icmp ult i64 %z, %d_out\n  br i1 %has_z, label %y_init, label %done\n");
+        out.push_str("y_init:\n  %z_str = mul i64 %z, %stride_z\n  %z_off = mul i64 %z_str, %plane_pitch\n  %z_out_plane = mul i64 %z, %h_out\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %y_init ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %z_next\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_off = mul i64 %y_str, %row_pitch\n  %zy_in_off = add i64 %z_off, %y_off\n  %zy_out_elem = add i64 %z_out_plane, %y\n  %zy_out_off = mul i64 %zy_out_elem, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_step ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %x_step, label %y_next\n");
+        out.push_str("x_step:\n  %x_str = mul i64 %x, %stride_x\n  %in_idx = add i64 %zy_in_off, %x_str\n  %out_idx = add i64 %zy_out_off, %x\n  %p_in = getelementptr inbounds i64, ptr %volume, i64 %in_idx\n  %v_in = load i64, ptr %p_in, align 8\n  %prod = mul i64 %v_in, %f0\n  %accum = add i64 %prod, %bias_scalar\n  %relu_cond = icmp sgt i64 %accum, 0\n  %relu_val = select i1 %relu_cond, i64 %accum, i64 0\n  %act_val = select i1 %is_relu, i64 %relu_val, i64 %accum\n  %p_dst = getelementptr inbounds i64, ptr %dst, i64 %out_idx\n  %old_dst = load i64, ptr %p_dst, align 8\n  %new_dst = add i64 %old_dst, %act_val\n  store i64 %new_dst, ptr %p_dst, align 8\n  %next_x = add i64 %x, 1\n  br label %x_loop, !llvm.loop !73\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("z_next:\n  %next_z = add i64 %z, 1\n  br label %z_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
         // 6. Arena Slice Count-If Reductions (Conditional Counting Zero-Heap)
         out.push_str("; IFA Standard Library SIMD Contiguous Arena Slice Count-If Reductions\n");
 
