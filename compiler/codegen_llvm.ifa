@@ -281,6 +281,49 @@ pub struct AstCowMakeMut {
     align_bytes: i64
 }
 
+// AST: Guaranteed Copy-on-Write Subtree Slicing
+pub struct AstCowSlice {
+    target_var: String,
+    src_var: String,
+    offset_bytes: i64,
+    len_bytes: i64
+}
+
+// AST: Guaranteed Copy-on-Write Freeze Read-Only
+pub struct AstCowFreeze {
+    target_var: String,
+    src_var: String
+}
+
+// AST: Guaranteed Copy-on-Write Clone Subtree
+pub struct AstCowCloneSubtree {
+    target_var: String,
+    root_var: String,
+    node_count: i64
+}
+
+// AST: SSA Phi Incoming Pair
+pub struct AstSsaPhiPair {
+    val_var: String,
+    block_label: String
+}
+
+// AST: SSA Phi Node
+pub struct AstSsaPhi {
+    target_var: String,
+    ty: String,
+    pairs: List<AstSsaPhiPair>
+}
+
+// AST: SSA Select Conditional Branchless Node
+pub struct AstSsaSelect {
+    target_var: String,
+    cond_var: String,
+    ty: String,
+    true_var: String,
+    false_var: String
+}
+
 pub fn mangle_generic_method(
     trait_name: String,
     struct_name: String,
@@ -3550,6 +3593,101 @@ pub fn emit_fir_cow_make_mut(cow: AstCowMakeMut) -> List<String> {
     return lines;
 }
 
+// Emits LLVM IR for Copy-on-Write Subtree Slice
+pub fn emit_llvm_cow_slice(cow: AstCowSlice) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  ; === Copy-on-Write Subtree Slice: %" + cow.target_var + " ===");
+    lines.push("  %" + cow.target_var + " = call ptr @ifa_rt_cow_slice(ptr %" + cow.src_var + ", i64 " + int_to_str(cow.offset_bytes) + ", i64 " + int_to_str(cow.len_bytes) + ")");
+    return lines;
+}
+
+// Emits FIR SSA for Copy-on-Write Subtree Slice
+pub fn emit_fir_cow_slice(cow: AstCowSlice) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + cow.target_var + " = fir.cow_slice %" + cow.src_var + ", offset=" + int_to_str(cow.offset_bytes) + ", len=" + int_to_str(cow.len_bytes));
+    return lines;
+}
+
+// Emits LLVM IR for Copy-on-Write Freeze Read-Only
+pub fn emit_llvm_cow_freeze(cow: AstCowFreeze) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  ; === Copy-on-Write Freeze Read-Only: %" + cow.target_var + " ===");
+    lines.push("  %" + cow.target_var + " = call ptr @ifa_rt_cow_freeze(ptr %" + cow.src_var + ")");
+    return lines;
+}
+
+// Emits FIR SSA for Copy-on-Write Freeze Read-Only
+pub fn emit_fir_cow_freeze(cow: AstCowFreeze) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + cow.target_var + " = fir.cow_freeze %" + cow.src_var);
+    return lines;
+}
+
+// Emits LLVM IR for Copy-on-Write Clone Subtree
+pub fn emit_llvm_cow_clone_subtree(cow: AstCowCloneSubtree) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  ; === Copy-on-Write Clone Subtree: %" + cow.target_var + " ===");
+    lines.push("  %" + cow.target_var + " = call ptr @ifa_rt_cow_clone_subtree(ptr %" + cow.root_var + ", i64 " + int_to_str(cow.node_count) + ")");
+    return lines;
+}
+
+// Emits FIR SSA for Copy-on-Write Clone Subtree
+pub fn emit_fir_cow_clone_subtree(cow: AstCowCloneSubtree) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + cow.target_var + " = fir.cow_clone_subtree %" + cow.root_var + ", nodes=" + int_to_str(cow.node_count));
+    return lines;
+}
+
+// Emits LLVM IR for SSA Phi Node
+pub fn emit_llvm_ssa_phi(phi: AstSsaPhi) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  ; === SSA Phi Node: %" + phi.target_var + " ===");
+    mut incoming = "";
+    mut i = 0;
+    while i < phi.pairs.len() {
+        let p = phi.pairs[i];
+        if i > 0 {
+            incoming = incoming + ", ";
+        }
+        incoming = incoming + "[ %" + p.val_var + ", %" + p.block_label + " ]";
+        i = i + 1;
+    }
+    lines.push("  %" + phi.target_var + " = phi " + phi.ty + " " + incoming);
+    return lines;
+}
+
+// Emits FIR SSA for Phi Node
+pub fn emit_fir_ssa_phi(phi: AstSsaPhi) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut incoming = "";
+    mut i = 0;
+    while i < phi.pairs.len() {
+        let p = phi.pairs[i];
+        if i > 0 {
+            incoming = incoming + ", ";
+        }
+        incoming = incoming + "[ %" + p.val_var + ", ^" + p.block_label + " ]";
+        i = i + 1;
+    }
+    lines.push("    %" + phi.target_var + " = fir.phi " + incoming);
+    return lines;
+}
+
+// Emits LLVM IR for SSA Select Node
+pub fn emit_llvm_ssa_select(sel: AstSsaSelect) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  ; === SSA Select Node: %" + sel.target_var + " ===");
+    lines.push("  %" + sel.target_var + " = select i1 %" + sel.cond_var + ", " + sel.ty + " %" + sel.true_var + ", " + sel.ty + " %" + sel.false_var);
+    return lines;
+}
+
+// Emits FIR SSA for Select Node
+pub fn emit_fir_ssa_select(sel: AstSsaSelect) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + sel.target_var + " = fir.select %" + sel.cond_var + ", %" + sel.true_var + ", %" + sel.false_var);
+    return lines;
+}
+
 // Unit test 29: Scoped arena creation, generational allocation and reset
 pub fn test_codegen_arena_allocation_and_reset() -> bool {
     let ac = AstArenaCreate(target_var: "arena_hdl", capacity_bytes: 65536);
@@ -3637,6 +3775,100 @@ pub fn test_codegen_cow_make_mut() -> bool {
     return has_llvm && has_fir;
 }
 
+// Unit test 32: Copy-on-Write Subtree Slicing and Freeze Read-Only lowering
+pub fn test_codegen_cow_slice_and_freeze() -> bool {
+    let sl = AstCowSlice(
+        target_var: "slice_buf",
+        src_var: "ast_tree_buf",
+        offset_bytes: 128,
+        len_bytes: 512
+    );
+    let llvm_sl = emit_llvm_cow_slice(sl);
+    let fir_sl = emit_fir_cow_slice(sl);
+    if llvm_sl.len() != 2 || fir_sl.len() != 1 {
+        return false;
+    }
+    if llvm_sl[1] != "  %slice_buf = call ptr @ifa_rt_cow_slice(ptr %ast_tree_buf, i64 128, i64 512)" {
+        return false;
+    }
+    if fir_sl[0] != "    %slice_buf = fir.cow_slice %ast_tree_buf, offset=128, len=512" {
+        return false;
+    }
+
+    let fr = AstCowFreeze(
+        target_var: "frozen_buf",
+        src_var: "slice_buf"
+    );
+    let llvm_fr = emit_llvm_cow_freeze(fr);
+    let fir_fr = emit_fir_cow_freeze(fr);
+    if llvm_fr.len() != 2 || fir_fr.len() != 1 {
+        return false;
+    }
+    if llvm_fr[1] != "  %frozen_buf = call ptr @ifa_rt_cow_freeze(ptr %slice_buf)" {
+        return false;
+    }
+    return fir_fr[0] == "    %frozen_buf = fir.cow_freeze %slice_buf";
+}
+
+// Unit test 33: Copy-on-Write Clone Subtree O(1) lowering
+pub fn test_codegen_cow_clone_subtree() -> bool {
+    let cl = AstCowCloneSubtree(
+        target_var: "cloned_ast_root",
+        root_var: "orig_ast_root",
+        node_count: 64
+    );
+    let llvm_cl = emit_llvm_cow_clone_subtree(cl);
+    let fir_cl = emit_fir_cow_clone_subtree(cl);
+    if llvm_cl.len() != 2 || fir_cl.len() != 1 {
+        return false;
+    }
+    if llvm_cl[1] != "  %cloned_ast_root = call ptr @ifa_rt_cow_clone_subtree(ptr %orig_ast_root, i64 64)" {
+        return false;
+    }
+    return fir_cl[0] == "    %cloned_ast_root = fir.cow_clone_subtree %orig_ast_root, nodes=64";
+}
+
+// Unit test 34: Advanced SSA Phi Node and Branchless Select lowering
+pub fn test_codegen_ssa_phi_and_select() -> bool {
+    mut pairs: List<AstSsaPhiPair> = List::new();
+    pairs.push(AstSsaPhiPair(val_var: "val_then", block_label: "then.block"));
+    pairs.push(AstSsaPhiPair(val_var: "val_else", block_label: "else.block"));
+
+    let phi = AstSsaPhi(
+        target_var: "merged_val",
+        ty: "i64",
+        pairs: pairs
+    );
+    let llvm_phi = emit_llvm_ssa_phi(phi);
+    let fir_phi = emit_fir_ssa_phi(phi);
+    if llvm_phi.len() != 2 || fir_phi.len() != 1 {
+        return false;
+    }
+    if llvm_phi[1] != "  %merged_val = phi i64 [ %val_then, %then.block ], [ %val_else, %else.block ]" {
+        return false;
+    }
+    if fir_phi[0] != "    %merged_val = fir.phi [ %val_then, ^then.block ], [ %val_else, ^else.block ]" {
+        return false;
+    }
+
+    let sel = AstSsaSelect(
+        target_var: "cond_res",
+        cond_var: "flag",
+        ty: "i64",
+        true_var: "x",
+        false_var: "y"
+    );
+    let llvm_sel = emit_llvm_ssa_select(sel);
+    let fir_sel = emit_fir_ssa_select(sel);
+    if llvm_sel.len() != 2 || fir_sel.len() != 1 {
+        return false;
+    }
+    if llvm_sel[1] != "  %cond_res = select i1 %flag, i64 %x, i64 %y" {
+        return false;
+    }
+    return fir_sel[0] == "    %cond_res = fir.select %flag, %x, %y";
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -3672,7 +3904,10 @@ pub fn main() {
     let t29 = test_codegen_arena_allocation_and_reset();
     let t30 = test_codegen_gen_ref_check();
     let t31 = test_codegen_cow_make_mut();
-    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 {
+    let t32 = test_codegen_cow_slice_and_freeze();
+    let t33 = test_codegen_cow_clone_subtree();
+    let t34 = test_codegen_ssa_phi_and_select();
+    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 && t33 && t34 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");

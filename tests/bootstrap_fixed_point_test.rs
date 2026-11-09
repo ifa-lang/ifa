@@ -691,8 +691,23 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("262 passed; 0 failed"),
-        "Expected 262 passed unit tests, got:\n{}",
+        stdout.contains("test test_codegen_cow_slice_and_freeze ... ok"),
+        "Modular codegen cow slice and freeze test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_cow_clone_subtree ... ok"),
+        "Modular codegen cow clone subtree test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_ssa_phi_and_select ... ok"),
+        "Modular codegen ssa phi and select test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("268 passed; 0 failed"),
+        "Expected 268 passed unit tests, got:\n{}",
         stdout
     );
 }
