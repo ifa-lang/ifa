@@ -1630,6 +1630,9 @@ impl<'a> LlvmIrEmitter<'a> {
         );
         out.push_str("define linkonce_odr void @ifa_rt_gen_check(ptr %ptr, i32 %remembered_gen) alwaysinline {\n");
         out.push_str("entry:\n");
+        out.push_str("  %is_null = icmp eq ptr %ptr, null\n");
+        out.push_str("  br i1 %is_null, label %ok, label %check\n\n");
+        out.push_str("check:\n");
         out.push_str("  %hdr_ptr = getelementptr inbounds i8, ptr %ptr, i64 -8\n");
         out.push_str("  %actual_gen = load i32, ptr %hdr_ptr, align 4\n");
         out.push_str("  %flags_ptr = getelementptr inbounds i8, ptr %ptr, i64 -4\n");

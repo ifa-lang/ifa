@@ -53,7 +53,7 @@ void ifa_rt_gen_free(void* ptr) {
 }
 
 void ifa_rt_gen_check(const void* ptr, uint32_t remembered_gen) {
-    if (!ptr) abort();
+    if (!ptr) return;
     const ifa_gen_header_t* h = (const ifa_gen_header_t*)((const uint8_t*)ptr - sizeof(ifa_gen_header_t));
     if (!(h->allocation_flags & 1) || h->generation_counter != remembered_gen) {
         fprintf(stderr, "\n[IFA RUNTIME ERROR: SAFE INTERCEPTION] Use-After-Free intercepted at %p (actual gen: %u, expected: %u)\n", ptr, h->generation_counter, remembered_gen);

@@ -480,8 +480,10 @@ fn test_bootstrap_triple_compilation_and_fixed_point_hash() {
     let hash_o_gen2 = sha256_hex(&fs::read(&gen2_o).expect("read gen2 o"));
     let hash_bin_gen2 = sha256_hex(&fs::read(&gen2_bin).expect("read gen2 bin"));
 
-    // Remove ifac binary before regenerating Gen 3
+    // Remove ifac artifacts before regenerating Gen 3
     let _ = fs::remove_file(&ifac_bin);
+    let _ = fs::remove_file(&ifac_ll);
+    let _ = fs::remove_file(&ifac_o);
 
     // Stage 1 -> Stage 2: Recompile with complete cache bypass to produce Gen 3 artifacts
     let build_gen2 = Command::new(&kori_bin)
@@ -515,6 +517,16 @@ fn test_bootstrap_triple_compilation_and_fixed_point_hash() {
     fs::copy(&ifac_bin, &gen3_bin).expect("copy gen3 binary");
     fs::copy(&ifac_ll, &gen3_ll).expect("copy gen3 ll");
     fs::copy(&ifac_o, &gen3_o).expect("copy gen3 o");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(&gen3_bin) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o755);
+            let _ = fs::set_permissions(&gen3_bin, perms);
+        }
+    }
 
     let hash_ll_gen3 = sha256_hex(&fs::read(&gen3_ll).expect("read gen3 ll"));
     let hash_o_gen3 = sha256_hex(&fs::read(&gen3_o).expect("read gen3 o"));
