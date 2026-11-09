@@ -2190,7 +2190,15 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     };
                     let cur_ty = self.builder.func.dfg.value_type(ret_val);
                     if cur_ty != expected_ret_ty {
-                        if cur_ty.bits() > expected_ret_ty.bits() {
+                        if cur_ty.is_float() && expected_ret_ty.is_int() {
+                            ret_val = self.builder.ins().fcvt_to_sint(expected_ret_ty, ret_val);
+                        } else if cur_ty.is_int() && expected_ret_ty.is_float() {
+                            ret_val = self.builder.ins().fcvt_from_sint(expected_ret_ty, ret_val);
+                        } else if cur_ty == types::F32 && expected_ret_ty == types::F64 {
+                            ret_val = self.builder.ins().fpromote(types::F64, ret_val);
+                        } else if cur_ty == types::F64 && expected_ret_ty == types::F32 {
+                            ret_val = self.builder.ins().fdemote(types::F32, ret_val);
+                        } else if cur_ty.bits() > expected_ret_ty.bits() {
                             ret_val = self.builder.ins().ireduce(expected_ret_ty, ret_val);
                         } else if cur_ty.bits() < expected_ret_ty.bits() {
                             ret_val = self.builder.ins().sextend(expected_ret_ty, ret_val);
@@ -2945,6 +2953,270 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     pool_h,
                     pool_w,
                     img_width,
+                )
+            }
+
+            // Multi-arena Depthwise 2D Convolutions
+            "ifa_simd_multi_arena_depthwise_conv2d_f32" if args.len() >= 13 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let img = self.ensure_ptr(self.value_map[&args[1]]);
+                let weights = self.ensure_ptr(self.value_map[&args[2]]);
+                let bias = self.ensure_ptr(self.value_map[&args[3]]);
+                let channels = self.ensure_i64(self.value_map[&args[4]]);
+                let h_out = self.ensure_i64(self.value_map[&args[5]]);
+                let w_out = self.ensure_i64(self.value_map[&args[6]]);
+                let stride_y = self.ensure_i64(self.value_map[&args[7]]);
+                let stride_x = self.ensure_i64(self.value_map[&args[8]]);
+                let kernel_h = self.ensure_i64(self.value_map[&args[9]]);
+                let kernel_w = self.ensure_i64(self.value_map[&args[10]]);
+                let img_h = self.ensure_i64(self.value_map[&args[11]]);
+                let img_w = self.ensure_i64(self.value_map[&args[12]]);
+                let activation = if args.len() >= 14 {
+                    self.ensure_i32(self.value_map[&args[13]])
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                self.lower_multi_arena_depthwise_conv2d(
+                    types::F32,
+                    true,
+                    4,
+                    dst,
+                    img,
+                    weights,
+                    bias,
+                    channels,
+                    h_out,
+                    w_out,
+                    stride_y,
+                    stride_x,
+                    kernel_h,
+                    kernel_w,
+                    img_h,
+                    img_w,
+                    activation,
+                )
+            }
+            "ifa_simd_multi_arena_depthwise_conv2d_f64" if args.len() >= 13 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let img = self.ensure_ptr(self.value_map[&args[1]]);
+                let weights = self.ensure_ptr(self.value_map[&args[2]]);
+                let bias = self.ensure_ptr(self.value_map[&args[3]]);
+                let channels = self.ensure_i64(self.value_map[&args[4]]);
+                let h_out = self.ensure_i64(self.value_map[&args[5]]);
+                let w_out = self.ensure_i64(self.value_map[&args[6]]);
+                let stride_y = self.ensure_i64(self.value_map[&args[7]]);
+                let stride_x = self.ensure_i64(self.value_map[&args[8]]);
+                let kernel_h = self.ensure_i64(self.value_map[&args[9]]);
+                let kernel_w = self.ensure_i64(self.value_map[&args[10]]);
+                let img_h = self.ensure_i64(self.value_map[&args[11]]);
+                let img_w = self.ensure_i64(self.value_map[&args[12]]);
+                let activation = if args.len() >= 14 {
+                    self.ensure_i32(self.value_map[&args[13]])
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                self.lower_multi_arena_depthwise_conv2d(
+                    types::F64,
+                    true,
+                    8,
+                    dst,
+                    img,
+                    weights,
+                    bias,
+                    channels,
+                    h_out,
+                    w_out,
+                    stride_y,
+                    stride_x,
+                    kernel_h,
+                    kernel_w,
+                    img_h,
+                    img_w,
+                    activation,
+                )
+            }
+            "ifa_simd_multi_arena_depthwise_conv2d_i64" if args.len() >= 13 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let img = self.ensure_ptr(self.value_map[&args[1]]);
+                let weights = self.ensure_ptr(self.value_map[&args[2]]);
+                let bias = self.ensure_ptr(self.value_map[&args[3]]);
+                let channels = self.ensure_i64(self.value_map[&args[4]]);
+                let h_out = self.ensure_i64(self.value_map[&args[5]]);
+                let w_out = self.ensure_i64(self.value_map[&args[6]]);
+                let stride_y = self.ensure_i64(self.value_map[&args[7]]);
+                let stride_x = self.ensure_i64(self.value_map[&args[8]]);
+                let kernel_h = self.ensure_i64(self.value_map[&args[9]]);
+                let kernel_w = self.ensure_i64(self.value_map[&args[10]]);
+                let img_h = self.ensure_i64(self.value_map[&args[11]]);
+                let img_w = self.ensure_i64(self.value_map[&args[12]]);
+                let activation = if args.len() >= 14 {
+                    self.ensure_i32(self.value_map[&args[13]])
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                self.lower_multi_arena_depthwise_conv2d(
+                    types::I64,
+                    false,
+                    8,
+                    dst,
+                    img,
+                    weights,
+                    bias,
+                    channels,
+                    h_out,
+                    w_out,
+                    stride_y,
+                    stride_x,
+                    kernel_h,
+                    kernel_w,
+                    img_h,
+                    img_w,
+                    activation,
+                )
+            }
+
+            // Multi-arena Pointwise (1x1) 2D Convolutions
+            "ifa_simd_multi_arena_pointwise_conv2d_f32" if args.len() >= 7 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let img = self.ensure_ptr(self.value_map[&args[1]]);
+                let weights = self.ensure_ptr(self.value_map[&args[2]]);
+                let bias = self.ensure_ptr(self.value_map[&args[3]]);
+                let c_in = self.ensure_i64(self.value_map[&args[4]]);
+                let c_out = self.ensure_i64(self.value_map[&args[5]]);
+                let spatial_size = self.ensure_i64(self.value_map[&args[6]]);
+                let activation = if args.len() >= 8 {
+                    self.ensure_i32(self.value_map[&args[7]])
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                self.lower_multi_arena_pointwise_conv2d(
+                    types::F32,
+                    true,
+                    4,
+                    dst,
+                    img,
+                    weights,
+                    bias,
+                    c_in,
+                    c_out,
+                    spatial_size,
+                    activation,
+                )
+            }
+            "ifa_simd_multi_arena_pointwise_conv2d_f64" if args.len() >= 7 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let img = self.ensure_ptr(self.value_map[&args[1]]);
+                let weights = self.ensure_ptr(self.value_map[&args[2]]);
+                let bias = self.ensure_ptr(self.value_map[&args[3]]);
+                let c_in = self.ensure_i64(self.value_map[&args[4]]);
+                let c_out = self.ensure_i64(self.value_map[&args[5]]);
+                let spatial_size = self.ensure_i64(self.value_map[&args[6]]);
+                let activation = if args.len() >= 8 {
+                    self.ensure_i32(self.value_map[&args[7]])
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                self.lower_multi_arena_pointwise_conv2d(
+                    types::F64,
+                    true,
+                    8,
+                    dst,
+                    img,
+                    weights,
+                    bias,
+                    c_in,
+                    c_out,
+                    spatial_size,
+                    activation,
+                )
+            }
+            "ifa_simd_multi_arena_pointwise_conv2d_i64" if args.len() >= 7 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let img = self.ensure_ptr(self.value_map[&args[1]]);
+                let weights = self.ensure_ptr(self.value_map[&args[2]]);
+                let bias = self.ensure_ptr(self.value_map[&args[3]]);
+                let c_in = self.ensure_i64(self.value_map[&args[4]]);
+                let c_out = self.ensure_i64(self.value_map[&args[5]]);
+                let spatial_size = self.ensure_i64(self.value_map[&args[6]]);
+                let activation = if args.len() >= 8 {
+                    self.ensure_i32(self.value_map[&args[7]])
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                self.lower_multi_arena_pointwise_conv2d(
+                    types::I64,
+                    false,
+                    8,
+                    dst,
+                    img,
+                    weights,
+                    bias,
+                    c_in,
+                    c_out,
+                    spatial_size,
+                    activation,
+                )
+            }
+
+            // Multi-arena 2D Batch Normalization
+            "ifa_simd_multi_arena_batch_norm2d_f32" if args.len() >= 9 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let src = self.ensure_ptr(self.value_map[&args[1]]);
+                let gamma = self.ensure_ptr(self.value_map[&args[2]]);
+                let beta = self.ensure_ptr(self.value_map[&args[3]]);
+                let mean = self.ensure_ptr(self.value_map[&args[4]]);
+                let var = self.ensure_ptr(self.value_map[&args[5]]);
+                let channels = self.ensure_i64(self.value_map[&args[6]]);
+                let spatial_size = self.ensure_i64(self.value_map[&args[7]]);
+                let epsilon = self.ensure_f32(self.value_map[&args[8]]);
+                let activation = if args.len() >= 10 {
+                    self.ensure_i32(self.value_map[&args[9]])
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                self.lower_multi_arena_batch_norm2d(
+                    types::F32,
+                    4,
+                    dst,
+                    src,
+                    gamma,
+                    beta,
+                    mean,
+                    var,
+                    channels,
+                    spatial_size,
+                    epsilon,
+                    activation,
+                )
+            }
+            "ifa_simd_multi_arena_batch_norm2d_f64" if args.len() >= 9 => {
+                let dst = self.ensure_ptr(self.value_map[&args[0]]);
+                let src = self.ensure_ptr(self.value_map[&args[1]]);
+                let gamma = self.ensure_ptr(self.value_map[&args[2]]);
+                let beta = self.ensure_ptr(self.value_map[&args[3]]);
+                let mean = self.ensure_ptr(self.value_map[&args[4]]);
+                let var = self.ensure_ptr(self.value_map[&args[5]]);
+                let channels = self.ensure_i64(self.value_map[&args[6]]);
+                let spatial_size = self.ensure_i64(self.value_map[&args[7]]);
+                let epsilon = self.ensure_f64(self.value_map[&args[8]]);
+                let activation = if args.len() >= 10 {
+                    self.ensure_i32(self.value_map[&args[9]])
+                } else {
+                    self.builder.ins().iconst(types::I32, 0)
+                };
+                self.lower_multi_arena_batch_norm2d(
+                    types::F64,
+                    8,
+                    dst,
+                    src,
+                    gamma,
+                    beta,
+                    mean,
+                    var,
+                    channels,
+                    spatial_size,
+                    epsilon,
+                    activation,
                 )
             }
 
@@ -6031,6 +6303,713 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         self.builder.switch_to_block(y_step);
         let next_y = self.builder.ins().iadd_imm_s(cur_y, 1);
         self.builder.ins().jump(y_header, &[BlockArg::from(next_y)]);
+
+        self.builder.switch_to_block(done_block);
+        Some(self.builder.ins().iconst(types::I64, 0))
+    }
+
+    /// Lower multi-arena 2D depthwise convolution directly into nested Cranelift loops.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_multi_arena_depthwise_conv2d(
+        &mut self,
+        elem_ty: types::Type,
+        is_float: bool,
+        elem_size: i64,
+        dst: ClValue,
+        img: ClValue,
+        weights: ClValue,
+        bias: ClValue,
+        channels: ClValue,
+        h_out: ClValue,
+        w_out: ClValue,
+        stride_y: ClValue,
+        stride_x: ClValue,
+        kernel_h: ClValue,
+        kernel_w: ClValue,
+        img_h: ClValue,
+        img_w: ClValue,
+        activation: ClValue,
+    ) -> Option<ClValue> {
+        let zero_ptr = self.builder.ins().iconst(self.ptr_type, 0);
+        let has_bias = self.builder.ins().icmp(IntCC::NotEqual, bias, zero_ptr);
+
+        let in_area = self.builder.ins().imul(img_h, img_w);
+        let kernel_area = self.builder.ins().imul(kernel_h, kernel_w);
+        let out_area = self.builder.ins().imul(h_out, w_out);
+
+        let zero_elem = if is_float {
+            if elem_ty == types::F32 {
+                self.builder.ins().f32const(0.0)
+            } else {
+                self.builder.ins().f64const(0.0)
+            }
+        } else {
+            self.builder.ins().iconst(elem_ty, 0)
+        };
+        let zero_i64 = self.builder.ins().iconst(types::I64, 0);
+
+        let act_relu = self.builder.ins().iconst(types::I32, 1);
+        let is_relu = self.builder.ins().icmp(IntCC::Equal, activation, act_relu);
+
+        let c_header = self.builder.create_block();
+        let y_header = self.builder.create_block();
+        let x_header = self.builder.create_block();
+        let ky_header = self.builder.create_block();
+        let kx_header = self.builder.create_block();
+        let kx_body = self.builder.create_block();
+        let ky_step = self.builder.create_block();
+        let x_store = self.builder.create_block();
+        let x_step = self.builder.create_block();
+        let y_step = self.builder.create_block();
+        let c_step = self.builder.create_block();
+        let done_block = self.builder.create_block();
+
+        // Channel loop entry
+        self.builder.append_block_param(c_header, types::I64);
+        self.builder
+            .ins()
+            .jump(c_header, &[BlockArg::from(zero_i64)]);
+
+        self.builder.switch_to_block(c_header);
+        let cur_c = self.builder.block_params(c_header)[0];
+        let has_c = self
+            .builder
+            .ins()
+            .icmp(IntCC::SignedLessThan, cur_c, channels);
+        let c_body = self.builder.create_block();
+        self.builder.ins().brif(has_c, c_body, &[], done_block, &[]);
+
+        self.builder.switch_to_block(c_body);
+        let c_img_off = self.builder.ins().imul(cur_c, in_area);
+        let c_w_off = self.builder.ins().imul(cur_c, kernel_area);
+        let c_dst_off = self.builder.ins().imul(cur_c, out_area);
+
+        // Load channel bias scalar if bias != null
+        let bias_block = self.builder.create_block();
+        let no_bias_block = self.builder.create_block();
+        let bias_merge = self.builder.create_block();
+        self.builder.append_block_param(bias_merge, elem_ty);
+        self.builder
+            .ins()
+            .brif(has_bias, bias_block, &[], no_bias_block, &[]);
+
+        self.builder.switch_to_block(bias_block);
+        let c_bias_byte = self.builder.ins().imul_imm_s(cur_c, elem_size);
+        let c_bias_ptr = self.builder.ins().iadd(bias, c_bias_byte);
+        let b_val = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), c_bias_ptr, 0);
+        self.builder
+            .ins()
+            .jump(bias_merge, &[BlockArg::from(b_val)]);
+
+        self.builder.switch_to_block(no_bias_block);
+        self.builder
+            .ins()
+            .jump(bias_merge, &[BlockArg::from(zero_elem)]);
+
+        self.builder.switch_to_block(bias_merge);
+        let bias_scalar = self.builder.block_params(bias_merge)[0];
+
+        // Start Y loop
+        self.builder.append_block_param(y_header, types::I64);
+        self.builder
+            .ins()
+            .jump(y_header, &[BlockArg::from(zero_i64)]);
+
+        self.builder.switch_to_block(y_header);
+        let cur_y = self.builder.block_params(y_header)[0];
+        let has_y = self.builder.ins().icmp(IntCC::SignedLessThan, cur_y, h_out);
+        let x_init = self.builder.create_block();
+        self.builder.ins().brif(has_y, x_init, &[], c_step, &[]);
+
+        self.builder.switch_to_block(x_init);
+        let y_str = self.builder.ins().imul(cur_y, stride_y);
+        let y_base = self.builder.ins().imul(y_str, img_w);
+        let y_out_off = self.builder.ins().imul(cur_y, w_out);
+
+        self.builder.append_block_param(x_header, types::I64);
+        self.builder.append_block_param(x_header, types::I64);
+        self.builder.append_block_param(x_header, types::I64);
+        self.builder.ins().jump(
+            x_header,
+            &[
+                BlockArg::from(zero_i64),
+                BlockArg::from(y_base),
+                BlockArg::from(y_out_off),
+            ],
+        );
+
+        self.builder.switch_to_block(x_header);
+        let cur_x = self.builder.block_params(x_header)[0];
+        let cur_y_base = self.builder.block_params(x_header)[1];
+        let cur_y_out_off = self.builder.block_params(x_header)[2];
+
+        let has_x = self.builder.ins().icmp(IntCC::SignedLessThan, cur_x, w_out);
+        let k_init = self.builder.create_block();
+        self.builder.ins().brif(has_x, k_init, &[], y_step, &[]);
+
+        self.builder.switch_to_block(k_init);
+        let x_base = self.builder.ins().imul(cur_x, stride_x);
+        let out_idx_rel = self.builder.ins().iadd(cur_y_out_off, cur_x);
+        let out_idx = self.builder.ins().iadd(c_dst_off, out_idx_rel);
+
+        self.builder.append_block_param(ky_header, types::I64);
+        self.builder.append_block_param(ky_header, elem_ty);
+        self.builder.ins().jump(
+            ky_header,
+            &[BlockArg::from(zero_i64), BlockArg::from(zero_elem)],
+        );
+
+        self.builder.switch_to_block(ky_header);
+        let cur_ky = self.builder.block_params(ky_header)[0];
+        let cur_accum_ky = self.builder.block_params(ky_header)[1];
+        let has_ky = self
+            .builder
+            .ins()
+            .icmp(IntCC::SignedLessThan, cur_ky, kernel_h);
+        let kx_init = self.builder.create_block();
+        self.builder.ins().brif(
+            has_ky,
+            kx_init,
+            &[],
+            x_store,
+            &[BlockArg::from(cur_accum_ky)],
+        );
+
+        self.builder.switch_to_block(kx_init);
+        let ky_off = self.builder.ins().imul(cur_ky, img_w);
+        let in_row = self.builder.ins().iadd(cur_y_base, ky_off);
+        let w_row = self.builder.ins().imul(cur_ky, kernel_w);
+
+        self.builder.append_block_param(kx_header, types::I64);
+        self.builder.append_block_param(kx_header, elem_ty);
+        self.builder.ins().jump(
+            kx_header,
+            &[BlockArg::from(zero_i64), BlockArg::from(cur_accum_ky)],
+        );
+
+        self.builder.switch_to_block(kx_header);
+        let cur_kx = self.builder.block_params(kx_header)[0];
+        let cur_accum_kx = self.builder.block_params(kx_header)[1];
+        let has_kx = self
+            .builder
+            .ins()
+            .icmp(IntCC::SignedLessThan, cur_kx, kernel_w);
+        self.builder.ins().brif(
+            has_kx,
+            kx_body,
+            &[],
+            ky_step,
+            &[BlockArg::from(cur_accum_kx)],
+        );
+
+        self.builder.switch_to_block(kx_body);
+        let in_pix = self.builder.ins().iadd(in_row, x_base);
+        let in_idx_rel = self.builder.ins().iadd(in_pix, cur_kx);
+        let in_idx = self.builder.ins().iadd(c_img_off, in_idx_rel);
+        let in_byte = self.builder.ins().imul_imm_s(in_idx, elem_size);
+        let in_ptr = self.builder.ins().iadd(img, in_byte);
+        let in_v = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), in_ptr, 0);
+
+        let w_idx_rel = self.builder.ins().iadd(w_row, cur_kx);
+        let w_idx = self.builder.ins().iadd(c_w_off, w_idx_rel);
+        let w_byte = self.builder.ins().imul_imm_s(w_idx, elem_size);
+        let w_ptr = self.builder.ins().iadd(weights, w_byte);
+        let w_v = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), w_ptr, 0);
+
+        let prod = if is_float {
+            self.builder.ins().fmul(in_v, w_v)
+        } else {
+            self.builder.ins().imul(in_v, w_v)
+        };
+        let next_accum_kx = if is_float {
+            self.builder.ins().fadd(cur_accum_kx, prod)
+        } else {
+            self.builder.ins().iadd(cur_accum_kx, prod)
+        };
+
+        let next_kx = self.builder.ins().iadd_imm_s(cur_kx, 1);
+        self.builder.ins().jump(
+            kx_header,
+            &[BlockArg::from(next_kx), BlockArg::from(next_accum_kx)],
+        );
+
+        // KY step
+        self.builder.append_block_param(ky_step, elem_ty);
+        self.builder.switch_to_block(ky_step);
+        let accum_from_kx = self.builder.block_params(ky_step)[0];
+        let next_ky = self.builder.ins().iadd_imm_s(cur_ky, 1);
+        self.builder.ins().jump(
+            ky_header,
+            &[BlockArg::from(next_ky), BlockArg::from(accum_from_kx)],
+        );
+
+        // X store: add bias, apply ReLU, dst[out_idx] = final_val
+        self.builder.append_block_param(x_store, elem_ty);
+        self.builder.switch_to_block(x_store);
+        let total_accum = self.builder.block_params(x_store)[0];
+        let biased = if is_float {
+            self.builder.ins().fadd(total_accum, bias_scalar)
+        } else {
+            self.builder.ins().iadd(total_accum, bias_scalar)
+        };
+
+        let relu_cand = if is_float {
+            let is_gt = self
+                .builder
+                .ins()
+                .fcmp(FloatCC::GreaterThan, biased, zero_elem);
+            self.builder.ins().select(is_gt, biased, zero_elem)
+        } else {
+            let is_gt = self
+                .builder
+                .ins()
+                .icmp(IntCC::SignedGreaterThan, biased, zero_elem);
+            self.builder.ins().select(is_gt, biased, zero_elem)
+        };
+        let final_val = self.builder.ins().select(is_relu, relu_cand, biased);
+
+        let out_byte = self.builder.ins().imul_imm_s(out_idx, elem_size);
+        let out_ptr = self.builder.ins().iadd(dst, out_byte);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), final_val, out_ptr, 0);
+
+        self.builder.ins().jump(x_step, &[]);
+
+        // X step
+        self.builder.switch_to_block(x_step);
+        let next_x = self.builder.ins().iadd_imm_s(cur_x, 1);
+        self.builder.ins().jump(
+            x_header,
+            &[
+                BlockArg::from(next_x),
+                BlockArg::from(cur_y_base),
+                BlockArg::from(cur_y_out_off),
+            ],
+        );
+
+        // Y step
+        self.builder.switch_to_block(y_step);
+        let next_y = self.builder.ins().iadd_imm_s(cur_y, 1);
+        self.builder.ins().jump(y_header, &[BlockArg::from(next_y)]);
+
+        // C step
+        self.builder.switch_to_block(c_step);
+        let next_c = self.builder.ins().iadd_imm_s(cur_c, 1);
+        self.builder.ins().jump(c_header, &[BlockArg::from(next_c)]);
+
+        self.builder.switch_to_block(done_block);
+        Some(self.builder.ins().iconst(types::I64, 0))
+    }
+
+    /// Lower multi-arena 2D pointwise (1x1) convolution directly into nested Cranelift loops.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_multi_arena_pointwise_conv2d(
+        &mut self,
+        elem_ty: types::Type,
+        is_float: bool,
+        elem_size: i64,
+        dst: ClValue,
+        img: ClValue,
+        weights: ClValue,
+        bias: ClValue,
+        c_in: ClValue,
+        c_out: ClValue,
+        spatial_size: ClValue,
+        activation: ClValue,
+    ) -> Option<ClValue> {
+        let zero_ptr = self.builder.ins().iconst(self.ptr_type, 0);
+        let has_bias = self.builder.ins().icmp(IntCC::NotEqual, bias, zero_ptr);
+
+        let zero_elem = if is_float {
+            if elem_ty == types::F32 {
+                self.builder.ins().f32const(0.0)
+            } else {
+                self.builder.ins().f64const(0.0)
+            }
+        } else {
+            self.builder.ins().iconst(elem_ty, 0)
+        };
+        let zero_i64 = self.builder.ins().iconst(types::I64, 0);
+
+        let act_relu = self.builder.ins().iconst(types::I32, 1);
+        let is_relu = self.builder.ins().icmp(IntCC::Equal, activation, act_relu);
+
+        let co_header = self.builder.create_block();
+        let p_header = self.builder.create_block();
+        let ci_header = self.builder.create_block();
+        let ci_body = self.builder.create_block();
+        let p_store = self.builder.create_block();
+        let p_step = self.builder.create_block();
+        let co_step = self.builder.create_block();
+        let done_block = self.builder.create_block();
+
+        // Channel out loop entry
+        self.builder.append_block_param(co_header, types::I64);
+        self.builder
+            .ins()
+            .jump(co_header, &[BlockArg::from(zero_i64)]);
+
+        self.builder.switch_to_block(co_header);
+        let cur_co = self.builder.block_params(co_header)[0];
+        let has_co = self
+            .builder
+            .ins()
+            .icmp(IntCC::SignedLessThan, cur_co, c_out);
+        let co_body = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(has_co, co_body, &[], done_block, &[]);
+
+        self.builder.switch_to_block(co_body);
+        let w_co_off = self.builder.ins().imul(cur_co, c_in);
+        let dst_co_off = self.builder.ins().imul(cur_co, spatial_size);
+
+        // Load channel bias scalar if bias != null
+        let bias_block = self.builder.create_block();
+        let no_bias_block = self.builder.create_block();
+        let bias_merge = self.builder.create_block();
+        self.builder.append_block_param(bias_merge, elem_ty);
+        self.builder
+            .ins()
+            .brif(has_bias, bias_block, &[], no_bias_block, &[]);
+
+        self.builder.switch_to_block(bias_block);
+        let co_bias_byte = self.builder.ins().imul_imm_s(cur_co, elem_size);
+        let co_bias_ptr = self.builder.ins().iadd(bias, co_bias_byte);
+        let b_val = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), co_bias_ptr, 0);
+        self.builder
+            .ins()
+            .jump(bias_merge, &[BlockArg::from(b_val)]);
+
+        self.builder.switch_to_block(no_bias_block);
+        self.builder
+            .ins()
+            .jump(bias_merge, &[BlockArg::from(zero_elem)]);
+
+        self.builder.switch_to_block(bias_merge);
+        let bias_scalar = self.builder.block_params(bias_merge)[0];
+
+        // Start Spatial P loop
+        self.builder.append_block_param(p_header, types::I64);
+        self.builder
+            .ins()
+            .jump(p_header, &[BlockArg::from(zero_i64)]);
+
+        self.builder.switch_to_block(p_header);
+        let cur_p = self.builder.block_params(p_header)[0];
+        let has_p = self
+            .builder
+            .ins()
+            .icmp(IntCC::SignedLessThan, cur_p, spatial_size);
+        let p_body = self.builder.create_block();
+        self.builder.ins().brif(has_p, p_body, &[], co_step, &[]);
+
+        self.builder.switch_to_block(p_body);
+        let out_idx = self.builder.ins().iadd(dst_co_off, cur_p);
+
+        // Start Channel in (ci) loop
+        self.builder.append_block_param(ci_header, types::I64);
+        self.builder.append_block_param(ci_header, elem_ty);
+        self.builder.ins().jump(
+            ci_header,
+            &[BlockArg::from(zero_i64), BlockArg::from(zero_elem)],
+        );
+
+        self.builder.switch_to_block(ci_header);
+        let cur_ci = self.builder.block_params(ci_header)[0];
+        let cur_accum_ci = self.builder.block_params(ci_header)[1];
+        let has_ci = self.builder.ins().icmp(IntCC::SignedLessThan, cur_ci, c_in);
+        self.builder.ins().brif(
+            has_ci,
+            ci_body,
+            &[],
+            p_store,
+            &[BlockArg::from(cur_accum_ci)],
+        );
+
+        self.builder.switch_to_block(ci_body);
+        let ci_spatial = self.builder.ins().imul(cur_ci, spatial_size);
+        let in_idx = self.builder.ins().iadd(ci_spatial, cur_p);
+        let in_byte = self.builder.ins().imul_imm_s(in_idx, elem_size);
+        let in_ptr = self.builder.ins().iadd(img, in_byte);
+        let in_v = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), in_ptr, 0);
+
+        let w_idx = self.builder.ins().iadd(w_co_off, cur_ci);
+        let w_byte = self.builder.ins().imul_imm_s(w_idx, elem_size);
+        let w_ptr = self.builder.ins().iadd(weights, w_byte);
+        let w_v = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), w_ptr, 0);
+
+        let prod = if is_float {
+            self.builder.ins().fmul(in_v, w_v)
+        } else {
+            self.builder.ins().imul(in_v, w_v)
+        };
+        let next_accum_ci = if is_float {
+            self.builder.ins().fadd(cur_accum_ci, prod)
+        } else {
+            self.builder.ins().iadd(cur_accum_ci, prod)
+        };
+
+        let next_ci = self.builder.ins().iadd_imm_s(cur_ci, 1);
+        self.builder.ins().jump(
+            ci_header,
+            &[BlockArg::from(next_ci), BlockArg::from(next_accum_ci)],
+        );
+
+        // P store: add bias, apply ReLU, dst[out_idx] = final_val
+        self.builder.append_block_param(p_store, elem_ty);
+        self.builder.switch_to_block(p_store);
+        let total_accum = self.builder.block_params(p_store)[0];
+        let biased = if is_float {
+            self.builder.ins().fadd(total_accum, bias_scalar)
+        } else {
+            self.builder.ins().iadd(total_accum, bias_scalar)
+        };
+
+        let relu_cand = if is_float {
+            let is_gt = self
+                .builder
+                .ins()
+                .fcmp(FloatCC::GreaterThan, biased, zero_elem);
+            self.builder.ins().select(is_gt, biased, zero_elem)
+        } else {
+            let is_gt = self
+                .builder
+                .ins()
+                .icmp(IntCC::SignedGreaterThan, biased, zero_elem);
+            self.builder.ins().select(is_gt, biased, zero_elem)
+        };
+        let final_val = self.builder.ins().select(is_relu, relu_cand, biased);
+
+        let out_byte = self.builder.ins().imul_imm_s(out_idx, elem_size);
+        let out_ptr = self.builder.ins().iadd(dst, out_byte);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), final_val, out_ptr, 0);
+
+        self.builder.ins().jump(p_step, &[]);
+
+        // P step
+        self.builder.switch_to_block(p_step);
+        let next_p = self.builder.ins().iadd_imm_s(cur_p, 1);
+        self.builder.ins().jump(p_header, &[BlockArg::from(next_p)]);
+
+        // CO step
+        self.builder.switch_to_block(co_step);
+        let next_co = self.builder.ins().iadd_imm_s(cur_co, 1);
+        self.builder
+            .ins()
+            .jump(co_header, &[BlockArg::from(next_co)]);
+
+        self.builder.switch_to_block(done_block);
+        Some(self.builder.ins().iconst(types::I64, 0))
+    }
+
+    /// Lower multi-arena 2D batch normalization directly into nested Cranelift loops.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_multi_arena_batch_norm2d(
+        &mut self,
+        elem_ty: types::Type,
+        elem_size: i64,
+        dst: ClValue,
+        src: ClValue,
+        gamma: ClValue,
+        beta: ClValue,
+        mean: ClValue,
+        var: ClValue,
+        channels: ClValue,
+        spatial_size: ClValue,
+        epsilon: ClValue,
+        activation: ClValue,
+    ) -> Option<ClValue> {
+        let zero_ptr = self.builder.ins().iconst(self.ptr_type, 0);
+        let has_gamma = self.builder.ins().icmp(IntCC::NotEqual, gamma, zero_ptr);
+        let has_beta = self.builder.ins().icmp(IntCC::NotEqual, beta, zero_ptr);
+
+        let zero_elem = if elem_ty == types::F32 {
+            self.builder.ins().f32const(0.0)
+        } else {
+            self.builder.ins().f64const(0.0)
+        };
+        let one_elem = if elem_ty == types::F32 {
+            self.builder.ins().f32const(1.0)
+        } else {
+            self.builder.ins().f64const(1.0)
+        };
+        let zero_i64 = self.builder.ins().iconst(types::I64, 0);
+
+        let act_relu = self.builder.ins().iconst(types::I32, 1);
+        let is_relu = self.builder.ins().icmp(IntCC::Equal, activation, act_relu);
+
+        let c_header = self.builder.create_block();
+        let i_header = self.builder.create_block();
+        let i_body = self.builder.create_block();
+        let i_step = self.builder.create_block();
+        let c_step = self.builder.create_block();
+        let done_block = self.builder.create_block();
+
+        // Channel loop entry
+        self.builder.append_block_param(c_header, types::I64);
+        self.builder
+            .ins()
+            .jump(c_header, &[BlockArg::from(zero_i64)]);
+
+        self.builder.switch_to_block(c_header);
+        let cur_c = self.builder.block_params(c_header)[0];
+        let has_c = self
+            .builder
+            .ins()
+            .icmp(IntCC::SignedLessThan, cur_c, channels);
+        let c_body = self.builder.create_block();
+        self.builder.ins().brif(has_c, c_body, &[], done_block, &[]);
+
+        self.builder.switch_to_block(c_body);
+        let c_byte = self.builder.ins().imul_imm_s(cur_c, elem_size);
+
+        // Load mean and var
+        let m_ptr = self.builder.ins().iadd(mean, c_byte);
+        let m = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), m_ptr, 0);
+
+        let v_ptr = self.builder.ins().iadd(var, c_byte);
+        let v = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), v_ptr, 0);
+
+        // Load gamma (or 1.0 if null)
+        let gamma_block = self.builder.create_block();
+        let no_gamma_block = self.builder.create_block();
+        let gamma_merge = self.builder.create_block();
+        self.builder.append_block_param(gamma_merge, elem_ty);
+        self.builder
+            .ins()
+            .brif(has_gamma, gamma_block, &[], no_gamma_block, &[]);
+
+        self.builder.switch_to_block(gamma_block);
+        let g_ptr = self.builder.ins().iadd(gamma, c_byte);
+        let g_val = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), g_ptr, 0);
+        self.builder
+            .ins()
+            .jump(gamma_merge, &[BlockArg::from(g_val)]);
+
+        self.builder.switch_to_block(no_gamma_block);
+        self.builder
+            .ins()
+            .jump(gamma_merge, &[BlockArg::from(one_elem)]);
+
+        self.builder.switch_to_block(gamma_merge);
+        let g = self.builder.block_params(gamma_merge)[0];
+
+        // Load beta (or 0.0 if null)
+        let beta_block = self.builder.create_block();
+        let no_beta_block = self.builder.create_block();
+        let beta_merge = self.builder.create_block();
+        self.builder.append_block_param(beta_merge, elem_ty);
+        self.builder
+            .ins()
+            .brif(has_beta, beta_block, &[], no_beta_block, &[]);
+
+        self.builder.switch_to_block(beta_block);
+        let b_ptr = self.builder.ins().iadd(beta, c_byte);
+        let b_val = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), b_ptr, 0);
+        self.builder
+            .ins()
+            .jump(beta_merge, &[BlockArg::from(b_val)]);
+
+        self.builder.switch_to_block(no_beta_block);
+        self.builder
+            .ins()
+            .jump(beta_merge, &[BlockArg::from(zero_elem)]);
+
+        self.builder.switch_to_block(beta_merge);
+        let b = self.builder.block_params(beta_merge)[0];
+
+        // Compute affine normalization scale and shift:
+        // inv_std = 1.0 / sqrt(v + epsilon)
+        // scale = g * inv_std
+        // shift = b - (m * scale)
+        let v_eps = self.builder.ins().fadd(v, epsilon);
+        let sqrt_v = self.builder.ins().sqrt(v_eps);
+        let inv_std = self.builder.ins().fdiv(one_elem, sqrt_v);
+        let scale = self.builder.ins().fmul(g, inv_std);
+        let m_scale = self.builder.ins().fmul(m, scale);
+        let shift = self.builder.ins().fsub(b, m_scale);
+        let c_base = self.builder.ins().imul(cur_c, spatial_size);
+
+        // Start Spatial I loop
+        self.builder.append_block_param(i_header, types::I64);
+        self.builder
+            .ins()
+            .jump(i_header, &[BlockArg::from(zero_i64)]);
+
+        self.builder.switch_to_block(i_header);
+        let cur_i = self.builder.block_params(i_header)[0];
+        let has_i = self
+            .builder
+            .ins()
+            .icmp(IntCC::SignedLessThan, cur_i, spatial_size);
+        self.builder.ins().brif(has_i, i_body, &[], c_step, &[]);
+
+        self.builder.switch_to_block(i_body);
+        let idx = self.builder.ins().iadd(c_base, cur_i);
+        let idx_byte = self.builder.ins().imul_imm_s(idx, elem_size);
+        let src_ptr = self.builder.ins().iadd(src, idx_byte);
+        let x = self
+            .builder
+            .ins()
+            .load(elem_ty, MemFlagsData::trusted(), src_ptr, 0);
+
+        let x_scale = self.builder.ins().fmul(x, scale);
+        let y = self.builder.ins().fadd(x_scale, shift);
+
+        let is_gt = self.builder.ins().fcmp(FloatCC::GreaterThan, y, zero_elem);
+        let relu_cand = self.builder.ins().select(is_gt, y, zero_elem);
+        let final_val = self.builder.ins().select(is_relu, relu_cand, y);
+
+        let dst_ptr = self.builder.ins().iadd(dst, idx_byte);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), final_val, dst_ptr, 0);
+
+        self.builder.ins().jump(i_step, &[]);
+
+        // I step
+        self.builder.switch_to_block(i_step);
+        let next_i = self.builder.ins().iadd_imm_s(cur_i, 1);
+        self.builder.ins().jump(i_header, &[BlockArg::from(next_i)]);
+
+        // C step
+        self.builder.switch_to_block(c_step);
+        let next_c = self.builder.ins().iadd_imm_s(cur_c, 1);
+        self.builder.ins().jump(c_header, &[BlockArg::from(next_c)]);
 
         self.builder.switch_to_block(done_block);
         Some(self.builder.ins().iconst(types::I64, 0))

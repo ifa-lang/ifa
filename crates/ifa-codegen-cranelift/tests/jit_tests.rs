@@ -3484,3 +3484,710 @@ fn test_jit_multi_arena_dilated_conv2d_and_pooling() {
         "Spatial max-pooling: dst[0] + dst[3] = 8 + 16 = 24"
     );
 }
+
+#[test]
+fn test_jit_multi_arena_depthwise_conv2d() {
+    use ifa_codegen_cranelift::jit::JitEngine;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let mut func = FirFunction::new(
+        INTERNER.intern("main"),
+        vec![],
+        FirType::Int(IntType::I64),
+        true,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+
+    // Channels = 2, img = 3x3 per channel -> 18 elements
+    // c0: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    // c1: [9, 8, 7, 6, 5, 4, 3, 2, 1]
+    let img_vals = [1i64, 2, 3, 4, 5, 6, 7, 8, 9, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+    let mut img_vids = Vec::new();
+    for (i, v) in img_vals.iter().enumerate() {
+        let vid = ValueId((200 + i) as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(vid),
+            ValueExpr::Constant(ConstantValue::Int(*v as i128, IntType::I64)),
+            Span::DUMMY,
+        ));
+        img_vids.push(vid);
+    }
+    let img = ValueId(220);
+    bb0.instructions.push(Instruction::new(
+        Some(img),
+        ValueExpr::ArrayInit(img_vids),
+        Span::DUMMY,
+    ));
+
+    // Weights: 2x2 per channel -> 8 elements
+    // c0: [1, 0, 0, 1]
+    // c1: [1, 1, 1, 1]
+    let w_vals = [1i64, 0, 0, 1, 1, 1, 1, 1];
+    let mut w_vids = Vec::new();
+    for (i, v) in w_vals.iter().enumerate() {
+        let vid = ValueId((230 + i) as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(vid),
+            ValueExpr::Constant(ConstantValue::Int(*v as i128, IntType::I64)),
+            Span::DUMMY,
+        ));
+        w_vids.push(vid);
+    }
+    let weights = ValueId(240);
+    bb0.instructions.push(Instruction::new(
+        Some(weights),
+        ValueExpr::ArrayInit(w_vids),
+        Span::DUMMY,
+    ));
+
+    // Bias: [5, -20]
+    let b0 = ValueId(241);
+    bb0.instructions.push(Instruction::new(
+        Some(b0),
+        ValueExpr::Constant(ConstantValue::Int(5, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let b1 = ValueId(242);
+    bb0.instructions.push(Instruction::new(
+        Some(b1),
+        ValueExpr::Constant(ConstantValue::Int(-20, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let bias = ValueId(243);
+    bb0.instructions.push(Instruction::new(
+        Some(bias),
+        ValueExpr::ArrayInit(vec![b0, b1]),
+        Span::DUMMY,
+    ));
+
+    // Dst: 2 * 2 * 2 = 8 elements
+    let zero = ValueId(244);
+    bb0.instructions.push(Instruction::new(
+        Some(zero),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let dst = ValueId(245);
+    bb0.instructions.push(Instruction::new(
+        Some(dst),
+        ValueExpr::ArrayInit(vec![zero; 8]),
+        Span::DUMMY,
+    ));
+
+    // Dimensions: channels=2, h_out=2, w_out=2, stride_y=1, stride_x=1, kernel_h=2, kernel_w=2, img_h=3, img_w=3, act=1
+    let channels = ValueId(246);
+    bb0.instructions.push(Instruction::new(
+        Some(channels),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let h_out = ValueId(247);
+    bb0.instructions.push(Instruction::new(
+        Some(h_out),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let w_out = ValueId(248);
+    bb0.instructions.push(Instruction::new(
+        Some(w_out),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let stride_y = ValueId(249);
+    bb0.instructions.push(Instruction::new(
+        Some(stride_y),
+        ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let stride_x = ValueId(250);
+    bb0.instructions.push(Instruction::new(
+        Some(stride_x),
+        ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let kernel_h = ValueId(251);
+    bb0.instructions.push(Instruction::new(
+        Some(kernel_h),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let kernel_w = ValueId(252);
+    bb0.instructions.push(Instruction::new(
+        Some(kernel_w),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let img_h = ValueId(253);
+    bb0.instructions.push(Instruction::new(
+        Some(img_h),
+        ValueExpr::Constant(ConstantValue::Int(3, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let img_w = ValueId(254);
+    bb0.instructions.push(Instruction::new(
+        Some(img_w),
+        ValueExpr::Constant(ConstantValue::Int(3, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let act = ValueId(255);
+    bb0.instructions.push(Instruction::new(
+        Some(act),
+        ValueExpr::Constant(ConstantValue::Int(1, IntType::I32)),
+        Span::DUMMY,
+    ));
+
+    // Call lowered depthwise conv2d directly
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("ifa_simd_multi_arena_depthwise_conv2d_i64"),
+            args: vec![
+                dst, img, weights, bias, channels, h_out, w_out, stride_y, stride_x, kernel_h,
+                kernel_w, img_h, img_w, act,
+            ],
+        },
+        Span::DUMMY,
+    ));
+
+    // Read dst[0] (11), dst[3] (19), dst[4] (8), dst[6] (0)
+    let idx0 = zero;
+    let idx3 = ValueId(256);
+    bb0.instructions.push(Instruction::new(
+        Some(idx3),
+        ValueExpr::Constant(ConstantValue::Int(3, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let idx4 = ValueId(257);
+    bb0.instructions.push(Instruction::new(
+        Some(idx4),
+        ValueExpr::Constant(ConstantValue::Int(4, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    let v0 = ValueId(258);
+    bb0.instructions.push(Instruction::new(
+        Some(v0),
+        ValueExpr::GetElement {
+            base: dst,
+            index: idx0,
+        },
+        Span::DUMMY,
+    ));
+    let v3 = ValueId(259);
+    bb0.instructions.push(Instruction::new(
+        Some(v3),
+        ValueExpr::GetElement {
+            base: dst,
+            index: idx3,
+        },
+        Span::DUMMY,
+    ));
+    let v4 = ValueId(260);
+    bb0.instructions.push(Instruction::new(
+        Some(v4),
+        ValueExpr::GetElement {
+            base: dst,
+            index: idx4,
+        },
+        Span::DUMMY,
+    ));
+
+    // sum = v0 + v3 + v4 = 11 + 19 + 8 = 38
+    let sum1 = ValueId(261);
+    bb0.instructions.push(Instruction::new(
+        Some(sum1),
+        ValueExpr::Binary {
+            op: ifa_fir::BinaryOp::Add,
+            lhs: v0,
+            rhs: v3,
+        },
+        Span::DUMMY,
+    ));
+    let sum2 = ValueId(262);
+    bb0.instructions.push(Instruction::new(
+        Some(sum2),
+        ValueExpr::Binary {
+            op: ifa_fir::BinaryOp::Add,
+            lhs: sum1,
+            rhs: v4,
+        },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(sum2)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("depthwise_conv2d_jit_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile FIR with multi-arena depthwise conv2d");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 38,
+        "Depthwise 2D convolution: dst[0] + dst[3] + dst[4] = 11 + 19 + 8 = 38"
+    );
+}
+
+#[test]
+fn test_jit_multi_arena_pointwise_conv2d() {
+    use ifa_codegen_cranelift::jit::JitEngine;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let mut func = FirFunction::new(
+        INTERNER.intern("main"),
+        vec![],
+        FirType::Int(IntType::I64),
+        true,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+
+    // c_in = 2, spatial_size = 3 -> 6 elements
+    // c0: [1, 2, 3], c1: [4, 5, 6]
+    let img_vals = [1i64, 2, 3, 4, 5, 6];
+    let mut img_vids = Vec::new();
+    for (i, v) in img_vals.iter().enumerate() {
+        let vid = ValueId((300 + i) as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(vid),
+            ValueExpr::Constant(ConstantValue::Int(*v as i128, IntType::I64)),
+            Span::DUMMY,
+        ));
+        img_vids.push(vid);
+    }
+    let img = ValueId(310);
+    bb0.instructions.push(Instruction::new(
+        Some(img),
+        ValueExpr::ArrayInit(img_vids),
+        Span::DUMMY,
+    ));
+
+    // weights: c_out = 2, c_in = 2 -> 4 elements: co0=[2, 3], co1=[1, -2]
+    let w_vals = [2i64, 3, 1, -2];
+    let mut w_vids = Vec::new();
+    for (i, v) in w_vals.iter().enumerate() {
+        let vid = ValueId((315 + i) as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(vid),
+            ValueExpr::Constant(ConstantValue::Int(*v as i128, IntType::I64)),
+            Span::DUMMY,
+        ));
+        w_vids.push(vid);
+    }
+    let weights = ValueId(320);
+    bb0.instructions.push(Instruction::new(
+        Some(weights),
+        ValueExpr::ArrayInit(w_vids),
+        Span::DUMMY,
+    ));
+
+    // bias: [10, -5]
+    let b0 = ValueId(321);
+    bb0.instructions.push(Instruction::new(
+        Some(b0),
+        ValueExpr::Constant(ConstantValue::Int(10, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let b1 = ValueId(322);
+    bb0.instructions.push(Instruction::new(
+        Some(b1),
+        ValueExpr::Constant(ConstantValue::Int(-5, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let bias = ValueId(323);
+    bb0.instructions.push(Instruction::new(
+        Some(bias),
+        ValueExpr::ArrayInit(vec![b0, b1]),
+        Span::DUMMY,
+    ));
+
+    // dst: c_out * spatial_size = 6 elements
+    let zero = ValueId(324);
+    bb0.instructions.push(Instruction::new(
+        Some(zero),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let dst = ValueId(325);
+    bb0.instructions.push(Instruction::new(
+        Some(dst),
+        ValueExpr::ArrayInit(vec![zero; 6]),
+        Span::DUMMY,
+    ));
+
+    let c_in = ValueId(326);
+    bb0.instructions.push(Instruction::new(
+        Some(c_in),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let c_out = ValueId(327);
+    bb0.instructions.push(Instruction::new(
+        Some(c_out),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let spatial_size = ValueId(328);
+    bb0.instructions.push(Instruction::new(
+        Some(spatial_size),
+        ValueExpr::Constant(ConstantValue::Int(3, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let act = ValueId(329);
+    bb0.instructions.push(Instruction::new(
+        Some(act),
+        ValueExpr::Constant(ConstantValue::Int(1, IntType::I32)),
+        Span::DUMMY,
+    ));
+
+    // Call lowered pointwise conv2d
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("ifa_simd_multi_arena_pointwise_conv2d_i64"),
+            args: vec![dst, img, weights, bias, c_in, c_out, spatial_size, act],
+        },
+        Span::DUMMY,
+    ));
+
+    // dst expected: [24, 29, 34, 0, 0, 0]
+    let idx0 = zero;
+    let idx2 = ValueId(330);
+    bb0.instructions.push(Instruction::new(
+        Some(idx2),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    let v0 = ValueId(331);
+    bb0.instructions.push(Instruction::new(
+        Some(v0),
+        ValueExpr::GetElement {
+            base: dst,
+            index: idx0,
+        },
+        Span::DUMMY,
+    ));
+    let v2 = ValueId(332);
+    bb0.instructions.push(Instruction::new(
+        Some(v2),
+        ValueExpr::GetElement {
+            base: dst,
+            index: idx2,
+        },
+        Span::DUMMY,
+    ));
+
+    // sum = v0 + v2 = 24 + 34 = 58
+    let sum = ValueId(333);
+    bb0.instructions.push(Instruction::new(
+        Some(sum),
+        ValueExpr::Binary {
+            op: ifa_fir::BinaryOp::Add,
+            lhs: v0,
+            rhs: v2,
+        },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(sum)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("pointwise_conv2d_jit_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile FIR with multi-arena pointwise conv2d");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 58,
+        "Pointwise 1x1 convolution: dst[0] + dst[2] = 24 + 34 = 58"
+    );
+}
+
+#[test]
+fn test_jit_multi_arena_batch_norm2d() {
+    use ifa_codegen_cranelift::jit::JitEngine;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::{FloatType, IntType};
+    use ifa_span::{Span, INTERNER};
+
+    let mut func = FirFunction::new(
+        INTERNER.intern("main"),
+        vec![],
+        FirType::Int(IntType::I64),
+        true,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+
+    // channels = 2, spatial_size = 2 -> 4 elements for src (f64)
+    // c0: [10.0, 20.0], c1: [5.0, 15.0]
+    let src_vals = [10.0f64, 20.0, 5.0, 15.0];
+    let mut src_vids = Vec::new();
+    for (i, v) in src_vals.iter().enumerate() {
+        let vid = ValueId((400 + i) as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(vid),
+            ValueExpr::Constant(ConstantValue::Float(*v, FloatType::F64)),
+            Span::DUMMY,
+        ));
+        src_vids.push(vid);
+    }
+    let src = ValueId(410);
+    bb0.instructions.push(Instruction::new(
+        Some(src),
+        ValueExpr::ArrayInit(src_vids),
+        Span::DUMMY,
+    ));
+
+    // gamma: [2.0, 1.0]
+    let g0 = ValueId(411);
+    bb0.instructions.push(Instruction::new(
+        Some(g0),
+        ValueExpr::Constant(ConstantValue::Float(2.0, FloatType::F64)),
+        Span::DUMMY,
+    ));
+    let g1 = ValueId(412);
+    bb0.instructions.push(Instruction::new(
+        Some(g1),
+        ValueExpr::Constant(ConstantValue::Float(1.0, FloatType::F64)),
+        Span::DUMMY,
+    ));
+    let gamma = ValueId(413);
+    bb0.instructions.push(Instruction::new(
+        Some(gamma),
+        ValueExpr::ArrayInit(vec![g0, g1]),
+        Span::DUMMY,
+    ));
+
+    // beta: [1.0, -5.0]
+    let b0 = ValueId(414);
+    bb0.instructions.push(Instruction::new(
+        Some(b0),
+        ValueExpr::Constant(ConstantValue::Float(1.0, FloatType::F64)),
+        Span::DUMMY,
+    ));
+    let b1 = ValueId(415);
+    bb0.instructions.push(Instruction::new(
+        Some(b1),
+        ValueExpr::Constant(ConstantValue::Float(-5.0, FloatType::F64)),
+        Span::DUMMY,
+    ));
+    let beta = ValueId(416);
+    bb0.instructions.push(Instruction::new(
+        Some(beta),
+        ValueExpr::ArrayInit(vec![b0, b1]),
+        Span::DUMMY,
+    ));
+
+    // mean: [10.0, 10.0]
+    let m0 = ValueId(417);
+    bb0.instructions.push(Instruction::new(
+        Some(m0),
+        ValueExpr::Constant(ConstantValue::Float(10.0, FloatType::F64)),
+        Span::DUMMY,
+    ));
+    let m1 = ValueId(418);
+    bb0.instructions.push(Instruction::new(
+        Some(m1),
+        ValueExpr::Constant(ConstantValue::Float(10.0, FloatType::F64)),
+        Span::DUMMY,
+    ));
+    let mean = ValueId(419);
+    bb0.instructions.push(Instruction::new(
+        Some(mean),
+        ValueExpr::ArrayInit(vec![m0, m1]),
+        Span::DUMMY,
+    ));
+
+    // var: [16.0, 25.0]
+    let var0 = ValueId(420);
+    bb0.instructions.push(Instruction::new(
+        Some(var0),
+        ValueExpr::Constant(ConstantValue::Float(16.0, FloatType::F64)),
+        Span::DUMMY,
+    ));
+    let var1 = ValueId(421);
+    bb0.instructions.push(Instruction::new(
+        Some(var1),
+        ValueExpr::Constant(ConstantValue::Float(25.0, FloatType::F64)),
+        Span::DUMMY,
+    ));
+    let var = ValueId(422);
+    bb0.instructions.push(Instruction::new(
+        Some(var),
+        ValueExpr::ArrayInit(vec![var0, var1]),
+        Span::DUMMY,
+    ));
+
+    // dst: 4 elements (f64)
+    let f_zero = ValueId(423);
+    bb0.instructions.push(Instruction::new(
+        Some(f_zero),
+        ValueExpr::Constant(ConstantValue::Float(0.0, FloatType::F64)),
+        Span::DUMMY,
+    ));
+    let dst = ValueId(424);
+    bb0.instructions.push(Instruction::new(
+        Some(dst),
+        ValueExpr::ArrayInit(vec![f_zero; 4]),
+        Span::DUMMY,
+    ));
+
+    let channels = ValueId(425);
+    bb0.instructions.push(Instruction::new(
+        Some(channels),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let spatial_size = ValueId(426);
+    bb0.instructions.push(Instruction::new(
+        Some(spatial_size),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let eps = ValueId(427);
+    bb0.instructions.push(Instruction::new(
+        Some(eps),
+        ValueExpr::Constant(ConstantValue::Float(0.0, FloatType::F64)),
+        Span::DUMMY,
+    ));
+    let act = ValueId(428);
+    bb0.instructions.push(Instruction::new(
+        Some(act),
+        ValueExpr::Constant(ConstantValue::Int(1, IntType::I32)),
+        Span::DUMMY,
+    ));
+
+    // Call lowered batch_norm2d directly
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("ifa_simd_multi_arena_batch_norm2d_f64"),
+            args: vec![
+                dst,
+                src,
+                gamma,
+                beta,
+                mean,
+                var,
+                channels,
+                spatial_size,
+                eps,
+                act,
+            ],
+        },
+        Span::DUMMY,
+    ));
+
+    // Expected dst: [1.0, 6.0, 0.0, 0.0]
+    let zero_idx = ValueId(429);
+    bb0.instructions.push(Instruction::new(
+        Some(zero_idx),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let one_idx = ValueId(430);
+    bb0.instructions.push(Instruction::new(
+        Some(one_idx),
+        ValueExpr::Constant(ConstantValue::Int(1, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    let v0 = ValueId(431);
+    bb0.instructions.push(Instruction::new(
+        Some(v0),
+        ValueExpr::GetElement {
+            base: dst,
+            index: zero_idx,
+        },
+        Span::DUMMY,
+    ));
+    let v1 = ValueId(432);
+    bb0.instructions.push(Instruction::new(
+        Some(v1),
+        ValueExpr::GetElement {
+            base: dst,
+            index: one_idx,
+        },
+        Span::DUMMY,
+    ));
+
+    // Sum v0 and v1 as f64 (1.0 + 6.0 = 7.0)
+    let sum = ValueId(433);
+    bb0.instructions.push(Instruction::new(
+        Some(sum),
+        ValueExpr::Binary {
+            op: ifa_fir::BinaryOp::Add,
+            lhs: v0,
+            rhs: v1,
+        },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(sum)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("batch_norm2d_jit_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile FIR with multi-arena batch norm 2d");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 7,
+        "Batch Normalization 2D: (1.0 as i64) + (6.0 as i64) = 7"
+    );
+}
