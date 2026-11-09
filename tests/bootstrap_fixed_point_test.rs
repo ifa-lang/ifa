@@ -576,8 +576,38 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("216 passed; 0 failed"),
-        "Expected 216 passed unit tests, got:\n{}",
+        stdout.contains("test test_codegen_simd_avx2_vector_add ... ok"),
+        "Modular codegen SIMD AVX2 vector add test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_simd_neon_dot_product ... ok"),
+        "Modular codegen SIMD NEON dot product test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_simd_metadata_and_fir ... ok"),
+        "Modular codegen SIMD metadata and FIR test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_simd_vectorization_metadata_assembly ... ok"),
+        "Modular driver SIMD vectorization metadata assembly test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_simd_vector_eligibility_and_width ... ok"),
+        "Modular sema SIMD vector eligibility test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_simd_disjoint_slice_aliasing ... ok"),
+        "Modular sema SIMD disjoint slice aliasing test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("228 passed; 0 failed"),
+        "Expected 228 passed unit tests, got:\n{}",
         stdout
     );
 }

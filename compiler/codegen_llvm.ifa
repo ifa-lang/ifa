@@ -2989,6 +2989,426 @@ pub fn test_codegen_error_propagation() -> bool {
     return has_call && has_cmp && has_fir_prop;
 }
 
+// SIMD Vector Architecture Configuration
+// arch_kind: 1 = AVX2 (256-bit), 2 = NEON (128-bit), 3 = SSE4.2 (128-bit)
+// elem_kind: 1 = i32, 2 = f32, 3 = i64, 4 = f64, 5 = i8/u8
+pub struct AstSimdConfig {
+    arch_kind: i64,
+    elem_kind: i64,
+    vector_width: i64,
+    interleave_count: i64,
+    enable_predication: bool,
+    unroll_enable: bool
+}
+
+// Computes deterministic SIMD parameters based on target architecture and element kind
+pub fn make_simd_config(arch_kind: i64, elem_kind: i64) -> AstSimdConfig {
+    mut width: i64 = 8;
+    if arch_kind == 1 {
+        // AVX2 (256-bit vectors)
+        if elem_kind == 1 || elem_kind == 2 {
+            width = 8;
+        } else if elem_kind == 3 || elem_kind == 4 {
+            width = 4;
+        } else if elem_kind == 5 {
+            width = 16;
+        }
+    } else if arch_kind == 2 {
+        // ARM NEON (128-bit vectors)
+        if elem_kind == 1 || elem_kind == 2 {
+            width = 4;
+        } else if elem_kind == 3 || elem_kind == 4 {
+            width = 2;
+        } else if elem_kind == 5 {
+            width = 16;
+        }
+    } else {
+        // SSE4.2 / Generic fallback (128-bit vectors)
+        if elem_kind == 1 || elem_kind == 2 {
+            width = 4;
+        } else if elem_kind == 3 || elem_kind == 4 {
+            width = 2;
+        } else {
+            width = 8;
+        }
+    }
+
+    return AstSimdConfig(
+        arch_kind: arch_kind,
+        elem_kind: elem_kind,
+        vector_width: width,
+        interleave_count: 4,
+        enable_predication: true,
+        unroll_enable: true
+    );
+}
+
+// High-level AST representation for a SIMD Auto-Vectorized Loop
+// op_kind:
+// 1 = Elementwise Add (dst[i] = src1[i] + src2[i])
+// 2 = Elementwise Mul (dst[i] = src1[i] * src2[i])
+// 3 = Dot Product Reduction (acc += src1[i] * src2[i])
+// 4 = Sum Reduction (acc += src[i])
+// 5 = Elementwise Clamp (dst[i] = clamp(src[i], min, max))
+// 6 = Count-If Greater Than (acc += src[i] > threshold ? 1 : 0)
+pub struct AstSimdLoop {
+    op_kind: i64,
+    config: AstSimdConfig,
+    dst_var: String,
+    src1_var: String,
+    src2_var: String,
+    len_var: String,
+    acc_var: String,
+    is_reduction: bool,
+    clamp_min: i64,
+    clamp_max: i64,
+    threshold: i64
+}
+
+// Emits deterministic LLVM IR loop metadata block for SIMD auto-vectorization
+pub fn emit_llvm_simd_metadata(config: AstSimdConfig, meta_id: i64) -> List<String> {
+    mut lines: List<String> = List::new();
+    let m_id_str = int_to_str(meta_id);
+    let m2_str = int_to_str(meta_id + 1);
+    let m3_str = int_to_str(meta_id + 2);
+    let m4_str = int_to_str(meta_id + 3);
+    let m5_str = int_to_str(meta_id + 4);
+
+    if config.enable_predication {
+        let m6_str = int_to_str(meta_id + 5);
+        let m7_str = int_to_str(meta_id + 6);
+        lines.push("!" + m_id_str + " = distinct !{{!" + m_id_str + ", !" + m2_str + ", !" + m3_str + ", !" + m4_str + ", !" + m5_str + ", !" + m6_str + ", !" + m7_str + "}}");
+        lines.push("!" + m2_str + " = !{{\"llvm.loop.vectorize.enable\", i1 1}}");
+        lines.push("!" + m3_str + " = !{{\"llvm.loop.vectorize.width\", i32 " + int_to_str(config.vector_width) + "}}");
+        lines.push("!" + m4_str + " = !{{\"llvm.loop.interleave.count\", i32 " + int_to_str(config.interleave_count) + "}}");
+        lines.push("!" + m5_str + " = !{{\"llvm.loop.unroll.enable\", i1 1}}");
+        lines.push("!" + m6_str + " = !{{\"llvm.loop.vectorize.predicate.enable\", i1 1}}");
+        lines.push("!" + m7_str + " = !{{\"llvm.loop.mustprogress\"}}");
+    } else {
+        lines.push("!" + m_id_str + " = distinct !{{!" + m_id_str + ", !" + m2_str + ", !" + m3_str + ", !" + m4_str + ", !" + m5_str + "}}");
+        lines.push("!" + m2_str + " = !{{\"llvm.loop.vectorize.enable\", i1 1}}");
+        lines.push("!" + m3_str + " = !{{\"llvm.loop.vectorize.width\", i32 " + int_to_str(config.vector_width) + "}}");
+        lines.push("!" + m4_str + " = !{{\"llvm.loop.interleave.count\", i32 " + int_to_str(config.interleave_count) + "}}");
+        lines.push("!" + m5_str + " = !{{\"llvm.loop.unroll.enable\", i1 1}}");
+    }
+    return lines;
+}
+
+// Lowers a SIMD Loop to deterministic textual LLVM IR SSA blocks with vector execution and scalar tail cleanup
+pub fn emit_llvm_simd_loop(loop_ast: AstSimdLoop, loop_id: i64) -> List<String> {
+    mut lines: List<String> = List::new();
+    let id_str = int_to_str(loop_id);
+    let width_str = int_to_str(loop_ast.config.vector_width);
+
+    mut elem_type = "i32";
+    mut is_float = false;
+    mut align_bytes = 4 * loop_ast.config.vector_width;
+    if loop_ast.config.elem_kind == 2 {
+        elem_type = "float";
+        is_float = true;
+    } else if loop_ast.config.elem_kind == 3 {
+        elem_type = "i64";
+        align_bytes = 8 * loop_ast.config.vector_width;
+    } else if loop_ast.config.elem_kind == 4 {
+        elem_type = "double";
+        is_float = true;
+        align_bytes = 8 * loop_ast.config.vector_width;
+    } else if loop_ast.config.elem_kind == 5 {
+        elem_type = "i8";
+        align_bytes = 1 * loop_ast.config.vector_width;
+    }
+    let align_str = int_to_str(align_bytes);
+    let vec_type = "<" + width_str + " x " + elem_type + ">";
+
+    mut arch_name = "AVX2";
+    if loop_ast.config.arch_kind == 2 {
+        arch_name = "NEON";
+    } else if loop_ast.config.arch_kind == 3 {
+        arch_name = "SSE4.2";
+    }
+
+    lines.push("  ; === SIMD Loop (" + arch_name + ", width " + width_str + "): " + loop_ast.dst_var + " ===");
+    lines.push("  %vec_len." + id_str + " = and i64 %" + loop_ast.len_var + ", -" + width_str);
+    lines.push("  br label %vec_loop." + id_str);
+    lines.push("");
+
+    // Vector Loop Header
+    lines.push("vec_loop." + id_str + ":");
+    lines.push("  %i." + id_str + " = phi i64 [ 0, %entry ], [ %next_i." + id_str + ", %vec_step." + id_str + " ]");
+    if loop_ast.is_reduction {
+        lines.push("  %acc." + id_str + " = phi " + vec_type + " [ zeroinitializer, %entry ], [ %next_acc." + id_str + ", %vec_step." + id_str + " ]");
+        lines.push("  %has_vec." + id_str + " = icmp ult i64 %i." + id_str + ", %vec_len." + id_str);
+        lines.push("  br i1 %has_vec." + id_str + ", label %vec_step." + id_str + ", label %reduce." + id_str);
+    } else {
+        lines.push("  %has_vec." + id_str + " = icmp ult i64 %i." + id_str + ", %vec_len." + id_str);
+        lines.push("  br i1 %has_vec." + id_str + ", label %vec_step." + id_str + ", label %tail_entry." + id_str);
+    }
+    lines.push("");
+
+    // Vector Step Block
+    lines.push("vec_step." + id_str + ":");
+    lines.push("  %p1." + id_str + " = getelementptr inbounds " + elem_type + ", ptr %" + loop_ast.src1_var + ", i64 %i." + id_str);
+    if loop_ast.src2_var != "" {
+        lines.push("  %p2." + id_str + " = getelementptr inbounds " + elem_type + ", ptr %" + loop_ast.src2_var + ", i64 %i." + id_str);
+    }
+    if !loop_ast.is_reduction {
+        lines.push("  %pd." + id_str + " = getelementptr inbounds " + elem_type + ", ptr %" + loop_ast.dst_var + ", i64 %i." + id_str);
+    }
+    lines.push("  %v1." + id_str + " = load " + vec_type + ", ptr %p1." + id_str + ", align " + align_str);
+    if loop_ast.src2_var != "" {
+        lines.push("  %v2." + id_str + " = load " + vec_type + ", ptr %p2." + id_str + ", align " + align_str);
+    }
+
+    if loop_ast.op_kind == 1 {
+        // Elementwise Add
+        mut add_op = "add";
+        if is_float { add_op = "fadd"; }
+        lines.push("  %vr." + id_str + " = " + add_op + " " + vec_type + " %v1." + id_str + ", %v2." + id_str);
+        lines.push("  store " + vec_type + " %vr." + id_str + ", ptr %pd." + id_str + ", align " + align_str);
+    } else if loop_ast.op_kind == 2 {
+        // Elementwise Mul
+        mut mul_op = "mul";
+        if is_float { mul_op = "fmul"; }
+        lines.push("  %vr." + id_str + " = " + mul_op + " " + vec_type + " %v1." + id_str + ", %v2." + id_str);
+        lines.push("  store " + vec_type + " %vr." + id_str + ", ptr %pd." + id_str + ", align " + align_str);
+    } else if loop_ast.op_kind == 3 {
+        // Dot product reduction (mul then accumulate)
+        mut mul_op = "mul";
+        mut add_op = "add";
+        if is_float {
+            mul_op = "fmul";
+            add_op = "fadd";
+        }
+        lines.push("  %prod." + id_str + " = " + mul_op + " " + vec_type + " %v1." + id_str + ", %v2." + id_str);
+        lines.push("  %next_acc." + id_str + " = " + add_op + " " + vec_type + " %acc." + id_str + ", %prod." + id_str);
+    } else if loop_ast.op_kind == 4 {
+        // Sum reduction (accumulate directly)
+        mut add_op = "add";
+        if is_float { add_op = "fadd"; }
+        lines.push("  %next_acc." + id_str + " = " + add_op + " " + vec_type + " %acc." + id_str + ", %v1." + id_str);
+    }
+
+    lines.push("  %next_i." + id_str + " = add i64 %i." + id_str + ", " + width_str);
+    lines.push("  br label %vec_loop." + id_str + ", !llvm.loop !" + id_str);
+    lines.push("");
+
+    // Reduction block if needed
+    if loop_ast.is_reduction {
+        lines.push("reduce." + id_str + ":");
+        mut reduce_intrinsic = "@llvm.vector.reduce.add.v" + width_str + elem_type;
+        if is_float {
+            reduce_intrinsic = "@llvm.vector.reduce.fadd.v" + width_str + elem_type;
+            lines.push("  %vec_sum." + id_str + " = call " + elem_type + " " + reduce_intrinsic + "(" + elem_type + " 0.0, " + vec_type + " %acc." + id_str + ")");
+        } else {
+            lines.push("  %vec_sum." + id_str + " = call " + elem_type + " " + reduce_intrinsic + "(" + vec_type + " %acc." + id_str + ")");
+        }
+        lines.push("  br label %tail_loop." + id_str);
+        lines.push("");
+    } else {
+        lines.push("tail_entry." + id_str + ":");
+        lines.push("  br label %tail_loop." + id_str);
+        lines.push("");
+    }
+
+    // Scalar Tail Loop
+    lines.push("tail_loop." + id_str + ":");
+    if loop_ast.is_reduction {
+        lines.push("  %ti." + id_str + " = phi i64 [ %vec_len." + id_str + ", %reduce." + id_str + " ], [ %next_ti." + id_str + ", %tail_step." + id_str + " ]");
+        lines.push("  %s_acc." + id_str + " = phi " + elem_type + " [ %vec_sum." + id_str + ", %reduce." + id_str + " ], [ %next_s_acc." + id_str + ", %tail_step." + id_str + " ]");
+    } else {
+        lines.push("  %ti." + id_str + " = phi i64 [ %vec_len." + id_str + ", %tail_entry." + id_str + " ], [ %next_ti." + id_str + ", %tail_step." + id_str + " ]");
+    }
+    lines.push("  %has_tail." + id_str + " = icmp ult i64 %ti." + id_str + ", %" + loop_ast.len_var);
+    lines.push("  br i1 %has_tail." + id_str + ", label %tail_step." + id_str + ", label %done." + id_str);
+    lines.push("");
+
+    // Scalar Tail Step
+    lines.push("tail_step." + id_str + ":");
+    lines.push("  %tp1." + id_str + " = getelementptr inbounds " + elem_type + ", ptr %" + loop_ast.src1_var + ", i64 %ti." + id_str);
+    if loop_ast.src2_var != "" {
+        lines.push("  %tp2." + id_str + " = getelementptr inbounds " + elem_type + ", ptr %" + loop_ast.src2_var + ", i64 %ti." + id_str);
+    }
+    if !loop_ast.is_reduction {
+        lines.push("  %tpd." + id_str + " = getelementptr inbounds " + elem_type + ", ptr %" + loop_ast.dst_var + ", i64 %ti." + id_str);
+    }
+    lines.push("  %tv1." + id_str + " = load " + elem_type + ", ptr %tp1." + id_str + ", align 4");
+    if loop_ast.src2_var != "" {
+        lines.push("  %tv2." + id_str + " = load " + elem_type + ", ptr %tp2." + id_str + ", align 4");
+    }
+
+    if loop_ast.op_kind == 1 {
+        mut add_op = "add";
+        if is_float { add_op = "fadd"; }
+        lines.push("  %tvr." + id_str + " = " + add_op + " " + elem_type + " %tv1." + id_str + ", %tv2." + id_str);
+        lines.push("  store " + elem_type + " %tvr." + id_str + ", ptr %tpd." + id_str + ", align 4");
+    } else if loop_ast.op_kind == 2 {
+        mut mul_op = "mul";
+        if is_float { mul_op = "fmul"; }
+        lines.push("  %tvr." + id_str + " = " + mul_op + " " + elem_type + " %tv1." + id_str + ", %tv2." + id_str);
+        lines.push("  store " + elem_type + " %tvr." + id_str + ", ptr %tpd." + id_str + ", align 4");
+    } else if loop_ast.op_kind == 3 {
+        mut mul_op = "mul";
+        mut add_op = "add";
+        if is_float {
+            mul_op = "fmul";
+            add_op = "fadd";
+        }
+        lines.push("  %tprod." + id_str + " = " + mul_op + " " + elem_type + " %tv1." + id_str + ", %tv2." + id_str);
+        lines.push("  %next_s_acc." + id_str + " = " + add_op + " " + elem_type + " %s_acc." + id_str + ", %tprod." + id_str);
+    } else if loop_ast.op_kind == 4 {
+        mut add_op = "add";
+        if is_float { add_op = "fadd"; }
+        lines.push("  %next_s_acc." + id_str + " = " + add_op + " " + elem_type + " %s_acc." + id_str + ", %tv1." + id_str);
+    }
+    lines.push("  %next_ti." + id_str + " = add i64 %ti." + id_str + ", 1");
+    lines.push("  br label %tail_loop." + id_str);
+    lines.push("");
+
+    // Done Block
+    lines.push("done." + id_str + ":");
+    if loop_ast.is_reduction {
+        lines.push("  %" + loop_ast.acc_var + " = phi " + elem_type + " [ %s_acc." + id_str + ", %tail_loop." + id_str + " ]");
+    }
+    return lines;
+}
+
+// Lowers a SIMD Loop to FIR textual representation
+pub fn emit_fir_simd_loop(loop_ast: AstSimdLoop, loop_id: i64) -> List<String> {
+    mut lines: List<String> = List::new();
+    let id_str = int_to_str(loop_id);
+    let width_str = int_to_str(loop_ast.config.vector_width);
+    let interleave_str = int_to_str(loop_ast.config.interleave_count);
+    mut arch_name = "avx2";
+    if loop_ast.config.arch_kind == 2 {
+        arch_name = "neon";
+    }
+
+    if loop_ast.is_reduction {
+        lines.push("    %" + loop_ast.acc_var + " = fir.simd_reduce %" + loop_ast.src1_var + " op " + int_to_str(loop_ast.op_kind) + ", target=\"" + arch_name + "\", width=" + width_str + ", interleave=" + interleave_str + ", len=%" + loop_ast.len_var);
+    } else {
+        lines.push("    fir.simd_loop %" + loop_ast.dst_var + " = %" + loop_ast.src1_var + " op " + int_to_str(loop_ast.op_kind) + " %" + loop_ast.src2_var + ", target=\"" + arch_name + "\", width=" + width_str + ", interleave=" + interleave_str + ", len=%" + loop_ast.len_var);
+    }
+    return lines;
+}
+
+// Unit test 26: SIMD AVX2 8-lane vector elementwise add lowering
+pub fn test_codegen_simd_avx2_vector_add() -> bool {
+    let cfg = make_simd_config(1, 1); // AVX2, i32 -> width 8
+    let loop_ast = AstSimdLoop(
+        op_kind: 1,
+        config: cfg,
+        dst_var: "dst_slice",
+        src1_var: "src_a",
+        src2_var: "src_b",
+        len_var: "arr_len",
+        acc_var: "",
+        is_reduction: false,
+        clamp_min: 0,
+        clamp_max: 0,
+        threshold: 0
+    );
+
+    let llvm_lines = emit_llvm_simd_loop(loop_ast, 1);
+    let fir_lines = emit_fir_simd_loop(loop_ast, 1);
+
+    if llvm_lines.len() < 25 || fir_lines.len() < 1 {
+        return false;
+    }
+
+    mut has_load_vec = false;
+    mut has_add_vec = false;
+    mut has_store_vec = false;
+    mut has_tail_scalar = false;
+    mut i: i64 = 0;
+    while i < llvm_lines.len() {
+        if llvm_lines[i] == "  %v1.1 = load <8 x i32>, ptr %p1.1, align 32" {
+            has_load_vec = true;
+        }
+        if llvm_lines[i] == "  %vr.1 = add <8 x i32> %v1.1, %v2.1" {
+            has_add_vec = true;
+        }
+        if llvm_lines[i] == "  store <8 x i32> %vr.1, ptr %pd.1, align 32" {
+            has_store_vec = true;
+        }
+        if llvm_lines[i] == "  %tvr.1 = add i32 %tv1.1, %tv2.1" {
+            has_tail_scalar = true;
+        }
+        i = i + 1;
+    }
+
+    let has_fir = fir_lines[0] == "    fir.simd_loop %dst_slice = %src_a op 1 %src_b, target=\"avx2\", width=8, interleave=4, len=%arr_len";
+    return has_load_vec && has_add_vec && has_store_vec && has_tail_scalar && has_fir;
+}
+
+// Unit test 27: SIMD NEON 4-lane float dot-product reduction lowering
+pub fn test_codegen_simd_neon_dot_product() -> bool {
+    let cfg = make_simd_config(2, 2); // NEON, f32 -> width 4
+    let loop_ast = AstSimdLoop(
+        op_kind: 3,
+        config: cfg,
+        dst_var: "",
+        src1_var: "vec_a",
+        src2_var: "vec_b",
+        len_var: "count",
+        acc_var: "dot_result",
+        is_reduction: true,
+        clamp_min: 0,
+        clamp_max: 0,
+        threshold: 0
+    );
+
+    let llvm_lines = emit_llvm_simd_loop(loop_ast, 2);
+    let fir_lines = emit_fir_simd_loop(loop_ast, 2);
+
+    if llvm_lines.len() < 25 || fir_lines.len() < 1 {
+        return false;
+    }
+
+    mut has_fmul_vec = false;
+    mut has_fadd_vec = false;
+    mut has_reduce_call = false;
+    mut has_phi_acc = false;
+    mut i: i64 = 0;
+    while i < llvm_lines.len() {
+        if llvm_lines[i] == "  %prod.2 = fmul <4 x float> %v1.2, %v2.2" {
+            has_fmul_vec = true;
+        }
+        if llvm_lines[i] == "  %next_acc.2 = fadd <4 x float> %acc.2, %prod.2" {
+            has_fadd_vec = true;
+        }
+        if llvm_lines[i] == "  %vec_sum.2 = call float @llvm.vector.reduce.fadd.v4float(float 0.0, <4 x float> %acc.2)" {
+            has_reduce_call = true;
+        }
+        if llvm_lines[i] == "  %dot_result = phi float [ %s_acc.2, %tail_loop.2 ]" {
+            has_phi_acc = true;
+        }
+        i = i + 1;
+    }
+
+    let has_fir_reduce = fir_lines[0] == "    %dot_result = fir.simd_reduce %vec_a op 3, target=\"neon\", width=4, interleave=4, len=%count";
+    return has_fmul_vec && has_fadd_vec && has_reduce_call && has_phi_acc && has_fir_reduce;
+}
+
+// Unit test 28: Deterministic SIMD loop metadata emission and attribute verification
+pub fn test_codegen_simd_metadata_and_fir() -> bool {
+    let cfg_avx2 = make_simd_config(1, 1); // AVX2, i32 -> width 8
+    let meta_lines = emit_llvm_simd_metadata(cfg_avx2, 1);
+
+    if meta_lines.len() != 7 {
+        return false;
+    }
+
+    let has_head = meta_lines[0] == "!1 = distinct !{{!1, !2, !3, !4, !5, !6, !7}}";
+    let has_vec_enable = meta_lines[1] == "!2 = !{{\"llvm.loop.vectorize.enable\", i1 1}}";
+    let has_width = meta_lines[2] == "!3 = !{{\"llvm.loop.vectorize.width\", i32 8}}";
+    let has_interleave = meta_lines[3] == "!4 = !{{\"llvm.loop.interleave.count\", i32 4}}";
+    let has_unroll = meta_lines[4] == "!5 = !{{\"llvm.loop.unroll.enable\", i1 1}}";
+    let has_predicate = meta_lines[5] == "!6 = !{{\"llvm.loop.vectorize.predicate.enable\", i1 1}}";
+    let has_progress = meta_lines[6] == "!7 = !{{\"llvm.loop.mustprogress\"}}";
+
+    return has_head && has_vec_enable && has_width && has_interleave && has_unroll && has_predicate && has_progress;
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -3018,7 +3438,10 @@ pub fn main() {
     let t23 = test_codegen_variadic_function_signature();
     let t24 = test_codegen_try_catch_blocks();
     let t25 = test_codegen_error_propagation();
-    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 {
+    let t26 = test_codegen_simd_avx2_vector_add();
+    let t27 = test_codegen_simd_neon_dot_product();
+    let t28 = test_codegen_simd_metadata_and_fir();
+    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");

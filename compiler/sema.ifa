@@ -1897,6 +1897,104 @@ pub fn test_sema_optional_and_union_return_inference() -> bool {
     return true;
 }
 
+// Semantic analysis result for auto-vectorization candidates
+pub struct SimdAnalysisResult {
+    is_vectorizable: bool,
+    recommended_arch: String,
+    recommended_width: i64,
+    elem_type: String,
+    memory_disjoint: bool
+}
+
+// Analyzes whether a loop candidate operating on primitive slices is eligible for SIMD auto-vectorization
+pub fn analyze_simd_loop_eligibility(
+    elem_type: String,
+    target_arch: String,
+    is_aliased: bool
+) -> SimdAnalysisResult {
+    mut eligible = false;
+    if elem_type == "i32" || elem_type == "f32" || elem_type == "i64" || elem_type == "f64" || elem_type == "i8" || elem_type == "u8" {
+        eligible = true;
+    }
+
+    // Strict safety requirement: memory regions must be provably disjoint (no RAW / WAR hazards)
+    let memory_disjoint = !is_aliased;
+    if !memory_disjoint {
+        eligible = false;
+    }
+
+    mut width: i64 = 0;
+    if eligible {
+        if target_arch == "avx2" {
+            if elem_type == "i32" || elem_type == "f32" {
+                width = 8;
+            } else if elem_type == "i64" || elem_type == "f64" {
+                width = 4;
+            } else {
+                width = 16;
+            }
+        } else if target_arch == "neon" {
+            if elem_type == "i32" || elem_type == "f32" {
+                width = 4;
+            } else if elem_type == "i64" || elem_type == "f64" {
+                width = 2;
+            } else {
+                width = 16;
+            }
+        } else {
+            width = 4;
+        }
+    }
+
+    return SimdAnalysisResult(
+        is_vectorizable: eligible,
+        recommended_arch: target_arch,
+        recommended_width: width,
+        elem_type: elem_type,
+        memory_disjoint: memory_disjoint
+    );
+}
+
+// Unit test 23: Semantic verification of SIMD vector eligibility and deterministic lane width calculation
+pub fn test_sema_simd_vector_eligibility_and_width() -> bool {
+    let res_avx2_f32 = analyze_simd_loop_eligibility("f32", "avx2", false);
+    if !res_avx2_f32.is_vectorizable || res_avx2_f32.recommended_width != 8 || !res_avx2_f32.memory_disjoint {
+        return false;
+    }
+
+    let res_avx2_i64 = analyze_simd_loop_eligibility("i64", "avx2", false);
+    if !res_avx2_i64.is_vectorizable || res_avx2_i64.recommended_width != 4 {
+        return false;
+    }
+
+    let res_neon_f32 = analyze_simd_loop_eligibility("f32", "neon", false);
+    if !res_neon_f32.is_vectorizable || res_neon_f32.recommended_width != 4 {
+        return false;
+    }
+
+    let res_neon_f64 = analyze_simd_loop_eligibility("f64", "neon", false);
+    if !res_neon_f64.is_vectorizable || res_neon_f64.recommended_width != 2 {
+        return false;
+    }
+
+    // Ineligible complex / non-primitive type
+    let res_ineligible = analyze_simd_loop_eligibility("String", "avx2", false);
+    return !res_ineligible.is_vectorizable && res_ineligible.recommended_width == 0;
+}
+
+// Unit test 24: Semantic rejection of vectorization on aliased memory slices
+pub fn test_sema_simd_disjoint_slice_aliasing() -> bool {
+    // When memory is aliased, vectorization must be inhibited to avoid nondeterministic race/hazard
+    let res_aliased = analyze_simd_loop_eligibility("i32", "avx2", true);
+    if res_aliased.is_vectorizable || res_aliased.memory_disjoint {
+        return false;
+    }
+
+    // Disjoint memory allows vectorization
+    let res_clean = analyze_simd_loop_eligibility("i32", "avx2", false);
+    return res_clean.is_vectorizable && res_clean.memory_disjoint && res_clean.recommended_width == 8;
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
@@ -1921,7 +2019,9 @@ pub fn main() {
     let t20 = test_sema_direct_call_eval();
     let t21 = test_sema_multi_and_variadic_call_eval();
     let t22 = test_sema_optional_and_union_return_inference();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 {
+    let t23 = test_sema_simd_vector_eligibility_and_width();
+    let t24 = test_sema_simd_disjoint_slice_aliasing();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");
