@@ -706,8 +706,33 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("268 passed; 0 failed"),
-        "Expected 268 passed unit tests, got:\n{}",
+        stdout.contains("test test_codegen_ssa_icmp ... ok"),
+        "Modular codegen ssa icmp test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_ssa_branches ... ok"),
+        "Modular codegen ssa branches test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_ssa_load_store ... ok"),
+        "Modular codegen ssa load store test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_extern_decl ... ok"),
+        "Modular codegen extern decl test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_llvm_module_header ... ok"),
+        "Modular codegen llvm module header test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("278 passed; 0 failed"),
+        "Expected 278 passed unit tests, got:\n{}",
         stdout
     );
 }

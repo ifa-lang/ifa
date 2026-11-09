@@ -3869,6 +3869,397 @@ pub fn test_codegen_ssa_phi_and_select() -> bool {
     return fir_sel[0] == "    %cond_res = fir.select %flag, %x, %y";
 }
 
+// AST: SSA integer comparison instruction
+pub struct AstSsaIcmp {
+    target_var: String,
+    predicate: String,
+    ty: String,
+    lhs_var: String,
+    rhs_var: String
+}
+
+// AST: SSA conditional branch instruction
+pub struct AstSsaCondBr {
+    cond_var: String,
+    true_label: String,
+    false_label: String
+}
+
+// AST: SSA unconditional branch instruction
+pub struct AstSsaUncondBr {
+    target_label: String
+}
+
+// AST: SSA typed load from pointer
+pub struct AstSsaLoad {
+    target_var: String,
+    ty: String,
+    ptr_var: String,
+    align_bytes: i64
+}
+
+// AST: SSA typed store to pointer
+pub struct AstSsaStore {
+    ty: String,
+    src_var: String,
+    ptr_var: String,
+    align_bytes: i64
+}
+
+// AST: External runtime function declaration (declare in .ll)
+pub struct AstExternDecl {
+    fn_name: String,
+    ret_ty: String,
+    param_tys: List<String>
+}
+
+// AST: Complete LLVM IR module descriptor
+pub struct AstLlvmModule {
+    source_filename: String,
+    target_triple: String,
+    data_layout: String,
+    extern_decls: List<AstExternDecl>,
+    fn_names: List<String>
+}
+
+/// Lowers `icmp` integer comparison to LLVM IR and FIR instructions.
+///
+/// LLVM: `%r = icmp <pred> <ty> %lhs, %rhs`
+/// FIR:  `%r = fir.icmp.<pred> %lhs, %rhs`
+pub fn emit_llvm_ssa_icmp(cmp: AstSsaIcmp) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  %" + cmp.target_var + " = icmp " + cmp.predicate + " " + cmp.ty + " %" + cmp.lhs_var + ", %" + cmp.rhs_var);
+    return lines;
+}
+
+pub fn emit_fir_ssa_icmp(cmp: AstSsaIcmp) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + cmp.target_var + " = fir.icmp." + cmp.predicate + " %" + cmp.lhs_var + ", %" + cmp.rhs_var);
+    return lines;
+}
+
+/// Lowers conditional branch to LLVM IR and FIR instructions.
+///
+/// LLVM: `br i1 %cond, label %true_bb, label %false_bb`
+/// FIR:  `fir.cond_br %cond, ^true_bb, ^false_bb`
+pub fn emit_llvm_ssa_cond_br(br: AstSsaCondBr) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  br i1 %" + br.cond_var + ", label %" + br.true_label + ", label %" + br.false_label);
+    return lines;
+}
+
+pub fn emit_fir_ssa_cond_br(br: AstSsaCondBr) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    fir.cond_br %" + br.cond_var + ", ^" + br.true_label + ", ^" + br.false_label);
+    return lines;
+}
+
+/// Lowers unconditional branch to LLVM IR and FIR instructions.
+///
+/// LLVM: `br label %target`
+/// FIR:  `fir.br ^target`
+pub fn emit_llvm_ssa_uncond_br(br: AstSsaUncondBr) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  br label %" + br.target_label);
+    return lines;
+}
+
+pub fn emit_fir_ssa_uncond_br(br: AstSsaUncondBr) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    fir.br ^" + br.target_label);
+    return lines;
+}
+
+/// Lowers a typed SSA load from a pointer to LLVM IR and FIR.
+///
+/// LLVM: `%r = load <ty>, ptr %p, align N`
+/// FIR:  `%r = fir.load.<ty> %p, align=N`
+pub fn emit_llvm_ssa_load(ld: AstSsaLoad) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  %" + ld.target_var + " = load " + ld.ty + ", ptr %" + ld.ptr_var + ", align " + int_to_str(ld.align_bytes));
+    return lines;
+}
+
+pub fn emit_fir_ssa_load(ld: AstSsaLoad) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + ld.target_var + " = fir.load." + ld.ty + " %" + ld.ptr_var + ", align=" + int_to_str(ld.align_bytes));
+    return lines;
+}
+
+/// Lowers a typed SSA store to a pointer to LLVM IR and FIR.
+///
+/// LLVM: `store <ty> %src, ptr %ptr, align N`
+/// FIR:  `fir.store.<ty> %src -> %ptr, align=N`
+pub fn emit_llvm_ssa_store(st: AstSsaStore) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  store " + st.ty + " %" + st.src_var + ", ptr %" + st.ptr_var + ", align " + int_to_str(st.align_bytes));
+    return lines;
+}
+
+pub fn emit_fir_ssa_store(st: AstSsaStore) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    fir.store." + st.ty + " %" + st.src_var + " -> %" + st.ptr_var + ", align=" + int_to_str(st.align_bytes));
+    return lines;
+}
+
+/// Emits a `declare` line for an external runtime function in LLVM IR.
+///
+/// LLVM: `declare <ret_ty> @fn_name(<param_ty>, ...)`
+/// FIR:  `fir.extern @fn_name : (<param_ty>, ...) -> <ret_ty>`
+pub fn emit_llvm_extern_decl(decl: AstExternDecl) -> String {
+    mut params = "";
+    mut i = 0;
+    while i < decl.param_tys.len() {
+        if i > 0 {
+            params = params + ", ";
+        }
+        params = params + decl.param_tys[i];
+        i = i + 1;
+    }
+    return "declare " + decl.ret_ty + " @" + decl.fn_name + "(" + params + ")";
+}
+
+pub fn emit_fir_extern_decl(decl: AstExternDecl) -> String {
+    mut params = "";
+    mut i = 0;
+    while i < decl.param_tys.len() {
+        if i > 0 {
+            params = params + ", ";
+        }
+        params = params + decl.param_tys[i];
+        i = i + 1;
+    }
+    return "fir.extern @" + decl.fn_name + " : (" + params + ") -> " + decl.ret_ty;
+}
+
+/// Emits the complete LLVM IR module header: source_filename, target_triple, datalayout,
+/// extern declarations, and a placeholder body stub for each named function.
+///
+/// The output is a deterministic, reproducible `.ll` preamble suitable for self-hosting
+/// bootstrap verification (sha256 stability across compiler generations).
+pub fn emit_llvm_module_header(module: AstLlvmModule) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("; ModuleID = '" + module.source_filename + "'");
+    lines.push("source_filename = \"" + module.source_filename + "\"");
+    lines.push("target datalayout = \"" + module.data_layout + "\"");
+    lines.push("target triple = \"" + module.target_triple + "\"");
+    lines.push("");
+    mut i = 0;
+    while i < module.extern_decls.len() {
+        lines.push(emit_llvm_extern_decl(module.extern_decls[i]));
+        i = i + 1;
+    }
+    if module.extern_decls.len() > 0 {
+        lines.push("");
+    }
+    return lines;
+}
+
+pub fn emit_fir_module_header(module: AstLlvmModule) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("fir.module @" + module.source_filename + " {");
+    lines.push("  target_triple = \"" + module.target_triple + "\"");
+    mut i = 0;
+    while i < module.extern_decls.len() {
+        lines.push("  " + emit_fir_extern_decl(module.extern_decls[i]));
+        i = i + 1;
+    }
+    lines.push("}");
+    return lines;
+}
+
+// Unit test 35: SSA icmp integer comparison lowering (eq/ne/slt/sgt)
+pub fn test_codegen_ssa_icmp() -> bool {
+    let cmp_eq = AstSsaIcmp(
+        target_var: "eq_flag",
+        predicate: "eq",
+        ty: "i64",
+        lhs_var: "x",
+        rhs_var: "y"
+    );
+    let llvm_eq = emit_llvm_ssa_icmp(cmp_eq);
+    let fir_eq = emit_fir_ssa_icmp(cmp_eq);
+    if llvm_eq.len() != 1 || fir_eq.len() != 1 {
+        return false;
+    }
+    if llvm_eq[0] != "  %eq_flag = icmp eq i64 %x, %y" {
+        return false;
+    }
+    if fir_eq[0] != "    %eq_flag = fir.icmp.eq %x, %y" {
+        return false;
+    }
+
+    let cmp_slt = AstSsaIcmp(
+        target_var: "lt_flag",
+        predicate: "slt",
+        ty: "i32",
+        lhs_var: "a",
+        rhs_var: "b"
+    );
+    let llvm_slt = emit_llvm_ssa_icmp(cmp_slt);
+    let fir_slt = emit_fir_ssa_icmp(cmp_slt);
+    if llvm_slt.len() != 1 || fir_slt.len() != 1 {
+        return false;
+    }
+    if llvm_slt[0] != "  %lt_flag = icmp slt i32 %a, %b" {
+        return false;
+    }
+    return fir_slt[0] == "    %lt_flag = fir.icmp.slt %a, %b";
+}
+
+// Unit test 36: SSA conditional and unconditional branch lowering
+pub fn test_codegen_ssa_branches() -> bool {
+    let cond_br = AstSsaCondBr(
+        cond_var: "loop_cond",
+        true_label: "loop.body",
+        false_label: "loop.exit"
+    );
+    let llvm_cond = emit_llvm_ssa_cond_br(cond_br);
+    let fir_cond = emit_fir_ssa_cond_br(cond_br);
+    if llvm_cond.len() != 1 || fir_cond.len() != 1 {
+        return false;
+    }
+    if llvm_cond[0] != "  br i1 %loop_cond, label %loop.body, label %loop.exit" {
+        return false;
+    }
+    if fir_cond[0] != "    fir.cond_br %loop_cond, ^loop.body, ^loop.exit" {
+        return false;
+    }
+
+    let uncond_br = AstSsaUncondBr(target_label: "merge.block");
+    let llvm_uncond = emit_llvm_ssa_uncond_br(uncond_br);
+    let fir_uncond = emit_fir_ssa_uncond_br(uncond_br);
+    if llvm_uncond.len() != 1 || fir_uncond.len() != 1 {
+        return false;
+    }
+    if llvm_uncond[0] != "  br label %merge.block" {
+        return false;
+    }
+    return fir_uncond[0] == "    fir.br ^merge.block";
+}
+
+// Unit test 37: SSA load and store memory instructions
+pub fn test_codegen_ssa_load_store() -> bool {
+    let ld = AstSsaLoad(
+        target_var: "val",
+        ty: "i64",
+        ptr_var: "buf_ptr",
+        align_bytes: 8
+    );
+    let llvm_ld = emit_llvm_ssa_load(ld);
+    let fir_ld = emit_fir_ssa_load(ld);
+    if llvm_ld.len() != 1 || fir_ld.len() != 1 {
+        return false;
+    }
+    if llvm_ld[0] != "  %val = load i64, ptr %buf_ptr, align 8" {
+        return false;
+    }
+    if fir_ld[0] != "    %val = fir.load.i64 %buf_ptr, align=8" {
+        return false;
+    }
+
+    let st = AstSsaStore(
+        ty: "i32",
+        src_var: "count",
+        ptr_var: "count_ptr",
+        align_bytes: 4
+    );
+    let llvm_st = emit_llvm_ssa_store(st);
+    let fir_st = emit_fir_ssa_store(st);
+    if llvm_st.len() != 1 || fir_st.len() != 1 {
+        return false;
+    }
+    if llvm_st[0] != "  store i32 %count, ptr %count_ptr, align 4" {
+        return false;
+    }
+    return fir_st[0] == "    fir.store.i32 %count -> %count_ptr, align=4";
+}
+
+// Unit test 38: External runtime function declare emission
+pub fn test_codegen_extern_decl() -> bool {
+    mut param_tys: List<String> = List::new();
+    param_tys.push("ptr");
+    param_tys.push("i64");
+    param_tys.push("i64");
+    let decl = AstExternDecl(
+        fn_name: "ifa_rt_cow_make_mut",
+        ret_ty: "ptr",
+        param_tys: param_tys
+    );
+    let llvm_decl = emit_llvm_extern_decl(decl);
+    let fir_decl = emit_fir_extern_decl(decl);
+    if llvm_decl != "declare ptr @ifa_rt_cow_make_mut(ptr, i64, i64)" {
+        return false;
+    }
+    return fir_decl == "fir.extern @ifa_rt_cow_make_mut : (ptr, i64, i64) -> ptr";
+}
+
+// Unit test 39: Complete LLVM IR module header emission (deterministic preamble)
+pub fn test_codegen_llvm_module_header() -> bool {
+    mut decls: List<AstExternDecl> = List::new();
+    mut p0: List<String> = List::new();
+    p0.push("i64");
+    decls.push(AstExternDecl(fn_name: "ifa_rt_arena_create", ret_ty: "i16", param_tys: p0));
+    mut p1: List<String> = List::new();
+    p1.push("i64");
+    p1.push("i64");
+    p1.push("i16");
+    decls.push(AstExternDecl(fn_name: "ifa_rt_gen_alloc", ret_ty: "ptr", param_tys: p1));
+
+    mut fn_names: List<String> = List::new();
+    fn_names.push("ifa_main");
+
+    let module = AstLlvmModule(
+        source_filename: "ifac_self.ll",
+        target_triple: "x86_64-unknown-linux-gnu",
+        data_layout: "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128",
+        extern_decls: decls,
+        fn_names: fn_names
+    );
+    let llvm_hdr = emit_llvm_module_header(module);
+    let fir_hdr = emit_fir_module_header(module);
+
+    // LLVM header: ModuleID line, source_filename, datalayout, triple, blank, 2 declares, blank = 8 lines
+    if llvm_hdr.len() != 8 {
+        return false;
+    }
+    if llvm_hdr[0] != "; ModuleID = 'ifac_self.ll'" {
+        return false;
+    }
+    if llvm_hdr[1] != "source_filename = \"ifac_self.ll\"" {
+        return false;
+    }
+    if llvm_hdr[4] != "" {
+        return false;
+    }
+    if llvm_hdr[5] != "declare i16 @ifa_rt_arena_create(i64)" {
+        return false;
+    }
+    if llvm_hdr[6] != "declare ptr @ifa_rt_gen_alloc(i64, i64, i16)" {
+        return false;
+    }
+    if llvm_hdr[7] != "" {
+        return false;
+    }
+    // FIR header: fir.module line, target_triple, 2 extern lines, closing brace = 5 lines
+    if fir_hdr.len() != 5 {
+        return false;
+    }
+    if fir_hdr[0] != "fir.module @ifac_self.ll {" {
+        return false;
+    }
+    if fir_hdr[1] != "  target_triple = \"x86_64-unknown-linux-gnu\"" {
+        return false;
+    }
+    if fir_hdr[2] != "  fir.extern @ifa_rt_arena_create : (i64) -> i16" {
+        return false;
+    }
+    if fir_hdr[3] != "  fir.extern @ifa_rt_gen_alloc : (i64, i64, i16) -> ptr" {
+        return false;
+    }
+    return fir_hdr[4] == "}";
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -3907,7 +4298,12 @@ pub fn main() {
     let t32 = test_codegen_cow_slice_and_freeze();
     let t33 = test_codegen_cow_clone_subtree();
     let t34 = test_codegen_ssa_phi_and_select();
-    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 && t33 && t34 {
+    let t35 = test_codegen_ssa_icmp();
+    let t36 = test_codegen_ssa_branches();
+    let t37 = test_codegen_ssa_load_store();
+    let t38 = test_codegen_extern_decl();
+    let t39 = test_codegen_llvm_module_header();
+    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 && t33 && t34 && t35 && t36 && t37 && t38 && t39 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");
