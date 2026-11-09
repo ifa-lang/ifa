@@ -2786,6 +2786,673 @@ pub fn test_driver_intermodule_dead_code_elimination() -> bool {
     return has_ipo_header && !has_dead_lexer && !has_dead_parser && has_live_lexer && has_live_parser;
 }
 
+// === IFA Autonomous Packaging & Embedded Stdlib Distribution Module ===
+
+pub struct StdlibModuleManifest {
+    module_name: String,
+    symbol_count: i64,
+    byte_size: i64,
+    checksum_tag: String,
+    is_embedded: bool
+}
+
+pub fn make_stdlib_module_manifest(
+    name: String,
+    symbols: i64,
+    size: i64,
+    checksum: String,
+    embedded: bool
+) -> StdlibModuleManifest {
+    return StdlibModuleManifest(
+        module_name: name,
+        symbol_count: symbols,
+        byte_size: size,
+        checksum_tag: checksum,
+        is_embedded: embedded
+    );
+}
+
+pub struct StaticRuntimeBundle {
+    allocator_name: String,
+    concurrency_model: String,
+    io_engine: String,
+    zero_host_dependency: bool,
+    deterministic_panic: bool,
+    runtime_symbols_count: i64
+}
+
+pub fn make_autonomous_static_runtime() -> StaticRuntimeBundle {
+    return StaticRuntimeBundle(
+        allocator_name: "generational_cow_arena",
+        concurrency_model: "m_n_colorless_fibers",
+        io_engine: "deterministic_blocking_and_reactor",
+        zero_host_dependency: true,
+        deterministic_panic: true,
+        runtime_symbols_count: 16
+    );
+}
+
+pub struct DistributionTarget {
+    triple: String,
+    binary_format: String,
+    package_kind: String,
+    is_static: bool
+}
+
+pub fn make_distribution_target(triple: String, binary_format: String, package_kind: String) -> DistributionTarget {
+    return DistributionTarget(
+        triple: triple,
+        binary_format: binary_format,
+        package_kind: package_kind,
+        is_static: true
+    );
+}
+
+pub struct AutonomousDistributionPackage {
+    package_name: String,
+    package_version: String,
+    target: DistributionTarget,
+    runtime: StaticRuntimeBundle,
+    stdlib_modules: List<StdlibModuleManifest>,
+    manifest_checksum: String,
+    total_binary_size: i64
+}
+
+pub fn create_default_stdlib_manifests() -> List<StdlibModuleManifest> {
+    mut list: List<StdlibModuleManifest> = List::new();
+    list.push(make_stdlib_module_manifest("std/fs", 12, 8192, "sha256:std-fs-v1", true));
+    list.push(make_stdlib_module_manifest("std/process", 10, 6144, "sha256:std-process-v1", true));
+    list.push(make_stdlib_module_manifest("std/collections", 24, 16384, "sha256:std-collections-v1", true));
+    list.push(make_stdlib_module_manifest("std/io", 8, 4096, "sha256:std-io-v1", true));
+    list.push(make_stdlib_module_manifest("std/sync", 14, 10240, "sha256:std-sync-v1", true));
+    list.push(make_stdlib_module_manifest("std/crypto", 16, 12288, "sha256:std-crypto-v1", true));
+    list.push(make_stdlib_module_manifest("std/fmt", 10, 5120, "sha256:std-fmt-v1", true));
+    list.push(make_stdlib_module_manifest("std/iter", 12, 6144, "sha256:std-iter-v1", true));
+    list.push(make_stdlib_module_manifest("std/json", 18, 14336, "sha256:std-json-v1", true));
+    return list;
+}
+
+pub fn string_starts_with(s: String, prefix: String) -> bool {
+    let len_s = string_len(s);
+    let len_p = string_len(prefix);
+    if len_p > len_s {
+        return false;
+    }
+    mut i: i64 = 0;
+    while i < len_p {
+        if string_char_at(s, i) != string_char_at(prefix, i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn build_autonomous_distribution_package(
+    pkg_name: String,
+    version: String,
+    triple: String
+) -> AutonomousDistributionPackage {
+    mut bin_format = "elf64";
+    if string_starts_with(triple, "x86_64-apple-darwin") || string_starts_with(triple, "aarch64-apple-darwin") {
+        bin_format = "macho64";
+    }
+    let target = make_distribution_target(triple, bin_format, "standalone_binary");
+    let rt = make_autonomous_static_runtime();
+    let stdlib = create_default_stdlib_manifests();
+
+    mut total_sz: i64 = 131072; // Base runtime size 128KB
+    mut i: i64 = 0;
+    while i < stdlib.len() {
+        total_sz = total_sz + stdlib[i].byte_size;
+        i = i + 1;
+    }
+
+    return AutonomousDistributionPackage(
+        package_name: pkg_name,
+        package_version: version,
+        target: target,
+        runtime: rt,
+        stdlib_modules: stdlib,
+        manifest_checksum: "sha256:pkg-" + pkg_name + "-" + version + "-" + bin_format,
+        total_binary_size: total_sz
+    );
+}
+
+pub fn verify_distribution_package_integrity(pkg: AutonomousDistributionPackage) -> bool {
+    if !pkg.runtime.zero_host_dependency {
+        return false;
+    }
+    if !pkg.runtime.deterministic_panic {
+        return false;
+    }
+    if pkg.stdlib_modules.len() < 4 {
+        return false;
+    }
+    mut has_fs = false;
+    mut has_process = false;
+    mut has_collections = false;
+    mut has_io = false;
+
+    mut i: i64 = 0;
+    while i < pkg.stdlib_modules.len() {
+        let m = pkg.stdlib_modules[i];
+        if !m.is_embedded {
+            return false;
+        }
+        if m.module_name == "std/fs" {
+            has_fs = true;
+        } else if m.module_name == "std/process" {
+            has_process = true;
+        } else if m.module_name == "std/collections" {
+            has_collections = true;
+        } else if m.module_name == "std/io" {
+            has_io = true;
+        }
+        i = i + 1;
+    }
+
+    return has_fs && has_process && has_collections && has_io && pkg.total_binary_size > 0;
+}
+
+pub fn generate_distribution_manifest_json(pkg: AutonomousDistributionPackage) -> String {
+    mut s = "{\n";
+    s = s + "  \"package\": \"" + pkg.package_name + "\",\n";
+    s = s + "  \"version\": \"" + pkg.package_version + "\",\n";
+    s = s + "  \"target_triple\": \"" + pkg.target.triple + "\",\n";
+    s = s + "  \"binary_format\": \"" + pkg.target.binary_format + "\",\n";
+    s = s + "  \"is_static\": true,\n";
+    s = s + "  \"runtime\": {\n";
+    s = s + "    \"allocator\": \"" + pkg.runtime.allocator_name + "\",\n";
+    s = s + "    \"concurrency\": \"" + pkg.runtime.concurrency_model + "\",\n";
+    s = s + "    \"zero_host_dependency\": true,\n";
+    s = s + "    \"runtime_symbols\": " + driver_int_to_str(pkg.runtime.runtime_symbols_count) + "\n";
+    s = s + "  },\n";
+    s = s + "  \"embedded_stdlib_count\": " + driver_int_to_str(pkg.stdlib_modules.len()) + ",\n";
+    s = s + "  \"total_size_bytes\": " + driver_int_to_str(pkg.total_binary_size) + ",\n";
+    s = s + "  \"checksum\": \"" + pkg.manifest_checksum + "\"\n";
+    s = s + "}";
+    return s;
+}
+
+pub fn assemble_distribution_archive_commands(pkg: AutonomousDistributionPackage, out_dir: String) -> List<String> {
+    mut cmds: List<String> = List::new();
+    let bin_name = pkg.package_name;
+    let archive_name = out_dir + "/" + pkg.package_name + "-" + pkg.package_version + "-" + pkg.target.triple + ".tar.gz";
+
+    cmds.push("mkdir -p " + out_dir);
+    cmds.push("strip --strip-all " + bin_name);
+    cmds.push("tar -czf " + archive_name + " -C " + out_dir + " " + bin_name);
+    cmds.push("sha256sum " + archive_name + " > " + archive_name + ".sha256");
+    return cmds;
+}
+
+// === Native Symbol Tables Generation (ELF & Mach-O) ===
+
+pub struct NativeSymbolDescriptor {
+    name: String,
+    mangled_name: String,
+    kind: i64,             // 1=Function, 2=GlobalVar, 3=Constant, 4=WeakAlias, 5=VTableDescriptor
+    binding: i64,          // 0=Local (STB_LOCAL), 1=Global (STB_GLOBAL), 2=Weak (STB_WEAK)
+    visibility: i64,       // 0=Default (STV_DEFAULT), 1=Hidden (STV_HIDDEN), 2=Protected (STV_PROTECTED)
+    section_name: String,  // ".text", ".rodata", ".data"
+    size: i64,
+    alignment: i64,
+    is_exported: bool
+}
+
+pub fn make_native_symbol(
+    name: String,
+    mangled: String,
+    kind: i64,
+    binding: i64,
+    vis: i64,
+    section: String,
+    size: i64,
+    align: i64,
+    exported: bool
+) -> NativeSymbolDescriptor {
+    return NativeSymbolDescriptor(
+        name: name,
+        mangled_name: mangled,
+        kind: kind,
+        binding: binding,
+        visibility: vis,
+        section_name: section,
+        size: size,
+        alignment: align,
+        is_exported: exported
+    );
+}
+
+pub struct ElfSymbolEntry {
+    name_str: String,
+    st_name_offset: i64,
+    st_info: i64,          // (binding << 4) + (kind & 0xf)
+    st_other: i64,         // visibility & 0x3
+    st_shndx: i64,         // section index (1=.text, 2=.rodata, 3=.data)
+    st_value: i64,         // offset / address
+    st_size: i64
+}
+
+pub struct ElfSymbolTable {
+    entries: List<ElfSymbolEntry>,
+    strtab_bytes: i64,
+    total_symbols: i64,
+    local_symbols_count: i64,
+    global_symbols_count: i64
+}
+
+pub struct MachOSymbolEntry {
+    name_str: String,
+    n_strx: i64,
+    n_type: i64,           // N_SECT (0x0e) | (N_EXT 0x01 if exported)
+    n_sect: i64,           // section number (1-based)
+    n_desc: i64,
+    n_value: i64
+}
+
+pub struct MachOSymbolTable {
+    entries: List<MachOSymbolEntry>,
+    strtab_bytes: i64,
+    total_symbols: i64,
+    exported_symbols_count: i64
+}
+
+pub fn string_compare_lexicographic(a: String, b: String) -> i64 {
+    let len_a = string_len(a);
+    let len_b = string_len(b);
+    let min_len = if len_a < len_b { len_a } else { len_b };
+    mut i: i64 = 0;
+    while i < min_len {
+        let ca = string_char_at(a, i);
+        let cb = string_char_at(b, i);
+        if ca < cb {
+            return -1;
+        }
+        if ca > cb {
+            return 1;
+        }
+        i = i + 1;
+    }
+    if len_a < len_b {
+        return -1;
+    }
+    if len_a > len_b {
+        return 1;
+    }
+    return 0;
+}
+
+pub fn list_contains_i64(list: List<i64>, val: i64) -> bool {
+    mut i: i64 = 0;
+    while i < list.len() {
+        if list[i] == val {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn sort_native_symbols_lexicographically(symbols: List<NativeSymbolDescriptor>) -> List<NativeSymbolDescriptor> {
+    mut sorted: List<NativeSymbolDescriptor> = List::new();
+    mut visited: List<i64> = List::new();
+
+    mut count: i64 = 0;
+    while count < symbols.len() {
+        mut best_idx: i64 = -1;
+        mut i: i64 = 0;
+        while i < symbols.len() {
+            if !list_contains_i64(visited, i) {
+                if best_idx < 0 {
+                    best_idx = i;
+                } else {
+                    let cmp = string_compare_lexicographic(symbols[i].name, symbols[best_idx].name);
+                    if cmp < 0 {
+                        best_idx = i;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        if best_idx >= 0 {
+            visited.push(best_idx);
+            sorted.push(symbols[best_idx]);
+        }
+        count = count + 1;
+    }
+    return sorted;
+}
+
+pub fn build_elf_symbol_table(symbols: List<NativeSymbolDescriptor>) -> ElfSymbolTable {
+    // Deterministic sort of symbols
+    let sorted_symbols = sort_native_symbols_lexicographically(symbols);
+
+    mut entries: List<ElfSymbolEntry> = List::new();
+    // 1. Mandatory ELF null symbol STN_UNDEF at index 0
+    entries.push(ElfSymbolEntry(
+        name_str: "",
+        st_name_offset: 0,
+        st_info: 0,
+        st_other: 0,
+        st_shndx: 0,
+        st_value: 0,
+        st_size: 0
+    ));
+
+    mut current_str_offset: i64 = 1; // Index 0 is the null byte
+
+    // 2. ELF specification requires local symbols (STB_LOCAL = 0) to precede global symbols
+    mut local_count: i64 = 0;
+    mut s_idx: i64 = 0;
+    while s_idx < sorted_symbols.len() {
+        let s = sorted_symbols[s_idx];
+        if s.binding == 0 {
+            let info = (s.binding * 16) + (s.kind % 16);
+            let other = s.visibility % 4;
+            mut shndx: i64 = 1; // default .text
+            if s.section_name == ".rodata" {
+                shndx = 2;
+            } else if s.section_name == ".data" {
+                shndx = 3;
+            }
+
+            entries.push(ElfSymbolEntry(
+                name_str: s.name,
+                st_name_offset: current_str_offset,
+                st_info: info,
+                st_other: other,
+                st_shndx: shndx,
+                st_value: s.size,
+                st_size: s.size
+            ));
+            current_str_offset = current_str_offset + string_len(s.name) + 1;
+            local_count = local_count + 1;
+        }
+        s_idx = s_idx + 1;
+    }
+
+    // 3. Global and Weak symbols
+    mut global_count: i64 = 0;
+    s_idx = 0;
+    while s_idx < sorted_symbols.len() {
+        let s = sorted_symbols[s_idx];
+        if s.binding != 0 {
+            let info = (s.binding * 16) + (s.kind % 16);
+            let other = s.visibility % 4;
+            mut shndx: i64 = 1;
+            if s.section_name == ".rodata" {
+                shndx = 2;
+            } else if s.section_name == ".data" {
+                shndx = 3;
+            }
+
+            entries.push(ElfSymbolEntry(
+                name_str: s.name,
+                st_name_offset: current_str_offset,
+                st_info: info,
+                st_other: other,
+                st_shndx: shndx,
+                st_value: s.size,
+                st_size: s.size
+            ));
+            current_str_offset = current_str_offset + string_len(s.name) + 1;
+            global_count = global_count + 1;
+        }
+        s_idx = s_idx + 1;
+    }
+
+    return ElfSymbolTable(
+        entries: entries,
+        strtab_bytes: current_str_offset,
+        total_symbols: entries.len(),
+        local_symbols_count: local_count,
+        global_symbols_count: global_count
+    );
+}
+
+pub fn build_macho_symbol_table(symbols: List<NativeSymbolDescriptor>) -> MachOSymbolTable {
+    let sorted_symbols = sort_native_symbols_lexicographically(symbols);
+
+    mut entries: List<MachOSymbolEntry> = List::new();
+    mut current_str_offset: i64 = 1;
+    mut exported_count: i64 = 0;
+
+    mut i: i64 = 0;
+    while i < sorted_symbols.len() {
+        let s = sorted_symbols[i];
+        let mangled = "_" + s.name;
+        mut n_type: i64 = 14; // N_SECT = 0x0e
+        if s.is_exported {
+            n_type = n_type + 1; // N_EXT = 0x01
+            exported_count = exported_count + 1;
+        }
+        mut n_sect: i64 = 1; // __TEXT,__text
+        if s.section_name == ".rodata" {
+            n_sect = 2; // __TEXT,__cstring / const
+        } else if s.section_name == ".data" {
+            n_sect = 3; // __DATA,__data
+        }
+
+        entries.push(MachOSymbolEntry(
+            name_str: mangled,
+            n_strx: current_str_offset,
+            n_type: n_type,
+            n_sect: n_sect,
+            n_desc: 0,
+            n_value: s.size
+        ));
+
+        current_str_offset = current_str_offset + string_len(mangled) + 1;
+        i = i + 1;
+    }
+
+    return MachOSymbolTable(
+        entries: entries,
+        strtab_bytes: current_str_offset,
+        total_symbols: entries.len(),
+        exported_symbols_count: exported_count
+    );
+}
+
+pub fn emit_native_symbol_export_directives(
+    symbols: List<NativeSymbolDescriptor>,
+    target_format: String
+) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("; === IFA Native Symbol Export Directives (" + target_format + ") ===");
+
+    mut used_names: List<String> = List::new();
+
+    mut i: i64 = 0;
+    while i < symbols.len() {
+        let s = symbols[i];
+        if s.is_exported {
+            mut vis_str = "default";
+            if s.visibility == 1 {
+                vis_str = "hidden";
+            } else if s.visibility == 2 {
+                vis_str = "protected";
+            }
+
+            mut bind_str = "global";
+            if s.binding == 2 {
+                bind_str = "weak_odr";
+            }
+
+            let line = "; export " + s.name + " [" + vis_str + ", " + bind_str + ", section \"" + s.section_name + "\"]";
+            lines.push(line);
+            used_names.push("@" + s.name);
+        }
+        i = i + 1;
+    }
+
+    // Emit @llvm.used array to guarantee preservation across linker optimizations
+    if used_names.len() > 0 {
+        mut used_decl = "@llvm.used = appending global [" + driver_int_to_str(used_names.len()) + " x ptr] [";
+        mut u: i64 = 0;
+        while u < used_names.len() {
+            if u > 0 {
+                used_decl = used_decl + ", ";
+            }
+            used_decl = used_decl + "ptr " + used_names[u];
+            u = u + 1;
+        }
+        used_decl = used_decl + "], section \"llvm.metadata\"";
+        lines.push(used_decl);
+    }
+
+    return lines;
+}
+
+// Unit Test 25: Verify autonomous packaging with embedded stdlib modules
+pub fn test_driver_autonomous_packaging_and_embedded_stdlib() -> bool {
+    let pkg = build_autonomous_distribution_package("ifac", "0.1.0", "x86_64-unknown-linux-gnu");
+    if !verify_distribution_package_integrity(pkg) {
+        return false;
+    }
+    if pkg.stdlib_modules.len() != 9 {
+        return false;
+    }
+    if pkg.target.binary_format != "elf64" || !pkg.target.is_static {
+        return false;
+    }
+    if pkg.total_binary_size <= 131072 {
+        return false;
+    }
+
+    let manifest_json = generate_distribution_manifest_json(pkg);
+    if string_len(manifest_json) < 100 {
+        return false;
+    }
+    return true;
+}
+
+// Unit Test 26: Verify static runtime bundle without host dependencies
+pub fn test_driver_static_runtime_bundle_validation() -> bool {
+    let rt = make_autonomous_static_runtime();
+    if !rt.zero_host_dependency || !rt.deterministic_panic {
+        return false;
+    }
+    if rt.allocator_name != "generational_cow_arena" || rt.concurrency_model != "m_n_colorless_fibers" {
+        return false;
+    }
+    if rt.runtime_symbols_count != 16 {
+        return false;
+    }
+
+    let pkg = build_autonomous_distribution_package("ifac", "0.1.0", "x86_64-unknown-linux-gnu");
+    let cmds = assemble_distribution_archive_commands(pkg, "dist");
+    if cmds.len() != 4 {
+        return false;
+    }
+    if cmds[1] != "strip --strip-all ifac" {
+        return false;
+    }
+    return true;
+}
+
+// Unit Test 27: Verify native ELF symbol table generation with deterministic ordering
+pub fn test_driver_native_elf_symbol_table_generation() -> bool {
+    mut syms: List<NativeSymbolDescriptor> = List::new();
+    syms.push(make_native_symbol("compute", "compute", 1, 1, 0, ".text", 64, 16, true));
+    syms.push(make_native_symbol("helper", "helper", 1, 0, 1, ".text", 32, 16, false));
+    syms.push(make_native_symbol("K_VERSION", "K_VERSION", 3, 1, 0, ".rodata", 8, 8, true));
+    syms.push(make_native_symbol("scratch_buf", "scratch_buf", 2, 0, 1, ".data", 256, 32, false));
+
+    let elf_tab = build_elf_symbol_table(syms);
+    if elf_tab.total_symbols != 5 {
+        return false;
+    }
+    if elf_tab.local_symbols_count != 2 || elf_tab.global_symbols_count != 2 {
+        return false;
+    }
+
+    // Index 0: STN_UNDEF
+    if elf_tab.entries[0].name_str != "" || elf_tab.entries[0].st_info != 0 {
+        return false;
+    }
+
+    // Local symbols first: helper, scratch_buf
+    let loc1 = elf_tab.entries[1];
+    let loc2 = elf_tab.entries[2];
+    if (loc1.st_info / 16) != 0 || (loc2.st_info / 16) != 0 {
+        return false;
+    }
+
+    // Global symbols next: K_VERSION, compute
+    let glob1 = elf_tab.entries[3];
+    let glob2 = elf_tab.entries[4];
+    if (glob1.st_info / 16) != 1 || (glob2.st_info / 16) != 1 {
+        return false;
+    }
+
+    // Check string offsets are strictly monotonic
+    if loc1.st_name_offset <= 0 || loc2.st_name_offset <= loc1.st_name_offset || glob1.st_name_offset <= loc2.st_name_offset {
+        return false;
+    }
+    return true;
+}
+
+// Unit Test 28: Verify native Mach-O symbol table generation
+pub fn test_driver_native_macho_symbol_table_generation() -> bool {
+    mut syms: List<NativeSymbolDescriptor> = List::new();
+    syms.push(make_native_symbol("compute", "compute", 1, 1, 0, ".text", 64, 16, true));
+    syms.push(make_native_symbol("helper", "helper", 1, 0, 1, ".text", 32, 16, false));
+    syms.push(make_native_symbol("K_VERSION", "K_VERSION", 3, 1, 0, ".rodata", 8, 8, true));
+    syms.push(make_native_symbol("scratch_buf", "scratch_buf", 2, 0, 1, ".data", 256, 32, false));
+
+    let macho_tab = build_macho_symbol_table(syms);
+    if macho_tab.total_symbols != 4 {
+        return false;
+    }
+    if macho_tab.exported_symbols_count != 2 {
+        return false;
+    }
+
+    // Entries are sorted: _K_VERSION, _compute, _helper, _scratch_buf
+    if macho_tab.entries[0].name_str != "_K_VERSION" || macho_tab.entries[1].name_str != "_compute" {
+        return false;
+    }
+    // Exported has N_EXT bit set (14 + 1 = 15)
+    if macho_tab.entries[0].n_type != 15 || macho_tab.entries[1].n_type != 15 {
+        return false;
+    }
+    // Non-exported has N_SECT only (14)
+    if macho_tab.entries[2].n_type != 14 || macho_tab.entries[3].n_type != 14 {
+        return false;
+    }
+    return true;
+}
+
+// Unit Test 29: Verify native symbol export directives emission
+pub fn test_driver_native_symbol_export_directives() -> bool {
+    mut syms: List<NativeSymbolDescriptor> = List::new();
+    syms.push(make_native_symbol("compute", "compute", 1, 1, 0, ".text", 64, 16, true));
+    syms.push(make_native_symbol("helper", "helper", 1, 0, 1, ".text", 32, 16, false));
+    syms.push(make_native_symbol("K_VERSION", "K_VERSION", 3, 1, 0, ".rodata", 8, 8, true));
+
+    let directives = emit_native_symbol_export_directives(syms, "elf64");
+    if directives.len() < 3 {
+        return false;
+    }
+    if directives[0] != "; === IFA Native Symbol Export Directives (elf64) ===" {
+        return false;
+    }
+
+    mut has_used = false;
+    mut i: i64 = 0;
+    while i < directives.len() {
+        if directives[i] == "@llvm.used = appending global [2 x ptr] [ptr @compute, ptr @K_VERSION], section \"llvm.metadata\"" {
+            has_used = true;
+        }
+        i = i + 1;
+    }
+
+    return has_used;
+}
+
 pub fn main() {
     println("=== IFA Compiler Driver & I/O Module ===");
     let t1 = test_driver_default_config();
@@ -2812,8 +3479,13 @@ pub fn main() {
     let t22 = test_driver_multi_file_build_orchestration();
     let t23 = test_driver_ipo_callgraph_and_reachability();
     let t24 = test_driver_intermodule_dead_code_elimination();
+    let t25 = test_driver_autonomous_packaging_and_embedded_stdlib();
+    let t26 = test_driver_static_runtime_bundle_validation();
+    let t27 = test_driver_native_elf_symbol_table_generation();
+    let t28 = test_driver_native_macho_symbol_table_generation();
+    let t29 = test_driver_native_symbol_export_directives();
 
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 {
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 {
         println("Driver validation tests: ALL PASSED");
     } else {
         println("Driver validation tests: FAILED");

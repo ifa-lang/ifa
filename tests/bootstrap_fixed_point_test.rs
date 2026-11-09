@@ -821,8 +821,33 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("314 passed; 0 failed"),
-        "Expected 314 passed unit tests, got:\n{}",
+        stdout.contains("test test_driver_autonomous_packaging_and_embedded_stdlib ... ok"),
+        "Modular driver autonomous packaging test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_static_runtime_bundle_validation ... ok"),
+        "Modular driver static runtime bundle test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_native_elf_symbol_table_generation ... ok"),
+        "Modular driver native elf symbol table test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_native_macho_symbol_table_generation ... ok"),
+        "Modular driver native macho symbol table test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_native_symbol_export_directives ... ok"),
+        "Modular driver native symbol export directives test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("324 passed; 0 failed"),
+        "Expected 324 passed unit tests, got:\n{}",
         stdout
     );
 }
