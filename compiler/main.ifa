@@ -92,6 +92,27 @@ pub fn test_selfhost_modular_pipeline() -> bool {
         return false;
     }
 
+    // Const and enum declarations pipeline validation
+    let const_tokens = lexer::tokenize_const_program();
+    mut cur_cn: i64 = 0;
+    let cn_decl = parser::parse_const(inout cur_cn, const_tokens);
+    if cn_decl.name != "MAX_BUFFER_SIZE" || cn_decl.val != 4096 {
+        return false;
+    }
+
+    let enum_tokens = lexer::tokenize_enum_program();
+    mut cur_en: i64 = 0;
+    let en_decl = parser::parse_enum(inout cur_en, enum_tokens);
+    if en_decl.name != "TokenKind" || en_decl.variants.len() != 4 {
+        return false;
+    }
+
+    let sema_const_ok = sema::test_sema_const_resolution();
+    let sema_enum_ok = sema::test_sema_enum_resolution();
+    if !sema_const_ok || !sema_enum_ok {
+        return false;
+    }
+
     // Driver orchestration and native pipeline validation
     let cfg = driver::make_default_config("sample.ifa", "sample.ll");
     if !driver::validate_compiler_config(cfg) {

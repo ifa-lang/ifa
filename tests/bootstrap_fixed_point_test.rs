@@ -110,6 +110,16 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_lexer_const_declaration ... ok"),
+        "Modular lexer const declaration test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_lexer_enum_declaration ... ok"),
+        "Modular lexer enum declaration test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_parser_ast_building ... ok"),
         "Modular parser tests missing from output:\n{}",
         stdout
@@ -132,6 +142,16 @@ fn test_modular_compiler_unit_tests() {
     assert!(
         stdout.contains("test test_parser_arena_declaration ... ok"),
         "Modular parser arena declaration test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_const_declaration ... ok"),
+        "Modular parser const declaration test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_enum_declaration ... ok"),
+        "Modular parser enum declaration test missing from output:\n{}",
         stdout
     );
     assert!(
@@ -172,6 +192,16 @@ fn test_modular_compiler_unit_tests() {
     assert!(
         stdout.contains("test test_sema_arena_allocation ... ok"),
         "Modular sema arena allocation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_const_resolution ... ok"),
+        "Modular sema const resolution test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_enum_resolution ... ok"),
+        "Modular sema enum resolution test missing from output:\n{}",
         stdout
     );
     assert!(
@@ -220,8 +250,8 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("73 passed; 0 failed"),
-        "Expected 73 passed unit tests, got:\n{}",
+        stdout.contains("85 passed; 0 failed"),
+        "Expected 85 passed unit tests, got:\n{}",
         stdout
     );
 }

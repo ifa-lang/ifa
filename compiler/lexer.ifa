@@ -1,8 +1,8 @@
 // Pure IFA Self-Hosting Compiler - Lexer Module (`compiler/lexer.ifa`)
 // Deterministic lexical scanner and token generation for IFA bootstrap compiler.
 
-comptime fn build_keyword_lut() -> [i64; 16] {
-    return [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 17, 18];
+comptime fn build_keyword_lut() -> [i64; 18] {
+    return [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 26];
 }
 
 pub const KEYWORD_LUT = comptime build_keyword_lut();
@@ -320,6 +320,54 @@ pub fn tokenize_arena_program() -> List<Token> {
     return tokens;
 }
 
+// Tokenize constant declarations:
+// `pub const MAX_BUFFER_SIZE: i64 = 4096; const DEFAULT_ALIGN: i64 = 8;`
+pub fn tokenize_const_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    // 1. pub const MAX_BUFFER_SIZE: i64 = 4096;
+    advance_token(inout tokens, 15, 0, "pub");
+    advance_token(inout tokens, 19, 0, "const");
+    advance_token(inout tokens, 10, 0, "MAX_BUFFER_SIZE");
+    advance_token(inout tokens, 34, 0, ":");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 24, 0, "=");
+    advance_token(inout tokens, 11, 4096, "4096");
+    advance_token(inout tokens, 35, 0, ";");
+
+    // 2. const DEFAULT_ALIGN: i64 = 8;
+    advance_token(inout tokens, 19, 0, "const");
+    advance_token(inout tokens, 10, 0, "DEFAULT_ALIGN");
+    advance_token(inout tokens, 34, 0, ":");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 24, 0, "=");
+    advance_token(inout tokens, 11, 8, "8");
+    advance_token(inout tokens, 35, 0, ";");
+
+    return tokens;
+}
+
+// Tokenize enum declaration:
+// `pub enum TokenKind { Eof, Identifier, Number, Plus }`
+pub fn tokenize_enum_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    advance_token(inout tokens, 15, 0, "pub");
+    advance_token(inout tokens, 26, 0, "enum");
+    advance_token(inout tokens, 10, 0, "TokenKind");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 10, 0, "Eof");
+    advance_token(inout tokens, 39, 0, ",");
+    advance_token(inout tokens, 10, 0, "Identifier");
+    advance_token(inout tokens, 39, 0, ",");
+    advance_token(inout tokens, 10, 0, "Number");
+    advance_token(inout tokens, 39, 0, ",");
+    advance_token(inout tokens, 10, 0, "Plus");
+    advance_token(inout tokens, 33, 0, "}");
+
+    return tokens;
+}
+
 // Unit test: Token stream verification and list properties
 pub fn test_lexer_stream() -> bool {
     let tokens = tokenize_sample_program();
@@ -343,7 +391,7 @@ pub fn test_lexer_stream() -> bool {
 
 // Unit test: Comptime keyword LUT validation
 pub fn test_comptime_keyword_lut() -> bool {
-    return KEYWORD_LUT.len() == 16;
+    return KEYWORD_LUT.len() == 18;
 }
 
 // Unit test: Type alias tokenization validation
@@ -390,6 +438,45 @@ pub fn test_lexer_arena() -> bool {
     return true;
 }
 
+// Unit test: Constant declaration tokenization validation
+pub fn test_lexer_const_declaration() -> bool {
+    let tokens = tokenize_const_program();
+    if tokens.len() != 15 {
+        return false;
+    }
+    // 0: pub, 1: const, 2: MAX_BUFFER_SIZE, 6: 4096
+    if tokens[0].kind != 15 || tokens[1].kind != 19 || tokens[2].lexeme != "MAX_BUFFER_SIZE" {
+        return false;
+    }
+    if tokens[6].kind != 11 || tokens[6].value != 4096 {
+        return false;
+    }
+    // 8: const, 9: DEFAULT_ALIGN, 13: 8
+    if tokens[8].kind != 19 || tokens[9].lexeme != "DEFAULT_ALIGN" || tokens[13].value != 8 {
+        return false;
+    }
+    return true;
+}
+
+// Unit test: Enum declaration tokenization validation
+pub fn test_lexer_enum_declaration() -> bool {
+    let tokens = tokenize_enum_program();
+    if tokens.len() != 12 {
+        return false;
+    }
+    // 0: pub, 1: enum, 2: TokenKind, 3: {, 4: Eof, 6: Identifier, 8: Number, 10: Plus, 11: }
+    if tokens[0].kind != 15 || tokens[1].kind != 26 || tokens[2].lexeme != "TokenKind" {
+        return false;
+    }
+    if tokens[4].lexeme != "Eof" || tokens[6].lexeme != "Identifier" {
+        return false;
+    }
+    if tokens[8].lexeme != "Number" || tokens[10].lexeme != "Plus" || tokens[11].kind != 33 {
+        return false;
+    }
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Lexer Module ===");
     let tokens = tokenize_sample_program();
@@ -399,7 +486,9 @@ pub fn main() {
     let t_alias = test_lexer_type_alias();
     let t_tuple = test_lexer_tuples();
     let t_arena = test_lexer_arena();
-    if t_ok && t_lut && t_alias && t_tuple && t_arena {
+    let t_const = test_lexer_const_declaration();
+    let t_enum = test_lexer_enum_declaration();
+    if t_ok && t_lut && t_alias && t_tuple && t_arena && t_const && t_enum {
         println("Lexer stream test: OK");
     } else {
         println("Lexer stream test: FAILED");

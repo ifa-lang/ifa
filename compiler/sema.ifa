@@ -449,6 +449,126 @@ pub fn test_sema_arena_allocation() -> bool {
     return arena_released.active_borrows == 0;
 }
 
+// Constant symbol table and lookup
+pub struct ConstSymbolTable {
+    names: List<String>,
+    values: List<i64>
+}
+
+pub fn make_const_table() -> ConstSymbolTable {
+    return ConstSymbolTable(names: List::new(), values: List::new());
+}
+
+pub fn register_const(inout table: ConstSymbolTable, name: String, val: i64) {
+    table.names.push(name);
+    table.values.push(val);
+}
+
+pub fn resolve_const(table: ConstSymbolTable, name: String) -> i64 {
+    mut i: i64 = 0;
+    while i < table.names.len() {
+        if table.names[i] == name {
+            return table.values[i];
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub fn has_const(table: ConstSymbolTable, name: String) -> bool {
+    mut i: i64 = 0;
+    while i < table.names.len() {
+        if table.names[i] == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Enum symbol table and discriminant resolution
+pub struct EnumSymbolTable {
+    enum_names: List<String>,
+    variant_names: List<String>,
+    discriminants: List<i64>
+}
+
+pub fn make_enum_table() -> EnumSymbolTable {
+    return EnumSymbolTable(
+        enum_names: List::new(),
+        variant_names: List::new(),
+        discriminants: List::new()
+    );
+}
+
+pub fn register_enum_variant(
+    inout table: EnumSymbolTable,
+    enum_name: String,
+    variant_name: String,
+    disc: i64
+) {
+    table.enum_names.push(enum_name);
+    table.variant_names.push(variant_name);
+    table.discriminants.push(disc);
+}
+
+pub fn resolve_enum_discriminant(
+    table: EnumSymbolTable,
+    enum_name: String,
+    variant_name: String
+) -> i64 {
+    mut i: i64 = 0;
+    while i < table.enum_names.len() {
+        if table.enum_names[i] == enum_name && table.variant_names[i] == variant_name {
+            return table.discriminants[i];
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Unit test 8: Constant resolution and lookup
+pub fn test_sema_const_resolution() -> bool {
+    mut table = make_const_table();
+    register_const(inout table, "MAX_BUFFER_SIZE", 4096);
+    register_const(inout table, "DEFAULT_ALIGN", 8);
+
+    if !has_const(table, "MAX_BUFFER_SIZE") {
+        return false;
+    }
+    if !has_const(table, "DEFAULT_ALIGN") {
+        return false;
+    }
+    if has_const(table, "NON_EXISTENT") {
+        return false;
+    }
+
+    let val1 = resolve_const(table, "MAX_BUFFER_SIZE");
+    let val2 = resolve_const(table, "DEFAULT_ALIGN");
+
+    return val1 == 4096 && val2 == 8;
+}
+
+// Unit test 9: Enum discriminant resolution
+pub fn test_sema_enum_resolution() -> bool {
+    mut table = make_enum_table();
+    register_enum_variant(inout table, "TokenKind", "Eof", 0);
+    register_enum_variant(inout table, "TokenKind", "Identifier", 1);
+    register_enum_variant(inout table, "TokenKind", "Number", 2);
+    register_enum_variant(inout table, "TokenKind", "Plus", 3);
+
+    let d0 = resolve_enum_discriminant(table, "TokenKind", "Eof");
+    let d1 = resolve_enum_discriminant(table, "TokenKind", "Identifier");
+    let d2 = resolve_enum_discriminant(table, "TokenKind", "Number");
+    let d3 = resolve_enum_discriminant(table, "TokenKind", "Plus");
+    let d_missing = resolve_enum_discriminant(table, "TokenKind", "Minus");
+
+    if d0 != 0 || d1 != 1 || d2 != 2 || d3 != 3 {
+        return false;
+    }
+    return d_missing == -1;
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
@@ -458,7 +578,9 @@ pub fn main() {
     let t5 = test_sema_type_alias_resolution();
     let t6 = test_sema_tuple_operations();
     let t7 = test_sema_arena_allocation();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 {
+    let t8 = test_sema_const_resolution();
+    let t9 = test_sema_enum_resolution();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");
