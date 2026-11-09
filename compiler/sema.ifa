@@ -89,8 +89,8 @@ pub fn eval_expression(
             return tup_val - ((tup_val / 1000) * 1000);
         }
     }
-    if k == 6 {
-        // Arena allocation: alloc(val, arena)
+    if k == 6 || k == 7 || k == 8 {
+        // Arena allocation (6), macro invocation (7), or comptime expression (8)
         return eval_expression(expr?.left, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
     }
     return 0;
@@ -1185,6 +1185,303 @@ pub fn test_sema_arena_transfer_ownership() -> bool {
     return true;
 }
 
+// Advanced Local Type Inference Representation and Environment
+pub struct InferredType {
+    kind: i64,      // 1: i64, 2: bool, 3: String, 4: Tuple, 5: Ref, 6: Channel, 7: Unknown
+    sub_kind1: i64, // First inner type parameter
+    sub_kind2: i64, // Second inner type parameter
+    name: String
+}
+
+pub fn make_type_i64() -> InferredType {
+    return InferredType(kind: 1, sub_kind1: 0, sub_kind2: 0, name: "i64");
+}
+
+pub fn make_type_bool() -> InferredType {
+    return InferredType(kind: 2, sub_kind1: 0, sub_kind2: 0, name: "bool");
+}
+
+pub fn make_type_tuple(t1: i64, t2: i64) -> InferredType {
+    return InferredType(kind: 4, sub_kind1: t1, sub_kind2: t2, name: "Tuple");
+}
+
+pub struct LocalTypeBinding {
+    name: String,
+    inferred_ty: InferredType
+}
+
+pub struct LocalTypeEnv {
+    bindings: List<LocalTypeBinding>
+}
+
+pub fn make_local_type_env() -> LocalTypeEnv {
+    return LocalTypeEnv(bindings: List::new());
+}
+
+pub fn bind_local_type(inout env: LocalTypeEnv, name: String, ty: InferredType) {
+    env.bindings.push(LocalTypeBinding(name: name, inferred_ty: ty));
+}
+
+pub fn lookup_local_type(env: LocalTypeEnv, name: String) -> InferredType {
+    mut i: i64 = 0;
+    while i < env.bindings.len() {
+        if env.bindings[i].name == name {
+            return env.bindings[i].inferred_ty;
+        }
+        i = i + 1;
+    }
+    return InferredType(kind: 7, sub_kind1: 0, sub_kind2: 0, name: "unknown");
+}
+
+// Bidirectional recursive type inference for complex expressions
+pub fn infer_expression_type(expr: ?ref AstExpr, env: LocalTypeEnv) -> InferredType {
+    let k = expr?.kind ?? 0;
+    if k == 1 {
+        // Integer literal -> i64
+        return make_type_i64();
+    }
+    if k == 2 {
+        // Variable lookup
+        let var_name = expr?.name ?? "";
+        return lookup_local_type(env, var_name);
+    }
+    if k == 3 {
+        // Binary operation
+        let op = expr?.op ?? 0;
+        if op >= 5 && op <= 8 {
+            return make_type_bool();
+        }
+        return make_type_i64();
+    }
+    if k == 4 {
+        // Tuple expression
+        let t_left = infer_expression_type(expr?.left, env);
+        let t_right = infer_expression_type(expr?.right, env);
+        return make_type_tuple(t_left.kind, t_right.kind);
+    }
+    if k == 5 {
+        // Tuple index access
+        let idx = expr?.val ?? 0;
+        let var_name = expr?.name ?? "";
+        let tup_ty = lookup_local_type(env, var_name);
+        if tup_ty.kind == 4 {
+            if idx == 0 {
+                return InferredType(kind: tup_ty.sub_kind1, sub_kind1: 0, sub_kind2: 0, name: "inferred");
+            } else {
+                return InferredType(kind: tup_ty.sub_kind2, sub_kind1: 0, sub_kind2: 0, name: "inferred");
+            }
+        }
+        return make_type_i64();
+    }
+    if k == 6 || k == 8 {
+        // Arena allocation or comptime evaluation
+        return infer_expression_type(expr?.left, env);
+    }
+    return InferredType(kind: 7, sub_kind1: 0, sub_kind2: 0, name: "unknown");
+}
+
+// Nested Pattern Matching Structures and Evaluator
+pub struct AstNestedPattern {
+    kind: i64,          // 1: Wildcard, 2: Literal, 4: Tuple, 5: Guarded
+    val: i64,
+    name: String,
+    sub_pat1_kind: i64, // 1: Wildcard, 2: Literal, 3: Binding
+    sub_pat1_val: i64,
+    sub_pat1_name: String,
+    sub_pat2_kind: i64,
+    sub_pat2_val: i64,
+    sub_pat2_name: String,
+    has_guard: bool,
+    guard_val: i64
+}
+
+pub fn make_wildcard_nested_pat() -> AstNestedPattern {
+    return AstNestedPattern(
+        kind: 1, val: 0, name: "_",
+        sub_pat1_kind: 0, sub_pat1_val: 0, sub_pat1_name: "",
+        sub_pat2_kind: 0, sub_pat2_val: 0, sub_pat2_name: "",
+        has_guard: false, guard_val: 0
+    );
+}
+
+pub fn make_tuple_nested_pat(
+    p1_kind: i64, p1_val: i64, p1_name: String,
+    p2_kind: i64, p2_val: i64, p2_name: String,
+    has_guard: bool, guard_val: i64
+) -> AstNestedPattern {
+    return AstNestedPattern(
+        kind: 4, val: 0, name: "tuple",
+        sub_pat1_kind: p1_kind, sub_pat1_val: p1_val, sub_pat1_name: p1_name,
+        sub_pat2_kind: p2_kind, sub_pat2_val: p2_val, sub_pat2_name: p2_name,
+        has_guard: has_guard, guard_val: guard_val
+    );
+}
+
+pub struct AstNestedMatchArm {
+    pat: AstNestedPattern,
+    expr: ?ref AstExpr
+}
+
+pub struct AstNestedMatch {
+    target_pair_val: i64, // Encoded (left * 1000) + right
+    arms: List<AstNestedMatchArm>
+}
+
+pub fn eval_nested_pattern_match(m: AstNestedMatch) -> i64 {
+    let left_val = m.target_pair_val / 1000;
+    let right_val = m.target_pair_val - (left_val * 1000);
+
+    mut i: i64 = 0;
+    while i < m.arms.len() {
+        let arm = m.arms[i];
+        let p = arm.pat;
+
+        if p.kind == 1 {
+            return eval_expression(arm.expr, "", 0, "", 0, "", 0);
+        }
+        if p.kind == 4 {
+            mut p1_matches = false;
+            if p.sub_pat1_kind == 1 || (p.sub_pat1_kind == 2 && p.sub_pat1_val == left_val) || p.sub_pat1_kind == 3 {
+                p1_matches = true;
+            }
+
+            mut p2_matches = false;
+            if p.sub_pat2_kind == 1 || (p.sub_pat2_kind == 2 && p.sub_pat2_val == right_val) || p.sub_pat2_kind == 3 {
+                p2_matches = true;
+            }
+
+            if p1_matches && p2_matches {
+                if !p.has_guard || (left_val + right_val == p.guard_val) {
+                    mut v1_n = "";
+                    mut v1_v: i64 = 0;
+                    if p.sub_pat1_kind == 3 {
+                        v1_n = p.sub_pat1_name;
+                        v1_v = left_val;
+                    }
+                    mut v2_n = "";
+                    mut v2_v: i64 = 0;
+                    if p.sub_pat2_kind == 3 {
+                        v2_n = p.sub_pat2_name;
+                        v2_v = right_val;
+                    }
+                    return eval_expression(arm.expr, "", 0, v1_n, v1_v, v2_n, v2_v);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Comptime Expression Folding and Static Verification
+pub fn eval_comptime_constant(expr: ?ref AstExpr) -> i64 {
+    return eval_expression(expr, "", 0, "", 0, "", 0);
+}
+
+pub fn eval_comptime_assert(expr: ?ref AstExpr, expected: i64) -> bool {
+    let computed = eval_comptime_constant(expr);
+    return computed == expected;
+}
+
+// Unit test 15: Advanced local type inference
+pub fn test_sema_local_type_inference() -> bool {
+    mut env = make_local_type_env();
+    bind_local_type(inout env, "x", make_type_i64());
+    bind_local_type(inout env, "flag", make_type_bool());
+    bind_local_type(inout env, "pair", make_type_tuple(1, 1));
+
+    let lookup_x = lookup_local_type(env, "x");
+    if lookup_x.kind != 1 {
+        return false;
+    }
+
+    let lookup_pair = lookup_local_type(env, "pair");
+    if lookup_pair.kind != 4 || lookup_pair.sub_kind1 != 1 || lookup_pair.sub_kind2 != 1 {
+        return false;
+    }
+
+    // Binary add expr: x + 40
+    let lit40 = AstExpr(kind: 1, val: 40, name: "", op: 0, left: None, right: None);
+    let var_x = AstExpr(kind: 2, val: 0, name: "x", op: 0, left: None, right: None);
+    let add_expr = AstExpr(kind: 3, val: 0, name: "", op: 1, left: ref var_x, right: ref lit40);
+    let inferred_add = infer_expression_type(ref add_expr, env);
+    if inferred_add.kind != 1 {
+        return false;
+    }
+
+    // Tuple access expr: pair.0
+    let access_0 = AstExpr(kind: 5, val: 0, name: "pair", op: 0, left: None, right: None);
+    let inferred_acc = infer_expression_type(ref access_0, env);
+    if inferred_acc.kind != 1 {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit test 16: Nested Pattern Matching with guards and sub-patterns
+pub fn test_sema_nested_pattern_matching() -> bool {
+    // Encoded pair (10, 32) -> 10032
+    let target = (10 * 1000) + 32;
+
+    mut pool: List<AstExpr> = List::new();
+
+    // Arm 1: (0, _) => 100
+    let e100 = AstExpr(kind: 1, val: 100, name: "", op: 0, left: None, right: None);
+    pool.push(e100);
+    let idx100 = pool.len() - 1;
+    let pat1 = make_tuple_nested_pat(2, 0, "", 1, 0, "_", false, 0);
+
+    // Arm 2: (10, y) if 10 + y == 42 => y + 10
+    let var_y = AstExpr(kind: 2, val: 0, name: "y", op: 0, left: None, right: None);
+    let lit10 = AstExpr(kind: 1, val: 10, name: "", op: 0, left: None, right: None);
+    pool.push(var_y);
+    let y_idx = pool.len() - 1;
+    pool.push(lit10);
+    let lit10_idx = pool.len() - 1;
+
+    let sum_expr = AstExpr(kind: 3, val: 0, name: "", op: 1, left: ref pool[y_idx], right: ref pool[lit10_idx]);
+    pool.push(sum_expr);
+    let sum_idx = pool.len() - 1;
+    let pat2 = make_tuple_nested_pat(2, 10, "", 3, 0, "y", true, 42);
+
+    // Arm 3: _ => 0
+    let e0 = AstExpr(kind: 1, val: 0, name: "", op: 0, left: None, right: None);
+    pool.push(e0);
+    let idx0 = pool.len() - 1;
+    let pat3 = make_wildcard_nested_pat();
+
+    mut arms: List<AstNestedMatchArm> = List::new();
+    arms.push(AstNestedMatchArm(pat: pat1, expr: ref pool[idx100]));
+    arms.push(AstNestedMatchArm(pat: pat2, expr: ref pool[sum_idx]));
+    arms.push(AstNestedMatchArm(pat: pat3, expr: ref pool[idx0]));
+
+    let nested_match = AstNestedMatch(target_pair_val: target, arms: arms);
+    let match_res = eval_nested_pattern_match(nested_match);
+    return match_res == 42;
+}
+
+// Unit test 17: Comptime constant folding and static assertion validation
+pub fn test_sema_comptime_evaluation() -> bool {
+    let lit20 = AstExpr(kind: 1, val: 20, name: "", op: 0, left: None, right: None);
+    let lit22 = AstExpr(kind: 1, val: 22, name: "", op: 0, left: None, right: None);
+    let bin_add = AstExpr(kind: 3, val: 0, name: "", op: 1, left: ref lit20, right: ref lit22);
+
+    let comptime_expr = AstExpr(kind: 8, val: 0, name: "comptime", op: 0, left: ref bin_add, right: None);
+    let folded = eval_comptime_constant(ref comptime_expr);
+    if folded != 42 {
+        return false;
+    }
+
+    let assert_ok = eval_comptime_assert(ref comptime_expr, 42);
+    let assert_bad = eval_comptime_assert(ref comptime_expr, 100);
+    if !assert_ok || assert_bad {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
@@ -1201,7 +1498,10 @@ pub fn main() {
     let t12 = test_sema_channel_directionality_and_bounds();
     let t13 = test_sema_fiber_escape_analysis();
     let t14 = test_sema_arena_transfer_ownership();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 {
+    let t15 = test_sema_local_type_inference();
+    let t16 = test_sema_nested_pattern_matching();
+    let t17 = test_sema_comptime_evaluation();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");

@@ -122,6 +122,18 @@ pub struct AstEnum {
     variants: List<AstEnumVariant>
 }
 
+// High-level AST Comptime Block node (`comptime { ... }`)
+pub struct AstComptimeBlock {
+    statements: List<AstStmt>
+}
+
+// High-level AST Syntax Macro Definition node (`macro name($param) { ... }`)
+pub struct AstMacroDef {
+    name: String,
+    param_name: String,
+    statements: List<AstStmt>
+}
+
 // Full Program AST containing all top-level module items
 pub struct AstProgram {
     traits: List<AstTrait>,
@@ -131,6 +143,8 @@ pub struct AstProgram {
     arenas: List<AstArenaDecl>,
     constants: List<AstConst>,
     enums: List<AstEnum>,
+    comptime_blocks: List<AstComptimeBlock>,
+    macros: List<AstMacroDef>,
     functions: List<AstFunction>
 }
 
@@ -175,9 +189,30 @@ pub fn parse_primary(inout cursor: i64, tokens: List<Token>, inout pool: List<As
             }
         }
 
-        // Variable Identifier with possible tuple member access: `var.0`, `var.1`
-        cursor = cursor + 1;
+        // Variable Identifier with possible macro invocation `name!(arg)` or tuple member access: `var.0`, `var.1`
         let var_name = tok.lexeme;
+        cursor = cursor + 1;
+        if cursor < tokens.len() && tokens[cursor].kind == 50 {
+            // Macro invocation: ident!(arg)
+            cursor = cursor + 1; // Consume '!'
+            if cursor < tokens.len() && tokens[cursor].kind == 30 {
+                cursor = cursor + 1; // Consume '('
+            }
+            let macro_arg = parse_additive(inout cursor, tokens, inout pool);
+            if cursor < tokens.len() && tokens[cursor].kind == 31 {
+                cursor = cursor + 1; // Consume ')'
+            }
+            pool.push(macro_arg);
+            let arg_idx = pool.len() - 1;
+            return AstExpr(
+                kind: 7, // Macro Invocation
+                val: 0,
+                name: var_name,
+                op: 0,
+                left: ref pool[arg_idx],
+                right: None
+            );
+        }
         if cursor < tokens.len() && tokens[cursor].kind == 42 {
             cursor = cursor + 1; // Consume '.'
             if cursor < tokens.len() && tokens[cursor].kind == 11 {
@@ -194,6 +229,31 @@ pub fn parse_primary(inout cursor: i64, tokens: List<Token>, inout pool: List<As
             }
         }
         return AstExpr(kind: 2, val: 0, name: var_name, op: 0, left: None, right: None);
+    }
+    if tok.kind == 52 {
+        // Comptime expression: comptime <expr>
+        cursor = cursor + 1; // Consume 'comptime'
+        let inner_expr = parse_additive(inout cursor, tokens, inout pool);
+        pool.push(inner_expr);
+        let c_idx = pool.len() - 1;
+        return AstExpr(
+            kind: 8, // Comptime Expression
+            val: 0,
+            name: "comptime",
+            op: 0,
+            left: ref pool[c_idx],
+            right: None
+        );
+    }
+    if tok.kind == 53 {
+        // Macro substituted identifier: $var
+        cursor = cursor + 1; // Consume '$'
+        mut subst_name = "";
+        if cursor < tokens.len() && tokens[cursor].kind == 10 {
+            subst_name = tokens[cursor].lexeme;
+            cursor = cursor + 1;
+        }
+        return AstExpr(kind: 9, val: 0, name: "$" + subst_name, op: 0, left: None, right: None);
     }
     if tok.kind == 30 {
         // Left parenthesis '(' -> check for tuple `(e1, e2)` or sub-expression `(e)`
@@ -792,6 +852,73 @@ pub fn parse_enum(inout cursor: i64, tokens: List<Token>) -> AstEnum {
     return AstEnum(is_pub: is_pub, name: name, variants: variants);
 }
 
+// High-level parser: comptime block (`comptime { let limit = 100; }`)
+pub fn parse_comptime_block(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstComptimeBlock {
+    cursor = cursor + 1; // Consume 'comptime'
+    if cursor < tokens.len() && tokens[cursor].kind == 32 {
+        cursor = cursor + 1; // Consume '{'
+    }
+
+    mut stmts: List<AstStmt> = List::new();
+    mut parsing = true;
+    while parsing {
+        if cursor >= tokens.len() {
+            parsing = false;
+        } else if tokens[cursor].kind == 33 {
+            cursor = cursor + 1; // Consume '}'
+            parsing = false;
+        } else {
+            let stmt = parse_statement(inout cursor, tokens, inout pool);
+            stmts.push(stmt);
+        }
+    }
+
+    return AstComptimeBlock(statements: stmts);
+}
+
+// High-level parser: syntax macro definition (`macro name($param) { return $param; }`)
+pub fn parse_macro_def(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstMacroDef {
+    cursor = cursor + 1; // Consume 'macro'
+    mut m_name = "";
+    if cursor < tokens.len() && tokens[cursor].kind == 10 {
+        m_name = tokens[cursor].lexeme;
+        cursor = cursor + 1; // Consume macro name
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 30 {
+        cursor = cursor + 1; // Consume '('
+    }
+    mut p_name = "";
+    if cursor < tokens.len() && tokens[cursor].kind == 53 {
+        cursor = cursor + 1; // Consume '$'
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 10 {
+        p_name = tokens[cursor].lexeme;
+        cursor = cursor + 1; // Consume parameter name
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 31 {
+        cursor = cursor + 1; // Consume ')'
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 32 {
+        cursor = cursor + 1; // Consume '{'
+    }
+
+    mut stmts: List<AstStmt> = List::new();
+    mut parsing = true;
+    while parsing {
+        if cursor >= tokens.len() {
+            parsing = false;
+        } else if tokens[cursor].kind == 33 {
+            cursor = cursor + 1; // Consume '}'
+            parsing = false;
+        } else {
+            let stmt = parse_statement(inout cursor, tokens, inout pool);
+            stmts.push(stmt);
+        }
+    }
+
+    return AstMacroDef(name: m_name, param_name: p_name, statements: stmts);
+}
+
 // High-level parser: full module program item collection
 pub fn parse_program(tokens: List<Token>, inout pool: List<AstExpr>) -> AstProgram {
     mut traits: List<AstTrait> = List::new();
@@ -801,6 +928,8 @@ pub fn parse_program(tokens: List<Token>, inout pool: List<AstExpr>) -> AstProgr
     mut arenas: List<AstArenaDecl> = List::new();
     mut constants: List<AstConst> = List::new();
     mut enums: List<AstEnum> = List::new();
+    mut comptime_blocks: List<AstComptimeBlock> = List::new();
+    mut macros: List<AstMacroDef> = List::new();
     mut functions: List<AstFunction> = List::new();
 
     mut cursor: i64 = 0;
@@ -856,6 +985,12 @@ pub fn parse_program(tokens: List<Token>, inout pool: List<AstExpr>) -> AstProgr
         } else if tok.kind == 8 {
             let st = parse_struct(inout cursor, tokens);
             structs.push(st);
+        } else if tok.kind == 51 {
+            let md = parse_macro_def(inout cursor, tokens, inout pool);
+            macros.push(md);
+        } else if tok.kind == 52 {
+            let cb = parse_comptime_block(inout cursor, tokens, inout pool);
+            comptime_blocks.push(cb);
         } else if tok.kind == 1 {
             let f = parse_function(inout cursor, tokens, inout pool);
             functions.push(f);
@@ -872,6 +1007,8 @@ pub fn parse_program(tokens: List<Token>, inout pool: List<AstExpr>) -> AstProgr
         arenas: arenas,
         constants: constants,
         enums: enums,
+        comptime_blocks: comptime_blocks,
+        macros: macros,
         functions: functions
     );
 }
@@ -1271,6 +1408,75 @@ pub fn test_parser_enum_declaration() -> bool {
     return en.variants[3].name == "Plus" && en.variants[3].discriminant == 3;
 }
 
+// Unit test 14: Comptime directive parsing `comptime { let limit = 100; }`
+pub fn test_parser_comptime_directives() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 52, value: 0, lexeme: "comptime"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 2, value: 0, lexeme: "let"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "limit"));
+    tokens.push(Token(kind: 24, value: 0, lexeme: "="));
+    tokens.push(Token(kind: 11, value: 100, lexeme: "100"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let cb = parse_comptime_block(inout cur, tokens, inout pool);
+    if cb.statements.len() != 1 {
+        return false;
+    }
+    let st = cb.statements[0];
+    if st.target_var != "limit" {
+        return false;
+    }
+    let val = st.expr?.val ?? 0;
+    return val == 100;
+}
+
+// Unit test 15: Syntax macro definition and invocation parsing `macro def_calc($val) { ... } def_calc!(42);`
+pub fn test_parser_syntax_macros() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 51, value: 0, lexeme: "macro"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "def_calc"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 53, value: 0, lexeme: "$"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "val"));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 4, value: 0, lexeme: "return"));
+    tokens.push(Token(kind: 53, value: 0, lexeme: "$"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "val"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let md = parse_macro_def(inout cur, tokens, inout pool);
+    if md.name != "def_calc" || md.param_name != "val" {
+        return false;
+    }
+    if md.statements.len() != 1 {
+        return false;
+    }
+
+    // Test macro invocation parsing
+    mut inv_tokens: List<Token> = List::new();
+    inv_tokens.push(Token(kind: 10, value: 0, lexeme: "def_calc"));
+    inv_tokens.push(Token(kind: 50, value: 0, lexeme: "!"));
+    inv_tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    inv_tokens.push(Token(kind: 11, value: 42, lexeme: "42"));
+    inv_tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+
+    mut cur_inv: i64 = 0;
+    let inv_expr = parse_primary(inout cur_inv, inv_tokens, inout pool);
+    if inv_expr.kind != 7 || inv_expr.name != "def_calc" {
+        return false;
+    }
+    let arg_val = inv_expr.left?.val ?? 0;
+    return arg_val == 42;
+}
+
 pub fn main() {
     println("=== IFA Compiler Parser Module ===");
     let t1 = test_parser_ast_building();
@@ -1286,7 +1492,9 @@ pub fn main() {
     let t11 = test_parser_arena_declaration();
     let t12 = test_parser_const_declaration();
     let t13 = test_parser_enum_declaration();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 {
+    let t14 = test_parser_comptime_directives();
+    let t15 = test_parser_syntax_macros();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 {
         println("Parser validation tests: ALL PASSED");
     } else {
         println("Parser validation tests: FAILED");

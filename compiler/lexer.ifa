@@ -368,6 +368,76 @@ pub fn tokenize_enum_program() -> List<Token> {
     return tokens;
 }
 
+// Tokenize comptime directive program:
+// `comptime { let limit = 100; } fn eval_limit() -> i64 { return comptime 100; }`
+pub fn tokenize_comptime_directive_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    // 1. comptime block
+    advance_token(inout tokens, 52, 0, "comptime");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 2, 0, "let");
+    advance_token(inout tokens, 10, 0, "limit");
+    advance_token(inout tokens, 24, 0, "=");
+    advance_token(inout tokens, 11, 100, "100");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+
+    // 2. fn eval_limit() -> i64 { return comptime 100; }
+    advance_token(inout tokens, 1, 0, "fn");
+    advance_token(inout tokens, 10, 0, "eval_limit");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 36, 0, "->");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 4, 0, "return");
+    advance_token(inout tokens, 52, 0, "comptime");
+    advance_token(inout tokens, 11, 100, "100");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+
+    return tokens;
+}
+
+// Tokenize syntax macro definition and invocation program:
+// `macro def_calc($val) { fn calc() -> i64 { return $val; } } def_calc!(42);`
+pub fn tokenize_syntax_macro_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    // 1. macro def_calc($val) { fn calc() -> i64 { return $val; } }
+    advance_token(inout tokens, 51, 0, "macro");
+    advance_token(inout tokens, 10, 0, "def_calc");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 53, 0, "$");
+    advance_token(inout tokens, 10, 0, "val");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 1, 0, "fn");
+    advance_token(inout tokens, 10, 0, "calc");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 36, 0, "->");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 4, 0, "return");
+    advance_token(inout tokens, 53, 0, "$");
+    advance_token(inout tokens, 10, 0, "val");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+    advance_token(inout tokens, 33, 0, "}");
+
+    // 2. def_calc!(42);
+    advance_token(inout tokens, 10, 0, "def_calc");
+    advance_token(inout tokens, 50, 0, "!");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 11, 42, "42");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 35, 0, ";");
+
+    return tokens;
+}
+
 // Unit test: Token stream verification and list properties
 pub fn test_lexer_stream() -> bool {
     let tokens = tokenize_sample_program();
@@ -477,6 +547,44 @@ pub fn test_lexer_enum_declaration() -> bool {
     return true;
 }
 
+// Unit test: Comptime directive tokenization validation
+pub fn test_lexer_comptime_directives() -> bool {
+    let tokens = tokenize_comptime_directive_program();
+    if tokens.len() != 20 {
+        return false;
+    }
+    // index 0: comptime (52), index 1: { (32)
+    if tokens[0].kind != 52 || tokens[0].lexeme != "comptime" || tokens[1].kind != 32 {
+        return false;
+    }
+    // index 5: 100 (11)
+    if tokens[5].kind != 11 || tokens[5].value != 100 {
+        return false;
+    }
+    // index 16: comptime (52), index 17: 100 (11)
+    if tokens[16].kind != 52 || tokens[17].value != 100 {
+        return false;
+    }
+    return true;
+}
+
+// Unit test: Syntax macro tokenization validation
+pub fn test_lexer_syntax_macros() -> bool {
+    let tokens = tokenize_syntax_macro_program();
+    if tokens.len() != 26 {
+        return false;
+    }
+    // index 0: macro (51), index 1: def_calc (10), index 3: $ (53), index 4: val (10)
+    if tokens[0].kind != 51 || tokens[1].lexeme != "def_calc" || tokens[3].kind != 53 || tokens[4].lexeme != "val" {
+        return false;
+    }
+    // invocation: index 20: def_calc (10), index 21: ! (50), index 23: 42 (11)
+    if tokens[20].lexeme != "def_calc" || tokens[21].kind != 50 || tokens[23].value != 42 {
+        return false;
+    }
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Lexer Module ===");
     let tokens = tokenize_sample_program();
@@ -488,7 +596,9 @@ pub fn main() {
     let t_arena = test_lexer_arena();
     let t_const = test_lexer_const_declaration();
     let t_enum = test_lexer_enum_declaration();
-    if t_ok && t_lut && t_alias && t_tuple && t_arena && t_const && t_enum {
+    let t_comptime = test_lexer_comptime_directives();
+    let t_macro = test_lexer_syntax_macros();
+    if t_ok && t_lut && t_alias && t_tuple && t_arena && t_const && t_enum && t_comptime && t_macro {
         println("Lexer stream test: OK");
     } else {
         println("Lexer stream test: FAILED");

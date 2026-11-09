@@ -131,6 +131,16 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_lexer_comptime_directives ... ok"),
+        "Modular lexer comptime directives test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_lexer_syntax_macros ... ok"),
+        "Modular lexer syntax macros test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_parser_ast_building ... ok"),
         "Modular parser tests missing from output:\n{}",
         stdout
@@ -183,6 +193,16 @@ fn test_modular_compiler_unit_tests() {
     assert!(
         stdout.contains("test test_parser_program_high_level_items ... ok"),
         "Modular parser program test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_comptime_directives ... ok"),
+        "Modular parser comptime directives test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_syntax_macros ... ok"),
+        "Modular parser syntax macros test missing from output:\n{}",
         stdout
     );
     assert!(
@@ -351,13 +371,28 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_sema_local_type_inference ... ok"),
+        "Modular sema local type inference test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_nested_pattern_matching ... ok"),
+        "Modular sema nested pattern matching test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_comptime_evaluation ... ok"),
+        "Modular sema comptime evaluation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_selfhost_modular_pipeline ... ok"),
         "Modular selfhost pipeline test missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("123 passed; 0 failed"),
-        "Expected 123 passed unit tests, got:\n{}",
+        stdout.contains("137 passed; 0 failed"),
+        "Expected 137 passed unit tests, got:\n{}",
         stdout
     );
 }

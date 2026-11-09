@@ -114,7 +114,14 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     let sema_chan_dir_ok = sema::test_sema_channel_directionality_and_bounds();
     let sema_fiber_esc_ok = sema::test_sema_fiber_escape_analysis();
     let sema_arena_xfer_ok = sema::test_sema_arena_transfer_ownership();
-    if !sema_const_ok || !sema_enum_ok || !sema_global_ok || !sema_chan_tc_ok || !sema_chan_dir_ok || !sema_fiber_esc_ok || !sema_arena_xfer_ok {
+    let sema_infer_ok = sema::test_sema_local_type_inference();
+    let sema_nested_ok = sema::test_sema_nested_pattern_matching();
+    let sema_comptime_ok = sema::test_sema_comptime_evaluation();
+    let parser_comptime_ok = parser::test_parser_comptime_directives();
+    let parser_macro_ok = parser::test_parser_syntax_macros();
+    let lexer_comptime_ok = lexer::test_lexer_comptime_directives();
+    let lexer_macro_ok = lexer::test_lexer_syntax_macros();
+    if !sema_const_ok || !sema_enum_ok || !sema_global_ok || !sema_chan_tc_ok || !sema_chan_dir_ok || !sema_fiber_esc_ok || !sema_arena_xfer_ok || !sema_infer_ok || !sema_nested_ok || !sema_comptime_ok || !parser_comptime_ok || !parser_macro_ok || !lexer_comptime_ok || !lexer_macro_ok {
         return false;
     }
 
