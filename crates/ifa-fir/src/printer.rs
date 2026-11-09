@@ -191,6 +191,31 @@ impl<'a> FirPrinter<'a> {
                 };
                 writeln!(self.output, "// [pooling: {}]", pool_str)?;
             }
+            if hint.is_depthwise_conv {
+                self.indent();
+                writeln!(
+                    self.output,
+                    "// [depthwise_conv: ch={}]",
+                    hint.depthwise_channels.unwrap_or(1)
+                )?;
+            }
+            if hint.is_pointwise_conv {
+                self.indent();
+                let (in_c, out_c) = hint.pointwise_channels.unwrap_or((1, 1));
+                writeln!(
+                    self.output,
+                    "// [pointwise_conv: in={}, out={}]",
+                    in_c, out_c
+                )?;
+            }
+            if hint.is_batch_norm {
+                self.indent();
+                writeln!(
+                    self.output,
+                    "// [batch_norm: ch={}]",
+                    hint.batch_norm_channels.unwrap_or(1)
+                )?;
+            }
         }
         for inst in &block.instructions {
             self.indent();

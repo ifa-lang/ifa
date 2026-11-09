@@ -3179,3 +3179,508 @@ pub unsafe extern "C" fn ifa_simd_multi_arena_avgpool2d_i64(
         }
     }
 }
+
+/// Multi-arena 2D depthwise convolution kernel (f32).
+///
+/// # Safety
+///
+/// `dst`, `img`, and `weights` must point to valid allocations for their channel and spatial bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_depthwise_conv2d_f32(
+    dst: *mut f32,
+    img: *const f32,
+    weights: *const f32,
+    bias: *const f32,
+    channels: i64,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    kernel_h: i64,
+    kernel_w: i64,
+    img_h: i64,
+    img_w: i64,
+    activation: i32,
+) {
+    if dst.is_null()
+        || img.is_null()
+        || weights.is_null()
+        || channels <= 0
+        || h_out <= 0
+        || w_out <= 0
+        || kernel_h <= 0
+        || kernel_w <= 0
+        || img_h <= 0
+        || img_w <= 0
+    {
+        return;
+    }
+    let in_area = img_h * img_w;
+    let kernel_area = kernel_h * kernel_w;
+    let out_area = h_out * w_out;
+
+    for c in 0..channels {
+        let c_img_off = c * in_area;
+        let c_w_off = c * kernel_area;
+        let c_dst_off = c * out_area;
+        let b = if !bias.is_null() {
+            *bias.offset(c as isize)
+        } else {
+            0.0f32
+        };
+
+        for y in 0..h_out {
+            let y_base = (y * stride_y) * img_w;
+            let y_out_off = y * w_out;
+            for x in 0..w_out {
+                let x_base = x * stride_x;
+                let out_idx = c_dst_off + y_out_off + x;
+                let mut accum = 0.0f32;
+
+                for ky in 0..kernel_h {
+                    let in_row = y_base + ky * img_w;
+                    let w_row = ky * kernel_w;
+                    for kx in 0..kernel_w {
+                        let in_idx = c_img_off + in_row + x_base + kx;
+                        let w_idx = c_w_off + w_row + kx;
+                        accum += *img.offset(in_idx as isize) * *weights.offset(w_idx as isize);
+                    }
+                }
+                accum += b;
+                if activation == 1 && accum < 0.0f32 {
+                    accum = 0.0f32;
+                }
+                *dst.offset(out_idx as isize) = accum;
+            }
+        }
+    }
+}
+
+/// Multi-arena 2D depthwise convolution kernel (f64).
+///
+/// # Safety
+///
+/// `dst`, `img`, and `weights` must point to valid allocations for their channel and spatial bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_depthwise_conv2d_f64(
+    dst: *mut f64,
+    img: *const f64,
+    weights: *const f64,
+    bias: *const f64,
+    channels: i64,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    kernel_h: i64,
+    kernel_w: i64,
+    img_h: i64,
+    img_w: i64,
+    activation: i32,
+) {
+    if dst.is_null()
+        || img.is_null()
+        || weights.is_null()
+        || channels <= 0
+        || h_out <= 0
+        || w_out <= 0
+        || kernel_h <= 0
+        || kernel_w <= 0
+        || img_h <= 0
+        || img_w <= 0
+    {
+        return;
+    }
+    let in_area = img_h * img_w;
+    let kernel_area = kernel_h * kernel_w;
+    let out_area = h_out * w_out;
+
+    for c in 0..channels {
+        let c_img_off = c * in_area;
+        let c_w_off = c * kernel_area;
+        let c_dst_off = c * out_area;
+        let b = if !bias.is_null() {
+            *bias.offset(c as isize)
+        } else {
+            0.0f64
+        };
+
+        for y in 0..h_out {
+            let y_base = (y * stride_y) * img_w;
+            let y_out_off = y * w_out;
+            for x in 0..w_out {
+                let x_base = x * stride_x;
+                let out_idx = c_dst_off + y_out_off + x;
+                let mut accum = 0.0f64;
+
+                for ky in 0..kernel_h {
+                    let in_row = y_base + ky * img_w;
+                    let w_row = ky * kernel_w;
+                    for kx in 0..kernel_w {
+                        let in_idx = c_img_off + in_row + x_base + kx;
+                        let w_idx = c_w_off + w_row + kx;
+                        accum += *img.offset(in_idx as isize) * *weights.offset(w_idx as isize);
+                    }
+                }
+                accum += b;
+                if activation == 1 && accum < 0.0f64 {
+                    accum = 0.0f64;
+                }
+                *dst.offset(out_idx as isize) = accum;
+            }
+        }
+    }
+}
+
+/// Multi-arena 2D depthwise convolution kernel (i64).
+///
+/// # Safety
+///
+/// `dst`, `img`, and `weights` must point to valid allocations for their channel and spatial bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_depthwise_conv2d_i64(
+    dst: *mut i64,
+    img: *const i64,
+    weights: *const i64,
+    bias: *const i64,
+    channels: i64,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    kernel_h: i64,
+    kernel_w: i64,
+    img_h: i64,
+    img_w: i64,
+    activation: i32,
+) {
+    if dst.is_null()
+        || img.is_null()
+        || weights.is_null()
+        || channels <= 0
+        || h_out <= 0
+        || w_out <= 0
+        || kernel_h <= 0
+        || kernel_w <= 0
+        || img_h <= 0
+        || img_w <= 0
+    {
+        return;
+    }
+    let in_area = img_h * img_w;
+    let kernel_area = kernel_h * kernel_w;
+    let out_area = h_out * w_out;
+
+    for c in 0..channels {
+        let c_img_off = c * in_area;
+        let c_w_off = c * kernel_area;
+        let c_dst_off = c * out_area;
+        let b = if !bias.is_null() {
+            *bias.offset(c as isize)
+        } else {
+            0i64
+        };
+
+        for y in 0..h_out {
+            let y_base = (y * stride_y) * img_w;
+            let y_out_off = y * w_out;
+            for x in 0..w_out {
+                let x_base = x * stride_x;
+                let out_idx = c_dst_off + y_out_off + x;
+                let mut accum: i64 = 0;
+
+                for ky in 0..kernel_h {
+                    let in_row = y_base + ky * img_w;
+                    let w_row = ky * kernel_w;
+                    for kx in 0..kernel_w {
+                        let in_idx = c_img_off + in_row + x_base + kx;
+                        let w_idx = c_w_off + w_row + kx;
+                        accum += *img.offset(in_idx as isize) * *weights.offset(w_idx as isize);
+                    }
+                }
+                accum += b;
+                if activation == 1 && accum < 0 {
+                    accum = 0;
+                }
+                *dst.offset(out_idx as isize) = accum;
+            }
+        }
+    }
+}
+
+/// Multi-arena 2D pointwise (1x1) convolution kernel (f32).
+///
+/// # Safety
+///
+/// `dst`, `img`, and `weights` must point to valid allocations for their channel and spatial bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_pointwise_conv2d_f32(
+    dst: *mut f32,
+    img: *const f32,
+    weights: *const f32,
+    bias: *const f32,
+    c_in: i64,
+    c_out: i64,
+    spatial_size: i64,
+    activation: i32,
+) {
+    if dst.is_null()
+        || img.is_null()
+        || weights.is_null()
+        || c_in <= 0
+        || c_out <= 0
+        || spatial_size <= 0
+    {
+        return;
+    }
+
+    for co in 0..c_out {
+        let w_co_off = co * c_in;
+        let dst_co_off = co * spatial_size;
+        let b = if !bias.is_null() {
+            *bias.offset(co as isize)
+        } else {
+            0.0f32
+        };
+
+        for p in 0..spatial_size {
+            let out_idx = dst_co_off + p;
+            let mut accum = 0.0f32;
+
+            for ci in 0..c_in {
+                let in_idx = ci * spatial_size + p;
+                let w_idx = w_co_off + ci;
+                accum += *img.offset(in_idx as isize) * *weights.offset(w_idx as isize);
+            }
+            accum += b;
+            if activation == 1 && accum < 0.0f32 {
+                accum = 0.0f32;
+            }
+            *dst.offset(out_idx as isize) = accum;
+        }
+    }
+}
+
+/// Multi-arena 2D pointwise (1x1) convolution kernel (f64).
+///
+/// # Safety
+///
+/// `dst`, `img`, and `weights` must point to valid allocations for their channel and spatial bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_pointwise_conv2d_f64(
+    dst: *mut f64,
+    img: *const f64,
+    weights: *const f64,
+    bias: *const f64,
+    c_in: i64,
+    c_out: i64,
+    spatial_size: i64,
+    activation: i32,
+) {
+    if dst.is_null()
+        || img.is_null()
+        || weights.is_null()
+        || c_in <= 0
+        || c_out <= 0
+        || spatial_size <= 0
+    {
+        return;
+    }
+
+    for co in 0..c_out {
+        let w_co_off = co * c_in;
+        let dst_co_off = co * spatial_size;
+        let b = if !bias.is_null() {
+            *bias.offset(co as isize)
+        } else {
+            0.0f64
+        };
+
+        for p in 0..spatial_size {
+            let out_idx = dst_co_off + p;
+            let mut accum = 0.0f64;
+
+            for ci in 0..c_in {
+                let in_idx = ci * spatial_size + p;
+                let w_idx = w_co_off + ci;
+                accum += *img.offset(in_idx as isize) * *weights.offset(w_idx as isize);
+            }
+            accum += b;
+            if activation == 1 && accum < 0.0f64 {
+                accum = 0.0f64;
+            }
+            *dst.offset(out_idx as isize) = accum;
+        }
+    }
+}
+
+/// Multi-arena 2D pointwise (1x1) convolution kernel (i64).
+///
+/// # Safety
+///
+/// `dst`, `img`, and `weights` must point to valid allocations for their channel and spatial bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_pointwise_conv2d_i64(
+    dst: *mut i64,
+    img: *const i64,
+    weights: *const i64,
+    bias: *const i64,
+    c_in: i64,
+    c_out: i64,
+    spatial_size: i64,
+    activation: i32,
+) {
+    if dst.is_null()
+        || img.is_null()
+        || weights.is_null()
+        || c_in <= 0
+        || c_out <= 0
+        || spatial_size <= 0
+    {
+        return;
+    }
+
+    for co in 0..c_out {
+        let w_co_off = co * c_in;
+        let dst_co_off = co * spatial_size;
+        let b = if !bias.is_null() {
+            *bias.offset(co as isize)
+        } else {
+            0i64
+        };
+
+        for p in 0..spatial_size {
+            let out_idx = dst_co_off + p;
+            let mut accum: i64 = 0;
+
+            for ci in 0..c_in {
+                let in_idx = ci * spatial_size + p;
+                let w_idx = w_co_off + ci;
+                accum += *img.offset(in_idx as isize) * *weights.offset(w_idx as isize);
+            }
+            accum += b;
+            if activation == 1 && accum < 0 {
+                accum = 0;
+            }
+            *dst.offset(out_idx as isize) = accum;
+        }
+    }
+}
+
+/// Multi-arena 2D batch normalization kernel (f32).
+///
+/// # Safety
+///
+/// `dst`, `src`, `mean`, and `var` must point to valid allocations for their channel bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_batch_norm2d_f32(
+    dst: *mut f32,
+    src: *const f32,
+    gamma: *const f32,
+    beta: *const f32,
+    mean: *const f32,
+    var: *const f32,
+    channels: i64,
+    spatial_size: i64,
+    epsilon: f32,
+    activation: i32,
+) {
+    if dst.is_null()
+        || src.is_null()
+        || mean.is_null()
+        || var.is_null()
+        || channels <= 0
+        || spatial_size <= 0
+    {
+        return;
+    }
+
+    for c in 0..channels {
+        let m = *mean.offset(c as isize);
+        let v = *var.offset(c as isize);
+        let g = if !gamma.is_null() {
+            *gamma.offset(c as isize)
+        } else {
+            1.0f32
+        };
+        let b = if !beta.is_null() {
+            *beta.offset(c as isize)
+        } else {
+            0.0f32
+        };
+
+        let inv_std = 1.0f32 / (v + epsilon).sqrt();
+        let scale = g * inv_std;
+        let shift = b - (m * scale);
+        let c_base = c * spatial_size;
+
+        for i in 0..spatial_size {
+            let idx = c_base + i;
+            let x = *src.offset(idx as isize);
+            let mut y = x * scale + shift;
+            if activation == 1 && y < 0.0f32 {
+                y = 0.0f32;
+            }
+            *dst.offset(idx as isize) = y;
+        }
+    }
+}
+
+/// Multi-arena 2D batch normalization kernel (f64).
+///
+/// # Safety
+///
+/// `dst`, `src`, `mean`, and `var` must point to valid allocations for their channel bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_batch_norm2d_f64(
+    dst: *mut f64,
+    src: *const f64,
+    gamma: *const f64,
+    beta: *const f64,
+    mean: *const f64,
+    var: *const f64,
+    channels: i64,
+    spatial_size: i64,
+    epsilon: f64,
+    activation: i32,
+) {
+    if dst.is_null()
+        || src.is_null()
+        || mean.is_null()
+        || var.is_null()
+        || channels <= 0
+        || spatial_size <= 0
+    {
+        return;
+    }
+
+    for c in 0..channels {
+        let m = *mean.offset(c as isize);
+        let v = *var.offset(c as isize);
+        let g = if !gamma.is_null() {
+            *gamma.offset(c as isize)
+        } else {
+            1.0f64
+        };
+        let b = if !beta.is_null() {
+            *beta.offset(c as isize)
+        } else {
+            0.0f64
+        };
+
+        let inv_std = 1.0f64 / (v + epsilon).sqrt();
+        let scale = g * inv_std;
+        let shift = b - (m * scale);
+        let c_base = c * spatial_size;
+
+        for i in 0..spatial_size {
+            let idx = c_base + i;
+            let x = *src.offset(idx as isize);
+            let mut y = x * scale + shift;
+            if activation == 1 && y < 0.0f64 {
+                y = 0.0f64;
+            }
+            *dst.offset(idx as isize) = y;
+        }
+    }
+}

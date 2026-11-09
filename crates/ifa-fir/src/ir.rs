@@ -578,6 +578,12 @@ pub struct LoopVectorHint {
     pub pooling_kind: Option<PoolingKind>,
     pub pooling_window: Option<(u32, u32)>,
     pub pooling_strides: Option<(u32, u32)>,
+    pub is_depthwise_conv: bool,
+    pub depthwise_channels: Option<u32>,
+    pub is_pointwise_conv: bool,
+    pub pointwise_channels: Option<(u32, u32)>,
+    pub is_batch_norm: bool,
+    pub batch_norm_channels: Option<u32>,
 }
 
 impl LoopVectorHint {
@@ -624,6 +630,12 @@ impl LoopVectorHint {
             pooling_kind: None,
             pooling_window: None,
             pooling_strides: None,
+            is_depthwise_conv: false,
+            depthwise_channels: None,
+            is_pointwise_conv: false,
+            pointwise_channels: None,
+            is_batch_norm: false,
+            batch_norm_channels: None,
         }
     }
 
@@ -698,6 +710,58 @@ impl LoopVectorHint {
         self.pooling_strides = Some(strides);
         self.disjoint_slices = true;
         self.unroll_and_jam = true;
+        self
+    }
+
+    /// Mark the loop as a multi-arena depthwise 2D convolution kernel.
+    pub fn with_depthwise_conv(
+        mut self,
+        channels: u32,
+        strides: (u32, u32),
+        has_bias: bool,
+        has_activation: bool,
+    ) -> Self {
+        self.is_depthwise_conv = true;
+        self.depthwise_channels = Some(channels);
+        self.conv_strides = Some((strides.0, strides.1, 1));
+        self.is_strided_conv2d = true;
+        self.is_convolution = true;
+        self.conv_has_bias = has_bias;
+        self.conv_has_activation = has_activation;
+        self.is_elementwise_fused = has_bias || has_activation;
+        self.unroll_and_jam = true;
+        self.disjoint_slices = true;
+        self
+    }
+
+    /// Mark the loop as a multi-arena pointwise (1x1) 2D convolution kernel.
+    pub fn with_pointwise_conv(
+        mut self,
+        in_channels: u32,
+        out_channels: u32,
+        has_bias: bool,
+        has_activation: bool,
+    ) -> Self {
+        self.is_pointwise_conv = true;
+        self.pointwise_channels = Some((in_channels, out_channels));
+        self.is_strided_conv2d = true;
+        self.is_convolution = true;
+        self.conv_has_bias = has_bias;
+        self.conv_has_activation = has_activation;
+        self.is_elementwise_fused = has_bias || has_activation;
+        self.unroll_and_jam = true;
+        self.disjoint_slices = true;
+        self
+    }
+
+    /// Mark the loop as a multi-arena 2D batch normalization kernel.
+    pub fn with_batch_norm(mut self, channels: u32, has_activation: bool) -> Self {
+        self.is_batch_norm = true;
+        self.batch_norm_channels = Some(channels);
+        self.conv_has_activation = has_activation;
+        self.is_elementwise_fused = has_activation;
+        self.unroll_and_jam = true;
+        self.disjoint_slices = true;
         self
     }
 

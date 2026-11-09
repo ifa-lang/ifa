@@ -1,6 +1,7 @@
 use ifa_fir::{
     compile_to_fir, format_function, BasicBlock, BinaryOp, BlockId, ConstantValue, FirFunction,
-    FirParam, FirType, Instruction, ParamMode, Terminator, ValueExpr, ValueId, VectorizePass,
+    FirParam, FirType, Instruction, LoopVectorHint, ParamMode, Terminator, ValueExpr, ValueId,
+    VectorizePass,
 };
 use ifa_lexer::tokenize;
 use ifa_parser::parse;
@@ -2376,6 +2377,301 @@ fn test_spatial_max_and_avg_pooling_vectorization_and_gen_check_elision() {
     assert!(
         stats.nested_gen_checks_eliminated >= 1,
         "Generational checks in spatial pooling loops must be eliminated: {:?}",
+        stats
+    );
+}
+
+#[test]
+fn test_depthwise_conv2d_vectorization_and_gen_check_elision() {
+    let src = r#"
+        pub strict fn depthwise_conv(
+            inout out: Slice<f32>,
+            in_img: Slice<f32>,
+            weights: Slice<f32>,
+            bias: Slice<f32>,
+            channels: i64,
+            h_out: i64,
+            w_out: i64,
+            kernel_size: i64,
+            img_w: i64
+        ) {
+            let mut c: i64 = 0;
+            while c < channels {
+                let mut y: i64 = 0;
+                while y < h_out {
+                    let mut x: i64 = 0;
+                    while x < w_out {
+                        let mut ky: i64 = 0;
+                        while ky < kernel_size {
+                            let mut kx: i64 = 0;
+                            while kx < kernel_size {
+                                let in_idx = (y + ky) * img_w + (x + kx);
+                                let w_idx = ky * kernel_size + kx;
+                                let out_idx = y * w_out + x;
+                                out[out_idx] = out[out_idx] + in_img[in_idx] * weights[w_idx];
+                                kx = kx + 1;
+                            }
+                            ky = ky + 1;
+                        }
+                        x = x + 1;
+                    }
+                    y = y + 1;
+                }
+                c = c + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("depthwise_conv.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut func = module.functions[0].clone();
+
+    // Attach depthwise convolution hint to loop blocks
+    for b in &mut func.blocks {
+        b.set_vector_hint(LoopVectorHint::new(8, 8, true).with_depthwise_conv(
+            4,
+            (1, 1),
+            true,
+            true,
+        ));
+    }
+
+    let inner_block = func
+        .blocks
+        .iter_mut()
+        .find(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(
+                    i.expr,
+                    ValueExpr::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                )
+            })
+        })
+        .unwrap();
+
+    let p_img = func.params[1].val;
+    inner_block.instructions.insert(
+        0,
+        Instruction::new(
+            None,
+            ValueExpr::GenCheck {
+                ref_val: p_img,
+                redundant: false,
+            },
+            Span::DUMMY,
+        ),
+    );
+
+    let mut pass = VectorizePass::new();
+    pass.run_on_function(&mut func);
+    let stats = pass.stats();
+
+    assert!(
+        stats.depthwise_conv_vectorized >= 1,
+        "Depthwise convolution must be recognized: {:?}",
+        stats
+    );
+    assert!(
+        stats.nested_gen_checks_eliminated >= 1,
+        "Generational checks in depthwise convolution loops must be eliminated: {:?}",
+        stats
+    );
+}
+
+#[test]
+fn test_pointwise_conv2d_vectorization_and_gen_check_elision() {
+    let src = r#"
+        pub strict fn pointwise_conv(
+            inout out: Slice<f32>,
+            in_img: Slice<f32>,
+            weights: Slice<f32>,
+            bias: Slice<f32>,
+            c_in: i64,
+            c_out: i64,
+            spatial: i64
+        ) {
+            let mut co: i64 = 0;
+            while co < c_out {
+                let mut p: i64 = 0;
+                while p < spatial {
+                    let mut ci: i64 = 0;
+                    while ci < c_in {
+                        let in_idx = ci * spatial + p;
+                        let w_idx = co * c_in + ci;
+                        let out_idx = co * spatial + p;
+                        out[out_idx] = out[out_idx] + in_img[in_idx] * weights[w_idx];
+                        ci = ci + 1;
+                    }
+                    p = p + 1;
+                }
+                co = co + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("pointwise_conv.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut func = module.functions[0].clone();
+
+    // Attach pointwise convolution hint to loop blocks
+    for b in &mut func.blocks {
+        b.set_vector_hint(LoopVectorHint::new(8, 8, true).with_pointwise_conv(16, 32, true, true));
+    }
+
+    let inner_block = func
+        .blocks
+        .iter_mut()
+        .find(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(
+                    i.expr,
+                    ValueExpr::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                )
+            })
+        })
+        .unwrap();
+
+    let p_img = func.params[1].val;
+    inner_block.instructions.insert(
+        0,
+        Instruction::new(
+            None,
+            ValueExpr::GenCheck {
+                ref_val: p_img,
+                redundant: false,
+            },
+            Span::DUMMY,
+        ),
+    );
+
+    let mut pass = VectorizePass::new();
+    pass.run_on_function(&mut func);
+    let stats = pass.stats();
+
+    assert!(
+        stats.pointwise_conv_vectorized >= 1,
+        "Pointwise convolution must be recognized: {:?}",
+        stats
+    );
+    assert!(
+        stats.nested_gen_checks_eliminated >= 1,
+        "Generational checks in pointwise convolution loops must be eliminated: {:?}",
+        stats
+    );
+}
+
+#[test]
+fn test_batch_norm2d_vectorization_and_gen_check_elision() {
+    let src = r#"
+        pub strict fn batch_norm(
+            inout out: Slice<f32>,
+            src: Slice<f32>,
+            gamma: Slice<f32>,
+            beta: Slice<f32>,
+            mean: Slice<f32>,
+            var: Slice<f32>,
+            channels: i64,
+            spatial: i64
+        ) {
+            let mut c: i64 = 0;
+            while c < channels {
+                let mut i: i64 = 0;
+                while i < spatial {
+                    let idx = c * spatial + i;
+                    out[idx] = (src[idx] - mean[c]) * gamma[c] + beta[c];
+                    i = i + 1;
+                }
+                c = c + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("batch_norm.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut func = module.functions[0].clone();
+
+    // Attach batch norm hint to loop blocks
+    for b in &mut func.blocks {
+        b.set_vector_hint(LoopVectorHint::new(8, 8, true).with_batch_norm(8, true));
+    }
+
+    let inner_block = func
+        .blocks
+        .iter_mut()
+        .find(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(
+                    i.expr,
+                    ValueExpr::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                )
+            })
+        })
+        .unwrap();
+
+    let p_src = func.params[1].val;
+    inner_block.instructions.insert(
+        0,
+        Instruction::new(
+            None,
+            ValueExpr::GenCheck {
+                ref_val: p_src,
+                redundant: false,
+            },
+            Span::DUMMY,
+        ),
+    );
+
+    let mut pass = VectorizePass::new();
+    pass.run_on_function(&mut func);
+    let stats = pass.stats();
+
+    assert!(
+        stats.batch_norm_vectorized >= 1,
+        "Batch norm must be recognized: {:?}",
+        stats
+    );
+    assert!(
+        stats.nested_gen_checks_eliminated >= 1,
+        "Generational checks in batch norm loops must be eliminated: {:?}",
         stats
     );
 }

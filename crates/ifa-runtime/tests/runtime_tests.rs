@@ -2139,3 +2139,86 @@ fn test_multi_arena_dilated_conv2d_and_spatial_pooling() {
     // 92 + 10 = 102
     assert_eq!(dst_i64[0], 102);
 }
+
+#[test]
+fn test_multi_arena_depthwise_pointwise_conv_and_batch_norm() {
+    use ifa_runtime::ffi::{
+        ifa_simd_multi_arena_batch_norm2d_f32, ifa_simd_multi_arena_depthwise_conv2d_f32,
+        ifa_simd_multi_arena_pointwise_conv2d_f32,
+    };
+
+    // 1. Depthwise 2D conv: 2 channels, 3x3 input per channel, 2x2 kernel per channel, stride 1 -> 2x2 output per channel
+    let img = [
+        1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0,
+        80.0, 90.0,
+    ];
+    let weights = [1.0f32, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+    let bias = [0.5f32, 1.0f32];
+    let mut dst = [0.0f32; 8];
+
+    unsafe {
+        ifa_simd_multi_arena_depthwise_conv2d_f32(
+            dst.as_mut_ptr(),
+            img.as_ptr(),
+            weights.as_ptr(),
+            bias.as_ptr(),
+            2, // channels
+            2, // h_out
+            2, // w_out
+            1, // stride_y
+            1, // stride_x
+            2, // kernel_h
+            2, // kernel_w
+            3, // img_h
+            3, // img_w
+            1, // ReLU
+        );
+    }
+    // Ch 0 at (0, 0): img[0]*1 + img[1]*0 + img[3]*0 + img[4]*1 + 0.5 = 1 + 5 + 0.5 = 6.5
+    assert!((dst[0] - 6.5).abs() < 1e-4);
+    // Ch 1 at (0, 0): img[9+0]*0 + img[9+1]*1 + img[9+3]*1 + img[9+4]*0 + 1.0 = 20 + 40 + 1.0 = 61.0
+    assert!((dst[4] - 61.0).abs() < 1e-4);
+
+    // 2. Pointwise (1x1) conv: 2 channels in -> 1 channel out, spatial size = 4
+    let pw_weights = [0.5f32, 2.0f32];
+    let pw_bias = [0.0f32];
+    let mut pw_dst = [0.0f32; 4];
+    unsafe {
+        ifa_simd_multi_arena_pointwise_conv2d_f32(
+            pw_dst.as_mut_ptr(),
+            img.as_ptr(),
+            pw_weights.as_ptr(),
+            pw_bias.as_ptr(),
+            2, // c_in
+            1, // c_out
+            4, // spatial_size
+            1, // ReLU
+        );
+    }
+    // Pixel 0: img[0]*0.5 + img[4]*2.0 + 0 = 1*0.5 + 5*2.0 = 10.5
+    assert!((pw_dst[0] - 10.5).abs() < 1e-4);
+
+    // 3. Batch Normalization: 2 channels, spatial size = 4
+    let bn_src = [2.0f32, 4.0, 6.0, 8.0, 10.0, 20.0, 30.0, 40.0];
+    let gamma = [1.0f32, 2.0f32];
+    let beta = [0.0f32, 5.0f32];
+    let mean = [5.0f32, 25.0f32];
+    let var = [5.0f32, 125.0f32];
+    let mut bn_dst = [0.0f32; 8];
+    unsafe {
+        ifa_simd_multi_arena_batch_norm2d_f32(
+            bn_dst.as_mut_ptr(),
+            bn_src.as_ptr(),
+            gamma.as_ptr(),
+            beta.as_ptr(),
+            mean.as_ptr(),
+            var.as_ptr(),
+            2,
+            4,
+            1e-5,
+            0,
+        );
+    }
+    // Ch 0, pixel 0: (2.0 - 5.0) / sqrt(5.00001) * 1.0 + 0.0 = -3.0 / 2.2360679 ~= -1.34164
+    assert!((bn_dst[0] - (-1.34164)).abs() < 1e-3);
+}

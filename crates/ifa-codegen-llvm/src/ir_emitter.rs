@@ -415,7 +415,9 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("declare double @llvm.vector.reduce.fmax.v4f64(<4 x double>)\n");
         out.push_str("declare i32 @llvm.vector.reduce.smax.v4i32(<4 x i32>)\n");
         out.push_str("declare i32 @llvm.vector.reduce.smax.v8i32(<8 x i32>)\n");
-        out.push_str("declare i64 @llvm.vector.reduce.smax.v4i64(<4 x i64>)\n\n");
+        out.push_str("declare i64 @llvm.vector.reduce.smax.v4i64(<4 x i64>)\n");
+        out.push_str("declare float @llvm.sqrt.f32(float)\n");
+        out.push_str("declare double @llvm.sqrt.f64(double)\n\n");
 
         if self.target.arch == TargetArch::AArch64 {
             out.push_str("; AArch64 Advanced SIMD (NEON) Horizontal Reduction Intrinsics\n");
@@ -1250,6 +1252,155 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("p_done:\n  %avg_val = sdiv i64 %sum_py, %area\n  %p_dst = getelementptr inbounds i64, ptr %dst, i64 %out_idx\n  store i64 %avg_val, ptr %p_dst, align 8\n  br label %x_next\n");
         out.push_str("x_next:\n  %next_x = add i64 %x, 1\n  br label %x_loop\n");
         out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        // Multi-Arena Depthwise 2D Convolutions
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_depthwise_conv2d_f32(ptr %dst, ptr %img, ptr %weights, ptr %bias, i64 %channels, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %kernel_h, i64 %kernel_w, i64 %img_h, i64 %img_w, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  %is_relu = icmp eq i32 %activation, 1\n  %in_area = mul i64 %img_h, %img_w\n  %kernel_area = mul i64 %kernel_h, %kernel_w\n  %out_area = mul i64 %h_out, %w_out\n  br label %c_loop\n");
+        out.push_str("c_loop:\n  %c = phi i64 [ 0, %entry ], [ %next_c, %c_next ]\n  %has_c = icmp ult i64 %c, %channels\n  br i1 %has_c, label %c_body, label %done\n");
+        out.push_str("c_body:\n  %c_img_off = mul i64 %c, %in_area\n  %c_w_off = mul i64 %c, %kernel_area\n  %c_dst_off = mul i64 %c, %out_area\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %p_b = getelementptr inbounds float, ptr %bias, i64 %c\n  %b_val = load float, ptr %p_b, align 4\n  br label %y_init\n");
+        out.push_str("zero_b:\n  br label %y_init\n");
+        out.push_str("y_init:\n  %bias_scalar = phi float [ %b_val, %load_b ], [ 0.0, %zero_b ]\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %y_init ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %c_next\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_base = mul i64 %y_str, %img_w\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_next ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %k_init, label %y_next\n");
+        out.push_str("k_init:\n  %x_base = mul i64 %x, %stride_x\n  %out_idx_rel = add i64 %y_out_off, %x\n  %out_idx = add i64 %c_dst_off, %out_idx_rel\n  br label %ky_loop\n");
+        out.push_str("ky_loop:\n  %ky = phi i64 [ 0, %k_init ], [ %next_ky, %ky_next ]\n  %accum_ky = phi float [ 0.0, %k_init ], [ %accum_ky_next, %ky_next ]\n  %has_ky = icmp ult i64 %ky, %kernel_h\n  br i1 %has_ky, label %kx_init, label %k_done\n");
+        out.push_str("kx_init:\n  %ky_off = mul i64 %ky, %img_w\n  %in_row = add i64 %y_base, %ky_off\n  %w_row = mul i64 %ky, %kernel_w\n  br label %kx_loop\n");
+        out.push_str("kx_loop:\n  %kx = phi i64 [ 0, %kx_init ], [ %next_kx, %kx_step ]\n  %accum_kx = phi float [ %accum_ky, %kx_init ], [ %next_accum_kx, %kx_step ]\n  %has_kx = icmp ult i64 %kx, %kernel_w\n  br i1 %has_kx, label %kx_step, label %ky_next\n");
+        out.push_str("kx_step:\n  %in_pix = add i64 %in_row, %x_base\n  %in_idx_rel = add i64 %in_pix, %kx\n  %in_idx = add i64 %c_img_off, %in_idx_rel\n  %w_idx_rel = add i64 %w_row, %kx\n  %w_idx = add i64 %c_w_off, %w_idx_rel\n  %p_in = getelementptr inbounds float, ptr %img, i64 %in_idx\n  %p_w = getelementptr inbounds float, ptr %weights, i64 %w_idx\n  %v_in = load float, ptr %p_in, align 4\n  %v_w = load float, ptr %p_w, align 4\n  %prod = fmul float %v_in, %v_w\n  %next_accum_kx = fadd float %accum_kx, %prod\n  %next_kx = add i64 %kx, 1\n  br label %kx_loop, !llvm.loop !74\n");
+        out.push_str("ky_next:\n  %accum_ky_next = phi float [ %accum_kx, %kx_loop ]\n  %next_ky = add i64 %ky, 1\n  br label %ky_loop\n");
+        out.push_str("k_done:\n  %biased = fadd float %accum_ky, %bias_scalar\n  %relu_cond = fcmp ogt float %biased, 0.0\n  %relu_val = select i1 %relu_cond, float %biased, float 0.0\n  %act_val = select i1 %is_relu, float %relu_val, float %biased\n  %p_dst = getelementptr inbounds float, ptr %dst, i64 %out_idx\n  store float %act_val, ptr %p_dst, align 4\n  br label %x_next\n");
+        out.push_str("x_next:\n  %next_x = add i64 %x, 1\n  br label %x_loop\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("c_next:\n  %next_c = add i64 %c, 1\n  br label %c_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_depthwise_conv2d_f64(ptr %dst, ptr %img, ptr %weights, ptr %bias, i64 %channels, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %kernel_h, i64 %kernel_w, i64 %img_h, i64 %img_w, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  %is_relu = icmp eq i32 %activation, 1\n  %in_area = mul i64 %img_h, %img_w\n  %kernel_area = mul i64 %kernel_h, %kernel_w\n  %out_area = mul i64 %h_out, %w_out\n  br label %c_loop\n");
+        out.push_str("c_loop:\n  %c = phi i64 [ 0, %entry ], [ %next_c, %c_next ]\n  %has_c = icmp ult i64 %c, %channels\n  br i1 %has_c, label %c_body, label %done\n");
+        out.push_str("c_body:\n  %c_img_off = mul i64 %c, %in_area\n  %c_w_off = mul i64 %c, %kernel_area\n  %c_dst_off = mul i64 %c, %out_area\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %p_b = getelementptr inbounds double, ptr %bias, i64 %c\n  %b_val = load double, ptr %p_b, align 8\n  br label %y_init\n");
+        out.push_str("zero_b:\n  br label %y_init\n");
+        out.push_str("y_init:\n  %bias_scalar = phi double [ %b_val, %load_b ], [ 0.0, %zero_b ]\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %y_init ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %c_next\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_base = mul i64 %y_str, %img_w\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_next ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %k_init, label %y_next\n");
+        out.push_str("k_init:\n  %x_base = mul i64 %x, %stride_x\n  %out_idx_rel = add i64 %y_out_off, %x\n  %out_idx = add i64 %c_dst_off, %out_idx_rel\n  br label %ky_loop\n");
+        out.push_str("ky_loop:\n  %ky = phi i64 [ 0, %k_init ], [ %next_ky, %ky_next ]\n  %accum_ky = phi double [ 0.0, %k_init ], [ %accum_ky_next, %ky_next ]\n  %has_ky = icmp ult i64 %ky, %kernel_h\n  br i1 %has_ky, label %kx_init, label %k_done\n");
+        out.push_str("kx_init:\n  %ky_off = mul i64 %ky, %img_w\n  %in_row = add i64 %y_base, %ky_off\n  %w_row = mul i64 %ky, %kernel_w\n  br label %kx_loop\n");
+        out.push_str("kx_loop:\n  %kx = phi i64 [ 0, %kx_init ], [ %next_kx, %kx_step ]\n  %accum_kx = phi double [ %accum_ky, %kx_init ], [ %next_accum_kx, %kx_step ]\n  %has_kx = icmp ult i64 %kx, %kernel_w\n  br i1 %has_kx, label %kx_step, label %ky_next\n");
+        out.push_str("kx_step:\n  %in_pix = add i64 %in_row, %x_base\n  %in_idx_rel = add i64 %in_pix, %kx\n  %in_idx = add i64 %c_img_off, %in_idx_rel\n  %w_idx_rel = add i64 %w_row, %kx\n  %w_idx = add i64 %c_w_off, %w_idx_rel\n  %p_in = getelementptr inbounds double, ptr %img, i64 %in_idx\n  %p_w = getelementptr inbounds double, ptr %weights, i64 %w_idx\n  %v_in = load double, ptr %p_in, align 8\n  %v_w = load double, ptr %p_w, align 8\n  %prod = fmul double %v_in, %v_w\n  %next_accum_kx = fadd double %accum_kx, %prod\n  %next_kx = add i64 %kx, 1\n  br label %kx_loop, !llvm.loop !74\n");
+        out.push_str("ky_next:\n  %accum_ky_next = phi double [ %accum_kx, %kx_loop ]\n  %next_ky = add i64 %ky, 1\n  br label %ky_loop\n");
+        out.push_str("k_done:\n  %biased = fadd double %accum_ky, %bias_scalar\n  %relu_cond = fcmp ogt double %biased, 0.0\n  %relu_val = select i1 %relu_cond, double %biased, double 0.0\n  %act_val = select i1 %is_relu, double %relu_val, double %biased\n  %p_dst = getelementptr inbounds double, ptr %dst, i64 %out_idx\n  store double %act_val, ptr %p_dst, align 8\n  br label %x_next\n");
+        out.push_str("x_next:\n  %next_x = add i64 %x, 1\n  br label %x_loop\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("c_next:\n  %next_c = add i64 %c, 1\n  br label %c_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_depthwise_conv2d_i64(ptr %dst, ptr %img, ptr %weights, ptr %bias, i64 %channels, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %kernel_h, i64 %kernel_w, i64 %img_h, i64 %img_w, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  %is_relu = icmp eq i32 %activation, 1\n  %in_area = mul i64 %img_h, %img_w\n  %kernel_area = mul i64 %kernel_h, %kernel_w\n  %out_area = mul i64 %h_out, %w_out\n  br label %c_loop\n");
+        out.push_str("c_loop:\n  %c = phi i64 [ 0, %entry ], [ %next_c, %c_next ]\n  %has_c = icmp ult i64 %c, %channels\n  br i1 %has_c, label %c_body, label %done\n");
+        out.push_str("c_body:\n  %c_img_off = mul i64 %c, %in_area\n  %c_w_off = mul i64 %c, %kernel_area\n  %c_dst_off = mul i64 %c, %out_area\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %p_b = getelementptr inbounds i64, ptr %bias, i64 %c\n  %b_val = load i64, ptr %p_b, align 8\n  br label %y_init\n");
+        out.push_str("zero_b:\n  br label %y_init\n");
+        out.push_str("y_init:\n  %bias_scalar = phi i64 [ %b_val, %load_b ], [ 0, %zero_b ]\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %y_init ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %c_next\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_base = mul i64 %y_str, %img_w\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_next ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %k_init, label %y_next\n");
+        out.push_str("k_init:\n  %x_base = mul i64 %x, %stride_x\n  %out_idx_rel = add i64 %y_out_off, %x\n  %out_idx = add i64 %c_dst_off, %out_idx_rel\n  br label %ky_loop\n");
+        out.push_str("ky_loop:\n  %ky = phi i64 [ 0, %k_init ], [ %next_ky, %ky_next ]\n  %accum_ky = phi i64 [ 0, %k_init ], [ %accum_ky_next, %ky_next ]\n  %has_ky = icmp ult i64 %ky, %kernel_h\n  br i1 %has_ky, label %kx_init, label %k_done\n");
+        out.push_str("kx_init:\n  %ky_off = mul i64 %ky, %img_w\n  %in_row = add i64 %y_base, %ky_off\n  %w_row = mul i64 %ky, %kernel_w\n  br label %kx_loop\n");
+        out.push_str("kx_loop:\n  %kx = phi i64 [ 0, %kx_init ], [ %next_kx, %kx_step ]\n  %accum_kx = phi i64 [ %accum_ky, %kx_init ], [ %next_accum_kx, %kx_step ]\n  %has_kx = icmp ult i64 %kx, %kernel_w\n  br i1 %has_kx, label %kx_step, label %ky_next\n");
+        out.push_str("kx_step:\n  %in_pix = add i64 %in_row, %x_base\n  %in_idx_rel = add i64 %in_pix, %kx\n  %in_idx = add i64 %c_img_off, %in_idx_rel\n  %w_idx_rel = add i64 %w_row, %kx\n  %w_idx = add i64 %c_w_off, %w_idx_rel\n  %p_in = getelementptr inbounds i64, ptr %img, i64 %in_idx\n  %p_w = getelementptr inbounds i64, ptr %weights, i64 %w_idx\n  %v_in = load i64, ptr %p_in, align 8\n  %v_w = load i64, ptr %p_w, align 8\n  %prod = mul i64 %v_in, %v_w\n  %next_accum_kx = add i64 %accum_kx, %prod\n  %next_kx = add i64 %kx, 1\n  br label %kx_loop, !llvm.loop !74\n");
+        out.push_str("ky_next:\n  %accum_ky_next = phi i64 [ %accum_kx, %kx_loop ]\n  %next_ky = add i64 %ky, 1\n  br label %ky_loop\n");
+        out.push_str("k_done:\n  %biased = add i64 %accum_ky, %bias_scalar\n  %relu_cond = icmp sgt i64 %biased, 0\n  %relu_val = select i1 %relu_cond, i64 %biased, i64 0\n  %act_val = select i1 %is_relu, i64 %relu_val, i64 %biased\n  %p_dst = getelementptr inbounds i64, ptr %dst, i64 %out_idx\n  store i64 %act_val, ptr %p_dst, align 8\n  br label %x_next\n");
+        out.push_str("x_next:\n  %next_x = add i64 %x, 1\n  br label %x_loop\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("c_next:\n  %next_c = add i64 %c, 1\n  br label %c_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        // Multi-Arena Pointwise (1x1) 2D Convolutions
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_pointwise_conv2d_f32(ptr %dst, ptr %img, ptr %weights, ptr %bias, i64 %c_in, i64 %c_out, i64 %spatial_size, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  %is_relu = icmp eq i32 %activation, 1\n  br label %co_loop\n");
+        out.push_str("co_loop:\n  %co = phi i64 [ 0, %entry ], [ %next_co, %co_next ]\n  %has_co = icmp ult i64 %co, %c_out\n  br i1 %has_co, label %co_body, label %done\n");
+        out.push_str("co_body:\n  %w_co_off = mul i64 %co, %c_in\n  %dst_co_off = mul i64 %co, %spatial_size\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %p_b = getelementptr inbounds float, ptr %bias, i64 %co\n  %b_val = load float, ptr %p_b, align 4\n  br label %p_init\n");
+        out.push_str("zero_b:\n  br label %p_init\n");
+        out.push_str("p_init:\n  %bias_scalar = phi float [ %b_val, %load_b ], [ 0.0, %zero_b ]\n  br label %p_loop\n");
+        out.push_str("p_loop:\n  %p = phi i64 [ 0, %p_init ], [ %next_p, %p_next ]\n  %has_p = icmp ult i64 %p, %spatial_size\n  br i1 %has_p, label %ci_init, label %co_next\n");
+        out.push_str("ci_init:\n  %out_idx = add i64 %dst_co_off, %p\n  br label %ci_loop\n");
+        out.push_str("ci_loop:\n  %ci = phi i64 [ 0, %ci_init ], [ %next_ci, %ci_step ]\n  %accum_ci = phi float [ 0.0, %ci_init ], [ %next_accum_ci, %ci_step ]\n  %has_ci = icmp ult i64 %ci, %c_in\n  br i1 %has_ci, label %ci_step, label %ci_done\n");
+        out.push_str("ci_step:\n  %in_ci_off = mul i64 %ci, %spatial_size\n  %in_idx = add i64 %in_ci_off, %p\n  %w_idx = add i64 %w_co_off, %ci\n  %p_in = getelementptr inbounds float, ptr %img, i64 %in_idx\n  %p_w = getelementptr inbounds float, ptr %weights, i64 %w_idx\n  %v_in = load float, ptr %p_in, align 4\n  %v_w = load float, ptr %p_w, align 4\n  %prod = fmul float %v_in, %v_w\n  %next_accum_ci = fadd float %accum_ci, %prod\n  %next_ci = add i64 %ci, 1\n  br label %ci_loop, !llvm.loop !74\n");
+        out.push_str("ci_done:\n  %biased = fadd float %accum_ci, %bias_scalar\n  %relu_cond = fcmp ogt float %biased, 0.0\n  %relu_val = select i1 %relu_cond, float %biased, float 0.0\n  %act_val = select i1 %is_relu, float %relu_val, float %biased\n  %p_dst = getelementptr inbounds float, ptr %dst, i64 %out_idx\n  store float %act_val, ptr %p_dst, align 4\n  br label %p_next\n");
+        out.push_str("p_next:\n  %next_p = add i64 %p, 1\n  br label %p_loop\n");
+        out.push_str("co_next:\n  %next_co = add i64 %co, 1\n  br label %co_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_pointwise_conv2d_f64(ptr %dst, ptr %img, ptr %weights, ptr %bias, i64 %c_in, i64 %c_out, i64 %spatial_size, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  %is_relu = icmp eq i32 %activation, 1\n  br label %co_loop\n");
+        out.push_str("co_loop:\n  %co = phi i64 [ 0, %entry ], [ %next_co, %co_next ]\n  %has_co = icmp ult i64 %co, %c_out\n  br i1 %has_co, label %co_body, label %done\n");
+        out.push_str("co_body:\n  %w_co_off = mul i64 %co, %c_in\n  %dst_co_off = mul i64 %co, %spatial_size\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %p_b = getelementptr inbounds double, ptr %bias, i64 %co\n  %b_val = load double, ptr %p_b, align 8\n  br label %p_init\n");
+        out.push_str("zero_b:\n  br label %p_init\n");
+        out.push_str("p_init:\n  %bias_scalar = phi double [ %b_val, %load_b ], [ 0.0, %zero_b ]\n  br label %p_loop\n");
+        out.push_str("p_loop:\n  %p = phi i64 [ 0, %p_init ], [ %next_p, %p_next ]\n  %has_p = icmp ult i64 %p, %spatial_size\n  br i1 %has_p, label %ci_init, label %co_next\n");
+        out.push_str("ci_init:\n  %out_idx = add i64 %dst_co_off, %p\n  br label %ci_loop\n");
+        out.push_str("ci_loop:\n  %ci = phi i64 [ 0, %ci_init ], [ %next_ci, %ci_step ]\n  %accum_ci = phi double [ 0.0, %ci_init ], [ %next_accum_ci, %ci_step ]\n  %has_ci = icmp ult i64 %ci, %c_in\n  br i1 %has_ci, label %ci_step, label %ci_done\n");
+        out.push_str("ci_step:\n  %in_ci_off = mul i64 %ci, %spatial_size\n  %in_idx = add i64 %in_ci_off, %p\n  %w_idx = add i64 %w_co_off, %ci\n  %p_in = getelementptr inbounds double, ptr %img, i64 %in_idx\n  %p_w = getelementptr inbounds double, ptr %weights, i64 %w_idx\n  %v_in = load double, ptr %p_in, align 8\n  %v_w = load double, ptr %p_w, align 8\n  %prod = fmul double %v_in, %v_w\n  %next_accum_ci = fadd double %accum_ci, %prod\n  %next_ci = add i64 %ci, 1\n  br label %ci_loop, !llvm.loop !74\n");
+        out.push_str("ci_done:\n  %biased = fadd double %accum_ci, %bias_scalar\n  %relu_cond = fcmp ogt double %biased, 0.0\n  %relu_val = select i1 %relu_cond, double %biased, double 0.0\n  %act_val = select i1 %is_relu, double %relu_val, double %biased\n  %p_dst = getelementptr inbounds double, ptr %dst, i64 %out_idx\n  store double %act_val, ptr %p_dst, align 8\n  br label %p_next\n");
+        out.push_str("p_next:\n  %next_p = add i64 %p, 1\n  br label %p_loop\n");
+        out.push_str("co_next:\n  %next_co = add i64 %co, 1\n  br label %co_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_pointwise_conv2d_i64(ptr %dst, ptr %img, ptr %weights, ptr %bias, i64 %c_in, i64 %c_out, i64 %spatial_size, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  %is_relu = icmp eq i32 %activation, 1\n  br label %co_loop\n");
+        out.push_str("co_loop:\n  %co = phi i64 [ 0, %entry ], [ %next_co, %co_next ]\n  %has_co = icmp ult i64 %co, %c_out\n  br i1 %has_co, label %co_body, label %done\n");
+        out.push_str("co_body:\n  %w_co_off = mul i64 %co, %c_in\n  %dst_co_off = mul i64 %co, %spatial_size\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %p_b = getelementptr inbounds i64, ptr %bias, i64 %co\n  %b_val = load i64, ptr %p_b, align 8\n  br label %p_init\n");
+        out.push_str("zero_b:\n  br label %p_init\n");
+        out.push_str("p_init:\n  %bias_scalar = phi i64 [ %b_val, %load_b ], [ 0, %zero_b ]\n  br label %p_loop\n");
+        out.push_str("p_loop:\n  %p = phi i64 [ 0, %p_init ], [ %next_p, %p_next ]\n  %has_p = icmp ult i64 %p, %spatial_size\n  br i1 %has_p, label %ci_init, label %co_next\n");
+        out.push_str("ci_init:\n  %out_idx = add i64 %dst_co_off, %p\n  br label %ci_loop\n");
+        out.push_str("ci_loop:\n  %ci = phi i64 [ 0, %ci_init ], [ %next_ci, %ci_step ]\n  %accum_ci = phi i64 [ 0, %ci_init ], [ %next_accum_ci, %ci_step ]\n  %has_ci = icmp ult i64 %ci, %c_in\n  br i1 %has_ci, label %ci_step, label %ci_done\n");
+        out.push_str("ci_step:\n  %in_ci_off = mul i64 %ci, %spatial_size\n  %in_idx = add i64 %in_ci_off, %p\n  %w_idx = add i64 %w_co_off, %ci\n  %p_in = getelementptr inbounds i64, ptr %img, i64 %in_idx\n  %p_w = getelementptr inbounds i64, ptr %weights, i64 %w_idx\n  %v_in = load i64, ptr %p_in, align 8\n  %v_w = load i64, ptr %p_w, align 8\n  %prod = mul i64 %v_in, %v_w\n  %next_accum_ci = add i64 %accum_ci, %prod\n  %next_ci = add i64 %ci, 1\n  br label %ci_loop, !llvm.loop !74\n");
+        out.push_str("ci_done:\n  %biased = add i64 %accum_ci, %bias_scalar\n  %relu_cond = icmp sgt i64 %biased, 0\n  %relu_val = select i1 %relu_cond, i64 %biased, i64 0\n  %act_val = select i1 %is_relu, i64 %relu_val, i64 %biased\n  %p_dst = getelementptr inbounds i64, ptr %dst, i64 %out_idx\n  store i64 %act_val, ptr %p_dst, align 8\n  br label %p_next\n");
+        out.push_str("p_next:\n  %next_p = add i64 %p, 1\n  br label %p_loop\n");
+        out.push_str("co_next:\n  %next_co = add i64 %co, 1\n  br label %co_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        // Multi-Arena 2D Batch Normalization
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_batch_norm2d_f32(ptr %dst, ptr %src, ptr %gamma, ptr %beta, ptr %mean, ptr %var, i64 %channels, i64 %spatial_size, float %epsilon, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_gamma = icmp ne ptr %gamma, null\n  %has_beta = icmp ne ptr %beta, null\n  %is_relu = icmp eq i32 %activation, 1\n  br label %c_loop\n");
+        out.push_str("c_loop:\n  %c = phi i64 [ 0, %entry ], [ %next_c, %c_next ]\n  %has_c = icmp ult i64 %c, %channels\n  br i1 %has_c, label %c_body, label %done\n");
+        out.push_str("c_body:\n  %p_mean = getelementptr inbounds float, ptr %mean, i64 %c\n  %m_val = load float, ptr %p_mean, align 4\n  %p_var = getelementptr inbounds float, ptr %var, i64 %c\n  %v_val = load float, ptr %p_var, align 4\n  %v_eps = fadd float %v_val, %epsilon\n  %std_dev = call float @llvm.sqrt.f32(float %v_eps)\n  %inv_std = fdiv float 1.0, %std_dev\n  br i1 %has_gamma, label %load_g, label %one_g\n");
+        out.push_str("load_g:\n  %p_g = getelementptr inbounds float, ptr %gamma, i64 %c\n  %g_val = load float, ptr %p_g, align 4\n  br label %beta_check\n");
+        out.push_str("one_g:\n  br label %beta_check\n");
+        out.push_str("beta_check:\n  %gamma_val = phi float [ %g_val, %load_g ], [ 1.0, %one_g ]\n  br i1 %has_beta, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %p_b = getelementptr inbounds float, ptr %beta, i64 %c\n  %b_val = load float, ptr %p_b, align 4\n  br label %coeff_calc\n");
+        out.push_str("zero_b:\n  br label %coeff_calc\n");
+        out.push_str("coeff_calc:\n  %beta_val = phi float [ %b_val, %load_b ], [ 0.0, %zero_b ]\n  %scale = fmul float %gamma_val, %inv_std\n  %m_scale = fmul float %m_val, %scale\n  %shift = fsub float %beta_val, %m_scale\n  %c_base = mul i64 %c, %spatial_size\n  br label %p_loop\n");
+        out.push_str("p_loop:\n  %i = phi i64 [ 0, %coeff_calc ], [ %next_i, %p_next ]\n  %has_i = icmp ult i64 %i, %spatial_size\n  br i1 %has_i, label %p_step, label %c_next\n");
+        out.push_str("p_step:\n  %idx = add i64 %c_base, %i\n  %p_src = getelementptr inbounds float, ptr %src, i64 %idx\n  %x_val = load float, ptr %p_src, align 4\n  %scaled = fmul float %x_val, %scale\n  %normed = fadd float %scaled, %shift\n  %relu_cond = fcmp ogt float %normed, 0.0\n  %relu_val = select i1 %relu_cond, float %normed, float 0.0\n  %act_val = select i1 %is_relu, float %relu_val, float %normed\n  %p_dst = getelementptr inbounds float, ptr %dst, i64 %idx\n  store float %act_val, ptr %p_dst, align 4\n  br label %p_next\n");
+        out.push_str("p_next:\n  %next_i = add i64 %i, 1\n  br label %p_loop, !llvm.loop !74\n");
+        out.push_str("c_next:\n  %next_c = add i64 %c, 1\n  br label %c_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_batch_norm2d_f64(ptr %dst, ptr %src, ptr %gamma, ptr %beta, ptr %mean, ptr %var, i64 %channels, i64 %spatial_size, double %epsilon, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_gamma = icmp ne ptr %gamma, null\n  %has_beta = icmp ne ptr %beta, null\n  %is_relu = icmp eq i32 %activation, 1\n  br label %c_loop\n");
+        out.push_str("c_loop:\n  %c = phi i64 [ 0, %entry ], [ %next_c, %c_next ]\n  %has_c = icmp ult i64 %c, %channels\n  br i1 %has_c, label %c_body, label %done\n");
+        out.push_str("c_body:\n  %p_mean = getelementptr inbounds double, ptr %mean, i64 %c\n  %m_val = load double, ptr %p_mean, align 8\n  %p_var = getelementptr inbounds double, ptr %var, i64 %c\n  %v_val = load double, ptr %p_var, align 8\n  %v_eps = fadd double %v_val, %epsilon\n  %std_dev = call double @llvm.sqrt.f64(double %v_eps)\n  %inv_std = fdiv double 1.0, %std_dev\n  br i1 %has_gamma, label %load_g, label %one_g\n");
+        out.push_str("load_g:\n  %p_g = getelementptr inbounds double, ptr %gamma, i64 %c\n  %g_val = load double, ptr %p_g, align 8\n  br label %beta_check\n");
+        out.push_str("one_g:\n  br label %beta_check\n");
+        out.push_str("beta_check:\n  %gamma_val = phi double [ %g_val, %load_g ], [ 1.0, %one_g ]\n  br i1 %has_beta, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %p_b = getelementptr inbounds double, ptr %beta, i64 %c\n  %b_val = load double, ptr %p_b, align 8\n  br label %coeff_calc\n");
+        out.push_str("zero_b:\n  br label %coeff_calc\n");
+        out.push_str("coeff_calc:\n  %beta_val = phi double [ %b_val, %load_b ], [ 0.0, %zero_b ]\n  %scale = fmul double %gamma_val, %inv_std\n  %m_scale = fmul double %m_val, %scale\n  %shift = fsub double %beta_val, %m_scale\n  %c_base = mul i64 %c, %spatial_size\n  br label %p_loop\n");
+        out.push_str("p_loop:\n  %i = phi i64 [ 0, %coeff_calc ], [ %next_i, %p_next ]\n  %has_i = icmp ult i64 %i, %spatial_size\n  br i1 %has_i, label %p_step, label %c_next\n");
+        out.push_str("p_step:\n  %idx = add i64 %c_base, %i\n  %p_src = getelementptr inbounds double, ptr %src, i64 %idx\n  %x_val = load double, ptr %p_src, align 8\n  %scaled = fmul double %x_val, %scale\n  %normed = fadd double %scaled, %shift\n  %relu_cond = fcmp ogt double %normed, 0.0\n  %relu_val = select i1 %relu_cond, double %normed, double 0.0\n  %act_val = select i1 %is_relu, double %relu_val, double %normed\n  %p_dst = getelementptr inbounds double, ptr %dst, i64 %idx\n  store double %act_val, ptr %p_dst, align 8\n  br label %p_next\n");
+        out.push_str("p_next:\n  %next_i = add i64 %i, 1\n  br label %p_loop, !llvm.loop !74\n");
+        out.push_str("c_next:\n  %next_c = add i64 %c, 1\n  br label %c_loop\n");
         out.push_str("done:\n  ret void\n}\n\n");
 
         // 6. Arena Slice Count-If Reductions (Conditional Counting Zero-Heap)

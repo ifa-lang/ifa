@@ -102,6 +102,12 @@ pub struct VectorizeStats {
     pub avg_pooling_vectorized: usize,
     /// Total number of deterministic zero-heap spatial pooling loops vectorized.
     pub total_pooling_vectorized: usize,
+    /// Number of depthwise 2D convolution loops vectorized.
+    pub depthwise_conv_vectorized: usize,
+    /// Number of pointwise (1x1) 2D convolution loops vectorized.
+    pub pointwise_conv_vectorized: usize,
+    /// Number of 2D batch normalization loops vectorized.
+    pub batch_norm_vectorized: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -529,6 +535,14 @@ impl VectorizePass {
                 let pooling_kind = existing_hint.and_then(|h| h.pooling_kind);
                 let pooling_window = existing_hint.and_then(|h| h.pooling_window);
                 let pooling_strides = existing_hint.and_then(|h| h.pooling_strides);
+                let mut is_depthwise_conv =
+                    existing_hint.map(|h| h.is_depthwise_conv).unwrap_or(false);
+                let depthwise_channels = existing_hint.and_then(|h| h.depthwise_channels);
+                let mut is_pointwise_conv =
+                    existing_hint.map(|h| h.is_pointwise_conv).unwrap_or(false);
+                let pointwise_channels = existing_hint.and_then(|h| h.pointwise_channels);
+                let mut is_batch_norm = existing_hint.map(|h| h.is_batch_norm).unwrap_or(false);
+                let batch_norm_channels = existing_hint.and_then(|h| h.batch_norm_channels);
 
                 // 4. Detect multidimensional matrix reduction operations with bipartite or tripartite disjoint windows
                 let mut distinct_roots: Vec<SliceRoot> = Vec::new();
@@ -834,6 +848,29 @@ impl VectorizePass {
                     }
                 }
 
+                if is_depthwise_conv || depthwise_channels.is_some() {
+                    is_depthwise_conv = true;
+                    is_convolution = true;
+                    disjoint_slices = true;
+                    unroll_and_jam = true;
+                    self.stats.depthwise_conv_vectorized += 1;
+                }
+
+                if is_pointwise_conv || pointwise_channels.is_some() {
+                    is_pointwise_conv = true;
+                    is_convolution = true;
+                    disjoint_slices = true;
+                    unroll_and_jam = true;
+                    self.stats.pointwise_conv_vectorized += 1;
+                }
+
+                if is_batch_norm || batch_norm_channels.is_some() {
+                    is_batch_norm = true;
+                    disjoint_slices = true;
+                    unroll_and_jam = true;
+                    self.stats.batch_norm_vectorized += 1;
+                }
+
                 // Elide generational checks in nested loops for multi-arena convolutions, matrix kernels, dilated conv, pooling, or provably disjoint slices
                 if is_zero_copy
                     || is_multi_arena_conv
@@ -843,6 +880,9 @@ impl VectorizePass {
                     || is_strided_multidim
                     || is_dilated_conv
                     || is_pooling
+                    || is_depthwise_conv
+                    || is_pointwise_conv
+                    || is_batch_norm
                     || disjoint_slices
                 {
                     let mut gen_eliminated = 0;
@@ -918,6 +958,9 @@ impl VectorizePass {
                 let effective_interleave = if is_multi_arena_conv
                     || is_dilated_conv
                     || is_pooling
+                    || is_depthwise_conv
+                    || is_pointwise_conv
+                    || is_batch_norm
                     || is_strided_conv3d
                     || is_strided_multidim
                 {
@@ -1000,6 +1043,12 @@ impl VectorizePass {
                     pooling_kind,
                     pooling_window,
                     pooling_strides,
+                    is_depthwise_conv,
+                    depthwise_channels,
+                    is_pointwise_conv,
+                    pointwise_channels,
+                    is_batch_norm,
+                    batch_norm_channels,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)
