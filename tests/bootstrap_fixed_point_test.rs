@@ -421,6 +421,41 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_parser_function_zero_arg ... ok"),
+        "Modular parser zero-arg test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_function_multi_param ... ok"),
+        "Modular parser multi-param test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_mut_statements ... ok"),
+        "Modular parser mut statements test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_pipeline_source_to_ast_basic ... ok"),
+        "Modular pipeline source to AST basic test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_pipeline_source_to_ast_multi_param ... ok"),
+        "Modular pipeline source to AST multi-param test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_pipeline_source_to_ast_mut_statements ... ok"),
+        "Modular pipeline source to AST mut statements test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_pipeline_source_to_ast_program_full ... ok"),
+        "Modular pipeline source to AST full program test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_sema_while_loop ... ok"),
         "Modular sema while loop test missing from output:\n{}",
         stdout
@@ -441,8 +476,8 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("157 passed; 0 failed"),
-        "Expected 157 passed unit tests, got:\n{}",
+        stdout.contains("167 passed; 0 failed"),
+        "Expected 167 passed unit tests, got:\n{}",
         stdout
     );
 }

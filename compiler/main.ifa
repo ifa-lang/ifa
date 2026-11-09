@@ -172,11 +172,74 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     let driver_mm_ok = driver::test_driver_multi_module_symbol_resolution();
     let driver_dag_ok = driver::test_driver_import_graph_and_transitive_deps();
     let driver_ffi_ok = driver::test_driver_ffi_header_and_php_bridge_generation();
-    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok || !fn_ptr_cg_ok || !thunk_cg_ok || !fiber_cg_ok || !chan_cg_ok || !select_cg_ok || !select_timed_cg_ok || !nursery_cg_ok || !codegen_if_ok || !driver_mm_ok || !driver_dag_ok || !driver_ffi_ok {
+    let pipe_basic_ok = test_pipeline_source_to_ast_basic();
+    let pipe_multi_ok = test_pipeline_source_to_ast_multi_param();
+    let pipe_mut_ok = test_pipeline_source_to_ast_mut_statements();
+    let pipe_full_ok = test_pipeline_source_to_ast_program_full();
+    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok || !fn_ptr_cg_ok || !thunk_cg_ok || !fiber_cg_ok || !chan_cg_ok || !select_cg_ok || !select_timed_cg_ok || !nursery_cg_ok || !codegen_if_ok || !driver_mm_ok || !driver_dag_ok || !driver_ffi_ok || !pipe_basic_ok || !pipe_multi_ok || !pipe_mut_ok || !pipe_full_ok {
         return false;
     }
 
     return true;
+}
+
+pub fn test_pipeline_source_to_ast_basic() -> bool {
+    let src = "fn compute(x: i64) -> i64 { return x + 40; }";
+    let tokens = lexer::tokenize_source(src);
+    mut cur: i64 = 0;
+    mut pool: List<parser::AstExpr> = List::new();
+    let f = parser::parse_function(inout cur, tokens, inout pool);
+    if f.name != "compute" || f.param_name != "x" {
+        return false;
+    }
+    if f.statements.len() != 1 {
+        return false;
+    }
+    return f.statements[0].is_return;
+}
+
+pub fn test_pipeline_source_to_ast_multi_param() -> bool {
+    let src = "fn add(x: i64, y: i64) -> i64 { return x + y; }";
+    let tokens = lexer::tokenize_source(src);
+    mut cur: i64 = 0;
+    mut pool: List<parser::AstExpr> = List::new();
+    let f = parser::parse_function(inout cur, tokens, inout pool);
+    if f.name != "add" || f.param_name != "x" {
+        return false;
+    }
+    return f.statements[0].is_return;
+}
+
+pub fn test_pipeline_source_to_ast_mut_statements() -> bool {
+    let src = "fn calc(x: i64) -> i64 { mut total: i64 = 0; total = total + x; return total; }";
+    let tokens = lexer::tokenize_source(src);
+    mut cur: i64 = 0;
+    mut pool: List<parser::AstExpr> = List::new();
+    let f = parser::parse_function(inout cur, tokens, inout pool);
+    if f.name != "calc" || f.statements.len() != 3 {
+        return false;
+    }
+    if f.statements[0].target_var != "total" || f.statements[0].is_return {
+        return false;
+    }
+    if f.statements[1].target_var != "total" || f.statements[1].is_return {
+        return false;
+    }
+    return f.statements[2].is_return;
+}
+
+pub fn test_pipeline_source_to_ast_program_full() -> bool {
+    let src = "pub struct Point { x: i64, y: i64 }\nfn origin() -> i64 { return 0; }";
+    let tokens = lexer::tokenize_source(src);
+    mut pool: List<parser::AstExpr> = List::new();
+    let prog = parser::parse_program(tokens, inout pool);
+    if prog.structs.len() != 1 || prog.functions.len() != 1 {
+        return false;
+    }
+    if prog.structs[0].name != "Point" || prog.structs[0].fields.len() != 2 {
+        return false;
+    }
+    return prog.functions[0].name == "origin";
 }
 
 pub fn parse_and_run_cli() -> bool {

@@ -411,15 +411,30 @@ pub fn parse_expression(inout cursor: i64, tokens: List<Token>, inout pool: List
     return parse_additive(inout cursor, tokens, inout pool);
 }
 
-// Recursive-descent parser: statement declarations (`let var = expr;` and `return expr;`)
+// Recursive-descent parser: statement declarations (`let var = expr;`, `mut var = expr;`, `return expr;`, assignments)
 pub fn parse_statement(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstStmt {
+    if cursor >= tokens.len() {
+        return AstStmt(is_return: false, target_var: "", expr: None);
+    }
     let tok = tokens[cursor];
-    if tok.kind == 2 {
-        // let <var> = <expr>;
+    if tok.kind == 2 || tok.kind == 3 {
+        // let <var> = <expr>; or mut <var> = <expr>; or let mut <var> = <expr>;
         cursor = cursor + 1;
-        let var_tok = tokens[cursor];
-        let var_name = var_tok.lexeme;
-        cursor = cursor + 1;
+        if cursor < tokens.len() && (tokens[cursor].kind == 2 || tokens[cursor].kind == 3) {
+            cursor = cursor + 1; // Consume optional second 'mut'
+        }
+        mut var_name = "";
+        if cursor < tokens.len() && tokens[cursor].kind == 10 {
+            var_name = tokens[cursor].lexeme;
+            cursor = cursor + 1;
+        }
+        // Optional type annotation `: Type`
+        if cursor < tokens.len() && tokens[cursor].kind == 34 {
+            cursor = cursor + 1; // Consume ':'
+            if cursor < tokens.len() && tokens[cursor].kind == 10 {
+                cursor = cursor + 1; // Consume type
+            }
+        }
         if cursor < tokens.len() && tokens[cursor].kind == 24 {
             cursor = cursor + 1; // Consume '='
         }
@@ -432,8 +447,12 @@ pub fn parse_statement(inout cursor: i64, tokens: List<Token>, inout pool: List<
         return AstStmt(is_return: false, target_var: var_name, expr: ref pool[expr_idx]);
     }
     if tok.kind == 4 {
-        // return <expr>;
+        // return <expr>; or return;
         cursor = cursor + 1;
+        if cursor < tokens.len() && tokens[cursor].kind == 35 {
+            cursor = cursor + 1; // Consume ';'
+            return AstStmt(is_return: true, target_var: "", expr: None);
+        }
         let expr = parse_expression(inout cursor, tokens, inout pool);
         pool.push(expr);
         let expr_idx = pool.len() - 1;
@@ -442,28 +461,98 @@ pub fn parse_statement(inout cursor: i64, tokens: List<Token>, inout pool: List<
         }
         return AstStmt(is_return: true, target_var: "", expr: ref pool[expr_idx]);
     }
+    if tok.kind == 10 {
+        // Reassignment: `var = expr;` or expression statement: `expr;`
+        let ident_name = tok.lexeme;
+        if cursor + 1 < tokens.len() && tokens[cursor + 1].kind == 24 {
+            cursor = cursor + 2; // Consume ident and '='
+            let expr = parse_expression(inout cursor, tokens, inout pool);
+            pool.push(expr);
+            let expr_idx = pool.len() - 1;
+            if cursor < tokens.len() && tokens[cursor].kind == 35 {
+                cursor = cursor + 1; // Consume ';'
+            }
+            return AstStmt(is_return: false, target_var: ident_name, expr: ref pool[expr_idx]);
+        }
+        // Expression statement: function call or expression
+        let expr = parse_expression(inout cursor, tokens, inout pool);
+        pool.push(expr);
+        let expr_idx = pool.len() - 1;
+        if cursor < tokens.len() && tokens[cursor].kind == 35 {
+            cursor = cursor + 1; // Consume ';'
+        }
+        return AstStmt(is_return: false, target_var: "_", expr: ref pool[expr_idx]);
+    }
+    // Advance by 1 to make progress on unrecognized tokens
+    cursor = cursor + 1;
     return AstStmt(is_return: false, target_var: "", expr: None);
 }
 
-// Recursive-descent parser: function declarations (`fn name(param: T) -> R { ... }`)
+// Recursive-descent parser: function declarations (`fn name(...) -> R { ... }`)
 pub fn parse_function(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstFunction {
     cursor = cursor + 1; // Consume 'fn'
-    let fn_tok = tokens[cursor];
-    let fn_name = fn_tok.lexeme;
-    cursor = cursor + 1; // Consume function name
-    cursor = cursor + 1; // Consume '('
-    if cursor < tokens.len() && tokens[cursor].kind == 5 {
-        cursor = cursor + 1; // Consume optional 'inout'
+    mut fn_name = "";
+    if cursor < tokens.len() && tokens[cursor].kind == 10 {
+        fn_name = tokens[cursor].lexeme;
+        cursor = cursor + 1; // Consume function name
     }
-    let param_tok = tokens[cursor];
-    let param_name = param_tok.lexeme;
-    cursor = cursor + 1; // Consume parameter name
-    cursor = cursor + 1; // Consume ':'
-    cursor = cursor + 1; // Consume parameter type
-    cursor = cursor + 1; // Consume ')'
-    cursor = cursor + 1; // Consume '->'
-    cursor = cursor + 1; // Consume return type
-    cursor = cursor + 1; // Consume '{'
+    if cursor < tokens.len() && tokens[cursor].kind == 30 {
+        cursor = cursor + 1; // Consume '('
+    }
+    mut param_name = "";
+    if cursor < tokens.len() && tokens[cursor].kind != 31 {
+        // First parameter
+        if tokens[cursor].kind == 5 || tokens[cursor].kind == 6 || tokens[cursor].kind == 7 {
+            cursor = cursor + 1; // Consume 'inout', 'in', 'sink'
+        }
+        if cursor < tokens.len() && tokens[cursor].kind == 10 {
+            param_name = tokens[cursor].lexeme;
+            cursor = cursor + 1; // Consume parameter name
+        }
+        if cursor < tokens.len() && tokens[cursor].kind == 34 {
+            cursor = cursor + 1; // Consume ':'
+            if cursor < tokens.len() && tokens[cursor].kind == 10 {
+                cursor = cursor + 1; // Consume parameter type
+            }
+        }
+        // Consume any additional parameters (e.g. , y: i64)
+        while cursor < tokens.len() && tokens[cursor].kind == 39 {
+            cursor = cursor + 1; // Consume ','
+            if cursor < tokens.len() && (tokens[cursor].kind == 5 || tokens[cursor].kind == 6 || tokens[cursor].kind == 7) {
+                cursor = cursor + 1;
+            }
+            if cursor < tokens.len() && tokens[cursor].kind == 10 {
+                cursor = cursor + 1;
+            }
+            if cursor < tokens.len() && tokens[cursor].kind == 34 {
+                cursor = cursor + 1;
+                if cursor < tokens.len() && tokens[cursor].kind == 10 {
+                    cursor = cursor + 1;
+                }
+            }
+        }
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 31 {
+        cursor = cursor + 1; // Consume ')'
+    }
+    // Optional return type `-> Type` or `-> (T1, T2)`
+    if cursor < tokens.len() && tokens[cursor].kind == 36 {
+        cursor = cursor + 1; // Consume '->'
+        if cursor < tokens.len() && tokens[cursor].kind == 30 {
+            cursor = cursor + 1; // Consume '('
+            while cursor < tokens.len() && tokens[cursor].kind != 31 {
+                cursor = cursor + 1;
+            }
+            if cursor < tokens.len() && tokens[cursor].kind == 31 {
+                cursor = cursor + 1; // Consume ')'
+            }
+        } else if cursor < tokens.len() && tokens[cursor].kind == 10 {
+            cursor = cursor + 1; // Consume return type name
+        }
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 32 {
+        cursor = cursor + 1; // Consume '{'
+    }
 
     mut stmts: List<AstStmt> = List::new();
     mut parsing = true;
@@ -472,6 +561,8 @@ pub fn parse_function(inout cursor: i64, tokens: List<Token>, inout pool: List<A
             parsing = false;
         } else if tokens[cursor].kind == 33 {
             cursor = cursor + 1; // Consume '}'
+            parsing = false;
+        } else if tokens[cursor].kind == 0 {
             parsing = false;
         } else {
             let stmt = parse_statement(inout cursor, tokens, inout pool);
@@ -1092,7 +1183,10 @@ pub fn parse_program(tokens: List<Token>, inout pool: List<AstExpr>) -> AstProgr
     mut cursor: i64 = 0;
     while cursor < tokens.len() {
         let tok = tokens[cursor];
-        if tok.kind == 15 {
+        if tok.kind == 0 {
+            // EOF sentinel - terminate parsing cleanly
+            cursor = tokens.len();
+        } else if tok.kind == 15 {
             // 'pub' prefix
             if cursor + 1 < tokens.len() {
                 let next = tokens[cursor + 1];
@@ -1697,6 +1791,119 @@ pub fn test_parser_if_else() -> bool {
     return left_name == "x" && right_val == 42 && then_val == 100 && else_val == 0;
 }
 
+// Unit test 18: Function parsing with zero parameters (`fn f() -> i64 { return 42; }`)
+pub fn test_parser_function_zero_arg() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 1, value: 0, lexeme: "fn"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "get_answer"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 36, value: 0, lexeme: "->"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "i64"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 4, value: 0, lexeme: "return"));
+    tokens.push(Token(kind: 11, value: 42, lexeme: "42"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let f = parse_function(inout cur, tokens, inout pool);
+    if f.name != "get_answer" || f.param_name != "" {
+        return false;
+    }
+    if f.statements.len() != 1 {
+        return false;
+    }
+    let val = f.statements[0].expr?.val ?? 0;
+    return val == 42;
+}
+
+// Unit test 19: Function parsing with multiple parameters (`fn add(x: i64, y: i64) -> i64 { return x + y; }`)
+pub fn test_parser_function_multi_param() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 1, value: 0, lexeme: "fn"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "add"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "x"));
+    tokens.push(Token(kind: 34, value: 0, lexeme: ":"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "i64"));
+    tokens.push(Token(kind: 39, value: 0, lexeme: ","));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "y"));
+    tokens.push(Token(kind: 34, value: 0, lexeme: ":"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "i64"));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 36, value: 0, lexeme: "->"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "i64"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 4, value: 0, lexeme: "return"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "x"));
+    tokens.push(Token(kind: 20, value: 0, lexeme: "+"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "y"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let f = parse_function(inout cur, tokens, inout pool);
+    if f.name != "add" || f.param_name != "x" {
+        return false;
+    }
+    if f.statements.len() != 1 {
+        return false;
+    }
+    return f.statements[0].is_return;
+}
+
+// Unit test 20: Statement parsing with mut declarations and reassignments
+pub fn test_parser_mut_statements() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 1, value: 0, lexeme: "fn"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "calc"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "x"));
+    tokens.push(Token(kind: 34, value: 0, lexeme: ":"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "i64"));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 36, value: 0, lexeme: "->"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "i64"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    // mut total: i64 = 0;
+    tokens.push(Token(kind: 3, value: 0, lexeme: "mut"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "total"));
+    tokens.push(Token(kind: 34, value: 0, lexeme: ":"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "i64"));
+    tokens.push(Token(kind: 24, value: 0, lexeme: "="));
+    tokens.push(Token(kind: 11, value: 0, lexeme: "0"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    // total = total + x;
+    tokens.push(Token(kind: 10, value: 0, lexeme: "total"));
+    tokens.push(Token(kind: 24, value: 0, lexeme: "="));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "total"));
+    tokens.push(Token(kind: 20, value: 0, lexeme: "+"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "x"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    // return total;
+    tokens.push(Token(kind: 4, value: 0, lexeme: "return"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "total"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let f = parse_function(inout cur, tokens, inout pool);
+    if f.name != "calc" || f.statements.len() != 3 {
+        return false;
+    }
+    if f.statements[0].target_var != "total" || f.statements[0].is_return {
+        return false;
+    }
+    if f.statements[1].target_var != "total" || f.statements[1].is_return {
+        return false;
+    }
+    return f.statements[2].is_return;
+}
+
 pub fn main() {
     println("=== IFA Compiler Parser Module ===");
     let t1 = test_parser_ast_building();
@@ -1716,7 +1923,10 @@ pub fn main() {
     let t15 = test_parser_syntax_macros();
     let t16 = test_parser_while_loop();
     let t17 = test_parser_if_else();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 {
+    let t18 = test_parser_function_zero_arg();
+    let t19 = test_parser_function_multi_param();
+    let t20 = test_parser_mut_statements();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 {
         println("Parser validation tests: ALL PASSED");
     } else {
         println("Parser validation tests: FAILED");

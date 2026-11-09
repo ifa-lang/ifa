@@ -734,31 +734,31 @@ fn is_alnum(c: i64) -> bool {
 
 /// Return the token kind for a known keyword string, or 10 (Ident) if unknown.
 fn keyword_kind(word: String) -> i64 {
-    if word == "fn"      { return 1; }
-    if word == "let"     { return 2; }
-    if word == "mut"     { return 3; }
-    if word == "return"  { return 4; }
-    if word == "inout"   { return 5; }
-    if word == "in"      { return 6; }
-    if word == "sink"    { return 7; }
-    if word == "impl"    { return 8; }
-    if word == "struct"  { return 9; }
-    if word == "trait"   { return 9; }
-    if word == "for"     { return 14; }
-    if word == "pub"     { return 15; }
-    if word == "self"    { return 16; }
-    if word == "type"    { return 17; }
-    if word == "arena"   { return 18; }
-    if word == "const"   { return 19; }
-    if word == "enum"    { return 26; }
-    if word == "while"   { return 27; }
-    if word == "if"      { return 28; }
-    if word == "else"    { return 29; }
-    if word == "match"   { return 13; }
-    if word == "macro"   { return 51; }
+    if word == "fn"       { return 1; }
+    if word == "let"      { return 2; }
+    if word == "mut"      { return 3; }
+    if word == "return"   { return 4; }
+    if word == "inout"    { return 5; }
+    if word == "in"       { return 6; }
+    if word == "sink"     { return 7; }
+    if word == "struct"   { return 8; }
+    if word == "trait"    { return 9; }
+    if word == "impl"     { return 12; }
+    if word == "for"      { return 13; }
+    if word == "match"    { return 14; }
+    if word == "pub"      { return 15; }
+    if word == "self"     { return 16; }
+    if word == "type"     { return 17; }
+    if word == "arena"    { return 18; }
+    if word == "const"    { return 19; }
+    if word == "enum"     { return 26; }
+    if word == "while"    { return 27; }
+    if word == "if"       { return 28; }
+    if word == "else"     { return 29; }
+    if word == "macro"    { return 51; }
     if word == "comptime" { return 52; }
-    if word == "true"    { return 11; }
-    if word == "false"   { return 11; }
+    if word == "true"     { return 11; }
+    if word == "false"    { return 11; }
     return 10;
 }
 
@@ -960,19 +960,20 @@ pub fn tokenize_source(src: String) -> List<Token> {
                                 i = i + 1;
                             }
                             i = i + 1; // consume closing quote
-                            advance_token(inout tokens, 12, 0, sl);
+                            advance_token(inout tokens, 60, 0, sl);
                         } else {
                             // --- Operators and punctuation ---
                             if c == 40 { advance_token(inout tokens, 30, 0, "("); i = i + 1; }
                             if c == 41 { advance_token(inout tokens, 31, 0, ")"); i = i + 1; }
                             if c == 123 { advance_token(inout tokens, 32, 0, "{"); i = i + 1; }
                             if c == 125 { advance_token(inout tokens, 33, 0, "}"); i = i + 1; }
-                            if c == 91  { advance_token(inout tokens, 37, 0, "["); i = i + 1; }
-                            if c == 93  { advance_token(inout tokens, 38, 0, "]"); i = i + 1; }
+                            if c == 91  { advance_token(inout tokens, 61, 0, "["); i = i + 1; }
+                            if c == 93  { advance_token(inout tokens, 62, 0, "]"); i = i + 1; }
                             if c == 59  { advance_token(inout tokens, 35, 0, ";"); i = i + 1; }
                             if c == 44  { advance_token(inout tokens, 39, 0, ","); i = i + 1; }
+                            if c == 46  { advance_token(inout tokens, 42, 0, "."); i = i + 1; }
                             if c == 36  { advance_token(inout tokens, 53, 0, "$"); i = i + 1; }
-                            if c == 95  { advance_token(inout tokens, 10, 0, "_"); i = i + 1; }
+                            if c == 95  { advance_token(inout tokens, 38, 0, "_"); i = i + 1; }
                             // Colon / double-colon
                             if c == 58 {
                                 let nc = string_char_at(src, i + 1);
@@ -984,7 +985,7 @@ pub fn tokenize_source(src: String) -> List<Token> {
                                     i = i + 1;
                                 }
                             }
-                            // = or ==
+                            // = or == or =>
                             if c == 61 {
                                 let nc = string_char_at(src, i + 1);
                                 if nc == 61 {
@@ -992,7 +993,7 @@ pub fn tokenize_source(src: String) -> List<Token> {
                                     i = i + 2;
                                 } else {
                                     if nc == 62 {
-                                        advance_token(inout tokens, 25, 0, "=>");
+                                        advance_token(inout tokens, 37, 0, "=>");
                                         i = i + 2;
                                     } else {
                                         advance_token(inout tokens, 24, 0, "=");
