@@ -236,6 +236,33 @@ pub struct AstMatch {
     arms: List<AstMatchArm>
 }
 
+// High-level AST Nested Pattern node (tuples, guards, and nested sub-patterns)
+pub struct AstNestedPattern {
+    kind: i64,          // 1: Wildcard, 2: Literal, 3: Binding, 4: Tuple, 5: Guarded
+    val: i64,
+    name: String,
+    sub_pat1_kind: i64, // 1: Wildcard, 2: Literal, 3: Binding
+    sub_pat1_val: i64,
+    sub_pat1_name: String,
+    sub_pat2_kind: i64, // 1: Wildcard, 2: Literal, 3: Binding
+    sub_pat2_val: i64,
+    sub_pat2_name: String,
+    has_guard: bool,
+    guard_val: i64
+}
+
+// High-level AST Nested Match Arm node (`nested_pattern => expression`)
+pub struct AstNestedMatchArm {
+    pat: AstNestedPattern,
+    expr: ?ref AstExpr
+}
+
+// High-level AST Nested Match Expression node
+pub struct AstNestedMatch {
+    target_var: String,
+    arms: List<AstNestedMatchArm>
+}
+
 // High-level AST Type Alias node (`type Name = TargetType;` or `pub type Name = TargetType;`)
 pub struct AstTypeAlias {
     is_pub: bool,
@@ -243,10 +270,12 @@ pub struct AstTypeAlias {
     target_ty: String
 }
 
-// High-level AST Arena declaration node (`arena scratch;`)
+// High-level AST Arena declaration node (`arena scratch;` or `arena cow scratch = 65536;`)
 pub struct AstArenaDecl {
     name: String,
-    capacity: i64
+    capacity: i64,
+    is_cow: bool,
+    page_size: i64
 }
 
 // High-level AST Constant declaration node (`pub const Name: Ty = Val;`)
@@ -906,6 +935,161 @@ pub fn parse_match(inout cursor: i64, tokens: List<Token>, inout pool: List<AstE
     return AstMatch(target_var: target_name, arms: arms);
 }
 
+// High-level parser: nested patterns with tuple destructuring and guards:
+// e.g. `_`, `42`, `(0, y)`, `(x, y) if x == y`
+pub fn parse_nested_pattern(inout cursor: i64, tokens: List<Token>) -> AstNestedPattern {
+    if cursor >= tokens.len() {
+        return AstNestedPattern(
+            kind: 1, val: 0, name: "_",
+            sub_pat1_kind: 0, sub_pat1_val: 0, sub_pat1_name: "",
+            sub_pat2_kind: 0, sub_pat2_val: 0, sub_pat2_name: "",
+            has_guard: false, guard_val: 0
+        );
+    }
+    let tok = tokens[cursor];
+    // 1. Wildcard `_`
+    if tok.kind == 38 {
+        cursor = cursor + 1;
+        return AstNestedPattern(
+            kind: 1, val: 0, name: "_",
+            sub_pat1_kind: 0, sub_pat1_val: 0, sub_pat1_name: "",
+            sub_pat2_kind: 0, sub_pat2_val: 0, sub_pat2_name: "",
+            has_guard: false, guard_val: 0
+        );
+    }
+    // 2. Integer literal
+    if tok.kind == 11 {
+        cursor = cursor + 1;
+        return AstNestedPattern(
+            kind: 2, val: tok.value, name: "",
+            sub_pat1_kind: 0, sub_pat1_val: 0, sub_pat1_name: "",
+            sub_pat2_kind: 0, sub_pat2_val: 0, sub_pat2_name: "",
+            has_guard: false, guard_val: 0
+        );
+    }
+    // 3. Tuple pattern: `(p1, p2)` or `(p1, p2) if guard`
+    if tok.kind == 30 {
+        cursor = cursor + 1; // Consume '('
+        mut p1_k: i64 = 1;
+        mut p1_v: i64 = 0;
+        mut p1_n = "";
+        if cursor < tokens.len() {
+            let t1 = tokens[cursor];
+            if t1.kind == 38 {
+                p1_k = 1;
+                cursor = cursor + 1;
+            } else if t1.kind == 11 {
+                p1_k = 2;
+                p1_v = t1.value;
+                cursor = cursor + 1;
+            } else if t1.kind == 10 {
+                p1_k = 3;
+                p1_n = t1.lexeme;
+                cursor = cursor + 1;
+            }
+        }
+        if cursor < tokens.len() && tokens[cursor].kind == 39 {
+            cursor = cursor + 1; // Consume ','
+        }
+        mut p2_k: i64 = 1;
+        mut p2_v: i64 = 0;
+        mut p2_n = "";
+        if cursor < tokens.len() {
+            let t2 = tokens[cursor];
+            if t2.kind == 38 {
+                p2_k = 1;
+                cursor = cursor + 1;
+            } else if t2.kind == 11 {
+                p2_k = 2;
+                p2_v = t2.value;
+                cursor = cursor + 1;
+            } else if t2.kind == 10 {
+                p2_k = 3;
+                p2_n = t2.lexeme;
+                cursor = cursor + 1;
+            }
+        }
+        if cursor < tokens.len() && tokens[cursor].kind == 31 {
+            cursor = cursor + 1; // Consume ')'
+        }
+        mut has_guard = false;
+        mut guard_val: i64 = 0;
+        if cursor < tokens.len() && tokens[cursor].kind == 28 {
+            // 'if' guard
+            cursor = cursor + 1; // Consume 'if'
+            has_guard = true;
+            // Parse simple guard expression until '=>'
+            while cursor < tokens.len() && tokens[cursor].kind != 37 {
+                if tokens[cursor].kind == 11 {
+                    guard_val = tokens[cursor].value;
+                }
+                cursor = cursor + 1;
+            }
+        }
+        return AstNestedPattern(
+            kind: 4, val: 0, name: "tuple",
+            sub_pat1_kind: p1_k, sub_pat1_val: p1_v, sub_pat1_name: p1_n,
+            sub_pat2_kind: p2_k, sub_pat2_val: p2_v, sub_pat2_name: p2_n,
+            has_guard: has_guard, guard_val: guard_val
+        );
+    }
+    // 4. Identifier binding: `x`
+    if tok.kind == 10 {
+        let id_name = tok.lexeme;
+        cursor = cursor + 1;
+        return AstNestedPattern(
+            kind: 3, val: 0, name: id_name,
+            sub_pat1_kind: 0, sub_pat1_val: 0, sub_pat1_name: "",
+            sub_pat2_kind: 0, sub_pat2_val: 0, sub_pat2_name: "",
+            has_guard: false, guard_val: 0
+        );
+    }
+    return AstNestedPattern(
+        kind: 1, val: 0, name: "_",
+        sub_pat1_kind: 0, sub_pat1_val: 0, sub_pat1_name: "",
+        sub_pat2_kind: 0, sub_pat2_val: 0, sub_pat2_name: "",
+        has_guard: false, guard_val: 0
+    );
+}
+
+// High-level parser: nested match expressions (`match target { (0, y) => expr, ... }`)
+pub fn parse_nested_match(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstNestedMatch {
+    cursor = cursor + 1; // Consume 'match'
+    let target_name = tokens[cursor].lexeme;
+    cursor = cursor + 1; // Consume target variable
+
+    if cursor < tokens.len() && tokens[cursor].kind == 32 {
+        cursor = cursor + 1; // Consume '{'
+    }
+
+    mut arms: List<AstNestedMatchArm> = List::new();
+    mut parsing = true;
+    while parsing {
+        if cursor >= tokens.len() {
+            parsing = false;
+        } else if tokens[cursor].kind == 33 {
+            cursor = cursor + 1; // Consume '}'
+            parsing = false;
+        } else {
+            let pat = parse_nested_pattern(inout cursor, tokens);
+            if cursor < tokens.len() && tokens[cursor].kind == 37 {
+                cursor = cursor + 1; // Consume '=>'
+            }
+            let body_expr = parse_expression(inout cursor, tokens, inout pool);
+            pool.push(body_expr);
+            let body_idx = pool.len() - 1;
+
+            if cursor < tokens.len() && (tokens[cursor].kind == 39 || tokens[cursor].kind == 35) {
+                cursor = cursor + 1; // Consume ',' or ';'
+            }
+
+            arms.push(AstNestedMatchArm(pat: pat, expr: ref pool[body_idx]));
+        }
+    }
+
+    return AstNestedMatch(target_var: target_name, arms: arms);
+}
+
 // High-level parser: trait definitions (`pub trait Name { fn meth(self) -> Ret; }`)
 pub fn parse_trait(inout cursor: i64, tokens: List<Token>) -> AstTrait {
     mut is_pub = false;
@@ -1109,10 +1293,19 @@ pub fn parse_type_alias(inout cursor: i64, tokens: List<Token>) -> AstTypeAlias 
     return AstTypeAlias(is_pub: is_pub, name: name, target_ty: target_ty);
 }
 
-// High-level parser: explicit arena declarations (`arena scratch;` or `arena scratch = 65536;`)
+// High-level parser: explicit arena declarations (`arena scratch;` or `arena cow scratch = 65536;`)
 pub fn parse_arena_decl(inout cursor: i64, tokens: List<Token>) -> AstArenaDecl {
+    mut is_cow = false;
+    if cursor < tokens.len() && tokens[cursor].kind == 54 {
+        is_cow = true;
+        cursor = cursor + 1; // Consume 'cow' prefix
+    }
     if cursor < tokens.len() && tokens[cursor].kind == 18 {
         cursor = cursor + 1; // Consume 'arena'
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 54 {
+        is_cow = true;
+        cursor = cursor + 1; // Consume 'cow' after 'arena'
     }
     mut name = "scratch";
     if cursor < tokens.len() && tokens[cursor].kind == 10 {
@@ -1120,7 +1313,33 @@ pub fn parse_arena_decl(inout cursor: i64, tokens: List<Token>) -> AstArenaDecl 
         cursor = cursor + 1; // Consume arena identifier
     }
     mut capacity: i64 = 65536;
-    if cursor < tokens.len() && tokens[cursor].kind == 24 {
+    mut page_size: i64 = 4096;
+    if cursor < tokens.len() && tokens[cursor].kind == 30 {
+        // Parenthesized parameters: (page_size: 4096, capacity: 65536)
+        cursor = cursor + 1; // Consume '('
+        while cursor < tokens.len() && tokens[cursor].kind != 31 {
+            let opt_name = tokens[cursor].lexeme;
+            cursor = cursor + 1;
+            if cursor < tokens.len() && tokens[cursor].kind == 34 {
+                cursor = cursor + 1; // Consume ':'
+            }
+            if cursor < tokens.len() && tokens[cursor].kind == 11 {
+                let opt_val = tokens[cursor].value;
+                cursor = cursor + 1;
+                if opt_name == "page_size" {
+                    page_size = opt_val;
+                } else if opt_name == "capacity" {
+                    capacity = opt_val;
+                }
+            }
+            if cursor < tokens.len() && tokens[cursor].kind == 39 {
+                cursor = cursor + 1; // Consume ','
+            }
+        }
+        if cursor < tokens.len() && tokens[cursor].kind == 31 {
+            cursor = cursor + 1; // Consume ')'
+        }
+    } else if cursor < tokens.len() && tokens[cursor].kind == 24 {
         cursor = cursor + 1; // Consume '='
         if cursor < tokens.len() && tokens[cursor].kind == 11 {
             capacity = tokens[cursor].value;
@@ -1130,7 +1349,7 @@ pub fn parse_arena_decl(inout cursor: i64, tokens: List<Token>) -> AstArenaDecl 
     if cursor < tokens.len() && tokens[cursor].kind == 35 {
         cursor = cursor + 1; // Consume ';'
     }
-    return AstArenaDecl(name: name, capacity: capacity);
+    return AstArenaDecl(name: name, capacity: capacity, is_cow: is_cow, page_size: page_size);
 }
 
 // High-level parser: constant declarations (`pub const Name: Ty = Val;` or `const Name: Ty = Val;`)
@@ -1476,7 +1695,7 @@ pub fn parse_program(tokens: List<Token>, inout pool: List<AstExpr>) -> AstProgr
         } else if tok.kind == 17 {
             let alias = parse_type_alias(inout cursor, tokens);
             type_aliases.push(alias);
-        } else if tok.kind == 18 {
+        } else if tok.kind == 18 || tok.kind == 54 {
             let ar = parse_arena_decl(inout cursor, tokens);
             arenas.push(ar);
         } else if tok.kind == 19 {
@@ -1736,7 +1955,7 @@ pub fn parse_program_with_diagnostics(
         } else if tok.kind == 17 {
             let alias = parse_type_alias(inout cursor, tokens);
             type_aliases.push(alias);
-        } else if tok.kind == 18 {
+        } else if tok.kind == 18 || tok.kind == 54 {
             let ar = parse_arena_decl(inout cursor, tokens);
             arenas.push(ar);
         } else if tok.kind == 19 {
@@ -2714,6 +2933,65 @@ pub fn test_parser_cow_mutability_annotations() -> bool {
     return true;
 }
 
+// Unit test 28: Advanced Copy-on-Write arena declaration parsing
+pub fn test_parser_advanced_cow_arena_decl() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 18, value: 0, lexeme: "arena"));
+    tokens.push(Token(kind: 54, value: 0, lexeme: "cow"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "cow_ast"));
+    tokens.push(Token(kind: 24, value: 0, lexeme: "="));
+    tokens.push(Token(kind: 11, value: 131072, lexeme: "131072"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+
+    mut cur: i64 = 0;
+    let ar = parse_arena_decl(inout cur, tokens);
+    if ar.name != "cow_ast" || !ar.is_cow || ar.capacity != 131072 || ar.page_size != 4096 {
+        return false;
+    }
+    return true;
+}
+
+// Unit test 29: Nested pattern matching with tuple destructuring and guards
+pub fn test_parser_nested_pattern_matching() -> bool {
+    // match pair { (10, y) => y + 2, _ => 0 }
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 14, value: 0, lexeme: "match"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "pair"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    // Arm 1: (10, y) => y + 2,
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 11, value: 10, lexeme: "10"));
+    tokens.push(Token(kind: 39, value: 0, lexeme: ","));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "y"));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 37, value: 0, lexeme: "=>"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "y"));
+    tokens.push(Token(kind: 20, value: 0, lexeme: "+"));
+    tokens.push(Token(kind: 11, value: 2, lexeme: "2"));
+    tokens.push(Token(kind: 39, value: 0, lexeme: ","));
+    // Arm 2: _ => 0
+    tokens.push(Token(kind: 38, value: 0, lexeme: "_"));
+    tokens.push(Token(kind: 37, value: 0, lexeme: "=>"));
+    tokens.push(Token(kind: 11, value: 0, lexeme: "0"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let m = parse_nested_match(inout cur, tokens, inout pool);
+    if m.target_var != "pair" || m.arms.len() != 2 {
+        return false;
+    }
+    let a1 = m.arms[0];
+    if a1.pat.kind != 4 || a1.pat.sub_pat1_kind != 2 || a1.pat.sub_pat1_val != 10 || a1.pat.sub_pat2_kind != 3 || a1.pat.sub_pat2_name != "y" {
+        return false;
+    }
+    let a2 = m.arms[1];
+    if a2.pat.kind != 1 || a2.pat.name != "_" {
+        return false;
+    }
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Parser Module ===");
     let t1 = test_parser_ast_building();
@@ -2743,7 +3021,9 @@ pub fn main() {
     let t25 = test_parser_syntax_diagnostics();
     let t26 = test_parser_arena_direct_ast_construction();
     let t27 = test_parser_cow_mutability_annotations();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 {
+    let t28 = test_parser_advanced_cow_arena_decl();
+    let t29 = test_parser_nested_pattern_matching();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 {
         println("Parser validation tests: ALL PASSED");
     } else {
         println("Parser validation tests: FAILED");

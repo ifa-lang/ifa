@@ -760,6 +760,8 @@ fn keyword_kind(word: String) -> i64 {
     if word == "else"     { return 29; }
     if word == "macro"    { return 51; }
     if word == "comptime" { return 52; }
+    if word == "cow"      { return 54; }
+    if word == "ref"      { return 55; }
     if word == "true"     { return 11; }
     if word == "false"    { return 11; }
     return 10;
@@ -1244,6 +1246,55 @@ pub fn test_lexer_raw_strings() -> bool {
     return true;
 }
 
+// Unit test: tokenize_source handles explicit Copy-on-Write arena declarations
+pub fn test_lexer_cow_arena() -> bool {
+    let src = "arena cow ast_arena = 65536;";
+    let tokens = tokenize_source(src);
+    // Expected: arena(18), cow(54), ast_arena(10), =(24), 65536(11), ;(35), EOF(0)
+    if tokens.len() != 7 {
+        return false;
+    }
+    if tokens[0].kind != 18 || tokens[0].lexeme != "arena" {
+        return false;
+    }
+    if tokens[1].kind != 54 || tokens[1].lexeme != "cow" {
+        return false;
+    }
+    if tokens[2].kind != 10 || tokens[2].lexeme != "ast_arena" {
+        return false;
+    }
+    if tokens[3].kind != 24 || tokens[4].kind != 11 || tokens[4].value != 65536 {
+        return false;
+    }
+    return tokens[5].kind == 35;
+}
+
+// Unit test: tokenize_source handles nested pattern matching with tuples and guards
+pub fn test_lexer_nested_match() -> bool {
+    let src = "match point { (0, y) => y, (x, y) if x == y => x * 2, _ => 0 }";
+    let tokens = tokenize_source(src);
+    if tokens.len() < 20 {
+        return false;
+    }
+    if tokens[0].kind != 14 || tokens[0].lexeme != "match" {
+        return false;
+    }
+    if tokens[1].kind != 10 || tokens[1].lexeme != "point" {
+        return false;
+    }
+    if tokens[2].kind != 32 { // '{'
+        return false;
+    }
+    // Arm 1 tuple pattern: (0, y) => y
+    if tokens[3].kind != 30 || tokens[4].kind != 11 || tokens[5].kind != 39 || tokens[6].kind != 10 || tokens[7].kind != 31 {
+        return false;
+    }
+    if tokens[8].kind != 37 { // '=>'
+        return false;
+    }
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Lexer Module ===");
     let tokens = tokenize_sample_program();
@@ -1265,7 +1316,9 @@ pub fn main() {
     let t_variadic = test_lexer_variadic_token();
     let t_escapes = test_lexer_complex_string_escapes();
     let t_raw = test_lexer_raw_strings();
-    if t_ok && t_lut && t_alias && t_tuple && t_arena && t_const && t_enum && t_comptime && t_macro && t_while && t_if_else && t_src_basic && t_src_int && t_src_cmt && t_variadic && t_escapes && t_raw {
+    let t_cow_arena = test_lexer_cow_arena();
+    let t_nested_match = test_lexer_nested_match();
+    if t_ok && t_lut && t_alias && t_tuple && t_arena && t_const && t_enum && t_comptime && t_macro && t_while && t_if_else && t_src_basic && t_src_int && t_src_cmt && t_variadic && t_escapes && t_raw && t_cow_arena && t_nested_match {
         println("Lexer stream test: OK");
     } else {
         println("Lexer stream test: FAILED");

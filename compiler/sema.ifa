@@ -1549,17 +1549,17 @@ pub fn make_tuple_nested_pat(
     );
 }
 
-pub struct AstNestedMatchArm {
+pub struct SemaNestedMatchArm {
     pat: AstNestedPattern,
     expr: ?ref AstExpr
 }
 
-pub struct AstNestedMatch {
+pub struct SemaNestedMatch {
     target_pair_val: i64, // Encoded (left * 1000) + right
-    arms: List<AstNestedMatchArm>
+    arms: List<SemaNestedMatchArm>
 }
 
-pub fn eval_nested_pattern_match(m: AstNestedMatch) -> i64 {
+pub fn eval_nested_pattern_match(m: SemaNestedMatch) -> i64 {
     let left_val = m.target_pair_val / 1000;
     let right_val = m.target_pair_val - (left_val * 1000);
 
@@ -1683,12 +1683,12 @@ pub fn test_sema_nested_pattern_matching() -> bool {
     let idx0 = pool.len() - 1;
     let pat3 = make_wildcard_nested_pat();
 
-    mut arms: List<AstNestedMatchArm> = List::new();
-    arms.push(AstNestedMatchArm(pat: pat1, expr: ref pool[idx100]));
-    arms.push(AstNestedMatchArm(pat: pat2, expr: ref pool[sum_idx]));
-    arms.push(AstNestedMatchArm(pat: pat3, expr: ref pool[idx0]));
+    mut arms: List<SemaNestedMatchArm> = List::new();
+    arms.push(SemaNestedMatchArm(pat: pat1, expr: ref pool[idx100]));
+    arms.push(SemaNestedMatchArm(pat: pat2, expr: ref pool[sum_idx]));
+    arms.push(SemaNestedMatchArm(pat: pat3, expr: ref pool[idx0]));
 
-    let nested_match = AstNestedMatch(target_pair_val: target, arms: arms);
+    let nested_match = SemaNestedMatch(target_pair_val: target, arms: arms);
     let match_res = eval_nested_pattern_match(nested_match);
     return match_res == 42;
 }
@@ -2357,6 +2357,149 @@ pub fn test_sema_interprocedural_access_path_propagation() -> bool {
     return true;
 }
 
+// Composes two interprocedural function access summaries across call-chain boundaries:
+// E.g. Upstream caller summary (A -> B) composed with downstream callee summary (B -> C)
+// produces a direct transitively-propagated summary (A -> C).
+pub fn compose_interprocedural_summaries(
+    upstream: FunctionAccessSummary,
+    downstream: FunctionAccessSummary
+) -> FunctionAccessSummary {
+    mut composed = make_function_access_summary(upstream.fn_name + "->" + downstream.fn_name);
+
+    mut k: i64 = 0;
+    while k < upstream.param_paths.len() && k < downstream.param_paths.len() {
+        let p_up = upstream.param_paths[k];
+        let p_down = downstream.param_paths[k];
+
+        // Max mutability mode (0: in, 1: inout, 2: sink)
+        mut mode = p_up.mut_mode;
+        if p_down.mut_mode > mode {
+            mode = p_down.mut_mode;
+        }
+
+        mut combined = make_root_access_path(p_up.root, mode);
+        mut s1: i64 = 0;
+        while s1 < p_up.segments.len() {
+            combined.segments.push(p_up.segments[s1]);
+            s1 = s1 + 1;
+        }
+        mut s2: i64 = 0;
+        while s2 < p_down.segments.len() {
+            combined.segments.push(p_down.segments[s2]);
+            s2 = s2 + 1;
+        }
+        composed.param_paths.push(combined);
+        k = k + 1;
+    }
+
+    return composed;
+}
+
+// Validates concurrent task / fiber access path exclusivity:
+// Asserts that tasks executing concurrently in a task nursery or fiber pool
+// have zero mutable data races (read-read allowed, read-write and write-write forbidden).
+pub fn validate_concurrent_task_exclusivity(
+    task_a_paths: List<AccessPath>,
+    task_b_paths: List<AccessPath>
+) -> bool {
+    mut i: i64 = 0;
+    while i < task_a_paths.len() {
+        let p_a = task_a_paths[i];
+        mut j: i64 = 0;
+        while j < task_b_paths.len() {
+            let p_b = task_b_paths[j];
+            // If either task writes (inout = 1 or sink = 2), paths must be strictly disjoint!
+            if p_a.mut_mode != 0 || p_b.mut_mode != 0 {
+                if !are_access_paths_disjoint(p_a, p_b) {
+                    return false; // Concurrent data race hazard!
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return true; // Provably race-free concurrent execution!
+}
+
+// Unit test 29: Multi-level transitive interprocedural access path propagation (A -> B -> C)
+pub fn test_sema_transitive_interprocedural_access_path_propagation() -> bool {
+    // Upstream (Caller -> Mid): passes param0.sub_left and param1.sub_right
+    mut up_summary = make_function_access_summary("mid_dispatcher");
+    add_summary_path(inout up_summary, make_field_access_path("p0", "sub_left", 1));
+    add_summary_path(inout up_summary, make_field_access_path("p1", "sub_right", 1));
+
+    // Downstream (Mid -> Leaf): mutates leaf_val on both
+    mut down_summary = make_function_access_summary("leaf_worker");
+    add_summary_path(inout down_summary, make_field_access_path("p0", "leaf_val", 1));
+    add_summary_path(inout down_summary, make_field_access_path("p1", "leaf_val", 1));
+
+    // Compose transitive summary: p0.sub_left.leaf_val vs p1.sub_right.leaf_val
+    let composed = compose_interprocedural_summaries(up_summary, down_summary);
+    if composed.param_paths.len() != 2 {
+        return false;
+    }
+
+    // Caller passes same root: root.sub_left.leaf_val vs root.sub_right.leaf_val -> PROVABLY DISJOINT!
+    mut caller_args: List<AccessPath> = List::new();
+    caller_args.push(make_root_access_path("root", 1));
+    caller_args.push(make_root_access_path("root", 1));
+
+    let ok_disjoint = validate_interprocedural_call_exclusivity(caller_args, composed);
+    if !ok_disjoint {
+        return false;
+    }
+
+    // Negative case: Downstream mutates colliding paths on same branch
+    mut colliding_down = make_function_access_summary("leaf_collision");
+    add_summary_path(inout colliding_down, make_field_access_path("p0", "same_leaf", 1));
+    add_summary_path(inout colliding_down, make_field_access_path("p1", "same_leaf", 1));
+
+    mut colliding_up = make_function_access_summary("mid_collision");
+    add_summary_path(inout colliding_up, make_field_access_path("p0", "common_branch", 1));
+    add_summary_path(inout colliding_up, make_field_access_path("p1", "common_branch", 1));
+
+    let composed_collision = compose_interprocedural_summaries(colliding_up, colliding_down);
+    let ok_collision = validate_interprocedural_call_exclusivity(caller_args, composed_collision);
+    if ok_collision {
+        return false; // Must reject aliasing collision!
+    }
+
+    return true;
+}
+
+// Unit test 30: Concurrent task nursery exclusivity with disjoint access paths
+pub fn test_sema_concurrent_task_path_exclusivity() -> bool {
+    // Task 1 mutates buffer[0], Task 2 mutates buffer[1] -> Safe disjoint indices
+    mut t1_paths: List<AccessPath> = List::new();
+    t1_paths.push(make_index_access_path("shared_buf", 0, 1));
+
+    mut t2_paths: List<AccessPath> = List::new();
+    t2_paths.push(make_index_access_path("shared_buf", 1, 1));
+
+    let ok_disjoint_tasks = validate_concurrent_task_exclusivity(t1_paths, t2_paths);
+    if !ok_disjoint_tasks {
+        return false;
+    }
+
+    // Simultaneous write to shared_buf[0] -> Race hazard, must reject!
+    mut t3_paths: List<AccessPath> = List::new();
+    t3_paths.push(make_index_access_path("shared_buf", 0, 1));
+
+    let race_detected = !validate_concurrent_task_exclusivity(t1_paths, t3_paths);
+    if !race_detected {
+        return false;
+    }
+
+    // Concurrent reads on same path (mut_mode == 0) -> Allowed!
+    mut read1_paths: List<AccessPath> = List::new();
+    read1_paths.push(make_field_access_path("config", "max_threads", 0));
+
+    mut read2_paths: List<AccessPath> = List::new();
+    read2_paths.push(make_field_access_path("config", "max_threads", 0));
+
+    return validate_concurrent_task_exclusivity(read1_paths, read2_paths);
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
@@ -2387,7 +2530,9 @@ pub fn main() {
     let t26 = test_sema_cow_inplace_exclusivity();
     let t27 = test_sema_disjoint_access_paths();
     let t28 = test_sema_interprocedural_access_path_propagation();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 {
+    let t29 = test_sema_transitive_interprocedural_access_path_propagation();
+    let t30 = test_sema_concurrent_task_path_exclusivity();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");

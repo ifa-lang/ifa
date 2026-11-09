@@ -661,8 +661,38 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("250 passed; 0 failed"),
-        "Expected 250 passed unit tests, got:\n{}",
+        stdout.contains("test test_lexer_cow_arena ... ok"),
+        "Modular lexer cow arena test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_lexer_nested_match ... ok"),
+        "Modular lexer nested match test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_advanced_cow_arena_decl ... ok"),
+        "Modular parser advanced cow arena decl test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_nested_pattern_matching ... ok"),
+        "Modular parser nested pattern matching test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_transitive_interprocedural_access_path_propagation ... ok"),
+        "Modular sema transitive access path propagation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_concurrent_task_path_exclusivity ... ok"),
+        "Modular sema concurrent task path exclusivity test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("262 passed; 0 failed"),
+        "Expected 262 passed unit tests, got:\n{}",
         stdout
     );
 }
