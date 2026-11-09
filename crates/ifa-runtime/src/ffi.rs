@@ -1055,6 +1055,28 @@ pub extern "C" fn ifa_rt_string_concat(a: *const u8, b: *const u8) -> *mut u8 {
     }
 }
 
+/// Compare two null-terminated UTF-8 C strings for lexicographical equality.
+#[no_mangle]
+pub extern "C" fn ifa_rt_string_eq(a: *const u8, b: *const u8) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.is_null() || b.is_null() {
+        return false;
+    }
+    unsafe {
+        let sa = match std::ffi::CStr::from_ptr(a as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let sb = match std::ffi::CStr::from_ptr(b as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        sa == sb
+    }
+}
+
 /// Convert a 64-bit integer to a heap-allocated null-terminated C string.
 #[no_mangle]
 pub extern "C" fn ifa_rt_string_from_i64(val: i64) -> *mut u8 {
@@ -1297,6 +1319,46 @@ pub extern "C" fn ifa_rt_env_var(name: *const u8) -> *mut u8 {
     };
     let val = std::env::var(name_str).unwrap_or_default();
     let bytes = format!("{}\0", val).into_bytes();
+    let len = bytes.len();
+    let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, len);
+        mem
+    }
+}
+
+/// Query the total number of command-line arguments passed to the process.
+#[no_mangle]
+pub extern "C" fn ifa_rt_args_count() -> i64 {
+    std::env::args().count() as i64
+}
+
+/// Retrieve the command-line argument at the given zero-based index as a heap-allocated C string.
+/// Returns an empty string if index is out of bounds or negative.
+#[no_mangle]
+pub extern "C" fn ifa_rt_args_get(index: i64) -> *mut u8 {
+    let empty_alloc = || {
+        let layout = std::alloc::Layout::from_size_align(1, 1).unwrap();
+        unsafe {
+            let mem = std::alloc::alloc(layout);
+            if !mem.is_null() {
+                *mem = 0;
+            }
+            mem
+        }
+    };
+    if index < 0 {
+        return empty_alloc();
+    }
+    let arg = match std::env::args().nth(index as usize) {
+        Some(s) => s,
+        None => return empty_alloc(),
+    };
+    let bytes = format!("{}\0", arg).into_bytes();
     let len = bytes.len();
     let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
     unsafe {

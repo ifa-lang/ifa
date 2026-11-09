@@ -175,7 +175,10 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_fs_file_size(ptr)\n");
             out.push_str("declare i64 @ifa_rt_process_exec(ptr, ptr)\n");
             out.push_str("declare ptr @ifa_rt_process_exec_output(ptr, ptr)\n");
-            out.push_str("declare ptr @ifa_rt_env_var(ptr)\n\n");
+            out.push_str("declare ptr @ifa_rt_env_var(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_args_count()\n");
+            out.push_str("declare ptr @ifa_rt_args_get(i64)\n");
+            out.push_str("declare i1 @ifa_rt_string_eq(ptr, ptr)\n\n");
         } else {
             out.push_str("; IFA Runtime Intrinsic Declarations\n");
             out.push_str("declare void @ifa_rt_println(ptr)\n");
@@ -250,7 +253,10 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_fs_file_size(ptr)\n");
             out.push_str("declare i64 @ifa_rt_process_exec(ptr, ptr)\n");
             out.push_str("declare ptr @ifa_rt_process_exec_output(ptr, ptr)\n");
-            out.push_str("declare ptr @ifa_rt_env_var(ptr)\n\n");
+            out.push_str("declare ptr @ifa_rt_env_var(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_args_count()\n");
+            out.push_str("declare ptr @ifa_rt_args_get(i64)\n");
+            out.push_str("declare i1 @ifa_rt_string_eq(ptr, ptr)\n\n");
         }
 
         // LLVM Standard Coroutine Intrinsics
@@ -1688,48 +1694,87 @@ impl<'a> LlvmIrEmitter<'a> {
         }
 
         // Also emit synthesized structure definitions (e.g. closures, environment records, generic instances) in deterministic order
-        let mut synthesized_structs: BTreeMap<String, usize> = BTreeMap::new();
-        for func in &module.functions {
-            for p in &func.params {
-                if let ifa_fir::FirType::Struct(name, fields) = &p.ty {
-                    let st_name = INTERNER.resolve(name);
-                    if !declared_structs.contains(&st_name)
-                        && !synthesized_structs.contains_key(&st_name)
-                    {
-                        synthesized_structs.insert(st_name, fields.len());
+        fn collect_struct_names(ty: &ifa_fir::FirType, out: &mut BTreeMap<String, usize>) {
+            match ty {
+                ifa_fir::FirType::Struct(name, fields) => {
+                    let s_name = INTERNER.resolve(name);
+                    let count = if s_name.starts_with("List__") || s_name == "List" {
+                        3
+                    } else {
+                        fields.len().max(1)
+                    };
+                    out.entry(s_name).or_insert(count);
+                    for (_, f_ty) in fields {
+                        collect_struct_names(f_ty, out);
                     }
                 }
-            }
-            if let ifa_fir::FirType::Struct(name, fields) = &func.ret_ty {
-                let st_name = INTERNER.resolve(name);
-                if !declared_structs.contains(&st_name)
-                    && !synthesized_structs.contains_key(&st_name)
-                {
-                    synthesized_structs.insert(st_name, fields.len());
+                ifa_fir::FirType::Pointer(inner)
+                | ifa_fir::FirType::Optional(inner)
+                | ifa_fir::FirType::GenerationalRef(inner)
+                | ifa_fir::FirType::Array(inner, _)
+                | ifa_fir::FirType::Slice(inner) => {
+                    collect_struct_names(inner, out);
                 }
+                ifa_fir::FirType::Range { elem, .. } => {
+                    collect_struct_names(elem, out);
+                }
+                _ => {}
             }
+        }
+
+        let mut synthesized_structs: BTreeMap<String, usize> = BTreeMap::new();
+        for st in &module.structs {
+            for (_, f_ty) in &st.fields {
+                collect_struct_names(f_ty, &mut synthesized_structs);
+            }
+        }
+        for func in &module.functions {
+            for p in &func.params {
+                collect_struct_names(&p.ty, &mut synthesized_structs);
+            }
+            collect_struct_names(&func.ret_ty, &mut synthesized_structs);
             for block in &func.blocks {
+                for (_, p_ty) in &block.params {
+                    collect_struct_names(p_ty, &mut synthesized_structs);
+                }
                 for inst in &block.instructions {
-                    if let ValueExpr::StructInit { name, fields } = &inst.expr {
-                        let st_name = INTERNER.resolve(name);
-                        if !declared_structs.contains(&st_name)
-                            && !synthesized_structs.contains_key(&st_name)
-                        {
-                            synthesized_structs.insert(st_name, fields.len());
+                    match &inst.expr {
+                        ValueExpr::Alloca { ty, .. } => {
+                            collect_struct_names(ty, &mut synthesized_structs);
                         }
+                        ValueExpr::StructInit { name, fields } => {
+                            let s_name = INTERNER.resolve(name);
+                            let count = if s_name.starts_with("List__") || s_name == "List" {
+                                3
+                            } else {
+                                fields.len().max(1)
+                            };
+                            synthesized_structs.entry(s_name).or_insert(count);
+                        }
+                        _ => {}
                     }
                 }
             }
         }
+
+        // Remove explicitly declared structs
+        for st_name in &declared_structs {
+            synthesized_structs.remove(st_name);
+        }
+
         if !synthesized_structs.is_empty() {
             out.push_str("; Synthesized Closure & Environment Structure Definitions\n");
             for (st_name, field_count) in synthesized_structs {
-                let field_types = vec!["i64"; field_count.max(1)];
-                out.push_str(&format!(
-                    "%struct.{} = type {{ {} }}\n",
-                    st_name,
-                    field_types.join(", ")
-                ));
+                if st_name.starts_with("List__") || st_name == "List" {
+                    out.push_str(&format!("%struct.{} = type {{ ptr, i64, i64 }}\n", st_name));
+                } else {
+                    let field_types = vec!["i64"; field_count.max(1)];
+                    out.push_str(&format!(
+                        "%struct.{} = type {{ {} }}\n",
+                        st_name,
+                        field_types.join(", ")
+                    ));
+                }
             }
             out.push('\n');
         }
@@ -2196,8 +2241,50 @@ impl<'a> LlvmIrEmitter<'a> {
                             Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
                                 ifa_fir::FirType::Array(elem, _)
                                 | ifa_fir::FirType::Slice(elem) => (**elem).clone(),
+                                ifa_fir::FirType::Struct(s_sym, _) => {
+                                    let s_name = INTERNER.resolve(s_sym);
+                                    if let Some(elem_name) = s_name.strip_prefix("List__") {
+                                        match elem_name {
+                                            "string" | "String" => ifa_fir::FirType::String,
+                                            "i64" | "int" => {
+                                                ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                                            }
+                                            "i32" => {
+                                                ifa_fir::FirType::Int(ifa_sema::types::IntType::I32)
+                                            }
+                                            "bool" => ifa_fir::FirType::Bool,
+                                            other => ifa_fir::FirType::Struct(
+                                                INTERNER.intern(other),
+                                                Vec::new(),
+                                            ),
+                                        }
+                                    } else {
+                                        ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                                    }
+                                }
                                 _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
                             },
+                            Some(ifa_fir::FirType::Struct(s_sym, _)) => {
+                                let s_name = INTERNER.resolve(s_sym);
+                                if let Some(elem_name) = s_name.strip_prefix("List__") {
+                                    match elem_name {
+                                        "string" | "String" => ifa_fir::FirType::String,
+                                        "i64" | "int" => {
+                                            ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                                        }
+                                        "i32" => {
+                                            ifa_fir::FirType::Int(ifa_sema::types::IntType::I32)
+                                        }
+                                        "bool" => ifa_fir::FirType::Bool,
+                                        other => ifa_fir::FirType::Struct(
+                                            INTERNER.intern(other),
+                                            Vec::new(),
+                                        ),
+                                    }
+                                } else {
+                                    ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                                }
+                            }
                             _ => ifa_fir::FirType::Int(ifa_sema::types::IntType::I64),
                         },
                         ValueExpr::SliceSub { base, .. } | ValueExpr::SliceStrided { base, .. } => {
@@ -2272,6 +2359,38 @@ impl<'a> LlvmIrEmitter<'a> {
                                 } else {
                                     ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                                 }
+                            } else if callee == "process::args_get"
+                                || callee == "env::args_get"
+                                || callee == "args_get"
+                                || callee == "ifa_rt_args_get"
+                                || callee == "process::env_var"
+                                || callee == "env_var"
+                                || callee == "ifa_rt_env_var"
+                                || callee == "fs::read_to_string"
+                                || callee == "read_to_string"
+                                || callee == "ifa_rt_fs_read_to_string"
+                            {
+                                ifa_fir::FirType::String
+                            } else if callee == "fs::exists"
+                                || callee == "exists"
+                                || callee == "ifa_rt_fs_exists"
+                                || callee == "fs::write_string"
+                                || callee == "write_string"
+                                || callee == "ifa_rt_fs_write_string"
+                            {
+                                ifa_fir::FirType::Bool
+                            } else if callee == "process::args_count"
+                                || callee == "env::args_count"
+                                || callee == "args_count"
+                                || callee == "ifa_rt_args_count"
+                                || callee == "process::exec"
+                                || callee == "exec"
+                                || callee == "ifa_rt_process_exec"
+                                || callee == "fs::file_size"
+                                || callee == "file_size"
+                                || callee == "ifa_rt_fs_file_size"
+                            {
+                                ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                             } else if let Some(target_fn) =
                                 module.functions.iter().find(|f| f.name == *name)
                             {
@@ -2306,7 +2425,15 @@ impl<'a> LlvmIrEmitter<'a> {
                             ))),
                         },
                         ValueExpr::GenDeref { ref_val } => match value_types.get(ref_val) {
-                            Some(ifa_fir::FirType::GenerationalRef(inner)) => (**inner).clone(),
+                            Some(ifa_fir::FirType::GenerationalRef(inner)) => {
+                                ifa_fir::FirType::Pointer(Box::new((**inner).clone()))
+                            }
+                            Some(ifa_fir::FirType::Optional(opt_inner)) => match &**opt_inner {
+                                ifa_fir::FirType::GenerationalRef(inner) => {
+                                    ifa_fir::FirType::Pointer(Box::new((**inner).clone()))
+                                }
+                                other => ifa_fir::FirType::Pointer(Box::new(other.clone())),
+                            },
                             _ => ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Int(
                                 ifa_sema::types::IntType::I64,
                             ))),
@@ -2885,6 +3012,127 @@ impl<'a> LlvmIrEmitter<'a> {
                         "  %v{} = {} {} %v{}, %v{}\n",
                         res_id, op_str, ty_str, lhs.0, rhs.0
                     ));
+                } else if matches!(
+                    value_types.get(lhs),
+                    Some(ifa_fir::FirType::String) | Some(ifa_fir::FirType::Str)
+                ) || matches!(
+                    value_types.get(rhs),
+                    Some(ifa_fir::FirType::String) | Some(ifa_fir::FirType::Str)
+                ) {
+                    if *op == BinaryOp::Eq {
+                        out.push_str(&format!(
+                            "  %v{} = call i1 @ifa_rt_string_eq(ptr %v{}, ptr %v{})\n",
+                            res_id, lhs.0, rhs.0
+                        ));
+                    } else if *op == BinaryOp::Ne {
+                        out.push_str(&format!(
+                            "  %cmp_eq_{} = call i1 @ifa_rt_string_eq(ptr %v{}, ptr %v{})\n",
+                            res_id, lhs.0, rhs.0
+                        ));
+                        out.push_str(&format!(
+                            "  %v{} = xor i1 %cmp_eq_{}, true\n",
+                            res_id, res_id
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  %v{} = icmp eq ptr %v{}, %v{}\n",
+                            res_id, lhs.0, rhs.0
+                        ));
+                    }
+                } else if matches!(value_types.get(lhs), Some(ifa_fir::FirType::Optional(_)))
+                    || matches!(value_types.get(rhs), Some(ifa_fir::FirType::Optional(_)))
+                {
+                    let (opt_val, opt_ty) =
+                        if matches!(value_types.get(lhs), Some(ifa_fir::FirType::Optional(_))) {
+                            (lhs, value_types.get(lhs).unwrap())
+                        } else {
+                            (rhs, value_types.get(rhs).unwrap())
+                        };
+                    let opt_llvm_ty = fir_to_llvm_type(opt_ty)?;
+                    out.push_str(&format!(
+                        "  %has_val_{} = extractvalue {} %v{}, 0\n",
+                        res_id, opt_llvm_ty, opt_val.0
+                    ));
+                    if *op == BinaryOp::Eq {
+                        out.push_str(&format!(
+                            "  %v{} = xor i1 %has_val_{}, true\n",
+                            res_id, res_id
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  %v{} = or i1 %has_val_{}, false\n",
+                            res_id, res_id
+                        ));
+                    }
+                } else if matches!(
+                    value_types.get(lhs),
+                    Some(ifa_fir::FirType::GenerationalRef(_))
+                ) || matches!(
+                    value_types.get(rhs),
+                    Some(ifa_fir::FirType::GenerationalRef(_))
+                ) {
+                    let (gr_val, other_val) = if matches!(
+                        value_types.get(lhs),
+                        Some(ifa_fir::FirType::GenerationalRef(_))
+                    ) {
+                        (lhs, rhs)
+                    } else {
+                        (rhs, lhs)
+                    };
+                    out.push_str(&format!(
+                        "  %gr_p_{} = extractvalue {{ ptr, i32, i16, i16 }} %v{}, 0\n",
+                        res_id, gr_val.0
+                    ));
+                    let cmp_inst = if *op == BinaryOp::Eq {
+                        "icmp eq"
+                    } else {
+                        "icmp ne"
+                    };
+                    if matches!(
+                        value_types.get(other_val),
+                        Some(ifa_fir::FirType::GenerationalRef(_))
+                    ) {
+                        out.push_str(&format!(
+                            "  %gr_p2_{} = extractvalue {{ ptr, i32, i16, i16 }} %v{}, 0\n",
+                            res_id, other_val.0
+                        ));
+                        out.push_str(&format!(
+                            "  %v{} = {} ptr %gr_p_{}, %gr_p2_{}\n",
+                            res_id, cmp_inst, res_id, res_id
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  %v{} = {} ptr %gr_p_{}, null\n",
+                            res_id, cmp_inst, res_id
+                        ));
+                    }
+                } else if matches!(value_types.get(lhs), Some(ifa_fir::FirType::Pointer(_)))
+                    || matches!(value_types.get(rhs), Some(ifa_fir::FirType::Pointer(_)))
+                {
+                    let cmp_inst = if *op == BinaryOp::Eq {
+                        "icmp eq"
+                    } else {
+                        "icmp ne"
+                    };
+                    if matches!(value_types.get(lhs), Some(ifa_fir::FirType::Pointer(_)))
+                        && matches!(value_types.get(rhs), Some(ifa_fir::FirType::Pointer(_)))
+                    {
+                        out.push_str(&format!(
+                            "  %v{} = {} ptr %v{}, %v{}\n",
+                            res_id, cmp_inst, lhs.0, rhs.0
+                        ));
+                    } else {
+                        let ptr_val =
+                            if matches!(value_types.get(lhs), Some(ifa_fir::FirType::Pointer(_))) {
+                                lhs.0
+                            } else {
+                                rhs.0
+                            };
+                        out.push_str(&format!(
+                            "  %v{} = {} ptr %v{}, null\n",
+                            res_id, cmp_inst, ptr_val
+                        ));
+                    }
                 } else {
                     let int_ty_str = match value_types.get(lhs) {
                         Some(ifa_fir::FirType::Int(i)) => match i {
@@ -3005,9 +3253,11 @@ impl<'a> LlvmIrEmitter<'a> {
                     "fs::write_string" | "write_string" => "ifa_rt_fs_write_string",
                     "fs::exists" | "exists" => "ifa_rt_fs_exists",
                     "fs::file_size" | "file_size" => "ifa_rt_fs_file_size",
-                    "process::exec" => "ifa_rt_process_exec",
-                    "process::exec_output" => "ifa_rt_process_exec_output",
-                    "process::env_var" => "ifa_rt_env_var",
+                    "process::exec" | "exec" => "ifa_rt_process_exec",
+                    "process::exec_output" | "exec_output" => "ifa_rt_process_exec_output",
+                    "process::env_var" | "env_var" => "ifa_rt_env_var",
+                    "process::args_count" | "env::args_count" | "args_count" => "ifa_rt_args_count",
+                    "process::args_get" | "env::args_get" | "args_get" => "ifa_rt_args_get",
                     _ => callee.as_str(),
                 };
                 let callee_name = norm_callee;
@@ -3043,9 +3293,16 @@ impl<'a> LlvmIrEmitter<'a> {
                         let params: Vec<String> = target_fn
                             .params
                             .iter()
-                            .map(|p| match &p.ty {
-                                ifa_fir::FirType::Array(..) => "ptr".to_string(),
-                                _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()),
+                            .map(|p| {
+                                if p.mode == ifa_fir::ParamMode::InOut {
+                                    "ptr".to_string()
+                                } else {
+                                    match &p.ty {
+                                        ifa_fir::FirType::Array(..) => "ptr".to_string(),
+                                        _ => fir_to_llvm_type(&p.ty)
+                                            .unwrap_or_else(|_| "i64".to_string()),
+                                    }
+                                }
                             })
                             .collect();
                         (ret_ty, params)
@@ -3069,6 +3326,10 @@ impl<'a> LlvmIrEmitter<'a> {
                         )
                     } else if norm_callee == "ifa_rt_env_var" {
                         ("ptr".to_string(), vec!["ptr".to_string()])
+                    } else if norm_callee == "ifa_rt_args_count" {
+                        ("i64".to_string(), Vec::new())
+                    } else if norm_callee == "ifa_rt_args_get" {
+                        ("ptr".to_string(), vec!["i64".to_string()])
                     } else if callee.starts_with("ifa_simd_")
                         || callee.starts_with("ifa_simd_arena_")
                     {
@@ -3251,9 +3512,16 @@ impl<'a> LlvmIrEmitter<'a> {
                         let params: Vec<String> = target_fn
                             .params
                             .iter()
-                            .map(|p| match &p.ty {
-                                ifa_fir::FirType::Array(..) => "ptr".to_string(),
-                                _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()),
+                            .map(|p| {
+                                if p.mode == ifa_fir::ParamMode::InOut {
+                                    "ptr".to_string()
+                                } else {
+                                    match &p.ty {
+                                        ifa_fir::FirType::Array(..) => "ptr".to_string(),
+                                        _ => fir_to_llvm_type(&p.ty)
+                                            .unwrap_or_else(|_| "i64".to_string()),
+                                    }
+                                }
                             })
                             .collect();
                         (ret_ty, params)
@@ -3503,6 +3771,18 @@ impl<'a> LlvmIrEmitter<'a> {
                         ));
                         format!("%gep_slice_ptr_{}", res_id)
                     }
+                    Some(ifa_fir::FirType::Struct(s_sym, _)) => {
+                        let s_name = INTERNER.resolve(s_sym);
+                        out.push_str(&format!(
+                            "  %st_gep_slot_{} = alloca %struct.{}, align 8\n",
+                            res_id, s_name
+                        ));
+                        out.push_str(&format!(
+                            "  store %struct.{} %v{}, ptr %st_gep_slot_{}, align 8\n",
+                            s_name, base.0, res_id
+                        ));
+                        format!("%st_gep_slot_{}", res_id)
+                    }
                     _ => array_ptrs
                         .get(base)
                         .cloned()
@@ -3543,11 +3823,54 @@ impl<'a> LlvmIrEmitter<'a> {
                     res_id, elem_ty_str, ptr_operand, effective_idx
                 ));
             }
-            ValueExpr::GenRef { ptr } | ValueExpr::GenDeref { ref_val: ptr } => {
+            ValueExpr::GenRef { ptr } => {
+                let gen_ref_ty = "{ ptr, i32, i16, i16 }";
                 out.push_str(&format!(
-                    "  %v{} = getelementptr i8, ptr %v{}, i64 0\n",
-                    res_id, ptr.0
+                    "  %t_gr1_{} = insertvalue {} undef, ptr %v{}, 0\n",
+                    res_id, gen_ref_ty, ptr.0
                 ));
+                out.push_str(&format!(
+                    "  %t_gr2_{} = insertvalue {} %t_gr1_{}, i32 1, 1\n",
+                    res_id, gen_ref_ty, res_id
+                ));
+                out.push_str(&format!(
+                    "  %t_gr3_{} = insertvalue {} %t_gr2_{}, i16 0, 2\n",
+                    res_id, gen_ref_ty, res_id
+                ));
+                out.push_str(&format!(
+                    "  %v{} = insertvalue {} %t_gr3_{}, i16 0, 3\n",
+                    res_id, gen_ref_ty, res_id
+                ));
+            }
+            ValueExpr::GenDeref { ref_val: ptr } => {
+                let ref_ty = value_types.get(ptr);
+                match ref_ty {
+                    Some(ifa_fir::FirType::Optional(inner))
+                        if matches!(&**inner, ifa_fir::FirType::GenerationalRef(_)) =>
+                    {
+                        let opt_ty = fir_to_llvm_type(ref_ty.unwrap())?;
+                        out.push_str(&format!(
+                            "  %gr_{} = extractvalue {} %v{}, 1\n",
+                            res_id, opt_ty, ptr.0
+                        ));
+                        out.push_str(&format!(
+                            "  %v{} = extractvalue {{ ptr, i32, i16, i16 }} %gr_{}, 0\n",
+                            res_id, res_id
+                        ));
+                    }
+                    Some(ifa_fir::FirType::GenerationalRef(_)) => {
+                        out.push_str(&format!(
+                            "  %v{} = extractvalue {{ ptr, i32, i16, i16 }} %v{}, 0\n",
+                            res_id, ptr.0
+                        ));
+                    }
+                    _ => {
+                        out.push_str(&format!(
+                            "  %v{} = getelementptr i8, ptr %v{}, i64 0\n",
+                            res_id, ptr.0
+                        ));
+                    }
+                }
             }
             ValueExpr::GetElement { base, index } => {
                 let base_ty = value_types.get(base);
@@ -3562,8 +3885,53 @@ impl<'a> LlvmIrEmitter<'a> {
                             fir_to_llvm_type(elem).unwrap_or_else(|_| "i64".to_string()),
                             llvm_align_for_type(elem),
                         ),
+                        ifa_fir::FirType::Struct(s_sym, _) => {
+                            let s_name = INTERNER.resolve(s_sym);
+                            if let Some(elem_name) = s_name.strip_prefix("List__") {
+                                let elem_ty = match elem_name {
+                                    "string" | "String" => ifa_fir::FirType::String,
+                                    "i64" | "int" => {
+                                        ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                                    }
+                                    "i32" => ifa_fir::FirType::Int(ifa_sema::types::IntType::I32),
+                                    "bool" => ifa_fir::FirType::Bool,
+                                    other => {
+                                        ifa_fir::FirType::Struct(INTERNER.intern(other), Vec::new())
+                                    }
+                                };
+                                (
+                                    fir_to_llvm_type(&elem_ty)
+                                        .unwrap_or_else(|_| "i64".to_string()),
+                                    llvm_align_for_type(&elem_ty),
+                                )
+                            } else {
+                                ("i64".to_string(), 8)
+                            }
+                        }
                         _ => ("i64".to_string(), 8),
                     },
+                    Some(ifa_fir::FirType::Struct(s_sym, _)) => {
+                        let s_name = INTERNER.resolve(s_sym);
+                        if let Some(elem_name) = s_name.strip_prefix("List__") {
+                            let elem_ty = match elem_name {
+                                "string" | "String" => ifa_fir::FirType::String,
+                                "i64" | "int" => {
+                                    ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+                                }
+                                "i32" => ifa_fir::FirType::Int(ifa_sema::types::IntType::I32),
+                                "bool" => ifa_fir::FirType::Bool,
+                                other => {
+                                    ifa_fir::FirType::Struct(INTERNER.intern(other), Vec::new())
+                                }
+                            };
+                            (
+                                fir_to_llvm_type(&elem_ty).unwrap_or_else(|_| "i64".to_string()),
+                                llvm_align_for_type(&elem_ty),
+                            )
+                        } else {
+                            ("i64".to_string(), 8)
+                        }
+                    }
                     _ => ("i64".to_string(), 8),
                 };
                 let ptr_operand = match base_ty {
@@ -3586,6 +3954,48 @@ impl<'a> LlvmIrEmitter<'a> {
                             res_id, res_id
                         ));
                         format!("%slice_elem_ptr_{}", res_id)
+                    }
+                    Some(ifa_fir::FirType::Pointer(inner))
+                        if matches!(&**inner, ifa_fir::FirType::Struct(..)) =>
+                    {
+                        if let ifa_fir::FirType::Struct(s_sym, _) = &**inner {
+                            let s_name = INTERNER.resolve(s_sym);
+                            if s_name.starts_with("List__") || s_name == "List" {
+                                out.push_str(&format!(
+                                    "  %list_data_ptr_{} = getelementptr inbounds %struct.{}, ptr %v{}, i32 0, i32 0\n",
+                                    res_id, s_name, base.0
+                                ));
+                                out.push_str(&format!(
+                                    "  %list_data_{} = load ptr, ptr %list_data_ptr_{}, align 8\n",
+                                    res_id, res_id
+                                ));
+                                format!("%list_data_{}", res_id)
+                            } else {
+                                format!("%v{}", base.0)
+                            }
+                        } else {
+                            format!("%v{}", base.0)
+                        }
+                    }
+                    Some(ifa_fir::FirType::Struct(s_sym, _)) => {
+                        let s_name = INTERNER.resolve(s_sym);
+                        if s_name.starts_with("List__") || s_name == "List" {
+                            out.push_str(&format!(
+                                "  %list_data_{} = extractvalue %struct.{} %v{}, 0\n",
+                                res_id, s_name, base.0
+                            ));
+                            format!("%list_data_{}", res_id)
+                        } else {
+                            out.push_str(&format!(
+                                "  %st_idx_slot_{} = alloca %struct.{}, align 8\n",
+                                res_id, s_name
+                            ));
+                            out.push_str(&format!(
+                                "  store %struct.{} %v{}, ptr %st_idx_slot_{}, align 8\n",
+                                s_name, base.0, res_id
+                            ));
+                            format!("%st_idx_slot_{}", res_id)
+                        }
                     }
                     Some(ifa_fir::FirType::Array(..)) => array_ptrs
                         .get(base)
@@ -4716,9 +5126,11 @@ impl<'a> LlvmIrEmitter<'a> {
                     "fs::write_string" | "write_string" => "ifa_rt_fs_write_string",
                     "fs::exists" | "exists" => "ifa_rt_fs_exists",
                     "fs::file_size" | "file_size" => "ifa_rt_fs_file_size",
-                    "process::exec" => "ifa_rt_process_exec",
-                    "process::exec_output" => "ifa_rt_process_exec_output",
-                    "process::env_var" => "ifa_rt_env_var",
+                    "process::exec" | "exec" => "ifa_rt_process_exec",
+                    "process::exec_output" | "exec_output" => "ifa_rt_process_exec_output",
+                    "process::env_var" | "env_var" => "ifa_rt_env_var",
+                    "process::args_count" | "env::args_count" | "args_count" => "ifa_rt_args_count",
+                    "process::args_get" | "env::args_get" | "args_get" => "ifa_rt_args_get",
                     _ => callee.as_str(),
                 };
                 let callee_name = norm_callee;
@@ -4751,9 +5163,16 @@ impl<'a> LlvmIrEmitter<'a> {
                         let params: Vec<String> = target_fn
                             .params
                             .iter()
-                            .map(|p| match &p.ty {
-                                ifa_fir::FirType::Array(..) => "ptr".to_string(),
-                                _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()),
+                            .map(|p| {
+                                if p.mode == ifa_fir::ParamMode::InOut {
+                                    "ptr".to_string()
+                                } else {
+                                    match &p.ty {
+                                        ifa_fir::FirType::Array(..) => "ptr".to_string(),
+                                        _ => fir_to_llvm_type(&p.ty)
+                                            .unwrap_or_else(|_| "i64".to_string()),
+                                    }
+                                }
                             })
                             .collect();
                         (ret_ty, params)
@@ -4777,6 +5196,10 @@ impl<'a> LlvmIrEmitter<'a> {
                         )
                     } else if norm_callee == "ifa_rt_env_var" {
                         ("ptr".to_string(), vec!["ptr".to_string()])
+                    } else if norm_callee == "ifa_rt_args_count" {
+                        ("i64".to_string(), Vec::new())
+                    } else if norm_callee == "ifa_rt_args_get" {
+                        ("ptr".to_string(), vec!["i64".to_string()])
                     } else if callee.starts_with("ifa_simd_")
                         || callee.starts_with("ifa_simd_arena_")
                     {
@@ -4916,9 +5339,16 @@ impl<'a> LlvmIrEmitter<'a> {
                         let params: Vec<String> = target_fn
                             .params
                             .iter()
-                            .map(|p| match &p.ty {
-                                ifa_fir::FirType::Array(..) => "ptr".to_string(),
-                                _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()),
+                            .map(|p| {
+                                if p.mode == ifa_fir::ParamMode::InOut {
+                                    "ptr".to_string()
+                                } else {
+                                    match &p.ty {
+                                        ifa_fir::FirType::Array(..) => "ptr".to_string(),
+                                        _ => fir_to_llvm_type(&p.ty)
+                                            .unwrap_or_else(|_| "i64".to_string()),
+                                    }
+                                }
                             })
                             .collect();
                         (ret_ty, params)
@@ -4978,10 +5408,54 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             ValueExpr::GenCheck { ref_val, redundant } => {
                 if !*redundant {
-                    out.push_str(&format!(
-                        "  call void @ifa_rt_gen_check(ptr %v{}, i32 1)\n",
-                        ref_val.0
-                    ));
+                    let ref_ty = value_types.get(ref_val);
+                    match ref_ty {
+                        Some(ifa_fir::FirType::Optional(inner))
+                            if matches!(&**inner, ifa_fir::FirType::GenerationalRef(_)) =>
+                        {
+                            let opt_ty = fir_to_llvm_type(ref_ty.unwrap())?;
+                            let chk_id = *eff_idx;
+                            *eff_idx += 1;
+                            out.push_str(&format!(
+                                "  %gr_chk_{} = extractvalue {} %v{}, 1\n",
+                                chk_id, opt_ty, ref_val.0
+                            ));
+                            out.push_str(&format!(
+                                "  %ptr_chk_{} = extractvalue {{ ptr, i32, i16, i16 }} %gr_chk_{}, 0\n",
+                                chk_id, chk_id
+                            ));
+                            out.push_str(&format!(
+                                "  %gen_chk_{} = extractvalue {{ ptr, i32, i16, i16 }} %gr_chk_{}, 1\n",
+                                chk_id, chk_id
+                            ));
+                            out.push_str(&format!(
+                                "  call void @ifa_rt_gen_check(ptr %ptr_chk_{}, i32 %gen_chk_{})\n",
+                                chk_id, chk_id
+                            ));
+                        }
+                        Some(ifa_fir::FirType::GenerationalRef(_)) => {
+                            let chk_id = *eff_idx;
+                            *eff_idx += 1;
+                            out.push_str(&format!(
+                                "  %ptr_chk_{} = extractvalue {{ ptr, i32, i16, i16 }} %v{}, 0\n",
+                                chk_id, ref_val.0
+                            ));
+                            out.push_str(&format!(
+                                "  %gen_chk_{} = extractvalue {{ ptr, i32, i16, i16 }} %v{}, 1\n",
+                                chk_id, ref_val.0
+                            ));
+                            out.push_str(&format!(
+                                "  call void @ifa_rt_gen_check(ptr %ptr_chk_{}, i32 %gen_chk_{})\n",
+                                chk_id, chk_id
+                            ));
+                        }
+                        _ => {
+                            out.push_str(&format!(
+                                "  call void @ifa_rt_gen_check(ptr %v{}, i32 1)\n",
+                                ref_val.0
+                            ));
+                        }
+                    }
                 }
             }
             ValueExpr::BoundsCheck {
@@ -5691,6 +6165,17 @@ impl<'a> LlvmIrEmitter<'a> {
                             cast_id, val.0
                         ));
                         out.push_str(&format!("  ret ptr %{}\n", cast_id));
+                    } else if (llvm_ty.starts_with('[')
+                        || llvm_ty.starts_with('{')
+                        || llvm_ty.starts_with("%struct."))
+                        && val_llvm_ty == "ptr"
+                    {
+                        let load_id = format!("ret_load_{}", val.0);
+                        out.push_str(&format!(
+                            "  %{} = load {}, ptr %v{}, align 8\n",
+                            load_id, llvm_ty, val.0
+                        ));
+                        out.push_str(&format!("  ret {} %{}\n", llvm_ty, load_id));
                     } else {
                         out.push_str(&format!("  ret {} %v{}\n", llvm_ty, val.0));
                     }

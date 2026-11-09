@@ -2464,5 +2464,36 @@ fn test_runtime_fs_and_process_primitives() {
         );
     }
 
+    // 8. Command-line args count and get
+    let argc = ifa_rt_args_count();
+    assert!(argc >= 1);
+    let arg0_ptr = ifa_rt_args_get(0);
+    assert!(!arg0_ptr.is_null());
+    let arg0_str = unsafe {
+        std::ffi::CStr::from_ptr(arg0_ptr as *const std::os::raw::c_char)
+            .to_str()
+            .unwrap()
+    };
+    assert!(!arg0_str.is_empty());
+    unsafe {
+        std::alloc::dealloc(
+            arg0_ptr,
+            std::alloc::Layout::from_size_align(arg0_str.len() + 1, 1).unwrap(),
+        );
+    }
+    let invalid_arg_ptr = ifa_rt_args_get(-1);
+    let invalid_str = unsafe {
+        std::ffi::CStr::from_ptr(invalid_arg_ptr as *const std::os::raw::c_char)
+            .to_str()
+            .unwrap()
+    };
+    assert_eq!(invalid_str, "");
+    unsafe {
+        std::alloc::dealloc(
+            invalid_arg_ptr,
+            std::alloc::Layout::from_size_align(1, 1).unwrap(),
+        );
+    }
+
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

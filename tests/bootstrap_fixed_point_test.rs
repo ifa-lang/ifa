@@ -136,8 +136,8 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("41 passed; 0 failed"),
-        "Expected 41 passed unit tests, got:\n{}",
+        stdout.contains("43 passed; 0 failed"),
+        "Expected 43 passed unit tests, got:\n{}",
         stdout
     );
 }

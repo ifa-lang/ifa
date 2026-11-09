@@ -647,8 +647,41 @@ impl SymbolTable {
             ret_ty: Type::String,
             span: dummy,
         });
+        proc_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("args_count"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let idx_sym = INTERNER.intern("index");
+        proc_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("args_get"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: idx_sym,
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::String,
+            span: dummy,
+        });
         self.modules.insert(process_name, proc_mod.clone());
-        self.modules.insert(std_process_name, proc_mod);
+        self.modules.insert(std_process_name, proc_mod.clone());
+
+        let env_name = INTERNER.intern("env");
+        let std_env_name = INTERNER.intern("std::env");
+        self.modules.insert(env_name, proc_mod.clone());
+        self.modules.insert(std_env_name, proc_mod);
 
         // 3. Module `net::http` / `http`
         let http_name = INTERNER.intern("http");

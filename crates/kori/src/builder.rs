@@ -8,7 +8,7 @@ use crate::resolver::{DependencyResolver, ResolvedPackage};
 use ifa_ast::Item;
 use ifa_codegen_cranelift::AotCompiler;
 use ifa_codegen_llvm::{LlvmCompiler, LlvmTargetConfig};
-use ifa_fir::compile_to_fir;
+use ifa_fir::{compile_to_fir_with_opts, CacheLayoutPass, SroaPass};
 use ifa_lexer::tokenize;
 use ifa_parser::parse;
 use ifa_sema::{analyze, analyze_with_symbols, symbol_table::ModuleSymbol, SymbolTable};
@@ -627,17 +627,24 @@ impl BuildOrchestrator {
                     }
 
                     // Lower submodule to FIR and collect
-                    let sub_fir = compile_to_fir(&sub_prog, &sub_analysis.symbols, true, true)
-                        .map_err(|errors| {
-                            let mut msg = String::new();
-                            for diag in &errors {
-                                msg.push_str(&diag.render_to_string(&sm));
-                            }
-                            KoriError::CompilationError {
-                                package: pkg_name.to_string(),
-                                message: msg,
-                            }
-                        })?;
+                    let sub_fir = compile_to_fir_with_opts(
+                        &sub_prog,
+                        &sub_analysis.symbols,
+                        true,
+                        true,
+                        false,
+                        true,
+                    )
+                    .map_err(|errors| {
+                        let mut msg = String::new();
+                        for diag in &errors {
+                            msg.push_str(&diag.render_to_string(&sm));
+                        }
+                        KoriError::CompilationError {
+                            package: pkg_name.to_string(),
+                            message: msg,
+                        }
+                    })?;
 
                     // Store binary module metadata into cache
                     let meta = ModuleMetadata::from_symbols_and_fir(
@@ -690,21 +697,29 @@ impl BuildOrchestrator {
         }
 
         let mut fir_module =
-            compile_to_fir(&ast_prog, &analysis.symbols, true, true).map_err(|errors| {
-                let mut msg = String::new();
-                for diag in &errors {
-                    msg.push_str(&diag.render_to_string(&sm));
-                }
-                KoriError::CompilationError {
-                    package: pkg_name.to_string(),
-                    message: msg,
-                }
-            })?;
+            compile_to_fir_with_opts(&ast_prog, &analysis.symbols, true, true, false, true)
+                .map_err(|errors| {
+                    let mut msg = String::new();
+                    for diag in &errors {
+                        msg.push_str(&diag.render_to_string(&sm));
+                    }
+                    KoriError::CompilationError {
+                        package: pkg_name.to_string(),
+                        message: msg,
+                    }
+                })?;
 
         // Merge all compiled submodule FIR definitions into the unified root FIR module
         for sub_fir in sub_fir_modules {
             fir_module.merge(sub_fir);
         }
+
+        // Run whole-module cache layout packing and SROA on the fully unified FIR module
+        let mut layout_pass = CacheLayoutPass::new();
+        layout_pass.run_on_module(&mut fir_module);
+
+        let mut sroa_pass = SroaPass::new();
+        sroa_pass.run_on_module(&mut fir_module);
 
         Ok(fir_module)
     }

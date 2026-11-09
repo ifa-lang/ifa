@@ -126,9 +126,14 @@ impl CacheLayoutPass {
         }
 
         if !struct_mappings.is_empty() {
+            let fn_ret_types: HashMap<Symbol, FirType> = module
+                .functions
+                .iter()
+                .map(|f| (f.name, f.ret_ty.clone()))
+                .collect();
             // Rewrite all FIR functions and instructions referencing reordered structs
             for func in &mut module.functions {
-                Self::rewrite_function(func, &struct_mappings, &module.structs);
+                Self::rewrite_function(func, &struct_mappings, &module.structs, &fn_ret_types);
             }
         }
 
@@ -160,6 +165,7 @@ impl CacheLayoutPass {
     fn infer_value_types(
         func: &FirFunction,
         struct_defs: &[crate::ir::FirStruct],
+        fn_ret_types: &HashMap<Symbol, FirType>,
     ) -> HashMap<ValueId, FirType> {
         let mut types = HashMap::new();
         for p in &func.params {
@@ -174,6 +180,11 @@ impl CacheLayoutPass {
                     let ty = match &inst.expr {
                         ValueExpr::Alloca { ty, .. } => FirType::Pointer(Box::new(ty.clone())),
                         ValueExpr::StructInit { name, .. } => FirType::Struct(*name, Vec::new()),
+                        ValueExpr::CallDirect { name, .. }
+                        | ValueExpr::BlockingCallDirect { name, .. } => fn_ret_types
+                            .get(name)
+                            .cloned()
+                            .unwrap_or(FirType::Int(IntType::I64)),
                         ValueExpr::Load { ptr } => match types.get(ptr) {
                             Some(FirType::Pointer(inner)) => (**inner).clone(),
                             _ => FirType::Int(IntType::I64),
@@ -213,6 +224,99 @@ impl CacheLayoutPass {
                                 .map(|(_, t)| t.clone())
                                 .unwrap_or(FirType::Int(IntType::I64))
                         }
+                        ValueExpr::GetElementPtr { base, .. } => {
+                            let elem_ty = match types.get(base) {
+                                Some(FirType::Array(inner, _)) | Some(FirType::Slice(inner)) => {
+                                    (**inner).clone()
+                                }
+                                Some(FirType::Pointer(inner)) => match &**inner {
+                                    FirType::Array(elem, _) | FirType::Slice(elem) => {
+                                        (**elem).clone()
+                                    }
+                                    FirType::Struct(s_sym, _) => {
+                                        let s_name = ifa_span::INTERNER.resolve(s_sym);
+                                        if let Some(elem_name) = s_name.strip_prefix("List__") {
+                                            match elem_name {
+                                                "string" | "String" => FirType::String,
+                                                "i64" | "int" => FirType::Int(IntType::I64),
+                                                "i32" => FirType::Int(IntType::I32),
+                                                "bool" => FirType::Bool,
+                                                other => FirType::Struct(
+                                                    ifa_span::INTERNER.intern(other),
+                                                    Vec::new(),
+                                                ),
+                                            }
+                                        } else {
+                                            FirType::Int(IntType::I64)
+                                        }
+                                    }
+                                    _ => FirType::Int(IntType::I64),
+                                },
+                                Some(FirType::Struct(s_sym, _)) => {
+                                    let s_name = ifa_span::INTERNER.resolve(s_sym);
+                                    if let Some(elem_name) = s_name.strip_prefix("List__") {
+                                        match elem_name {
+                                            "string" | "String" => FirType::String,
+                                            "i64" | "int" => FirType::Int(IntType::I64),
+                                            "i32" => FirType::Int(IntType::I32),
+                                            "bool" => FirType::Bool,
+                                            other => FirType::Struct(
+                                                ifa_span::INTERNER.intern(other),
+                                                Vec::new(),
+                                            ),
+                                        }
+                                    } else {
+                                        FirType::Int(IntType::I64)
+                                    }
+                                }
+                                _ => FirType::Int(IntType::I64),
+                            };
+                            FirType::Pointer(Box::new(elem_ty))
+                        }
+                        ValueExpr::GetElement { base, .. } => match types.get(base) {
+                            Some(FirType::Array(inner, _)) | Some(FirType::Slice(inner)) => {
+                                (**inner).clone()
+                            }
+                            Some(FirType::Pointer(inner)) => match &**inner {
+                                FirType::Array(elem, _) | FirType::Slice(elem) => (**elem).clone(),
+                                FirType::Struct(s_sym, _) => {
+                                    let s_name = ifa_span::INTERNER.resolve(s_sym);
+                                    if let Some(elem_name) = s_name.strip_prefix("List__") {
+                                        match elem_name {
+                                            "string" | "String" => FirType::String,
+                                            "i64" | "int" => FirType::Int(IntType::I64),
+                                            "i32" => FirType::Int(IntType::I32),
+                                            "bool" => FirType::Bool,
+                                            other => FirType::Struct(
+                                                ifa_span::INTERNER.intern(other),
+                                                Vec::new(),
+                                            ),
+                                        }
+                                    } else {
+                                        FirType::Int(IntType::I64)
+                                    }
+                                }
+                                _ => FirType::Int(IntType::I64),
+                            },
+                            Some(FirType::Struct(s_sym, _)) => {
+                                let s_name = ifa_span::INTERNER.resolve(s_sym);
+                                if let Some(elem_name) = s_name.strip_prefix("List__") {
+                                    match elem_name {
+                                        "string" | "String" => FirType::String,
+                                        "i64" | "int" => FirType::Int(IntType::I64),
+                                        "i32" => FirType::Int(IntType::I32),
+                                        "bool" => FirType::Bool,
+                                        other => FirType::Struct(
+                                            ifa_span::INTERNER.intern(other),
+                                            Vec::new(),
+                                        ),
+                                    }
+                                } else {
+                                    FirType::Int(IntType::I64)
+                                }
+                            }
+                            _ => FirType::Int(IntType::I64),
+                        },
                         _ => FirType::Int(IntType::I64),
                     };
                     types.insert(res, ty);
@@ -228,6 +332,7 @@ impl CacheLayoutPass {
         func: &mut FirFunction,
         mappings: &HashMap<Symbol, (HashMap<usize, usize>, Vec<usize>)>,
         struct_defs: &[crate::ir::FirStruct],
+        fn_ret_types: &HashMap<Symbol, FirType>,
     ) {
         // Build a fast lookup for field names belonging to structs: f_name -> (struct_name, new_idx)
         let mut struct_field_names: HashMap<Symbol, (Symbol, usize)> = HashMap::new();
@@ -239,7 +344,7 @@ impl CacheLayoutPass {
             }
         }
 
-        let value_types = Self::infer_value_types(func, struct_defs);
+        let value_types = Self::infer_value_types(func, struct_defs, fn_ret_types);
 
         for block in &mut func.blocks {
             for inst in &mut block.instructions {

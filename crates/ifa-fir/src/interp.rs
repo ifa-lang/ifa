@@ -288,7 +288,7 @@ fn navigate_value<'b>(root: &'b FirValue, path: &[usize]) -> Result<&'b FirValue
     let mut cur = root;
     for (step, &idx) in path.iter().enumerate() {
         match cur {
-            FirValue::Struct { fields, .. } | FirValue::Tuple(fields) => {
+            FirValue::Struct { fields, .. } | FirValue::Tuple(fields) | FirValue::Array(fields) => {
                 if let Some(next) = fields.get(idx) {
                     cur = next;
                 } else {
@@ -316,7 +316,7 @@ fn navigate_value_mut<'b>(
     let mut cur = root;
     for (step, &idx) in path.iter().enumerate() {
         match cur {
-            FirValue::Struct { fields, .. } | FirValue::Tuple(fields) => {
+            FirValue::Struct { fields, .. } | FirValue::Tuple(fields) | FirValue::Array(fields) => {
                 if let Some(next) = fields.get_mut(idx) {
                     cur = next;
                 } else {
@@ -967,8 +967,162 @@ impl<'a> FirInterpreter<'a> {
                                     ))
                                 }
                             }
+                            FirValue::ElementPointer { base_addr, index } => {
+                                let target = self
+                                    .stack_memory
+                                    .get(base_addr)
+                                    .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                                match target {
+                                    FirValue::Array(elements) => {
+                                        if let Some(elem) = elements.get(*index) {
+                                            match elem {
+                                                FirValue::Struct { name, fields } => {
+                                                    let actual_idx = self
+                                                        .resolve_struct_field_index(
+                                                            *name,
+                                                            *field_idx,
+                                                            *field_name,
+                                                        );
+                                                    if let Some(f) = fields.get(actual_idx) {
+                                                        Ok(f.clone())
+                                                    } else {
+                                                        Err(InterpError::Panic(format!(
+                                                            "Field index {} out of bounds",
+                                                            actual_idx
+                                                        )))
+                                                    }
+                                                }
+                                                FirValue::Tuple(fields) => {
+                                                    if let Some(f) = fields.get(*field_idx) {
+                                                        Ok(f.clone())
+                                                    } else {
+                                                        Err(InterpError::Panic(format!(
+                                                            "Tuple index {} out of bounds",
+                                                            field_idx
+                                                        )))
+                                                    }
+                                                }
+                                                FirValue::GenRef { slot, generation } => {
+                                                    self.heap.check(*slot, *generation)?;
+                                                    let heap_val = self.heap.deref(*slot)?;
+                                                    if let FirValue::Struct { name, fields } =
+                                                        heap_val
+                                                    {
+                                                        let actual_idx = self
+                                                            .resolve_struct_field_index(
+                                                                *name,
+                                                                *field_idx,
+                                                                *field_name,
+                                                            );
+                                                        if let Some(f) = fields.get(actual_idx) {
+                                                            Ok(f.clone())
+                                                        } else {
+                                                            Err(InterpError::Panic(format!(
+                                                                "Field index {} out of bounds",
+                                                                actual_idx
+                                                            )))
+                                                        }
+                                                    } else {
+                                                        Err(InterpError::TypeMismatch(
+                                                            "Heap target is not a struct".into(),
+                                                        ))
+                                                    }
+                                                }
+                                                other => Err(InterpError::TypeMismatch(format!(
+                                                    "Cannot access field of {}",
+                                                    other
+                                                ))),
+                                            }
+                                        } else {
+                                            Err(InterpError::Panic(format!(
+                                                "Element index {} out of bounds",
+                                                index
+                                            )))
+                                        }
+                                    }
+                                    other => Err(InterpError::TypeMismatch(format!(
+                                        "ElementPointer target must be array, got {}",
+                                        other
+                                    ))),
+                                }
+                            }
                             other => Err(InterpError::TypeMismatch(format!(
                                 "Cannot access field of {}",
+                                other
+                            ))),
+                        }
+                    }
+                    FirValue::ElementPointer { base_addr, index } => {
+                        let target = self
+                            .stack_memory
+                            .get(base_addr)
+                            .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                        match target {
+                            FirValue::Array(elements) => {
+                                if let Some(elem) = elements.get(*index) {
+                                    match elem {
+                                        FirValue::Struct { name, fields } => {
+                                            let actual_idx = self.resolve_struct_field_index(
+                                                *name,
+                                                *field_idx,
+                                                *field_name,
+                                            );
+                                            if let Some(f) = fields.get(actual_idx) {
+                                                Ok(f.clone())
+                                            } else {
+                                                Err(InterpError::Panic(format!(
+                                                    "Field index {} out of bounds",
+                                                    actual_idx
+                                                )))
+                                            }
+                                        }
+                                        FirValue::Tuple(fields) => {
+                                            if let Some(f) = fields.get(*field_idx) {
+                                                Ok(f.clone())
+                                            } else {
+                                                Err(InterpError::Panic(format!(
+                                                    "Tuple index {} out of bounds",
+                                                    field_idx
+                                                )))
+                                            }
+                                        }
+                                        FirValue::GenRef { slot, generation } => {
+                                            self.heap.check(*slot, *generation)?;
+                                            let heap_val = self.heap.deref(*slot)?;
+                                            if let FirValue::Struct { name, fields } = heap_val {
+                                                let actual_idx = self.resolve_struct_field_index(
+                                                    *name,
+                                                    *field_idx,
+                                                    *field_name,
+                                                );
+                                                if let Some(f) = fields.get(actual_idx) {
+                                                    Ok(f.clone())
+                                                } else {
+                                                    Err(InterpError::Panic(format!(
+                                                        "Field index {} out of bounds",
+                                                        actual_idx
+                                                    )))
+                                                }
+                                            } else {
+                                                Err(InterpError::TypeMismatch(
+                                                    "Heap target is not a struct".into(),
+                                                ))
+                                            }
+                                        }
+                                        other => Err(InterpError::TypeMismatch(format!(
+                                            "Cannot access field of {}",
+                                            other
+                                        ))),
+                                    }
+                                } else {
+                                    Err(InterpError::Panic(format!(
+                                        "Element index {} out of bounds",
+                                        index
+                                    )))
+                                }
+                            }
+                            other => Err(InterpError::TypeMismatch(format!(
+                                "ElementPointer target must be array, got {}",
                                 other
                             ))),
                         }
@@ -1054,6 +1208,23 @@ impl<'a> FirInterpreter<'a> {
                             slot: *slot,
                             generation: *generation,
                             path: new_path,
+                        })
+                    }
+                    FirValue::ElementPointer { base_addr, index } => {
+                        let actual_idx = if let Some(FirValue::Array(elements)) =
+                            self.stack_memory.get(base_addr)
+                        {
+                            if let Some(FirValue::Struct { name, .. }) = elements.get(*index) {
+                                self.resolve_struct_field_index(*name, *field_idx, *field_name)
+                            } else {
+                                *field_idx
+                            }
+                        } else {
+                            *field_idx
+                        };
+                        Ok(FirValue::FieldPointer {
+                            base_addr: *base_addr,
+                            path: vec![*index, actual_idx],
                         })
                     }
                     other => Err(InterpError::TypeMismatch(format!(
@@ -1179,6 +1350,42 @@ impl<'a> FirInterpreter<'a> {
                                 }
                             }
                             _ => Err(InterpError::TypeMismatch("Target must be a struct".into())),
+                        }
+                    }
+                    FirValue::ElementPointer { base_addr, index } => {
+                        let target = self
+                            .stack_memory
+                            .get_mut(base_addr)
+                            .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                        match target {
+                            FirValue::Array(elements) => {
+                                if let Some(elem) = elements.get_mut(*index) {
+                                    match elem {
+                                        FirValue::Struct { fields, .. } => {
+                                            if let Some(slot) = fields.get_mut(*field_idx) {
+                                                *slot = val_to_set;
+                                                Ok(FirValue::Unit)
+                                            } else {
+                                                Err(InterpError::Panic(format!(
+                                                    "Field index {} out of bounds",
+                                                    field_idx
+                                                )))
+                                            }
+                                        }
+                                        _ => Err(InterpError::TypeMismatch(
+                                            "Target element is not a struct".into(),
+                                        )),
+                                    }
+                                } else {
+                                    Err(InterpError::Panic(format!(
+                                        "Element index {} out of bounds",
+                                        index
+                                    )))
+                                }
+                            }
+                            _ => Err(InterpError::TypeMismatch(
+                                "ElementPointer base is not an array".into(),
+                            )),
                         }
                     }
                     _ => Err(InterpError::TypeMismatch(
@@ -2061,6 +2268,43 @@ impl<'a> FirInterpreter<'a> {
                             }
                         }
                     }
+                    FirValue::ElementPointer { base_addr, index } => {
+                        let target = self
+                            .stack_memory
+                            .get(base_addr)
+                            .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                        match target {
+                            FirValue::Array(elements) => {
+                                if let Some(leaf) = elements.get(*index) {
+                                    match leaf {
+                                        FirValue::GenRef { slot, generation } => {
+                                            Ok(FirValue::GenRef {
+                                                slot: *slot,
+                                                generation: *generation,
+                                            })
+                                        }
+                                        other => {
+                                            let (new_slot, new_gen) =
+                                                self.heap.alloc(other.clone());
+                                            Ok(FirValue::GenRef {
+                                                slot: new_slot,
+                                                generation: new_gen,
+                                            })
+                                        }
+                                    }
+                                } else {
+                                    Err(InterpError::Panic(format!(
+                                        "Element index {} out of bounds",
+                                        index
+                                    )))
+                                }
+                            }
+                            other => Err(InterpError::TypeMismatch(format!(
+                                "ElementPointer target must be array, got {}",
+                                other
+                            ))),
+                        }
+                    }
                     _ => {
                         let (slot, generation) = self.heap.alloc(v.clone());
                         Ok(FirValue::GenRef { slot, generation })
@@ -2084,6 +2328,17 @@ impl<'a> FirInterpreter<'a> {
                                 self.stack_memory.get(addr)
                             {
                                 self.heap.check(*slot, *generation)?;
+                            }
+                        }
+                        FirValue::ElementPointer { base_addr, index } => {
+                            if let Some(FirValue::Array(elements)) =
+                                self.stack_memory.get(base_addr)
+                            {
+                                if let Some(FirValue::GenRef { slot, generation }) =
+                                    elements.get(*index)
+                                {
+                                    self.heap.check(*slot, *generation)?;
+                                }
                             }
                         }
                         _ => {}
@@ -2222,6 +2477,34 @@ impl<'a> FirInterpreter<'a> {
                             }
                         } else {
                             Err(InterpError::InvalidPointer(*addr))
+                        }
+                    }
+                    FirValue::ElementPointer { base_addr, index } => {
+                        let target = self
+                            .stack_memory
+                            .get(base_addr)
+                            .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                        match target {
+                            FirValue::Array(elements) => {
+                                if let Some(elem) = elements.get(*index) {
+                                    if let FirValue::GenRef { slot, generation } = elem {
+                                        self.heap.check(*slot, *generation)?;
+                                        let val = self.heap.deref(*slot)?.clone();
+                                        Ok(val)
+                                    } else {
+                                        Ok(elem.clone())
+                                    }
+                                } else {
+                                    Err(InterpError::Panic(format!(
+                                        "Element index {} out of bounds",
+                                        index
+                                    )))
+                                }
+                            }
+                            other => Err(InterpError::TypeMismatch(format!(
+                                "ElementPointer target must be array, got {}",
+                                other
+                            ))),
                         }
                     }
                     other => Ok(other.clone()),

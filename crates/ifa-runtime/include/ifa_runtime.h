@@ -598,6 +598,8 @@ uint64_t ifa_rt_fs_file_size(const char* path);
 int64_t ifa_rt_process_exec(const char* cmd, const char* args);
 char* ifa_rt_process_exec_output(const char* cmd, const char* args);
 char* ifa_rt_env_var(const char* name);
+int64_t ifa_rt_args_count(void);
+char* ifa_rt_args_get(int64_t index);
 
 #ifdef __cplusplus
 }

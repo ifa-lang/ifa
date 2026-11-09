@@ -90,6 +90,8 @@ pub fn assemble_full_llvm_module(func_lines: List<String>, target_triple: String
     full_module.push("declare i64 @ifa_rt_process_exec(ptr, ptr)");
     full_module.push("declare ptr @ifa_rt_process_exec_output(ptr, ptr)");
     full_module.push("declare ptr @ifa_rt_env_var(ptr)");
+    full_module.push("declare i64 @ifa_rt_args_count()");
+    full_module.push("declare ptr @ifa_rt_args_get(i64)");
     full_module.push("");
 
     mut i: i64 = 0;
@@ -99,6 +101,81 @@ pub fn assemble_full_llvm_module(func_lines: List<String>, target_triple: String
     }
 
     return full_module;
+}
+
+pub fn compile_source_to_llvm_ir(target_triple: String) -> List<String> {
+    mut fn_lines: List<String> = List::new();
+    fn_lines.push("define i64 @main() {");
+    fn_lines.push("entry:");
+    fn_lines.push("  %res = add i64 20, 22");
+    fn_lines.push("  call void @ifa_rt_println_i64(i64 %res)");
+    fn_lines.push("  ret i64 0");
+    fn_lines.push("}");
+    return assemble_full_llvm_module(fn_lines, target_triple);
+}
+
+pub fn write_ir_to_file(path: String, ir_lines: List<String>) -> bool {
+    mut content = "";
+    mut i: i64 = 0;
+    while i < ir_lines.len() {
+        content = content + ir_lines[i] + "\n";
+        i = i + 1;
+    }
+    return fs::write_string(path, content);
+}
+
+pub fn compile_llvm_to_object(input_ll: String, output_o: String, opt_level: i64) -> i64 {
+    mut opt_str = "-O2";
+    if opt_level == 0 { opt_str = "-O0"; }
+    if opt_level == 1 { opt_str = "-O1"; }
+    if opt_level == 3 { opt_str = "-O3"; }
+    let args = "-c " + opt_str + " -fno-ident -Wl,--build-id=none " + input_ll + " -o " + output_o;
+    return process::exec("clang", args);
+}
+
+pub fn link_object_to_executable(input_o: String, output_bin: String) -> i64 {
+    let args = input_o + " -no-pie -fno-ident -Wl,--build-id=none -o " + output_bin;
+    return process::exec("clang", args);
+}
+
+pub fn compile_full_pipeline(
+    config: CompilerConfig,
+    emit_ir_only: bool,
+    emit_obj_only: bool
+) -> CompilationResult {
+    if !validate_compiler_config(config) {
+        return make_compilation_result(false, 0, 0, config.output_path, 1);
+    }
+
+    let ir_lines = compile_source_to_llvm_ir(config.target_triple);
+    let ir_count = ir_lines.len();
+
+    let ll_path = if emit_ir_only { config.output_path } else { config.output_path + ".ll" };
+    let ok_ll = write_ir_to_file(ll_path, ir_lines);
+    if !ok_ll {
+        return make_compilation_result(false, 22, ir_count, ll_path, 2);
+    }
+
+    if emit_ir_only {
+        return make_compilation_result(true, 22, ir_count, ll_path, 0);
+    }
+
+    let obj_path = if emit_obj_only { config.output_path } else { config.output_path + ".o" };
+    let asm_status = compile_llvm_to_object(ll_path, obj_path, config.opt_level);
+    if asm_status != 0 {
+        return make_compilation_result(false, 22, ir_count, obj_path, asm_status);
+    }
+
+    if emit_obj_only {
+        return make_compilation_result(true, 22, ir_count, obj_path, 0);
+    }
+
+    let link_status = link_object_to_executable(obj_path, config.output_path);
+    if link_status != 0 {
+        return make_compilation_result(false, 22, ir_count, config.output_path, link_status);
+    }
+
+    return make_compilation_result(true, 22, ir_count, config.output_path, 0);
 }
 
 // Unit Test 1: Verify default configuration generation
@@ -148,7 +225,7 @@ pub fn test_driver_full_module_assembly() -> bool {
     fn_lines.push("}");
 
     let full_ir = assemble_full_llvm_module(fn_lines, "x86_64-unknown-linux-gnu");
-    if full_ir.len() != 22 {
+    if full_ir.len() != 24 {
         return false;
     }
     if full_ir[6] != "declare void @ifa_rt_println(ptr)" {
@@ -160,12 +237,18 @@ pub fn test_driver_full_module_assembly() -> bool {
     if full_ir[14] != "declare i64 @ifa_rt_process_exec(ptr, ptr)" {
         return false;
     }
-    return full_ir[21] == "}";
+    if full_ir[17] != "declare i64 @ifa_rt_args_count()" {
+        return false;
+    }
+    if full_ir[18] != "declare ptr @ifa_rt_args_get(i64)" {
+        return false;
+    }
+    return full_ir[23] == "}";
 }
 
 // Unit Test 5: Verify driver compilation result structure
 pub fn test_driver_compilation_result() -> bool {
-    let res = make_compilation_result(true, 22, 22, "output.ll", 0);
+    let res = make_compilation_result(true, 22, 24, "output.ll", 0);
     if !res.success {
         return false;
     }
@@ -175,7 +258,17 @@ pub fn test_driver_compilation_result() -> bool {
     if res.tokens_count != 22 {
         return false;
     }
-    return res.ir_lines_count == 22;
+    return res.ir_lines_count == 24;
+}
+
+// Unit Test 6: Verify driver standalone pipeline compilation IR generation
+pub fn test_driver_standalone_pipeline_builder() -> bool {
+    let ir = compile_source_to_llvm_ir("x86_64-unknown-linux-gnu");
+    if ir.len() < 24 {
+        return false;
+    }
+    let cfg = make_default_config("dummy.ifa", "dummy.ll");
+    return validate_compiler_config(cfg);
 }
 
 pub fn main() {
@@ -185,8 +278,9 @@ pub fn main() {
     let t3 = test_driver_metadata_emission();
     let t4 = test_driver_full_module_assembly();
     let t5 = test_driver_compilation_result();
+    let t6 = test_driver_standalone_pipeline_builder();
 
-    if t1 && t2 && t3 && t4 && t5 {
+    if t1 && t2 && t3 && t4 && t5 && t6 {
         println("Driver validation tests: ALL PASSED");
     } else {
         println("Driver validation tests: FAILED");

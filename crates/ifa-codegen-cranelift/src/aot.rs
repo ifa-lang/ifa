@@ -480,6 +480,12 @@ char* ifa_rt_string_from_bool(int8_t val) {
     return res;
 }
 
+int8_t ifa_rt_string_eq(const char* a, const char* b) {
+    if (a == b) return 1;
+    if (!a || !b) return 0;
+    return strcmp(a, b) == 0 ? 1 : 0;
+}
+
 const char* ifa_rt_version_string(void) {
     return "IFA Runtime 0.1.0 (Zero-GC Generational Concurrency)";
 }
@@ -632,6 +638,53 @@ char* ifa_rt_env_var(const char* name) {
     if (!buf) abort();
     memcpy(buf, val, len + 1);
     return buf;
+}
+
+static int s_ifa_args_initialized = 0;
+static int s_ifa_argc = 0;
+static char* s_ifa_argv[256];
+
+static void ifa_rt_init_args(void) {
+    if (s_ifa_args_initialized) return;
+    s_ifa_args_initialized = 1;
+    s_ifa_argc = 0;
+    FILE* f = fopen("/proc/self/cmdline", "rb");
+    if (!f) return;
+    char buf[4096];
+    size_t rd = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (rd == 0) return;
+    buf[rd] = '\0';
+    size_t pos = 0;
+    while (pos < rd && s_ifa_argc < 256) {
+        size_t arg_len = strlen(buf + pos);
+        char* arg_copy = (char*)malloc(arg_len + 1);
+        if (arg_copy) {
+            memcpy(arg_copy, buf + pos, arg_len + 1);
+            s_ifa_argv[s_ifa_argc++] = arg_copy;
+        }
+        pos += arg_len + 1;
+    }
+}
+
+int64_t ifa_rt_args_count(void) {
+    ifa_rt_init_args();
+    return (int64_t)s_ifa_argc;
+}
+
+char* ifa_rt_args_get(int64_t index) {
+    ifa_rt_init_args();
+    if (index < 0 || index >= (int64_t)s_ifa_argc || !s_ifa_argv[index]) {
+        char* empty = (char*)malloc(1);
+        if (empty) empty[0] = '\0';
+        return empty;
+    }
+    size_t len = strlen(s_ifa_argv[index]);
+    char* copy = (char*)malloc(len + 1);
+    if (copy) {
+        memcpy(copy, s_ifa_argv[index], len + 1);
+    }
+    return copy;
 }
 "#;
 

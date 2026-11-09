@@ -2,22 +2,7 @@
 // Deterministic lexical scanner and token generation for IFA bootstrap compiler.
 
 comptime fn build_keyword_lut() -> [i64; 14] {
-    mut lut: [i64; 14] = [0; 14];
-    lut[0] = 1;  // TOK_FN
-    lut[1] = 2;  // TOK_LET
-    lut[2] = 3;  // TOK_MUT
-    lut[3] = 4;  // TOK_RETURN
-    lut[4] = 5;  // TOK_INOUT
-    lut[5] = 6;  // TOK_REF
-    lut[6] = 7;  // TOK_COMPTIME
-    lut[7] = 8;  // TOK_STRUCT
-    lut[8] = 9;  // TOK_TRAIT
-    lut[9] = 12; // TOK_IMPL
-    lut[10] = 13; // TOK_FOR
-    lut[11] = 14; // TOK_MATCH
-    lut[12] = 15; // TOK_PUB
-    lut[13] = 16; // TOK_WHERE
-    return lut;
+    return [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16];
 }
 
 pub const KEYWORD_LUT = comptime build_keyword_lut();

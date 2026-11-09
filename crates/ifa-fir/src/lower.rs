@@ -1298,11 +1298,25 @@ impl<'a> FunctionLoweringContext<'a> {
         match stmt {
             Stmt::Let {
                 pattern,
+                ty: annotated_ty,
                 init,
                 else_block,
                 span,
                 ..
             } => {
+                let explicit_ty = annotated_ty.as_ref().and_then(|ast_ty| {
+                    let known_structs = HashMap::new();
+                    let known_enums = HashMap::new();
+                    ifa_sema::types::Type::from_ast_with_generics(
+                        ast_ty,
+                        &known_structs,
+                        &known_enums,
+                        &[],
+                    )
+                    .ok()
+                    .map(|t| FirType::from_sema_type(&t.substitute(&self.type_subst)))
+                });
+
                 let init_val = init.as_ref().map(|e| self.lower_expr(e));
 
                 match pattern {
@@ -1312,20 +1326,26 @@ impl<'a> FunctionLoweringContext<'a> {
                         name,
                         span: p_span,
                     } => {
-                        let ty = if let Some(init_expr) = init {
+                        let ty = if let Some(et) = explicit_ty.clone() {
+                            et
+                        } else if let Some(var_sym) = self.symbols.lookup_variable(name) {
+                            let substituted = var_sym.ty.substitute(&self.type_subst);
+                            let st = FirType::from_sema_type(&substituted);
+                            if !matches!(st, FirType::Unit) {
+                                st
+                            } else if let Some(init_expr) = init {
+                                self.infer_expr_fir_type(init_expr).unwrap_or(FirType::Unit)
+                            } else {
+                                FirType::Unit
+                            }
+                        } else if let Some(init_expr) = init {
                             if let Some(inferred) = self.infer_expr_fir_type(init_expr) {
                                 inferred
-                            } else if let Some(var_sym) = self.symbols.lookup_variable(name) {
-                                let substituted = var_sym.ty.substitute(&self.type_subst);
-                                FirType::from_sema_type(&substituted)
                             } else {
                                 init_val
                                     .map(|_| FirType::Int(IntType::I64))
                                     .unwrap_or(FirType::Unit)
                             }
-                        } else if let Some(var_sym) = self.symbols.lookup_variable(name) {
-                            let substituted = var_sym.ty.substitute(&self.type_subst);
-                            FirType::from_sema_type(&substituted)
                         } else {
                             FirType::Unit
                         };
@@ -1387,15 +1407,20 @@ impl<'a> FunctionLoweringContext<'a> {
                         name,
                         span: p_span,
                     } => {
-                        let ty = if let Some(init_expr) = init {
-                            if let Some(inferred) = self.infer_expr_fir_type(init_expr) {
-                                inferred
-                            } else if let Some(var_sym) = self.symbols.lookup_variable(name) {
-                                let substituted = var_sym.ty.substitute(&self.type_subst);
-                                FirType::from_sema_type(&substituted)
+                        let ty = if let Some(var_sym) = self.symbols.lookup_variable(name) {
+                            let substituted = var_sym.ty.substitute(&self.type_subst);
+                            let st = FirType::from_sema_type(&substituted);
+                            if !matches!(st, FirType::Unit) {
+                                st
+                            } else if let Some(init_expr) = init {
+                                self.infer_expr_fir_type(init_expr)
+                                    .unwrap_or(FirType::Int(IntType::I64))
                             } else {
                                 FirType::Int(IntType::I64)
                             }
+                        } else if let Some(init_expr) = init {
+                            self.infer_expr_fir_type(init_expr)
+                                .unwrap_or(FirType::Int(IntType::I64))
                         } else {
                             FirType::Int(IntType::I64)
                         };
@@ -2735,14 +2760,7 @@ impl<'a> FunctionLoweringContext<'a> {
                     }
                     // Mot-clé `ref`: Création d'une référence générationnelle sûre (Section 9.2)
                     UnaryOp::Ref => {
-                        let ptr = if let ExprKind::Ident(sym) = &expr.kind {
-                            self.var_allocas
-                                .get(sym)
-                                .copied()
-                                .unwrap_or_else(|| self.lower_expr(expr))
-                        } else {
-                            self.lower_expr(expr)
-                        };
+                        let ptr = self.lower_lvalue_ptr(expr, span);
                         let res = self.alloc_value();
                         self.emit(Some(res), ValueExpr::GenRef { ptr }, span);
                         res
@@ -3833,9 +3851,15 @@ impl<'a> FunctionLoweringContext<'a> {
 
                 // Merge block
                 self.current_block = merge_block;
+                let phi_ty = if has_phi {
+                    self.infer_expr_fir_type(expr)
+                        .unwrap_or(FirType::Int(IntType::I64))
+                } else {
+                    FirType::Unit
+                };
                 if let Some(mb) = self.func.get_block_mut(merge_block) {
                     if has_phi {
-                        mb.push_param(res, FirType::Int(IntType::I64));
+                        mb.push_param(res, phi_ty);
                     }
                 }
                 if !has_phi {
