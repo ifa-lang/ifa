@@ -742,6 +742,7 @@ impl BuildOrchestrator {
                 .unwrap_or(0)
         ));
         fs::write(&rt_path, rt_stub)?;
+        let _ = fs::remove_file(output_so);
 
         for compiler in &compilers {
             let status = Command::new(compiler)

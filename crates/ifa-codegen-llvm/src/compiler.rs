@@ -234,6 +234,9 @@ impl LlvmCompiler {
         let rt_path = object_path.with_extension("rt.c");
         let _ = fs::write(&rt_path, ifa_codegen_cranelift::RUNTIME_STUB_C);
 
+        // Remove destination executable if present to avoid ETXTBSY on Linux
+        let _ = fs::remove_file(output_bin);
+
         let mut clang_cmd = Command::new("clang");
         clang_cmd
             .arg(object_path)

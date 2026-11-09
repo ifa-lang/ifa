@@ -1392,6 +1392,9 @@ impl AotCompiler {
         let rt_path = object_path.with_extension("rt.c");
         fs::write(&rt_path, rt_stub)?;
 
+        // Remove destination executable if present to avoid ETXTBSY on Linux
+        let _ = fs::remove_file(output_binary);
+
         for compiler in &compilers {
             let status = Command::new(compiler)
                 .arg(object_path)

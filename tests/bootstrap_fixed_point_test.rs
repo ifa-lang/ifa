@@ -10,6 +10,10 @@ use ifa_stdlib::crypto::sha256_hex;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+
+static BOOTSTRAP_TEST_MUTEX: Mutex<()> = Mutex::new(());
+static KORI_BIN_CACHE: OnceLock<PathBuf> = OnceLock::new();
 
 fn get_workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -21,22 +25,26 @@ fn get_workspace_root() -> PathBuf {
 }
 
 fn get_kori_binary() -> PathBuf {
-    let mut path = std::env::current_exe().expect("current test executable");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push("kori");
-    if !path.exists() {
-        let status = Command::new("cargo")
-            .arg("build")
-            .arg("-p")
-            .arg("kori")
-            .status()
-            .expect("Build kori binary");
-        assert!(status.success(), "Failed to build kori binary");
-    }
-    path
+    KORI_BIN_CACHE
+        .get_or_init(|| {
+            let mut path = std::env::current_exe().expect("current test executable");
+            path.pop();
+            if path.ends_with("deps") {
+                path.pop();
+            }
+            path.push("kori");
+            if !path.exists() {
+                let status = Command::new("cargo")
+                    .arg("build")
+                    .arg("-p")
+                    .arg("kori")
+                    .status()
+                    .expect("Build kori binary");
+                assert!(status.success(), "Failed to build kori binary");
+            }
+            path
+        })
+        .clone()
 }
 
 #[test]
@@ -68,6 +76,9 @@ fn test_modular_compiler_sources_exist() {
 
 #[test]
 fn test_modular_compiler_unit_tests() {
+    let _lock = BOOTSTRAP_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let root = get_workspace_root();
     let kori_bin = get_kori_binary();
     let manifest_path = root.join("compiler").join("kori.toml");
@@ -258,10 +269,17 @@ fn test_modular_compiler_unit_tests() {
 
 #[test]
 fn test_bootstrap_triple_compilation_and_fixed_point_hash() {
+    let _lock = BOOTSTRAP_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let root = get_workspace_root();
     let kori_bin = get_kori_binary();
     let manifest_path = root.join("compiler").join("kori.toml");
     let target_dev_dir = root.join("compiler").join("target").join("dev");
+    let ifac_bin = target_dev_dir.join("ifac");
+
+    // Remove any previously compiled binary to prevent ETXTBSY
+    let _ = fs::remove_file(&ifac_bin);
 
     // Stage 0 -> Stage 1: Build Gen 1 compiler executable
     let build_gen1 = Command::new(&kori_bin)
@@ -325,6 +343,9 @@ fn test_bootstrap_triple_compilation_and_fixed_point_hash() {
     let hash_ll_gen2 = sha256_hex(&fs::read(&gen2_ll).expect("read gen2 ll"));
     let hash_o_gen2 = sha256_hex(&fs::read(&gen2_o).expect("read gen2 o"));
     let hash_bin_gen2 = sha256_hex(&fs::read(&gen2_bin).expect("read gen2 bin"));
+
+    // Remove ifac binary before regenerating Gen 3
+    let _ = fs::remove_file(&ifac_bin);
 
     // Stage 1 -> Stage 2: Recompile with complete cache bypass to produce Gen 3 artifacts
     let build_gen2 = Command::new(&kori_bin)
@@ -462,6 +483,9 @@ fn test_stdlib_compiler_essentials() {
 
 #[test]
 fn test_autonomous_selfhost_driver_triple_stage_execution() {
+    let _lock = BOOTSTRAP_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let root = get_workspace_root();
     let kori_bin = get_kori_binary();
     let manifest_path = root.join("compiler").join("kori.toml");
