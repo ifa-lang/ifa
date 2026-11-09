@@ -138,6 +138,47 @@ pub fn report_entry<T: Diagnosable>(rep: DiagnosticReporter<T>) -> String {
     return rep.entry.diagnose();
 }
 
+// Pattern matching representation for semantic evaluation
+pub struct AstPattern {
+    kind: i64,         // 1: Wildcard `_`, 2: Literal, 3: Identifier / Binding, 4: Variant
+    val: i64,          // Literal integer value
+    name: String,      // Identifier / Variant name
+    has_sub: bool,     // Whether variant has sub-pattern payload
+    sub_pat_name: String // Sub-pattern variable name
+}
+
+pub struct AstMatchArm {
+    pat: AstPattern,
+    expr: ?ref AstExpr
+}
+
+pub struct AstMatch {
+    target_var: String,
+    arms: List<AstMatchArm>
+}
+
+// Evaluates a pattern matching AST against a runtime value
+pub fn eval_pattern_match(m: AstMatch, target_val: i64) -> i64 {
+    mut i: i64 = 0;
+    while i < m.arms.len() {
+        let arm = m.arms[i];
+        if arm.pat.kind == 1 {
+            // Wildcard '_' matches anything
+            return eval_expression(arm.expr, "", 0, "", 0, "", 0);
+        } else if arm.pat.kind == 2 {
+            // Literal value match
+            if arm.pat.val == target_val {
+                return eval_expression(arm.expr, "", 0, "", 0, "", 0);
+            }
+        } else if arm.pat.kind == 3 {
+            // Identifier variable binding
+            return eval_expression(arm.expr, arm.pat.name, target_val, "", 0, "", 0);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 // Unit test 1: Semantic evaluation over generational AST nodes
 pub fn test_sema_eval() -> bool {
     mut node_left = AstExpr(kind: 2, val: 0, name: "x", op: 0, left: None, right: None);
@@ -176,12 +217,54 @@ pub fn test_sema_generic_trait_bound() -> bool {
     return msg == "type mismatch";
 }
 
+// Unit test 4: Semantic Pattern Matching evaluation
+pub fn test_sema_pattern_matching() -> bool {
+    mut pool: List<AstExpr> = List::new();
+    let expr10 = AstExpr(kind: 1, val: 10, name: "", op: 0, left: None, right: None);
+    pool.push(expr10);
+    let idx10 = pool.len() - 1;
+
+    let expr20 = AstExpr(kind: 1, val: 20, name: "", op: 0, left: None, right: None);
+    pool.push(expr20);
+    let idx20 = pool.len() - 1;
+
+    let expr42 = AstExpr(kind: 1, val: 42, name: "", op: 0, left: None, right: None);
+    pool.push(expr42);
+    let idx42 = pool.len() - 1;
+
+    mut arms: List<AstMatchArm> = List::new();
+    // Arm 1: 1 => 10
+    let pat1 = AstPattern(kind: 2, val: 1, name: "", has_sub: false, sub_pat_name: "");
+    arms.push(AstMatchArm(pat: pat1, expr: ref pool[idx10]));
+    // Arm 2: 2 => 20
+    let pat2 = AstPattern(kind: 2, val: 2, name: "", has_sub: false, sub_pat_name: "");
+    arms.push(AstMatchArm(pat: pat2, expr: ref pool[idx20]));
+    // Arm 3: _ => 42
+    let pat_def = AstPattern(kind: 1, val: 0, name: "_", has_sub: false, sub_pat_name: "");
+    arms.push(AstMatchArm(pat: pat_def, expr: ref pool[idx42]));
+
+    let match_ast = AstMatch(target_var: "status", arms: arms);
+
+    let res1 = eval_pattern_match(match_ast, 1);
+    let res2 = eval_pattern_match(match_ast, 2);
+    let res_def = eval_pattern_match(match_ast, 999);
+
+    if res1 != 10 {
+        return false;
+    }
+    if res2 != 20 {
+        return false;
+    }
+    return res_def == 42;
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
     let t2 = test_sema_polymorphic_method();
     let t3 = test_sema_generic_trait_bound();
-    if t1 && t2 && t3 {
+    let t4 = test_sema_pattern_matching();
+    if t1 && t2 && t3 && t4 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");

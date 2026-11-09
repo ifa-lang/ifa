@@ -43,7 +43,28 @@ pub fn test_selfhost_modular_pipeline() -> bool {
         return false;
     }
 
-    return fir_lines[0] == "fir.func @compute(%x: i64) -> i64 {";
+    if fir_lines[0] != "fir.func @compute(%x: i64) -> i64 {" {
+        return false;
+    }
+
+    // High-level items validation in modular self-hosting pipeline
+    let full_tokens = lexer::tokenize_full_module();
+    mut full_pool: List<parser::AstExpr> = List::new();
+    let prog = parser::parse_program(full_tokens, inout full_pool);
+    if prog.traits.len() != 1 || prog.structs.len() != 1 || prog.functions.len() != 1 {
+        return false;
+    }
+
+    // Pattern matching validation in modular pipeline
+    let match_tokens = lexer::tokenize_match_program();
+    mut cur_m: i64 = 0;
+    mut match_pool: List<parser::AstExpr> = List::new();
+    let parsed_match = parser::parse_match(inout cur_m, match_tokens, inout match_pool);
+    if parsed_match.target_var != "val" || parsed_match.arms.len() != 3 {
+        return false;
+    }
+
+    return true;
 }
 
 pub fn main() {
@@ -64,6 +85,22 @@ pub fn main() {
     mut pool: List<parser::AstExpr> = List::new();
     let fn1 = parser::parse_function(inout cur, tokens, inout pool);
     println("Parsed AST function name: compute");
+
+    // 3b. High-level Item Parsing (Traits, Impls, Pattern Matching)
+    let full_tokens = lexer::tokenize_full_module();
+    mut full_pool: List<parser::AstExpr> = List::new();
+    let prog = parser::parse_program(full_tokens, inout full_pool);
+    if prog.traits.len() == 1 && prog.structs.len() == 1 {
+        println("Parsed high-level module: trait " + prog.traits[0].name + ", struct " + prog.structs[0].name);
+    }
+
+    let match_tokens = lexer::tokenize_match_program();
+    mut cur_m: i64 = 0;
+    mut match_pool: List<parser::AstExpr> = List::new();
+    let parsed_match = parser::parse_match(inout cur_m, match_tokens, inout match_pool);
+    if parsed_match.arms.len() == 3 {
+        println("Parsed pattern matching: match " + parsed_match.target_var + " with 3 arms");
+    }
 
     // 4. Semantic Evaluation via modular sema
     let sema_fn = sema::AstFunction(

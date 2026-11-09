@@ -31,6 +31,71 @@ pub struct AstFunction {
     statements: List<AstStmt>
 }
 
+// High-level AST Field node for Struct definitions
+pub struct AstField {
+    name: String,
+    ty: String
+}
+
+// High-level AST Struct node
+pub struct AstStruct {
+    is_pub: bool,
+    name: String,
+    fields: List<AstField>
+}
+
+// High-level AST Trait Method signature
+pub struct AstTraitMethod {
+    name: String,
+    param_name: String,
+    param_ty: String,
+    ret_ty: String
+}
+
+// High-level AST Trait node
+pub struct AstTrait {
+    is_pub: bool,
+    name: String,
+    methods: List<AstTraitMethod>
+}
+
+// High-level AST Impl node (trait implementation or inherent implementation)
+pub struct AstImpl {
+    has_trait: bool,
+    trait_name: String,
+    target_ty: String,
+    methods: List<AstFunction>
+}
+
+// High-level AST Pattern node for Pattern Matching
+pub struct AstPattern {
+    kind: i64,         // 1: Wildcard `_`, 2: Literal, 3: Identifier / Binding, 4: Variant
+    val: i64,          // Literal integer value
+    name: String,      // Identifier / Variant name
+    has_sub: bool,     // Whether variant has sub-pattern payload
+    sub_pat_name: String // Sub-pattern variable name
+}
+
+// High-level AST Match Arm node (`pattern => expression`)
+pub struct AstMatchArm {
+    pat: AstPattern,
+    expr: ?ref AstExpr
+}
+
+// High-level AST Match Expression node
+pub struct AstMatch {
+    target_var: String,
+    arms: List<AstMatchArm>
+}
+
+// Full Program AST containing all top-level module items
+pub struct AstProgram {
+    traits: List<AstTrait>,
+    impls: List<AstImpl>,
+    structs: List<AstStruct>,
+    functions: List<AstFunction>
+}
+
 // Recursive-descent parser: primary expressions (literals, variables, parenthesized sub-trees)
 pub fn parse_primary(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstExpr {
     if cursor >= tokens.len() {
@@ -236,6 +301,296 @@ pub fn parse_function(inout cursor: i64, tokens: List<Token>, inout pool: List<A
     return AstFunction(name: fn_name, param_name: param_name, statements: stmts);
 }
 
+// High-level parser: pattern matching (`_`, literal, identifier, `Some(x)`)
+pub fn parse_pattern(inout cursor: i64, tokens: List<Token>) -> AstPattern {
+    if cursor >= tokens.len() {
+        return AstPattern(kind: 1, val: 0, name: "_", has_sub: false, sub_pat_name: "");
+    }
+    let tok = tokens[cursor];
+    if tok.kind == 38 {
+        // Wildcard '_'
+        cursor = cursor + 1;
+        return AstPattern(kind: 1, val: 0, name: "_", has_sub: false, sub_pat_name: "");
+    }
+    if tok.kind == 11 {
+        // Integer literal pattern
+        cursor = cursor + 1;
+        return AstPattern(kind: 2, val: tok.value, name: "", has_sub: false, sub_pat_name: "");
+    }
+    if tok.kind == 10 {
+        let ident_name = tok.lexeme;
+        cursor = cursor + 1;
+        // Check if followed by '(' for variant pattern e.g. Some(x)
+        if cursor < tokens.len() && tokens[cursor].kind == 30 {
+            cursor = cursor + 1; // Consume '('
+            mut sub_name = "";
+            if cursor < tokens.len() && tokens[cursor].kind == 10 {
+                sub_name = tokens[cursor].lexeme;
+                cursor = cursor + 1;
+            }
+            if cursor < tokens.len() && tokens[cursor].kind == 31 {
+                cursor = cursor + 1; // Consume ')'
+            }
+            return AstPattern(kind: 4, val: 0, name: ident_name, has_sub: true, sub_pat_name: sub_name);
+        }
+        return AstPattern(kind: 3, val: 0, name: ident_name, has_sub: false, sub_pat_name: "");
+    }
+    return AstPattern(kind: 1, val: 0, name: "_", has_sub: false, sub_pat_name: "");
+}
+
+// High-level parser: match expressions (`match target { pat => expr, ... }`)
+pub fn parse_match(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstMatch {
+    cursor = cursor + 1; // Consume 'match'
+    let target_name = tokens[cursor].lexeme;
+    cursor = cursor + 1; // Consume target variable
+
+    if cursor < tokens.len() && tokens[cursor].kind == 32 {
+        cursor = cursor + 1; // Consume '{'
+    }
+
+    mut arms: List<AstMatchArm> = List::new();
+    mut parsing = true;
+    while parsing {
+        if cursor >= tokens.len() {
+            parsing = false;
+        } else if tokens[cursor].kind == 33 {
+            cursor = cursor + 1; // Consume '}'
+            parsing = false;
+        } else {
+            let pat = parse_pattern(inout cursor, tokens);
+            if cursor < tokens.len() && tokens[cursor].kind == 37 {
+                cursor = cursor + 1; // Consume '=>'
+            }
+            let body_expr = parse_expression(inout cursor, tokens, inout pool);
+            pool.push(body_expr);
+            let body_idx = pool.len() - 1;
+
+            if cursor < tokens.len() && (tokens[cursor].kind == 39 || tokens[cursor].kind == 35) {
+                cursor = cursor + 1; // Consume ',' or ';'
+            }
+
+            arms.push(AstMatchArm(pat: pat, expr: ref pool[body_idx]));
+        }
+    }
+
+    return AstMatch(target_var: target_name, arms: arms);
+}
+
+// High-level parser: trait definitions (`pub trait Name { fn meth(self) -> Ret; }`)
+pub fn parse_trait(inout cursor: i64, tokens: List<Token>) -> AstTrait {
+    mut is_pub = false;
+    if cursor < tokens.len() && tokens[cursor].kind == 15 {
+        is_pub = true;
+        cursor = cursor + 1; // Consume 'pub'
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 9 {
+        cursor = cursor + 1; // Consume 'trait'
+    }
+    let trait_name = tokens[cursor].lexeme;
+    cursor = cursor + 1; // Consume trait name
+
+    if cursor < tokens.len() && tokens[cursor].kind == 32 {
+        cursor = cursor + 1; // Consume '{'
+    }
+
+    mut methods: List<AstTraitMethod> = List::new();
+    mut parsing = true;
+    while parsing {
+        if cursor >= tokens.len() {
+            parsing = false;
+        } else if tokens[cursor].kind == 33 {
+            cursor = cursor + 1; // Consume '}'
+            parsing = false;
+        } else if tokens[cursor].kind == 1 {
+            cursor = cursor + 1; // Consume 'fn'
+            let meth_name = tokens[cursor].lexeme;
+            cursor = cursor + 1; // Consume method name
+            cursor = cursor + 1; // Consume '('
+            let p_name = tokens[cursor].lexeme;
+            cursor = cursor + 1; // Consume param name
+            mut p_ty = "";
+            if cursor < tokens.len() && tokens[cursor].kind == 34 {
+                cursor = cursor + 1; // Consume ':'
+                p_ty = tokens[cursor].lexeme;
+                cursor = cursor + 1; // Consume param type
+            }
+            cursor = cursor + 1; // Consume ')'
+            mut r_ty = "";
+            if cursor < tokens.len() && tokens[cursor].kind == 36 {
+                cursor = cursor + 1; // Consume '->'
+                r_ty = tokens[cursor].lexeme;
+                cursor = cursor + 1; // Consume return type
+            }
+            if cursor < tokens.len() && tokens[cursor].kind == 35 {
+                cursor = cursor + 1; // Consume ';'
+            }
+            methods.push(AstTraitMethod(
+                name: meth_name,
+                param_name: p_name,
+                param_ty: p_ty,
+                ret_ty: r_ty
+            ));
+        } else {
+            cursor = cursor + 1;
+        }
+    }
+
+    return AstTrait(is_pub: is_pub, name: trait_name, methods: methods);
+}
+
+// High-level parser: impl definitions (`impl Trait for Target { ... }` or `impl Target { ... }`)
+pub fn parse_impl(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstImpl {
+    cursor = cursor + 1; // Consume 'impl'
+    let first_tok = tokens[cursor];
+    cursor = cursor + 1;
+
+    mut has_trait = false;
+    mut trait_name = "";
+    mut target_ty = "";
+
+    if cursor < tokens.len() && tokens[cursor].kind == 13 {
+        // 'for' keyword found: `impl Trait for Target`
+        has_trait = true;
+        trait_name = first_tok.lexeme;
+        cursor = cursor + 1; // Consume 'for'
+        target_ty = tokens[cursor].lexeme;
+        cursor = cursor + 1; // Consume target type
+    } else {
+        // Inherent impl: `impl Target`
+        has_trait = false;
+        trait_name = "";
+        target_ty = first_tok.lexeme;
+    }
+
+    if cursor < tokens.len() && tokens[cursor].kind == 32 {
+        cursor = cursor + 1; // Consume '{'
+    }
+
+    mut methods: List<AstFunction> = List::new();
+    mut parsing = true;
+    while parsing {
+        if cursor >= tokens.len() {
+            parsing = false;
+        } else if tokens[cursor].kind == 33 {
+            cursor = cursor + 1; // Consume '}'
+            parsing = false;
+        } else if tokens[cursor].kind == 1 || (tokens[cursor].kind == 15 && cursor + 1 < tokens.len() && tokens[cursor + 1].kind == 1) {
+            if tokens[cursor].kind == 15 {
+                cursor = cursor + 1; // Consume optional 'pub'
+            }
+            let func = parse_function(inout cursor, tokens, inout pool);
+            methods.push(func);
+        } else {
+            cursor = cursor + 1;
+        }
+    }
+
+    return AstImpl(
+        has_trait: has_trait,
+        trait_name: trait_name,
+        target_ty: target_ty,
+        methods: methods
+    );
+}
+
+// High-level parser: struct definitions (`pub struct Name { field: Ty, ... }`)
+pub fn parse_struct(inout cursor: i64, tokens: List<Token>) -> AstStruct {
+    mut is_pub = false;
+    if cursor < tokens.len() && tokens[cursor].kind == 15 {
+        is_pub = true;
+        cursor = cursor + 1; // Consume 'pub'
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 8 {
+        cursor = cursor + 1; // Consume 'struct'
+    }
+    let st_name = tokens[cursor].lexeme;
+    cursor = cursor + 1; // Consume struct name
+
+    if cursor < tokens.len() && tokens[cursor].kind == 32 {
+        cursor = cursor + 1; // Consume '{'
+    }
+
+    mut fields: List<AstField> = List::new();
+    mut parsing = true;
+    while parsing {
+        if cursor >= tokens.len() {
+            parsing = false;
+        } else if tokens[cursor].kind == 33 {
+            cursor = cursor + 1; // Consume '}'
+            parsing = false;
+        } else if tokens[cursor].kind == 10 {
+            let f_name = tokens[cursor].lexeme;
+            cursor = cursor + 1;
+            cursor = cursor + 1; // Consume ':'
+            let f_ty = tokens[cursor].lexeme;
+            cursor = cursor + 1; // Consume type
+            if cursor < tokens.len() && (tokens[cursor].kind == 39 || tokens[cursor].kind == 35) {
+                cursor = cursor + 1; // Consume ',' or ';'
+            }
+            fields.push(AstField(name: f_name, ty: f_ty));
+        } else {
+            cursor = cursor + 1;
+        }
+    }
+
+    return AstStruct(is_pub: is_pub, name: st_name, fields: fields);
+}
+
+// High-level parser: full module program item collection
+pub fn parse_program(tokens: List<Token>, inout pool: List<AstExpr>) -> AstProgram {
+    mut traits: List<AstTrait> = List::new();
+    mut impls: List<AstImpl> = List::new();
+    mut structs: List<AstStruct> = List::new();
+    mut functions: List<AstFunction> = List::new();
+
+    mut cursor: i64 = 0;
+    while cursor < tokens.len() {
+        let tok = tokens[cursor];
+        if tok.kind == 15 {
+            // 'pub' prefix
+            if cursor + 1 < tokens.len() {
+                let next = tokens[cursor + 1];
+                if next.kind == 9 {
+                    let tr = parse_trait(inout cursor, tokens);
+                    traits.push(tr);
+                } else if next.kind == 8 {
+                    let st = parse_struct(inout cursor, tokens);
+                    structs.push(st);
+                } else if next.kind == 1 {
+                    cursor = cursor + 1; // Consume 'pub'
+                    let f = parse_function(inout cursor, tokens, inout pool);
+                    functions.push(f);
+                } else {
+                    cursor = cursor + 1;
+                }
+            } else {
+                cursor = cursor + 1;
+            }
+        } else if tok.kind == 9 {
+            let tr = parse_trait(inout cursor, tokens);
+            traits.push(tr);
+        } else if tok.kind == 12 {
+            let im = parse_impl(inout cursor, tokens, inout pool);
+            impls.push(im);
+        } else if tok.kind == 8 {
+            let st = parse_struct(inout cursor, tokens);
+            structs.push(st);
+        } else if tok.kind == 1 {
+            let f = parse_function(inout cursor, tokens, inout pool);
+            functions.push(f);
+        } else {
+            cursor = cursor + 1;
+        }
+    }
+
+    return AstProgram(
+        traits: traits,
+        impls: impls,
+        structs: structs,
+        functions: functions
+    );
+}
+
 // Unit test 1: Generational reference AST construction
 pub fn test_parser_ast_building() -> bool {
     mut node_left = AstExpr(kind: 2, val: 0, name: "x", op: 0, left: None, right: None);
@@ -293,12 +648,209 @@ pub fn test_parser_paren_precedence() -> bool {
     return root.op == 3; // Root must be '*' multiplication
 }
 
+// Unit test 4: High-level Trait item parsing
+pub fn test_parser_trait_declaration() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 15, value: 0, lexeme: "pub"));
+    tokens.push(Token(kind: 9, value: 0, lexeme: "trait"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "Diagnosable"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 1, value: 0, lexeme: "fn"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "diagnose"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "self"));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 36, value: 0, lexeme: "->"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "String"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+
+    mut cur: i64 = 0;
+    let tr = parse_trait(inout cur, tokens);
+    if !tr.is_pub {
+        return false;
+    }
+    if tr.name != "Diagnosable" {
+        return false;
+    }
+    if tr.methods.len() != 1 {
+        return false;
+    }
+    let m = tr.methods[0];
+    if m.name != "diagnose" {
+        return false;
+    }
+    if m.param_name != "self" {
+        return false;
+    }
+    return m.ret_ty == "String";
+}
+
+// Unit test 5: High-level Impl item parsing
+pub fn test_parser_impl_declaration() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 12, value: 0, lexeme: "impl"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "Diagnosable"));
+    tokens.push(Token(kind: 13, value: 0, lexeme: "for"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "Diagnostic"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 1, value: 0, lexeme: "fn"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "diagnose"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "self"));
+    tokens.push(Token(kind: 34, value: 0, lexeme: ":"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "Diagnostic"));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 36, value: 0, lexeme: "->"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "String"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 4, value: 0, lexeme: "return"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "msg"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let im = parse_impl(inout cur, tokens, inout pool);
+
+    if !im.has_trait {
+        return false;
+    }
+    if im.trait_name != "Diagnosable" {
+        return false;
+    }
+    if im.target_ty != "Diagnostic" {
+        return false;
+    }
+    if im.methods.len() != 1 {
+        return false;
+    }
+    return im.methods[0].name == "diagnose";
+}
+
+// Unit test 6: High-level Match Expression and Pattern Parsing
+pub fn test_parser_match_expression() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 14, value: 0, lexeme: "match"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "val"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 11, value: 1, lexeme: "1"));
+    tokens.push(Token(kind: 37, value: 0, lexeme: "=>"));
+    tokens.push(Token(kind: 11, value: 10, lexeme: "10"));
+    tokens.push(Token(kind: 39, value: 0, lexeme: ","));
+    tokens.push(Token(kind: 11, value: 2, lexeme: "2"));
+    tokens.push(Token(kind: 37, value: 0, lexeme: "=>"));
+    tokens.push(Token(kind: 11, value: 20, lexeme: "20"));
+    tokens.push(Token(kind: 39, value: 0, lexeme: ","));
+    tokens.push(Token(kind: 38, value: 0, lexeme: "_"));
+    tokens.push(Token(kind: 37, value: 0, lexeme: "=>"));
+    tokens.push(Token(kind: 11, value: 42, lexeme: "42"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let mat = parse_match(inout cur, tokens, inout pool);
+
+    if mat.target_var != "val" {
+        return false;
+    }
+    if mat.arms.len() != 3 {
+        return false;
+    }
+    let arm0 = mat.arms[0];
+    if arm0.pat.kind != 2 || arm0.pat.val != 1 {
+        return false;
+    }
+    let arm1 = mat.arms[1];
+    if arm1.pat.kind != 2 || arm1.pat.val != 2 {
+        return false;
+    }
+    let arm2 = mat.arms[2];
+    if arm2.pat.kind != 1 {
+        return false;
+    }
+    return true;
+}
+
+// Unit test 7: Full Program with high-level traits, structs, and functions
+pub fn test_parser_program_high_level_items() -> bool {
+    mut tokens: List<Token> = List::new();
+    // 1. Trait item
+    tokens.push(Token(kind: 15, value: 0, lexeme: "pub"));
+    tokens.push(Token(kind: 9, value: 0, lexeme: "trait"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "Diagnosable"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 1, value: 0, lexeme: "fn"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "diagnose"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "self"));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 36, value: 0, lexeme: "->"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "String"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+    // 2. Struct item
+    tokens.push(Token(kind: 15, value: 0, lexeme: "pub"));
+    tokens.push(Token(kind: 8, value: 0, lexeme: "struct"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "Diagnostic"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "code"));
+    tokens.push(Token(kind: 34, value: 0, lexeme: ":"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "i64"));
+    tokens.push(Token(kind: 39, value: 0, lexeme: ","));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "msg"));
+    tokens.push(Token(kind: 34, value: 0, lexeme: ":"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "String"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+    // 3. Function item
+    tokens.push(Token(kind: 1, value: 0, lexeme: "fn"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "compute"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 5, value: 0, lexeme: "inout"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "x"));
+    tokens.push(Token(kind: 34, value: 0, lexeme: ":"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "i64"));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 36, value: 0, lexeme: "->"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "i64"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 4, value: 0, lexeme: "return"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "x"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+
+    mut pool: List<AstExpr> = List::new();
+    let prog = parse_program(tokens, inout pool);
+
+    if prog.traits.len() != 1 {
+        return false;
+    }
+    if prog.structs.len() != 1 {
+        return false;
+    }
+    if prog.functions.len() != 1 {
+        return false;
+    }
+    if prog.traits[0].name != "Diagnosable" {
+        return false;
+    }
+    if prog.structs[0].name != "Diagnostic" {
+        return false;
+    }
+    return prog.functions[0].name == "compute";
+}
+
 pub fn main() {
     println("=== IFA Compiler Parser Module ===");
     let t1 = test_parser_ast_building();
     let t2 = test_parser_precedence();
     let t3 = test_parser_paren_precedence();
-    if t1 && t2 && t3 {
+    let t4 = test_parser_trait_declaration();
+    let t5 = test_parser_impl_declaration();
+    let t6 = test_parser_match_expression();
+    let t7 = test_parser_program_high_level_items();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 {
         println("Parser validation tests: ALL PASSED");
     } else {
         println("Parser validation tests: FAILED");

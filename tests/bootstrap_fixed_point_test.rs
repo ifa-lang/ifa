@@ -90,8 +90,33 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_parser_trait_declaration ... ok"),
+        "Modular parser trait test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_impl_declaration ... ok"),
+        "Modular parser impl test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_match_expression ... ok"),
+        "Modular parser match test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_program_high_level_items ... ok"),
+        "Modular parser program test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_sema_eval ... ok"),
         "Modular sema tests missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_pattern_matching ... ok"),
+        "Modular sema pattern matching test missing from output:\n{}",
         stdout
     );
     assert!(
@@ -105,8 +130,8 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("21 passed; 0 failed"),
-        "Expected 21 passed unit tests, got:\n{}",
+        stdout.contains("31 passed; 0 failed"),
+        "Expected 31 passed unit tests, got:\n{}",
         stdout
     );
 }

@@ -1,16 +1,22 @@
 // Pure IFA Self-Hosting Compiler - Lexer Module (`compiler/lexer.ifa`)
 // Deterministic lexical scanner and token generation for IFA bootstrap compiler.
 
-comptime fn build_keyword_lut() -> [i64; 8] {
-    mut lut: [i64; 8] = [0; 8];
-    lut[0] = 1; // TOK_FN
-    lut[1] = 2; // TOK_LET
-    lut[2] = 3; // TOK_MUT
-    lut[3] = 4; // TOK_RETURN
-    lut[4] = 5; // TOK_INOUT
-    lut[5] = 6; // TOK_REF
-    lut[6] = 7; // TOK_COMPTIME
-    lut[7] = 8; // TOK_STRUCT
+comptime fn build_keyword_lut() -> [i64; 14] {
+    mut lut: [i64; 14] = [0; 14];
+    lut[0] = 1;  // TOK_FN
+    lut[1] = 2;  // TOK_LET
+    lut[2] = 3;  // TOK_MUT
+    lut[3] = 4;  // TOK_RETURN
+    lut[4] = 5;  // TOK_INOUT
+    lut[5] = 6;  // TOK_REF
+    lut[6] = 7;  // TOK_COMPTIME
+    lut[7] = 8;  // TOK_STRUCT
+    lut[8] = 9;  // TOK_TRAIT
+    lut[9] = 12; // TOK_IMPL
+    lut[10] = 13; // TOK_FOR
+    lut[11] = 14; // TOK_MATCH
+    lut[12] = 15; // TOK_PUB
+    lut[13] = 16; // TOK_WHERE
     return lut;
 }
 
@@ -107,6 +113,137 @@ pub fn tokenize_arithmetic_program() -> List<Token> {
     return tokens;
 }
 
+// Tokenize trait declaration:
+// `pub trait Diagnosable { fn diagnose(self) -> String; }`
+pub fn tokenize_trait_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    advance_token(inout tokens, 15, 0, "pub");
+    advance_token(inout tokens, 9, 0, "trait");
+    advance_token(inout tokens, 10, 0, "Diagnosable");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 1, 0, "fn");
+    advance_token(inout tokens, 10, 0, "diagnose");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 10, 0, "self");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 36, 0, "->");
+    advance_token(inout tokens, 10, 0, "String");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+
+    return tokens;
+}
+
+// Tokenize impl declaration:
+// `impl Diagnosable for Diagnostic { fn diagnose(self) -> String { return msg; } }`
+pub fn tokenize_impl_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    advance_token(inout tokens, 12, 0, "impl");
+    advance_token(inout tokens, 10, 0, "Diagnosable");
+    advance_token(inout tokens, 13, 0, "for");
+    advance_token(inout tokens, 10, 0, "Diagnostic");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 1, 0, "fn");
+    advance_token(inout tokens, 10, 0, "diagnose");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 10, 0, "self");
+    advance_token(inout tokens, 34, 0, ":");
+    advance_token(inout tokens, 10, 0, "Diagnostic");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 36, 0, "->");
+    advance_token(inout tokens, 10, 0, "String");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 4, 0, "return");
+    advance_token(inout tokens, 10, 0, "msg");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+    advance_token(inout tokens, 33, 0, "}");
+
+    return tokens;
+}
+
+// Tokenize pattern matching expression:
+// `match val { 1 => 10, 2 => 20, _ => 42 }`
+pub fn tokenize_match_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    advance_token(inout tokens, 14, 0, "match");
+    advance_token(inout tokens, 10, 0, "val");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 11, 1, "1");
+    advance_token(inout tokens, 37, 0, "=>");
+    advance_token(inout tokens, 11, 10, "10");
+    advance_token(inout tokens, 39, 0, ",");
+    advance_token(inout tokens, 11, 2, "2");
+    advance_token(inout tokens, 37, 0, "=>");
+    advance_token(inout tokens, 11, 20, "20");
+    advance_token(inout tokens, 39, 0, ",");
+    advance_token(inout tokens, 38, 0, "_");
+    advance_token(inout tokens, 37, 0, "=>");
+    advance_token(inout tokens, 11, 42, "42");
+    advance_token(inout tokens, 33, 0, "}");
+
+    return tokens;
+}
+
+// Tokenize full program with high-level items:
+// pub trait Diagnosable { fn diagnose(self) -> String; }
+// pub struct Diagnostic { code: i64, msg: String }
+// fn compute(inout x: i64) -> i64 { return x; }
+pub fn tokenize_full_module() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    // 1. Trait item
+    advance_token(inout tokens, 15, 0, "pub");
+    advance_token(inout tokens, 9, 0, "trait");
+    advance_token(inout tokens, 10, 0, "Diagnosable");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 1, 0, "fn");
+    advance_token(inout tokens, 10, 0, "diagnose");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 10, 0, "self");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 36, 0, "->");
+    advance_token(inout tokens, 10, 0, "String");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+
+    // 2. Struct item
+    advance_token(inout tokens, 15, 0, "pub");
+    advance_token(inout tokens, 8, 0, "struct");
+    advance_token(inout tokens, 10, 0, "Diagnostic");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 10, 0, "code");
+    advance_token(inout tokens, 34, 0, ":");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 39, 0, ",");
+    advance_token(inout tokens, 10, 0, "msg");
+    advance_token(inout tokens, 34, 0, ":");
+    advance_token(inout tokens, 10, 0, "String");
+    advance_token(inout tokens, 33, 0, "}");
+
+    // 3. Function item
+    advance_token(inout tokens, 1, 0, "fn");
+    advance_token(inout tokens, 10, 0, "compute");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 5, 0, "inout");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 34, 0, ":");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 36, 0, "->");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 4, 0, "return");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+
+    return tokens;
+}
+
 // Unit test: Token stream verification and list properties
 pub fn test_lexer_stream() -> bool {
     let tokens = tokenize_sample_program();
@@ -130,7 +267,7 @@ pub fn test_lexer_stream() -> bool {
 
 // Unit test: Comptime keyword LUT validation
 pub fn test_comptime_keyword_lut() -> bool {
-    return KEYWORD_LUT.len() == 8;
+    return KEYWORD_LUT.len() == 14;
 }
 
 pub fn main() {
