@@ -214,6 +214,40 @@ pub struct AstReifiedVTable {
     method_symbols: List<String>
 }
 
+// AST: Switch statement case arm for deterministic SSA branching
+pub struct AstSwitchCase {
+    val: i64,
+    label: String
+}
+
+// AST: Multi-way branch instruction (LLVM `switch`, FIR `fir.switch`)
+pub struct AstSwitchStmt {
+    cond_var: String,
+    cond_ty: String,
+    default_label: String,
+    cases: List<AstSwitchCase>
+}
+
+// AST: Key-Value symbol entry for deterministic lookup table
+pub struct AstSymbolTableEntry {
+    symbol_name: String,
+    symbol_id: i64
+}
+
+// AST: Global deterministic symbol lookup table definition
+pub struct AstSymbolLookupTable {
+    table_name: String,
+    entries: List<AstSymbolTableEntry>
+}
+
+// AST: Fast memory hash / checksum assertion instruction
+pub struct AstChecksumVerification {
+    target_var: String,
+    buf_ptr_var: String,
+    len_var: String,
+    expected_hash: i64
+}
+
 // AST: Thunk definition for zero-allocation stack closures
 pub struct AstThunkDef {
     thunk_name: String,
@@ -4552,6 +4586,193 @@ pub fn test_codegen_reified_vtable_descriptor() -> bool {
     return fir_vt == "fir.reified_vtable @Point$Describable$reified_vt = { struct: \"Point\", trait: \"Describable\", size: 16, align: 8, methods: [@Point$describe, @Point$compute_hash] }";
 }
 
+/// Lowers an SSA multi-way branch (switch) to LLVM IR instructions.
+pub fn emit_llvm_ssa_switch(stmt: AstSwitchStmt) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  switch " + stmt.cond_ty + " %" + stmt.cond_var + ", label %" + stmt.default_label + " [");
+    mut i: i64 = 0;
+    while i < stmt.cases.len() {
+        let c = stmt.cases[i];
+        lines.push("    " + stmt.cond_ty + " " + int_to_str(c.val) + ", label %" + c.label);
+        i = i + 1;
+    }
+    lines.push("  ]");
+    return lines;
+}
+
+pub fn emit_fir_ssa_switch(stmt: AstSwitchStmt) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut cases_str = "";
+    mut i: i64 = 0;
+    while i < stmt.cases.len() {
+        let c = stmt.cases[i];
+        if i > 0 {
+            cases_str = cases_str + ", ";
+        }
+        cases_str = cases_str + int_to_str(c.val) + ": ^" + c.label;
+        i = i + 1;
+    }
+    lines.push("    fir.switch %" + stmt.cond_var + ", default: ^" + stmt.default_label + " [ " + cases_str + " ]");
+    return lines;
+}
+
+/// Lowers a deterministic global symbol lookup table to LLVM IR constant definitions.
+pub fn emit_llvm_symbol_lookup_table(tbl: AstSymbolLookupTable) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut i: i64 = 0;
+    while i < tbl.entries.len() {
+        let entry = tbl.entries[i];
+        let sym_len = entry.symbol_name.len() + 1;
+        let str_const = "@.sym." + tbl.table_name + "." + int_to_str(i) + " = private unnamed_addr constant [" + int_to_str(sym_len) + " x i8] c\"" + entry.symbol_name + "\\00\", align 1";
+        lines.push(str_const);
+        i = i + 1;
+    }
+    mut arr = "@" + tbl.table_name + " = constant [" + int_to_str(tbl.entries.len()) + " x { ptr, i64 }] [";
+    mut j: i64 = 0;
+    while j < tbl.entries.len() {
+        if j > 0 {
+            arr = arr + ", ";
+        }
+        let e = tbl.entries[j];
+        arr = arr + "{ ptr, i64 } { ptr @.sym." + tbl.table_name + "." + int_to_str(j) + ", i64 " + int_to_str(e.symbol_id) + " }";
+        j = j + 1;
+    }
+    arr = arr + "], align 8";
+    lines.push(arr);
+    return lines;
+}
+
+pub fn emit_fir_symbol_lookup_table(tbl: AstSymbolLookupTable) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut s = "fir.symbol_table @" + tbl.table_name + " = [";
+    mut i: i64 = 0;
+    while i < tbl.entries.len() {
+        if i > 0 {
+            s = s + ", ";
+        }
+        let e = tbl.entries[i];
+        s = s + "(\"" + e.symbol_name + "\", " + int_to_str(e.symbol_id) + ")";
+        i = i + 1;
+    }
+    s = s + "]";
+    lines.push(s);
+    return lines;
+}
+
+/// Lowers checksum/fast hash verification instructions for deterministic bit-for-bit validation.
+pub fn emit_llvm_checksum_verification(chk: AstChecksumVerification) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  %" + chk.target_var + " = call i64 @ifa_rt_crypto_fast_hash(ptr %" + chk.buf_ptr_var + ", i64 %" + chk.len_var + ")");
+    lines.push("  %" + chk.target_var + "_match = icmp eq i64 %" + chk.target_var + ", " + int_to_str(chk.expected_hash));
+    return lines;
+}
+
+pub fn emit_fir_checksum_verification(chk: AstChecksumVerification) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + chk.target_var + " = fir.crypto_fast_hash %" + chk.buf_ptr_var + ", len=%" + chk.len_var);
+    lines.push("    %" + chk.target_var + "_match = fir.icmp.eq %" + chk.target_var + ", " + int_to_str(chk.expected_hash));
+    return lines;
+}
+
+// Unit test 43: SSA switch and jump table multi-way branching
+pub fn test_codegen_ssa_switch_and_jump_table() -> bool {
+    mut cases: List<AstSwitchCase> = List::new();
+    cases.push(AstSwitchCase(val: 0, label: "case.zero"));
+    cases.push(AstSwitchCase(val: 1, label: "case.one"));
+    cases.push(AstSwitchCase(val: 2, label: "case.two"));
+
+    let sw = AstSwitchStmt(
+        cond_var: "tag",
+        cond_ty: "i64",
+        default_label: "case.default",
+        cases: cases
+    );
+
+    let llvm_sw = emit_llvm_ssa_switch(sw);
+    let fir_sw = emit_fir_ssa_switch(sw);
+
+    if llvm_sw.len() != 5 || fir_sw.len() != 1 {
+        return false;
+    }
+    if llvm_sw[0] != "  switch i64 %tag, label %case.default [" {
+        return false;
+    }
+    if llvm_sw[1] != "    i64 0, label %case.zero" {
+        return false;
+    }
+    if llvm_sw[2] != "    i64 1, label %case.one" {
+        return false;
+    }
+    if llvm_sw[3] != "    i64 2, label %case.two" {
+        return false;
+    }
+    if llvm_sw[4] != "  ]" {
+        return false;
+    }
+    return fir_sw[0] == "    fir.switch %tag, default: ^case.default [ 0: ^case.zero, 1: ^case.one, 2: ^case.two ]";
+}
+
+// Unit test 44: Deterministic global symbol lookup table lowering
+pub fn test_codegen_symbol_lookup_table() -> bool {
+    mut entries: List<AstSymbolTableEntry> = List::new();
+    entries.push(AstSymbolTableEntry(symbol_name: "fn", symbol_id: 101));
+    entries.push(AstSymbolTableEntry(symbol_name: "let", symbol_id: 102));
+    entries.push(AstSymbolTableEntry(symbol_name: "match", symbol_id: 103));
+
+    let tbl = AstSymbolLookupTable(
+        table_name: "ifa_keyword_table",
+        entries: entries
+    );
+
+    let llvm_tbl = emit_llvm_symbol_lookup_table(tbl);
+    let fir_tbl = emit_fir_symbol_lookup_table(tbl);
+
+    if llvm_tbl.len() != 4 || fir_tbl.len() != 1 {
+        return false;
+    }
+    if llvm_tbl[0] != "@.sym.ifa_keyword_table.0 = private unnamed_addr constant [3 x i8] c\"fn\\00\", align 1" {
+        return false;
+    }
+    if llvm_tbl[1] != "@.sym.ifa_keyword_table.1 = private unnamed_addr constant [4 x i8] c\"let\\00\", align 1" {
+        return false;
+    }
+    if llvm_tbl[2] != "@.sym.ifa_keyword_table.2 = private unnamed_addr constant [6 x i8] c\"match\\00\", align 1" {
+        return false;
+    }
+    let exp_arr = "@ifa_keyword_table = constant [3 x { ptr, i64 }] [{ ptr, i64 } { ptr @.sym.ifa_keyword_table.0, i64 101 }, { ptr, i64 } { ptr @.sym.ifa_keyword_table.1, i64 102 }, { ptr, i64 } { ptr @.sym.ifa_keyword_table.2, i64 103 }], align 8";
+    if llvm_tbl[3] != exp_arr {
+        return false;
+    }
+    return fir_tbl[0] == "fir.symbol_table @ifa_keyword_table = [(\"fn\", 101), (\"let\", 102), (\"match\", 103)]";
+}
+
+// Unit test 45: Fast checksum and hash verification lowering
+pub fn test_codegen_checksum_verification() -> bool {
+    let chk = AstChecksumVerification(
+        target_var: "hash_code",
+        buf_ptr_var: "ir_bytes",
+        len_var: "ir_len",
+        expected_hash: 42
+    );
+
+    let llvm_chk = emit_llvm_checksum_verification(chk);
+    let fir_chk = emit_fir_checksum_verification(chk);
+
+    if llvm_chk.len() != 2 || fir_chk.len() != 2 {
+        return false;
+    }
+    if llvm_chk[0] != "  %hash_code = call i64 @ifa_rt_crypto_fast_hash(ptr %ir_bytes, i64 %ir_len)" {
+        return false;
+    }
+    if llvm_chk[1] != "  %hash_code_match = icmp eq i64 %hash_code, 42" {
+        return false;
+    }
+    if fir_chk[0] != "    %hash_code = fir.crypto_fast_hash %ir_bytes, len=%ir_len" {
+        return false;
+    }
+    return fir_chk[1] == "    %hash_code_match = fir.icmp.eq %hash_code, 42";
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -4598,7 +4819,10 @@ pub fn main() {
     let t40 = test_codegen_fn_ptr_multi_call();
     let t41 = test_codegen_trait_fat_ptr_and_reified_dispatch();
     let t42 = test_codegen_reified_vtable_descriptor();
-    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 && t33 && t34 && t35 && t36 && t37 && t38 && t39 && t40 && t41 && t42 {
+    let t43 = test_codegen_ssa_switch_and_jump_table();
+    let t44 = test_codegen_symbol_lookup_table();
+    let t45 = test_codegen_checksum_verification();
+    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 && t33 && t34 && t35 && t36 && t37 && t38 && t39 && t40 && t41 && t42 && t43 && t44 && t45 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");

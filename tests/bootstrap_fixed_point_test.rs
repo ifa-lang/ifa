@@ -761,8 +761,33 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("290 passed; 0 failed"),
-        "Expected 290 passed unit tests, got:\n{}",
+        stdout.contains("test test_codegen_ssa_switch_and_jump_table ... ok"),
+        "Modular codegen ssa switch test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_symbol_lookup_table ... ok"),
+        "Modular codegen symbol lookup table test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_checksum_verification ... ok"),
+        "Modular codegen checksum verification test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_manifest_generation ... ok"),
+        "Modular driver manifest generation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_ast_function_summary ... ok"),
+        "Modular driver ast function summary test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("300 passed; 0 failed"),
+        "Expected 300 passed unit tests, got:\n{}",
         stdout
     );
 }

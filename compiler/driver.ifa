@@ -2022,6 +2022,105 @@ pub fn test_driver_disjoint_access_path_validation() -> bool {
     return ld == "  %val = load i64, ptr %ptr_x, align 8, !noalias !10";
 }
 
+pub struct DriverManifest {
+    compiler_id: String,
+    stage_generation: i64,
+    source_digest: String,
+    target_triple: String,
+    opt_level: i64,
+    deterministic: bool
+}
+
+pub fn make_driver_manifest(
+    gen: i64,
+    digest: String,
+    target: String,
+    opt: i64
+) -> DriverManifest {
+    return DriverManifest(
+        compiler_id: "ifac-stage" + driver_int_to_str(gen),
+        stage_generation: gen,
+        source_digest: digest,
+        target_triple: target,
+        opt_level: opt,
+        deterministic: true
+    );
+}
+
+pub fn emit_manifest_header_comments(manifest: DriverManifest) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("; === IFA Compiler Autonomous Deterministic Manifest ===");
+    lines.push("; CompilerID: " + manifest.compiler_id);
+    lines.push("; StageGeneration: " + driver_int_to_str(manifest.stage_generation));
+    lines.push("; SourceDigest: " + manifest.source_digest);
+    lines.push("; TargetTriple: " + manifest.target_triple);
+    lines.push("; OptLevel: -O" + driver_int_to_str(manifest.opt_level));
+    lines.push("; DeterministicBitForBit: true");
+    lines.push("; ======================================================");
+    return lines;
+}
+
+pub struct DriverAstFunctionSummary {
+    name: String,
+    param_count: i64,
+    statement_count: i64,
+    returns_value: bool
+}
+
+pub fn summarize_driver_function(name: String, params: i64, stmts: i64, ret: bool) -> DriverAstFunctionSummary {
+    return DriverAstFunctionSummary(
+        name: name,
+        param_count: params,
+        statement_count: stmts,
+        returns_value: ret
+    );
+}
+
+// Unit Test 19: Verify autonomous driver manifest and deterministic metadata header
+pub fn test_driver_manifest_generation() -> bool {
+    let manifest = make_driver_manifest(
+        2,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "x86_64-unknown-linux-gnu",
+        2
+    );
+    if manifest.compiler_id != "ifac-stage2" || manifest.stage_generation != 2 {
+        return false;
+    }
+    if !manifest.deterministic || manifest.opt_level != 2 {
+        return false;
+    }
+    let lines = emit_manifest_header_comments(manifest);
+    if lines.len() != 8 {
+        return false;
+    }
+    if lines[0] != "; === IFA Compiler Autonomous Deterministic Manifest ===" {
+        return false;
+    }
+    if lines[1] != "; CompilerID: ifac-stage2" {
+        return false;
+    }
+    if lines[2] != "; StageGeneration: 2" {
+        return false;
+    }
+    if lines[6] != "; DeterministicBitForBit: true" {
+        return false;
+    }
+    return lines[7] == "; ======================================================";
+}
+
+// Unit Test 20: Verify driver AST function summary and metadata extraction
+pub fn test_driver_ast_function_summary() -> bool {
+    let summary = summarize_driver_function("compute_payload", 3, 12, true);
+    if summary.name != "compute_payload" {
+        return false;
+    }
+    if summary.param_count != 3 || summary.statement_count != 12 {
+        return false;
+    }
+    return summary.returns_value;
+}
+
 pub fn main() {
     println("=== IFA Compiler Driver & I/O Module ===");
     let t1 = test_driver_default_config();
@@ -2042,8 +2141,10 @@ pub fn main() {
     let t16 = test_driver_memory_alignment_and_struct_layout();
     let t17 = test_driver_arena_aligned_allocation_and_reset();
     let t18 = test_driver_disjoint_access_path_validation();
+    let t19 = test_driver_manifest_generation();
+    let t20 = test_driver_ast_function_summary();
 
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 {
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 {
         println("Driver validation tests: ALL PASSED");
     } else {
         println("Driver validation tests: FAILED");
