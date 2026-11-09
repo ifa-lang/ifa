@@ -731,8 +731,23 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("278 passed; 0 failed"),
-        "Expected 278 passed unit tests, got:\n{}",
+        stdout.contains("test test_codegen_fn_ptr_multi_call ... ok"),
+        "Modular codegen fn ptr multi call test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_trait_fat_ptr_and_reified_dispatch ... ok"),
+        "Modular codegen trait fat ptr and reified dispatch test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_reified_vtable_descriptor ... ok"),
+        "Modular codegen reified vtable descriptor test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("284 passed; 0 failed"),
+        "Expected 284 passed unit tests, got:\n{}",
         stdout
     );
 }

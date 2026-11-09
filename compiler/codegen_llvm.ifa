@@ -172,6 +172,48 @@ pub struct AstFnPtrCall {
     param_ty: String
 }
 
+// AST: Argument definition for function pointer calls
+pub struct AstFnPtrArg {
+    param_ty: String,
+    arg_var: String
+}
+
+// AST: Function pointer indirect call with arbitrary arguments
+pub struct AstFnPtrMultiCall {
+    fn_var: String,
+    target_var: String,
+    return_ty: String,
+    args: List<AstFnPtrArg>
+}
+
+// AST: Trait Object fat pointer representation { ptr data, ptr vtable }
+pub struct AstTraitFatPtr {
+    target_var: String,
+    trait_name: String,
+    data_var: String,
+    vtable_sym: String
+}
+
+// AST: Dynamic dispatch method call on a Trait Object
+pub struct AstDynDispatchCall {
+    target_var: String,
+    fat_ptr_var: String,
+    trait_name: String,
+    method_idx: i64,
+    return_ty: String,
+    extra_args: List<AstFnPtrArg>
+}
+
+// AST: Reified VTable definition with metadata header
+pub struct AstReifiedVTable {
+    vtable_sym: String,
+    struct_name: String,
+    trait_name: String,
+    type_size: i64,
+    type_align: i64,
+    method_symbols: List<String>
+}
+
 // AST: Thunk definition for zero-allocation stack closures
 pub struct AstThunkDef {
     thunk_name: String,
@@ -1890,6 +1932,135 @@ pub fn emit_fir_fn_ptr_call(call: AstFnPtrCall) -> List<String> {
     mut lines: List<String> = List::new();
     lines.push("    %" + call.target_var + " = fir.call_indirect %" + call.fn_var + "(%" + call.arg_var + ")");
     return lines;
+}
+
+// Emits LLVM function pointer indirect call with multiple arbitrary arguments
+pub fn emit_llvm_fn_ptr_multi_call(call: AstFnPtrMultiCall) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut arg_str = "";
+    mut i: i64 = 0;
+    while i < call.args.len() {
+        if i > 0 {
+            arg_str = arg_str + ", ";
+        }
+        arg_str = arg_str + call.args[i].param_ty + " %" + call.args[i].arg_var;
+        i = i + 1;
+    }
+    lines.push("  %" + call.target_var + " = call " + call.return_ty + " %" + call.fn_var + "(" + arg_str + ")");
+    return lines;
+}
+
+// Emits FIR function pointer indirect call with multiple arbitrary arguments
+pub fn emit_fir_fn_ptr_multi_call(call: AstFnPtrMultiCall) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut arg_str = "";
+    mut i: i64 = 0;
+    while i < call.args.len() {
+        if i > 0 {
+            arg_str = arg_str + ", ";
+        }
+        arg_str = arg_str + "%" + call.args[i].arg_var;
+        i = i + 1;
+    }
+    lines.push("    %" + call.target_var + " = fir.call_indirect %" + call.fn_var + "(" + arg_str + ")");
+    return lines;
+}
+
+// Emits LLVM trait object fat pointer reification ({ ptr data, ptr vtable })
+pub fn emit_llvm_trait_fat_ptr(fat: AstTraitFatPtr) -> List<String> {
+    mut lines: List<String> = List::new();
+    let tmp = "%" + fat.target_var + ".0";
+    lines.push("  " + tmp + " = insertvalue { ptr, ptr } undef, ptr %" + fat.data_var + ", 0");
+    lines.push("  %" + fat.target_var + " = insertvalue { ptr, ptr } " + tmp + ", ptr @" + fat.vtable_sym + ", 1");
+    return lines;
+}
+
+// Emits FIR trait object fat pointer reification
+pub fn emit_fir_trait_fat_ptr(fat: AstTraitFatPtr) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + fat.target_var + " = fir.make_fat_ptr %" + fat.data_var + ", @" + fat.vtable_sym + " : !dyn<" + fat.trait_name + ">");
+    return lines;
+}
+
+// Emits LLVM dynamic dispatch method call on a Trait Object
+pub fn emit_llvm_dyn_dispatch_call(dispatch: AstDynDispatchCall) -> List<String> {
+    mut lines: List<String> = List::new();
+    let data_reg = "%data." + dispatch.target_var;
+    let vptr_reg = "%vptr." + dispatch.target_var;
+    let slot_reg = "%slot." + dispatch.target_var;
+    let fn_reg = "%fn." + dispatch.target_var;
+    let idx_str = int_to_str(dispatch.method_idx);
+
+    lines.push("  " + data_reg + " = extractvalue { ptr, ptr } %" + dispatch.fat_ptr_var + ", 0");
+    lines.push("  " + vptr_reg + " = extractvalue { ptr, ptr } %" + dispatch.fat_ptr_var + ", 1");
+    lines.push("  " + slot_reg + " = getelementptr ptr, ptr " + vptr_reg + ", i64 " + idx_str);
+    lines.push("  " + fn_reg + " = load ptr, ptr " + slot_reg + ", align 8");
+
+    mut args_str = "ptr " + data_reg;
+    mut i: i64 = 0;
+    while i < dispatch.extra_args.len() {
+        args_str = args_str + ", " + dispatch.extra_args[i].param_ty + " %" + dispatch.extra_args[i].arg_var;
+        i = i + 1;
+    }
+    lines.push("  %" + dispatch.target_var + " = call " + dispatch.return_ty + " " + fn_reg + "(" + args_str + ")");
+    return lines;
+}
+
+// Emits FIR dynamic dispatch method call on a Trait Object
+pub fn emit_fir_dyn_dispatch_call(dispatch: AstDynDispatchCall) -> List<String> {
+    mut lines: List<String> = List::new();
+    let data_reg = "%data." + dispatch.target_var;
+    let vptr_reg = "%vptr." + dispatch.target_var;
+    let fn_reg = "%fn." + dispatch.target_var;
+    let idx_str = int_to_str(dispatch.method_idx);
+
+    lines.push("    " + data_reg + " = fir.fat_ptr_data %" + dispatch.fat_ptr_var);
+    lines.push("    " + vptr_reg + " = fir.fat_ptr_vtable %" + dispatch.fat_ptr_var);
+    lines.push("    " + fn_reg + " = fir.vtable_slot_load " + vptr_reg + "[" + idx_str + "]");
+
+    mut args_str = data_reg;
+    mut i: i64 = 0;
+    while i < dispatch.extra_args.len() {
+        args_str = args_str + ", %" + dispatch.extra_args[i].arg_var;
+        i = i + 1;
+    }
+    lines.push("    %" + dispatch.target_var + " = fir.call_indirect " + fn_reg + "(" + args_str + ")");
+    return lines;
+}
+
+// Emits textual LLVM reified vtable with metadata descriptor header
+pub fn emit_llvm_reified_vtable(vt: AstReifiedVTable) -> String {
+    let count_str = int_to_str(vt.method_symbols.len());
+    let size_str = int_to_str(vt.type_size);
+    let align_str = int_to_str(vt.type_align);
+    mut s = "@" + vt.vtable_sym + " = constant { i64, i64, [" + count_str + " x ptr] } { i64 " + size_str + ", i64 " + align_str + ", [" + count_str + " x ptr] [";
+    mut i: i64 = 0;
+    while i < vt.method_symbols.len() {
+        if i > 0 {
+            s = s + ", ";
+        }
+        s = s + "ptr @" + vt.method_symbols[i];
+        i = i + 1;
+    }
+    s = s + "] }, align 8";
+    return s;
+}
+
+// Emits FIR reified vtable with metadata descriptor header
+pub fn emit_fir_reified_vtable(vt: AstReifiedVTable) -> String {
+    let size_str = int_to_str(vt.type_size);
+    let align_str = int_to_str(vt.type_align);
+    mut s = "fir.reified_vtable @" + vt.vtable_sym + " = { struct: \"" + vt.struct_name + "\", trait: \"" + vt.trait_name + "\", size: " + size_str + ", align: " + align_str + ", methods: [";
+    mut i: i64 = 0;
+    while i < vt.method_symbols.len() {
+        if i > 0 {
+            s = s + ", ";
+        }
+        s = s + "@" + vt.method_symbols[i];
+        i = i + 1;
+    }
+    s = s + "] }";
+    return s;
 }
 
 // Emits LLVM higher-order function call passing named function pointer
@@ -4260,6 +4431,127 @@ pub fn test_codegen_llvm_module_header() -> bool {
     return fir_hdr[4] == "}";
 }
 
+// Unit test 40: Multi-argument indirect function call emission
+pub fn test_codegen_fn_ptr_multi_call() -> bool {
+    mut args: List<AstFnPtrArg> = List::new();
+    args.push(AstFnPtrArg(param_ty: "i64", arg_var: "arg_x"));
+    args.push(AstFnPtrArg(param_ty: "ptr", arg_var: "buf_ptr"));
+    args.push(AstFnPtrArg(param_ty: "i32", arg_var: "flag"));
+
+    let call = AstFnPtrMultiCall(
+        fn_var: "callback_ptr",
+        target_var: "call_res",
+        return_ty: "i64",
+        args: args
+    );
+
+    let llvm_call = emit_llvm_fn_ptr_multi_call(call);
+    let fir_call = emit_fir_fn_ptr_multi_call(call);
+
+    if llvm_call.len() != 1 || fir_call.len() != 1 {
+        return false;
+    }
+    if llvm_call[0] != "  %call_res = call i64 %callback_ptr(i64 %arg_x, ptr %buf_ptr, i32 %flag)" {
+        return false;
+    }
+    return fir_call[0] == "    %call_res = fir.call_indirect %callback_ptr(%arg_x, %buf_ptr, %flag)";
+}
+
+// Unit test 41: Trait object fat pointer reification and dynamic dispatch
+pub fn test_codegen_trait_fat_ptr_and_reified_dispatch() -> bool {
+    let fat_ast = AstTraitFatPtr(
+        target_var: "dyn_obj",
+        trait_name: "Describable",
+        data_var: "pt_ptr",
+        vtable_sym: "Point$Describable$vtable"
+    );
+
+    let llvm_fat = emit_llvm_trait_fat_ptr(fat_ast);
+    let fir_fat = emit_fir_trait_fat_ptr(fat_ast);
+
+    if llvm_fat.len() != 2 || fir_fat.len() != 1 {
+        return false;
+    }
+    if llvm_fat[0] != "  %dyn_obj.0 = insertvalue { ptr, ptr } undef, ptr %pt_ptr, 0" {
+        return false;
+    }
+    if llvm_fat[1] != "  %dyn_obj = insertvalue { ptr, ptr } %dyn_obj.0, ptr @Point$Describable$vtable, 1" {
+        return false;
+    }
+    if fir_fat[0] != "    %dyn_obj = fir.make_fat_ptr %pt_ptr, @Point$Describable$vtable : !dyn<Describable>" {
+        return false;
+    }
+
+    mut extra_args: List<AstFnPtrArg> = List::new();
+    extra_args.push(AstFnPtrArg(param_ty: "i64", arg_var: "offset"));
+
+    let dispatch_ast = AstDynDispatchCall(
+        target_var: "method_res",
+        fat_ptr_var: "dyn_obj",
+        trait_name: "Describable",
+        method_idx: 1,
+        return_ty: "i64",
+        extra_args: extra_args
+    );
+
+    let llvm_disp = emit_llvm_dyn_dispatch_call(dispatch_ast);
+    let fir_disp = emit_fir_dyn_dispatch_call(dispatch_ast);
+
+    if llvm_disp.len() != 5 || fir_disp.len() != 4 {
+        return false;
+    }
+    if llvm_disp[0] != "  %data.method_res = extractvalue { ptr, ptr } %dyn_obj, 0" {
+        return false;
+    }
+    if llvm_disp[1] != "  %vptr.method_res = extractvalue { ptr, ptr } %dyn_obj, 1" {
+        return false;
+    }
+    if llvm_disp[2] != "  %slot.method_res = getelementptr ptr, ptr %vptr.method_res, i64 1" {
+        return false;
+    }
+    if llvm_disp[3] != "  %fn.method_res = load ptr, ptr %slot.method_res, align 8" {
+        return false;
+    }
+    if llvm_disp[4] != "  %method_res = call i64 %fn.method_res(ptr %data.method_res, i64 %offset)" {
+        return false;
+    }
+
+    if fir_disp[0] != "    %data.method_res = fir.fat_ptr_data %dyn_obj" {
+        return false;
+    }
+    if fir_disp[1] != "    %vptr.method_res = fir.fat_ptr_vtable %dyn_obj" {
+        return false;
+    }
+    if fir_disp[2] != "    %fn.method_res = fir.vtable_slot_load %vptr.method_res[1]" {
+        return false;
+    }
+    return fir_disp[3] == "    %method_res = fir.call_indirect %fn.method_res(%data.method_res, %offset)";
+}
+
+// Unit test 42: Reified vtable definition with metadata descriptor header
+pub fn test_codegen_reified_vtable_descriptor() -> bool {
+    mut syms: List<String> = List::new();
+    syms.push("Point$describe");
+    syms.push("Point$compute_hash");
+
+    let r_vt = AstReifiedVTable(
+        vtable_sym: "Point$Describable$reified_vt",
+        struct_name: "Point",
+        trait_name: "Describable",
+        type_size: 16,
+        type_align: 8,
+        method_symbols: syms
+    );
+
+    let llvm_vt = emit_llvm_reified_vtable(r_vt);
+    let fir_vt = emit_fir_reified_vtable(r_vt);
+
+    if llvm_vt != "@Point$Describable$reified_vt = constant { i64, i64, [2 x ptr] } { i64 16, i64 8, [2 x ptr] [ptr @Point$describe, ptr @Point$compute_hash] }, align 8" {
+        return false;
+    }
+    return fir_vt == "fir.reified_vtable @Point$Describable$reified_vt = { struct: \"Point\", trait: \"Describable\", size: 16, align: 8, methods: [@Point$describe, @Point$compute_hash] }";
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -4303,7 +4595,10 @@ pub fn main() {
     let t37 = test_codegen_ssa_load_store();
     let t38 = test_codegen_extern_decl();
     let t39 = test_codegen_llvm_module_header();
-    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 && t33 && t34 && t35 && t36 && t37 && t38 && t39 {
+    let t40 = test_codegen_fn_ptr_multi_call();
+    let t41 = test_codegen_trait_fat_ptr_and_reified_dispatch();
+    let t42 = test_codegen_reified_vtable_descriptor();
+    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 && t33 && t34 && t35 && t36 && t37 && t38 && t39 && t40 && t41 && t42 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");
