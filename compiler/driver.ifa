@@ -57,7 +57,7 @@ pub fn make_compilation_result(
 }
 
 pub fn build_toolchain_command(compiler_bin: String, input_obj: String, output_bin: String) -> String {
-    let base_cmd = compiler_bin + " " + input_obj + " -no-pie -fno-ident -Wl,--build-id=none -o " + output_bin;
+    let base_cmd = compiler_bin + " " + input_obj + " -no-pie -Wl,--build-id=none -o " + output_bin;
     return base_cmd;
 }
 
@@ -268,12 +268,12 @@ pub fn compile_llvm_to_object(input_ll: String, output_o: String, opt_level: i64
     if opt_level == 0 { opt_str = "-O0"; }
     if opt_level == 1 { opt_str = "-O1"; }
     if opt_level == 3 { opt_str = "-O3"; }
-    let args = "-c " + opt_str + " -fno-ident -Wl,--build-id=none " + input_ll + " -o " + output_o;
+    let args = "-c " + opt_str + " --target=x86_64-unknown-linux-gnu " + input_ll + " -o " + output_o;
     return process::exec("clang", args);
 }
 
 pub fn link_object_to_executable(input_o: String, output_bin: String) -> i64 {
-    let args = input_o + " -no-pie -fno-ident -Wl,--build-id=none -o " + output_bin;
+    let args = input_o + " -no-pie -Wl,--build-id=none -o " + output_bin;
     return process::exec("clang", args);
 }
 
@@ -335,7 +335,7 @@ pub fn test_driver_default_config() -> bool {
 // Unit Test 2: Verify toolchain command string generation
 pub fn test_driver_toolchain_command_builder() -> bool {
     let cmd = build_toolchain_command("clang", "module.o", "module.bin");
-    let expected = "clang module.o -no-pie -fno-ident -Wl,--build-id=none -o module.bin";
+    let expected = "clang module.o -no-pie -Wl,--build-id=none -o module.bin";
     if cmd != expected {
         return false;
     }
