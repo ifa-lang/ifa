@@ -681,13 +681,129 @@ pub fn get_trait_method_count(table: TraitSymbolTable, name: String) -> i64 {
     return 0;
 }
 
+// Channel symbol table for fiber inter-communication type verification
+pub struct ChannelSymbolEntry {
+    name: String,
+    elem_type: String,
+    capacity: i64,
+    mode: i64 // 1: Bidirectional (SendRecv), 2: SenderOnly, 3: ReceiverOnly
+}
+
+pub struct ChannelSymbolTable {
+    entries: List<ChannelSymbolEntry>
+}
+
+pub fn make_channel_table() -> ChannelSymbolTable {
+    return ChannelSymbolTable(entries: List::new());
+}
+
+pub fn register_channel(
+    inout table: ChannelSymbolTable,
+    name: String,
+    elem_type: String,
+    capacity: i64,
+    mode: i64
+) {
+    table.entries.push(ChannelSymbolEntry(
+        name: name,
+        elem_type: elem_type,
+        capacity: capacity,
+        mode: mode
+    ));
+}
+
+pub fn has_channel(table: ChannelSymbolTable, name: String) -> bool {
+    mut i: i64 = 0;
+    while i < table.entries.len() {
+        if table.entries[i].name == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn get_channel_elem_type(table: ChannelSymbolTable, name: String) -> String {
+    mut i: i64 = 0;
+    while i < table.entries.len() {
+        if table.entries[i].name == name {
+            return table.entries[i].elem_type;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub fn get_channel_capacity(table: ChannelSymbolTable, name: String) -> i64 {
+    mut i: i64 = 0;
+    while i < table.entries.len() {
+        if table.entries[i].name == name {
+            return table.entries[i].capacity;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub fn get_channel_mode(table: ChannelSymbolTable, name: String) -> i64 {
+    mut i: i64 = 0;
+    while i < table.entries.len() {
+        if table.entries[i].name == name {
+            return table.entries[i].mode;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Validates that sending `msg_type` into `chan_name` conforms to channel type and sender mode
+pub fn validate_channel_send(
+    table: ChannelSymbolTable,
+    chan_name: String,
+    msg_type: String
+) -> bool {
+    mut i: i64 = 0;
+    while i < table.entries.len() {
+        let e = table.entries[i];
+        if e.name == chan_name {
+            if e.mode != 1 && e.mode != 2 {
+                return false;
+            }
+            return e.elem_type == msg_type;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Validates that receiving into `target_type` from `chan_name` conforms to channel type and receiver mode
+pub fn validate_channel_recv(
+    table: ChannelSymbolTable,
+    chan_name: String,
+    target_type: String
+) -> bool {
+    mut i: i64 = 0;
+    while i < table.entries.len() {
+        let e = table.entries[i];
+        if e.name == chan_name {
+            if e.mode != 1 && e.mode != 3 {
+                return false;
+            }
+            return e.elem_type == target_type;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
 // Unified Global Symbol Table aggregating multi-file program symbols
 pub struct GlobalSymbolTable {
     type_aliases: TypeAliasTable,
     constants: ConstSymbolTable,
     enums: EnumSymbolTable,
     structs: StructSymbolTable,
-    traits: TraitSymbolTable
+    traits: TraitSymbolTable,
+    channels: ChannelSymbolTable
 }
 
 pub fn make_global_symbol_table() -> GlobalSymbolTable {
@@ -696,7 +812,8 @@ pub fn make_global_symbol_table() -> GlobalSymbolTable {
         constants: make_const_table(),
         enums: make_enum_table(),
         structs: make_struct_table(),
-        traits: make_trait_table()
+        traits: make_trait_table(),
+        channels: make_channel_table()
     );
 }
 
@@ -755,6 +872,88 @@ pub fn test_sema_global_symbol_table() -> bool {
         return false;
     }
 
+    // 6. Channel
+    register_channel(inout global_table.channels, "work_queue", "i64", 128, 1);
+    if !has_channel(global_table.channels, "work_queue") {
+        return false;
+    }
+    if get_channel_capacity(global_table.channels, "work_queue") != 128 {
+        return false;
+    }
+    if get_channel_elem_type(global_table.channels, "work_queue") != "i64" {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit test 11: Channel message type checking and conformance validation
+pub fn test_sema_channel_type_checking() -> bool {
+    mut table = make_channel_table();
+    register_channel(inout table, "int_chan", "i64", 32, 1);
+    register_channel(inout table, "str_chan", "String", 16, 1);
+
+    if !has_channel(table, "int_chan") || !has_channel(table, "str_chan") {
+        return false;
+    }
+    if has_channel(table, "unknown_chan") {
+        return false;
+    }
+
+    // Matching types
+    let send_int_ok = validate_channel_send(table, "int_chan", "i64");
+    let recv_int_ok = validate_channel_recv(table, "int_chan", "i64");
+    let send_str_ok = validate_channel_send(table, "str_chan", "String");
+    let recv_str_ok = validate_channel_recv(table, "str_chan", "String");
+
+    if !send_int_ok || !recv_int_ok || !send_str_ok || !recv_str_ok {
+        return false;
+    }
+
+    // Mismatched types must be rejected
+    let send_int_bad = validate_channel_send(table, "int_chan", "String");
+    let recv_int_bad = validate_channel_recv(table, "int_chan", "ptr");
+    let send_str_bad = validate_channel_send(table, "str_chan", "i64");
+    let recv_str_bad = validate_channel_recv(table, "str_chan", "bool");
+
+    if send_int_bad || recv_int_bad || send_str_bad || recv_str_bad {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit test 12: Channel directionality and capacity boundary validation
+pub fn test_sema_channel_directionality_and_bounds() -> bool {
+    mut table = make_channel_table();
+    // mode 2: Sender-Only
+    register_channel(inout table, "producer_chan", "i64", 64, 2);
+    // mode 3: Receiver-Only
+    register_channel(inout table, "consumer_chan", "i64", 64, 3);
+
+    if get_channel_mode(table, "producer_chan") != 2 {
+        return false;
+    }
+    if get_channel_mode(table, "consumer_chan") != 3 {
+        return false;
+    }
+
+    // Sender-only can send, cannot recv
+    let prod_send_ok = validate_channel_send(table, "producer_chan", "i64");
+    let prod_recv_bad = validate_channel_recv(table, "producer_chan", "i64");
+
+    if !prod_send_ok || prod_recv_bad {
+        return false;
+    }
+
+    // Receiver-only can recv, cannot send
+    let cons_send_bad = validate_channel_send(table, "consumer_chan", "i64");
+    let cons_recv_ok = validate_channel_recv(table, "consumer_chan", "i64");
+
+    if cons_send_bad || !cons_recv_ok {
+        return false;
+    }
+
     return true;
 }
 
@@ -770,7 +969,9 @@ pub fn main() {
     let t8 = test_sema_const_resolution();
     let t9 = test_sema_enum_resolution();
     let t10 = test_sema_global_symbol_table();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 {
+    let t11 = test_sema_channel_type_checking();
+    let t12 = test_sema_channel_directionality_and_bounds();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");

@@ -276,8 +276,33 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_codegen_fiber_spawn_and_yield ... ok"),
+        "Modular codegen fiber spawn and yield test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_channel_operations ... ok"),
+        "Modular codegen channel operations test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_channel_select ... ok"),
+        "Modular codegen channel select test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_sema_global_symbol_table ... ok"),
         "Modular sema global symbol table test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_channel_type_checking ... ok"),
+        "Modular sema channel type checking test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_channel_directionality_and_bounds ... ok"),
+        "Modular sema channel directionality test missing from output:\n{}",
         stdout
     );
     assert!(
@@ -301,8 +326,8 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("101 passed; 0 failed"),
-        "Expected 101 passed unit tests, got:\n{}",
+        stdout.contains("111 passed; 0 failed"),
+        "Expected 111 passed unit tests, got:\n{}",
         stdout
     );
 }

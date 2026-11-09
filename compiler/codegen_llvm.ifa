@@ -155,6 +155,44 @@ pub struct AstClosureInit {
     captured_vals: List<AstStructInitField>
 }
 
+// AST: Fiber spawn expression for cooperative multitasking
+pub struct AstSpawnExpr {
+    target_var: String,
+    entry_fn: String,
+    has_arg: bool,
+    arg_var: String
+}
+
+// AST: Channel creation statement
+pub struct AstChanCreate {
+    target_var: String,
+    elem_type: String,
+    capacity: i64
+}
+
+// AST: Channel send statement
+pub struct AstChanSend {
+    chan_var: String,
+    val_var: String,
+    val_ty: String,
+    res_var: String
+}
+
+// AST: Channel receive statement
+pub struct AstChanRecv {
+    chan_var: String,
+    target_val_var: String,
+    val_ty: String,
+    res_var: String
+}
+
+// AST: Multi-channel select multiplexer
+pub struct AstChanSelect {
+    target_var: String,
+    chan_vars: List<String>,
+    has_default: bool
+}
+
 pub fn mangle_generic_method(
     trait_name: String,
     struct_name: String,
@@ -1734,6 +1772,360 @@ pub fn test_codegen_lightweight_thunk_and_closure() -> bool {
     return true;
 }
 
+// Emits LLVM fiber spawn calling runtime entry point
+pub fn emit_llvm_fiber_spawn(sp_expr: AstSpawnExpr) -> List<String> {
+    mut lines: List<String> = List::new();
+    if sp_expr.has_arg {
+        lines.push("  %" + sp_expr.target_var + " = call i64 @ifa_rt_fiber_spawn(ptr @" + sp_expr.entry_fn + ", ptr %" + sp_expr.arg_var + ")");
+    } else {
+        lines.push("  %" + sp_expr.target_var + " = call i64 @ifa_rt_fiber_spawn(ptr @" + sp_expr.entry_fn + ", ptr null)");
+    }
+    return lines;
+}
+
+// Emits FIR fiber spawn instruction
+pub fn emit_fir_fiber_spawn(sp_expr: AstSpawnExpr) -> List<String> {
+    mut lines: List<String> = List::new();
+    if sp_expr.has_arg {
+        lines.push("    %" + sp_expr.target_var + " = fir.fiber_spawn @" + sp_expr.entry_fn + "(%" + sp_expr.arg_var + ")");
+    } else {
+        lines.push("    %" + sp_expr.target_var + " = fir.fiber_spawn @" + sp_expr.entry_fn + "()");
+    }
+    return lines;
+}
+
+// Emits LLVM fiber cooperative yield
+pub fn emit_llvm_fiber_yield() -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  call void @ifa_rt_fiber_yield()");
+    return lines;
+}
+
+// Emits FIR fiber cooperative yield
+pub fn emit_fir_fiber_yield() -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    fir.fiber_yield");
+    return lines;
+}
+
+// Emits LLVM fiber join waiting on fiber ID
+pub fn emit_llvm_fiber_join(fid_var: String) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  call void @ifa_rt_fiber_join(i64 %" + fid_var + ")");
+    return lines;
+}
+
+// Emits FIR fiber join instruction
+pub fn emit_fir_fiber_join(fid_var: String) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    fir.fiber_join %" + fid_var);
+    return lines;
+}
+
+// Emits LLVM channel creation
+pub fn emit_llvm_chan_create(init: AstChanCreate) -> List<String> {
+    mut lines: List<String> = List::new();
+    let cap_str = int_to_str(init.capacity);
+    lines.push("  %" + init.target_var + " = call ptr @ifa_rt_channel_create(i64 " + cap_str + ")");
+    return lines;
+}
+
+// Emits FIR channel creation
+pub fn emit_fir_chan_create(init: AstChanCreate) -> List<String> {
+    mut lines: List<String> = List::new();
+    let cap_str = int_to_str(init.capacity);
+    lines.push("    %" + init.target_var + " = fir.chan_create<" + init.elem_type + ">(" + cap_str + ")");
+    return lines;
+}
+
+// Emits LLVM channel send
+pub fn emit_llvm_chan_send(send: AstChanSend) -> List<String> {
+    mut lines: List<String> = List::new();
+    let slot_var = "%chan_slot." + send.val_var;
+    lines.push("  " + slot_var + " = alloca " + send.val_ty + ", align 8");
+    lines.push("  store " + send.val_ty + " %" + send.val_var + ", ptr " + slot_var + ", align 8");
+    lines.push("  %" + send.res_var + " = call i32 @ifa_rt_channel_send(ptr %" + send.chan_var + ", ptr " + slot_var + ")");
+    return lines;
+}
+
+// Emits FIR channel send
+pub fn emit_fir_chan_send(send: AstChanSend) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + send.res_var + " = fir.chan_send %" + send.chan_var + ", %" + send.val_var);
+    return lines;
+}
+
+// Emits LLVM channel receive
+pub fn emit_llvm_chan_recv(recv: AstChanRecv) -> List<String> {
+    mut lines: List<String> = List::new();
+    let slot_var = "%chan_recv_slot." + recv.target_val_var;
+    lines.push("  " + slot_var + " = alloca " + recv.val_ty + ", align 8");
+    lines.push("  %" + recv.res_var + " = call i32 @ifa_rt_channel_recv(ptr %" + recv.chan_var + ", ptr " + slot_var + ")");
+    lines.push("  %" + recv.target_val_var + " = load " + recv.val_ty + ", ptr " + slot_var + ", align 8");
+    return lines;
+}
+
+// Emits FIR channel receive
+pub fn emit_fir_chan_recv(recv: AstChanRecv) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + recv.target_val_var + ", %" + recv.res_var + " = fir.chan_recv %" + recv.chan_var);
+    return lines;
+}
+
+// Emits LLVM channel close
+pub fn emit_llvm_chan_close(chan_var: String) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  call void @ifa_rt_channel_close(ptr %" + chan_var + ")");
+    return lines;
+}
+
+// Emits FIR channel close
+pub fn emit_fir_chan_close(chan_var: String) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    fir.chan_close %" + chan_var);
+    return lines;
+}
+
+// Emits LLVM multi-channel select multiplexer
+pub fn emit_llvm_chan_select(sel: AstChanSelect) -> List<String> {
+    mut lines: List<String> = List::new();
+    let count_str = int_to_str(sel.chan_vars.len());
+    let arr_var = "%sel_arr." + sel.target_var;
+    lines.push("  " + arr_var + " = alloca [" + count_str + " x ptr], align 8");
+    mut i: i64 = 0;
+    while i < sel.chan_vars.len() {
+        let idx_str = int_to_str(i);
+        let elem_slot = "%sel_elem." + sel.target_var + "." + idx_str;
+        lines.push("  " + elem_slot + " = getelementptr inbounds [" + count_str + " x ptr], ptr " + arr_var + ", i64 0, i64 " + idx_str);
+        lines.push("  store ptr %" + sel.chan_vars[i] + ", ptr " + elem_slot + ", align 8");
+        i = i + 1;
+    }
+    mut def_flag = "0";
+    if sel.has_default {
+        def_flag = "1";
+    }
+    lines.push("  %" + sel.target_var + " = call i64 @ifa_rt_channel_select(ptr " + arr_var + ", i64 " + count_str + ", i32 " + def_flag + ")");
+    return lines;
+}
+
+// Emits FIR multi-channel select multiplexer
+pub fn emit_fir_chan_select(sel: AstChanSelect) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut def_flag = "0";
+    if sel.has_default {
+        def_flag = "1";
+    }
+    mut chan_list = "[";
+    mut i: i64 = 0;
+    while i < sel.chan_vars.len() {
+        if i > 0 {
+            chan_list = chan_list + ", ";
+        }
+        chan_list = chan_list + "%" + sel.chan_vars[i];
+        i = i + 1;
+    }
+    chan_list = chan_list + "]";
+    lines.push("    %" + sel.target_var + " = fir.chan_select " + chan_list + ", default=" + def_flag);
+    return lines;
+}
+
+// Unit test 13: Fiber spawn and yield lowering to runtime calls
+pub fn test_codegen_fiber_spawn_and_yield() -> bool {
+    let spawn_simple = AstSpawnExpr(
+        target_var: "fid_simple",
+        entry_fn: "worker_task",
+        has_arg: false,
+        arg_var: ""
+    );
+
+    let llvm_sp1 = emit_llvm_fiber_spawn(spawn_simple);
+    if llvm_sp1.len() != 1 {
+        return false;
+    }
+    if llvm_sp1[0] != "  %fid_simple = call i64 @ifa_rt_fiber_spawn(ptr @worker_task, ptr null)" {
+        return false;
+    }
+
+    let fir_sp1 = emit_fir_fiber_spawn(spawn_simple);
+    if fir_sp1.len() != 1 {
+        return false;
+    }
+    if fir_sp1[0] != "    %fid_simple = fir.fiber_spawn @worker_task()" {
+        return false;
+    }
+
+    let spawn_arg = AstSpawnExpr(
+        target_var: "fid_arg",
+        entry_fn: "worker_task_ctx",
+        has_arg: true,
+        arg_var: "task_ctx"
+    );
+
+    let llvm_sp2 = emit_llvm_fiber_spawn(spawn_arg);
+    if llvm_sp2.len() != 1 {
+        return false;
+    }
+    if llvm_sp2[0] != "  %fid_arg = call i64 @ifa_rt_fiber_spawn(ptr @worker_task_ctx, ptr %task_ctx)" {
+        return false;
+    }
+
+    let fir_sp2 = emit_fir_fiber_spawn(spawn_arg);
+    if fir_sp2.len() != 1 {
+        return false;
+    }
+    if fir_sp2[0] != "    %fid_arg = fir.fiber_spawn @worker_task_ctx(%task_ctx)" {
+        return false;
+    }
+
+    let llvm_yield = emit_llvm_fiber_yield();
+    if llvm_yield.len() != 1 || llvm_yield[0] != "  call void @ifa_rt_fiber_yield()" {
+        return false;
+    }
+
+    let fir_yield = emit_fir_fiber_yield();
+    if fir_yield.len() != 1 || fir_yield[0] != "    fir.fiber_yield" {
+        return false;
+    }
+
+    let llvm_join = emit_llvm_fiber_join("fid_simple");
+    if llvm_join.len() != 1 || llvm_join[0] != "  call void @ifa_rt_fiber_join(i64 %fid_simple)" {
+        return false;
+    }
+
+    let fir_join = emit_fir_fiber_join("fid_simple");
+    if fir_join.len() != 1 || fir_join[0] != "    fir.fiber_join %fid_simple" {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit test 14: Channel create, send, recv, and close lowering
+pub fn test_codegen_channel_operations() -> bool {
+    let chan_init = AstChanCreate(
+        target_var: "data_ch",
+        elem_type: "i64",
+        capacity: 64
+    );
+
+    let llvm_create = emit_llvm_chan_create(chan_init);
+    if llvm_create.len() != 1 || llvm_create[0] != "  %data_ch = call ptr @ifa_rt_channel_create(i64 64)" {
+        return false;
+    }
+
+    let fir_create = emit_fir_chan_create(chan_init);
+    if fir_create.len() != 1 || fir_create[0] != "    %data_ch = fir.chan_create<i64>(64)" {
+        return false;
+    }
+
+    let send_op = AstChanSend(
+        chan_var: "data_ch",
+        val_var: "payload",
+        val_ty: "i64",
+        res_var: "send_st"
+    );
+
+    let llvm_send = emit_llvm_chan_send(send_op);
+    if llvm_send.len() != 3 {
+        return false;
+    }
+    if llvm_send[0] != "  %chan_slot.payload = alloca i64, align 8" {
+        return false;
+    }
+    if llvm_send[1] != "  store i64 %payload, ptr %chan_slot.payload, align 8" {
+        return false;
+    }
+    if llvm_send[2] != "  %send_st = call i32 @ifa_rt_channel_send(ptr %data_ch, ptr %chan_slot.payload)" {
+        return false;
+    }
+
+    let fir_send = emit_fir_chan_send(send_op);
+    if fir_send.len() != 1 || fir_send[0] != "    %send_st = fir.chan_send %data_ch, %payload" {
+        return false;
+    }
+
+    let recv_op = AstChanRecv(
+        chan_var: "data_ch",
+        target_val_var: "in_val",
+        val_ty: "i64",
+        res_var: "recv_st"
+    );
+
+    let llvm_recv = emit_llvm_chan_recv(recv_op);
+    if llvm_recv.len() != 3 {
+        return false;
+    }
+    if llvm_recv[0] != "  %chan_recv_slot.in_val = alloca i64, align 8" {
+        return false;
+    }
+    if llvm_recv[1] != "  %recv_st = call i32 @ifa_rt_channel_recv(ptr %data_ch, ptr %chan_recv_slot.in_val)" {
+        return false;
+    }
+    if llvm_recv[2] != "  %in_val = load i64, ptr %chan_recv_slot.in_val, align 8" {
+        return false;
+    }
+
+    let fir_recv = emit_fir_chan_recv(recv_op);
+    if fir_recv.len() != 1 || fir_recv[0] != "    %in_val, %recv_st = fir.chan_recv %data_ch" {
+        return false;
+    }
+
+    let llvm_close = emit_llvm_chan_close("data_ch");
+    if llvm_close.len() != 1 || llvm_close[0] != "  call void @ifa_rt_channel_close(ptr %data_ch)" {
+        return false;
+    }
+
+    let fir_close = emit_fir_chan_close("data_ch");
+    if fir_close.len() != 1 || fir_close[0] != "    fir.chan_close %data_ch" {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit test 15: Multi-channel select multiplexer lowering
+pub fn test_codegen_channel_select() -> bool {
+    mut chans: List<String> = List::new();
+    chans.push("ch_alpha");
+    chans.push("ch_beta");
+
+    let sel = AstChanSelect(
+        target_var: "selected_idx",
+        chan_vars: chans,
+        has_default: true
+    );
+
+    let llvm_sel = emit_llvm_chan_select(sel);
+    if llvm_sel.len() != 6 {
+        return false;
+    }
+    if llvm_sel[0] != "  %sel_arr.selected_idx = alloca [2 x ptr], align 8" {
+        return false;
+    }
+    if llvm_sel[1] != "  %sel_elem.selected_idx.0 = getelementptr inbounds [2 x ptr], ptr %sel_arr.selected_idx, i64 0, i64 0" {
+        return false;
+    }
+    if llvm_sel[2] != "  store ptr %ch_alpha, ptr %sel_elem.selected_idx.0, align 8" {
+        return false;
+    }
+    if llvm_sel[3] != "  %sel_elem.selected_idx.1 = getelementptr inbounds [2 x ptr], ptr %sel_arr.selected_idx, i64 0, i64 1" {
+        return false;
+    }
+    if llvm_sel[4] != "  store ptr %ch_beta, ptr %sel_elem.selected_idx.1, align 8" {
+        return false;
+    }
+    if llvm_sel[5] != "  %selected_idx = call i64 @ifa_rt_channel_select(ptr %sel_arr.selected_idx, i64 2, i32 1)" {
+        return false;
+    }
+
+    let fir_sel = emit_fir_chan_select(sel);
+    if fir_sel.len() != 1 || fir_sel[0] != "    %selected_idx = fir.chan_select [%ch_alpha, %ch_beta], default=1" {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -1748,7 +2140,10 @@ pub fn main() {
     let t10 = test_codegen_vtable_dispatch();
     let t11 = test_codegen_fn_pointer_and_indirect_call();
     let t12 = test_codegen_lightweight_thunk_and_closure();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 {
+    let t13 = test_codegen_fiber_spawn_and_yield();
+    let t14 = test_codegen_channel_operations();
+    let t15 = test_codegen_channel_select();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");
