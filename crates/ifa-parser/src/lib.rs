@@ -1449,7 +1449,29 @@ impl Parser {
                     if depth == 0 {
                         let expr_str: String = chars[i + 1..look].iter().collect();
                         let trimmed = expr_str.trim();
-                        if !trimmed.is_empty() {
+                        // Primitive type names and keywords are never interpolation targets;
+                        // they appear as LLVM/FIR type names in string literals (e.g. "{ i32 }").
+                        let is_primitive_type_token = matches!(
+                            trimmed,
+                            "i8" | "i16"
+                                | "i32"
+                                | "i64"
+                                | "i128"
+                                | "isize"
+                                | "u8"
+                                | "u16"
+                                | "u32"
+                                | "u64"
+                                | "u128"
+                                | "usize"
+                                | "f32"
+                                | "f64"
+                                | "bool"
+                                | "char"
+                                | "str"
+                                | "void"
+                        );
+                        if !trimmed.is_empty() && !is_primitive_type_token {
                             let sub_tokens = ifa_lexer::tokenize(self.file_id, trimmed);
                             let mut sub_parser = Parser::new(self.file_id, sub_tokens);
                             if let Ok(parsed_expr) = sub_parser.parse_expr() {

@@ -139,7 +139,9 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     }
 
     let comp_fn_ok = codegen_llvm::test_codegen_complex_function();
-    if !comp_fn_ok {
+    let const_cg_ok = codegen_llvm::test_codegen_global_constants();
+    let enum_cg_ok = codegen_llvm::test_codegen_enum_definitions();
+    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok {
         return false;
     }
 

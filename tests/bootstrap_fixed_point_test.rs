@@ -246,6 +246,16 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_codegen_global_constants ... ok"),
+        "Modular codegen global constants test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_enum_definitions ... ok"),
+        "Modular codegen enum definitions test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_driver_full_module_assembly ... ok"),
         "Modular driver tests missing from output:\n{}",
         stdout
@@ -261,8 +271,8 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("85 passed; 0 failed"),
-        "Expected 85 passed unit tests, got:\n{}",
+        stdout.contains("89 passed; 0 failed"),
+        "Expected 89 passed unit tests, got:\n{}",
         stdout
     );
 }

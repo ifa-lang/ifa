@@ -73,6 +73,27 @@ pub struct AstComplexFunction {
     return_var: String
 }
 
+// AST: Constant Definition for global emission
+pub struct AstConstDef {
+    is_pub: bool,
+    name: String,
+    ty: String,
+    val: i64
+}
+
+// AST: Enum Variant Definition
+pub struct AstEnumVariantDef {
+    name: String,
+    discriminant: i64
+}
+
+// AST: Enum Declaration Definition
+pub struct AstEnumDef {
+    is_pub: bool,
+    name: String,
+    variants: List<AstEnumVariantDef>
+}
+
 pub fn mangle_generic_method(
     trait_name: String,
     struct_name: String,
@@ -1011,6 +1032,127 @@ pub fn test_codegen_complex_function() -> bool {
     return true;
 }
 
+// Lowers constant definitions to textual LLVM IR global constants
+pub fn emit_llvm_global_const(c: AstConstDef) -> String {
+    mut linkage = "private ";
+    if c.is_pub {
+        linkage = "";
+    }
+    mut align_val = "8";
+    if c.ty == "i32" {
+        align_val = "4";
+    }
+    return "@" + c.name + " = " + linkage + "unnamed_addr constant " + c.ty + " " + int_to_str(c.val) + ", align " + align_val;
+}
+
+// Lowers constant definitions to FIR globals
+pub fn emit_fir_global_const(c: AstConstDef) -> String {
+    return "fir.global @" + c.name + " : " + c.ty + " = " + int_to_str(c.val);
+}
+
+// Emits textual LLVM type definition for Enum
+pub fn emit_llvm_enum_type(e: AstEnumDef) -> String {
+    return "%" + e.name + " = type { i32 }";
+}
+
+// Emits FIR type definition for Enum
+pub fn emit_fir_enum_type(e: AstEnumDef) -> String {
+    return "fir.type @" + e.name + " = !fir.enum<i32>";
+}
+
+// Emits textual LLVM getter function for an enum variant discriminant
+pub fn emit_llvm_variant_getter(enum_name: String, v: AstEnumVariantDef) -> List<String> {
+    mut lines: List<String> = List::new();
+    let fn_name = "@" + enum_name + "$" + v.name;
+    lines.push("define i32 " + fn_name + "() unnamed_addr {");
+    lines.push("  ret i32 " + int_to_str(v.discriminant));
+    lines.push("}");
+    return lines;
+}
+
+// Emits FIR getter function for an enum variant discriminant
+pub fn emit_fir_variant_getter(enum_name: String, v: AstEnumVariantDef) -> List<String> {
+    mut lines: List<String> = List::new();
+    let fn_name = "@" + enum_name + "$" + v.name;
+    lines.push("fir.func " + fn_name + "() -> i32 {");
+    lines.push("    %res = fir.constant " + int_to_str(v.discriminant) + " : i32");
+    lines.push("    return %res");
+    lines.push("}");
+    return lines;
+}
+
+// Unit test 7: Global Constant LLVM and FIR emission
+pub fn test_codegen_global_constants() -> bool {
+    let c1 = AstConstDef(is_pub: true, name: "MAX_BUFFER_SIZE", ty: "i64", val: 4096);
+    let c2 = AstConstDef(is_pub: false, name: "DEFAULT_ALIGN", ty: "i32", val: 8);
+
+    let llvm1 = emit_llvm_global_const(c1);
+    let llvm2 = emit_llvm_global_const(c2);
+
+    if llvm1 != "@MAX_BUFFER_SIZE = unnamed_addr constant i64 4096, align 8" {
+        return false;
+    }
+    if llvm2 != "@DEFAULT_ALIGN = private unnamed_addr constant i32 8, align 4" {
+        return false;
+    }
+
+    let fir1 = emit_fir_global_const(c1);
+    let fir2 = emit_fir_global_const(c2);
+
+    if fir1 != "fir.global @MAX_BUFFER_SIZE : i64 = 4096" {
+        return false;
+    }
+    if fir2 != "fir.global @DEFAULT_ALIGN : i32 = 8" {
+        return false;
+    }
+    return true;
+}
+
+// Unit test 8: Enum Type and Variant Discriminant Getter emission
+pub fn test_codegen_enum_definitions() -> bool {
+    mut variants: List<AstEnumVariantDef> = List::new();
+    variants.push(AstEnumVariantDef(name: "Eof", discriminant: 0));
+    variants.push(AstEnumVariantDef(name: "Identifier", discriminant: 1));
+    variants.push(AstEnumVariantDef(name: "Number", discriminant: 2));
+    variants.push(AstEnumVariantDef(name: "Plus", discriminant: 3));
+
+    let enum_def = AstEnumDef(is_pub: true, name: "TokenKind", variants: variants);
+
+    let ty_llvm = emit_llvm_enum_type(enum_def);
+    if ty_llvm != "%TokenKind = type { i32 }" {
+        return false;
+    }
+
+    let ty_fir = emit_fir_enum_type(enum_def);
+    if ty_fir != "fir.type @TokenKind = !fir.enum<i32>" {
+        return false;
+    }
+
+    let get_eof_llvm = emit_llvm_variant_getter(enum_def.name, enum_def.variants[0]);
+    if get_eof_llvm.len() != 3 {
+        return false;
+    }
+    if get_eof_llvm[0] != "define i32 @TokenKind$Eof() unnamed_addr {" {
+        return false;
+    }
+    if get_eof_llvm[1] != "  ret i32 0" {
+        return false;
+    }
+
+    let get_plus_fir = emit_fir_variant_getter(enum_def.name, enum_def.variants[3]);
+    if get_plus_fir.len() != 4 {
+        return false;
+    }
+    if get_plus_fir[0] != "fir.func @TokenKind$Plus() -> i32 {" {
+        return false;
+    }
+    if get_plus_fir[1] != "    %res = fir.constant 3 : i32" {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -1019,7 +1161,9 @@ pub fn main() {
     let t4 = test_codegen_pattern_match();
     let t5 = test_codegen_generic_method_call();
     let t6 = test_codegen_complex_function();
-    if t1 && t2 && t3 && t4 && t5 && t6 {
+    let t7 = test_codegen_global_constants();
+    let t8 = test_codegen_enum_definitions();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");
