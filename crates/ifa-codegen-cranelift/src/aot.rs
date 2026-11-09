@@ -61,6 +61,11 @@ void ifa_rt_gen_check(const void* ptr, uint32_t remembered_gen) {
     }
 }
 
+void ifa_rt_panic_uaf(const void* ptr, uint32_t expected_gen, uint32_t actual_gen) {
+    fprintf(stderr, "\n[IFA RUNTIME ERROR: SAFE INTERCEPTION] Use-After-Free intercepted at %p (actual gen: %u, expected: %u)\n", ptr, actual_gen, expected_gen);
+    abort();
+}
+
 void ifa_rt_fiber_yield(void) {}
 
 uint64_t ifa_rt_fiber_spawn(void (*entry)(void*), void* arg) {

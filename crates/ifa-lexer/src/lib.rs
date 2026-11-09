@@ -80,7 +80,8 @@ impl<'a> Lexer<'a> {
                         } else {
                             slice
                         };
-                        TokenKind::StringLiteral(sym(inner))
+                        let unescaped = unescape_string(inner);
+                        TokenKind::StringLiteral(sym(&unescaped))
                     }
                     RawToken::CharLiteral => {
                         let c = slice.chars().nth(1).unwrap_or('\0');
@@ -156,6 +157,32 @@ impl<'a> Lexer<'a> {
 pub fn tokenize(file_id: FileId, src: &str) -> Vec<Token> {
     let mut lexer = Lexer::new(file_id, src);
     lexer.tokenize()
+}
+
+fn unescape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some('\'') => out.push('\''),
+                Some('\"') => out.push('\"'),
+                Some('0') => out.push('\0'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

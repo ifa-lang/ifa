@@ -22,6 +22,66 @@ pub struct AstFunction {
     statements: List<AstStmt>
 }
 
+// Complex AST: While Loop representation
+pub struct AstWhile {
+    cond_left: ?ref AstExpr,
+    cond_op: i64, // 1: ==, 2: !=, 3: <, 4: <=, 5: >, 6: >=
+    cond_right: ?ref AstExpr,
+    body_target_var: String,
+    body_expr: ?ref AstExpr
+}
+
+// Complex AST: Pattern for Match expressions
+pub struct AstPattern {
+    kind: i64, // 1: Wildcard `_`, 2: Literal, 3: Identifier
+    val: i64,
+    name: String
+}
+
+// Complex AST: Match Arm
+pub struct AstMatchArm {
+    pat: AstPattern,
+    expr: ?ref AstExpr
+}
+
+// Complex AST: Pattern Match Expression
+pub struct AstMatch {
+    target_var: String,
+    arms: List<AstMatchArm>
+}
+
+// Complex AST: Generic Method representation with deterministic mangling
+pub struct AstGenericMethod {
+    trait_name: String,
+    struct_name: String,
+    method_name: String,
+    type_param: String,
+    mangled_name: String
+}
+
+// Complex AST: Comprehensive Function combining loops, match, and generic calls
+pub struct AstComplexFunction {
+    name: String,
+    param_name: String,
+    init_statements: List<AstStmt>,
+    has_while: bool,
+    while_loop: AstWhile,
+    has_match: bool,
+    match_stmt: AstMatch,
+    has_generic_call: bool,
+    generic_callee: String,
+    return_var: String
+}
+
+pub fn mangle_generic_method(
+    trait_name: String,
+    struct_name: String,
+    method_name: String,
+    type_param: String
+) -> String {
+    return struct_name + "$" + method_name + "$" + type_param;
+}
+
 pub fn int_to_digit(n: i64) -> String {
     if n == 0 { return "0"; }
     if n == 1 { return "1"; }
@@ -123,12 +183,404 @@ pub fn emit_fir_expression(
         if op == 4 {
             op_name = "div";
         }
+        if op == 5 {
+            op_name = "icmp_eq";
+        }
+        if op == 6 {
+            op_name = "icmp_ne";
+        }
+        if op == 7 {
+            op_name = "icmp_slt";
+        }
+        if op == 8 {
+            op_name = "icmp_sle";
+        }
+        if op == 9 {
+            op_name = "icmp_sgt";
+        }
+        if op == 10 {
+            op_name = "icmp_sge";
+        }
 
         let line = "    " + reg + " = " + op_name + " " + lhs_reg + ", " + rhs_reg;
         instructions.push(line);
         return reg;
     }
+    if k == 4 {
+        // Function or Method Call: %tN = call @callee(%arg)
+        let arg_reg = emit_fir_expression(
+            expr?.left,
+            inout temp_id,
+            env1_var,
+            env1_reg,
+            env2_var,
+            env2_reg,
+            inout instructions
+        );
+        let reg = "%t" + int_to_str(temp_id);
+        temp_id = temp_id + 1;
+        let callee = expr?.name ?? "unknown";
+        let line = "    " + reg + " = call @" + callee + "(" + arg_reg + ")";
+        instructions.push(line);
+        return reg;
+    }
     return "%t0";
+}
+
+// Lowers recursive AST expressions to LLVM IR instructions
+pub fn emit_llvm_expression(
+    expr: ?ref AstExpr,
+    inout temp_id: i64,
+    env1_var: String,
+    env1_reg: String,
+    env2_var: String,
+    env2_reg: String,
+    inout instructions: List<String>
+) -> String {
+    let k = expr?.kind ?? 0;
+    if k == 1 {
+        let reg = "%t" + int_to_str(temp_id);
+        temp_id = temp_id + 1;
+        let line = "  " + reg + " = add i64 0, " + int_to_str(expr?.val ?? 0);
+        instructions.push(line);
+        return reg;
+    }
+    if k == 2 {
+        let name = expr?.name ?? "";
+        if name == env1_var && env1_reg != "" {
+            return env1_reg;
+        }
+        if name == env2_var && env2_reg != "" {
+            return env2_reg;
+        }
+        return "%" + name;
+    }
+    if k == 3 {
+        let lhs_reg = emit_llvm_expression(
+            expr?.left,
+            inout temp_id,
+            env1_var,
+            env1_reg,
+            env2_var,
+            env2_reg,
+            inout instructions
+        );
+        let rhs_reg = emit_llvm_expression(
+            expr?.right,
+            inout temp_id,
+            env1_var,
+            env1_reg,
+            env2_var,
+            env2_reg,
+            inout instructions
+        );
+        let reg = "%t" + int_to_str(temp_id);
+        temp_id = temp_id + 1;
+
+        let op = expr?.op ?? 0;
+        mut line = "  " + reg + " = add i64 " + lhs_reg + ", " + rhs_reg;
+        if op == 2 {
+            line = "  " + reg + " = sub i64 " + lhs_reg + ", " + rhs_reg;
+        } else if op == 3 {
+            line = "  " + reg + " = mul i64 " + lhs_reg + ", " + rhs_reg;
+        } else if op == 4 {
+            line = "  " + reg + " = sdiv i64 " + lhs_reg + ", " + rhs_reg;
+        } else if op == 5 {
+            line = "  " + reg + " = icmp eq i64 " + lhs_reg + ", " + rhs_reg;
+        } else if op == 6 {
+            line = "  " + reg + " = icmp ne i64 " + lhs_reg + ", " + rhs_reg;
+        } else if op == 7 {
+            line = "  " + reg + " = icmp slt i64 " + lhs_reg + ", " + rhs_reg;
+        } else if op == 8 {
+            line = "  " + reg + " = icmp sle i64 " + lhs_reg + ", " + rhs_reg;
+        } else if op == 9 {
+            line = "  " + reg + " = icmp sgt i64 " + lhs_reg + ", " + rhs_reg;
+        } else if op == 10 {
+            line = "  " + reg + " = icmp sge i64 " + lhs_reg + ", " + rhs_reg;
+        }
+        instructions.push(line);
+        return reg;
+    }
+    if k == 4 {
+        let arg_reg = emit_llvm_expression(
+            expr?.left,
+            inout temp_id,
+            env1_var,
+            env1_reg,
+            env2_var,
+            env2_reg,
+            inout instructions
+        );
+        let reg = "%t" + int_to_str(temp_id);
+        temp_id = temp_id + 1;
+        let callee = expr?.name ?? "unknown";
+        let line = "  " + reg + " = call i64 @" + callee + "(i64 " + arg_reg + ")";
+        instructions.push(line);
+        return reg;
+    }
+    return "%t0";
+}
+
+// Lowers While Loop to FIR SSA blocks
+pub fn emit_fir_while_loop(
+    while_ast: AstWhile,
+    loop_id: i64,
+    inout temp_id: i64,
+    inout env_var: String,
+    inout env_reg: String,
+    inout lines: List<String>
+) {
+    let id_str = int_to_str(loop_id);
+    let cond_bb = "bb_while_cond_" + id_str;
+    let body_bb = "bb_while_body_" + id_str;
+    let end_bb = "bb_while_end_" + id_str;
+
+    lines.push("    br " + cond_bb);
+    lines.push("  " + cond_bb + ":");
+
+    let lhs = emit_fir_expression(while_ast.cond_left, inout temp_id, env_var, env_reg, "", "", inout lines);
+    let rhs = emit_fir_expression(while_ast.cond_right, inout temp_id, env_var, env_reg, "", "", inout lines);
+
+    let cmp_reg = "%t" + int_to_str(temp_id);
+    temp_id = temp_id + 1;
+    mut op_name = "icmp_slt";
+    if while_ast.cond_op == 1 { op_name = "icmp_eq"; }
+    if while_ast.cond_op == 2 { op_name = "icmp_ne"; }
+    if while_ast.cond_op == 4 { op_name = "icmp_sle"; }
+    if while_ast.cond_op == 5 { op_name = "icmp_sgt"; }
+    if while_ast.cond_op == 6 { op_name = "icmp_sge"; }
+
+    lines.push("    " + cmp_reg + " = " + op_name + " " + lhs + ", " + rhs);
+    lines.push("    cond_br " + cmp_reg + ", " + body_bb + ", " + end_bb);
+
+    lines.push("  " + body_bb + ":");
+    let body_reg = emit_fir_expression(while_ast.body_expr, inout temp_id, env_var, env_reg, "", "", inout lines);
+    if while_ast.body_target_var != "" {
+        env_var = while_ast.body_target_var;
+        env_reg = body_reg;
+    }
+    lines.push("    br " + cond_bb);
+
+    lines.push("  " + end_bb + ":");
+}
+
+// Lowers While Loop to textual LLVM IR blocks
+pub fn emit_llvm_while_loop(
+    while_ast: AstWhile,
+    loop_id: i64,
+    inout temp_id: i64,
+    inout env_var: String,
+    inout env_reg: String,
+    inout lines: List<String>
+) {
+    let id_str = int_to_str(loop_id);
+    let cond_lbl = "while.cond." + id_str;
+    let body_lbl = "while.body." + id_str;
+    let end_lbl = "while.end." + id_str;
+
+    lines.push("  br label %" + cond_lbl);
+    lines.push(cond_lbl + ":");
+
+    let lhs = emit_llvm_expression(while_ast.cond_left, inout temp_id, env_var, env_reg, "", "", inout lines);
+    let rhs = emit_llvm_expression(while_ast.cond_right, inout temp_id, env_var, env_reg, "", "", inout lines);
+
+    let cmp_reg = "%t" + int_to_str(temp_id);
+    temp_id = temp_id + 1;
+    mut cmp_op = "slt";
+    if while_ast.cond_op == 1 { cmp_op = "eq"; }
+    if while_ast.cond_op == 2 { cmp_op = "ne"; }
+    if while_ast.cond_op == 4 { cmp_op = "sle"; }
+    if while_ast.cond_op == 5 { cmp_op = "sgt"; }
+    if while_ast.cond_op == 6 { cmp_op = "sge"; }
+
+    lines.push("  " + cmp_reg + " = icmp " + cmp_op + " i64 " + lhs + ", " + rhs);
+    lines.push("  br i1 " + cmp_reg + ", label %" + body_lbl + ", label %" + end_lbl);
+
+    lines.push(body_lbl + ":");
+    let body_reg = emit_llvm_expression(while_ast.body_expr, inout temp_id, env_var, env_reg, "", "", inout lines);
+    if while_ast.body_target_var != "" {
+        env_var = while_ast.body_target_var;
+        env_reg = body_reg;
+    }
+    lines.push("  br label %" + cond_lbl);
+
+    lines.push(end_lbl + ":");
+}
+
+// Lowers Pattern Matching to FIR SSA blocks
+pub fn emit_fir_match(
+    match_ast: AstMatch,
+    match_id: i64,
+    inout temp_id: i64,
+    target_reg: String,
+    inout result_reg: String,
+    inout lines: List<String>
+) {
+    let m_id = int_to_str(match_id);
+    let exit_bb = "bb_match_exit_" + m_id;
+    let start_check_bb = "bb_match_check_" + m_id + "_0";
+
+    lines.push("    br " + start_check_bb);
+
+    mut i: i64 = 0;
+    while i < match_ast.arms.len() {
+        let i_str = int_to_str(i);
+        let check_bb = "bb_match_check_" + m_id + "_" + i_str;
+        let arm_bb = "bb_match_arm_" + m_id + "_" + i_str;
+        let next_check_bb = "bb_match_check_" + m_id + "_" + int_to_str(i + 1);
+
+        lines.push("  " + check_bb + ":");
+        let arm = match_ast.arms[i];
+
+        if arm.pat.kind == 1 || arm.pat.kind == 3 {
+            lines.push("    br " + arm_bb);
+        } else {
+            let cmp_reg = "%t" + int_to_str(temp_id);
+            temp_id = temp_id + 1;
+            let val_str = int_to_str(arm.pat.val);
+            lines.push("    " + cmp_reg + " = icmp_eq " + target_reg + ", " + val_str);
+            lines.push("    cond_br " + cmp_reg + ", " + arm_bb + ", " + next_check_bb);
+        }
+
+        lines.push("  " + arm_bb + ":");
+        let arm_res = emit_fir_expression(arm.expr, inout temp_id, arm.pat.name, target_reg, "", "", inout lines);
+        result_reg = arm_res;
+        lines.push("    br " + exit_bb);
+
+        i = i + 1;
+    }
+
+    lines.push("  " + exit_bb + ":");
+}
+
+// Lowers Pattern Matching to textual LLVM IR blocks
+pub fn emit_llvm_match(
+    match_ast: AstMatch,
+    match_id: i64,
+    inout temp_id: i64,
+    target_reg: String,
+    inout result_reg: String,
+    inout lines: List<String>
+) {
+    let m_id = int_to_str(match_id);
+    let exit_lbl = "match.exit." + m_id;
+    let start_check_lbl = "match.check." + m_id + ".0";
+
+    lines.push("  br label %" + start_check_lbl);
+
+    mut i: i64 = 0;
+    while i < match_ast.arms.len() {
+        let i_str = int_to_str(i);
+        let check_lbl = "match.check." + m_id + "." + i_str;
+        let arm_lbl = "match.arm." + m_id + "." + i_str;
+        let next_check_lbl = "match.check." + m_id + "." + int_to_str(i + 1);
+
+        lines.push(check_lbl + ":");
+        let arm = match_ast.arms[i];
+
+        if arm.pat.kind == 1 || arm.pat.kind == 3 {
+            lines.push("  br label %" + arm_lbl);
+        } else {
+            let cmp_reg = "%t" + int_to_str(temp_id);
+            temp_id = temp_id + 1;
+            let val_str = int_to_str(arm.pat.val);
+            lines.push("  " + cmp_reg + " = icmp eq i64 " + target_reg + ", " + val_str);
+            lines.push("  br i1 " + cmp_reg + ", label %" + arm_lbl + ", label %" + next_check_lbl);
+        }
+
+        lines.push(arm_lbl + ":");
+        let arm_res = emit_llvm_expression(arm.expr, inout temp_id, arm.pat.name, target_reg, "", "", inout lines);
+        result_reg = arm_res;
+        lines.push("  br label %" + exit_lbl);
+
+        i = i + 1;
+    }
+
+    lines.push(exit_lbl + ":");
+}
+
+// Lowers an entire Complex Function containing loops, pattern matching, and generic calls
+pub fn emit_fir_complex_function(func: AstComplexFunction) -> List<String> {
+    mut lines: List<String> = List::new();
+    let header = "fir.func @" + func.name + "(%" + func.param_name + ": i64) -> i64 {";
+    lines.push(header);
+    lines.push("  bb0:");
+
+    mut temp_counter: i64 = 0;
+    mut env_var = func.param_name;
+    mut env_reg = "%" + func.param_name;
+
+    mut i: i64 = 0;
+    while i < func.init_statements.len() {
+        let stmt = func.init_statements[i];
+        let res_reg = emit_fir_expression(stmt.expr, inout temp_counter, env_var, env_reg, "", "", inout lines);
+        env_var = stmt.target_var;
+        env_reg = res_reg;
+        i = i + 1;
+    }
+
+    if func.has_while {
+        emit_fir_while_loop(func.while_loop, 0, inout temp_counter, inout env_var, inout env_reg, inout lines);
+    }
+
+    mut match_result = env_reg;
+    if func.has_match {
+        emit_fir_match(func.match_stmt, 0, inout temp_counter, env_reg, inout match_result, inout lines);
+        env_reg = match_result;
+    }
+
+    if func.has_generic_call {
+        let reg = "%t" + int_to_str(temp_counter);
+        temp_counter = temp_counter + 1;
+        lines.push("    " + reg + " = call @" + func.generic_callee + "(" + env_reg + ")");
+        env_reg = reg;
+    }
+
+    lines.push("    ret " + env_reg);
+    lines.push("}");
+    return lines;
+}
+
+// Lowers an entire Complex Function to textual LLVM IR
+pub fn emit_llvm_complex_function(func: AstComplexFunction) -> List<String> {
+    mut lines: List<String> = List::new();
+    let header = "define i64 @" + func.name + "(i64 %" + func.param_name + ") {";
+    lines.push(header);
+    lines.push("entry:");
+
+    mut temp_counter: i64 = 0;
+    mut env_var = func.param_name;
+    mut env_reg = "%" + func.param_name;
+
+    mut i: i64 = 0;
+    while i < func.init_statements.len() {
+        let stmt = func.init_statements[i];
+        let res_reg = emit_llvm_expression(stmt.expr, inout temp_counter, env_var, env_reg, "", "", inout lines);
+        env_var = stmt.target_var;
+        env_reg = res_reg;
+        i = i + 1;
+    }
+
+    if func.has_while {
+        emit_llvm_while_loop(func.while_loop, 0, inout temp_counter, inout env_var, inout env_reg, inout lines);
+    }
+
+    mut match_result = env_reg;
+    if func.has_match {
+        emit_llvm_match(func.match_stmt, 0, inout temp_counter, env_reg, inout match_result, inout lines);
+        env_reg = match_result;
+    }
+
+    if func.has_generic_call {
+        let reg = "%t" + int_to_str(temp_counter);
+        temp_counter = temp_counter + 1;
+        lines.push("  " + reg + " = call i64 @" + func.generic_callee + "(i64 " + env_reg + ")");
+        env_reg = reg;
+    }
+
+    lines.push("  ret i64 " + env_reg);
+    lines.push("}");
+    return lines;
 }
 
 // FIR SSA Code Generator: lowers parsed AST functions into complete SSA basic block representations
@@ -309,11 +761,265 @@ pub fn test_codegen_function_emission() -> bool {
     return lines[0] == "fir.func @compute(%x: i64) -> i64 {";
 }
 
+// Unit test 3: While Loop Lowering (FIR SSA and textual LLVM IR)
+pub fn test_codegen_while_loop() -> bool {
+    mut pool: List<AstExpr> = List::new();
+    let expr_x = AstExpr(kind: 2, val: 0, name: "x", op: 0, left: None, right: None);
+    pool.push(expr_x);
+    let x_idx = pool.len() - 1;
+
+    let expr_limit = AstExpr(kind: 1, val: 10, name: "", op: 0, left: None, right: None);
+    pool.push(expr_limit);
+    let lim_idx = pool.len() - 1;
+
+    let expr_one = AstExpr(kind: 1, val: 1, name: "", op: 0, left: None, right: None);
+    pool.push(expr_one);
+    let one_idx = pool.len() - 1;
+
+    let expr_inc = AstExpr(kind: 3, val: 0, name: "", op: 1, left: ref pool[x_idx], right: ref pool[one_idx]);
+    pool.push(expr_inc);
+    let inc_idx = pool.len() - 1;
+
+    let loop_ast = AstWhile(
+        cond_left: ref pool[x_idx],
+        cond_op: 3, // slt (<)
+        cond_right: ref pool[lim_idx],
+        body_target_var: "x",
+        body_expr: ref pool[inc_idx]
+    );
+
+    // Verify FIR SSA emission
+    mut temp_id: i64 = 0;
+    mut fir_lines: List<String> = List::new();
+    mut env_var = "x";
+    mut env_reg = "%x";
+    emit_fir_while_loop(loop_ast, 0, inout temp_id, inout env_var, inout env_reg, inout fir_lines);
+
+    if fir_lines.len() != 10 {
+        return false;
+    }
+    if fir_lines[0] != "    br bb_while_cond_0" {
+        return false;
+    }
+    if fir_lines[1] != "  bb_while_cond_0:" {
+        return false;
+    }
+
+    // Verify LLVM IR emission
+    mut temp_id_llvm: i64 = 0;
+    mut llvm_lines: List<String> = List::new();
+    mut env_var_llvm = "x";
+    mut env_reg_llvm = "%x";
+    emit_llvm_while_loop(loop_ast, 0, inout temp_id_llvm, inout env_var_llvm, inout env_reg_llvm, inout llvm_lines);
+
+    if llvm_lines.len() != 10 {
+        return false;
+    }
+    if llvm_lines[0] != "  br label %while.cond.0" {
+        return false;
+    }
+    if llvm_lines[1] != "while.cond.0:" {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit test 4: Pattern Match Lowering (FIR SSA and textual LLVM IR)
+pub fn test_codegen_pattern_match() -> bool {
+    mut pool: List<AstExpr> = List::new();
+    let expr10 = AstExpr(kind: 1, val: 10, name: "", op: 0, left: None, right: None);
+    pool.push(expr10);
+    let idx10 = pool.len() - 1;
+
+    let expr20 = AstExpr(kind: 1, val: 20, name: "", op: 0, left: None, right: None);
+    pool.push(expr20);
+    let idx20 = pool.len() - 1;
+
+    let expr42 = AstExpr(kind: 1, val: 42, name: "", op: 0, left: None, right: None);
+    pool.push(expr42);
+    let idx42 = pool.len() - 1;
+
+    mut arms: List<AstMatchArm> = List::new();
+    arms.push(AstMatchArm(
+        pat: AstPattern(kind: 2, val: 1, name: ""),
+        expr: ref pool[idx10]
+    ));
+    arms.push(AstMatchArm(
+        pat: AstPattern(kind: 2, val: 2, name: ""),
+        expr: ref pool[idx20]
+    ));
+    arms.push(AstMatchArm(
+        pat: AstPattern(kind: 1, val: 0, name: "_"),
+        expr: ref pool[idx42]
+    ));
+
+    let match_ast = AstMatch(target_var: "code", arms: arms);
+
+    // Verify FIR SSA emission
+    mut temp_id: i64 = 0;
+    mut fir_lines: List<String> = List::new();
+    mut res_reg = "";
+    emit_fir_match(match_ast, 0, inout temp_id, "%code", inout res_reg, inout fir_lines);
+
+    if fir_lines.len() != 19 {
+        return false;
+    }
+    if fir_lines[0] != "    br bb_match_check_0_0" {
+        return false;
+    }
+
+    // Verify LLVM IR emission
+    mut temp_id_llvm: i64 = 0;
+    mut llvm_lines: List<String> = List::new();
+    mut res_reg_llvm = "";
+    emit_llvm_match(match_ast, 0, inout temp_id_llvm, "%code", inout res_reg_llvm, inout llvm_lines);
+
+    if llvm_lines.len() != 19 {
+        return false;
+    }
+    if llvm_lines[0] != "  br label %match.check.0.0" {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit test 5: Generic Method Call & Deterministic Mangling
+pub fn test_codegen_generic_method_call() -> bool {
+    let mangled = mangle_generic_method(
+        "Diagnosable",
+        "DiagnosticReporter",
+        "diagnose",
+        "CompileDiagnostic"
+    );
+    if mangled != "DiagnosticReporter$diagnose$CompileDiagnostic" {
+        return false;
+    }
+
+    mut pool: List<AstExpr> = List::new();
+    let arg_expr = AstExpr(kind: 1, val: 42, name: "", op: 0, left: None, right: None);
+    pool.push(arg_expr);
+    let arg_idx = pool.len() - 1;
+
+    let call_expr = AstExpr(
+        kind: 4,
+        val: 0,
+        name: mangled,
+        op: 0,
+        left: ref pool[arg_idx],
+        right: None
+    );
+    pool.push(call_expr);
+    let call_idx = pool.len() - 1;
+
+    mut temp_id: i64 = 0;
+    mut fir_lines: List<String> = List::new();
+    let res = emit_fir_expression(ref pool[call_idx], inout temp_id, "", "", "", "", inout fir_lines);
+
+    if res != "%t1" {
+        return false;
+    }
+    if fir_lines.len() != 2 {
+        return false;
+    }
+    return fir_lines[1] == "    %t1 = call @DiagnosticReporter$diagnose$CompileDiagnostic(%t0)";
+}
+
+// Unit test 6: Complex Function Lowering (combining init stmts, while loop, match, and call)
+pub fn test_codegen_complex_function() -> bool {
+    mut pool: List<AstExpr> = List::new();
+
+    // 1. Init stmt: let x = 0;
+    let expr_zero = AstExpr(kind: 1, val: 0, name: "", op: 0, left: None, right: None);
+    pool.push(expr_zero);
+    let zero_idx = pool.len() - 1;
+
+    mut init_stmts: List<AstStmt> = List::new();
+    init_stmts.push(AstStmt(is_return: false, target_var: "x", expr: ref pool[zero_idx]));
+
+    // 2. While loop: while x < 5 { x = x + 1; }
+    let expr_x = AstExpr(kind: 2, val: 0, name: "x", op: 0, left: None, right: None);
+    pool.push(expr_x);
+    let x_idx = pool.len() - 1;
+
+    let expr_five = AstExpr(kind: 1, val: 5, name: "", op: 0, left: None, right: None);
+    pool.push(expr_five);
+    let five_idx = pool.len() - 1;
+
+    let expr_one = AstExpr(kind: 1, val: 1, name: "", op: 0, left: None, right: None);
+    pool.push(expr_one);
+    let one_idx = pool.len() - 1;
+
+    let expr_add = AstExpr(kind: 3, val: 0, name: "", op: 1, left: ref pool[x_idx], right: ref pool[one_idx]);
+    pool.push(expr_add);
+    let add_idx = pool.len() - 1;
+
+    let while_ast = AstWhile(
+        cond_left: ref pool[x_idx],
+        cond_op: 3,
+        cond_right: ref pool[five_idx],
+        body_target_var: "x",
+        body_expr: ref pool[add_idx]
+    );
+
+    // 3. Match: match x { 5 => 42, _ => 0 }
+    let expr42 = AstExpr(kind: 1, val: 42, name: "", op: 0, left: None, right: None);
+    pool.push(expr42);
+    let idx42 = pool.len() - 1;
+
+    mut arms: List<AstMatchArm> = List::new();
+    arms.push(AstMatchArm(
+        pat: AstPattern(kind: 2, val: 5, name: ""),
+        expr: ref pool[idx42]
+    ));
+    arms.push(AstMatchArm(
+        pat: AstPattern(kind: 1, val: 0, name: "_"),
+        expr: ref pool[zero_idx]
+    ));
+    let match_ast = AstMatch(target_var: "x", arms: arms);
+
+    let comp_func = AstComplexFunction(
+        name: "complex_pipeline",
+        param_name: "seed",
+        init_statements: init_stmts,
+        has_while: true,
+        while_loop: while_ast,
+        has_match: true,
+        match_stmt: match_ast,
+        has_generic_call: true,
+        generic_callee: "identity$i64",
+        return_var: "res"
+    );
+
+    let fir_lines = emit_fir_complex_function(comp_func);
+    if fir_lines.len() < 20 {
+        return false;
+    }
+    if fir_lines[0] != "fir.func @complex_pipeline(%seed: i64) -> i64 {" {
+        return false;
+    }
+
+    let llvm_lines = emit_llvm_complex_function(comp_func);
+    if llvm_lines.len() < 20 {
+        return false;
+    }
+    if llvm_lines[0] != "define i64 @complex_pipeline(i64 %seed) {" {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
     let t2 = test_codegen_function_emission();
-    if t1 && t2 {
+    let t3 = test_codegen_while_loop();
+    let t4 = test_codegen_pattern_match();
+    let t5 = test_codegen_generic_method_call();
+    let t6 = test_codegen_complex_function();
+    if t1 && t2 && t3 && t4 && t5 && t6 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");

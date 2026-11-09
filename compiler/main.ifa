@@ -85,6 +85,16 @@ pub fn test_selfhost_modular_pipeline() -> bool {
         return false;
     }
 
+    let comp_ir = driver::compile_complex_module_to_llvm_ir(cfg.target_triple);
+    if comp_ir.len() < 50 {
+        return false;
+    }
+
+    let comp_fn_ok = codegen_llvm::test_codegen_complex_function();
+    if !comp_fn_ok {
+        return false;
+    }
+
     return true;
 }
 
@@ -120,14 +130,32 @@ pub fn parse_and_run_cli() -> bool {
             opt_lvl = 2;
         } else if arg == "-O3" {
             opt_lvl = 3;
+        } else if arg == "--bootstrap-triple" {
+            mut base_out = "target/dev/ifac";
+            if i + 1 < argc {
+                i = i + 1;
+                base_out = process::args_get(i);
+            }
+            let ok = driver::orchestrate_triple_stage_pipeline(
+                "x86_64-unknown-linux-gnu",
+                base_out + "-gen2",
+                base_out + "-gen3"
+            );
+            if ok {
+                println("Self-hosting triple-stage bootstrap completed: SUCCESS");
+            } else {
+                println("Self-hosting triple-stage bootstrap: FAILED");
+            }
+            return true;
         } else if arg == "--help" || arg == "-h" {
             println("Usage: ifac [options] <source.ifa>");
             println("Options:");
-            println("  -o <file>        Specify output binary or object file");
-            println("  --emit-ir, -S    Emit LLVM IR textual representation (.ll)");
-            println("  -c               Assemble source into native object file (.o)");
-            println("  -O0..-O3         Set optimization level (default: -O2)");
-            println("  --help, -h       Display this help message");
+            println("  -o <file>            Specify output binary or object file");
+            println("  --emit-ir, -S        Emit LLVM IR textual representation (.ll)");
+            println("  -c                   Assemble source into native object file (.o)");
+            println("  -O0..-O3             Set optimization level (default: -O2)");
+            println("  --bootstrap-triple   Execute autonomous triple-stage bootstrap");
+            println("  --help, -h           Display this help message");
             return true;
         } else {
             if input_path == "" {

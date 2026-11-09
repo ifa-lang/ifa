@@ -2452,9 +2452,7 @@ impl<'a> LlvmIrEmitter<'a> {
                             base, field_idx, ..
                         } => match value_types.get(base) {
                             Some(ifa_fir::FirType::Struct(s_name, fields)) => {
-                                if *field_idx < fields.len() {
-                                    fields[*field_idx].1.clone()
-                                } else if let Some(st_def) =
+                                if let Some(st_def) =
                                     module.structs.iter().find(|s| s.name == *s_name)
                                 {
                                     if *field_idx < st_def.fields.len() {
@@ -2462,15 +2460,15 @@ impl<'a> LlvmIrEmitter<'a> {
                                     } else {
                                         ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                                     }
+                                } else if *field_idx < fields.len() {
+                                    fields[*field_idx].1.clone()
                                 } else {
                                     ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                                 }
                             }
                             Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
                                 ifa_fir::FirType::Struct(s_name, fields) => {
-                                    if *field_idx < fields.len() {
-                                        fields[*field_idx].1.clone()
-                                    } else if let Some(st_def) =
+                                    if let Some(st_def) =
                                         module.structs.iter().find(|s| s.name == *s_name)
                                     {
                                         if *field_idx < st_def.fields.len() {
@@ -2478,6 +2476,8 @@ impl<'a> LlvmIrEmitter<'a> {
                                         } else {
                                             ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                                         }
+                                    } else if *field_idx < fields.len() {
+                                        fields[*field_idx].1.clone()
                                     } else {
                                         ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                                     }
@@ -2491,11 +2491,7 @@ impl<'a> LlvmIrEmitter<'a> {
                         } => match value_types.get(base) {
                             Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
                                 ifa_fir::FirType::Struct(s_name, fields) => {
-                                    if *field_idx < fields.len() {
-                                        ifa_fir::FirType::Pointer(Box::new(
-                                            fields[*field_idx].1.clone(),
-                                        ))
-                                    } else if let Some(st_def) =
+                                    if let Some(st_def) =
                                         module.structs.iter().find(|s| s.name == *s_name)
                                     {
                                         if *field_idx < st_def.fields.len() {
@@ -2509,6 +2505,10 @@ impl<'a> LlvmIrEmitter<'a> {
                                                 ),
                                             ))
                                         }
+                                    } else if *field_idx < fields.len() {
+                                        ifa_fir::FirType::Pointer(Box::new(
+                                            fields[*field_idx].1.clone(),
+                                        ))
                                     } else {
                                         ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Int(
                                             ifa_sema::types::IntType::I64,
@@ -2520,11 +2520,7 @@ impl<'a> LlvmIrEmitter<'a> {
                                 ))),
                             },
                             Some(ifa_fir::FirType::Struct(s_name, fields)) => {
-                                if *field_idx < fields.len() {
-                                    ifa_fir::FirType::Pointer(Box::new(
-                                        fields[*field_idx].1.clone(),
-                                    ))
-                                } else if let Some(st_def) =
+                                if let Some(st_def) =
                                     module.structs.iter().find(|s| s.name == *s_name)
                                 {
                                     if *field_idx < st_def.fields.len() {
@@ -2536,6 +2532,10 @@ impl<'a> LlvmIrEmitter<'a> {
                                             ifa_sema::types::IntType::I64,
                                         )))
                                     }
+                                } else if *field_idx < fields.len() {
+                                    ifa_fir::FirType::Pointer(Box::new(
+                                        fields[*field_idx].1.clone(),
+                                    ))
                                 } else {
                                     ifa_fir::FirType::Pointer(Box::new(ifa_fir::FirType::Int(
                                         ifa_sema::types::IntType::I64,
@@ -2909,6 +2909,22 @@ impl<'a> LlvmIrEmitter<'a> {
                 } else {
                     args_str.push(format!("ptr %v{}", a.0));
                 }
+            } else if p_ty.starts_with("{ i1,")
+                && !matches!(arg_fir_ty, Some(ifa_fir::FirType::Optional(_)))
+            {
+                let inner_ty = p_ty
+                    .strip_prefix("{ i1, ")
+                    .and_then(|s| s.strip_suffix(" }"))
+                    .unwrap_or("i64");
+                out.push_str(&format!(
+                    "  %opt_wrap_t0_{}_{} = insertvalue {} undef, i1 1, 0\n",
+                    prefix_id, i, p_ty
+                ));
+                out.push_str(&format!(
+                    "  %opt_wrap_{}_{} = insertvalue {} %opt_wrap_t0_{}_{}, {} %v{}, 1\n",
+                    prefix_id, i, p_ty, prefix_id, i, inner_ty, a.0
+                ));
+                args_str.push(format!("{} %opt_wrap_{}_{}", p_ty, prefix_id, i));
             } else {
                 args_str.push(format!("{} %v{}", p_ty, a.0));
             }
@@ -3658,10 +3674,7 @@ impl<'a> LlvmIrEmitter<'a> {
                     ));
                 } else if let Some(ifa_fir::FirType::Pointer(inner)) = base_ty {
                     if let ifa_fir::FirType::Struct(s_sym, fields) = &**inner {
-                        let field_ty_str = if *field_idx < fields.len() {
-                            fir_to_llvm_type(&fields[*field_idx].1)
-                                .unwrap_or_else(|_| "i64".to_string())
-                        } else if let Some(st_def) =
+                        let field_ty_str = if let Some(st_def) =
                             module.structs.iter().find(|s| s.name == *s_sym)
                         {
                             if *field_idx < st_def.fields.len() {
@@ -3670,6 +3683,9 @@ impl<'a> LlvmIrEmitter<'a> {
                             } else {
                                 "i64".to_string()
                             }
+                        } else if *field_idx < fields.len() {
+                            fir_to_llvm_type(&fields[*field_idx].1)
+                                .unwrap_or_else(|_| "i64".to_string())
                         } else {
                             "i64".to_string()
                         };
@@ -5467,13 +5483,13 @@ impl<'a> LlvmIrEmitter<'a> {
                     let chk_id = *eff_idx;
                     *eff_idx += 1;
                     let base_ty = value_types.get(base);
-                    let len_operand = match base_ty {
+                    let len_operand_opt = match base_ty {
                         Some(ifa_fir::FirType::Slice(_)) => {
                             out.push_str(&format!(
                                 "  %bce_slice_len_{} = extractvalue {{ ptr, i64 }} %v{}, 1\n",
                                 chk_id, base.0
                             ));
-                            format!("%bce_slice_len_{}", chk_id)
+                            Some(format!("%bce_slice_len_{}", chk_id))
                         }
                         Some(ifa_fir::FirType::Pointer(inner))
                             if matches!(&**inner, ifa_fir::FirType::Slice(_)) =>
@@ -5486,24 +5502,26 @@ impl<'a> LlvmIrEmitter<'a> {
                                 "  %bce_slice_len_{} = extractvalue {{ ptr, i64 }} %bce_slice_ld_{}, 1\n",
                                 chk_id, chk_id
                             ));
-                            format!("%bce_slice_len_{}", chk_id)
+                            Some(format!("%bce_slice_len_{}", chk_id))
                         }
-                        Some(ifa_fir::FirType::Array(_, count)) => count.to_string(),
+                        Some(ifa_fir::FirType::Array(_, count)) => Some(count.to_string()),
                         Some(ifa_fir::FirType::Pointer(inner))
                             if matches!(&**inner, ifa_fir::FirType::Array(..)) =>
                         {
                             if let ifa_fir::FirType::Array(_, count) = &**inner {
-                                count.to_string()
+                                Some(count.to_string())
                             } else {
-                                "0".to_string()
+                                None
                             }
                         }
-                        _ => "0".to_string(),
+                        _ => None,
                     };
-                    out.push_str(&format!(
-                        "  call void @ifa_rt_bounds_check(i64 %v{}, i64 {}, ptr null)\n",
-                        index.0, len_operand
-                    ));
+                    if let Some(len_operand) = len_operand_opt {
+                        out.push_str(&format!(
+                            "  call void @ifa_rt_bounds_check(i64 %v{}, i64 {}, ptr null)\n",
+                            index.0, len_operand
+                        ));
+                    }
                 }
             }
             ValueExpr::SliceBoundsCheck {
