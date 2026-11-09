@@ -201,6 +201,491 @@ pub fn assemble_multi_module_llvm(
     return full_module;
 }
 
+// Multi-File Dependency Graph and Import DAG
+pub struct ModuleNode {
+    name: String,
+    path: String,
+    dependencies: List<String>
+}
+
+pub struct ImportGraph {
+    modules: List<ModuleNode>
+}
+
+pub struct MultiFileCompilationPlan {
+    modules_in_order: List<String>,
+    is_valid: bool,
+    error_message: String
+}
+
+pub fn make_import_graph() -> ImportGraph {
+    return ImportGraph(modules: List::new());
+}
+
+pub fn register_module(
+    inout graph: ImportGraph,
+    name: String,
+    path: String,
+    deps: List<String>
+) {
+    graph.modules.push(ModuleNode(
+        name: name,
+        path: path,
+        dependencies: deps
+    ));
+}
+
+pub fn find_module_index(graph: ImportGraph, name: String) -> i64 {
+    mut i: i64 = 0;
+    while i < graph.modules.len() {
+        if graph.modules[i].name == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn list_contains(list: List<String>, item: String) -> bool {
+    mut i: i64 = 0;
+    while i < list.len() {
+        if list[i] == item {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn find_index_in_list(list: List<String>, item: String) -> i64 {
+    mut i: i64 = 0;
+    while i < list.len() {
+        if list[i] == item {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Deterministic topological sort of modules using iterative dependency resolution (Kahn's algorithm)
+pub fn topological_sort_modules(graph: ImportGraph) -> List<String> {
+    mut resolved: List<String> = List::new();
+    mut progressed = true;
+    while progressed {
+        progressed = false;
+        mut i: i64 = 0;
+        while i < graph.modules.len() {
+            let mod_node = graph.modules[i];
+            let name = mod_node.name;
+            if !list_contains(resolved, name) {
+                mut all_deps_resolved = true;
+                mut d: i64 = 0;
+                while d < mod_node.dependencies.len() {
+                    let dep = mod_node.dependencies[d];
+                    if find_module_index(graph, dep) >= 0 {
+                        if !list_contains(resolved, dep) {
+                            all_deps_resolved = false;
+                        }
+                    }
+                    d = d + 1;
+                }
+                if all_deps_resolved {
+                    resolved.push(name);
+                    progressed = true;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    return resolved;
+}
+
+pub fn has_circular_dependency(graph: ImportGraph) -> bool {
+    let sorted = topological_sort_modules(graph);
+    return sorted.len() < graph.modules.len();
+}
+
+// Computes the transitive closure of dependencies for a target root module in topological order
+pub fn resolve_transitive_dependencies(
+    graph: ImportGraph,
+    root_module: String
+) -> List<String> {
+    mut needed: List<String> = List::new();
+    mut frontier: List<String> = List::new();
+
+    let root_idx = find_module_index(graph, root_module);
+    if root_idx < 0 {
+        return needed;
+    }
+
+    let root_node = graph.modules[root_idx];
+    mut d: i64 = 0;
+    while d < root_node.dependencies.len() {
+        let dep = root_node.dependencies[d];
+        if find_module_index(graph, dep) >= 0 {
+            frontier.push(dep);
+            needed.push(dep);
+        }
+        d = d + 1;
+    }
+
+    mut f_idx: i64 = 0;
+    while f_idx < frontier.len() {
+        let cur = frontier[f_idx];
+        let cur_idx = find_module_index(graph, cur);
+        if cur_idx >= 0 {
+            let cur_node = graph.modules[cur_idx];
+            mut cd: i64 = 0;
+            while cd < cur_node.dependencies.len() {
+                let sub_dep = cur_node.dependencies[cd];
+                if find_module_index(graph, sub_dep) >= 0 {
+                    if !list_contains(needed, sub_dep) {
+                        needed.push(sub_dep);
+                        frontier.push(sub_dep);
+                    }
+                }
+                cd = cd + 1;
+            }
+        }
+        f_idx = f_idx + 1;
+    }
+
+    let full_order = topological_sort_modules(graph);
+    mut sorted_needed: List<String> = List::new();
+    mut o: i64 = 0;
+    while o < full_order.len() {
+        let mod_name = full_order[o];
+        if list_contains(needed, mod_name) {
+            sorted_needed.push(mod_name);
+        }
+        o = o + 1;
+    }
+
+    return sorted_needed;
+}
+
+// Builds a multi-file compilation plan verifying DAG acyclicity and ordering dependencies
+pub fn create_multi_file_compilation_plan(
+    graph: ImportGraph,
+    root_module: String
+) -> MultiFileCompilationPlan {
+    if find_module_index(graph, root_module) < 0 {
+        return MultiFileCompilationPlan(
+            modules_in_order: List::new(),
+            is_valid: false,
+            error_message: "Root module not found: " + root_module
+        );
+    }
+
+    if has_circular_dependency(graph) {
+        return MultiFileCompilationPlan(
+            modules_in_order: List::new(),
+            is_valid: false,
+            error_message: "Cyclic dependency detected in import graph"
+        );
+    }
+
+    let deps = resolve_transitive_dependencies(graph, root_module);
+    mut plan_modules: List<String> = List::new();
+    mut i: i64 = 0;
+    while i < deps.len() {
+        plan_modules.push(deps[i]);
+        i = i + 1;
+    }
+    plan_modules.push(root_module);
+
+    return MultiFileCompilationPlan(
+        modules_in_order: plan_modules,
+        is_valid: true,
+        error_message: ""
+    );
+}
+
+// Assembles a multi-file LLVM module adhering strictly to the acyclic compilation plan
+pub fn assemble_dependency_graph_llvm(
+    graph: ImportGraph,
+    catalog: MultiModuleCatalog,
+    root_module: String,
+    body_lines: List<String>,
+    target_triple: String
+) -> List<String> {
+    mut full_module = emit_header_metadata(target_triple, 2);
+    full_module.push("");
+    full_module.push("; Multi-File Acyclic Dependency Graph Linking");
+
+    let plan = create_multi_file_compilation_plan(graph, root_module);
+    if !plan.is_valid {
+        full_module.push("; Error: " + plan.error_message);
+        return full_module;
+    }
+
+    mut i: i64 = 0;
+    while i < plan.modules_in_order.len() {
+        let mod_name = plan.modules_in_order[i];
+        full_module.push("; Module Unit: " + mod_name);
+        mut j: i64 = 0;
+        while j < catalog.entries.len() {
+            let e = catalog.entries[j];
+            if e.module_name == mod_name {
+                if e.symbol_kind == 1 {
+                    full_module.push("@" + e.mangled_id + " = constant i64 0, align 8");
+                } else if e.symbol_kind == 4 {
+                    full_module.push("%" + e.mangled_id + " = type { i64, i64 }");
+                } else if e.symbol_kind == 5 {
+                    full_module.push("@" + e.mangled_id + "$vtable = external global ptr");
+                } else if e.symbol_kind == 6 {
+                    full_module.push("declare i64 @" + e.mangled_id + "(i64)");
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    full_module.push("");
+    full_module.push("; Standard IFA Runtime Declarations");
+    full_module.push("declare void @ifa_rt_println_i64(i64)");
+    full_module.push("");
+
+    mut k: i64 = 0;
+    while k < body_lines.len() {
+        full_module.push(body_lines[k]);
+        k = k + 1;
+    }
+
+    return full_module;
+}
+
+// Native FFI C/PHP Bridge Export Metadata and Generators
+pub struct FfiExportParam {
+    name: String,
+    type_name: String
+}
+
+pub struct FfiExportFunction {
+    module_name: String,
+    func_name: String,
+    params: List<FfiExportParam>,
+    return_type: String,
+    is_strict: bool
+}
+
+pub struct FfiExportCatalog {
+    functions: List<FfiExportFunction>
+}
+
+pub fn make_ffi_catalog() -> FfiExportCatalog {
+    return FfiExportCatalog(functions: List::new());
+}
+
+pub fn register_ffi_function(
+    inout catalog: FfiExportCatalog,
+    mod_name: String,
+    fn_name: String,
+    params: List<FfiExportParam>,
+    ret_ty: String,
+    is_strict_fn: bool
+) {
+    catalog.functions.push(FfiExportFunction(
+        module_name: mod_name,
+        func_name: fn_name,
+        params: params,
+        return_type: ret_ty,
+        is_strict: is_strict_fn
+    ));
+}
+
+pub fn map_ifa_to_c_type(ty: String) -> String {
+    if ty == "i64" { return "int64_t"; }
+    if ty == "i32" { return "int32_t"; }
+    if ty == "i16" { return "int16_t"; }
+    if ty == "i8" { return "int8_t"; }
+    if ty == "bool" { return "bool"; }
+    if ty == "f64" { return "double"; }
+    if ty == "f32" { return "float"; }
+    if ty == "ptr" || ty == "string" { return "const char*"; }
+    if ty == "void" { return "void"; }
+    return "int64_t";
+}
+
+pub fn map_ifa_to_php_type(ty: String) -> String {
+    if ty == "i64" || ty == "i32" || ty == "i16" || ty == "i8" { return "int"; }
+    if ty == "bool" { return "bool"; }
+    if ty == "f64" || ty == "f32" { return "float"; }
+    if ty == "ptr" || ty == "string" { return "string"; }
+    if ty == "void" { return "void"; }
+    return "int";
+}
+
+pub fn generate_c_header_lines(catalog: FfiExportCatalog, package_name: String) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("/* Auto-generated IFA Pure Self-Hosted C FFI Header */");
+    lines.push("#ifndef IFA_" + package_name + "_H");
+    lines.push("#define IFA_" + package_name + "_H");
+    lines.push("");
+    lines.push("#include <stdint.h>");
+    lines.push("#include <stdbool.h>");
+    lines.push("#include <stddef.h>");
+    lines.push("");
+    lines.push("#ifdef __cplusplus");
+    lines.push("extern \"C\" {");
+    lines.push("#endif");
+    lines.push("");
+
+    mut i: i64 = 0;
+    while i < catalog.functions.len() {
+        let f = catalog.functions[i];
+        let c_ret = map_ifa_to_c_type(f.return_type);
+        let sym_name = "ifa_" + f.module_name + "_" + f.func_name;
+        lines.push("/* Exported: " + f.module_name + "::" + f.func_name + " */");
+        if f.is_strict {
+            lines.push("/* Note: Deterministic zero-heap strict execution guaranteed */");
+        }
+
+        mut sig = c_ret + " " + sym_name + "(";
+        if f.params.len() == 0 {
+            sig = sig + "void";
+        } else {
+            mut p: i64 = 0;
+            while p < f.params.len() {
+                if p > 0 {
+                    sig = sig + ", ";
+                }
+                let param = f.params[p];
+                sig = sig + map_ifa_to_c_type(param.type_name) + " " + param.name;
+                p = p + 1;
+            }
+        }
+        sig = sig + ");";
+        lines.push(sig);
+        lines.push("");
+        i = i + 1;
+    }
+
+    lines.push("#ifdef __cplusplus");
+    lines.push("}");
+    lines.push("#endif");
+    lines.push("");
+    lines.push("#endif /* IFA_" + package_name + "_H */");
+    return lines;
+}
+
+pub fn generate_c_header_text(catalog: FfiExportCatalog, package_name: String) -> String {
+    let lines = generate_c_header_lines(catalog, package_name);
+    mut out = "";
+    mut i: i64 = 0;
+    while i < lines.len() {
+        out = out + lines[i] + "\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn generate_php_ffi_bridge_lines(
+    catalog: FfiExportCatalog,
+    package_name: String,
+    class_name: String
+) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("<?php");
+    lines.push("");
+    lines.push("declare(strict_types=1);");
+    lines.push("");
+    lines.push("namespace Ifa\\" + package_name + ";");
+    lines.push("");
+    lines.push("/**");
+    lines.push(" * High-Performance Native PHP 8.4+ FFI Bridge for IFA package: " + package_name);
+    lines.push(" * Generated natively by the IFA self-hosted compiler driver.");
+    lines.push(" */");
+    lines.push("final class " + class_name);
+    lines.push("{");
+    lines.push("    private \\FFI $ffi;");
+    lines.push("");
+    lines.push("    public function __construct(?string $libPath = null, ?string $headerPath = null)");
+    lines.push("    {");
+    lines.push("        $lib = $libPath ?? __DIR__ . '/lib" + package_name + ".so';");
+    lines.push("        $hdr = $headerPath ?? __DIR__ . '/" + package_name + ".h';");
+    lines.push("        $this->ffi = \\FFI::cdef((string)file_get_contents($hdr), $lib);");
+    lines.push("    }");
+    lines.push("");
+
+    mut i: i64 = 0;
+    while i < catalog.functions.len() {
+        let f = catalog.functions[i];
+        let sym_name = "ifa_" + f.module_name + "_" + f.func_name;
+        let php_ret = map_ifa_to_php_type(f.return_type);
+
+        mut sig = "    public function " + f.func_name + "(";
+        mut p: i64 = 0;
+        while p < f.params.len() {
+            if p > 0 {
+                sig = sig + ", ";
+            }
+            let param = f.params[p];
+            sig = sig + map_ifa_to_php_type(param.type_name) + " $" + param.name;
+            p = p + 1;
+        }
+        sig = sig + "): " + php_ret;
+        lines.push(sig);
+        lines.push("    {");
+
+        mut call_str = "$this->ffi->" + sym_name + "(";
+        mut ap: i64 = 0;
+        while ap < f.params.len() {
+            if ap > 0 {
+                call_str = call_str + ", ";
+            }
+            call_str = call_str + "$" + f.params[ap].name;
+            ap = ap + 1;
+        }
+        call_str = call_str + ");";
+
+        if f.return_type == "void" {
+            lines.push("        " + call_str);
+        } else {
+            lines.push("        return " + call_str);
+        }
+        lines.push("    }");
+        lines.push("");
+
+        i = i + 1;
+    }
+
+    lines.push("}");
+    return lines;
+}
+
+pub fn generate_php_ffi_bridge_text(
+    catalog: FfiExportCatalog,
+    package_name: String,
+    class_name: String
+) -> String {
+    let lines = generate_php_ffi_bridge_lines(catalog, package_name, class_name);
+    mut out = "";
+    mut i: i64 = 0;
+    while i < lines.len() {
+        out = out + lines[i] + "\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn emit_ffi_bridge_artifacts(
+    catalog: FfiExportCatalog,
+    package_name: String,
+    header_path: String,
+    php_path: String
+) -> bool {
+    let c_text = generate_c_header_text(catalog, package_name);
+    let ok_c = fs::write_string(header_path, c_text);
+    if !ok_c {
+        return false;
+    }
+    let php_text = generate_php_ffi_bridge_text(catalog, package_name, package_name + "Bridge");
+    return fs::write_string(php_path, php_text);
+}
+
 pub fn compile_source_to_llvm_ir(target_triple: String) -> List<String> {
     mut fn_lines: List<String> = List::new();
     fn_lines.push("define i64 @main() {");
@@ -610,6 +1095,175 @@ pub fn test_driver_multi_module_symbol_resolution() -> bool {
     return has_decl_fn && has_vtable;
 }
 
+// Unit Test 9: Verify import graph DAG ordering, cycle detection, and transitive closure
+pub fn test_driver_import_graph_and_transitive_deps() -> bool {
+    mut graph = make_import_graph();
+
+    mut empty_deps: List<String> = List::new();
+    register_module(inout graph, "lexer", "compiler/lexer.ifa", empty_deps);
+
+    mut parser_deps: List<String> = List::new();
+    parser_deps.push("lexer");
+    register_module(inout graph, "parser", "compiler/parser.ifa", parser_deps);
+
+    mut sema_deps: List<String> = List::new();
+    sema_deps.push("lexer");
+    sema_deps.push("parser");
+    register_module(inout graph, "sema", "compiler/sema.ifa", sema_deps);
+
+    mut codegen_deps: List<String> = List::new();
+    codegen_deps.push("lexer");
+    codegen_deps.push("parser");
+    codegen_deps.push("sema");
+    register_module(inout graph, "codegen_llvm", "compiler/codegen_llvm.ifa", codegen_deps);
+
+    mut driver_deps: List<String> = List::new();
+    driver_deps.push("codegen_llvm");
+    driver_deps.push("sema");
+    register_module(inout graph, "driver", "compiler/driver.ifa", driver_deps);
+
+    mut main_deps: List<String> = List::new();
+    main_deps.push("driver");
+    main_deps.push("sema");
+    register_module(inout graph, "main", "compiler/main.ifa", main_deps);
+
+    if graph.modules.len() != 6 {
+        return false;
+    }
+
+    // Verify DAG is acyclic
+    if has_circular_dependency(graph) {
+        return false;
+    }
+
+    let topo = topological_sort_modules(graph);
+    if topo.len() != 6 {
+        return false;
+    }
+    // Lexer must precede parser, parser precede sema, sema precede codegen, codegen precede driver, driver precede main
+    let idx_lex = find_index_in_list(topo, "lexer");
+    let idx_par = find_index_in_list(topo, "parser");
+    let idx_sem = find_index_in_list(topo, "sema");
+    let idx_cg = find_index_in_list(topo, "codegen_llvm");
+    let idx_drv = find_index_in_list(topo, "driver");
+    let idx_main = find_index_in_list(topo, "main");
+
+    if !(idx_lex < idx_par && idx_par < idx_sem && idx_sem < idx_cg && idx_cg < idx_drv && idx_drv < idx_main) {
+        return false;
+    }
+
+    // Transitive dependencies of "driver" (should be lexer, parser, sema, codegen_llvm)
+    let drv_trans = resolve_transitive_dependencies(graph, "driver");
+    if drv_trans.len() != 4 {
+        return false;
+    }
+    if drv_trans[0] != "lexer" || drv_trans[1] != "parser" || drv_trans[2] != "sema" || drv_trans[3] != "codegen_llvm" {
+        return false;
+    }
+
+    // Compilation plan for "main"
+    let plan = create_multi_file_compilation_plan(graph, "main");
+    if !plan.is_valid || plan.modules_in_order.len() != 6 {
+        return false;
+    }
+    if plan.modules_in_order[5] != "main" {
+        return false;
+    }
+
+    // Circular dependency detection
+    mut cycle_graph = make_import_graph();
+    mut mod_a_deps: List<String> = List::new();
+    mod_a_deps.push("mod_b");
+    register_module(inout cycle_graph, "mod_a", "a.ifa", mod_a_deps);
+
+    mut mod_b_deps: List<String> = List::new();
+    mod_b_deps.push("mod_a");
+    register_module(inout cycle_graph, "mod_b", "b.ifa", mod_b_deps);
+
+    if !has_circular_dependency(cycle_graph) {
+        return false;
+    }
+
+    let cycle_plan = create_multi_file_compilation_plan(cycle_graph, "mod_a");
+    if cycle_plan.is_valid {
+        return false;
+    }
+
+    // Assemble LLVM with dependency graph
+    mut cat = make_module_catalog();
+    register_module_symbol(inout cat, "lexer", "Token", 4);
+    register_module_symbol(inout cat, "driver", "compile_full_pipeline", 6);
+
+    mut body: List<String> = List::new();
+    body.push("define i64 @main() {");
+    body.push("entry:");
+    body.push("  ret i64 0");
+    body.push("}");
+
+    let assembled = assemble_dependency_graph_llvm(graph, cat, "main", body, "x86_64-unknown-linux-gnu");
+    if assembled.len() < 12 {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit Test 10: Verify native C header and PHP 8.4+ FFI bridge generation
+pub fn test_driver_ffi_header_and_php_bridge_generation() -> bool {
+    mut cat = make_ffi_catalog();
+
+    mut p1: List<FfiExportParam> = List::new();
+    p1.push(FfiExportParam(name: "a", type_name: "i64"));
+    p1.push(FfiExportParam(name: "b", type_name: "i64"));
+    register_ffi_function(inout cat, "math", "fast_add", p1, "i64", true);
+
+    mut p2: List<FfiExportParam> = List::new();
+    p2.push(FfiExportParam(name: "data", type_name: "ptr"));
+    register_ffi_function(inout cat, "crypto", "hash_bytes", p2, "i64", false);
+
+    let c_lines = generate_c_header_lines(cat, "calc");
+    if c_lines.len() < 18 {
+        return false;
+    }
+    if c_lines[1] != "#ifndef IFA_calc_H" || c_lines[2] != "#define IFA_calc_H" {
+        return false;
+    }
+    if c_lines[14] != "int64_t ifa_math_fast_add(int64_t a, int64_t b);" {
+        return false;
+    }
+    if c_lines[17] != "int64_t ifa_crypto_hash_bytes(const char* data);" {
+        return false;
+    }
+
+    let php_lines = generate_php_ffi_bridge_lines(cat, "calc", "CalcBridge");
+    if php_lines.len() < 25 {
+        return false;
+    }
+    if php_lines[4] != "namespace Ifa\\calc;" {
+        return false;
+    }
+    if php_lines[10] != "final class CalcBridge" {
+        return false;
+    }
+    if php_lines[21] != "    public function fast_add(int $a, int $b): int" {
+        return false;
+    }
+    if php_lines[23] != "        return $this->ffi->ifa_math_fast_add($a, $b);" {
+        return false;
+    }
+    if php_lines[26] != "    public function hash_bytes(string $data): int" {
+        return false;
+    }
+
+    let c_text = generate_c_header_text(cat, "calc");
+    let php_text = generate_php_ffi_bridge_text(cat, "calc", "CalcBridge");
+    if c_text == "" || php_text == "" {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Driver & I/O Module ===");
     let t1 = test_driver_default_config();
@@ -620,8 +1274,10 @@ pub fn main() {
     let t6 = test_driver_standalone_pipeline_builder();
     let t7 = test_driver_complex_module_and_bootstrap_orchestration();
     let t8 = test_driver_multi_module_symbol_resolution();
+    let t9 = test_driver_import_graph_and_transitive_deps();
+    let t10 = test_driver_ffi_header_and_php_bridge_generation();
 
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 {
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 {
         println("Driver validation tests: ALL PASSED");
     } else {
         println("Driver validation tests: FAILED");

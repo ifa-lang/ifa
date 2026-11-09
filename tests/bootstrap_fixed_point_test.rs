@@ -321,6 +321,16 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_driver_import_graph_and_transitive_deps ... ok"),
+        "Modular driver import DAG test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_ffi_header_and_php_bridge_generation ... ok"),
+        "Modular driver FFI C/PHP bridge test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_codegen_timed_and_prioritized_channel_select ... ok"),
         "Modular codegen timed select test missing from output:\n{}",
         stdout
@@ -346,8 +356,8 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("119 passed; 0 failed"),
-        "Expected 119 passed unit tests, got:\n{}",
+        stdout.contains("123 passed; 0 failed"),
+        "Expected 123 passed unit tests, got:\n{}",
         stdout
     );
 }

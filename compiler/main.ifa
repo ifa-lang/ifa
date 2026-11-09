@@ -156,7 +156,9 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     let select_timed_cg_ok = codegen_llvm::test_codegen_timed_and_prioritized_channel_select();
     let nursery_cg_ok = codegen_llvm::test_codegen_task_nursery_concurrency();
     let driver_mm_ok = driver::test_driver_multi_module_symbol_resolution();
-    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok || !fn_ptr_cg_ok || !thunk_cg_ok || !fiber_cg_ok || !chan_cg_ok || !select_cg_ok || !select_timed_cg_ok || !nursery_cg_ok || !driver_mm_ok {
+    let driver_dag_ok = driver::test_driver_import_graph_and_transitive_deps();
+    let driver_ffi_ok = driver::test_driver_ffi_header_and_php_bridge_generation();
+    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok || !fn_ptr_cg_ok || !thunk_cg_ok || !fiber_cg_ok || !chan_cg_ok || !select_cg_ok || !select_timed_cg_ok || !nursery_cg_ok || !driver_mm_ok || !driver_dag_ok || !driver_ffi_ok {
         return false;
     }
 

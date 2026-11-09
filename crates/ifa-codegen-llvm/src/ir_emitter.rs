@@ -2925,6 +2925,72 @@ impl<'a> LlvmIrEmitter<'a> {
                     prefix_id, i, p_ty, prefix_id, i, inner_ty, a.0
                 ));
                 args_str.push(format!("{} %opt_wrap_{}_{}", p_ty, prefix_id, i));
+            } else if p_ty.starts_with("%struct.") {
+                match arg_fir_ty {
+                    Some(ifa_fir::FirType::Struct(..)) => {
+                        args_str.push(format!("{} %v{}", p_ty, a.0));
+                    }
+                    Some(ifa_fir::FirType::Pointer(inner))
+                        if matches!(&**inner, ifa_fir::FirType::Struct(..)) =>
+                    {
+                        out.push_str(&format!(
+                            "  %st_arg_ld_{}_{} = load {}, ptr %v{}, align 8\n",
+                            prefix_id, i, p_ty, a.0
+                        ));
+                        args_str.push(format!("{} %st_arg_ld_{}_{}", p_ty, prefix_id, i));
+                    }
+                    Some(ifa_fir::FirType::Pointer(inner)) if p_ty.starts_with("%struct.List") => {
+                        let (arr_ptr, arr_len) = match &**inner {
+                            ifa_fir::FirType::Array(_, len) => {
+                                let ptr_str = array_allocas
+                                    .get(a)
+                                    .map(|p| format!("%v{}", p.0))
+                                    .unwrap_or_else(|| format!("%v{}", a.0));
+                                (ptr_str, *len as usize)
+                            }
+                            _ => (format!("%v{}", a.0), 0),
+                        };
+                        out.push_str(&format!(
+                            "  %list_wrap_t0_{}_{} = insertvalue {} undef, ptr {}, 0\n",
+                            prefix_id, i, p_ty, arr_ptr
+                        ));
+                        out.push_str(&format!(
+                            "  %list_wrap_t1_{}_{} = insertvalue {} %list_wrap_t0_{}_{}, i64 {}, 1\n",
+                            prefix_id, i, p_ty, prefix_id, i, arr_len
+                        ));
+                        out.push_str(&format!(
+                            "  %list_wrap_{}_{} = insertvalue {} %list_wrap_t1_{}_{}, i64 {}, 2\n",
+                            prefix_id, i, p_ty, prefix_id, i, arr_len
+                        ));
+                        args_str.push(format!("{} %list_wrap_{}_{}", p_ty, prefix_id, i));
+                    }
+                    Some(ifa_fir::FirType::Array(_, len)) if p_ty.starts_with("%struct.List") => {
+                        let ptr_str = array_allocas
+                            .get(a)
+                            .map(|p| format!("%v{}", p.0))
+                            .unwrap_or_else(|| format!("%v{}", a.0));
+                        out.push_str(&format!(
+                            "  %list_wrap_t0_{}_{} = insertvalue {} undef, ptr {}, 0\n",
+                            prefix_id, i, p_ty, ptr_str
+                        ));
+                        out.push_str(&format!(
+                            "  %list_wrap_t1_{}_{} = insertvalue {} %list_wrap_t0_{}_{}, i64 {}, 1\n",
+                            prefix_id, i, p_ty, prefix_id, i, len
+                        ));
+                        out.push_str(&format!(
+                            "  %list_wrap_{}_{} = insertvalue {} %list_wrap_t1_{}_{}, i64 {}, 2\n",
+                            prefix_id, i, p_ty, prefix_id, i, len
+                        ));
+                        args_str.push(format!("{} %list_wrap_{}_{}", p_ty, prefix_id, i));
+                    }
+                    _ => {
+                        out.push_str(&format!(
+                            "  %st_arg_ld_{}_{} = load {}, ptr %v{}, align 8\n",
+                            prefix_id, i, p_ty, a.0
+                        ));
+                        args_str.push(format!("{} %st_arg_ld_{}_{}", p_ty, prefix_id, i));
+                    }
+                }
             } else {
                 args_str.push(format!("{} %v{}", p_ty, a.0));
             }
