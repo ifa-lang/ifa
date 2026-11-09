@@ -2173,3 +2173,209 @@ fn test_vectorize_pass_multi_arena_fused_conv3d_volumetric_gen_elision() {
         stats
     );
 }
+
+#[test]
+fn test_dilated_convolution_vectorization_and_gen_check_elision() {
+    use ifa_fir::LoopVectorHint;
+    let src = r#"
+        pub strict fn dilated_conv2d_kernel(
+            inout dst: Slice<f32>,
+            img: Slice<f32>,
+            weights: Slice<f32>,
+            bias: Slice<f32>
+        ) {
+            let mut y: i64 = 0;
+            while y < 3 {
+                let mut x: i64 = 0;
+                while x < 3 {
+                    let mut ky: i64 = 0;
+                    while ky < 2 {
+                        let mut kx: i64 = 0;
+                        while kx < 2 {
+                            let in_idx = (y * 1 + ky * 2) * 5 + (x * 1 + kx * 2);
+                            let w_idx = ky * 2 + kx;
+                            let out_idx = y * 3 + x;
+                            dst[out_idx] = dst[out_idx] + img[in_idx] * weights[w_idx];
+                            kx = kx + 1;
+                        }
+                        ky = ky + 1;
+                    }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("dilated_conv.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut func = module.functions[0].clone();
+
+    // Attach dilated convolution vector hint to loop blocks
+    for b in &mut func.blocks {
+        b.set_vector_hint(LoopVectorHint::new(8, 8, true).with_dilated_conv(
+            false,
+            (1, 2, 2),
+            true,
+            true,
+        ));
+    }
+
+    // Insert generation check into the inner loop body
+    let inner_block = func
+        .blocks
+        .iter_mut()
+        .find(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(
+                    i.expr,
+                    ValueExpr::Binary {
+                        op: BinaryOp::Mul,
+                        ..
+                    }
+                )
+            })
+        })
+        .unwrap();
+
+    let p_img = func.params[1].val;
+    inner_block.instructions.insert(
+        0,
+        Instruction::new(
+            None,
+            ValueExpr::GenCheck {
+                ref_val: p_img,
+                redundant: false,
+            },
+            Span::DUMMY,
+        ),
+    );
+
+    let mut pass = VectorizePass::new();
+    pass.run_on_function(&mut func);
+    let stats = pass.stats();
+
+    assert!(
+        stats.dilated_conv_vectorized >= 1,
+        "Dilated convolution must be recognized: {:?}",
+        stats
+    );
+    assert!(
+        stats.nested_gen_checks_eliminated >= 1,
+        "Generational checks in dilated conv loops must be statically eliminated: {:?}",
+        stats
+    );
+}
+
+#[test]
+fn test_spatial_max_and_avg_pooling_vectorization_and_gen_check_elision() {
+    use ifa_fir::{LoopVectorHint, PoolingKind};
+    let src = r#"
+        pub strict fn spatial_pool_kernel(
+            inout dst: Slice<f32>,
+            img: Slice<f32>
+        ) {
+            let mut y: i64 = 0;
+            while y < 2 {
+                let mut x: i64 = 0;
+                while x < 2 {
+                    let mut py: i64 = 0;
+                    while py < 2 {
+                        let mut px: i64 = 0;
+                        while px < 2 {
+                            let in_idx = (y * 2 + py) * 4 + (x * 2 + px);
+                            let out_idx = y * 2 + x;
+                            dst[out_idx] = dst[out_idx] + img[in_idx];
+                            px = px + 1;
+                        }
+                        py = py + 1;
+                    }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+        }
+    "#;
+
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("spatial_pool.ifa".to_string(), src);
+    let (prog, diags) = parse(fid, tokenize(fid, src));
+    assert!(diags.is_empty(), "Parse errors: {:?}", diags);
+    let analysis = analyze(&sm, &prog);
+    assert!(
+        !analysis.has_errors(),
+        "Sema errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let module = compile_to_fir(&prog, &analysis.symbols, true, true).unwrap();
+    let mut func = module.functions[0].clone();
+
+    // Attach spatial max pooling hint to loop blocks
+    for b in &mut func.blocks {
+        b.set_vector_hint(LoopVectorHint::new(8, 8, true).with_pooling(
+            PoolingKind::Max,
+            (2, 2),
+            (2, 2),
+        ));
+    }
+
+    let inner_block = func
+        .blocks
+        .iter_mut()
+        .find(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(
+                    i.expr,
+                    ValueExpr::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                )
+            })
+        })
+        .unwrap();
+
+    let p_img = func.params[1].val;
+    inner_block.instructions.insert(
+        0,
+        Instruction::new(
+            None,
+            ValueExpr::GenCheck {
+                ref_val: p_img,
+                redundant: false,
+            },
+            Span::DUMMY,
+        ),
+    );
+
+    let mut pass = VectorizePass::new();
+    pass.run_on_function(&mut func);
+    let stats = pass.stats();
+
+    assert!(
+        stats.total_pooling_vectorized >= 1,
+        "Total pooling must be recognized: {:?}",
+        stats
+    );
+    assert!(
+        stats.max_pooling_vectorized >= 1,
+        "Max pooling must be recognized: {:?}",
+        stats
+    );
+    assert!(
+        stats.nested_gen_checks_eliminated >= 1,
+        "Generational checks in spatial pooling loops must be eliminated: {:?}",
+        stats
+    );
+}

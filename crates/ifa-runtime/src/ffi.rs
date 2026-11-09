@@ -2747,3 +2747,435 @@ pub unsafe extern "C" fn ifa_simd_arena_slice_count_if_gt_i64(
     }
     count
 }
+
+// =========================================================================
+// IFA Native Dilated Convolutions & Zero-Heap Spatial Pooling Kernels
+// =========================================================================
+
+/// Multi-arena 2D dilated (atrous) convolution with fused bias and optional activation (f32).
+/// activation: 0 = None, 1 = ReLU
+///
+/// # Safety
+///
+/// All raw pointers (`dst`, `img`, `weights`, `bias`) must be valid for read/write
+/// operations across computed dilated index bounds and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_dilated_conv2d_f32(
+    dst: *mut f32,
+    img: *const f32,
+    weights: *const f32,
+    bias: *const f32,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    dilation_y: i64,
+    dilation_x: i64,
+    kernel_h: i64,
+    kernel_w: i64,
+    img_width: i64,
+    activation: i32,
+) {
+    if dst.is_null()
+        || img.is_null()
+        || weights.is_null()
+        || h_out <= 0
+        || w_out <= 0
+        || kernel_h <= 0
+        || kernel_w <= 0
+    {
+        return;
+    }
+    let b0 = if !bias.is_null() { *bias } else { 0.0 };
+    for y in 0..h_out {
+        let y_base = (y * stride_y) * img_width;
+        let y_out_off = y * w_out;
+        for x in 0..w_out {
+            let x_base = x * stride_x;
+            let out_idx = y_out_off + x;
+            let mut accum = 0.0f32;
+            for ky in 0..kernel_h {
+                let in_row = y_base + (ky * dilation_y) * img_width;
+                let w_row = ky * kernel_w;
+                for kx in 0..kernel_w {
+                    let in_idx = in_row + x_base + (kx * dilation_x);
+                    let w_idx = w_row + kx;
+                    accum += *img.offset(in_idx as isize) * *weights.offset(w_idx as isize);
+                }
+            }
+            accum += b0;
+            if activation == 1 && accum < 0.0 {
+                accum = 0.0;
+            }
+            *dst.offset(out_idx as isize) += accum;
+        }
+    }
+}
+
+/// Multi-arena 2D dilated (atrous) convolution with fused bias and optional activation (f64).
+/// activation: 0 = None, 1 = ReLU
+///
+/// # Safety
+///
+/// All raw pointers (`dst`, `img`, `weights`, `bias`) must be valid for read/write
+/// operations across computed dilated index bounds and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_dilated_conv2d_f64(
+    dst: *mut f64,
+    img: *const f64,
+    weights: *const f64,
+    bias: *const f64,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    dilation_y: i64,
+    dilation_x: i64,
+    kernel_h: i64,
+    kernel_w: i64,
+    img_width: i64,
+    activation: i32,
+) {
+    if dst.is_null()
+        || img.is_null()
+        || weights.is_null()
+        || h_out <= 0
+        || w_out <= 0
+        || kernel_h <= 0
+        || kernel_w <= 0
+    {
+        return;
+    }
+    let b0 = if !bias.is_null() { *bias } else { 0.0 };
+    for y in 0..h_out {
+        let y_base = (y * stride_y) * img_width;
+        let y_out_off = y * w_out;
+        for x in 0..w_out {
+            let x_base = x * stride_x;
+            let out_idx = y_out_off + x;
+            let mut accum = 0.0f64;
+            for ky in 0..kernel_h {
+                let in_row = y_base + (ky * dilation_y) * img_width;
+                let w_row = ky * kernel_w;
+                for kx in 0..kernel_w {
+                    let in_idx = in_row + x_base + (kx * dilation_x);
+                    let w_idx = w_row + kx;
+                    accum += *img.offset(in_idx as isize) * *weights.offset(w_idx as isize);
+                }
+            }
+            accum += b0;
+            if activation == 1 && accum < 0.0 {
+                accum = 0.0;
+            }
+            *dst.offset(out_idx as isize) += accum;
+        }
+    }
+}
+
+/// Multi-arena 2D dilated (atrous) convolution with fused bias and optional activation (i64).
+/// activation: 0 = None, 1 = ReLU
+///
+/// # Safety
+///
+/// All raw pointers (`dst`, `img`, `weights`, `bias`) must be valid for read/write
+/// operations across computed dilated index bounds and appropriately aligned.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_dilated_conv2d_i64(
+    dst: *mut i64,
+    img: *const i64,
+    weights: *const i64,
+    bias: *const i64,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    dilation_y: i64,
+    dilation_x: i64,
+    kernel_h: i64,
+    kernel_w: i64,
+    img_width: i64,
+    activation: i32,
+) {
+    if dst.is_null()
+        || img.is_null()
+        || weights.is_null()
+        || h_out <= 0
+        || w_out <= 0
+        || kernel_h <= 0
+        || kernel_w <= 0
+    {
+        return;
+    }
+    let b0 = if !bias.is_null() { *bias } else { 0 };
+    for y in 0..h_out {
+        let y_base = (y * stride_y) * img_width;
+        let y_out_off = y * w_out;
+        for x in 0..w_out {
+            let x_base = x * stride_x;
+            let out_idx = y_out_off + x;
+            let mut accum: i64 = 0;
+            for ky in 0..kernel_h {
+                let in_row = y_base + (ky * dilation_y) * img_width;
+                let w_row = ky * kernel_w;
+                for kx in 0..kernel_w {
+                    let in_idx = in_row + x_base + (kx * dilation_x);
+                    let w_idx = w_row + kx;
+                    accum += *img.offset(in_idx as isize) * *weights.offset(w_idx as isize);
+                }
+            }
+            accum += b0;
+            if activation == 1 && accum < 0 {
+                accum = 0;
+            }
+            *dst.offset(out_idx as isize) += accum;
+        }
+    }
+}
+
+/// Multi-arena 2D spatial max-pooling kernel (f32).
+///
+/// # Safety
+///
+/// `dst` and `img` must be valid for memory operations across computed spatial window bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_maxpool2d_f32(
+    dst: *mut f32,
+    img: *const f32,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    pool_h: i64,
+    pool_w: i64,
+    img_width: i64,
+) {
+    if dst.is_null() || img.is_null() || h_out <= 0 || w_out <= 0 || pool_h <= 0 || pool_w <= 0 {
+        return;
+    }
+    for y in 0..h_out {
+        let y_base = (y * stride_y) * img_width;
+        let y_out_off = y * w_out;
+        for x in 0..w_out {
+            let x_base = x * stride_x;
+            let out_idx = y_out_off + x;
+            let mut max_val = f32::NEG_INFINITY;
+            for ky in 0..pool_h {
+                let in_row = y_base + ky * img_width;
+                for kx in 0..pool_w {
+                    let in_idx = in_row + x_base + kx;
+                    let v = *img.offset(in_idx as isize);
+                    if v > max_val {
+                        max_val = v;
+                    }
+                }
+            }
+            *dst.offset(out_idx as isize) = max_val;
+        }
+    }
+}
+
+/// Multi-arena 2D spatial max-pooling kernel (f64).
+///
+/// # Safety
+///
+/// `dst` and `img` must be valid for memory operations across computed spatial window bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_maxpool2d_f64(
+    dst: *mut f64,
+    img: *const f64,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    pool_h: i64,
+    pool_w: i64,
+    img_width: i64,
+) {
+    if dst.is_null() || img.is_null() || h_out <= 0 || w_out <= 0 || pool_h <= 0 || pool_w <= 0 {
+        return;
+    }
+    for y in 0..h_out {
+        let y_base = (y * stride_y) * img_width;
+        let y_out_off = y * w_out;
+        for x in 0..w_out {
+            let x_base = x * stride_x;
+            let out_idx = y_out_off + x;
+            let mut max_val = f64::NEG_INFINITY;
+            for ky in 0..pool_h {
+                let in_row = y_base + ky * img_width;
+                for kx in 0..pool_w {
+                    let in_idx = in_row + x_base + kx;
+                    let v = *img.offset(in_idx as isize);
+                    if v > max_val {
+                        max_val = v;
+                    }
+                }
+            }
+            *dst.offset(out_idx as isize) = max_val;
+        }
+    }
+}
+
+/// Multi-arena 2D spatial max-pooling kernel (i64).
+///
+/// # Safety
+///
+/// `dst` and `img` must be valid for memory operations across computed spatial window bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_maxpool2d_i64(
+    dst: *mut i64,
+    img: *const i64,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    pool_h: i64,
+    pool_w: i64,
+    img_width: i64,
+) {
+    if dst.is_null() || img.is_null() || h_out <= 0 || w_out <= 0 || pool_h <= 0 || pool_w <= 0 {
+        return;
+    }
+    for y in 0..h_out {
+        let y_base = (y * stride_y) * img_width;
+        let y_out_off = y * w_out;
+        for x in 0..w_out {
+            let x_base = x * stride_x;
+            let out_idx = y_out_off + x;
+            let mut max_val = i64::MIN;
+            for ky in 0..pool_h {
+                let in_row = y_base + ky * img_width;
+                for kx in 0..pool_w {
+                    let in_idx = in_row + x_base + kx;
+                    let v = *img.offset(in_idx as isize);
+                    if v > max_val {
+                        max_val = v;
+                    }
+                }
+            }
+            *dst.offset(out_idx as isize) = max_val;
+        }
+    }
+}
+
+/// Multi-arena 2D spatial average-pooling kernel (f32).
+///
+/// # Safety
+///
+/// `dst` and `img` must be valid for memory operations across computed spatial window bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_avgpool2d_f32(
+    dst: *mut f32,
+    img: *const f32,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    pool_h: i64,
+    pool_w: i64,
+    img_width: i64,
+) {
+    if dst.is_null() || img.is_null() || h_out <= 0 || w_out <= 0 || pool_h <= 0 || pool_w <= 0 {
+        return;
+    }
+    let area = (pool_h * pool_w) as f32;
+    let inv_area = 1.0f32 / area;
+    for y in 0..h_out {
+        let y_base = (y * stride_y) * img_width;
+        let y_out_off = y * w_out;
+        for x in 0..w_out {
+            let x_base = x * stride_x;
+            let out_idx = y_out_off + x;
+            let mut sum_val = 0.0f32;
+            for ky in 0..pool_h {
+                let in_row = y_base + ky * img_width;
+                for kx in 0..pool_w {
+                    let in_idx = in_row + x_base + kx;
+                    sum_val += *img.offset(in_idx as isize);
+                }
+            }
+            *dst.offset(out_idx as isize) = sum_val * inv_area;
+        }
+    }
+}
+
+/// Multi-arena 2D spatial average-pooling kernel (f64).
+///
+/// # Safety
+///
+/// `dst` and `img` must be valid for memory operations across computed spatial window bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_avgpool2d_f64(
+    dst: *mut f64,
+    img: *const f64,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    pool_h: i64,
+    pool_w: i64,
+    img_width: i64,
+) {
+    if dst.is_null() || img.is_null() || h_out <= 0 || w_out <= 0 || pool_h <= 0 || pool_w <= 0 {
+        return;
+    }
+    let area = (pool_h * pool_w) as f64;
+    let inv_area = 1.0f64 / area;
+    for y in 0..h_out {
+        let y_base = (y * stride_y) * img_width;
+        let y_out_off = y * w_out;
+        for x in 0..w_out {
+            let x_base = x * stride_x;
+            let out_idx = y_out_off + x;
+            let mut sum_val = 0.0f64;
+            for ky in 0..pool_h {
+                let in_row = y_base + ky * img_width;
+                for kx in 0..pool_w {
+                    let in_idx = in_row + x_base + kx;
+                    sum_val += *img.offset(in_idx as isize);
+                }
+            }
+            *dst.offset(out_idx as isize) = sum_val * inv_area;
+        }
+    }
+}
+
+/// Multi-arena 2D spatial average-pooling kernel (i64).
+///
+/// # Safety
+///
+/// `dst` and `img` must be valid for memory operations across computed spatial window bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ifa_simd_multi_arena_avgpool2d_i64(
+    dst: *mut i64,
+    img: *const i64,
+    h_out: i64,
+    w_out: i64,
+    stride_y: i64,
+    stride_x: i64,
+    pool_h: i64,
+    pool_w: i64,
+    img_width: i64,
+) {
+    if dst.is_null() || img.is_null() || h_out <= 0 || w_out <= 0 || pool_h <= 0 || pool_w <= 0 {
+        return;
+    }
+    let area = pool_h * pool_w;
+    for y in 0..h_out {
+        let y_base = (y * stride_y) * img_width;
+        let y_out_off = y * w_out;
+        for x in 0..w_out {
+            let x_base = x * stride_x;
+            let out_idx = y_out_off + x;
+            let mut sum_val: i64 = 0;
+            for ky in 0..pool_h {
+                let in_row = y_base + ky * img_width;
+                for kx in 0..pool_w {
+                    let in_idx = in_row + x_base + kx;
+                    sum_val += *img.offset(in_idx as isize);
+                }
+            }
+            *dst.offset(out_idx as isize) = sum_val / area;
+        }
+    }
+}

@@ -1968,3 +1968,174 @@ fn test_runtime_multi_arena_conv_and_stencil_kernels() {
     let count = unsafe { ifa_simd_arena_slice_count_if_gt_f64(slice_data.as_ptr(), 5, 2.5) };
     assert_eq!(count, 3, "Elements > 2.5 must be 3 (5.0, 8.0, 3.0)");
 }
+
+#[test]
+fn test_multi_arena_dilated_conv2d_and_spatial_pooling() {
+    use ifa_runtime::ffi::{
+        ifa_simd_multi_arena_avgpool2d_f32, ifa_simd_multi_arena_avgpool2d_i64,
+        ifa_simd_multi_arena_dilated_conv2d_f32, ifa_simd_multi_arena_dilated_conv2d_i64,
+        ifa_simd_multi_arena_maxpool2d_f32, ifa_simd_multi_arena_maxpool2d_i64,
+    };
+
+    // 1. Dilated 2D Convolution (5x5 image, 2x2 kernel with dilation=2 -> 3x3 output)
+    // img:
+    // [ 1,  2,  3,  4,  5,
+    //   6,  7,  8,  9, 10,
+    //  11, 12, 13, 14, 15,
+    //  16, 17, 18, 19, 20,
+    //  21, 22, 23, 24, 25 ]
+    let mut img = [0.0f32; 25];
+    for (i, v) in img.iter_mut().enumerate() {
+        *v = (i + 1) as f32;
+    }
+    // weights 2x2: [1.0, 2.0, 3.0, 4.0]
+    let weights = [1.0f32, 2.0, 3.0, 4.0];
+    let bias = 0.5f32;
+    let mut dst = [0.0f32; 9]; // 3x3 output (stride=1)
+
+    // For (y=0, x=0), receptive field with dilation=2 uses:
+    // img[0,0]=1, img[0,2]=3, img[2,0]=11, img[2,2]=13
+    // accum = 1*1 + 3*2 + 11*3 + 13*4 + 0.5 = 1 + 6 + 33 + 52 + 0.5 = 92.5
+    unsafe {
+        ifa_simd_multi_arena_dilated_conv2d_f32(
+            dst.as_mut_ptr(),
+            img.as_ptr(),
+            weights.as_ptr(),
+            &bias as *const f32,
+            3,
+            3,
+            1,
+            1,
+            2, // dilation_y
+            2, // dilation_x
+            2, // kernel_h
+            2, // kernel_w
+            5, // img_width
+            1, // ReLU
+        );
+    }
+    assert!(
+        (dst[0] - 92.5).abs() < 1e-4,
+        "dst[0] expected 92.5, got {}",
+        dst[0]
+    );
+
+    // 2. Spatial Max-Pooling 2D (4x4 image, 2x2 pool window, stride=2 -> 2x2 output)
+    // [ 1,  8,  3,  4,
+    //   5,  6,  7,  2,
+    //   9, 10, 15, 12,
+    //  13, 14, 11, 16 ]
+    #[rustfmt::skip]
+    let pool_img_f32 = [
+        1.0f32, 8.0,  3.0,  4.0,
+        5.0,    6.0,  7.0,  2.0,
+        9.0,   10.0, 15.0, 12.0,
+       13.0,   14.0, 11.0, 16.0,
+    ];
+    let mut max_out_f32 = [0.0f32; 4];
+    unsafe {
+        ifa_simd_multi_arena_maxpool2d_f32(
+            max_out_f32.as_mut_ptr(),
+            pool_img_f32.as_ptr(),
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            4,
+        );
+    }
+    // Block (0,0): max(1,8,5,6) = 8.0
+    // Block (0,1): max(3,4,7,2) = 7.0
+    // Block (1,0): max(9,10,13,14) = 14.0
+    // Block (1,1): max(15,12,11,16) = 16.0
+    assert_eq!(max_out_f32, [8.0, 7.0, 14.0, 16.0]);
+
+    // 3. Spatial Average-Pooling 2D (4x4 image, 2x2 pool window, stride=2 -> 2x2 output)
+    let mut avg_out_f32 = [0.0f32; 4];
+    unsafe {
+        ifa_simd_multi_arena_avgpool2d_f32(
+            avg_out_f32.as_mut_ptr(),
+            pool_img_f32.as_ptr(),
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            4,
+        );
+    }
+    // Block (0,0): (1+8+5+6)/4 = 20/4 = 5.0
+    // Block (0,1): (3+4+7+2)/4 = 16/4 = 4.0
+    // Block (1,0): (9+10+13+14)/4 = 46/4 = 11.5
+    // Block (1,1): (15+12+11+16)/4 = 54/4 = 13.5
+    assert_eq!(avg_out_f32, [5.0, 4.0, 11.5, 13.5]);
+
+    // 4. Integer i64 Dilated Conv and Pooling
+    #[rustfmt::skip]
+    let pool_img_i64: [i64; 16] = [
+        1, 8,  3,  4,
+        5, 6,  7,  2,
+        9, 10, 15, 12,
+       13, 14, 11, 16,
+    ];
+    let mut max_out_i64 = [0i64; 4];
+    let mut avg_out_i64 = [0i64; 4];
+    unsafe {
+        ifa_simd_multi_arena_maxpool2d_i64(
+            max_out_i64.as_mut_ptr(),
+            pool_img_i64.as_ptr(),
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            4,
+        );
+        ifa_simd_multi_arena_avgpool2d_i64(
+            avg_out_i64.as_mut_ptr(),
+            pool_img_i64.as_ptr(),
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            4,
+        );
+    }
+    assert_eq!(max_out_i64, [8, 7, 14, 16]);
+    assert_eq!(avg_out_i64, [5, 4, 11, 13]); // 46/4 = 11, 54/4 = 13 integer division
+
+    // Dilated conv i64
+    let mut img_i64 = [0i64; 25];
+    for (i, v) in img_i64.iter_mut().enumerate() {
+        *v = (i + 1) as i64;
+    }
+    let weights_i64 = [1i64, 2, 3, 4];
+    let bias_i64 = 10i64;
+    let mut dst_i64 = [0i64; 9];
+    unsafe {
+        ifa_simd_multi_arena_dilated_conv2d_i64(
+            dst_i64.as_mut_ptr(),
+            img_i64.as_ptr(),
+            weights_i64.as_ptr(),
+            &bias_i64 as *const i64,
+            3,
+            3,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            5,
+            1,
+        );
+    }
+    // 92 + 10 = 102
+    assert_eq!(dst_i64[0], 102);
+}

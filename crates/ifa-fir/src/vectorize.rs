@@ -94,6 +94,14 @@ pub struct VectorizeStats {
     pub fused_convolutions_vectorized: usize,
     /// Number of generational checks statically eliminated within nested convolution loops.
     pub nested_gen_checks_eliminated: usize,
+    /// Number of dilated (atrous) convolution loops vectorized.
+    pub dilated_conv_vectorized: usize,
+    /// Number of spatial max pooling loops vectorized.
+    pub max_pooling_vectorized: usize,
+    /// Number of spatial average pooling loops vectorized.
+    pub avg_pooling_vectorized: usize,
+    /// Total number of deterministic zero-heap spatial pooling loops vectorized.
+    pub total_pooling_vectorized: usize,
 }
 
 /// Pipeline for automatic SIMD vectorization on primitive arrays and slices in FIR SSA.
@@ -499,7 +507,7 @@ impl VectorizePass {
 
                 let existing_hint = func.get_block(loop_info.header).and_then(|b| b.vector_hint);
                 let sliding_window_size = existing_hint.and_then(|h| h.sliding_window_size);
-                let is_convolution = existing_hint.map(|h| h.is_convolution).unwrap_or(false)
+                let mut is_convolution = existing_hint.map(|h| h.is_convolution).unwrap_or(false)
                     || (existing_hint.and_then(|h| h.sliding_window_size).is_some()
                         && detected_reduction == Some(crate::ir::ReductionKind::Dot));
 
@@ -515,6 +523,12 @@ impl VectorizePass {
                 let tile_size = existing_hint.and_then(|h| h.tile_size);
                 let mut unroll_and_jam = existing_hint.map(|h| h.unroll_and_jam).unwrap_or(false);
                 let is_fused = existing_hint.map(|h| h.is_fused).unwrap_or(false);
+                let mut is_dilated_conv = existing_hint.map(|h| h.is_dilated_conv).unwrap_or(false);
+                let dilation_factors = existing_hint.and_then(|h| h.dilation_factors);
+                let mut is_pooling = existing_hint.map(|h| h.is_pooling).unwrap_or(false);
+                let pooling_kind = existing_hint.and_then(|h| h.pooling_kind);
+                let pooling_window = existing_hint.and_then(|h| h.pooling_window);
+                let pooling_strides = existing_hint.and_then(|h| h.pooling_strides);
 
                 // 4. Detect multidimensional matrix reduction operations with bipartite or tripartite disjoint windows
                 let mut distinct_roots: Vec<SliceRoot> = Vec::new();
@@ -794,13 +808,41 @@ impl VectorizePass {
                     }
                 }
 
-                // Elide generational checks in nested loops for multi-arena convolutions, matrix kernels, or provably disjoint slices
+                if is_dilated_conv || dilation_factors.is_some() {
+                    is_dilated_conv = true;
+                    is_convolution = true;
+                    disjoint_slices = true;
+                    unroll_and_jam = true;
+                    self.stats.dilated_conv_vectorized += 1;
+                }
+
+                if is_pooling || pooling_kind.is_some() {
+                    is_pooling = true;
+                    disjoint_slices = true;
+                    unroll_and_jam = true;
+                    self.stats.total_pooling_vectorized += 1;
+                    match pooling_kind {
+                        Some(crate::ir::PoolingKind::Max) => {
+                            self.stats.max_pooling_vectorized += 1;
+                        }
+                        Some(crate::ir::PoolingKind::Average) => {
+                            self.stats.avg_pooling_vectorized += 1;
+                        }
+                        None => {
+                            self.stats.max_pooling_vectorized += 1;
+                        }
+                    }
+                }
+
+                // Elide generational checks in nested loops for multi-arena convolutions, matrix kernels, dilated conv, pooling, or provably disjoint slices
                 if is_zero_copy
                     || is_multi_arena_conv
                     || is_multi_arena_matrix
                     || is_strided_conv2d
                     || is_strided_conv3d
                     || is_strided_multidim
+                    || is_dilated_conv
+                    || is_pooling
                     || disjoint_slices
                 {
                     let mut gen_eliminated = 0;
@@ -873,42 +915,45 @@ impl VectorizePass {
                     }
                 }
 
-                let effective_interleave =
-                    if is_multi_arena_conv || is_strided_conv3d || is_strided_multidim {
-                        8
-                    } else if is_strided_conv2d
-                        || (is_strided_loop && !is_tripartite && !is_bipartite)
-                    {
-                        match primary_ty {
-                            FirType::Float(FloatType::F32)
-                            | FirType::Int(
-                                IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8,
-                            ) => 8,
-                            _ => 4,
+                let effective_interleave = if is_multi_arena_conv
+                    || is_dilated_conv
+                    || is_pooling
+                    || is_strided_conv3d
+                    || is_strided_multidim
+                {
+                    8
+                } else if is_strided_conv2d || (is_strided_loop && !is_tripartite && !is_bipartite)
+                {
+                    match primary_ty {
+                        FirType::Float(FloatType::F32)
+                        | FirType::Int(IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8) => {
+                            8
                         }
-                    } else if is_tripartite {
-                        8
-                    } else if is_bipartite {
-                        match primary_ty {
-                            FirType::Float(FloatType::F32)
-                            | FirType::Int(
-                                IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8,
-                            ) => 8,
-                            _ => 4,
+                        _ => 4,
+                    }
+                } else if is_tripartite {
+                    8
+                } else if is_bipartite {
+                    match primary_ty {
+                        FirType::Float(FloatType::F32)
+                        | FirType::Int(IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8) => {
+                            8
                         }
-                    } else if let Some(w) = sliding_window_size {
-                        w.min(8)
-                    } else if local_arena && contiguous_reduction {
-                        match primary_ty {
-                            FirType::Float(FloatType::F32)
-                            | FirType::Int(
-                                IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8,
-                            ) => 8,
-                            _ => 4,
+                        _ => 4,
+                    }
+                } else if let Some(w) = sliding_window_size {
+                    w.min(8)
+                } else if local_arena && contiguous_reduction {
+                    match primary_ty {
+                        FirType::Float(FloatType::F32)
+                        | FirType::Int(IntType::I32 | IntType::U32 | IntType::I8 | IntType::U8) => {
+                            8
                         }
-                    } else {
-                        4
-                    };
+                        _ => 4,
+                    }
+                } else {
+                    4
+                };
 
                 let hint = LoopVectorHint {
                     vector_width,
@@ -949,6 +994,12 @@ impl VectorizePass {
                     is_multi_arena_conv,
                     conv_has_bias,
                     conv_has_activation,
+                    is_dilated_conv,
+                    dilation_factors,
+                    is_pooling,
+                    pooling_kind,
+                    pooling_window,
+                    pooling_strides,
                 };
 
                 // Find latch blocks (blocks in loop that jump back to loop header)

@@ -3308,3 +3308,179 @@ fn test_cranelift_jit_multi_arena_conv3d_i64() {
         "Multi-arena 3D volumetric convolution with fused bias and ReLU: dst[0] + dst[7] = 3 + 17 = 20"
     );
 }
+
+#[test]
+fn test_jit_multi_arena_dilated_conv2d_and_pooling() {
+    use ifa_codegen_cranelift::jit::JitEngine;
+    use ifa_fir::{
+        BasicBlock, BlockId, ConstantValue, FirFunction, FirModule, FirType, Instruction,
+        Terminator, ValueExpr, ValueId,
+    };
+    use ifa_sema::types::IntType;
+    use ifa_span::{Span, INTERNER};
+
+    let mut func = FirFunction::new(
+        INTERNER.intern("main"),
+        vec![],
+        FirType::Int(IntType::I64),
+        true,
+        true,
+        false,
+        None,
+        Span::DUMMY,
+    );
+    func.blocks.clear();
+
+    let mut bb0 = BasicBlock::new(BlockId(0));
+
+    // Allocate img array [1, 8, 3, 4, 5, 6, 7, 2, 9, 10, 15, 12, 13, 14, 11, 16] (16 elements)
+    let vals = [1i64, 8, 3, 4, 5, 6, 7, 2, 9, 10, 15, 12, 13, 14, 11, 16];
+    let mut val_ids = Vec::new();
+    for (i, v) in vals.iter().enumerate() {
+        let vid = ValueId((100 + i) as u32);
+        bb0.instructions.push(Instruction::new(
+            Some(vid),
+            ValueExpr::Constant(ConstantValue::Int(*v as i128, IntType::I64)),
+            Span::DUMMY,
+        ));
+        val_ids.push(vid);
+    }
+
+    let img = ValueId(120);
+    bb0.instructions.push(Instruction::new(
+        Some(img),
+        ValueExpr::ArrayInit(val_ids),
+        Span::DUMMY,
+    ));
+
+    // Allocate dst array [0, 0, 0, 0] (4 elements for 2x2 max pooling)
+    let zero = ValueId(121);
+    bb0.instructions.push(Instruction::new(
+        Some(zero),
+        ValueExpr::Constant(ConstantValue::Int(0, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    let dst = ValueId(122);
+    bb0.instructions.push(Instruction::new(
+        Some(dst),
+        ValueExpr::ArrayInit(vec![zero, zero, zero, zero]),
+        Span::DUMMY,
+    ));
+
+    let h_out = ValueId(123);
+    bb0.instructions.push(Instruction::new(
+        Some(h_out),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let w_out = ValueId(124);
+    bb0.instructions.push(Instruction::new(
+        Some(w_out),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let stride_y = ValueId(125);
+    bb0.instructions.push(Instruction::new(
+        Some(stride_y),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let stride_x = ValueId(126);
+    bb0.instructions.push(Instruction::new(
+        Some(stride_x),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let pool_h = ValueId(127);
+    bb0.instructions.push(Instruction::new(
+        Some(pool_h),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let pool_w = ValueId(128);
+    bb0.instructions.push(Instruction::new(
+        Some(pool_w),
+        ValueExpr::Constant(ConstantValue::Int(2, IntType::I64)),
+        Span::DUMMY,
+    ));
+    let img_width = ValueId(129);
+    bb0.instructions.push(Instruction::new(
+        Some(img_width),
+        ValueExpr::Constant(ConstantValue::Int(4, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    // Call ifa_simd_multi_arena_maxpool2d_i64
+    bb0.instructions.push(Instruction::new(
+        None,
+        ValueExpr::CallDirect {
+            name: INTERNER.intern("ifa_simd_multi_arena_maxpool2d_i64"),
+            args: vec![
+                dst, img, h_out, w_out, stride_y, stride_x, pool_h, pool_w, img_width,
+            ],
+        },
+        Span::DUMMY,
+    ));
+
+    // Read dst[0] (should be 8) and dst[3] (should be 16)
+    let idx0 = zero;
+    let idx3 = ValueId(130);
+    bb0.instructions.push(Instruction::new(
+        Some(idx3),
+        ValueExpr::Constant(ConstantValue::Int(3, IntType::I64)),
+        Span::DUMMY,
+    ));
+
+    let v0 = ValueId(131);
+    bb0.instructions.push(Instruction::new(
+        Some(v0),
+        ValueExpr::GetElement {
+            base: dst,
+            index: idx0,
+        },
+        Span::DUMMY,
+    ));
+    let v3 = ValueId(132);
+    bb0.instructions.push(Instruction::new(
+        Some(v3),
+        ValueExpr::GetElement {
+            base: dst,
+            index: idx3,
+        },
+        Span::DUMMY,
+    ));
+
+    // sum = v0 + v3 = 8 + 16 = 24
+    let sum = ValueId(133);
+    bb0.instructions.push(Instruction::new(
+        Some(sum),
+        ValueExpr::Binary {
+            op: ifa_fir::BinaryOp::Add,
+            lhs: v0,
+            rhs: v3,
+        },
+        Span::DUMMY,
+    ));
+
+    bb0.terminator = Some(Terminator::Return(Some(sum)));
+    func.blocks.push(bb0);
+
+    let module = FirModule {
+        name: INTERNER.intern("maxpool2d_jit_mod"),
+        functions: vec![func],
+        structs: Vec::new(),
+        enums: Vec::new(),
+        constants: Vec::new(),
+    };
+
+    let mut jit = JitEngine::new().expect("Failed to initialize Cranelift JIT engine");
+    jit.compile_module(&module)
+        .expect("Failed to compile FIR with multi-arena maxpool2d");
+
+    let result = jit.run_main().expect("Failed to execute native main");
+    assert_eq!(
+        result, 24,
+        "Spatial max-pooling: dst[0] + dst[3] = 8 + 16 = 24"
+    );
+}

@@ -1096,6 +1096,162 @@ impl<'a> LlvmIrEmitter<'a> {
         out.push_str("z_next:\n  %next_z = add i64 %z, 1\n  br label %z_loop\n");
         out.push_str("done:\n  ret void\n}\n\n");
 
+        // Dilated 2D Convolutions with Fused Bias and ReLU
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_dilated_conv2d_f32(ptr %dst, ptr %img, ptr %weights, ptr %bias, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %dilation_y, i64 %dilation_x, i64 %kernel_h, i64 %kernel_w, i64 %img_width, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %b_val = load float, ptr %bias, align 4\n  br label %y_init\n");
+        out.push_str("zero_b:\n  br label %y_init\n");
+        out.push_str("y_init:\n  %bias_scalar = phi float [ %b_val, %load_b ], [ 0.0, %zero_b ]\n  %is_relu = icmp eq i32 %activation, 1\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %y_init ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %done\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_base = mul i64 %y_str, %img_width\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_next ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %k_init, label %y_next\n");
+        out.push_str("k_init:\n  %x_base = mul i64 %x, %stride_x\n  %out_idx = add i64 %y_out_off, %x\n  br label %ky_loop\n");
+        out.push_str("ky_loop:\n  %ky = phi i64 [ 0, %k_init ], [ %next_ky, %ky_next ]\n  %accum_ky = phi float [ 0.0, %k_init ], [ %accum_ky_next, %ky_next ]\n  %has_ky = icmp ult i64 %ky, %kernel_h\n  br i1 %has_ky, label %kx_init, label %k_done\n");
+        out.push_str("kx_init:\n  %ky_dil = mul i64 %ky, %dilation_y\n  %ky_off = mul i64 %ky_dil, %img_width\n  %in_row = add i64 %y_base, %ky_off\n  %w_row = mul i64 %ky, %kernel_w\n  br label %kx_loop\n");
+        out.push_str("kx_loop:\n  %kx = phi i64 [ 0, %kx_init ], [ %next_kx, %kx_step ]\n  %accum_kx = phi float [ %accum_ky, %kx_init ], [ %next_accum_kx, %kx_step ]\n  %has_kx = icmp ult i64 %kx, %kernel_w\n  br i1 %has_kx, label %kx_step, label %ky_next\n");
+        out.push_str("kx_step:\n  %kx_dil = mul i64 %kx, %dilation_x\n  %in_idx = add i64 %in_row, %x_base\n  %in_full_idx = add i64 %in_idx, %kx_dil\n  %w_idx = add i64 %w_row, %kx\n  %p_in = getelementptr inbounds float, ptr %img, i64 %in_full_idx\n  %p_w = getelementptr inbounds float, ptr %weights, i64 %w_idx\n  %v_in = load float, ptr %p_in, align 4\n  %v_w = load float, ptr %p_w, align 4\n  %prod = fmul float %v_in, %v_w\n  %next_accum_kx = fadd float %accum_kx, %prod\n  %next_kx = add i64 %kx, 1\n  br label %kx_loop, !llvm.loop !74\n");
+        out.push_str("ky_next:\n  %accum_ky_next = phi float [ %accum_kx, %kx_loop ]\n  %next_ky = add i64 %ky, 1\n  br label %ky_loop\n");
+        out.push_str("k_done:\n  %biased = fadd float %accum_ky, %bias_scalar\n  %relu_cond = fcmp ogt float %biased, 0.0\n  %relu_val = select i1 %relu_cond, float %biased, float 0.0\n  %act_val = select i1 %is_relu, float %relu_val, float %biased\n  %p_dst = getelementptr inbounds float, ptr %dst, i64 %out_idx\n  %old_dst = load float, ptr %p_dst, align 4\n  %new_dst = fadd float %old_dst, %act_val\n  store float %new_dst, ptr %p_dst, align 4\n  br label %x_next\n");
+        out.push_str("x_next:\n  %next_x = add i64 %x, 1\n  br label %x_loop\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_dilated_conv2d_f64(ptr %dst, ptr %img, ptr %weights, ptr %bias, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %dilation_y, i64 %dilation_x, i64 %kernel_h, i64 %kernel_w, i64 %img_width, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %b_val = load double, ptr %bias, align 8\n  br label %y_init\n");
+        out.push_str("zero_b:\n  br label %y_init\n");
+        out.push_str("y_init:\n  %bias_scalar = phi double [ %b_val, %load_b ], [ 0.0, %zero_b ]\n  %is_relu = icmp eq i32 %activation, 1\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %y_init ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %done\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_base = mul i64 %y_str, %img_width\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_next ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %k_init, label %y_next\n");
+        out.push_str("k_init:\n  %x_base = mul i64 %x, %stride_x\n  %out_idx = add i64 %y_out_off, %x\n  br label %ky_loop\n");
+        out.push_str("ky_loop:\n  %ky = phi i64 [ 0, %k_init ], [ %next_ky, %ky_next ]\n  %accum_ky = phi double [ 0.0, %k_init ], [ %accum_ky_next, %ky_next ]\n  %has_ky = icmp ult i64 %ky, %kernel_h\n  br i1 %has_ky, label %kx_init, label %k_done\n");
+        out.push_str("kx_init:\n  %ky_dil = mul i64 %ky, %dilation_y\n  %ky_off = mul i64 %ky_dil, %img_width\n  %in_row = add i64 %y_base, %ky_off\n  %w_row = mul i64 %ky, %kernel_w\n  br label %kx_loop\n");
+        out.push_str("kx_loop:\n  %kx = phi i64 [ 0, %kx_init ], [ %next_kx, %kx_step ]\n  %accum_kx = phi double [ %accum_ky, %kx_init ], [ %next_accum_kx, %kx_step ]\n  %has_kx = icmp ult i64 %kx, %kernel_w\n  br i1 %has_kx, label %kx_step, label %ky_next\n");
+        out.push_str("kx_step:\n  %kx_dil = mul i64 %kx, %dilation_x\n  %in_idx = add i64 %in_row, %x_base\n  %in_full_idx = add i64 %in_idx, %kx_dil\n  %w_idx = add i64 %w_row, %kx\n  %p_in = getelementptr inbounds double, ptr %img, i64 %in_full_idx\n  %p_w = getelementptr inbounds double, ptr %weights, i64 %w_idx\n  %v_in = load double, ptr %p_in, align 8\n  %v_w = load double, ptr %p_w, align 8\n  %prod = fmul double %v_in, %v_w\n  %next_accum_kx = fadd double %accum_kx, %prod\n  %next_kx = add i64 %kx, 1\n  br label %kx_loop, !llvm.loop !74\n");
+        out.push_str("ky_next:\n  %accum_ky_next = phi double [ %accum_kx, %kx_loop ]\n  %next_ky = add i64 %ky, 1\n  br label %ky_loop\n");
+        out.push_str("k_done:\n  %biased = fadd double %accum_ky, %bias_scalar\n  %relu_cond = fcmp ogt double %biased, 0.0\n  %relu_val = select i1 %relu_cond, double %biased, double 0.0\n  %act_val = select i1 %is_relu, double %relu_val, double %biased\n  %p_dst = getelementptr inbounds double, ptr %dst, i64 %out_idx\n  %old_dst = load double, ptr %p_dst, align 8\n  %new_dst = fadd double %old_dst, %act_val\n  store double %new_dst, ptr %p_dst, align 8\n  br label %x_next\n");
+        out.push_str("x_next:\n  %next_x = add i64 %x, 1\n  br label %x_loop\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_dilated_conv2d_i64(ptr %dst, ptr %img, ptr %weights, ptr %bias, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %dilation_y, i64 %dilation_x, i64 %kernel_h, i64 %kernel_w, i64 %img_width, i32 %activation) alwaysinline {\n");
+        out.push_str("entry:\n  %has_bias = icmp ne ptr %bias, null\n  br i1 %has_bias, label %load_b, label %zero_b\n");
+        out.push_str("load_b:\n  %b_val = load i64, ptr %bias, align 8\n  br label %y_init\n");
+        out.push_str("zero_b:\n  br label %y_init\n");
+        out.push_str("y_init:\n  %bias_scalar = phi i64 [ %b_val, %load_b ], [ 0, %zero_b ]\n  %is_relu = icmp eq i32 %activation, 1\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %y_init ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %done\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_base = mul i64 %y_str, %img_width\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_next ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %k_init, label %y_next\n");
+        out.push_str("k_init:\n  %x_base = mul i64 %x, %stride_x\n  %out_idx = add i64 %y_out_off, %x\n  br label %ky_loop\n");
+        out.push_str("ky_loop:\n  %ky = phi i64 [ 0, %k_init ], [ %next_ky, %ky_next ]\n  %accum_ky = phi i64 [ 0, %k_init ], [ %accum_ky_next, %ky_next ]\n  %has_ky = icmp ult i64 %ky, %kernel_h\n  br i1 %has_ky, label %kx_init, label %k_done\n");
+        out.push_str("kx_init:\n  %ky_dil = mul i64 %ky, %dilation_y\n  %ky_off = mul i64 %ky_dil, %img_width\n  %in_row = add i64 %y_base, %ky_off\n  %w_row = mul i64 %ky, %kernel_w\n  br label %kx_loop\n");
+        out.push_str("kx_loop:\n  %kx = phi i64 [ 0, %kx_init ], [ %next_kx, %kx_step ]\n  %accum_kx = phi i64 [ %accum_ky, %kx_init ], [ %next_accum_kx, %kx_step ]\n  %has_kx = icmp ult i64 %kx, %kernel_w\n  br i1 %has_kx, label %kx_step, label %ky_next\n");
+        out.push_str("kx_step:\n  %kx_dil = mul i64 %kx, %dilation_x\n  %in_idx = add i64 %in_row, %x_base\n  %in_full_idx = add i64 %in_idx, %kx_dil\n  %w_idx = add i64 %w_row, %kx\n  %p_in = getelementptr inbounds i64, ptr %img, i64 %in_full_idx\n  %p_w = getelementptr inbounds i64, ptr %weights, i64 %w_idx\n  %v_in = load i64, ptr %p_in, align 8\n  %v_w = load i64, ptr %p_w, align 8\n  %prod = mul i64 %v_in, %v_w\n  %next_accum_kx = add i64 %accum_kx, %prod\n  %next_kx = add i64 %kx, 1\n  br label %kx_loop, !llvm.loop !74\n");
+        out.push_str("ky_next:\n  %accum_ky_next = phi i64 [ %accum_kx, %kx_loop ]\n  %next_ky = add i64 %ky, 1\n  br label %ky_loop\n");
+        out.push_str("k_done:\n  %biased = add i64 %accum_ky, %bias_scalar\n  %relu_cond = icmp sgt i64 %biased, 0\n  %relu_val = select i1 %relu_cond, i64 %biased, i64 0\n  %act_val = select i1 %is_relu, i64 %relu_val, i64 %biased\n  %p_dst = getelementptr inbounds i64, ptr %dst, i64 %out_idx\n  %old_dst = load i64, ptr %p_dst, align 8\n  %new_dst = add i64 %old_dst, %act_val\n  store i64 %new_dst, ptr %p_dst, align 8\n  br label %x_next\n");
+        out.push_str("x_next:\n  %next_x = add i64 %x, 1\n  br label %x_loop\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        // Spatial Max-Pooling 2D Kernels
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_maxpool2d_f32(ptr %dst, ptr %img, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %pool_h, i64 %pool_w, i64 %img_width) alwaysinline {\n");
+        out.push_str("entry:\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %entry ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %done\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_base = mul i64 %y_str, %img_width\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_next ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %p_init, label %y_next\n");
+        out.push_str("p_init:\n  %x_base = mul i64 %x, %stride_x\n  %out_idx = add i64 %y_out_off, %x\n  br label %py_loop\n");
+        out.push_str("py_loop:\n  %py = phi i64 [ 0, %p_init ], [ %next_py, %py_next ]\n  %max_py = phi float [ 0xFFF0000000000000, %p_init ], [ %max_py_next, %py_next ]\n  %has_py = icmp ult i64 %py, %pool_h\n  br i1 %has_py, label %px_init, label %p_done\n");
+        out.push_str("px_init:\n  %py_off = mul i64 %py, %img_width\n  %in_row = add i64 %y_base, %py_off\n  br label %px_loop\n");
+        out.push_str("px_loop:\n  %px = phi i64 [ 0, %px_init ], [ %next_px, %px_step ]\n  %max_px = phi float [ %max_py, %px_init ], [ %next_max_px, %px_step ]\n  %has_px = icmp ult i64 %px, %pool_w\n  br i1 %has_px, label %px_step, label %py_next\n");
+        out.push_str("px_step:\n  %in_idx = add i64 %in_row, %x_base\n  %in_full_idx = add i64 %in_idx, %px\n  %p_in = getelementptr inbounds float, ptr %img, i64 %in_full_idx\n  %v_in = load float, ptr %p_in, align 4\n  %gt_cond = fcmp ogt float %v_in, %max_px\n  %next_max_px = select i1 %gt_cond, float %v_in, float %max_px\n  %next_px = add i64 %px, 1\n  br label %px_loop, !llvm.loop !74\n");
+        out.push_str("py_next:\n  %max_py_next = phi float [ %max_px, %px_loop ]\n  %next_py = add i64 %py, 1\n  br label %py_loop\n");
+        out.push_str("p_done:\n  %p_dst = getelementptr inbounds float, ptr %dst, i64 %out_idx\n  store float %max_py, ptr %p_dst, align 4\n  br label %x_next\n");
+        out.push_str("x_next:\n  %next_x = add i64 %x, 1\n  br label %x_loop\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_maxpool2d_f64(ptr %dst, ptr %img, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %pool_h, i64 %pool_w, i64 %img_width) alwaysinline {\n");
+        out.push_str("entry:\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %entry ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %done\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_base = mul i64 %y_str, %img_width\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_next ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %p_init, label %y_next\n");
+        out.push_str("p_init:\n  %x_base = mul i64 %x, %stride_x\n  %out_idx = add i64 %y_out_off, %x\n  br label %py_loop\n");
+        out.push_str("py_loop:\n  %py = phi i64 [ 0, %p_init ], [ %next_py, %py_next ]\n  %max_py = phi double [ 0xFFF0000000000000, %p_init ], [ %max_py_next, %py_next ]\n  %has_py = icmp ult i64 %py, %pool_h\n  br i1 %has_py, label %px_init, label %p_done\n");
+        out.push_str("px_init:\n  %py_off = mul i64 %py, %img_width\n  %in_row = add i64 %y_base, %py_off\n  br label %px_loop\n");
+        out.push_str("px_loop:\n  %px = phi i64 [ 0, %px_init ], [ %next_px, %px_step ]\n  %max_px = phi double [ %max_py, %px_init ], [ %next_max_px, %px_step ]\n  %has_px = icmp ult i64 %px, %pool_w\n  br i1 %has_px, label %px_step, label %py_next\n");
+        out.push_str("px_step:\n  %in_idx = add i64 %in_row, %x_base\n  %in_full_idx = add i64 %in_idx, %px\n  %p_in = getelementptr inbounds double, ptr %img, i64 %in_full_idx\n  %v_in = load double, ptr %p_in, align 8\n  %gt_cond = fcmp ogt double %v_in, %max_px\n  %next_max_px = select i1 %gt_cond, double %v_in, double %max_px\n  %next_px = add i64 %px, 1\n  br label %px_loop, !llvm.loop !74\n");
+        out.push_str("py_next:\n  %max_py_next = phi double [ %max_px, %px_loop ]\n  %next_py = add i64 %py, 1\n  br label %py_loop\n");
+        out.push_str("p_done:\n  %p_dst = getelementptr inbounds double, ptr %dst, i64 %out_idx\n  store double %max_py, ptr %p_dst, align 8\n  br label %x_next\n");
+        out.push_str("x_next:\n  %next_x = add i64 %x, 1\n  br label %x_loop\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_maxpool2d_i64(ptr %dst, ptr %img, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %pool_h, i64 %pool_w, i64 %img_width) alwaysinline {\n");
+        out.push_str("entry:\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %entry ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %done\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_base = mul i64 %y_str, %img_width\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_next ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %p_init, label %y_next\n");
+        out.push_str("p_init:\n  %x_base = mul i64 %x, %stride_x\n  %out_idx = add i64 %y_out_off, %x\n  br label %py_loop\n");
+        out.push_str("py_loop:\n  %py = phi i64 [ 0, %p_init ], [ %next_py, %py_next ]\n  %max_py = phi i64 [ -9223372036854775808, %p_init ], [ %max_py_next, %py_next ]\n  %has_py = icmp ult i64 %py, %pool_h\n  br i1 %has_py, label %px_init, label %p_done\n");
+        out.push_str("px_init:\n  %py_off = mul i64 %py, %img_width\n  %in_row = add i64 %y_base, %py_off\n  br label %px_loop\n");
+        out.push_str("px_loop:\n  %px = phi i64 [ 0, %px_init ], [ %next_px, %px_step ]\n  %max_px = phi i64 [ %max_py, %px_init ], [ %next_max_px, %px_step ]\n  %has_px = icmp ult i64 %px, %pool_w\n  br i1 %has_px, label %px_step, label %py_next\n");
+        out.push_str("px_step:\n  %in_idx = add i64 %in_row, %x_base\n  %in_full_idx = add i64 %in_idx, %px\n  %p_in = getelementptr inbounds i64, ptr %img, i64 %in_full_idx\n  %v_in = load i64, ptr %p_in, align 8\n  %gt_cond = icmp sgt i64 %v_in, %max_px\n  %next_max_px = select i1 %gt_cond, i64 %v_in, i64 %max_px\n  %next_px = add i64 %px, 1\n  br label %px_loop, !llvm.loop !74\n");
+        out.push_str("py_next:\n  %max_py_next = phi i64 [ %max_px, %px_loop ]\n  %next_py = add i64 %py, 1\n  br label %py_loop\n");
+        out.push_str("p_done:\n  %p_dst = getelementptr inbounds i64, ptr %dst, i64 %out_idx\n  store i64 %max_py, ptr %p_dst, align 8\n  br label %x_next\n");
+        out.push_str("x_next:\n  %next_x = add i64 %x, 1\n  br label %x_loop\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        // Spatial Average-Pooling 2D Kernels
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_avgpool2d_f32(ptr %dst, ptr %img, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %pool_h, i64 %pool_w, i64 %img_width) alwaysinline {\n");
+        out.push_str("entry:\n  %area_i64 = mul i64 %pool_h, %pool_w\n  %area_f = sitofp i64 %area_i64 to float\n  %inv_area = fdiv float 1.0, %area_f\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %entry ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %done\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_base = mul i64 %y_str, %img_width\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_next ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %p_init, label %y_next\n");
+        out.push_str("p_init:\n  %x_base = mul i64 %x, %stride_x\n  %out_idx = add i64 %y_out_off, %x\n  br label %py_loop\n");
+        out.push_str("py_loop:\n  %py = phi i64 [ 0, %p_init ], [ %next_py, %py_next ]\n  %sum_py = phi float [ 0.0, %p_init ], [ %sum_py_next, %py_next ]\n  %has_py = icmp ult i64 %py, %pool_h\n  br i1 %has_py, label %px_init, label %p_done\n");
+        out.push_str("px_init:\n  %py_off = mul i64 %py, %img_width\n  %in_row = add i64 %y_base, %py_off\n  br label %px_loop\n");
+        out.push_str("px_loop:\n  %px = phi i64 [ 0, %px_init ], [ %next_px, %px_step ]\n  %sum_px = phi float [ %sum_py, %px_init ], [ %next_sum_px, %px_step ]\n  %has_px = icmp ult i64 %px, %pool_w\n  br i1 %has_px, label %px_step, label %py_next\n");
+        out.push_str("px_step:\n  %in_idx = add i64 %in_row, %x_base\n  %in_full_idx = add i64 %in_idx, %px\n  %p_in = getelementptr inbounds float, ptr %img, i64 %in_full_idx\n  %v_in = load float, ptr %p_in, align 4\n  %next_sum_px = fadd float %sum_px, %v_in\n  %next_px = add i64 %px, 1\n  br label %px_loop, !llvm.loop !74\n");
+        out.push_str("py_next:\n  %sum_py_next = phi float [ %sum_px, %px_loop ]\n  %next_py = add i64 %py, 1\n  br label %py_loop\n");
+        out.push_str("p_done:\n  %avg_val = fmul float %sum_py, %inv_area\n  %p_dst = getelementptr inbounds float, ptr %dst, i64 %out_idx\n  store float %avg_val, ptr %p_dst, align 4\n  br label %x_next\n");
+        out.push_str("x_next:\n  %next_x = add i64 %x, 1\n  br label %x_loop\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_avgpool2d_f64(ptr %dst, ptr %img, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %pool_h, i64 %pool_w, i64 %img_width) alwaysinline {\n");
+        out.push_str("entry:\n  %area_i64 = mul i64 %pool_h, %pool_w\n  %area_f = sitofp i64 %area_i64 to double\n  %inv_area = fdiv double 1.0, %area_f\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %entry ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %done\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_base = mul i64 %y_str, %img_width\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_next ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %p_init, label %y_next\n");
+        out.push_str("p_init:\n  %x_base = mul i64 %x, %stride_x\n  %out_idx = add i64 %y_out_off, %x\n  br label %py_loop\n");
+        out.push_str("py_loop:\n  %py = phi i64 [ 0, %p_init ], [ %next_py, %py_next ]\n  %sum_py = phi double [ 0.0, %p_init ], [ %sum_py_next, %py_next ]\n  %has_py = icmp ult i64 %py, %pool_h\n  br i1 %has_py, label %px_init, label %p_done\n");
+        out.push_str("px_init:\n  %py_off = mul i64 %py, %img_width\n  %in_row = add i64 %y_base, %py_off\n  br label %px_loop\n");
+        out.push_str("px_loop:\n  %px = phi i64 [ 0, %px_init ], [ %next_px, %px_step ]\n  %sum_px = phi double [ %sum_py, %px_init ], [ %next_sum_px, %px_step ]\n  %has_px = icmp ult i64 %px, %pool_w\n  br i1 %has_px, label %px_step, label %py_next\n");
+        out.push_str("px_step:\n  %in_idx = add i64 %in_row, %x_base\n  %in_full_idx = add i64 %in_idx, %px\n  %p_in = getelementptr inbounds double, ptr %img, i64 %in_full_idx\n  %v_in = load double, ptr %p_in, align 8\n  %next_sum_px = fadd double %sum_px, %v_in\n  %next_px = add i64 %px, 1\n  br label %px_loop, !llvm.loop !74\n");
+        out.push_str("py_next:\n  %sum_py_next = phi double [ %sum_px, %px_loop ]\n  %next_py = add i64 %py, 1\n  br label %py_loop\n");
+        out.push_str("p_done:\n  %avg_val = fmul double %sum_py, %inv_area\n  %p_dst = getelementptr inbounds double, ptr %dst, i64 %out_idx\n  store double %avg_val, ptr %p_dst, align 8\n  br label %x_next\n");
+        out.push_str("x_next:\n  %next_x = add i64 %x, 1\n  br label %x_loop\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
+        out.push_str("define linkonce_odr void @ifa_simd_multi_arena_avgpool2d_i64(ptr %dst, ptr %img, i64 %h_out, i64 %w_out, i64 %stride_y, i64 %stride_x, i64 %pool_h, i64 %pool_w, i64 %img_width) alwaysinline {\n");
+        out.push_str("entry:\n  %area = mul i64 %pool_h, %pool_w\n  br label %y_loop\n");
+        out.push_str("y_loop:\n  %y = phi i64 [ 0, %entry ], [ %next_y, %y_next ]\n  %has_y = icmp ult i64 %y, %h_out\n  br i1 %has_y, label %x_init, label %done\n");
+        out.push_str("x_init:\n  %y_str = mul i64 %y, %stride_y\n  %y_base = mul i64 %y_str, %img_width\n  %y_out_off = mul i64 %y, %w_out\n  br label %x_loop\n");
+        out.push_str("x_loop:\n  %x = phi i64 [ 0, %x_init ], [ %next_x, %x_next ]\n  %has_x = icmp ult i64 %x, %w_out\n  br i1 %has_x, label %p_init, label %y_next\n");
+        out.push_str("p_init:\n  %x_base = mul i64 %x, %stride_x\n  %out_idx = add i64 %y_out_off, %x\n  br label %py_loop\n");
+        out.push_str("py_loop:\n  %py = phi i64 [ 0, %p_init ], [ %next_py, %py_next ]\n  %sum_py = phi i64 [ 0, %p_init ], [ %sum_py_next, %py_next ]\n  %has_py = icmp ult i64 %py, %pool_h\n  br i1 %has_py, label %px_init, label %p_done\n");
+        out.push_str("px_init:\n  %py_off = mul i64 %py, %img_width\n  %in_row = add i64 %y_base, %py_off\n  br label %px_loop\n");
+        out.push_str("px_loop:\n  %px = phi i64 [ 0, %px_init ], [ %next_px, %px_step ]\n  %sum_px = phi i64 [ %sum_py, %px_init ], [ %next_sum_px, %px_step ]\n  %has_px = icmp ult i64 %px, %pool_w\n  br i1 %has_px, label %px_step, label %py_next\n");
+        out.push_str("px_step:\n  %in_idx = add i64 %in_row, %x_base\n  %in_full_idx = add i64 %in_idx, %px\n  %p_in = getelementptr inbounds i64, ptr %img, i64 %in_full_idx\n  %v_in = load i64, ptr %p_in, align 8\n  %next_sum_px = add i64 %sum_px, %v_in\n  %next_px = add i64 %px, 1\n  br label %px_loop, !llvm.loop !74\n");
+        out.push_str("py_next:\n  %sum_py_next = phi i64 [ %sum_px, %px_loop ]\n  %next_py = add i64 %py, 1\n  br label %py_loop\n");
+        out.push_str("p_done:\n  %avg_val = sdiv i64 %sum_py, %area\n  %p_dst = getelementptr inbounds i64, ptr %dst, i64 %out_idx\n  store i64 %avg_val, ptr %p_dst, align 8\n  br label %x_next\n");
+        out.push_str("x_next:\n  %next_x = add i64 %x, 1\n  br label %x_loop\n");
+        out.push_str("y_next:\n  %next_y = add i64 %y, 1\n  br label %y_loop\n");
+        out.push_str("done:\n  ret void\n}\n\n");
+
         // 6. Arena Slice Count-If Reductions (Conditional Counting Zero-Heap)
         out.push_str("; IFA Standard Library SIMD Contiguous Arena Slice Count-If Reductions\n");
 

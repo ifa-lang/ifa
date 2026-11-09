@@ -178,6 +178,19 @@ impl<'a> FirPrinter<'a> {
                 self.indent();
                 writeln!(self.output, "// [conv_activation: true]")?;
             }
+            if hint.is_dilated_conv {
+                self.indent();
+                writeln!(self.output, "// [dilated_conv: true]")?;
+            }
+            if hint.is_pooling {
+                self.indent();
+                let pool_str = match hint.pooling_kind {
+                    Some(crate::ir::PoolingKind::Max) => "max",
+                    Some(crate::ir::PoolingKind::Average) => "avg",
+                    None => "pool",
+                };
+                writeln!(self.output, "// [pooling: {}]", pool_str)?;
+            }
         }
         for inst in &block.instructions {
             self.indent();

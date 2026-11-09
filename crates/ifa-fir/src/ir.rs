@@ -526,6 +526,15 @@ pub enum ReductionKind {
     CountIf,
 }
 
+/// Classification of deterministic zero-heap spatial pooling operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PoolingKind {
+    /// Max-pooling over spatial window.
+    Max,
+    /// Average-pooling over spatial window.
+    Average,
+}
+
 /// Optimization hint for loop vectorization (SIMD lane width, interleave, unroll directives, reduction kind, disjoint slices guarantee, tail-folding predication, strict determinism, contiguous arena reductions, sliding window convolutions, predicated scatter/gather filters, matrix/tensor tiling, and loop fusion).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LoopVectorHint {
@@ -563,6 +572,12 @@ pub struct LoopVectorHint {
     pub is_multi_arena_conv: bool,
     pub conv_has_bias: bool,
     pub conv_has_activation: bool,
+    pub is_dilated_conv: bool,
+    pub dilation_factors: Option<(u32, u32, u32)>,
+    pub is_pooling: bool,
+    pub pooling_kind: Option<PoolingKind>,
+    pub pooling_window: Option<(u32, u32)>,
+    pub pooling_strides: Option<(u32, u32)>,
 }
 
 impl LoopVectorHint {
@@ -603,6 +618,12 @@ impl LoopVectorHint {
             is_multi_arena_conv: false,
             conv_has_bias: false,
             conv_has_activation: false,
+            is_dilated_conv: false,
+            dilation_factors: None,
+            is_pooling: false,
+            pooling_kind: None,
+            pooling_window: None,
+            pooling_strides: None,
         }
     }
 
@@ -637,6 +658,46 @@ impl LoopVectorHint {
     /// Mark the loop as operating over zero-copy multidimensional strided projections.
     pub fn with_strided_multidim(mut self) -> Self {
         self.is_strided_multidim = true;
+        self
+    }
+
+    /// Mark the loop as a dilated / atrous convolution kernel.
+    pub fn with_dilated_conv(
+        mut self,
+        is_3d: bool,
+        dilation: (u32, u32, u32),
+        has_bias: bool,
+        has_activation: bool,
+    ) -> Self {
+        self.is_dilated_conv = true;
+        self.dilation_factors = Some(dilation);
+        self.is_convolution = true;
+        if is_3d {
+            self.is_strided_conv3d = true;
+        } else {
+            self.is_strided_conv2d = true;
+        }
+        self.conv_has_bias = has_bias;
+        self.conv_has_activation = has_activation;
+        self.is_elementwise_fused = has_bias || has_activation;
+        self.unroll_and_jam = true;
+        self.disjoint_slices = true;
+        self
+    }
+
+    /// Mark the loop as a deterministic zero-heap spatial pooling kernel (Max or Average).
+    pub fn with_pooling(
+        mut self,
+        kind: PoolingKind,
+        window: (u32, u32),
+        strides: (u32, u32),
+    ) -> Self {
+        self.is_pooling = true;
+        self.pooling_kind = Some(kind);
+        self.pooling_window = Some(window);
+        self.pooling_strides = Some(strides);
+        self.disjoint_slices = true;
+        self.unroll_and_jam = true;
         self
     }
 

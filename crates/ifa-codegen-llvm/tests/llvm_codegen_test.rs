@@ -6011,6 +6011,18 @@ fn test_llvm_multi_arena_conv_definitions_and_codegen() {
         ir.contains("define linkonce_odr void @ifa_simd_multi_arena_conv3d_i64"),
         "Must emit linkonce_odr definition for ifa_simd_multi_arena_conv3d_i64"
     );
+    assert!(
+        ir.contains("define linkonce_odr void @ifa_simd_multi_arena_dilated_conv2d_f32"),
+        "Must emit linkonce_odr definition for ifa_simd_multi_arena_dilated_conv2d_f32"
+    );
+    assert!(
+        ir.contains("define linkonce_odr void @ifa_simd_multi_arena_maxpool2d_f32"),
+        "Must emit linkonce_odr definition for ifa_simd_multi_arena_maxpool2d_f32"
+    );
+    assert!(
+        ir.contains("define linkonce_odr void @ifa_simd_multi_arena_avgpool2d_f32"),
+        "Must emit linkonce_odr definition for ifa_simd_multi_arena_avgpool2d_f32"
+    );
 
     let temp_dir =
         std::env::temp_dir().join(format!("llvm_multi_conv_defs_{}", std::process::id()));

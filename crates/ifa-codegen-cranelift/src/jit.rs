@@ -153,6 +153,42 @@ impl JitEngine {
             ifa_simd_multi_arena_conv3d_i64 as *const u8,
         );
         builder.symbol(
+            "ifa_simd_multi_arena_dilated_conv2d_f32",
+            ifa_simd_multi_arena_dilated_conv2d_f32 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_dilated_conv2d_f64",
+            ifa_simd_multi_arena_dilated_conv2d_f64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_dilated_conv2d_i64",
+            ifa_simd_multi_arena_dilated_conv2d_i64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_maxpool2d_f32",
+            ifa_simd_multi_arena_maxpool2d_f32 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_maxpool2d_f64",
+            ifa_simd_multi_arena_maxpool2d_f64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_maxpool2d_i64",
+            ifa_simd_multi_arena_maxpool2d_i64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_avgpool2d_f32",
+            ifa_simd_multi_arena_avgpool2d_f32 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_avgpool2d_f64",
+            ifa_simd_multi_arena_avgpool2d_f64 as *const u8,
+        );
+        builder.symbol(
+            "ifa_simd_multi_arena_avgpool2d_i64",
+            ifa_simd_multi_arena_avgpool2d_i64 as *const u8,
+        );
+        builder.symbol(
             "ifa_simd_multi_arena_slice_dot_f32",
             ifa_simd_multi_arena_slice_dot_f32 as *const u8,
         );
