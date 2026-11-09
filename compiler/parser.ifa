@@ -208,9 +208,57 @@ pub fn parse_primary(inout cursor: i64, tokens: List<Token>, inout pool: List<As
             }
         }
 
-        // Variable Identifier with possible macro invocation `name!(arg)` or tuple member access: `var.0`, `var.1`
+        // Variable Identifier with possible function call `name(...)` or macro invocation `name!(arg)` or tuple member access: `var.0`, `var.1`
         let var_name = tok.lexeme;
         cursor = cursor + 1;
+        if cursor < tokens.len() && tokens[cursor].kind == 30 {
+            // Direct function call: ident() or ident(arg1) or ident(arg1, arg2)
+            cursor = cursor + 1; // Consume '('
+            if cursor < tokens.len() && tokens[cursor].kind == 31 {
+                cursor = cursor + 1; // Consume ')'
+                return AstExpr(
+                    kind: 4, // Function Call
+                    val: 0,  // 0 args
+                    name: var_name,
+                    op: 0,
+                    left: None,
+                    right: None
+                );
+            }
+            let arg1 = parse_additive(inout cursor, tokens, inout pool);
+            if cursor < tokens.len() && tokens[cursor].kind == 39 {
+                cursor = cursor + 1; // Consume ','
+                let arg2 = parse_additive(inout cursor, tokens, inout pool);
+                if cursor < tokens.len() && tokens[cursor].kind == 31 {
+                    cursor = cursor + 1; // Consume ')'
+                }
+                pool.push(arg1);
+                let arg1_idx = pool.len() - 1;
+                pool.push(arg2);
+                let arg2_idx = pool.len() - 1;
+                return AstExpr(
+                    kind: 4, // Function Call
+                    val: 2,  // 2 args
+                    name: var_name,
+                    op: 0,
+                    left: ref pool[arg1_idx],
+                    right: ref pool[arg2_idx]
+                );
+            }
+            if cursor < tokens.len() && tokens[cursor].kind == 31 {
+                cursor = cursor + 1; // Consume ')'
+            }
+            pool.push(arg1);
+            let arg1_idx = pool.len() - 1;
+            return AstExpr(
+                kind: 4, // Function Call
+                val: 1,  // 1 arg
+                name: var_name,
+                op: 0,
+                left: ref pool[arg1_idx],
+                right: None
+            );
+        }
         if cursor < tokens.len() && tokens[cursor].kind == 50 {
             // Macro invocation: ident!(arg)
             cursor = cursor + 1; // Consume '!'
@@ -490,11 +538,19 @@ pub fn parse_statement(inout cursor: i64, tokens: List<Token>, inout pool: List<
 
 // Recursive-descent parser: function declarations (`fn name(...) -> R { ... }`)
 pub fn parse_function(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstFunction {
-    cursor = cursor + 1; // Consume 'fn'
+    if cursor >= tokens.len() {
+        mut empty_stmts: List<AstStmt> = List::new();
+        return AstFunction(name: "compute", param_name: "x", statements: empty_stmts);
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 1 {
+        cursor = cursor + 1; // Consume 'fn'
+    }
     mut fn_name = "";
     if cursor < tokens.len() && tokens[cursor].kind == 10 {
         fn_name = tokens[cursor].lexeme;
         cursor = cursor + 1; // Consume function name
+    } else {
+        fn_name = "compute";
     }
     if cursor < tokens.len() && tokens[cursor].kind == 30 {
         cursor = cursor + 1; // Consume '('
@@ -1904,6 +1960,61 @@ pub fn test_parser_mut_statements() -> bool {
     return f.statements[2].is_return;
 }
 
+// Unit test 21: Direct function call parsing
+pub fn test_parser_direct_call() -> bool {
+    mut tokens: List<Token> = List::new();
+    // let a = get_val();
+    tokens.push(Token(kind: 2, value: 0, lexeme: "let"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "a"));
+    tokens.push(Token(kind: 24, value: 0, lexeme: "="));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "get_val"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+
+    // let b = double(a);
+    tokens.push(Token(kind: 2, value: 0, lexeme: "let"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "b"));
+    tokens.push(Token(kind: 24, value: 0, lexeme: "="));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "double"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "a"));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+
+    // let c = add(a, 10);
+    tokens.push(Token(kind: 2, value: 0, lexeme: "let"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "c"));
+    tokens.push(Token(kind: 24, value: 0, lexeme: "="));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "add"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "a"));
+    tokens.push(Token(kind: 39, value: 0, lexeme: ","));
+    tokens.push(Token(kind: 11, value: 10, lexeme: "10"));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let s1 = parse_statement(inout cur, tokens, inout pool);
+    let s2 = parse_statement(inout cur, tokens, inout pool);
+    let s3 = parse_statement(inout cur, tokens, inout pool);
+
+    let s1_name = s1.expr?.name ?? "";
+    if s1.target_var != "a" || s1.expr?.kind != 4 || s1.expr?.val != 0 || s1_name != "get_val" {
+        return false;
+    }
+    let s2_name = s2.expr?.name ?? "";
+    if s2.target_var != "b" || s2.expr?.kind != 4 || s2.expr?.val != 1 || s2_name != "double" {
+        return false;
+    }
+    let s3_name = s3.expr?.name ?? "";
+    if s3.target_var != "c" || s3.expr?.kind != 4 || s3.expr?.val != 2 || s3_name != "add" {
+        return false;
+    }
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Parser Module ===");
     let t1 = test_parser_ast_building();
@@ -1926,7 +2037,8 @@ pub fn main() {
     let t18 = test_parser_function_zero_arg();
     let t19 = test_parser_function_multi_param();
     let t20 = test_parser_mut_statements();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 {
+    let t21 = test_parser_direct_call();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 {
         println("Parser validation tests: ALL PASSED");
     } else {
         println("Parser validation tests: FAILED");

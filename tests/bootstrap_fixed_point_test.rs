@@ -486,13 +486,43 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_parser_direct_call ... ok"),
+        "Modular parser direct call test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_direct_call_eval ... ok"),
+        "Modular sema direct call eval test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_direct_call_zero_arg ... ok"),
+        "Modular codegen direct call zero arg test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_direct_call_multi_arg ... ok"),
+        "Modular codegen direct call multi arg test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_function_with_direct_call_and_return_reg ... ok"),
+        "Modular codegen function with direct call test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_pipeline_source_to_llvm_ir_direct_call ... ok"),
+        "Modular pipeline source to LLVM IR direct call test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_selfhost_modular_pipeline ... ok"),
         "Modular selfhost pipeline test missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("172 passed; 0 failed"),
-        "Expected 172 passed unit tests, got:\n{}",
+        stdout.contains("183 passed; 0 failed"),
+        "Expected 183 passed unit tests, got:\n{}",
         stdout
     );
 }

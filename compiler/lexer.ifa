@@ -25,11 +25,9 @@ pub fn advance_token(inout stream: List<Token>, kind: i64, value: i64, lexeme: S
     stream.push(tok);
 }
 
-// Tokenize sample program:
+// Populate sample program tokens:
 // `fn compute(inout x: i64) -> i64 { let bonus = 40; return x + bonus; }`
-pub fn tokenize_sample_program() -> List<Token> {
-    mut tokens: List<Token> = List::new();
-
+pub fn populate_sample_tokens(inout tokens: List<Token>) {
     advance_token(inout tokens, 1, 0, "fn");
     advance_token(inout tokens, 10, 0, "compute");
     advance_token(inout tokens, 30, 0, "(");
@@ -52,7 +50,12 @@ pub fn tokenize_sample_program() -> List<Token> {
     advance_token(inout tokens, 10, 0, "bonus");
     advance_token(inout tokens, 35, 0, ";");
     advance_token(inout tokens, 33, 0, "}");
+}
 
+// Tokenize sample program:
+pub fn tokenize_sample_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+    populate_sample_tokens(inout tokens);
     return tokens;
 }
 
