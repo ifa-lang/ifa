@@ -127,6 +127,34 @@ pub struct AstVTableDef {
     method_names: List<String>
 }
 
+// AST: Function Pointer Indirect Call representation
+pub struct AstFnPtrCall {
+    fn_var: String,
+    arg_var: String,
+    target_var: String,
+    return_ty: String,
+    param_ty: String
+}
+
+// AST: Thunk definition for zero-allocation stack closures
+pub struct AstThunkDef {
+    thunk_name: String,
+    target_fn: String,
+    env_struct_name: String,
+    captured_fields: List<AstStructFieldDef>,
+    param_name: String,
+    param_type: String,
+    return_type: String
+}
+
+// AST: Closure stack instantiation
+pub struct AstClosureInit {
+    closure_name: String,
+    env_var: String,
+    thunk_name: String,
+    captured_vals: List<AstStructInitField>
+}
+
 pub fn mangle_generic_method(
     trait_name: String,
     struct_name: String,
@@ -1432,6 +1460,280 @@ pub fn test_codegen_vtable_dispatch() -> bool {
     return true;
 }
 
+// Emits LLVM function pointer indirect call
+pub fn emit_llvm_fn_ptr_call(call: AstFnPtrCall) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  %" + call.target_var + " = call " + call.return_ty + " %" + call.fn_var + "(" + call.param_ty + " %" + call.arg_var + ")");
+    return lines;
+}
+
+// Emits FIR function pointer indirect call
+pub fn emit_fir_fn_ptr_call(call: AstFnPtrCall) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + call.target_var + " = fir.call_indirect %" + call.fn_var + "(%" + call.arg_var + ")");
+    return lines;
+}
+
+// Emits LLVM higher-order function call passing named function pointer
+pub fn emit_llvm_higher_order_call(
+    callee: String,
+    fn_target: String,
+    val_var: String,
+    res_var: String
+) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  %" + res_var + " = call i64 @" + callee + "(ptr @" + fn_target + ", i64 %" + val_var + ")");
+    return lines;
+}
+
+// Emits FIR higher-order function call passing named function symbol
+pub fn emit_fir_higher_order_call(
+    callee: String,
+    fn_target: String,
+    val_var: String,
+    res_var: String
+) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + res_var + " = fir.call @" + callee + "(@" + fn_target + ", %" + val_var + ")");
+    return lines;
+}
+
+// Emits internal LLVM thunk function unpacking stack-allocated environment and invoking target
+pub fn emit_llvm_thunk_definition(thunk: AstThunkDef) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("define internal " + thunk.return_type + " @" + thunk.thunk_name + "(ptr %env_ptr, " + thunk.param_type + " %" + thunk.param_name + ") {");
+    lines.push("entry:");
+    mut i: i64 = 0;
+    mut call_args = "";
+    while i < thunk.captured_fields.len() {
+        let f = thunk.captured_fields[i];
+        let slot = "%cap_slot." + f.name;
+        let val = "%cap_val." + f.name;
+        let idx_str = int_to_str(i);
+        lines.push("  " + slot + " = getelementptr inbounds %" + thunk.env_struct_name + ", ptr %env_ptr, i32 0, i32 " + idx_str);
+        lines.push("  " + val + " = load " + f.ty + ", ptr " + slot + ", align 8");
+        call_args = call_args + f.ty + " " + val + ", ";
+        i = i + 1;
+    }
+    call_args = call_args + thunk.param_type + " %" + thunk.param_name;
+    lines.push("  %thunk_res = call " + thunk.return_type + " @" + thunk.target_fn + "(" + call_args + ")");
+    lines.push("  ret " + thunk.return_type + " %thunk_res");
+    lines.push("}");
+    return lines;
+}
+
+// Emits FIR thunk function definition
+pub fn emit_fir_thunk_definition(thunk: AstThunkDef) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("fir.func internal @" + thunk.thunk_name + "(%env_ptr: ptr, %" + thunk.param_name + ": " + thunk.param_type + ") -> " + thunk.return_type + " {");
+    lines.push("entry:");
+    lines.push("  %thunk_res = fir.thunk_invoke @" + thunk.target_fn + "(%env_ptr, %" + thunk.param_name + ")");
+    lines.push("  fir.return %thunk_res");
+    lines.push("}");
+    return lines;
+}
+
+// Emits LLVM stack-allocated closure environment initialization
+pub fn emit_llvm_closure_instantiation(
+    init: AstClosureInit,
+    env_struct_name: String
+) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  %" + init.env_var + " = alloca %" + env_struct_name + ", align 8");
+    mut i: i64 = 0;
+    while i < init.captured_vals.len() {
+        let cf = init.captured_vals[i];
+        let slot = "%" + init.env_var + ".f" + int_to_str(i);
+        let idx_str = int_to_str(i);
+        let val_str = int_to_str(cf.val);
+        lines.push("  " + slot + " = getelementptr inbounds %" + env_struct_name + ", ptr %" + init.env_var + ", i32 0, i32 " + idx_str);
+        lines.push("  store i64 " + val_str + ", ptr " + slot + ", align 8");
+        i = i + 1;
+    }
+    return lines;
+}
+
+// Emits FIR stack-allocated closure environment initialization
+pub fn emit_fir_closure_instantiation(
+    init: AstClosureInit,
+    env_struct_name: String
+) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + init.env_var + " = fir.alloca !" + env_struct_name);
+    mut i: i64 = 0;
+    while i < init.captured_vals.len() {
+        let cf = init.captured_vals[i];
+        let idx_str = int_to_str(i);
+        let val_str = int_to_str(cf.val);
+        lines.push("    fir.struct_set %" + init.env_var + "[" + idx_str + "] = " + val_str);
+        i = i + 1;
+    }
+    return lines;
+}
+
+// Emits LLVM closure invocation via thunk and stack environment pointer
+pub fn emit_llvm_closure_call(
+    thunk_name: String,
+    env_var: String,
+    arg_var: String,
+    res_var: String
+) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  %" + res_var + " = call i64 @" + thunk_name + "(ptr %" + env_var + ", i64 %" + arg_var + ")");
+    return lines;
+}
+
+// Emits FIR closure invocation via thunk and environment
+pub fn emit_fir_closure_call(
+    thunk_name: String,
+    env_var: String,
+    arg_var: String,
+    res_var: String
+) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + res_var + " = fir.call @" + thunk_name + "(%" + env_var + ", %" + arg_var + ")");
+    return lines;
+}
+
+// Unit test 11: Function pointer indirect call and higher-order function lowering
+pub fn test_codegen_fn_pointer_and_indirect_call() -> bool {
+    let call_ast = AstFnPtrCall(
+        fn_var: "strategy_fn",
+        arg_var: "input_val",
+        target_var: "res",
+        return_ty: "i64",
+        param_ty: "i64"
+    );
+
+    let llvm_call = emit_llvm_fn_ptr_call(call_ast);
+    if llvm_call.len() != 1 {
+        return false;
+    }
+    if llvm_call[0] != "  %res = call i64 %strategy_fn(i64 %input_val)" {
+        return false;
+    }
+
+    let fir_call = emit_fir_fn_ptr_call(call_ast);
+    if fir_call.len() != 1 {
+        return false;
+    }
+    if fir_call[0] != "    %res = fir.call_indirect %strategy_fn(%input_val)" {
+        return false;
+    }
+
+    let ho_llvm = emit_llvm_higher_order_call("apply_fn", "square", "val", "step1");
+    if ho_llvm.len() != 1 {
+        return false;
+    }
+    if ho_llvm[0] != "  %step1 = call i64 @apply_fn(ptr @square, i64 %val)" {
+        return false;
+    }
+
+    let ho_fir = emit_fir_higher_order_call("apply_fn", "square", "val", "step1");
+    if ho_fir.len() != 1 {
+        return false;
+    }
+    if ho_fir[0] != "    %step1 = fir.call @apply_fn(@square, %val)" {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit test 12: Lightweight zero-allocation adapter thunk and stack closure lowering
+pub fn test_codegen_lightweight_thunk_and_closure() -> bool {
+    mut cap_fields: List<AstStructFieldDef> = List::new();
+    cap_fields.push(AstStructFieldDef(name: "offset", ty: "i64"));
+
+    let thunk_def = AstThunkDef(
+        thunk_name: "__ifa_thunk_custom_lambda",
+        target_fn: "custom_lambda$body",
+        env_struct_name: "ClosureEnv$1",
+        captured_fields: cap_fields,
+        param_name: "v",
+        param_type: "i64",
+        return_type: "i64"
+    );
+
+    let llvm_thunk = emit_llvm_thunk_definition(thunk_def);
+    if llvm_thunk.len() != 7 {
+        return false;
+    }
+    if llvm_thunk[0] != "define internal i64 @__ifa_thunk_custom_lambda(ptr %env_ptr, i64 %v) {" {
+        return false;
+    }
+    if llvm_thunk[2] != "  %cap_slot.offset = getelementptr inbounds %ClosureEnv$1, ptr %env_ptr, i32 0, i32 0" {
+        return false;
+    }
+    if llvm_thunk[3] != "  %cap_val.offset = load i64, ptr %cap_slot.offset, align 8" {
+        return false;
+    }
+    if llvm_thunk[4] != "  %thunk_res = call i64 @custom_lambda$body(i64 %cap_val.offset, i64 %v)" {
+        return false;
+    }
+
+    let fir_thunk = emit_fir_thunk_definition(thunk_def);
+    if fir_thunk.len() != 5 {
+        return false;
+    }
+    if fir_thunk[0] != "fir.func internal @__ifa_thunk_custom_lambda(%env_ptr: ptr, %v: i64) -> i64 {" {
+        return false;
+    }
+
+    mut cap_vals: List<AstStructInitField> = List::new();
+    cap_vals.push(AstStructInitField(name: "offset", val: 5));
+
+    let closure_init = AstClosureInit(
+        closure_name: "custom_lambda",
+        env_var: "closure_env",
+        thunk_name: "__ifa_thunk_custom_lambda",
+        captured_vals: cap_vals
+    );
+
+    let llvm_closure = emit_llvm_closure_instantiation(closure_init, "ClosureEnv$1");
+    if llvm_closure.len() != 3 {
+        return false;
+    }
+    if llvm_closure[0] != "  %closure_env = alloca %ClosureEnv$1, align 8" {
+        return false;
+    }
+    if llvm_closure[1] != "  %closure_env.f0 = getelementptr inbounds %ClosureEnv$1, ptr %closure_env, i32 0, i32 0" {
+        return false;
+    }
+    if llvm_closure[2] != "  store i64 5, ptr %closure_env.f0, align 8" {
+        return false;
+    }
+
+    let fir_closure = emit_fir_closure_instantiation(closure_init, "ClosureEnv$1");
+    if fir_closure.len() != 2 {
+        return false;
+    }
+    if fir_closure[0] != "    %closure_env = fir.alloca !ClosureEnv$1" {
+        return false;
+    }
+    if fir_closure[1] != "    fir.struct_set %closure_env[0] = 5" {
+        return false;
+    }
+
+    let llvm_call = emit_llvm_closure_call("__ifa_thunk_custom_lambda", "closure_env", "arg_val", "step3");
+    if llvm_call.len() != 1 {
+        return false;
+    }
+    if llvm_call[0] != "  %step3 = call i64 @__ifa_thunk_custom_lambda(ptr %closure_env, i64 %arg_val)" {
+        return false;
+    }
+
+    let fir_call = emit_fir_closure_call("__ifa_thunk_custom_lambda", "closure_env", "arg_val", "step3");
+    if fir_call.len() != 1 {
+        return false;
+    }
+    if fir_call[0] != "    %step3 = fir.call @__ifa_thunk_custom_lambda(%closure_env, %arg_val)" {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -1444,7 +1746,9 @@ pub fn main() {
     let t8 = test_codegen_enum_definitions();
     let t9 = test_codegen_struct_definitions();
     let t10 = test_codegen_vtable_dispatch();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 {
+    let t11 = test_codegen_fn_pointer_and_indirect_call();
+    let t12 = test_codegen_lightweight_thunk_and_closure();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");

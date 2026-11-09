@@ -266,6 +266,16 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_codegen_fn_pointer_and_indirect_call ... ok"),
+        "Modular codegen fn pointer and indirect call test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_lightweight_thunk_and_closure ... ok"),
+        "Modular codegen lightweight thunk and closure test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_sema_global_symbol_table ... ok"),
         "Modular sema global symbol table test missing from output:\n{}",
         stdout
@@ -281,13 +291,18 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_driver_multi_module_symbol_resolution ... ok"),
+        "Modular driver multi-module symbol resolution test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_selfhost_modular_pipeline ... ok"),
         "Modular selfhost pipeline test missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("95 passed; 0 failed"),
-        "Expected 95 passed unit tests, got:\n{}",
+        stdout.contains("101 passed; 0 failed"),
+        "Expected 101 passed unit tests, got:\n{}",
         stdout
     );
 }

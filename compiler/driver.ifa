@@ -103,6 +103,89 @@ pub fn assemble_full_llvm_module(func_lines: List<String>, target_triple: String
     return full_module;
 }
 
+// Multi-Module Symbol Descriptor for cross-module compilation and linking
+pub struct ModuleSymbolEntry {
+    module_name: String,
+    symbol_name: String,
+    symbol_kind: i64, // 1: Const, 2: TypeAlias, 3: Enum, 4: Struct, 5: Trait, 6: Function
+    mangled_id: String
+}
+
+pub struct MultiModuleCatalog {
+    entries: List<ModuleSymbolEntry>
+}
+
+pub fn make_module_catalog() -> MultiModuleCatalog {
+    return MultiModuleCatalog(entries: List::new());
+}
+
+pub fn register_module_symbol(
+    inout catalog: MultiModuleCatalog,
+    mod_name: String,
+    sym_name: String,
+    kind: i64
+) -> String {
+    let mangled = mod_name + "$" + sym_name;
+    catalog.entries.push(ModuleSymbolEntry(
+        module_name: mod_name,
+        symbol_name: sym_name,
+        symbol_kind: kind,
+        mangled_id: mangled
+    ));
+    return mangled;
+}
+
+pub fn resolve_module_symbol(
+    catalog: MultiModuleCatalog,
+    mod_name: String,
+    sym_name: String
+) -> String {
+    mut i: i64 = 0;
+    while i < catalog.entries.len() {
+        let e = catalog.entries[i];
+        if e.module_name == mod_name && e.symbol_name == sym_name {
+            return e.mangled_id;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// Assembles a unified LLVM module incorporating multi-module global declarations and vtables
+pub fn assemble_multi_module_llvm(
+    catalog: MultiModuleCatalog,
+    body_lines: List<String>,
+    target_triple: String
+) -> List<String> {
+    mut full_module = emit_header_metadata(target_triple, 2);
+    full_module.push("");
+    full_module.push("; Multi-Module Symbol Declarations");
+    mut i: i64 = 0;
+    while i < catalog.entries.len() {
+        let e = catalog.entries[i];
+        if e.symbol_kind == 1 {
+            full_module.push("@" + e.mangled_id + " = constant i64 0, align 8");
+        } else if e.symbol_kind == 4 {
+            full_module.push("%" + e.mangled_id + " = type { i64, i64 }");
+        } else if e.symbol_kind == 5 {
+            full_module.push("@" + e.mangled_id + "$vtable = external global ptr");
+        } else if e.symbol_kind == 6 {
+            full_module.push("declare i64 @" + e.mangled_id + "(i64)");
+        }
+        i = i + 1;
+    }
+    full_module.push("");
+    full_module.push("; Standard IFA Runtime Declarations");
+    full_module.push("declare void @ifa_rt_println_i64(i64)");
+    full_module.push("");
+    mut j: i64 = 0;
+    while j < body_lines.len() {
+        full_module.push(body_lines[j]);
+        j = j + 1;
+    }
+    return full_module;
+}
+
 pub fn compile_source_to_llvm_ir(target_triple: String) -> List<String> {
     mut fn_lines: List<String> = List::new();
     fn_lines.push("define i64 @main() {");
@@ -437,6 +520,57 @@ pub fn test_driver_complex_module_and_bootstrap_orchestration() -> bool {
     return has_identity && has_pipeline && has_main;
 }
 
+// Unit Test 8: Verify multi-module symbol catalog and unified LLVM assembly
+pub fn test_driver_multi_module_symbol_resolution() -> bool {
+    mut catalog = make_module_catalog();
+    register_module_symbol(inout catalog, "lexer", "Token", 4);
+    register_module_symbol(inout catalog, "parser", "parse_program", 6);
+    register_module_symbol(inout catalog, "sema", "Describable", 5);
+    register_module_symbol(inout catalog, "codegen_llvm", "PAGE_SIZE", 1);
+
+    if catalog.entries.len() != 4 {
+        return false;
+    }
+
+    let sym_fn = resolve_module_symbol(catalog, "parser", "parse_program");
+    if sym_fn != "parser$parse_program" {
+        return false;
+    }
+
+    let sym_tr = resolve_module_symbol(catalog, "sema", "Describable");
+    if sym_tr != "sema$Describable" {
+        return false;
+    }
+
+    mut body: List<String> = List::new();
+    body.push("define i64 @main() {");
+    body.push("entry:");
+    body.push("  %res = call i64 @parser$parse_program(i64 0)");
+    body.push("  call void @ifa_rt_println_i64(i64 %res)");
+    body.push("  ret i64 0");
+    body.push("}");
+
+    let assembled = assemble_multi_module_llvm(catalog, body, "x86_64-unknown-linux-gnu");
+    if assembled.len() < 15 {
+        return false;
+    }
+
+    mut has_decl_fn = false;
+    mut has_vtable = false;
+    mut i: i64 = 0;
+    while i < assembled.len() {
+        let line = assembled[i];
+        if line == "declare i64 @parser$parse_program(i64)" {
+            has_decl_fn = true;
+        } else if line == "@sema$Describable$vtable = external global ptr" {
+            has_vtable = true;
+        }
+        i = i + 1;
+    }
+
+    return has_decl_fn && has_vtable;
+}
+
 pub fn main() {
     println("=== IFA Compiler Driver & I/O Module ===");
     let t1 = test_driver_default_config();
@@ -446,8 +580,9 @@ pub fn main() {
     let t5 = test_driver_compilation_result();
     let t6 = test_driver_standalone_pipeline_builder();
     let t7 = test_driver_complex_module_and_bootstrap_orchestration();
+    let t8 = test_driver_multi_module_symbol_resolution();
 
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 {
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 {
         println("Driver validation tests: ALL PASSED");
     } else {
         println("Driver validation tests: FAILED");
