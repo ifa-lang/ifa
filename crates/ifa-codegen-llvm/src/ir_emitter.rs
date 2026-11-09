@@ -178,7 +178,9 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare ptr @ifa_rt_env_var(ptr)\n");
             out.push_str("declare i64 @ifa_rt_args_count()\n");
             out.push_str("declare ptr @ifa_rt_args_get(i64)\n");
-            out.push_str("declare i1 @ifa_rt_string_eq(ptr, ptr)\n\n");
+            out.push_str("declare i1 @ifa_rt_string_eq(ptr, ptr)\n");
+            out.push_str("declare i64 @ifa_rt_string_len(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_string_char_at(ptr, i64)\n\n");
         } else {
             out.push_str("; IFA Runtime Intrinsic Declarations\n");
             out.push_str("declare void @ifa_rt_println(ptr)\n");
@@ -256,7 +258,9 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare ptr @ifa_rt_env_var(ptr)\n");
             out.push_str("declare i64 @ifa_rt_args_count()\n");
             out.push_str("declare ptr @ifa_rt_args_get(i64)\n");
-            out.push_str("declare i1 @ifa_rt_string_eq(ptr, ptr)\n\n");
+            out.push_str("declare i1 @ifa_rt_string_eq(ptr, ptr)\n");
+            out.push_str("declare i64 @ifa_rt_string_len(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_string_char_at(ptr, i64)\n\n");
         }
 
         // LLVM Standard Coroutine Intrinsics
@@ -3343,6 +3347,8 @@ impl<'a> LlvmIrEmitter<'a> {
                     "process::env_var" | "env_var" => "ifa_rt_env_var",
                     "process::args_count" | "env::args_count" | "args_count" => "ifa_rt_args_count",
                     "process::args_get" | "env::args_get" | "args_get" => "ifa_rt_args_get",
+                    "string_len" | "String::len" => "ifa_rt_string_len",
+                    "string_char_at" | "String::char_at" => "ifa_rt_string_char_at",
                     _ => callee.as_str(),
                 };
                 let callee_name = norm_callee;
@@ -3415,6 +3421,13 @@ impl<'a> LlvmIrEmitter<'a> {
                         ("i64".to_string(), Vec::new())
                     } else if norm_callee == "ifa_rt_args_get" {
                         ("ptr".to_string(), vec!["i64".to_string()])
+                    } else if norm_callee == "ifa_rt_string_len" {
+                        ("i64".to_string(), vec!["ptr".to_string()])
+                    } else if norm_callee == "ifa_rt_string_char_at" {
+                        (
+                            "i64".to_string(),
+                            vec!["ptr".to_string(), "i64".to_string()],
+                        )
                     } else if callee.starts_with("ifa_simd_")
                         || callee.starts_with("ifa_simd_arena_")
                     {
@@ -5216,6 +5229,8 @@ impl<'a> LlvmIrEmitter<'a> {
                     "process::env_var" | "env_var" => "ifa_rt_env_var",
                     "process::args_count" | "env::args_count" | "args_count" => "ifa_rt_args_count",
                     "process::args_get" | "env::args_get" | "args_get" => "ifa_rt_args_get",
+                    "string_len" | "String::len" => "ifa_rt_string_len",
+                    "string_char_at" | "String::char_at" => "ifa_rt_string_char_at",
                     _ => callee.as_str(),
                 };
                 let callee_name = norm_callee;
@@ -5285,6 +5300,13 @@ impl<'a> LlvmIrEmitter<'a> {
                         ("i64".to_string(), Vec::new())
                     } else if norm_callee == "ifa_rt_args_get" {
                         ("ptr".to_string(), vec!["i64".to_string()])
+                    } else if norm_callee == "ifa_rt_string_len" {
+                        ("i64".to_string(), vec!["ptr".to_string()])
+                    } else if norm_callee == "ifa_rt_string_char_at" {
+                        (
+                            "i64".to_string(),
+                            vec!["ptr".to_string(), "i64".to_string()],
+                        )
                     } else if callee.starts_with("ifa_simd_")
                         || callee.starts_with("ifa_simd_arena_")
                     {

@@ -1463,6 +1463,8 @@ impl IpoPass {
                 | "abort"
                 | "read_line"
                 | "read_to_string"
+                | "string_len"
+                | "string_char_at"
                 | "flush"
         )
     }
@@ -1554,7 +1556,7 @@ impl IpoPass {
                 continue;
             }
 
-            let mut loop_blocks = HashSet::new();
+            let mut loop_blocks: HashSet<BlockId> = HashSet::new();
             for loop_info in &natural_loops {
                 loop_blocks.extend(&loop_info.blocks);
             }
@@ -1564,82 +1566,78 @@ impl IpoPass {
             let mut func_subst: HashMap<ValueId, ValueId> = HashMap::new();
             let mut transformed_any_loop = false;
 
-            for &b_id in &loop_blocks {
-                if let Some(block) = func.get_block_mut(b_id) {
-                    let mut new_instructions = Vec::with_capacity(block.instructions.len());
-                    let mut inlined_in_block = false;
+            for block in &mut func.blocks {
+                if !loop_blocks.contains(&block.id) {
+                    continue;
+                }
+                let mut new_instructions = Vec::with_capacity(block.instructions.len());
+                let mut inlined_in_block = false;
 
-                    for inst in block.instructions.drain(..) {
-                        if let (Some(res), ValueExpr::CallDirect { name, args }) =
-                            (inst.result, &inst.expr)
-                        {
-                            if *name != caller_name {
-                                if let Some(target) = candidates.get(name) {
-                                    // 1. Map callee parameters to argument values
-                                    let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
-                                    for (p_idx, param) in target.params.iter().enumerate() {
-                                        if let Some(&arg_val) = args.get(p_idx) {
-                                            let resolved = func_subst
-                                                .get(&arg_val)
-                                                .copied()
-                                                .unwrap_or(arg_val);
-                                            subst.insert(param.val, resolved);
-                                        }
+                for inst in block.instructions.drain(..) {
+                    if let (Some(res), ValueExpr::CallDirect { name, args }) =
+                        (inst.result, &inst.expr)
+                    {
+                        if *name != caller_name {
+                            if let Some(target) = candidates.get(name) {
+                                // 1. Map callee parameters to argument values
+                                let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
+                                for (p_idx, param) in target.params.iter().enumerate() {
+                                    if let Some(&arg_val) = args.get(p_idx) {
+                                        let resolved =
+                                            func_subst.get(&arg_val).copied().unwrap_or(arg_val);
+                                        subst.insert(param.val, resolved);
                                     }
-
-                                    // 2. Clone and inline callee instructions
-                                    for target_inst in &target.blocks[0].instructions {
-                                        let mut cloned = target_inst.clone();
-                                        let fresh_val = ValueId(next_val);
-                                        next_val += 1;
-
-                                        if let Some(orig_res) = cloned.result {
-                                            subst.insert(orig_res, fresh_val);
-                                            cloned.result = Some(fresh_val);
-                                        }
-
-                                        SroaPass::substitute_instruction_operands(
-                                            &mut cloned,
-                                            &subst,
-                                        );
-                                        new_instructions.push(cloned);
-                                    }
-
-                                    // 3. Map return value to replace the CallDirect result
-                                    if let Some(Terminator::Return(Some(ret_val))) =
-                                        &target.blocks[0].terminator
-                                    {
-                                        let actual_ret =
-                                            subst.get(ret_val).copied().unwrap_or(*ret_val);
-                                        func_subst.insert(res, actual_ret);
-                                    } else {
-                                        // Callee returns Unit
-                                        let unit_val = ValueId(next_val);
-                                        next_val += 1;
-                                        new_instructions.push(Instruction::new(
-                                            Some(unit_val),
-                                            ValueExpr::Constant(ConstantValue::Unit),
-                                            inst.span,
-                                        ));
-                                        func_subst.insert(res, unit_val);
-                                    }
-
-                                    self.stats.pure_calls_inlined_in_loops += 1;
-                                    inlined_in_block = true;
-                                    continue;
                                 }
+
+                                // 2. Clone and inline callee instructions
+                                for target_inst in &target.blocks[0].instructions {
+                                    let mut cloned = target_inst.clone();
+                                    let fresh_val = ValueId(next_val);
+                                    next_val += 1;
+
+                                    if let Some(orig_res) = cloned.result {
+                                        subst.insert(orig_res, fresh_val);
+                                        cloned.result = Some(fresh_val);
+                                    }
+
+                                    SroaPass::substitute_instruction_operands(&mut cloned, &subst);
+                                    new_instructions.push(cloned);
+                                }
+
+                                // 3. Map return value to replace the CallDirect result
+                                if let Some(Terminator::Return(Some(ret_val))) =
+                                    &target.blocks[0].terminator
+                                {
+                                    let actual_ret =
+                                        subst.get(ret_val).copied().unwrap_or(*ret_val);
+                                    func_subst.insert(res, actual_ret);
+                                } else {
+                                    // Callee returns Unit
+                                    let unit_val = ValueId(next_val);
+                                    next_val += 1;
+                                    new_instructions.push(Instruction::new(
+                                        Some(unit_val),
+                                        ValueExpr::Constant(ConstantValue::Unit),
+                                        inst.span,
+                                    ));
+                                    func_subst.insert(res, unit_val);
+                                }
+
+                                self.stats.pure_calls_inlined_in_loops += 1;
+                                inlined_in_block = true;
+                                continue;
                             }
                         }
-
-                        let mut remaining_inst = inst;
-                        SroaPass::substitute_instruction_operands(&mut remaining_inst, &func_subst);
-                        new_instructions.push(remaining_inst);
                     }
 
-                    block.instructions = new_instructions;
-                    if inlined_in_block {
-                        transformed_any_loop = true;
-                    }
+                    let mut remaining_inst = inst;
+                    SroaPass::substitute_instruction_operands(&mut remaining_inst, &func_subst);
+                    new_instructions.push(remaining_inst);
+                }
+
+                block.instructions = new_instructions;
+                if inlined_in_block {
+                    transformed_any_loop = true;
                 }
             }
 

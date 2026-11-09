@@ -491,6 +491,44 @@ int8_t ifa_rt_string_eq(const char* a, const char* b) {
     return strcmp(a, b) == 0 ? 1 : 0;
 }
 
+int64_t ifa_rt_string_len(const char* s) {
+    if (!s) return 0;
+    int64_t count = 0;
+    const unsigned char* p = (const unsigned char*)s;
+    while (*p) {
+        if ((*p & 0xC0) != 0x80) {
+            count++;
+        }
+        p++;
+    }
+    return count;
+}
+
+int64_t ifa_rt_string_char_at(const char* s, int64_t index) {
+    if (!s || index < 0) return -1;
+    const unsigned char* p = (const unsigned char*)s;
+    int64_t cur = 0;
+    while (*p) {
+        if ((*p & 0xC0) != 0x80) {
+            if (cur == index) {
+                if (*p < 0x80) {
+                    return *p;
+                } else if ((*p & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+                    return ((p[0] & 0x1F) << 6) | (p[1] & 0x3F);
+                } else if ((*p & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+                    return ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+                } else if ((*p & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
+                    return ((p[0] & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+                }
+                return *p;
+            }
+            cur++;
+        }
+        p++;
+    }
+    return -1;
+}
+
 const char* ifa_rt_version_string(void) {
     return "IFA Runtime 0.1.0 (Zero-GC Generational Concurrency)";
 }

@@ -2161,6 +2161,47 @@ impl<'a> FirInterpreter<'a> {
                     Ok(FirValue::Unit)
                 } else if fn_name == "new" || fn_name == "List::new" {
                     Ok(FirValue::Array(Vec::new()))
+                } else if fn_name == "string_len" || fn_name == "String::len" {
+                    if let Some(arg) = evaluated_args.first() {
+                        match arg {
+                            FirValue::String(s) => Ok(FirValue::Int(s.chars().count() as i128)),
+                            _ => Ok(FirValue::Int(0)),
+                        }
+                    } else {
+                        Ok(FirValue::Int(0))
+                    }
+                } else if fn_name == "string_char_at" || fn_name == "String::char_at" {
+                    if evaluated_args.len() >= 2 {
+                        let s = match &evaluated_args[0] {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        };
+                        let idx = match evaluated_args[1] {
+                            FirValue::Int(i) => i as i64,
+                            _ => -1,
+                        };
+                        if idx < 0 {
+                            Ok(FirValue::Int(-1))
+                        } else {
+                            match s.chars().nth(idx as usize) {
+                                Some(c) => Ok(FirValue::Int(c as i128)),
+                                None => Ok(FirValue::Int(-1)),
+                            }
+                        }
+                    } else {
+                        Ok(FirValue::Int(-1))
+                    }
+                } else if fn_name == "fs::read_to_string" || fn_name == "read_to_string" {
+                    if let Some(arg) = evaluated_args.first() {
+                        let path = match arg {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        };
+                        let content = std::fs::read_to_string(path).unwrap_or_default();
+                        Ok(FirValue::String(content))
+                    } else {
+                        Ok(FirValue::String(String::new()))
+                    }
                 } else if let Some(target_func) = self.find_function(&fn_name) {
                     // Direct function call to another FIR function in module
                     let func_clone = target_func.clone();

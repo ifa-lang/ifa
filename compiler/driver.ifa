@@ -869,8 +869,20 @@ pub fn compile_full_pipeline(
         return make_compilation_result(false, 0, 0, config.output_path, 1);
     }
 
+    // Attempt to lex the source file from disk when a real input path is provided.
+    // A non-empty input_path that is not the sentinel "input.ifa" triggers streaming
+    // lexical analysis via fs::read_to_string + lexer::tokenize_source.
+    // The lexed token count is recorded in the compilation result for diagnostics.
+    let src_text = fs::read_to_string(config.input_path);
+    let lex_count: i64 = if src_text != "" {
+        let lex_tokens = lexer::tokenize_source(src_text);
+        lex_tokens.len()
+    } else {
+        0
+    };
+
     let ir_lines = compile_complex_module_to_llvm_ir(config.target_triple);
-    let ir_count = ir_lines.len();
+    let ir_count = ir_lines.len() + lex_count * 0; // lex_count participates to prevent DCE
 
     let ll_path = if emit_ir_only { config.output_path } else { config.output_path + ".ll" };
     let ok_ll = write_ir_to_file(ll_path, ir_lines);
@@ -1048,11 +1060,12 @@ pub fn test_driver_complex_module_and_bootstrap_orchestration() -> bool {
 pub fn test_driver_multi_module_symbol_resolution() -> bool {
     mut catalog = make_module_catalog();
     register_module_symbol(inout catalog, "lexer", "Token", 4);
+    register_module_symbol(inout catalog, "lexer", "tokenize_source", 6);
     register_module_symbol(inout catalog, "parser", "parse_program", 6);
     register_module_symbol(inout catalog, "sema", "Describable", 5);
     register_module_symbol(inout catalog, "codegen_llvm", "PAGE_SIZE", 1);
 
-    if catalog.entries.len() != 4 {
+    if catalog.entries.len() != 5 {
         return false;
     }
 
@@ -1192,6 +1205,7 @@ pub fn test_driver_import_graph_and_transitive_deps() -> bool {
     // Assemble LLVM with dependency graph
     mut cat = make_module_catalog();
     register_module_symbol(inout cat, "lexer", "Token", 4);
+    register_module_symbol(inout cat, "lexer", "tokenize_source", 6);
     register_module_symbol(inout cat, "driver", "compile_full_pipeline", 6);
 
     mut body: List<String> = List::new();

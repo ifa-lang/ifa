@@ -1200,6 +1200,52 @@ impl SymbolTable {
                 span: dummy,
             },
         );
+
+        // Global string intrinsics: string_len, string_char_at
+        let str_sym = INTERNER.intern("s");
+        let idx_sym2 = INTERNER.intern("index");
+        let string_len_sym = INTERNER.intern("string_len");
+        let string_char_at_sym = INTERNER.intern("string_char_at");
+        let _ = self.define_function(FunctionSymbol {
+            name: string_len_sym,
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: str_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: string_char_at_sym,
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: str_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: idx_sym2,
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
     }
 
     pub fn enter_scope(&mut self, is_loop: bool, is_function_root: bool) {

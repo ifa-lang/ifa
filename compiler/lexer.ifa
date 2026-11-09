@@ -698,6 +698,450 @@ pub fn test_lexer_if_else() -> bool {
     return true;
 }
 
+// --- Streaming Source Lexer ---
+//
+// tokenize_source(src: String) -> List<Token>
+//
+// Performs a full character-by-character scan of a raw IFA source string and
+// produces a deterministic token stream.  The function is used by the driver to
+// lex source files read from disk with `fs::read_to_string`.
+//
+// Character code constants (ASCII):
+//   space=32, tab=9, CR=13, LF=10
+//   '0'=48 … '9'=57
+//   'A'=65 … 'Z'=90
+//   'a'=97 … 'z'=122
+//   '_'=95
+//   '"'=34   '\''=39   '/'=47   '*'=42   '\n'=10
+//   '!'=33   '$'=36   '#'=35   '@'=64   '`'=96
+//
+// Token kind encoding matches the hand-built tokenizers above.
+
+/// Return true when `c` is a decimal digit (0-9).
+fn is_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+/// Return true when `c` is a valid first character of an identifier (letter or '_').
+fn is_alpha(c: i64) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+/// Return true when `c` is a valid non-first character of an identifier.
+fn is_alnum(c: i64) -> bool {
+    return is_alpha(c) || is_digit(c);
+}
+
+/// Return the token kind for a known keyword string, or 10 (Ident) if unknown.
+fn keyword_kind(word: String) -> i64 {
+    if word == "fn"      { return 1; }
+    if word == "let"     { return 2; }
+    if word == "mut"     { return 3; }
+    if word == "return"  { return 4; }
+    if word == "inout"   { return 5; }
+    if word == "in"      { return 6; }
+    if word == "sink"    { return 7; }
+    if word == "impl"    { return 8; }
+    if word == "struct"  { return 9; }
+    if word == "trait"   { return 9; }
+    if word == "for"     { return 14; }
+    if word == "pub"     { return 15; }
+    if word == "self"    { return 16; }
+    if word == "type"    { return 17; }
+    if word == "arena"   { return 18; }
+    if word == "const"   { return 19; }
+    if word == "enum"    { return 26; }
+    if word == "while"   { return 27; }
+    if word == "if"      { return 28; }
+    if word == "else"    { return 29; }
+    if word == "match"   { return 13; }
+    if word == "macro"   { return 51; }
+    if word == "comptime" { return 52; }
+    if word == "true"    { return 11; }
+    if word == "false"   { return 11; }
+    return 10;
+}
+
+/// Build a single-character string from an ASCII codepoint.
+/// Returns an empty string for codepoints outside printable ASCII.
+fn char_to_string(c: i64) -> String {
+    // Map codepoint to a precomputed single-char string.
+    // We cover the full printable ASCII range 32-126 plus common escapes.
+    if c == 32  { return " "; }
+    if c == 10  { return "\n"; }
+    if c == 9   { return "\t"; }
+    if c == 13  { return "\r"; }
+    if c == 33  { return "!"; }
+    if c == 34  { return "\""; }
+    if c == 35  { return "#"; }
+    if c == 36  { return "$"; }
+    if c == 37  { return "%"; }
+    if c == 38  { return "&"; }
+    if c == 39  { return "'"; }
+    if c == 40  { return "("; }
+    if c == 41  { return ")"; }
+    if c == 42  { return "*"; }
+    if c == 43  { return "+"; }
+    if c == 44  { return ","; }
+    if c == 45  { return "-"; }
+    if c == 46  { return "."; }
+    if c == 47  { return "/"; }
+    if c == 48  { return "0"; }
+    if c == 49  { return "1"; }
+    if c == 50  { return "2"; }
+    if c == 51  { return "3"; }
+    if c == 52  { return "4"; }
+    if c == 53  { return "5"; }
+    if c == 54  { return "6"; }
+    if c == 55  { return "7"; }
+    if c == 56  { return "8"; }
+    if c == 57  { return "9"; }
+    if c == 58  { return ":"; }
+    if c == 59  { return ";"; }
+    if c == 60  { return "<"; }
+    if c == 61  { return "="; }
+    if c == 62  { return ">"; }
+    if c == 63  { return "?"; }
+    if c == 64  { return "@"; }
+    if c == 65  { return "A"; }
+    if c == 66  { return "B"; }
+    if c == 67  { return "C"; }
+    if c == 68  { return "D"; }
+    if c == 69  { return "E"; }
+    if c == 70  { return "F"; }
+    if c == 71  { return "G"; }
+    if c == 72  { return "H"; }
+    if c == 73  { return "I"; }
+    if c == 74  { return "J"; }
+    if c == 75  { return "K"; }
+    if c == 76  { return "L"; }
+    if c == 77  { return "M"; }
+    if c == 78  { return "N"; }
+    if c == 79  { return "O"; }
+    if c == 80  { return "P"; }
+    if c == 81  { return "Q"; }
+    if c == 82  { return "R"; }
+    if c == 83  { return "S"; }
+    if c == 84  { return "T"; }
+    if c == 85  { return "U"; }
+    if c == 86  { return "V"; }
+    if c == 87  { return "W"; }
+    if c == 88  { return "X"; }
+    if c == 89  { return "Y"; }
+    if c == 90  { return "Z"; }
+    if c == 91  { return "["; }
+    if c == 92  { return "\\"; }
+    if c == 93  { return "]"; }
+    if c == 94  { return "^"; }
+    if c == 95  { return "_"; }
+    if c == 96  { return "`"; }
+    if c == 97  { return "a"; }
+    if c == 98  { return "b"; }
+    if c == 99  { return "c"; }
+    if c == 100 { return "d"; }
+    if c == 101 { return "e"; }
+    if c == 102 { return "f"; }
+    if c == 103 { return "g"; }
+    if c == 104 { return "h"; }
+    if c == 105 { return "i"; }
+    if c == 106 { return "j"; }
+    if c == 107 { return "k"; }
+    if c == 108 { return "l"; }
+    if c == 109 { return "m"; }
+    if c == 110 { return "n"; }
+    if c == 111 { return "o"; }
+    if c == 112 { return "p"; }
+    if c == 113 { return "q"; }
+    if c == 114 { return "r"; }
+    if c == 115 { return "s"; }
+    if c == 116 { return "t"; }
+    if c == 117 { return "u"; }
+    if c == 118 { return "v"; }
+    if c == 119 { return "w"; }
+    if c == 120 { return "x"; }
+    if c == 121 { return "y"; }
+    if c == 122 { return "z"; }
+    if c == 123 { return "{"; }
+    if c == 124 { return "|"; }
+    if c == 125 { return "}"; }
+    if c == 126 { return "~"; }
+    return "";
+}
+
+/// Full deterministic source-level tokenizer.
+///
+/// Accepts the entire source text of an IFA module as a `String` and returns
+/// a `List<Token>` using the same kind/value/lexeme encoding as the hand-built
+/// tokenizers.  Whitespace and line comments (`//`) are silently skipped.
+/// Block comments (`/* … */`) are also consumed without emitting tokens.
+pub fn tokenize_source(src: String) -> List<Token> {
+    mut tokens: List<Token> = List::new();
+    let n = string_len(src);
+    mut i: i64 = 0;
+
+    while i < n {
+        let c = string_char_at(src, i);
+
+        // --- Skip whitespace ---
+        if c == 32 || c == 9 || c == 13 || c == 10 {
+            i = i + 1;
+        } else {
+            // --- Line comment: // ---
+            if c == 47 {
+                let c2 = string_char_at(src, i + 1);
+                if c2 == 47 {
+                    // Skip until end of line
+                    i = i + 2;
+                    while i < n && string_char_at(src, i) != 10 {
+                        i = i + 1;
+                    }
+                } else {
+                    // Block comment: /*
+                    if c2 == 42 {
+                        i = i + 2;
+                        mut in_bcomment: bool = true;
+                        while i < n && in_bcomment {
+                            let bc = string_char_at(src, i);
+                            if bc == 42 && string_char_at(src, i + 1) == 47 {
+                                i = i + 2;
+                                in_bcomment = false;
+                            } else {
+                                i = i + 1;
+                            }
+                        }
+                    } else {
+                        // Division operator
+                        advance_token(inout tokens, 23, 0, "/");
+                        i = i + 1;
+                    }
+                }
+            } else {
+                // --- Integer literal ---
+                if is_digit(c) {
+                    mut num_val: i64 = 0;
+                    mut num_lex: String = "";
+                    while i < n && is_digit(string_char_at(src, i)) {
+                        let d = string_char_at(src, i);
+                        num_val = num_val * 10 + (d - 48);
+                        num_lex = num_lex + char_to_string(d);
+                        i = i + 1;
+                    }
+                    advance_token(inout tokens, 11, num_val, num_lex);
+                } else {
+                    // --- Identifier or keyword ---
+                    if is_alpha(c) {
+                        mut word: String = "";
+                        while i < n && is_alnum(string_char_at(src, i)) {
+                            word = word + char_to_string(string_char_at(src, i));
+                            i = i + 1;
+                        }
+                        let kk = keyword_kind(word);
+                        let kv: i64 = if word == "true" { 1 } else { 0 };
+                        advance_token(inout tokens, kk, kv, word);
+                    } else {
+                        // --- String literal ---
+                        if c == 34 {
+                            mut sl: String = "";
+                            i = i + 1; // consume opening quote
+                            while i < n && string_char_at(src, i) != 34 {
+                                let sc = string_char_at(src, i);
+                                // Simple backslash escape pass-through
+                                if sc == 92 && i + 1 < n {
+                                    i = i + 1;
+                                    let esc = string_char_at(src, i);
+                                    if esc == 110 { sl = sl + "\n"; }
+                                    if esc == 116 { sl = sl + "\t"; }
+                                    if esc == 114 { sl = sl + "\r"; }
+                                    if esc == 34  { sl = sl + "\""; }
+                                    if esc == 92  { sl = sl + "\\"; }
+                                } else {
+                                    sl = sl + char_to_string(sc);
+                                }
+                                i = i + 1;
+                            }
+                            i = i + 1; // consume closing quote
+                            advance_token(inout tokens, 12, 0, sl);
+                        } else {
+                            // --- Operators and punctuation ---
+                            if c == 40 { advance_token(inout tokens, 30, 0, "("); i = i + 1; }
+                            if c == 41 { advance_token(inout tokens, 31, 0, ")"); i = i + 1; }
+                            if c == 123 { advance_token(inout tokens, 32, 0, "{"); i = i + 1; }
+                            if c == 125 { advance_token(inout tokens, 33, 0, "}"); i = i + 1; }
+                            if c == 91  { advance_token(inout tokens, 37, 0, "["); i = i + 1; }
+                            if c == 93  { advance_token(inout tokens, 38, 0, "]"); i = i + 1; }
+                            if c == 59  { advance_token(inout tokens, 35, 0, ";"); i = i + 1; }
+                            if c == 44  { advance_token(inout tokens, 39, 0, ","); i = i + 1; }
+                            if c == 36  { advance_token(inout tokens, 53, 0, "$"); i = i + 1; }
+                            if c == 95  { advance_token(inout tokens, 10, 0, "_"); i = i + 1; }
+                            // Colon / double-colon
+                            if c == 58 {
+                                let nc = string_char_at(src, i + 1);
+                                if nc == 58 {
+                                    advance_token(inout tokens, 34, 0, "::");
+                                    i = i + 2;
+                                } else {
+                                    advance_token(inout tokens, 34, 0, ":");
+                                    i = i + 1;
+                                }
+                            }
+                            // = or ==
+                            if c == 61 {
+                                let nc = string_char_at(src, i + 1);
+                                if nc == 61 {
+                                    advance_token(inout tokens, 40, 0, "==");
+                                    i = i + 2;
+                                } else {
+                                    if nc == 62 {
+                                        advance_token(inout tokens, 25, 0, "=>");
+                                        i = i + 2;
+                                    } else {
+                                        advance_token(inout tokens, 24, 0, "=");
+                                        i = i + 1;
+                                    }
+                                }
+                            }
+                            // ! or !=
+                            if c == 33 {
+                                let nc = string_char_at(src, i + 1);
+                                if nc == 61 {
+                                    advance_token(inout tokens, 41, 0, "!=");
+                                    i = i + 2;
+                                } else {
+                                    advance_token(inout tokens, 50, 0, "!");
+                                    i = i + 1;
+                                }
+                            }
+                            // < or <=
+                            if c == 60 {
+                                let nc = string_char_at(src, i + 1);
+                                if nc == 61 {
+                                    advance_token(inout tokens, 43, 0, "<=");
+                                    i = i + 2;
+                                } else {
+                                    advance_token(inout tokens, 42, 0, "<");
+                                    i = i + 1;
+                                }
+                            }
+                            // > or >=
+                            if c == 62 {
+                                let nc = string_char_at(src, i + 1);
+                                if nc == 61 {
+                                    advance_token(inout tokens, 45, 0, ">=");
+                                    i = i + 2;
+                                } else {
+                                    advance_token(inout tokens, 44, 0, ">");
+                                    i = i + 1;
+                                }
+                            }
+                            // + operator
+                            if c == 43 { advance_token(inout tokens, 20, 0, "+"); i = i + 1; }
+                            // - or ->
+                            if c == 45 {
+                                let nc = string_char_at(src, i + 1);
+                                if nc == 62 {
+                                    advance_token(inout tokens, 36, 0, "->");
+                                    i = i + 2;
+                                } else {
+                                    advance_token(inout tokens, 21, 0, "-");
+                                    i = i + 1;
+                                }
+                            }
+                            // * operator
+                            if c == 42 { advance_token(inout tokens, 22, 0, "*"); i = i + 1; }
+                            // & or &&
+                            if c == 38 {
+                                let nc = string_char_at(src, i + 1);
+                                if nc == 38 {
+                                    advance_token(inout tokens, 46, 0, "&&");
+                                    i = i + 2;
+                                } else {
+                                    advance_token(inout tokens, 48, 0, "&");
+                                    i = i + 1;
+                                }
+                            }
+                            // | or ||
+                            if c == 124 {
+                                let nc = string_char_at(src, i + 1);
+                                if nc == 124 {
+                                    advance_token(inout tokens, 47, 0, "||");
+                                    i = i + 2;
+                                } else {
+                                    advance_token(inout tokens, 49, 0, "|");
+                                    i = i + 1;
+                                }
+                            }
+                            // Skip unknown character (@ # ` etc.)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // EOF sentinel
+    advance_token(inout tokens, 0, 0, "");
+    return tokens;
+}
+
+// Unit test: tokenize_source correctly scans a minimal IFA snippet
+pub fn test_tokenize_source_basic() -> bool {
+    // Input: `fn add(x: i64) -> i64 { return x; }`
+    let src = "fn add(x: i64) -> i64 { return x; }";
+    let tokens = tokenize_source(src);
+    // Expected: fn(1), add(10), ((30), x(10), :(34), i64(10), )(31), ->(36),
+    //           i64(10), {(32), return(4), x(10), ;(35), }(33), EOF(0)  = 15 tokens
+    if tokens.len() != 15 {
+        return false;
+    }
+    if tokens[0].kind != 1 || tokens[0].lexeme != "fn" {
+        return false;
+    }
+    if tokens[1].kind != 10 || tokens[1].lexeme != "add" {
+        return false;
+    }
+    if tokens[7].kind != 36 || tokens[7].lexeme != "->" {
+        return false;
+    }
+    if tokens[10].kind != 4 || tokens[10].lexeme != "return" {
+        return false;
+    }
+    if tokens[14].kind != 0 {
+        return false;
+    }
+    return true;
+}
+
+// Unit test: tokenize_source correctly scans integer literals
+pub fn test_tokenize_source_integers() -> bool {
+    let src = "let x = 42; let y = 100;";
+    let tokens = tokenize_source(src);
+    // let(2), x(10), =(24), 42(11,42), ;(35), let(2), y(10), =(24), 100(11,100), ;(35), EOF(0)
+    if tokens.len() != 11 {
+        return false;
+    }
+    if tokens[3].kind != 11 || tokens[3].value != 42 {
+        return false;
+    }
+    if tokens[8].kind != 11 || tokens[8].value != 100 {
+        return false;
+    }
+    return true;
+}
+
+// Unit test: tokenize_source skips // line comments
+pub fn test_tokenize_source_comments() -> bool {
+    let src = "// this is a comment\nfn foo() -> i64 { return 1; }";
+    let tokens = tokenize_source(src);
+    // fn(1), foo(10), ((30), )(31), ->(36), i64(10), {(32), return(4), 1(11,1), ;(35), }(33), EOF(0)
+    if tokens.len() != 12 {
+        return false;
+    }
+    if tokens[0].kind != 1 || tokens[0].lexeme != "fn" {
+        return false;
+    }
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Lexer Module ===");
     let tokens = tokenize_sample_program();
@@ -713,7 +1157,10 @@ pub fn main() {
     let t_macro = test_lexer_syntax_macros();
     let t_while = test_lexer_while_loop();
     let t_if_else = test_lexer_if_else();
-    if t_ok && t_lut && t_alias && t_tuple && t_arena && t_const && t_enum && t_comptime && t_macro && t_while && t_if_else {
+    let t_src_basic = test_tokenize_source_basic();
+    let t_src_int = test_tokenize_source_integers();
+    let t_src_cmt = test_tokenize_source_comments();
+    if t_ok && t_lut && t_alias && t_tuple && t_arena && t_const && t_enum && t_comptime && t_macro && t_while && t_if_else && t_src_basic && t_src_int && t_src_cmt {
         println("Lexer stream test: OK");
     } else {
         println("Lexer stream test: FAILED");

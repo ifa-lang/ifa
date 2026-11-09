@@ -1207,6 +1207,40 @@ pub extern "C" fn ifa_rt_fs_file_size(path: *const u8) -> u64 {
     std::fs::metadata(path_str).map(|m| m.len()).unwrap_or(0)
 }
 
+/// Return the byte-length of a null-terminated UTF-8 C string (excluding the null terminator).
+/// Returns 0 for a null pointer.
+#[no_mangle]
+pub extern "C" fn ifa_rt_string_len(s: *const u8) -> i64 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe {
+        match std::ffi::CStr::from_ptr(s as *const std::os::raw::c_char).to_str() {
+            Ok(st) => st.chars().count() as i64,
+            Err(_) => 0,
+        }
+    }
+}
+
+/// Return the Unicode scalar value (codepoint) of the character at the given index
+/// in a null-terminated UTF-8 C string.  Returns -1 on out-of-bounds or null input.
+#[no_mangle]
+pub extern "C" fn ifa_rt_string_char_at(s: *const u8, index: i64) -> i64 {
+    if s.is_null() || index < 0 {
+        return -1;
+    }
+    let st = unsafe {
+        match std::ffi::CStr::from_ptr(s as *const std::os::raw::c_char).to_str() {
+            Ok(st) => st,
+            Err(_) => return -1,
+        }
+    };
+    match st.chars().nth(index as usize) {
+        Some(c) => c as i64,
+        None => -1,
+    }
+}
+
 /// Execute an external command and return exit status code (0 for success).
 #[no_mangle]
 pub extern "C" fn ifa_rt_process_exec(cmd: *const u8, args: *const u8) -> i64 {

@@ -396,6 +396,21 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_tokenize_source_basic ... ok"),
+        "Modular lexer tokenize_source basic test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_tokenize_source_integers ... ok"),
+        "Modular lexer tokenize_source integers test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_tokenize_source_comments ... ok"),
+        "Modular lexer tokenize_source comments test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_parser_while_loop ... ok"),
         "Modular parser while loop test missing from output:\n{}",
         stdout
@@ -426,8 +441,8 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("151 passed; 0 failed"),
-        "Expected 151 passed unit tests, got:\n{}",
+        stdout.contains("157 passed; 0 failed"),
+        "Expected 157 passed unit tests, got:\n{}",
         stdout
     );
 }
