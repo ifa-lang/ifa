@@ -19,10 +19,10 @@ pub const RUNTIME_STUB_C: &str = r#"
 #include <stdint.h>
 #include <string.h>
 
-void println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } }
-void ifa_rt_println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } }
+void println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } fflush(stdout); }
+void ifa_rt_println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } fflush(stdout); }
 void ifa_rt_print(const char *s) { if (s) { fputs(s, stdout); fflush(stdout); } }
-void ifa_rt_println_i64(int64_t n) { printf("%ld\n", n); }
+void ifa_rt_println_i64(int64_t n) { printf("%ld\n", n); fflush(stdout); }
 void ifa_rt_print_i64(int64_t n) { printf("%ld", n); fflush(stdout); }
 
 typedef struct {

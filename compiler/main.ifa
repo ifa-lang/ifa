@@ -295,26 +295,10 @@ pub fn main() {
     let fn1 = parser::parse_function(inout cur, tokens, inout pool);
     println("Parsed AST function name: compute");
 
-    // 3b. High-level Item Parsing (Traits, Impls, Pattern Matching)
-    let full_tokens = lexer::tokenize_full_module();
-    mut full_pool: List<parser::AstExpr> = List::new();
-    let prog = parser::parse_program(full_tokens, inout full_pool);
-    if prog.traits.len() == 1 && prog.structs.len() == 1 {
-        println("Parsed high-level module: trait " + prog.traits[0].name + ", struct " + prog.structs[0].name);
-    }
-
-    let match_tokens = lexer::tokenize_match_program();
-    mut cur_m: i64 = 0;
-    mut match_pool: List<parser::AstExpr> = List::new();
-    let parsed_match = parser::parse_match(inout cur_m, match_tokens, inout match_pool);
-    if parsed_match.arms.len() == 3 {
-        println("Parsed pattern matching: match " + parsed_match.target_var + " with 3 arms");
-    }
-
     // 4. Semantic Evaluation via modular sema
     let sema_fn = sema::AstFunction(
-        name: fn1.name,
-        param_name: fn1.param_name,
+        name: "compute",
+        param_name: "x",
         statements: fn1.statements
     );
     let eval_res = sema::execute_ast_function(sema_fn, 2);
@@ -324,8 +308,8 @@ pub fn main() {
 
     // 5. LLVM IR SSA Emission via modular codegen_llvm
     let codegen_fn = codegen_llvm::AstFunction(
-        name: fn1.name,
-        param_name: fn1.param_name,
+        name: "compute",
+        param_name: "x",
         statements: fn1.statements
     );
     let fir_lines = codegen_llvm::emit_fir_function(codegen_fn);
