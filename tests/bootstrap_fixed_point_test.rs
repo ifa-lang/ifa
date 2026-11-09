@@ -439,7 +439,13 @@ fn test_bootstrap_triple_compilation_and_fixed_point_hash() {
     let run_gen1 = Command::new(&ifac_bin)
         .output()
         .expect("Execute Stage 1 binary");
-    assert!(run_gen1.status.success(), "Stage 1 execution failed");
+    assert!(
+        run_gen1.status.success(),
+        "Stage 1 execution failed (status: {:?}):\nstdout:\n{}\nstderr:\n{}",
+        run_gen1.status,
+        String::from_utf8_lossy(&run_gen1.stdout),
+        String::from_utf8_lossy(&run_gen1.stderr)
+    );
     let gen1_stdout = String::from_utf8_lossy(&run_gen1.stdout);
     assert!(
         gen1_stdout.contains("=== IFA Self-Hosting Compiler (Stage 1 Pure IFA) ==="),
@@ -518,7 +524,13 @@ fn test_bootstrap_triple_compilation_and_fixed_point_hash() {
     let run_gen3 = Command::new(&gen3_bin)
         .output()
         .expect("Execute Stage 3 binary");
-    assert!(run_gen3.status.success(), "Stage 3 execution failed");
+    assert!(
+        run_gen3.status.success(),
+        "Stage 3 execution failed (status: {:?}):\nstdout:\n{}\nstderr:\n{}",
+        run_gen3.status,
+        String::from_utf8_lossy(&run_gen3.stdout),
+        String::from_utf8_lossy(&run_gen3.stderr)
+    );
     let gen3_stdout = String::from_utf8_lossy(&run_gen3.stdout);
     assert!(
         gen3_stdout.contains("Self-hosting modular bootstrap validation: SUCCESS (42)"),
