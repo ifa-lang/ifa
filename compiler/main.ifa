@@ -112,7 +112,9 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     let sema_global_ok = sema::test_sema_global_symbol_table();
     let sema_chan_tc_ok = sema::test_sema_channel_type_checking();
     let sema_chan_dir_ok = sema::test_sema_channel_directionality_and_bounds();
-    if !sema_const_ok || !sema_enum_ok || !sema_global_ok || !sema_chan_tc_ok || !sema_chan_dir_ok {
+    let sema_fiber_esc_ok = sema::test_sema_fiber_escape_analysis();
+    let sema_arena_xfer_ok = sema::test_sema_arena_transfer_ownership();
+    if !sema_const_ok || !sema_enum_ok || !sema_global_ok || !sema_chan_tc_ok || !sema_chan_dir_ok || !sema_fiber_esc_ok || !sema_arena_xfer_ok {
         return false;
     }
 
@@ -151,8 +153,10 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     let fiber_cg_ok = codegen_llvm::test_codegen_fiber_spawn_and_yield();
     let chan_cg_ok = codegen_llvm::test_codegen_channel_operations();
     let select_cg_ok = codegen_llvm::test_codegen_channel_select();
+    let select_timed_cg_ok = codegen_llvm::test_codegen_timed_and_prioritized_channel_select();
+    let nursery_cg_ok = codegen_llvm::test_codegen_task_nursery_concurrency();
     let driver_mm_ok = driver::test_driver_multi_module_symbol_resolution();
-    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok || !fn_ptr_cg_ok || !thunk_cg_ok || !fiber_cg_ok || !chan_cg_ok || !select_cg_ok || !driver_mm_ok {
+    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok || !fn_ptr_cg_ok || !thunk_cg_ok || !fiber_cg_ok || !chan_cg_ok || !select_cg_ok || !select_timed_cg_ok || !nursery_cg_ok || !driver_mm_ok {
         return false;
     }
 

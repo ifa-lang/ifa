@@ -796,6 +796,142 @@ pub fn validate_channel_recv(
     return false;
 }
 
+// Fiber inter-task escape analysis and ephemeral arena ownership transfer
+pub struct FiberArenaBinding {
+    var_name: String,
+    var_type: String,
+    arena_name: String,
+    arena_id: i64,
+    fiber_id: i64,
+    is_ephemeral: bool,
+    is_transferred: bool
+}
+
+pub struct FiberArenaTransfer {
+    arena_id: i64,
+    target_fiber_id: i64
+}
+
+pub struct FiberEscapeTable {
+    bindings: List<FiberArenaBinding>,
+    transfers: List<FiberArenaTransfer>
+}
+
+pub fn make_fiber_escape_table() -> FiberEscapeTable {
+    return FiberEscapeTable(
+        bindings: List::new(),
+        transfers: List::new()
+    );
+}
+
+pub fn bind_fiber_arena(
+    inout table: FiberEscapeTable,
+    var_name: String,
+    var_type: String,
+    arena_name: String,
+    arena_id: i64,
+    fiber_id: i64,
+    is_ephemeral: bool
+) {
+    table.bindings.push(FiberArenaBinding(
+        var_name: var_name,
+        var_type: var_type,
+        arena_name: arena_name,
+        arena_id: arena_id,
+        fiber_id: fiber_id,
+        is_ephemeral: is_ephemeral,
+        is_transferred: false
+    ));
+}
+
+// Transfers arena ownership to target fiber ID, validating ifa_rt_arena_transfer_owner
+pub fn transfer_arena_ownership(
+    inout table: FiberEscapeTable,
+    arena_id: i64,
+    target_fiber_id: i64
+) -> bool {
+    if arena_id == 0 {
+        return false;
+    }
+    mut found = false;
+    mut i: i64 = 0;
+    while i < table.bindings.len() {
+        if table.bindings[i].arena_id == arena_id {
+            found = true;
+        }
+        i = i + 1;
+    }
+    if !found {
+        return false;
+    }
+    table.transfers.push(FiberArenaTransfer(
+        arena_id: arena_id,
+        target_fiber_id: target_fiber_id
+    ));
+    return true;
+}
+
+// Verifies if sending var_name from its current fiber to target_fiber_id is safe:
+// Returns:
+//  1: Safe - global arena or value type without ephemeral arena references
+//  2: Safe - arena ownership transferred to target fiber
+//  0: Escape Error - ephemeral arena reference crosses fiber boundary without ownership transfer
+// -1: Variable not found
+pub fn verify_fiber_escape(
+    table: FiberEscapeTable,
+    var_name: String,
+    target_fiber_id: i64
+) -> i64 {
+    mut i: i64 = 0;
+    while i < table.bindings.len() {
+        let b = table.bindings[i];
+        if b.var_name == var_name {
+            if b.arena_id == 0 || !b.is_ephemeral {
+                return 1;
+            }
+            mut is_xfer = false;
+            mut xfer_target: i64 = -1;
+            mut t: i64 = 0;
+            while t < table.transfers.len() {
+                if table.transfers[t].arena_id == b.arena_id {
+                    is_xfer = true;
+                    xfer_target = table.transfers[t].target_fiber_id;
+                }
+                t = t + 1;
+            }
+            if is_xfer && xfer_target == target_fiber_id {
+                return 2;
+            }
+            if b.fiber_id == target_fiber_id {
+                return 1;
+            }
+            return 0;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Validates whether argument var can be safely passed to spawned fiber
+pub fn validate_fiber_spawn_arg(
+    table: FiberEscapeTable,
+    arg_var: String,
+    target_fiber_id: i64
+) -> bool {
+    let status = verify_fiber_escape(table, arg_var, target_fiber_id);
+    return status == 1 || status == 2;
+}
+
+// Validates whether message var sent through a channel escapes its fiber boundary
+pub fn validate_channel_send_escape(
+    table: FiberEscapeTable,
+    val_var: String,
+    target_fiber_id: i64
+) -> bool {
+    let status = verify_fiber_escape(table, val_var, target_fiber_id);
+    return status == 1 || status == 2;
+}
+
 // Unified Global Symbol Table aggregating multi-file program symbols
 pub struct GlobalSymbolTable {
     type_aliases: TypeAliasTable,
@@ -803,7 +939,8 @@ pub struct GlobalSymbolTable {
     enums: EnumSymbolTable,
     structs: StructSymbolTable,
     traits: TraitSymbolTable,
-    channels: ChannelSymbolTable
+    channels: ChannelSymbolTable,
+    fiber_escapes: FiberEscapeTable
 }
 
 pub fn make_global_symbol_table() -> GlobalSymbolTable {
@@ -813,7 +950,8 @@ pub fn make_global_symbol_table() -> GlobalSymbolTable {
         enums: make_enum_table(),
         structs: make_struct_table(),
         traits: make_trait_table(),
-        channels: make_channel_table()
+        channels: make_channel_table(),
+        fiber_escapes: make_fiber_escape_table()
     );
 }
 
@@ -881,6 +1019,15 @@ pub fn test_sema_global_symbol_table() -> bool {
         return false;
     }
     if get_channel_elem_type(global_table.channels, "work_queue") != "i64" {
+        return false;
+    }
+
+    // 7. Fiber escape table
+    bind_fiber_arena(inout global_table.fiber_escapes, "task_state", "ptr", "fiber_arena", 10, 1, true);
+    if verify_fiber_escape(global_table.fiber_escapes, "task_state", 1) != 1 {
+        return false;
+    }
+    if verify_fiber_escape(global_table.fiber_escapes, "task_state", 2) != 0 {
         return false;
     }
 
@@ -957,6 +1104,87 @@ pub fn test_sema_channel_directionality_and_bounds() -> bool {
     return true;
 }
 
+// Unit test 13: Fiber inter-task escape analysis
+pub fn test_sema_fiber_escape_analysis() -> bool {
+    mut table = make_fiber_escape_table();
+    // Scalar or global arena binding (arena_id == 0, is_ephemeral == false)
+    bind_fiber_arena(inout table, "global_counter", "i64", "global", 0, 1, false);
+    // Ephemeral local arena reference bound to fiber 1
+    bind_fiber_arena(inout table, "ephemeral_buf", "ptr", "fiber1_local", 42, 1, true);
+
+    // Global variable is safe across any fiber
+    let global_ok = verify_fiber_escape(table, "global_counter", 2);
+    if global_ok != 1 {
+        return false;
+    }
+
+    // Ephemeral buffer is safe within same fiber 1
+    let local_same_ok = verify_fiber_escape(table, "ephemeral_buf", 1);
+    if local_same_ok != 1 {
+        return false;
+    }
+
+    // Ephemeral buffer escapes when crossing to fiber 2 without transfer
+    let local_escape_err = verify_fiber_escape(table, "ephemeral_buf", 2);
+    if local_escape_err != 0 {
+        return false;
+    }
+
+    // Helper functions conformance
+    let spawn_arg_safe = validate_fiber_spawn_arg(table, "global_counter", 2);
+    let spawn_arg_unsafe = validate_fiber_spawn_arg(table, "ephemeral_buf", 2);
+    if !spawn_arg_safe || spawn_arg_unsafe {
+        return false;
+    }
+
+    let chan_send_safe = validate_channel_send_escape(table, "global_counter", 2);
+    let chan_send_unsafe = validate_channel_send_escape(table, "ephemeral_buf", 2);
+    if !chan_send_safe || chan_send_unsafe {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit test 14: Ephemeral arena ownership transfer across fibers
+pub fn test_sema_arena_transfer_ownership() -> bool {
+    mut table = make_fiber_escape_table();
+    bind_fiber_arena(inout table, "batch_result", "ptr", "ephemeral_arena", 101, 1, true);
+
+    // Prior to transfer, passing to fiber 2 is prohibited
+    let before_transfer = verify_fiber_escape(table, "batch_result", 2);
+    if before_transfer != 0 {
+        return false;
+    }
+
+    // Attempt transfer on non-existent arena (0) fails
+    let zero_res = transfer_arena_ownership(inout table, 0, 2);
+    if zero_res {
+        return false;
+    }
+
+    // Transfer ownership of arena 101 to fiber 2
+    let transfer_res = transfer_arena_ownership(inout table, 101, 2);
+    if !transfer_res {
+        return false;
+    }
+
+    // Post transfer, accessing from fiber 2 is now valid (code 2)
+    let after_transfer = verify_fiber_escape(table, "batch_result", 2);
+    if after_transfer != 2 {
+        return false;
+    }
+
+    // Spawn arg and channel validation reflect transfer
+    let spawn_after_ok = validate_fiber_spawn_arg(table, "batch_result", 2);
+    let chan_after_ok = validate_channel_send_escape(table, "batch_result", 2);
+    if !spawn_after_ok || !chan_after_ok {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
@@ -971,7 +1199,9 @@ pub fn main() {
     let t10 = test_sema_global_symbol_table();
     let t11 = test_sema_channel_type_checking();
     let t12 = test_sema_channel_directionality_and_bounds();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 {
+    let t13 = test_sema_fiber_escape_analysis();
+    let t14 = test_sema_arena_transfer_ownership();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");

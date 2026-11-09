@@ -103,6 +103,10 @@ pub fn assemble_full_llvm_module(func_lines: List<String>, target_triple: String
     full_module.push("declare i32 @ifa_rt_channel_recv(ptr, ptr)");
     full_module.push("declare void @ifa_rt_channel_close(ptr)");
     full_module.push("declare i64 @ifa_rt_channel_select(ptr, i64, i32)");
+    full_module.push("declare i64 @ifa_rt_channel_select_timed(ptr, ptr, i64, i64, i32)");
+    full_module.push("declare i64 @ifa_rt_fiber_spawn_with_arena(ptr, ptr)");
+    full_module.push("declare i32 @ifa_rt_arena_transfer_owner(i16, i64)");
+    full_module.push("declare i32 @ifa_rt_arena_verify_owner(i16, i64)");
     full_module.push("");
 
     mut i: i64 = 0;
@@ -458,7 +462,7 @@ pub fn test_driver_full_module_assembly() -> bool {
     fn_lines.push("}");
 
     let full_ir = assemble_full_llvm_module(fn_lines, "x86_64-unknown-linux-gnu");
-    if full_ir.len() != 35 {
+    if full_ir.len() != 39 {
         return false;
     }
     if full_ir[6] != "declare void @ifa_rt_println(ptr)" {
@@ -485,10 +489,22 @@ pub fn test_driver_full_module_assembly() -> bool {
     if full_ir[29] != "declare i64 @ifa_rt_channel_select(ptr, i64, i32)" {
         return false;
     }
+    if full_ir[30] != "declare i64 @ifa_rt_channel_select_timed(ptr, ptr, i64, i64, i32)" {
+        return false;
+    }
+    if full_ir[31] != "declare i64 @ifa_rt_fiber_spawn_with_arena(ptr, ptr)" {
+        return false;
+    }
+    if full_ir[32] != "declare i32 @ifa_rt_arena_transfer_owner(i16, i64)" {
+        return false;
+    }
+    if full_ir[33] != "declare i32 @ifa_rt_arena_verify_owner(i16, i64)" {
+        return false;
+    }
     if full_ir[18] != "declare ptr @ifa_rt_args_get(i64)" {
         return false;
     }
-    return full_ir[34] == "}";
+    return full_ir[38] == "}";
 }
 
 // Unit Test 5: Verify driver compilation result structure

@@ -321,13 +321,33 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_codegen_timed_and_prioritized_channel_select ... ok"),
+        "Modular codegen timed select test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_task_nursery_concurrency ... ok"),
+        "Modular codegen nursery test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_fiber_escape_analysis ... ok"),
+        "Modular sema fiber escape analysis test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_arena_transfer_ownership ... ok"),
+        "Modular sema arena transfer ownership test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_selfhost_modular_pipeline ... ok"),
         "Modular selfhost pipeline test missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("111 passed; 0 failed"),
-        "Expected 111 passed unit tests, got:\n{}",
+        stdout.contains("119 passed; 0 failed"),
+        "Expected 119 passed unit tests, got:\n{}",
         stdout
     );
 }

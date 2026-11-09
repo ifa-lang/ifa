@@ -193,6 +193,23 @@ pub struct AstChanSelect {
     has_default: bool
 }
 
+// AST: Multi-channel select multiplexer with timeout and priority weights
+pub struct AstChanSelectTimed {
+    target_var: String,
+    chan_vars: List<String>,
+    priorities: List<i64>,
+    has_priorities: bool,
+    timeout_ns: i64,
+    has_default: bool
+}
+
+// AST: Structured concurrency task nursery enclosing scoped fibers
+pub struct AstTaskNursery {
+    nursery_var: String,
+    spawns: List<AstSpawnExpr>,
+    use_isolated_arenas: bool
+}
+
 pub fn mangle_generic_method(
     trait_name: String,
     struct_name: String,
@@ -2126,6 +2143,238 @@ pub fn test_codegen_channel_select() -> bool {
     return true;
 }
 
+// Emits LLVM multi-channel select multiplexer with timeout and priorities
+pub fn emit_llvm_chan_select_timed(sel: AstChanSelectTimed) -> List<String> {
+    mut lines: List<String> = List::new();
+    let count_str = int_to_str(sel.chan_vars.len());
+    let arr_var = "%sel_arr." + sel.target_var;
+    lines.push("  " + arr_var + " = alloca [" + count_str + " x ptr], align 8");
+    mut i: i64 = 0;
+    while i < sel.chan_vars.len() {
+        let idx_str = int_to_str(i);
+        let elem_slot = "%sel_elem." + sel.target_var + "." + idx_str;
+        lines.push("  " + elem_slot + " = getelementptr inbounds [" + count_str + " x ptr], ptr " + arr_var + ", i64 0, i64 " + idx_str);
+        lines.push("  store ptr %" + sel.chan_vars[i] + ", ptr " + elem_slot + ", align 8");
+        i = i + 1;
+    }
+
+    mut prio_ptr_var = "null";
+    if sel.has_priorities {
+        let prio_arr_var = "%sel_prio_arr." + sel.target_var;
+        lines.push("  " + prio_arr_var + " = alloca [" + count_str + " x i32], align 4");
+        mut j: i64 = 0;
+        while j < sel.priorities.len() {
+            let j_str = int_to_str(j);
+            let prio_slot = "%sel_prio_elem." + sel.target_var + "." + j_str;
+            lines.push("  " + prio_slot + " = getelementptr inbounds [" + count_str + " x i32], ptr " + prio_arr_var + ", i64 0, i64 " + j_str);
+            let p_val_str = int_to_str(sel.priorities[j]);
+            lines.push("  store i32 " + p_val_str + ", ptr " + prio_slot + ", align 4");
+            j = j + 1;
+        }
+        prio_ptr_var = prio_arr_var;
+    }
+
+    let timeout_str = int_to_str(sel.timeout_ns);
+    mut def_flag = "0";
+    if sel.has_default {
+        def_flag = "1";
+    }
+    lines.push("  %" + sel.target_var + " = call i64 @ifa_rt_channel_select_timed(ptr " + arr_var + ", ptr " + prio_ptr_var + ", i64 " + count_str + ", i64 " + timeout_str + ", i32 " + def_flag + ")");
+    return lines;
+}
+
+// Emits FIR multi-channel select multiplexer with timeout and priorities
+pub fn emit_fir_chan_select_timed(sel: AstChanSelectTimed) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut chan_list = "[";
+    mut i: i64 = 0;
+    while i < sel.chan_vars.len() {
+        if i > 0 {
+            chan_list = chan_list + ", ";
+        }
+        chan_list = chan_list + "%" + sel.chan_vars[i];
+        i = i + 1;
+    }
+    chan_list = chan_list + "]";
+
+    mut prio_list = "[]";
+    if sel.has_priorities {
+        prio_list = "[";
+        mut j: i64 = 0;
+        while j < sel.priorities.len() {
+            if j > 0 {
+                prio_list = prio_list + ", ";
+            }
+            prio_list = prio_list + int_to_str(sel.priorities[j]);
+            j = j + 1;
+        }
+        prio_list = prio_list + "]";
+    }
+
+    mut def_flag = "0";
+    if sel.has_default {
+        def_flag = "1";
+    }
+    let timeout_str = int_to_str(sel.timeout_ns);
+    lines.push("    %" + sel.target_var + " = fir.chan_select_timed " + chan_list + ", priorities=" + prio_list + ", timeout=" + timeout_str + ", default=" + def_flag);
+    return lines;
+}
+
+// Emits LLVM structured concurrency task nursery
+pub fn emit_llvm_task_nursery(nursery: AstTaskNursery) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  ; === Structured Concurrency Task Nursery: " + nursery.nursery_var + " ===");
+    mut i: i64 = 0;
+    while i < nursery.spawns.len() {
+        let sp = nursery.spawns[i];
+        let fid_var = "%" + nursery.nursery_var + ".fid." + int_to_str(i);
+        mut arg_repr = "null";
+        if sp.has_arg {
+            arg_repr = "%" + sp.arg_var;
+        }
+        if nursery.use_isolated_arenas {
+            lines.push("  " + fid_var + " = call i64 @ifa_rt_fiber_spawn_with_arena(ptr @" + sp.entry_fn + ", ptr " + arg_repr + ")");
+        } else {
+            lines.push("  " + fid_var + " = call i64 @ifa_rt_fiber_spawn(ptr @" + sp.entry_fn + ", ptr " + arg_repr + ")");
+        }
+        i = i + 1;
+    }
+    mut k: i64 = 0;
+    while k < nursery.spawns.len() {
+        let fid_var = "%" + nursery.nursery_var + ".fid." + int_to_str(k);
+        lines.push("  call void @ifa_rt_fiber_join(i64 " + fid_var + ")");
+        k = k + 1;
+    }
+    return lines;
+}
+
+// Emits FIR structured concurrency task nursery
+pub fn emit_fir_task_nursery(nursery: AstTaskNursery) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    fir.nursery_begin %" + nursery.nursery_var);
+    mut i: i64 = 0;
+    while i < nursery.spawns.len() {
+        let sp = nursery.spawns[i];
+        if sp.has_arg {
+            lines.push("    %" + nursery.nursery_var + ".fid." + int_to_str(i) + " = fir.fiber_spawn @" + sp.entry_fn + "(%" + sp.arg_var + ")");
+        } else {
+            lines.push("    %" + nursery.nursery_var + ".fid." + int_to_str(i) + " = fir.fiber_spawn @" + sp.entry_fn + "()");
+        }
+        i = i + 1;
+    }
+    lines.push("    fir.nursery_join_all %" + nursery.nursery_var);
+    return lines;
+}
+
+// Unit test 16: Timed and prioritized channel select lowering
+pub fn test_codegen_timed_and_prioritized_channel_select() -> bool {
+    mut chans: List<String> = List::new();
+    chans.push("ch_urgent");
+    chans.push("ch_normal");
+
+    mut prios: List<i64> = List::new();
+    prios.push(10);
+    prios.push(1);
+
+    let sel_timed = AstChanSelectTimed(
+        target_var: "timed_idx",
+        chan_vars: chans,
+        priorities: prios,
+        has_priorities: true,
+        timeout_ns: 5000000,
+        has_default: false
+    );
+
+    let llvm_timed = emit_llvm_chan_select_timed(sel_timed);
+    if llvm_timed.len() != 11 {
+        return false;
+    }
+    if llvm_timed[0] != "  %sel_arr.timed_idx = alloca [2 x ptr], align 8" {
+        return false;
+    }
+    if llvm_timed[5] != "  %sel_prio_arr.timed_idx = alloca [2 x i32], align 4" {
+        return false;
+    }
+    if llvm_timed[7] != "  store i32 10, ptr %sel_prio_elem.timed_idx.0, align 4" {
+        return false;
+    }
+    if llvm_timed[9] != "  store i32 1, ptr %sel_prio_elem.timed_idx.1, align 4" {
+        return false;
+    }
+    if llvm_timed[10] != "  %timed_idx = call i64 @ifa_rt_channel_select_timed(ptr %sel_arr.timed_idx, ptr %sel_prio_arr.timed_idx, i64 2, i64 5000000, i32 0)" {
+        return false;
+    }
+
+    let fir_timed = emit_fir_chan_select_timed(sel_timed);
+    if fir_timed.len() != 1 || fir_timed[0] != "    %timed_idx = fir.chan_select_timed [%ch_urgent, %ch_normal], priorities=[10, 1], timeout=5000000, default=0" {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit test 17: Structured concurrency task nursery lowering
+pub fn test_codegen_task_nursery_concurrency() -> bool {
+    mut spawns: List<AstSpawnExpr> = List::new();
+    spawns.push(AstSpawnExpr(
+        target_var: "",
+        entry_fn: "bg_worker_a",
+        has_arg: false,
+        arg_var: ""
+    ));
+    spawns.push(AstSpawnExpr(
+        target_var: "",
+        entry_fn: "bg_worker_b",
+        has_arg: true,
+        arg_var: "ctx_ptr"
+    ));
+
+    let nursery = AstTaskNursery(
+        nursery_var: "nursery_scope",
+        spawns: spawns,
+        use_isolated_arenas: true
+    );
+
+    let llvm_nursery = emit_llvm_task_nursery(nursery);
+    if llvm_nursery.len() != 5 {
+        return false;
+    }
+    if llvm_nursery[0] != "  ; === Structured Concurrency Task Nursery: nursery_scope ===" {
+        return false;
+    }
+    if llvm_nursery[1] != "  %nursery_scope.fid.0 = call i64 @ifa_rt_fiber_spawn_with_arena(ptr @bg_worker_a, ptr null)" {
+        return false;
+    }
+    if llvm_nursery[2] != "  %nursery_scope.fid.1 = call i64 @ifa_rt_fiber_spawn_with_arena(ptr @bg_worker_b, ptr %ctx_ptr)" {
+        return false;
+    }
+    if llvm_nursery[3] != "  call void @ifa_rt_fiber_join(i64 %nursery_scope.fid.0)" {
+        return false;
+    }
+    if llvm_nursery[4] != "  call void @ifa_rt_fiber_join(i64 %nursery_scope.fid.1)" {
+        return false;
+    }
+
+    let fir_nursery = emit_fir_task_nursery(nursery);
+    if fir_nursery.len() != 4 {
+        return false;
+    }
+    if fir_nursery[0] != "    fir.nursery_begin %nursery_scope" {
+        return false;
+    }
+    if fir_nursery[1] != "    %nursery_scope.fid.0 = fir.fiber_spawn @bg_worker_a()" {
+        return false;
+    }
+    if fir_nursery[2] != "    %nursery_scope.fid.1 = fir.fiber_spawn @bg_worker_b(%ctx_ptr)" {
+        return false;
+    }
+    if fir_nursery[3] != "    fir.nursery_join_all %nursery_scope" {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -2143,7 +2392,9 @@ pub fn main() {
     let t13 = test_codegen_fiber_spawn_and_yield();
     let t14 = test_codegen_channel_operations();
     let t15 = test_codegen_channel_select();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 {
+    let t16 = test_codegen_timed_and_prioritized_channel_select();
+    let t17 = test_codegen_task_nursery_concurrency();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");
