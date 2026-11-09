@@ -1580,6 +1580,448 @@ pub fn test_driver_linker_selection_and_process_bindings() -> bool {
     return true;
 }
 
+pub fn driver_int_to_digit(n: i64) -> String {
+    if n == 0 { return "0"; }
+    if n == 1 { return "1"; }
+    if n == 2 { return "2"; }
+    if n == 3 { return "3"; }
+    if n == 4 { return "4"; }
+    if n == 5 { return "5"; }
+    if n == 6 { return "6"; }
+    if n == 7 { return "7"; }
+    if n == 8 { return "8"; }
+    if n == 9 { return "9"; }
+    return "0";
+}
+
+pub fn driver_int_to_str(mut n: i64) -> String {
+    if n == 0 {
+        return "0";
+    }
+    mut is_neg = false;
+    if n < 0 {
+        is_neg = true;
+        n = 0 - n;
+    }
+    mut digits = "";
+    while n > 0 {
+        let rem = n % 10;
+        let d = driver_int_to_digit(rem);
+        digits = d + digits;
+        n = n / 10;
+    }
+    if is_neg {
+        return "-" + digits;
+    }
+    return digits;
+}
+
+/// Aligns an offset upwards to the specified power-of-two alignment boundary
+pub fn align_up(offset: i64, alignment: i64) -> i64 {
+    if alignment <= 1 {
+        return offset;
+    }
+    let remainder = offset % alignment;
+    if remainder == 0 {
+        return offset;
+    }
+    return offset + (alignment - remainder);
+}
+
+/// Checks whether an alignment value is a valid power-of-two (1, 2, 4, 8, 16, 32, 64)
+pub fn is_valid_alignment(alignment: i64) -> bool {
+    if alignment <= 0 {
+        return false;
+    }
+    if alignment == 1 || alignment == 2 || alignment == 4 || alignment == 8 || alignment == 16 || alignment == 32 || alignment == 64 {
+        return true;
+    }
+    return false;
+}
+
+pub struct MemoryLayout {
+    size: i64,
+    alignment: i64
+}
+
+pub struct StructFieldLayout {
+    name: String,
+    field_type: String,
+    offset: i64,
+    size: i64,
+    alignment: i64
+}
+
+pub struct StructLayoutResult {
+    name: String,
+    total_size: i64,
+    alignment: i64,
+    fields: List<StructFieldLayout>
+}
+
+pub fn get_type_memory_layout(type_name: String) -> MemoryLayout {
+    if type_name == "i8" || type_name == "u8" || type_name == "bool" {
+        return MemoryLayout(size: 1, alignment: 1);
+    }
+    if type_name == "i16" || type_name == "u16" {
+        return MemoryLayout(size: 2, alignment: 2);
+    }
+    if type_name == "i32" || type_name == "u32" || type_name == "f32" {
+        return MemoryLayout(size: 4, alignment: 4);
+    }
+    if type_name == "i64" || type_name == "u64" || type_name == "f64" || type_name == "int" {
+        return MemoryLayout(size: 8, alignment: 8);
+    }
+    if type_name == "ptr" || type_name == "String" {
+        return MemoryLayout(size: 8, alignment: 8);
+    }
+    if type_name == "fat_ptr" || type_name == "dyn" {
+        return MemoryLayout(size: 16, alignment: 8);
+    }
+    return MemoryLayout(size: 8, alignment: 8);
+}
+
+pub fn compute_struct_memory_layout(
+    struct_name: String,
+    field_names: List<String>,
+    field_types: List<String>
+) -> StructLayoutResult {
+    mut fields: List<StructFieldLayout> = List::new();
+    mut cur_offset: i64 = 0;
+    mut max_align: i64 = 1;
+
+    mut i: i64 = 0;
+    while i < field_names.len() && i < field_types.len() {
+        let fname = field_names[i];
+        let fty = field_types[i];
+        let lay = get_type_memory_layout(fty);
+
+        if lay.alignment > max_align {
+            max_align = lay.alignment;
+        }
+
+        let aligned_offset = align_up(cur_offset, lay.alignment);
+        fields.push(StructFieldLayout(
+            name: fname,
+            field_type: fty,
+            offset: aligned_offset,
+            size: lay.size,
+            alignment: lay.alignment
+        ));
+
+        cur_offset = aligned_offset + lay.size;
+        i = i + 1;
+    }
+
+    let total_size = align_up(cur_offset, max_align);
+    return StructLayoutResult(
+        name: struct_name,
+        total_size: total_size,
+        alignment: max_align,
+        fields: fields
+    );
+}
+
+pub struct DriverArenaDescriptor {
+    driver_arena_id: i64,
+    capacity: i64,
+    cursor: i64,
+    peak_usage: i64,
+    alloc_count: i64,
+    is_active: bool,
+    owner_fiber_id: i64
+}
+
+pub struct DriverArenaAllocation {
+    ptr_offset: i64,
+    allocated_size: i64,
+    alignment: i64,
+    success: bool
+}
+
+pub fn make_driver_arena(driver_arena_id: i64, capacity: i64, owner_fiber_id: i64) -> DriverArenaDescriptor {
+    return DriverArenaDescriptor(
+        driver_arena_id: driver_arena_id,
+        capacity: capacity,
+        cursor: 0,
+        peak_usage: 0,
+        alloc_count: 0,
+        is_active: true,
+        owner_fiber_id: owner_fiber_id
+    );
+}
+
+pub fn driver_arena_allocate(
+    inout arena: DriverArenaDescriptor,
+    size: i64,
+    alignment: i64
+) -> DriverArenaAllocation {
+    if !arena.is_active || size < 0 {
+        return DriverArenaAllocation(ptr_offset: -1, allocated_size: 0, alignment: alignment, success: false);
+    }
+    let aligned_cursor = align_up(arena.cursor, alignment);
+    let new_cursor = aligned_cursor + size;
+    if new_cursor > arena.capacity {
+        return DriverArenaAllocation(ptr_offset: -1, allocated_size: 0, alignment: alignment, success: false);
+    }
+
+    mut new_peak = arena.peak_usage;
+    if new_cursor > new_peak {
+        new_peak = new_cursor;
+    }
+
+    arena = DriverArenaDescriptor(
+        driver_arena_id: arena.driver_arena_id,
+        capacity: arena.capacity,
+        cursor: new_cursor,
+        peak_usage: new_peak,
+        alloc_count: arena.alloc_count + 1,
+        is_active: arena.is_active,
+        owner_fiber_id: arena.owner_fiber_id
+    );
+
+    return DriverArenaAllocation(
+        ptr_offset: aligned_cursor,
+        allocated_size: size,
+        alignment: alignment,
+        success: true
+    );
+}
+
+pub fn driver_arena_reset(inout arena: DriverArenaDescriptor) {
+    arena = DriverArenaDescriptor(
+        driver_arena_id: arena.driver_arena_id,
+        capacity: arena.capacity,
+        cursor: 0,
+        peak_usage: arena.peak_usage,
+        alloc_count: 0,
+        is_active: arena.is_active,
+        owner_fiber_id: arena.owner_fiber_id
+    );
+}
+
+pub fn driver_arena_transfer_ownership(inout arena: DriverArenaDescriptor, new_fiber_id: i64) -> bool {
+    if !arena.is_active {
+        return false;
+    }
+    arena = DriverArenaDescriptor(
+        driver_arena_id: arena.driver_arena_id,
+        capacity: arena.capacity,
+        cursor: arena.cursor,
+        peak_usage: arena.peak_usage,
+        alloc_count: arena.alloc_count,
+        is_active: arena.is_active,
+        owner_fiber_id: new_fiber_id
+    );
+    return true;
+}
+
+pub fn emit_llvm_arena_alloc_call(target_reg: String, arena_id: i64, size: i64, align: i64) -> String {
+    return "  %" + target_reg + " = call ptr @ifa_rt_arena_alloc(i16 " + driver_int_to_str(arena_id) + ", i64 " + driver_int_to_str(size) + ", i64 " + driver_int_to_str(align) + ")";
+}
+
+pub fn emit_llvm_arena_reset_call(arena_id: i64) -> String {
+    return "  call void @ifa_rt_arena_reset(i16 " + driver_int_to_str(arena_id) + ")";
+}
+
+pub struct DriverAccessPath {
+    root_var: String,
+    field_indices: List<i64>,
+    is_mutable: bool
+}
+
+pub fn make_driver_access_path(root: String, is_mut: bool) -> DriverAccessPath {
+    mut fields: List<i64> = List::new();
+    return DriverAccessPath(
+        root_var: root,
+        field_indices: fields,
+        is_mutable: is_mut
+    );
+}
+
+pub fn append_driver_path_field(inout path: DriverAccessPath, field_idx: i64) {
+    path.field_indices.push(field_idx);
+}
+
+/// Checks whether two access paths are provably disjoint (guaranteed non-overlapping)
+pub fn check_driver_paths_disjoint(p1: DriverAccessPath, p2: DriverAccessPath) -> bool {
+    // Distinct roots are provably disjoint
+    if p1.root_var != p2.root_var {
+        return true;
+    }
+
+    let len1 = p1.field_indices.len();
+    let len2 = p2.field_indices.len();
+    mut min_len = len1;
+    if len2 < min_len {
+        min_len = len2;
+    }
+
+    mut i: i64 = 0;
+    while i < min_len {
+        let f1 = p1.field_indices[i];
+        let f2 = p2.field_indices[i];
+        if f1 != f2 {
+            // Divergence in field projections on the same root guarantees disjointness
+            return true;
+        }
+        i = i + 1;
+    }
+
+    // Identical paths or prefix relationship: not disjoint
+    return false;
+}
+
+pub fn emit_llvm_noalias_metadata_decl(meta_id: i64, scope_name: String) -> List<String> {
+    mut lines: List<String> = List::new();
+    let id_str = driver_int_to_str(meta_id);
+    lines.push("!" + id_str + " = !{{ !" + id_str + "_domain }}");
+    lines.push("!" + id_str + "_domain = distinct !{{ !\"IFA_Disjoint_" + scope_name + "\" }}");
+    return lines;
+}
+
+pub fn emit_llvm_noalias_load(target_reg: String, ptr_reg: String, meta_id: i64, align_bytes: i64) -> String {
+    return "  %" + target_reg + " = load i64, ptr %" + ptr_reg + ", align " + driver_int_to_str(align_bytes) + ", !noalias !" + driver_int_to_str(meta_id);
+}
+
+// Unit Test 16: Verify memory alignment calculation and deterministic struct memory layout
+pub fn test_driver_memory_alignment_and_struct_layout() -> bool {
+    if align_up(0, 8) != 0 || align_up(1, 8) != 8 || align_up(7, 8) != 8 || align_up(8, 8) != 8 || align_up(9, 8) != 16 {
+        return false;
+    }
+    if !is_valid_alignment(1) || !is_valid_alignment(8) || !is_valid_alignment(64) || is_valid_alignment(3) || is_valid_alignment(0) {
+        return false;
+    }
+
+    mut field_names: List<String> = List::new();
+    field_names.push("x");
+    field_names.push("y");
+    field_names.push("is_active");
+
+    mut field_types: List<String> = List::new();
+    field_types.push("i64");
+    field_types.push("i64");
+    field_types.push("bool");
+
+    let layout = compute_struct_memory_layout("Point", field_names, field_types);
+    if layout.name != "Point" || layout.alignment != 8 || layout.total_size != 24 {
+        return false;
+    }
+    if layout.fields.len() != 3 {
+        return false;
+    }
+    if layout.fields[0].offset != 0 || layout.fields[0].size != 8 || layout.fields[0].alignment != 8 {
+        return false;
+    }
+    if layout.fields[1].offset != 8 || layout.fields[1].size != 8 || layout.fields[1].alignment != 8 {
+        return false;
+    }
+    if layout.fields[2].offset != 16 || layout.fields[2].size != 1 || layout.fields[2].alignment != 1 {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit Test 17: Verify scoped arena descriptor, aligned bump allocation, peak tracking, and reset
+pub fn test_driver_arena_aligned_allocation_and_reset() -> bool {
+    mut arena = make_driver_arena(1, 1024, 42);
+    if arena.driver_arena_id != 1 || arena.capacity != 1024 || arena.cursor != 0 || arena.peak_usage != 0 || arena.owner_fiber_id != 42 {
+        return false;
+    }
+
+    let a1 = driver_arena_allocate(inout arena, 16, 8);
+    if !a1.success || a1.ptr_offset != 0 || a1.allocated_size != 16 || arena.cursor != 16 {
+        return false;
+    }
+
+    let a2 = driver_arena_allocate(inout arena, 5, 4);
+    if !a2.success || a2.ptr_offset != 16 || a2.allocated_size != 5 || arena.cursor != 21 {
+        return false;
+    }
+
+    let a3 = driver_arena_allocate(inout arena, 8, 8);
+    if !a3.success || a3.ptr_offset != 24 || a3.allocated_size != 8 || arena.cursor != 32 {
+        return false;
+    }
+
+    if arena.alloc_count != 3 || arena.peak_usage != 32 {
+        return false;
+    }
+
+    let ok_xfer = driver_arena_transfer_ownership(inout arena, 99);
+    if !ok_xfer || arena.owner_fiber_id != 99 {
+        return false;
+    }
+
+    driver_arena_reset(inout arena);
+    if arena.cursor != 0 || arena.alloc_count != 0 || arena.peak_usage != 32 {
+        return false;
+    }
+
+    let a4 = driver_arena_allocate(inout arena, 2048, 8);
+    if a4.success {
+        return false;
+    }
+
+    let alloc_call = emit_llvm_arena_alloc_call("buf_ptr", 1, 64, 8);
+    if alloc_call != "  %buf_ptr = call ptr @ifa_rt_arena_alloc(i16 1, i64 64, i64 8)" {
+        return false;
+    }
+
+    let reset_call = emit_llvm_arena_reset_call(1);
+    return reset_call == "  call void @ifa_rt_arena_reset(i16 1)";
+}
+
+// Unit Test 18: Verify disjoint access paths, path interference, and llvm noalias metadata
+pub fn test_driver_disjoint_access_path_validation() -> bool {
+    // 1. Distinct roots: disjoint
+    let p_a = make_driver_access_path("node_a", false);
+    let p_b = make_driver_access_path("node_b", true);
+    if !check_driver_paths_disjoint(p_a, p_b) {
+        return false;
+    }
+
+    // 2. Same root, distinct fields: disjoint! (root.left vs root.right)
+    mut p_left = make_driver_access_path("root", false);
+    append_driver_path_field(inout p_left, 0);
+
+    mut p_right = make_driver_access_path("root", true);
+    append_driver_path_field(inout p_right, 1);
+
+    if !check_driver_paths_disjoint(p_left, p_right) {
+        return false;
+    }
+
+    // 3. Same root, same field: alias (not disjoint)
+    mut p_left_dup = make_driver_access_path("root", false);
+    append_driver_path_field(inout p_left_dup, 0);
+    if check_driver_paths_disjoint(p_left, p_left_dup) {
+        return false;
+    }
+
+    // 4. Same root, prefix ancestor vs child field: not disjoint
+    let p_root = make_driver_access_path("root", false);
+    if check_driver_paths_disjoint(p_root, p_left) {
+        return false;
+    }
+
+    // 5. LLVM IR noalias metadata and load instruction emission
+    let meta_lines = emit_llvm_noalias_metadata_decl(10, "Point_Fields");
+    if meta_lines.len() != 2 {
+        return false;
+    }
+    if meta_lines[0] != "!10 = !{{ !10_domain }}" {
+        return false;
+    }
+    if meta_lines[1] != "!10_domain = distinct !{{ !\"IFA_Disjoint_Point_Fields\" }}" {
+        return false;
+    }
+
+    let ld = emit_llvm_noalias_load("val", "ptr_x", 10, 8);
+    return ld == "  %val = load i64, ptr %ptr_x, align 8, !noalias !10";
+}
+
 pub fn main() {
     println("=== IFA Compiler Driver & I/O Module ===");
     let t1 = test_driver_default_config();
@@ -1597,8 +2039,11 @@ pub fn main() {
     let t13 = test_driver_simd_vectorization_metadata_assembly();
     let t14 = test_driver_generational_memory_runtime_assembly();
     let t15 = test_driver_linker_selection_and_process_bindings();
+    let t16 = test_driver_memory_alignment_and_struct_layout();
+    let t17 = test_driver_arena_aligned_allocation_and_reset();
+    let t18 = test_driver_disjoint_access_path_validation();
 
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 {
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 {
         println("Driver validation tests: ALL PASSED");
     } else {
         println("Driver validation tests: FAILED");

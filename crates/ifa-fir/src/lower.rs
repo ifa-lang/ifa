@@ -760,6 +760,26 @@ impl<'a> FunctionLoweringContext<'a> {
                 } else {
                     match rec_ty {
                         FirType::Array(elem, _) | FirType::Slice(elem) => Some(*elem),
+                        FirType::Struct(name, _)
+                            if INTERNER.resolve(&name).starts_with("List__") =>
+                        {
+                            let s = INTERNER.resolve(&name);
+                            let elem_name = s.strip_prefix("List__").unwrap();
+                            let elem_sym = INTERNER.intern(elem_name);
+                            if let Some(st) = self.symbols.lookup_struct(&elem_sym) {
+                                let fields = st
+                                    .fields
+                                    .iter()
+                                    .map(|f| (f.name, FirType::from_sema_type(&f.ty)))
+                                    .collect();
+                                Some(FirType::Struct(elem_sym, fields))
+                            } else {
+                                self.module_structs
+                                    .iter()
+                                    .find(|s| s.name == elem_sym)
+                                    .map(|st| FirType::Struct(elem_sym, st.fields.clone()))
+                            }
+                        }
                         _ => None,
                     }
                 }

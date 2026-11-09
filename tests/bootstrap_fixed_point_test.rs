@@ -746,8 +746,23 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("284 passed; 0 failed"),
-        "Expected 284 passed unit tests, got:\n{}",
+        stdout.contains("test test_driver_memory_alignment_and_struct_layout ... ok"),
+        "Modular driver memory alignment and struct layout test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_arena_aligned_allocation_and_reset ... ok"),
+        "Modular driver arena aligned allocation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_disjoint_access_path_validation ... ok"),
+        "Modular driver disjoint access path validation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("290 passed; 0 failed"),
+        "Expected 290 passed unit tests, got:\n{}",
         stdout
     );
 }
