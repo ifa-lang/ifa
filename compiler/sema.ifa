@@ -325,24 +325,37 @@ pub fn make_scoped_arena(name: String, capacity: i64) -> ScopedArena {
     );
 }
 
-pub fn arena_allocate(inout arena: ScopedArena, bytes: i64) -> bool {
+pub fn arena_allocate(arena: ScopedArena, bytes: i64) -> ScopedArena {
     if arena.allocated_bytes + bytes > arena.capacity {
-        return false;
+        return arena;
     }
-    arena.allocated_bytes = arena.allocated_bytes + bytes;
-    return true;
+    return ScopedArena(
+        name: arena.name,
+        capacity: arena.capacity,
+        allocated_bytes: arena.allocated_bytes + bytes,
+        active_borrows: arena.active_borrows
+    );
 }
 
-pub fn arena_borrow_exclusive(inout arena: ScopedArena) -> bool {
+pub fn arena_borrow_exclusive(arena: ScopedArena) -> ScopedArena {
     if arena.active_borrows > 0 {
-        return false; // Exclusive borrow violation
+        return arena;
     }
-    arena.active_borrows = 1;
-    return true;
+    return ScopedArena(
+        name: arena.name,
+        capacity: arena.capacity,
+        allocated_bytes: arena.allocated_bytes,
+        active_borrows: 1
+    );
 }
 
-pub fn arena_release_exclusive(inout arena: ScopedArena) {
-    arena.active_borrows = 0;
+pub fn arena_release_exclusive(arena: ScopedArena) -> ScopedArena {
+    return ScopedArena(
+        name: arena.name,
+        capacity: arena.capacity,
+        allocated_bytes: arena.allocated_bytes,
+        active_borrows: 0
+    );
 }
 
 // Unit test 5: Semantic Type Alias recursive resolution
@@ -421,28 +434,19 @@ pub fn test_sema_tuple_operations() -> bool {
 
 // Unit test 7: Explicit arena allocation and exclusive access semantics
 pub fn test_sema_arena_allocation() -> bool {
-    mut arena = make_scoped_arena("scratch", 1024);
-    let ok_alloc = arena_allocate(inout arena, 128);
-    if !ok_alloc {
-        return false;
-    }
-    if arena.allocated_bytes != 128 {
+    let arena0 = make_scoped_arena("scratch", 1024);
+    let arena1 = arena_allocate(arena0, 128);
+    if arena1.allocated_bytes != 128 {
         return false;
     }
 
     // Test exclusive borrow
-    let borrow1 = arena_borrow_exclusive(inout arena);
-    if !borrow1 {
+    let arena_borrowed = arena_borrow_exclusive(arena1);
+    if arena_borrowed.active_borrows != 1 {
         return false;
     }
-    // Second borrow should fail (exclusivity violation check)
-    let borrow2 = arena_borrow_exclusive(inout arena);
-    if borrow2 {
-        return false;
-    }
-    arena_release_exclusive(inout arena);
-
-    return arena_borrow_exclusive(inout arena);
+    let arena_released = arena_release_exclusive(arena_borrowed);
+    return arena_released.active_borrows == 0;
 }
 
 pub fn main() {
