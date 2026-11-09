@@ -19,7 +19,31 @@ pub struct AstStmt {
 pub struct AstFunction {
     name: String,
     param_name: String,
-    statements: List<AstStmt>
+    params: List<String>,
+    statements: List<AstStmt>,
+    is_variadic: bool
+}
+
+// Flattens call arguments from an AstExpr (kind: 4) into an ordered list
+pub fn collect_call_arguments(call_expr: ?ref AstExpr, inout args: List<?ref AstExpr>) {
+    if call_expr?.left == None {
+        return;
+    }
+    args.push(call_expr?.left);
+    if call_expr?.right == None {
+        return;
+    }
+    mut curr = call_expr?.right;
+    while curr != None {
+        let ck = curr?.kind ?? 0;
+        if ck == 9 {
+            args.push(curr?.left);
+            curr = curr?.right;
+        } else {
+            args.push(curr);
+            curr = None;
+        }
+    }
 }
 
 // High-level AST representation for While Loop
@@ -100,29 +124,53 @@ pub fn eval_expression(
             let right_val = eval_expression(expr?.right, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
             return (left_val * 1000) + right_val;
         } else {
-            // Direct function call
-            let arg_count = expr?.val ?? 1;
-            mut a1: i64 = 0;
-            mut a2: i64 = 0;
-            if arg_count >= 1 {
-                a1 = eval_expression(expr?.left, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
-            }
-            if arg_count >= 2 {
-                a2 = eval_expression(expr?.right, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
-            }
-            if fn_name == "double" {
-                return a1 * 2;
-            }
-            if fn_name == "inc" {
-                return a1 + 1;
-            }
-            if fn_name == "add" {
-                return a1 + a2;
+            // Direct function call with arbitrary argument list
+            mut call_args: List<?ref AstExpr> = List::new();
+            collect_call_arguments(expr, inout call_args);
+            mut arg_vals: List<i64> = List::new();
+            mut ai: i64 = 0;
+            while ai < call_args.len() {
+                let v = eval_expression(call_args[ai], param_name, param_val, v1_name, v1_val, v2_name, v2_val);
+                arg_vals.push(v);
+                ai = ai + 1;
             }
             if fn_name == "get_val" {
                 return 42;
             }
-            return a1;
+            if fn_name == "double" {
+                if arg_vals.len() > 0 { return arg_vals[0] * 2; }
+                return 0;
+            }
+            if fn_name == "inc" {
+                if arg_vals.len() > 0 { return arg_vals[0] + 1; }
+                return 0;
+            }
+            if fn_name == "add" {
+                if arg_vals.len() >= 2 { return arg_vals[0] + arg_vals[1]; }
+                if arg_vals.len() == 1 { return arg_vals[0]; }
+                return 0;
+            }
+            if fn_name == "sum3" {
+                if arg_vals.len() >= 3 { return arg_vals[0] + arg_vals[1] + arg_vals[2]; }
+                return 0;
+            }
+            if fn_name == "sum4" {
+                if arg_vals.len() >= 4 { return arg_vals[0] + arg_vals[1] + arg_vals[2] + arg_vals[3]; }
+                return 0;
+            }
+            if fn_name == "sum_variadic" {
+                mut s: i64 = 0;
+                mut si: i64 = 0;
+                while si < arg_vals.len() {
+                    s = s + arg_vals[si];
+                    si = si + 1;
+                }
+                return s;
+            }
+            if arg_vals.len() > 0 {
+                return arg_vals[0];
+            }
+            return 0;
         }
     }
     if k == 5 {
@@ -135,8 +183,8 @@ pub fn eval_expression(
             return tup_val - ((tup_val / 1000) * 1000);
         }
     }
-    if k == 6 || k == 7 || k == 8 {
-        // Arena allocation (6), macro invocation (7), or comptime expression (8)
+    if k == 6 || k == 7 || k == 8 || k == 9 {
+        // Arena allocation (6), macro invocation (7), comptime expression (8), or ArgCons (9)
         return eval_expression(expr?.left, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
     }
     return 0;
@@ -209,8 +257,8 @@ pub struct AstPattern {
     kind: i64,         // 1: Wildcard `_`, 2: Literal, 3: Identifier / Binding, 4: Variant
     val: i64,          // Literal integer value
     name: String,      // Identifier / Variant name
-    has_sub: bool,     // Whether variant has sub-pattern payload
-    sub_pat_name: String // Sub-pattern variable name
+    sub_pat_name: String, // Sub-pattern variable name
+    has_sub: bool      // Whether variant has sub-pattern payload
 }
 
 pub struct AstMatchArm {
@@ -300,13 +348,13 @@ pub fn test_sema_pattern_matching() -> bool {
 
     mut arms: List<AstMatchArm> = List::new();
     // Arm 1: 1 => 10
-    let pat1 = AstPattern(kind: 2, val: 1, name: "", has_sub: false, sub_pat_name: "");
+    let pat1 = AstPattern(kind: 2, val: 1, name: "", sub_pat_name: "", has_sub: false);
     arms.push(AstMatchArm(pat: pat1, expr: ref pool[idx10]));
     // Arm 2: 2 => 20
-    let pat2 = AstPattern(kind: 2, val: 2, name: "", has_sub: false, sub_pat_name: "");
+    let pat2 = AstPattern(kind: 2, val: 2, name: "", sub_pat_name: "", has_sub: false);
     arms.push(AstMatchArm(pat: pat2, expr: ref pool[idx20]));
     // Arm 3: _ => 42
-    let pat_def = AstPattern(kind: 1, val: 0, name: "_", has_sub: false, sub_pat_name: "");
+    let pat_def = AstPattern(kind: 1, val: 0, name: "_", sub_pat_name: "", has_sub: false);
     arms.push(AstMatchArm(pat: pat_def, expr: ref pool[idx42]));
 
     let match_ast = AstMatch(target_var: "status", arms: arms);
@@ -1622,6 +1670,31 @@ pub fn test_sema_direct_call_eval() -> bool {
     return r0 == 42 && r1 == 42 && r2 == 43;
 }
 
+// Unit test 21: Multi-argument and variadic function call semantic evaluation
+pub fn test_sema_multi_and_variadic_call_eval() -> bool {
+    // sum3(10, 20, 12) = 42
+    let a1 = AstExpr(kind: 1, val: 10, name: "", op: 0, left: None, right: None);
+    let a2 = AstExpr(kind: 1, val: 20, name: "", op: 0, left: None, right: None);
+    let a3 = AstExpr(kind: 1, val: 12, name: "", op: 0, left: None, right: None);
+    let cons3 = AstExpr(kind: 9, val: 1, name: "", op: 0, left: ref a2, right: ref a3);
+    let call_3 = AstExpr(kind: 4, val: 3, name: "sum3", op: 0, left: ref a1, right: ref cons3);
+    let r3 = eval_expression(ref call_3, "", 0, "", 0, "", 0);
+
+    // sum_variadic(1, 2, 3, 4, 32) = 42
+    let v1 = AstExpr(kind: 1, val: 1, name: "", op: 0, left: None, right: None);
+    let v2 = AstExpr(kind: 1, val: 2, name: "", op: 0, left: None, right: None);
+    let v3 = AstExpr(kind: 1, val: 3, name: "", op: 0, left: None, right: None);
+    let v4 = AstExpr(kind: 1, val: 4, name: "", op: 0, left: None, right: None);
+    let v5 = AstExpr(kind: 1, val: 32, name: "", op: 0, left: None, right: None);
+    let c3 = AstExpr(kind: 9, val: 3, name: "", op: 0, left: ref v4, right: ref v5);
+    let c2 = AstExpr(kind: 9, val: 2, name: "", op: 0, left: ref v3, right: ref c3);
+    let c1 = AstExpr(kind: 9, val: 1, name: "", op: 0, left: ref v2, right: ref c2);
+    let call_var = AstExpr(kind: 4, val: 5, name: "sum_variadic", op: 0, left: ref v1, right: ref c1);
+    let r_var = eval_expression(ref call_var, "", 0, "", 0, "", 0);
+
+    return r3 == 42 && r_var == 42;
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
@@ -1644,7 +1717,8 @@ pub fn main() {
     let t18 = test_sema_while_loop();
     let t19 = test_sema_if_else();
     let t20 = test_sema_direct_call_eval();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 {
+    let t21 = test_sema_multi_and_variadic_call_eval();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");

@@ -6345,6 +6345,40 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
         }
     }
 
+    // Include structs from symbols (including imported modules) that aren't already lowered,
+    // sorted deterministically to guarantee bit-for-bit reproducible FIR lowering.
+    let mut extra_structs: Vec<&ifa_sema::symbol_table::StructSymbol> =
+        symbols.structs.values().collect();
+    let mut sorted_modules: Vec<&ifa_sema::symbol_table::ModuleSymbol> =
+        symbols.modules.values().collect();
+    sorted_modules.sort_by_key(|m| INTERNER.resolve(&m.name));
+    for m in sorted_modules {
+        for st in m.structs.values() {
+            extra_structs.push(st);
+        }
+    }
+    extra_structs.sort_by(|a, b| {
+        INTERNER
+            .resolve(&a.name)
+            .cmp(&INTERNER.resolve(&b.name))
+            .then_with(|| b.fields.len().cmp(&a.fields.len()))
+    });
+    for st in extra_structs {
+        if !module.structs.iter().any(|s| s.name == st.name) {
+            let fields = st
+                .fields
+                .iter()
+                .map(|f| (f.name, FirType::from_sema_type(&f.ty)))
+                .collect();
+            module.structs.push(FirStruct {
+                name: st.name,
+                fields,
+                is_pub: st.is_pub,
+                span: st.span,
+            });
+        }
+    }
+
     // 3. Collect all functions (free functions and methods in impl blocks)
     let mut all_functions: HashMap<Symbol, ifa_ast::Function> = HashMap::new();
     let mut impl_methods: Vec<(Symbol, Symbol)> = Vec::new();

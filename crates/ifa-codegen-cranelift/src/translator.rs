@@ -1021,15 +1021,20 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
 
             ValueExpr::CallDirect { name, args } | ValueExpr::BlockingCallDirect { name, args } => {
                 let fn_name = INTERNER.resolve(name);
+                let lookup_name = match fn_name.as_str() {
+                    "process::args_count" | "env::args_count" | "args_count" => "ifa_rt_args_count",
+                    "process::args_get" | "env::args_get" | "args_get" => "ifa_rt_args_get",
+                    _ => fn_name.as_str(),
+                };
                 if let Some(res) = self.try_lower_simd_reduction(&fn_name, args) {
                     Some(res)
-                } else if let Some(&callee_id) = self.func_ids.get(&fn_name) {
+                } else if let Some(&callee_id) = self.func_ids.get(lookup_name) {
                     let local_func = self
                         .module
                         .declare_func_in_func(callee_id, self.builder.func);
                     let sig_ref = self.builder.func.dfg.ext_funcs[local_func].signature;
                     let expected_params = self.builder.func.dfg.signatures[sig_ref].params.clone();
-                    let expected_fir_params = self.fn_param_types.get(&fn_name);
+                    let expected_fir_params = self.fn_param_types.get(lookup_name);
                     let mut arg_vals = Vec::with_capacity(args.len());
                     for (i, a) in args.iter().enumerate() {
                         let mut v = self.value_map[a];

@@ -9,7 +9,7 @@ pub struct Token {
 
 // AST Expression node leveraging generational references for recursive trees
 pub struct AstExpr {
-    kind: i64, // 1: Integer Literal, 2: Variable, 3: Binary Operation
+    kind: i64, // 1: Integer Literal, 2: Variable, 3: Binary Operation, 4: Call / Tuple, 5: Tuple index, 6: Arena, 7: Macro, 8: Comptime, 9: ArgCons
     val: i64,
     name: String,
     op: i64,   // 1: Add (+), 2: Sub (-), 3: Mul (*), 4: Div (/)
@@ -24,11 +24,35 @@ pub struct AstStmt {
     expr: ?ref AstExpr
 }
 
-// AST Function node
+// AST Function node with multi-parameter and variadic support
 pub struct AstFunction {
     name: String,
     param_name: String,
-    statements: List<AstStmt>
+    params: List<String>,
+    statements: List<AstStmt>,
+    is_variadic: bool
+}
+
+// Flattens call arguments from an AstExpr (kind: 4) into an ordered list
+pub fn collect_call_arguments(call_expr: ?ref AstExpr, inout args: List<?ref AstExpr>) {
+    if call_expr?.left == None {
+        return;
+    }
+    args.push(call_expr?.left);
+    if call_expr?.right == None {
+        return;
+    }
+    mut curr = call_expr?.right;
+    while curr != None {
+        let ck = curr?.kind ?? 0;
+        if ck == 9 {
+            args.push(curr?.left);
+            curr = curr?.right;
+        } else {
+            args.push(curr);
+            curr = None;
+        }
+    }
 }
 
 // High-level AST Field node for Struct definitions
@@ -72,8 +96,8 @@ pub struct AstPattern {
     kind: i64,         // 1: Wildcard `_`, 2: Literal, 3: Identifier / Binding, 4: Variant
     val: i64,          // Literal integer value
     name: String,      // Identifier / Variant name
-    has_sub: bool,     // Whether variant has sub-pattern payload
-    sub_pat_name: String // Sub-pattern variable name
+    sub_pat_name: String, // Sub-pattern variable name
+    has_sub: bool      // Whether variant has sub-pattern payload
 }
 
 // High-level AST Match Arm node (`pattern => expression`)
@@ -212,7 +236,7 @@ pub fn parse_primary(inout cursor: i64, tokens: List<Token>, inout pool: List<As
         let var_name = tok.lexeme;
         cursor = cursor + 1;
         if cursor < tokens.len() && tokens[cursor].kind == 30 {
-            // Direct function call: ident() or ident(arg1) or ident(arg1, arg2)
+            // Function call with 0, 1, 2, or arbitrary N arguments: ident(arg0, arg1, ..., argN-1)
             cursor = cursor + 1; // Consume '('
             if cursor < tokens.len() && tokens[cursor].kind == 31 {
                 cursor = cursor + 1; // Consume ')'
@@ -225,38 +249,70 @@ pub fn parse_primary(inout cursor: i64, tokens: List<Token>, inout pool: List<As
                     right: None
                 );
             }
-            let arg1 = parse_additive(inout cursor, tokens, inout pool);
-            if cursor < tokens.len() && tokens[cursor].kind == 39 {
+            mut arg_indices: List<i64> = List::new();
+            let first_arg = parse_additive(inout cursor, tokens, inout pool);
+            pool.push(first_arg);
+            arg_indices.push(pool.len() - 1);
+
+            while cursor < tokens.len() && tokens[cursor].kind == 39 {
                 cursor = cursor + 1; // Consume ','
-                let arg2 = parse_additive(inout cursor, tokens, inout pool);
-                if cursor < tokens.len() && tokens[cursor].kind == 31 {
-                    cursor = cursor + 1; // Consume ')'
-                }
-                pool.push(arg1);
-                let arg1_idx = pool.len() - 1;
-                pool.push(arg2);
-                let arg2_idx = pool.len() - 1;
-                return AstExpr(
-                    kind: 4, // Function Call
-                    val: 2,  // 2 args
-                    name: var_name,
-                    op: 0,
-                    left: ref pool[arg1_idx],
-                    right: ref pool[arg2_idx]
-                );
+                let next_arg = parse_additive(inout cursor, tokens, inout pool);
+                pool.push(next_arg);
+                arg_indices.push(pool.len() - 1);
             }
+
             if cursor < tokens.len() && tokens[cursor].kind == 31 {
                 cursor = cursor + 1; // Consume ')'
             }
-            pool.push(arg1);
-            let arg1_idx = pool.len() - 1;
+
+            let num_args = arg_indices.len();
+            if num_args == 1 {
+                let a0 = arg_indices[0];
+                return AstExpr(
+                    kind: 4,
+                    val: 1,
+                    name: var_name,
+                    op: 0,
+                    left: ref pool[a0],
+                    right: None
+                );
+            }
+            if num_args == 2 {
+                let a0 = arg_indices[0];
+                let a1 = arg_indices[1];
+                return AstExpr(
+                    kind: 4,
+                    val: 2,
+                    name: var_name,
+                    op: 0,
+                    left: ref pool[a0],
+                    right: ref pool[a1]
+                );
+            }
+            // For N >= 3 arguments: construct an argument chain (Cons-List) using kind: 9 (ArgCons)
+            mut tail_idx = arg_indices[num_args - 1];
+            mut j = num_args - 2;
+            while j >= 1 {
+                let cons = AstExpr(
+                    kind: 9, // ArgCons node
+                    val: j,
+                    name: "",
+                    op: 0,
+                    left: ref pool[arg_indices[j]],
+                    right: ref pool[tail_idx]
+                );
+                pool.push(cons);
+                tail_idx = pool.len() - 1;
+                j = j - 1;
+            }
+            let a0 = arg_indices[0];
             return AstExpr(
-                kind: 4, // Function Call
-                val: 1,  // 1 arg
+                kind: 4,
+                val: num_args,
                 name: var_name,
                 op: 0,
-                left: ref pool[arg1_idx],
-                right: None
+                left: ref pool[a0],
+                right: ref pool[tail_idx]
             );
         }
         if cursor < tokens.len() && tokens[cursor].kind == 50 {
@@ -540,7 +596,7 @@ pub fn parse_statement(inout cursor: i64, tokens: List<Token>, inout pool: List<
 pub fn parse_function(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstFunction {
     if cursor >= tokens.len() {
         mut empty_stmts: List<AstStmt> = List::new();
-        return AstFunction(name: "compute", param_name: "x", statements: empty_stmts);
+        return AstFunction(name: "compute", param_name: "x", params: List::new(), statements: empty_stmts, is_variadic: false);
     }
     if cursor < tokens.len() && tokens[cursor].kind == 1 {
         cursor = cursor + 1; // Consume 'fn'
@@ -555,41 +611,42 @@ pub fn parse_function(inout cursor: i64, tokens: List<Token>, inout pool: List<A
     if cursor < tokens.len() && tokens[cursor].kind == 30 {
         cursor = cursor + 1; // Consume '('
     }
-    mut param_name = "";
+    mut params: List<String> = List::new();
+    mut is_variadic = false;
     if cursor < tokens.len() && tokens[cursor].kind != 31 {
-        // First parameter
-        if tokens[cursor].kind == 5 || tokens[cursor].kind == 6 || tokens[cursor].kind == 7 {
-            cursor = cursor + 1; // Consume 'inout', 'in', 'sink'
-        }
-        if cursor < tokens.len() && tokens[cursor].kind == 10 {
-            param_name = tokens[cursor].lexeme;
-            cursor = cursor + 1; // Consume parameter name
-        }
-        if cursor < tokens.len() && tokens[cursor].kind == 34 {
-            cursor = cursor + 1; // Consume ':'
-            if cursor < tokens.len() && tokens[cursor].kind == 10 {
-                cursor = cursor + 1; // Consume parameter type
+        while cursor < tokens.len() && tokens[cursor].kind != 31 {
+            if tokens[cursor].kind == 37 {
+                cursor = cursor + 1; // Consume '...'
+                is_variadic = true;
+                break;
             }
-        }
-        // Consume any additional parameters (e.g. , y: i64)
-        while cursor < tokens.len() && tokens[cursor].kind == 39 {
-            cursor = cursor + 1; // Consume ','
-            if cursor < tokens.len() && (tokens[cursor].kind == 5 || tokens[cursor].kind == 6 || tokens[cursor].kind == 7) {
-                cursor = cursor + 1;
+            if tokens[cursor].kind == 5 || tokens[cursor].kind == 6 || tokens[cursor].kind == 7 {
+                cursor = cursor + 1; // Consume 'inout', 'in', 'sink'
             }
             if cursor < tokens.len() && tokens[cursor].kind == 10 {
-                cursor = cursor + 1;
+                let pname = tokens[cursor].lexeme;
+                cursor = cursor + 1; // Consume parameter name
+                params.push(pname);
             }
             if cursor < tokens.len() && tokens[cursor].kind == 34 {
-                cursor = cursor + 1;
+                cursor = cursor + 1; // Consume ':'
                 if cursor < tokens.len() && tokens[cursor].kind == 10 {
-                    cursor = cursor + 1;
+                    cursor = cursor + 1; // Consume parameter type
                 }
+            }
+            if cursor < tokens.len() && tokens[cursor].kind == 39 {
+                cursor = cursor + 1; // Consume ','
+            } else {
+                break;
             }
         }
     }
     if cursor < tokens.len() && tokens[cursor].kind == 31 {
         cursor = cursor + 1; // Consume ')'
+    }
+    mut param_name = "";
+    if params.len() > 0 {
+        param_name = params[0];
     }
     // Optional return type `-> Type` or `-> (T1, T2)`
     if cursor < tokens.len() && tokens[cursor].kind == 36 {
@@ -626,24 +683,24 @@ pub fn parse_function(inout cursor: i64, tokens: List<Token>, inout pool: List<A
         }
     }
 
-    return AstFunction(name: fn_name, param_name: param_name, statements: stmts);
+    return AstFunction(name: fn_name, param_name: param_name, params: params, statements: stmts, is_variadic: is_variadic);
 }
 
 // High-level parser: pattern matching (`_`, literal, identifier, `Some(x)`)
 pub fn parse_pattern(inout cursor: i64, tokens: List<Token>) -> AstPattern {
     if cursor >= tokens.len() {
-        return AstPattern(kind: 1, val: 0, name: "_", has_sub: false, sub_pat_name: "");
+        return AstPattern(kind: 1, val: 0, name: "_", sub_pat_name: "", has_sub: false);
     }
     let tok = tokens[cursor];
     if tok.kind == 38 {
         // Wildcard '_'
         cursor = cursor + 1;
-        return AstPattern(kind: 1, val: 0, name: "_", has_sub: false, sub_pat_name: "");
+        return AstPattern(kind: 1, val: 0, name: "_", sub_pat_name: "", has_sub: false);
     }
     if tok.kind == 11 {
         // Integer literal pattern
         cursor = cursor + 1;
-        return AstPattern(kind: 2, val: tok.value, name: "", has_sub: false, sub_pat_name: "");
+        return AstPattern(kind: 2, val: tok.value, name: "", sub_pat_name: "", has_sub: false);
     }
     if tok.kind == 10 {
         let ident_name = tok.lexeme;
@@ -659,11 +716,11 @@ pub fn parse_pattern(inout cursor: i64, tokens: List<Token>) -> AstPattern {
             if cursor < tokens.len() && tokens[cursor].kind == 31 {
                 cursor = cursor + 1; // Consume ')'
             }
-            return AstPattern(kind: 4, val: 0, name: ident_name, has_sub: true, sub_pat_name: sub_name);
+            return AstPattern(kind: 4, val: 0, name: ident_name, sub_pat_name: sub_name, has_sub: true);
         }
-        return AstPattern(kind: 3, val: 0, name: ident_name, has_sub: false, sub_pat_name: "");
+        return AstPattern(kind: 3, val: 0, name: ident_name, sub_pat_name: "", has_sub: false);
     }
-    return AstPattern(kind: 1, val: 0, name: "_", has_sub: false, sub_pat_name: "");
+    return AstPattern(kind: 1, val: 0, name: "_", sub_pat_name: "", has_sub: false);
 }
 
 // High-level parser: match expressions (`match target { pat => expr, ... }`)
@@ -2015,6 +2072,72 @@ pub fn test_parser_direct_call() -> bool {
     return true;
 }
 
+// Unit test 22: Call parsing with arbitrary argument count (3+ arguments)
+pub fn test_parser_arbitrary_call_args() -> bool {
+    mut tokens: List<Token> = List::new();
+    // let res = sum4(1, 2, 3, 4);
+    tokens.push(Token(kind: 2, value: 0, lexeme: "let"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "res"));
+    tokens.push(Token(kind: 24, value: 0, lexeme: "="));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "sum4"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 11, value: 1, lexeme: "1"));
+    tokens.push(Token(kind: 39, value: 0, lexeme: ","));
+    tokens.push(Token(kind: 11, value: 2, lexeme: "2"));
+    tokens.push(Token(kind: 39, value: 0, lexeme: ","));
+    tokens.push(Token(kind: 11, value: 3, lexeme: "3"));
+    tokens.push(Token(kind: 39, value: 0, lexeme: ","));
+    tokens.push(Token(kind: 11, value: 4, lexeme: "4"));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let stmt = parse_statement(inout cur, tokens, inout pool);
+    if stmt.target_var != "res" || stmt.expr?.kind != 4 || stmt.expr?.val != 4 {
+        return false;
+    }
+    mut args: List<?ref AstExpr> = List::new();
+    collect_call_arguments(stmt.expr, inout args);
+    if args.len() != 4 {
+        return false;
+    }
+    let a0 = args[0]?.val ?? 0;
+    let a1 = args[1]?.val ?? 0;
+    let a2 = args[2]?.val ?? 0;
+    let a3 = args[3]?.val ?? 0;
+    return a0 == 1 && a1 == 2 && a2 == 3 && a3 == 4;
+}
+
+// Unit test 23: Variadic function parsing (`fn printf(fmt: i64, ...) -> i64`)
+pub fn test_parser_variadic_function() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 1, value: 0, lexeme: "fn"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "printf"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "fmt"));
+    tokens.push(Token(kind: 34, value: 0, lexeme: ":"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "i64"));
+    tokens.push(Token(kind: 39, value: 0, lexeme: ","));
+    tokens.push(Token(kind: 37, value: 0, lexeme: "..."));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 36, value: 0, lexeme: "->"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "i64"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 4, value: 0, lexeme: "return"));
+    tokens.push(Token(kind: 11, value: 0, lexeme: "0"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let f = parse_function(inout cur, tokens, inout pool);
+    if f.name != "printf" || !f.is_variadic || f.params.len() != 1 {
+        return false;
+    }
+    return f.params[0] == "fmt";
+}
+
 pub fn main() {
     println("=== IFA Compiler Parser Module ===");
     let t1 = test_parser_ast_building();
@@ -2038,7 +2161,9 @@ pub fn main() {
     let t19 = test_parser_function_multi_param();
     let t20 = test_parser_mut_statements();
     let t21 = test_parser_direct_call();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 {
+    let t22 = test_parser_arbitrary_call_args();
+    let t23 = test_parser_variadic_function();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 {
         println("Parser validation tests: ALL PASSED");
     } else {
         println("Parser validation tests: FAILED");

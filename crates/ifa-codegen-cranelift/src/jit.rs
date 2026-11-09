@@ -115,6 +115,14 @@ impl JitEngine {
             "ifa_rt_string_from_bool",
             ifa_rt_string_from_bool as *const u8,
         );
+        builder.symbol(
+            "ifa_rt_args_count",
+            ifa_runtime::ffi::ifa_rt_args_count as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_args_get",
+            ifa_runtime::ffi::ifa_rt_args_get as *const u8,
+        );
         builder.symbol("ifa_rt_coro_create", ifa_rt_coro_create as *const u8);
         builder.symbol(
             "ifa_rt_coro_create_custom",
@@ -549,6 +557,30 @@ impl JitEngine {
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids
             .insert("ifa_rt_string_from_bool".into(), str_bool_id);
+
+        let mut args_count_sig = Signature::new(call_conv);
+        args_count_sig.returns.push(AbiParam::new(types::I64));
+        let args_count_id = self
+            .module
+            .declare_function("ifa_rt_args_count", Linkage::Import, &args_count_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_args_count".into(), args_count_id);
+        self.func_ids
+            .insert("process::args_count".into(), args_count_id);
+        self.func_ids.insert("args_count".into(), args_count_id);
+
+        let mut args_get_sig = Signature::new(call_conv);
+        args_get_sig.params.push(AbiParam::new(types::I64));
+        args_get_sig.returns.push(AbiParam::new(ptr_type));
+        let args_get_id = self
+            .module
+            .declare_function("ifa_rt_args_get", Linkage::Import, &args_get_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids.insert("ifa_rt_args_get".into(), args_get_id);
+        self.func_ids
+            .insert("process::args_get".into(), args_get_id);
+        self.func_ids.insert("args_get".into(), args_get_id);
 
         // Register stackless coroutine intrinsics
         let mut coro_create_sig = Signature::new(call_conv);

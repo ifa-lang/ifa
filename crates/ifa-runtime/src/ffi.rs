@@ -1365,10 +1365,33 @@ pub extern "C" fn ifa_rt_env_var(name: *const u8) -> *mut u8 {
     }
 }
 
+/// Retrieve process command-line arguments reliably across platforms.
+/// On Linux, falls back to `/proc/self/cmdline` when `main` entrypoint bypassed Rust std `lang_start`.
+fn get_cmdline_args() -> Vec<String> {
+    let std_args: Vec<String> = std::env::args().collect();
+    if std_args.len() <= 1 {
+        #[cfg(target_os = "linux")]
+        if let Ok(bytes) = std::fs::read("/proc/self/cmdline") {
+            let mut proc_args = Vec::new();
+            for part in bytes.split(|&b| b == 0) {
+                if !part.is_empty() {
+                    if let Ok(s) = std::str::from_utf8(part) {
+                        proc_args.push(s.to_string());
+                    }
+                }
+            }
+            if proc_args.len() > std_args.len() {
+                return proc_args;
+            }
+        }
+    }
+    std_args
+}
+
 /// Query the total number of command-line arguments passed to the process.
 #[no_mangle]
 pub extern "C" fn ifa_rt_args_count() -> i64 {
-    std::env::args().count() as i64
+    get_cmdline_args().len() as i64
 }
 
 /// Retrieve the command-line argument at the given zero-based index as a heap-allocated C string.
@@ -1388,7 +1411,8 @@ pub extern "C" fn ifa_rt_args_get(index: i64) -> *mut u8 {
     if index < 0 {
         return empty_alloc();
     }
-    let arg = match std::env::args().nth(index as usize) {
+    let args = get_cmdline_args();
+    let arg = match args.get(index as usize) {
         Some(s) => s,
         None => return empty_alloc(),
     };

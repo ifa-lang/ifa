@@ -974,7 +974,17 @@ pub fn tokenize_source(src: String) -> List<Token> {
                             if c == 93  { advance_token(inout tokens, 62, 0, "]"); i = i + 1; }
                             if c == 59  { advance_token(inout tokens, 35, 0, ";"); i = i + 1; }
                             if c == 44  { advance_token(inout tokens, 39, 0, ","); i = i + 1; }
-                            if c == 46  { advance_token(inout tokens, 42, 0, "."); i = i + 1; }
+                            if c == 46  {
+                                let nc1 = string_char_at(src, i + 1);
+                                let nc2 = string_char_at(src, i + 2);
+                                if nc1 == 46 && nc2 == 46 {
+                                    advance_token(inout tokens, 37, 0, "...");
+                                    i = i + 3;
+                                } else {
+                                    advance_token(inout tokens, 42, 0, ".");
+                                    i = i + 1;
+                                }
+                            }
                             if c == 36  { advance_token(inout tokens, 53, 0, "$"); i = i + 1; }
                             if c == 95  { advance_token(inout tokens, 38, 0, "_"); i = i + 1; }
                             // Colon / double-colon
@@ -1146,6 +1156,21 @@ pub fn test_tokenize_source_comments() -> bool {
     return true;
 }
 
+// Unit test: tokenize_source scans variadic ellipsis token `...`
+pub fn test_lexer_variadic_token() -> bool {
+    let src = "fn print_fmt(fmt: i64, ...) -> i64 { return 0; }";
+    let tokens = tokenize_source(src);
+    mut has_ellipsis = false;
+    mut i: i64 = 0;
+    while i < tokens.len() {
+        if tokens[i].kind == 37 && tokens[i].lexeme == "..." {
+            has_ellipsis = true;
+        }
+        i = i + 1;
+    }
+    return has_ellipsis;
+}
+
 pub fn main() {
     println("=== IFA Compiler Lexer Module ===");
     let tokens = tokenize_sample_program();
@@ -1164,7 +1189,8 @@ pub fn main() {
     let t_src_basic = test_tokenize_source_basic();
     let t_src_int = test_tokenize_source_integers();
     let t_src_cmt = test_tokenize_source_comments();
-    if t_ok && t_lut && t_alias && t_tuple && t_arena && t_const && t_enum && t_comptime && t_macro && t_while && t_if_else && t_src_basic && t_src_int && t_src_cmt {
+    let t_variadic = test_lexer_variadic_token();
+    if t_ok && t_lut && t_alias && t_tuple && t_arena && t_const && t_enum && t_comptime && t_macro && t_while && t_if_else && t_src_basic && t_src_int && t_src_cmt && t_variadic {
         println("Lexer stream test: OK");
     } else {
         println("Lexer stream test: FAILED");

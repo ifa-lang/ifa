@@ -26,7 +26,9 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     let sema_fn = sema::AstFunction(
         name: fn1.name,
         param_name: fn1.param_name,
-        statements: fn1.statements
+        params: fn1.params,
+        statements: fn1.statements,
+        is_variadic: fn1.is_variadic
     );
 
     let res = sema::execute_ast_function(sema_fn, 2);
@@ -37,7 +39,9 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     let codegen_fn = codegen_llvm::AstFunction(
         name: fn1.name,
         param_name: fn1.param_name,
-        statements: fn1.statements
+        params: fn1.params,
+        statements: fn1.statements,
+        is_variadic: fn1.is_variadic
     );
 
     let fir_lines = codegen_llvm::emit_fir_function(codegen_fn);
@@ -121,16 +125,20 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     let sema_while_ok = sema::test_sema_while_loop();
     let sema_if_ok = sema::test_sema_if_else();
     let sema_call_ok = sema::test_sema_direct_call_eval();
+    let sema_multi_ok = sema::test_sema_multi_and_variadic_call_eval();
     let parser_comptime_ok = parser::test_parser_comptime_directives();
     let parser_macro_ok = parser::test_parser_syntax_macros();
     let parser_while_ok = parser::test_parser_while_loop();
     let parser_if_ok = parser::test_parser_if_else();
     let parser_call_ok = parser::test_parser_direct_call();
+    let parser_args_ok = parser::test_parser_arbitrary_call_args();
+    let parser_var_ok = parser::test_parser_variadic_function();
     let lexer_comptime_ok = lexer::test_lexer_comptime_directives();
     let lexer_macro_ok = lexer::test_lexer_syntax_macros();
     let lexer_while_ok = lexer::test_lexer_while_loop();
     let lexer_if_ok = lexer::test_lexer_if_else();
-    if !sema_const_ok || !sema_enum_ok || !sema_global_ok || !sema_chan_tc_ok || !sema_chan_dir_ok || !sema_fiber_esc_ok || !sema_arena_xfer_ok || !sema_infer_ok || !sema_nested_ok || !sema_comptime_ok || !sema_while_ok || !sema_if_ok || !sema_call_ok || !parser_comptime_ok || !parser_macro_ok || !parser_while_ok || !parser_if_ok || !parser_call_ok || !lexer_comptime_ok || !lexer_macro_ok || !lexer_while_ok || !lexer_if_ok {
+    let lexer_var_ok = lexer::test_lexer_variadic_token();
+    if !sema_const_ok || !sema_enum_ok || !sema_global_ok || !sema_chan_tc_ok || !sema_chan_dir_ok || !sema_fiber_esc_ok || !sema_arena_xfer_ok || !sema_infer_ok || !sema_nested_ok || !sema_comptime_ok || !sema_while_ok || !sema_if_ok || !sema_call_ok || !sema_multi_ok || !parser_comptime_ok || !parser_macro_ok || !parser_while_ok || !parser_if_ok || !parser_call_ok || !parser_args_ok || !parser_var_ok || !lexer_comptime_ok || !lexer_macro_ok || !lexer_while_ok || !lexer_if_ok || !lexer_var_ok {
         return false;
     }
 
@@ -181,10 +189,13 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     let pipe_full_ok = test_pipeline_source_to_ast_program_full();
     let pipe_ir_ok = test_pipeline_source_to_llvm_ir();
     let pipe_ir_call_ok = test_pipeline_source_to_llvm_ir_direct_call();
+    let pipe_ir_multi_call_ok = test_pipeline_source_to_llvm_ir_multi_arg_call();
     let cg_call_zero_ok = codegen_llvm::test_codegen_direct_call_zero_arg();
     let cg_call_multi_ok = codegen_llvm::test_codegen_direct_call_multi_arg();
     let cg_call_fn_ok = codegen_llvm::test_codegen_function_with_direct_call_and_return_reg();
-    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok || !fn_ptr_cg_ok || !thunk_cg_ok || !fiber_cg_ok || !chan_cg_ok || !select_cg_ok || !select_timed_cg_ok || !nursery_cg_ok || !codegen_if_ok || !driver_mm_ok || !driver_dag_ok || !driver_ffi_ok || !pipe_basic_ok || !pipe_multi_ok || !pipe_mut_ok || !pipe_full_ok || !pipe_ir_ok || !pipe_ir_call_ok || !cg_call_zero_ok || !cg_call_multi_ok || !cg_call_fn_ok {
+    let cg_args_ok = codegen_llvm::test_codegen_arbitrary_call_args();
+    let cg_var_ok = codegen_llvm::test_codegen_variadic_function_signature();
+    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok || !fn_ptr_cg_ok || !thunk_cg_ok || !fiber_cg_ok || !chan_cg_ok || !select_cg_ok || !select_timed_cg_ok || !nursery_cg_ok || !codegen_if_ok || !driver_mm_ok || !driver_dag_ok || !driver_ffi_ok || !pipe_basic_ok || !pipe_multi_ok || !pipe_mut_ok || !pipe_full_ok || !pipe_ir_ok || !pipe_ir_call_ok || !pipe_ir_multi_call_ok || !cg_call_zero_ok || !cg_call_multi_ok || !cg_call_fn_ok || !cg_args_ok || !cg_var_ok {
         return false;
     }
 
@@ -302,7 +313,9 @@ pub fn compile_ast_program_to_llvm_ir(prog: parser::AstProgram, target_triple: S
         let cg_fn = codegen_llvm::AstFunction(
             name: f.name,
             param_name: f.param_name,
-            statements: f.statements
+            params: f.params,
+            statements: f.statements,
+            is_variadic: f.is_variadic
         );
         let fn_lines = codegen_llvm::emit_llvm_ir_function(cg_fn);
         mut li: i64 = 0;
@@ -367,6 +380,34 @@ pub fn test_pipeline_source_to_llvm_ir_direct_call() -> bool {
         i = i + 1;
     }
     return has_double && has_compute && has_call_double;
+}
+
+pub fn test_pipeline_source_to_llvm_ir_multi_arg_call() -> bool {
+    let src = "fn sum3(a: i64, b: i64, c: i64) -> i64 { return a + b + c; } fn run() -> i64 { let r = sum3(10, 20, 12); return r; }";
+    let tokens = lexer::tokenize_source(src);
+    mut pool: List<parser::AstExpr> = List::new();
+    let prog = parser::parse_program(tokens, inout pool);
+    if prog.functions.len() != 2 {
+        return false;
+    }
+    let ir_lines = compile_ast_program_to_llvm_ir(prog, "x86_64-unknown-linux-gnu");
+    if ir_lines.len() < 25 {
+        return false;
+    }
+    mut has_sum3_def = false;
+    mut has_call_sum3 = false;
+    mut i: i64 = 0;
+    while i < ir_lines.len() {
+        let line = ir_lines[i];
+        if line == "define i64 @sum3(i64 %a, i64 %b, i64 %c) {" {
+            has_sum3_def = true;
+        }
+        if line == "  %t3 = call i64 @sum3(i64 %t0, i64 %t1, i64 %t2)" {
+            has_call_sum3 = true;
+        }
+        i = i + 1;
+    }
+    return has_sum3_def && has_call_sum3;
 }
 
 pub fn parse_and_run_cli() -> bool {
@@ -497,7 +538,9 @@ pub fn main() {
     let sema_fn = sema::AstFunction(
         name: "compute",
         param_name: "x",
-        statements: fn1.statements
+        params: fn1.params,
+        statements: fn1.statements,
+        is_variadic: fn1.is_variadic
     );
     let eval_res = sema::execute_ast_function(sema_fn, 2);
     if eval_res == 42 {
@@ -508,7 +551,9 @@ pub fn main() {
     let codegen_fn = codegen_llvm::AstFunction(
         name: "compute",
         param_name: "x",
-        statements: fn1.statements
+        params: fn1.params,
+        statements: fn1.statements,
+        is_variadic: fn1.is_variadic
     );
     let fir_lines = codegen_llvm::emit_fir_function(codegen_fn);
     println("--- Generated Modular FIR SSA ---");

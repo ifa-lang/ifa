@@ -1710,7 +1710,10 @@ impl<'a> LlvmIrEmitter<'a> {
                     } else {
                         fields.len().max(1)
                     };
-                    out.entry(s_name).or_insert(count);
+                    out.entry(s_name.clone()).or_insert(count);
+                    if let Some(elem_name) = s_name.strip_prefix("List__") {
+                        collect_struct_names(&fir_type_from_elem_name(elem_name), out);
+                    }
                     for (_, f_ty) in fields {
                         collect_struct_names(f_ty, out);
                     }
@@ -2251,20 +2254,7 @@ impl<'a> LlvmIrEmitter<'a> {
                                 ifa_fir::FirType::Struct(s_sym, _) => {
                                     let s_name = INTERNER.resolve(s_sym);
                                     if let Some(elem_name) = s_name.strip_prefix("List__") {
-                                        match elem_name {
-                                            "string" | "String" => ifa_fir::FirType::String,
-                                            "i64" | "int" => {
-                                                ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
-                                            }
-                                            "i32" => {
-                                                ifa_fir::FirType::Int(ifa_sema::types::IntType::I32)
-                                            }
-                                            "bool" => ifa_fir::FirType::Bool,
-                                            other => ifa_fir::FirType::Struct(
-                                                INTERNER.intern(other),
-                                                Vec::new(),
-                                            ),
-                                        }
+                                        fir_type_from_elem_name(elem_name)
                                     } else {
                                         ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                                     }
@@ -2274,20 +2264,7 @@ impl<'a> LlvmIrEmitter<'a> {
                             Some(ifa_fir::FirType::Struct(s_sym, _)) => {
                                 let s_name = INTERNER.resolve(s_sym);
                                 if let Some(elem_name) = s_name.strip_prefix("List__") {
-                                    match elem_name {
-                                        "string" | "String" => ifa_fir::FirType::String,
-                                        "i64" | "int" => {
-                                            ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
-                                        }
-                                        "i32" => {
-                                            ifa_fir::FirType::Int(ifa_sema::types::IntType::I32)
-                                        }
-                                        "bool" => ifa_fir::FirType::Bool,
-                                        other => ifa_fir::FirType::Struct(
-                                            INTERNER.intern(other),
-                                            Vec::new(),
-                                        ),
-                                    }
+                                    fir_type_from_elem_name(elem_name)
                                 } else {
                                     ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                                 }
@@ -3986,17 +3963,7 @@ impl<'a> LlvmIrEmitter<'a> {
                         ifa_fir::FirType::Struct(s_sym, _) => {
                             let s_name = INTERNER.resolve(s_sym);
                             if let Some(elem_name) = s_name.strip_prefix("List__") {
-                                let elem_ty = match elem_name {
-                                    "string" | "String" => ifa_fir::FirType::String,
-                                    "i64" | "int" => {
-                                        ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
-                                    }
-                                    "i32" => ifa_fir::FirType::Int(ifa_sema::types::IntType::I32),
-                                    "bool" => ifa_fir::FirType::Bool,
-                                    other => {
-                                        ifa_fir::FirType::Struct(INTERNER.intern(other), Vec::new())
-                                    }
-                                };
+                                let elem_ty = fir_type_from_elem_name(elem_name);
                                 (
                                     fir_to_llvm_type(&elem_ty)
                                         .unwrap_or_else(|_| "i64".to_string()),
@@ -4011,17 +3978,7 @@ impl<'a> LlvmIrEmitter<'a> {
                     Some(ifa_fir::FirType::Struct(s_sym, _)) => {
                         let s_name = INTERNER.resolve(s_sym);
                         if let Some(elem_name) = s_name.strip_prefix("List__") {
-                            let elem_ty = match elem_name {
-                                "string" | "String" => ifa_fir::FirType::String,
-                                "i64" | "int" => {
-                                    ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
-                                }
-                                "i32" => ifa_fir::FirType::Int(ifa_sema::types::IntType::I32),
-                                "bool" => ifa_fir::FirType::Bool,
-                                other => {
-                                    ifa_fir::FirType::Struct(INTERNER.intern(other), Vec::new())
-                                }
-                            };
+                            let elem_ty = fir_type_from_elem_name(elem_name);
                             (
                                 fir_to_llvm_type(&elem_ty).unwrap_or_else(|_| "i64".to_string()),
                                 llvm_align_for_type(&elem_ty),
@@ -6619,6 +6576,28 @@ fn escape_llvm_string(s: &str) -> String {
         }
     }
     escaped
+}
+
+pub(crate) fn fir_type_from_elem_name(elem_name: &str) -> ifa_fir::FirType {
+    if elem_name == "string" || elem_name == "String" {
+        ifa_fir::FirType::String
+    } else if elem_name == "i64" || elem_name == "int" {
+        ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
+    } else if elem_name == "i32" {
+        ifa_fir::FirType::Int(ifa_sema::types::IntType::I32)
+    } else if elem_name == "bool" {
+        ifa_fir::FirType::Bool
+    } else if let Some(inner) = elem_name.strip_prefix("opt_ref_") {
+        ifa_fir::FirType::Optional(Box::new(ifa_fir::FirType::GenerationalRef(Box::new(
+            fir_type_from_elem_name(inner),
+        ))))
+    } else if let Some(inner) = elem_name.strip_prefix("ref_") {
+        ifa_fir::FirType::GenerationalRef(Box::new(fir_type_from_elem_name(inner)))
+    } else if let Some(inner) = elem_name.strip_prefix("opt_") {
+        ifa_fir::FirType::Optional(Box::new(fir_type_from_elem_name(inner)))
+    } else {
+        ifa_fir::FirType::Struct(INTERNER.intern(elem_name), Vec::new())
+    }
 }
 
 fn llvm_align_for_type(ty: &ifa_fir::FirType) -> u32 {

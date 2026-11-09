@@ -521,8 +521,8 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("183 passed; 0 failed"),
-        "Expected 183 passed unit tests, got:\n{}",
+        stdout.contains("196 passed; 0 failed"),
+        "Expected 196 passed unit tests, got:\n{}",
         stdout
     );
 }
@@ -776,16 +776,20 @@ fn test_autonomous_selfhost_driver_triple_stage_execution() {
     let target_dev_dir = root.join("compiler").join("target").join("dev");
     let ifac_bin = target_dev_dir.join("ifac");
 
-    // Ensure ifac executable is built
-    if !ifac_bin.exists() {
-        let build = Command::new(&kori_bin)
-            .arg("build")
-            .arg("--manifest-path")
-            .arg(&manifest_path)
-            .output()
-            .expect("Build ifac compiler");
-        assert!(build.status.success(), "Failed to build ifac compiler");
-    }
+    // Ensure ifac executable is built and up to date
+    let build = Command::new(&kori_bin)
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .arg("--force")
+        .output()
+        .expect("Build ifac compiler");
+    assert!(
+        build.status.success(),
+        "Failed to build ifac compiler:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
 
     let temp_dir = std::env::temp_dir().join(format!(
         "ifa_autonomous_bootstrap_{}",

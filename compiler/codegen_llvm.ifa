@@ -19,7 +19,31 @@ pub struct AstStmt {
 pub struct AstFunction {
     name: String,
     param_name: String,
-    statements: List<AstStmt>
+    params: List<String>,
+    statements: List<AstStmt>,
+    is_variadic: bool
+}
+
+// Flattens call arguments from an AstExpr (kind: 4) into an ordered list
+pub fn collect_call_arguments(call_expr: ?ref AstExpr, inout args: List<?ref AstExpr>) {
+    if call_expr?.left == None {
+        return;
+    }
+    args.push(call_expr?.left);
+    if call_expr?.right == None {
+        return;
+    }
+    mut curr = call_expr?.right;
+    while curr != None {
+        let ck = curr?.kind ?? 0;
+        if ck == 9 {
+            args.push(curr?.left);
+            curr = curr?.right;
+        } else {
+            args.push(curr);
+            curr = None;
+        }
+    }
 }
 
 // Complex AST: While Loop representation
@@ -43,9 +67,11 @@ pub struct AstIf {
 
 // Complex AST: Pattern for Match expressions
 pub struct AstPattern {
-    kind: i64, // 1: Wildcard `_`, 2: Literal, 3: Identifier
-    val: i64,
-    name: String
+    kind: i64,         // 1: Wildcard `_`, 2: Literal, 3: Identifier / Binding, 4: Variant
+    val: i64,          // Literal integer value
+    name: String,      // Identifier / Variant name
+    sub_pat_name: String, // Sub-pattern variable name
+    has_sub: bool      // Whether variant has sub-pattern payload
 }
 
 // Complex AST: Match Arm
@@ -355,15 +381,13 @@ pub fn emit_fir_expression(
     }
     if k == 4 {
         let callee = expr?.name ?? "unknown";
-        if expr?.left == None {
-            let reg = "%t" + int_to_str(temp_id);
-            temp_id = temp_id + 1;
-            let line = "    " + reg + " = call @" + callee + "()";
-            instructions.push(line);
-            return reg;
-        } else if expr?.right == None {
+        mut call_args: List<?ref AstExpr> = List::new();
+        collect_call_arguments(expr, inout call_args);
+        mut arg_str = "";
+        mut i: i64 = 0;
+        while i < call_args.len() {
             let arg_reg = emit_fir_expression(
-                expr?.left,
+                call_args[i],
                 inout temp_id,
                 env1_var,
                 env1_reg,
@@ -371,36 +395,17 @@ pub fn emit_fir_expression(
                 env2_reg,
                 inout instructions
             );
-            let reg = "%t" + int_to_str(temp_id);
-            temp_id = temp_id + 1;
-            let line = "    " + reg + " = call @" + callee + "(" + arg_reg + ")";
-            instructions.push(line);
-            return reg;
-        } else {
-            let arg1_reg = emit_fir_expression(
-                expr?.left,
-                inout temp_id,
-                env1_var,
-                env1_reg,
-                env2_var,
-                env2_reg,
-                inout instructions
-            );
-            let arg2_reg = emit_fir_expression(
-                expr?.right,
-                inout temp_id,
-                env1_var,
-                env1_reg,
-                env2_var,
-                env2_reg,
-                inout instructions
-            );
-            let reg = "%t" + int_to_str(temp_id);
-            temp_id = temp_id + 1;
-            let line = "    " + reg + " = call @" + callee + "(" + arg1_reg + ", " + arg2_reg + ")";
-            instructions.push(line);
-            return reg;
+            if i > 0 {
+                arg_str = arg_str + ", ";
+            }
+            arg_str = arg_str + arg_reg;
+            i = i + 1;
         }
+        let reg = "%t" + int_to_str(temp_id);
+        temp_id = temp_id + 1;
+        let line = "    " + reg + " = call @" + callee + "(" + arg_str + ")";
+        instructions.push(line);
+        return reg;
     }
     return "%t0";
 }
@@ -481,15 +486,13 @@ pub fn emit_llvm_expression(
     }
     if k == 4 {
         let callee = expr?.name ?? "unknown";
-        if expr?.left == None {
-            let reg = "%t" + int_to_str(temp_id);
-            temp_id = temp_id + 1;
-            let line = "  " + reg + " = call i64 @" + callee + "()";
-            instructions.push(line);
-            return reg;
-        } else if expr?.right == None {
+        mut call_args: List<?ref AstExpr> = List::new();
+        collect_call_arguments(expr, inout call_args);
+        mut arg_str = "";
+        mut i: i64 = 0;
+        while i < call_args.len() {
             let arg_reg = emit_llvm_expression(
-                expr?.left,
+                call_args[i],
                 inout temp_id,
                 env1_var,
                 env1_reg,
@@ -497,36 +500,17 @@ pub fn emit_llvm_expression(
                 env2_reg,
                 inout instructions
             );
-            let reg = "%t" + int_to_str(temp_id);
-            temp_id = temp_id + 1;
-            let line = "  " + reg + " = call i64 @" + callee + "(i64 " + arg_reg + ")";
-            instructions.push(line);
-            return reg;
-        } else {
-            let arg1_reg = emit_llvm_expression(
-                expr?.left,
-                inout temp_id,
-                env1_var,
-                env1_reg,
-                env2_var,
-                env2_reg,
-                inout instructions
-            );
-            let arg2_reg = emit_llvm_expression(
-                expr?.right,
-                inout temp_id,
-                env1_var,
-                env1_reg,
-                env2_var,
-                env2_reg,
-                inout instructions
-            );
-            let reg = "%t" + int_to_str(temp_id);
-            temp_id = temp_id + 1;
-            let line = "  " + reg + " = call i64 @" + callee + "(i64 " + arg1_reg + ", i64 " + arg2_reg + ")";
-            instructions.push(line);
-            return reg;
+            if i > 0 {
+                arg_str = arg_str + ", ";
+            }
+            arg_str = arg_str + "i64 " + arg_reg;
+            i = i + 1;
         }
+        let reg = "%t" + int_to_str(temp_id);
+        temp_id = temp_id + 1;
+        let line = "  " + reg + " = call i64 @" + callee + "(" + arg_str + ")";
+        instructions.push(line);
+        return reg;
     }
     return "%t0";
 }
@@ -890,11 +874,28 @@ pub fn emit_llvm_complex_function(func: AstComplexFunction) -> List<String> {
 // FIR SSA Code Generator: lowers parsed AST functions into complete SSA basic block representations
 pub fn emit_fir_function(func: AstFunction) -> List<String> {
     mut lines: List<String> = List::new();
-    let header = if func.param_name == "" {
-        "fir.func @" + func.name + "() -> i64 {"
-    } else {
-        "fir.func @" + func.name + "(%" + func.param_name + ": i64) -> i64 {"
-    };
+    mut param_sig = "";
+    if func.params.len() > 0 {
+        mut pi: i64 = 0;
+        while pi < func.params.len() {
+            if pi > 0 {
+                param_sig = param_sig + ", ";
+            }
+            param_sig = param_sig + "%" + func.params[pi] + ": i64";
+            pi = pi + 1;
+        }
+        if func.is_variadic {
+            param_sig = param_sig + ", ...";
+        }
+    } else if func.param_name != "" {
+        param_sig = "%" + func.param_name + ": i64";
+        if func.is_variadic {
+            param_sig = param_sig + ", ...";
+        }
+    } else if func.is_variadic {
+        param_sig = "...";
+    }
+    let header = "fir.func @" + func.name + "(" + param_sig + ") -> i64 {";
     lines.push(header);
     lines.push("  bb0:");
 
@@ -950,11 +951,28 @@ pub fn emit_fir_function(func: AstFunction) -> List<String> {
 // Emits bit-for-bit deterministic textual LLVM IR (.ll) for a function
 pub fn emit_llvm_ir_function(func: AstFunction) -> List<String> {
     mut lines: List<String> = List::new();
-    let header = if func.param_name == "" {
-        "define i64 @" + func.name + "() {"
-    } else {
-        "define i64 @" + func.name + "(i64 %" + func.param_name + ") {"
-    };
+    mut param_sig = "";
+    if func.params.len() > 0 {
+        mut pi: i64 = 0;
+        while pi < func.params.len() {
+            if pi > 0 {
+                param_sig = param_sig + ", ";
+            }
+            param_sig = param_sig + "i64 %" + func.params[pi];
+            pi = pi + 1;
+        }
+        if func.is_variadic {
+            param_sig = param_sig + ", ...";
+        }
+    } else if func.param_name != "" {
+        param_sig = "i64 %" + func.param_name;
+        if func.is_variadic {
+            param_sig = param_sig + ", ...";
+        }
+    } else if func.is_variadic {
+        param_sig = "...";
+    }
+    let header = "define i64 @" + func.name + "(" + param_sig + ") {";
     lines.push(header);
     lines.push("entry:");
 
@@ -1072,7 +1090,7 @@ pub fn test_codegen_function_emission() -> bool {
     let stmt2 = AstStmt(is_return: true, target_var: "", expr: ref pool[add_idx]);
     stmts.push(stmt2);
 
-    let func = AstFunction(name: "compute", param_name: "x", statements: stmts);
+    let func = AstFunction(name: "compute", param_name: "x", params: List::new(), statements: stmts, is_variadic: false);
     let lines = emit_fir_function(func);
 
     if lines.len() != 6 {
@@ -1100,7 +1118,7 @@ pub fn test_codegen_llvm_ir_function_emission() -> bool {
     let stmt = AstStmt(is_return: true, target_var: "", expr: ref pool[add_idx]);
     stmts.push(stmt);
 
-    let func = AstFunction(name: "compute", param_name: "x", statements: stmts);
+    let func = AstFunction(name: "compute", param_name: "x", params: List::new(), statements: stmts, is_variadic: false);
     let lines = emit_llvm_ir_function(func);
     if lines.len() != 6 {
         return false;
@@ -1125,7 +1143,7 @@ pub fn test_codegen_llvm_ir_zero_arg_function() -> bool {
     let stmt = AstStmt(is_return: true, target_var: "", expr: ref pool[c_idx]);
     stmts.push(stmt);
 
-    let func = AstFunction(name: "origin", param_name: "", statements: stmts);
+    let func = AstFunction(name: "origin", param_name: "", params: List::new(), statements: stmts, is_variadic: false);
     let lines = emit_llvm_ir_function(func);
     if lines.len() != 5 {
         return false;
@@ -1220,15 +1238,15 @@ pub fn test_codegen_pattern_match() -> bool {
 
     mut arms: List<AstMatchArm> = List::new();
     arms.push(AstMatchArm(
-        pat: AstPattern(kind: 2, val: 1, name: ""),
+        pat: AstPattern(kind: 2, val: 1, name: "", sub_pat_name: "", has_sub: false),
         expr: ref pool[idx10]
     ));
     arms.push(AstMatchArm(
-        pat: AstPattern(kind: 2, val: 2, name: ""),
+        pat: AstPattern(kind: 2, val: 2, name: "", sub_pat_name: "", has_sub: false),
         expr: ref pool[idx20]
     ));
     arms.push(AstMatchArm(
-        pat: AstPattern(kind: 1, val: 0, name: "_"),
+        pat: AstPattern(kind: 1, val: 0, name: "_", sub_pat_name: "", has_sub: false),
         expr: ref pool[idx42]
     ));
 
@@ -1348,11 +1366,11 @@ pub fn test_codegen_complex_function() -> bool {
 
     mut arms: List<AstMatchArm> = List::new();
     arms.push(AstMatchArm(
-        pat: AstPattern(kind: 2, val: 5, name: ""),
+        pat: AstPattern(kind: 2, val: 5, name: "", sub_pat_name: "", has_sub: false),
         expr: ref pool[idx42]
     ));
     arms.push(AstMatchArm(
-        pat: AstPattern(kind: 1, val: 0, name: "_"),
+        pat: AstPattern(kind: 1, val: 0, name: "_", sub_pat_name: "", has_sub: false),
         expr: ref pool[zero_idx]
     ));
     let match_ast = AstMatch(target_var: "x", arms: arms);
@@ -2720,7 +2738,7 @@ pub fn test_codegen_function_with_direct_call_and_return_reg() -> bool {
     stmts.push(s1);
     stmts.push(s2);
 
-    let func = AstFunction(name: "compute", param_name: "y", statements: stmts);
+    let func = AstFunction(name: "compute", param_name: "y", params: List::new(), statements: stmts, is_variadic: false);
     let lines = emit_llvm_ir_function(func);
     if lines.len() != 7 {
         return false;
@@ -2735,6 +2753,75 @@ pub fn test_codegen_function_with_direct_call_and_return_reg() -> bool {
         return false;
     }
     return lines[6] == "}";
+}
+
+// Unit test 22: Textual LLVM IR call emission with 3+ arguments
+pub fn test_codegen_arbitrary_call_args() -> bool {
+    mut pool: List<AstExpr> = List::new();
+    let a1 = AstExpr(kind: 1, val: 10, name: "", op: 0, left: None, right: None);
+    pool.push(a1);
+    let a1_idx = pool.len() - 1;
+    let a2 = AstExpr(kind: 1, val: 20, name: "", op: 0, left: None, right: None);
+    pool.push(a2);
+    let a2_idx = pool.len() - 1;
+    let a3 = AstExpr(kind: 1, val: 12, name: "", op: 0, left: None, right: None);
+    pool.push(a3);
+    let a3_idx = pool.len() - 1;
+
+    let cons3 = AstExpr(kind: 9, val: 1, name: "", op: 0, left: ref pool[a2_idx], right: ref pool[a3_idx]);
+    pool.push(cons3);
+    let cons_idx = pool.len() - 1;
+
+    let call_expr = AstExpr(kind: 4, val: 3, name: "sum3", op: 0, left: ref pool[a1_idx], right: ref pool[cons_idx]);
+    pool.push(call_expr);
+    let call_idx = pool.len() - 1;
+
+    mut temp_id: i64 = 0;
+    mut instructions: List<String> = List::new();
+    let res_reg = emit_llvm_expression(
+        ref pool[call_idx],
+        inout temp_id,
+        "",
+        "",
+        "",
+        "",
+        inout instructions
+    );
+
+    if instructions.len() != 4 {
+        return false;
+    }
+    // instructions[0]: %t0 = 10, instructions[1]: %t1 = 20, instructions[2]: %t2 = 12
+    // instructions[3]: %t3 = call i64 @sum3(i64 %t0, i64 %t1, i64 %t2)
+    let call_line = instructions[3];
+    return call_line == "  %t3 = call i64 @sum3(i64 %t0, i64 %t1, i64 %t2)" && res_reg == "%t3";
+}
+
+// Unit test 23: Textual LLVM IR and FIR lowering of variadic function signature
+pub fn test_codegen_variadic_function_signature() -> bool {
+    mut params: List<String> = List::new();
+    params.push("fmt");
+    mut stmts: List<AstStmt> = List::new();
+    let ret_stmt = AstStmt(is_return: true, target_var: "", expr: None);
+    stmts.push(ret_stmt);
+
+    let func = AstFunction(
+        name: "printf",
+        param_name: "fmt",
+        params: params,
+        statements: stmts,
+        is_variadic: true
+    );
+
+    let llvm_lines = emit_llvm_ir_function(func);
+    let fir_lines = emit_fir_function(func);
+
+    if llvm_lines.len() < 3 || fir_lines.len() < 3 {
+        return false;
+    }
+    let has_llvm_sig = llvm_lines[0] == "define i64 @printf(i64 %fmt, ...) {";
+    let has_fir_sig = fir_lines[0] == "fir.func @printf(%fmt: i64, ...) -> i64 {";
+    return has_llvm_sig && has_fir_sig;
 }
 
 pub fn main() {
@@ -2762,7 +2849,9 @@ pub fn main() {
     let t19 = test_codegen_direct_call_zero_arg();
     let t20 = test_codegen_direct_call_multi_arg();
     let t21 = test_codegen_function_with_direct_call_and_return_reg();
-    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 {
+    let t22 = test_codegen_arbitrary_call_args();
+    let t23 = test_codegen_variadic_function_signature();
+    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");
