@@ -386,13 +386,48 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_lexer_while_loop ... ok"),
+        "Modular lexer while loop test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_lexer_if_else ... ok"),
+        "Modular lexer if/else test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_while_loop ... ok"),
+        "Modular parser while loop test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_if_else ... ok"),
+        "Modular parser if/else test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_while_loop ... ok"),
+        "Modular sema while loop test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_if_else ... ok"),
+        "Modular sema if/else test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_if_else ... ok"),
+        "Modular codegen if/else test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_selfhost_modular_pipeline ... ok"),
         "Modular selfhost pipeline test missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("137 passed; 0 failed"),
-        "Expected 137 passed unit tests, got:\n{}",
+        stdout.contains("151 passed; 0 failed"),
+        "Expected 151 passed unit tests, got:\n{}",
         stdout
     );
 }

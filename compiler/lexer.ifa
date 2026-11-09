@@ -1,8 +1,8 @@
 // Pure IFA Self-Hosting Compiler - Lexer Module (`compiler/lexer.ifa`)
 // Deterministic lexical scanner and token generation for IFA bootstrap compiler.
 
-comptime fn build_keyword_lut() -> [i64; 18] {
-    return [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 26];
+comptime fn build_keyword_lut() -> [i64; 21] {
+    return [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 26, 27, 28, 29];
 }
 
 pub const KEYWORD_LUT = comptime build_keyword_lut();
@@ -438,6 +438,84 @@ pub fn tokenize_syntax_macro_program() -> List<Token> {
     return tokens;
 }
 
+// Tokenize while loop statement program:
+// `fn count_down(mut x: i64) -> i64 { while x > 0 { x = x - 1; } return x; }`
+pub fn tokenize_while_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    advance_token(inout tokens, 1, 0, "fn");
+    advance_token(inout tokens, 10, 0, "count_down");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 5, 0, "mut");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 34, 0, ":");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 36, 0, "->");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 32, 0, "{");
+
+    // while x > 0 { x = x - 1; }
+    advance_token(inout tokens, 27, 0, "while");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 44, 0, ">");
+    advance_token(inout tokens, 11, 0, "0");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 24, 0, "=");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 21, 0, "-");
+    advance_token(inout tokens, 11, 1, "1");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+
+    // return x; }
+    advance_token(inout tokens, 4, 0, "return");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+
+    return tokens;
+}
+
+// Tokenize if/else branching statement program:
+// `fn branch_check(x: i64) -> i64 { if x == 42 { return 100; } else { return 0; } }`
+pub fn tokenize_if_else_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    advance_token(inout tokens, 1, 0, "fn");
+    advance_token(inout tokens, 10, 0, "branch_check");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 34, 0, ":");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 36, 0, "->");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 32, 0, "{");
+
+    // if x == 42 { return 100; } else { return 0; }
+    advance_token(inout tokens, 28, 0, "if");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 40, 0, "==");
+    advance_token(inout tokens, 11, 42, "42");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 4, 0, "return");
+    advance_token(inout tokens, 11, 100, "100");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+    advance_token(inout tokens, 29, 0, "else");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 4, 0, "return");
+    advance_token(inout tokens, 11, 0, "0");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+
+    advance_token(inout tokens, 33, 0, "}");
+
+    return tokens;
+}
+
 // Unit test: Token stream verification and list properties
 pub fn test_lexer_stream() -> bool {
     let tokens = tokenize_sample_program();
@@ -461,7 +539,7 @@ pub fn test_lexer_stream() -> bool {
 
 // Unit test: Comptime keyword LUT validation
 pub fn test_comptime_keyword_lut() -> bool {
-    return KEYWORD_LUT.len() == 18;
+    return KEYWORD_LUT.len() == 21;
 }
 
 // Unit test: Type alias tokenization validation
@@ -585,6 +663,41 @@ pub fn test_lexer_syntax_macros() -> bool {
     return true;
 }
 
+// Unit test: While loop tokenization validation
+pub fn test_lexer_while_loop() -> bool {
+    let tokens = tokenize_while_program();
+    if tokens.len() != 27 {
+        return false;
+    }
+    // index 11: while (27), index 12: x (10), index 13: > (44), index 14: 0 (11)
+    if tokens[11].kind != 27 || tokens[11].lexeme != "while" {
+        return false;
+    }
+    if tokens[13].kind != 44 || tokens[14].kind != 11 {
+        return false;
+    }
+    return true;
+}
+
+// Unit test: If/else conditional branching tokenization validation
+pub fn test_lexer_if_else() -> bool {
+    let tokens = tokenize_if_else_program();
+    if tokens.len() != 26 {
+        return false;
+    }
+    // index 10: if (28), index 12: == (40), index 13: 42 (11), index 19: else (29)
+    if tokens[10].kind != 28 || tokens[10].lexeme != "if" {
+        return false;
+    }
+    if tokens[12].kind != 40 || tokens[13].value != 42 {
+        return false;
+    }
+    if tokens[19].kind != 29 || tokens[19].lexeme != "else" {
+        return false;
+    }
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Lexer Module ===");
     let tokens = tokenize_sample_program();
@@ -598,7 +711,9 @@ pub fn main() {
     let t_enum = test_lexer_enum_declaration();
     let t_comptime = test_lexer_comptime_directives();
     let t_macro = test_lexer_syntax_macros();
-    if t_ok && t_lut && t_alias && t_tuple && t_arena && t_const && t_enum && t_comptime && t_macro {
+    let t_while = test_lexer_while_loop();
+    let t_if_else = test_lexer_if_else();
+    if t_ok && t_lut && t_alias && t_tuple && t_arena && t_const && t_enum && t_comptime && t_macro && t_while && t_if_else {
         println("Lexer stream test: OK");
     } else {
         println("Lexer stream test: FAILED");

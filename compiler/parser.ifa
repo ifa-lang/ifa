@@ -134,6 +134,25 @@ pub struct AstMacroDef {
     statements: List<AstStmt>
 }
 
+// High-level AST representation for While Loop
+pub struct AstWhile {
+    cond_left: ?ref AstExpr,
+    cond_op: i64, // 1: ==, 2: !=, 3: <, 4: <=, 5: >, 6: >=
+    cond_right: ?ref AstExpr,
+    body_target_var: String,
+    body_expr: ?ref AstExpr
+}
+
+// High-level AST representation for If/Else conditional branching
+pub struct AstIf {
+    cond_left: ?ref AstExpr,
+    cond_op: i64, // 1: ==, 2: !=, 3: <, 4: <=, 5: >, 6: >=
+    cond_right: ?ref AstExpr,
+    then_expr: ?ref AstExpr,
+    has_else: bool,
+    else_expr: ?ref AstExpr
+}
+
 // Full Program AST containing all top-level module items
 pub struct AstProgram {
     traits: List<AstTrait>,
@@ -919,6 +938,144 @@ pub fn parse_macro_def(inout cursor: i64, tokens: List<Token>, inout pool: List<
     return AstMacroDef(name: m_name, param_name: p_name, statements: stmts);
 }
 
+// Recursive-descent parser: while loops (`while left op right { target = expr; }`)
+pub fn parse_while(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstWhile {
+    cursor = cursor + 1; // Consume 'while'
+    let left_expr = parse_expression(inout cursor, tokens, inout pool);
+    pool.push(left_expr);
+    let left_idx = pool.len() - 1;
+
+    mut op: i64 = 3; // default <
+    if cursor < tokens.len() {
+        let op_tok = tokens[cursor];
+        if op_tok.kind == 40 { op = 1; }
+        else if op_tok.kind == 41 { op = 2; }
+        else if op_tok.kind == 42 { op = 3; }
+        else if op_tok.kind == 43 { op = 4; }
+        else if op_tok.kind == 44 { op = 5; }
+        else if op_tok.kind == 45 { op = 6; }
+        cursor = cursor + 1;
+    }
+
+    let right_expr = parse_expression(inout cursor, tokens, inout pool);
+    pool.push(right_expr);
+    let right_idx = pool.len() - 1;
+
+    // Consume '{'
+    if cursor < tokens.len() && tokens[cursor].kind == 32 {
+        cursor = cursor + 1;
+    }
+
+    // Parse body assignment: `x = x - 1;` or body expr
+    mut target_var = "";
+    if cursor < tokens.len() && tokens[cursor].kind == 10 {
+        target_var = tokens[cursor].lexeme;
+        cursor = cursor + 1;
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 24 { // '='
+        cursor = cursor + 1;
+    }
+
+    let body_expr = parse_expression(inout cursor, tokens, inout pool);
+    pool.push(body_expr);
+    let body_idx = pool.len() - 1;
+
+    if cursor < tokens.len() && tokens[cursor].kind == 35 { // ';'
+        cursor = cursor + 1;
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 33 { // '}'
+        cursor = cursor + 1;
+    }
+
+    return AstWhile(
+        cond_left: ref pool[left_idx],
+        cond_op: op,
+        cond_right: ref pool[right_idx],
+        body_target_var: target_var,
+        body_expr: ref pool[body_idx]
+    );
+}
+
+// Recursive-descent parser: if/else conditional branching
+pub fn parse_if(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstIf {
+    cursor = cursor + 1; // Consume 'if'
+    let left_expr = parse_expression(inout cursor, tokens, inout pool);
+    pool.push(left_expr);
+    let left_idx = pool.len() - 1;
+
+    mut op: i64 = 1; // default ==
+    if cursor < tokens.len() {
+        let op_tok = tokens[cursor];
+        if op_tok.kind == 40 { op = 1; }
+        else if op_tok.kind == 41 { op = 2; }
+        else if op_tok.kind == 42 { op = 3; }
+        else if op_tok.kind == 43 { op = 4; }
+        else if op_tok.kind == 44 { op = 5; }
+        else if op_tok.kind == 45 { op = 6; }
+        cursor = cursor + 1;
+    }
+
+    let right_expr = parse_expression(inout cursor, tokens, inout pool);
+    pool.push(right_expr);
+    let right_idx = pool.len() - 1;
+
+    // Consume '{'
+    if cursor < tokens.len() && tokens[cursor].kind == 32 {
+        cursor = cursor + 1;
+    }
+
+    // Inside then block: parse return or expr
+    if cursor < tokens.len() && tokens[cursor].kind == 4 { // 'return'
+        cursor = cursor + 1;
+    }
+    let then_expr = parse_expression(inout cursor, tokens, inout pool);
+    pool.push(then_expr);
+    let then_idx = pool.len() - 1;
+
+    if cursor < tokens.len() && tokens[cursor].kind == 35 { // ';'
+        cursor = cursor + 1;
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 33 { // '}'
+        cursor = cursor + 1;
+    }
+
+    mut has_else = false;
+    mut else_idx: i64 = -1;
+    if cursor < tokens.len() && tokens[cursor].kind == 29 { // 'else'
+        cursor = cursor + 1;
+        has_else = true;
+        if cursor < tokens.len() && tokens[cursor].kind == 32 { // '{'
+            cursor = cursor + 1;
+        }
+        if cursor < tokens.len() && tokens[cursor].kind == 4 { // 'return'
+            cursor = cursor + 1;
+        }
+        let else_expr = parse_expression(inout cursor, tokens, inout pool);
+        pool.push(else_expr);
+        else_idx = pool.len() - 1;
+        if cursor < tokens.len() && tokens[cursor].kind == 35 { // ';'
+            cursor = cursor + 1;
+        }
+        if cursor < tokens.len() && tokens[cursor].kind == 33 { // '}'
+            cursor = cursor + 1;
+        }
+    }
+
+    mut else_ref: ?ref AstExpr = None;
+    if has_else {
+        else_ref = ref pool[else_idx];
+    }
+
+    return AstIf(
+        cond_left: ref pool[left_idx],
+        cond_op: op,
+        cond_right: ref pool[right_idx],
+        then_expr: ref pool[then_idx],
+        has_else: has_else,
+        else_expr: else_ref
+    );
+}
+
 // High-level parser: full module program item collection
 pub fn parse_program(tokens: List<Token>, inout pool: List<AstExpr>) -> AstProgram {
     mut traits: List<AstTrait> = List::new();
@@ -1477,6 +1634,69 @@ pub fn test_parser_syntax_macros() -> bool {
     return arg_val == 42;
 }
 
+// Unit test: While loop AST parsing validation
+pub fn test_parser_while_loop() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 27, value: 0, lexeme: "while"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "x"));
+    tokens.push(Token(kind: 44, value: 0, lexeme: ">"));
+    tokens.push(Token(kind: 11, value: 0, lexeme: "0"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "x"));
+    tokens.push(Token(kind: 24, value: 0, lexeme: "="));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "x"));
+    tokens.push(Token(kind: 21, value: 0, lexeme: "-"));
+    tokens.push(Token(kind: 11, value: 1, lexeme: "1"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let w = parse_while(inout cur, tokens, inout pool);
+    if w.cond_op != 5 || w.body_target_var != "x" {
+        return false;
+    }
+    let left_name = w.cond_left?.name ?? "";
+    let right_val = w.cond_right?.val ?? -1;
+    if left_name != "x" || right_val != 0 {
+        return false;
+    }
+    let body_op = w.body_expr?.op ?? 0;
+    return body_op == 2;
+}
+
+// Unit test: If/else branching AST parsing validation
+pub fn test_parser_if_else() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 28, value: 0, lexeme: "if"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "x"));
+    tokens.push(Token(kind: 40, value: 0, lexeme: "=="));
+    tokens.push(Token(kind: 11, value: 42, lexeme: "42"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 4, value: 0, lexeme: "return"));
+    tokens.push(Token(kind: 11, value: 100, lexeme: "100"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+    tokens.push(Token(kind: 29, value: 0, lexeme: "else"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 4, value: 0, lexeme: "return"));
+    tokens.push(Token(kind: 11, value: 0, lexeme: "0"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let if_node = parse_if(inout cur, tokens, inout pool);
+    if if_node.cond_op != 1 || !if_node.has_else {
+        return false;
+    }
+    let left_name = if_node.cond_left?.name ?? "";
+    let right_val = if_node.cond_right?.val ?? -1;
+    let then_val = if_node.then_expr?.val ?? -1;
+    let else_val = if_node.else_expr?.val ?? -1;
+    return left_name == "x" && right_val == 42 && then_val == 100 && else_val == 0;
+}
+
 pub fn main() {
     println("=== IFA Compiler Parser Module ===");
     let t1 = test_parser_ast_building();
@@ -1494,7 +1714,9 @@ pub fn main() {
     let t13 = test_parser_enum_declaration();
     let t14 = test_parser_comptime_directives();
     let t15 = test_parser_syntax_macros();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 {
+    let t16 = test_parser_while_loop();
+    let t17 = test_parser_if_else();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 {
         println("Parser validation tests: ALL PASSED");
     } else {
         println("Parser validation tests: FAILED");

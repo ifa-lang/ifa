@@ -31,6 +31,16 @@ pub struct AstWhile {
     body_expr: ?ref AstExpr
 }
 
+// Complex AST: If/Else conditional branching representation
+pub struct AstIf {
+    cond_left: ?ref AstExpr,
+    cond_op: i64, // 1: ==, 2: !=, 3: <, 4: <=, 5: >, 6: >=
+    cond_right: ?ref AstExpr,
+    then_expr: ?ref AstExpr,
+    has_else: bool,
+    else_expr: ?ref AstExpr
+}
+
 // Complex AST: Pattern for Match expressions
 pub struct AstPattern {
     kind: i64, // 1: Wildcard `_`, 2: Literal, 3: Identifier
@@ -542,6 +552,100 @@ pub fn emit_llvm_while_loop(
     lines.push("  br label %" + cond_lbl);
 
     lines.push(end_lbl + ":");
+}
+
+// Lowers If/Else to FIR SSA blocks
+pub fn emit_fir_if_else(
+    if_ast: AstIf,
+    if_id: i64,
+    inout temp_id: i64,
+    env_var: String,
+    env_reg: String,
+    inout result_reg: String,
+    inout lines: List<String>
+) {
+    let id_str = int_to_str(if_id);
+    let then_bb = "bb_if_then_" + id_str;
+    let else_bb = "bb_if_else_" + id_str;
+    let exit_bb = "bb_if_exit_" + id_str;
+
+    let lhs = emit_fir_expression(if_ast.cond_left, inout temp_id, env_var, env_reg, "", "", inout lines);
+    let rhs = emit_fir_expression(if_ast.cond_right, inout temp_id, env_var, env_reg, "", "", inout lines);
+
+    let cmp_reg = "%t" + int_to_str(temp_id);
+    temp_id = temp_id + 1;
+    mut op_name = "icmp_eq";
+    if if_ast.cond_op == 2 { op_name = "icmp_ne"; }
+    if if_ast.cond_op == 3 { op_name = "icmp_slt"; }
+    if if_ast.cond_op == 4 { op_name = "icmp_sle"; }
+    if if_ast.cond_op == 5 { op_name = "icmp_sgt"; }
+    if if_ast.cond_op == 6 { op_name = "icmp_sge"; }
+
+    lines.push("    " + cmp_reg + " = " + op_name + " " + lhs + ", " + rhs);
+    lines.push("    cond_br " + cmp_reg + ", " + then_bb + ", " + else_bb);
+
+    lines.push("  " + then_bb + ":");
+    let then_val_reg = emit_fir_expression(if_ast.then_expr, inout temp_id, env_var, env_reg, "", "", inout lines);
+    lines.push("    br " + exit_bb);
+
+    lines.push("  " + else_bb + ":");
+    mut else_val_reg = "0";
+    if if_ast.has_else {
+        else_val_reg = emit_fir_expression(if_ast.else_expr, inout temp_id, env_var, env_reg, "", "", inout lines);
+    }
+    lines.push("    br " + exit_bb);
+
+    lines.push("  " + exit_bb + ":");
+    result_reg = "%t" + int_to_str(temp_id);
+    temp_id = temp_id + 1;
+    lines.push("    " + result_reg + " = phi [" + then_val_reg + ", ^" + then_bb + "], [" + else_val_reg + ", ^" + else_bb + "]");
+}
+
+// Lowers If/Else conditional branching to textual LLVM IR blocks
+pub fn emit_llvm_if_else(
+    if_ast: AstIf,
+    if_id: i64,
+    inout temp_id: i64,
+    env_var: String,
+    env_reg: String,
+    inout result_reg: String,
+    inout lines: List<String>
+) {
+    let id_str = int_to_str(if_id);
+    let then_lbl = "if.then." + id_str;
+    let else_lbl = "if.else." + id_str;
+    let exit_lbl = "if.exit." + id_str;
+
+    let lhs = emit_llvm_expression(if_ast.cond_left, inout temp_id, env_var, env_reg, "", "", inout lines);
+    let rhs = emit_llvm_expression(if_ast.cond_right, inout temp_id, env_var, env_reg, "", "", inout lines);
+
+    let cmp_reg = "%t" + int_to_str(temp_id);
+    temp_id = temp_id + 1;
+    mut cmp_op = "eq";
+    if if_ast.cond_op == 2 { cmp_op = "ne"; }
+    if if_ast.cond_op == 3 { cmp_op = "slt"; }
+    if if_ast.cond_op == 4 { cmp_op = "sle"; }
+    if if_ast.cond_op == 5 { cmp_op = "sgt"; }
+    if if_ast.cond_op == 6 { cmp_op = "sge"; }
+
+    lines.push("  " + cmp_reg + " = icmp " + cmp_op + " i64 " + lhs + ", " + rhs);
+    lines.push("  br i1 " + cmp_reg + ", label %" + then_lbl + ", label %" + else_lbl);
+
+    lines.push(then_lbl + ":");
+    let then_val_reg = emit_llvm_expression(if_ast.then_expr, inout temp_id, env_var, env_reg, "", "", inout lines);
+    lines.push("  br label %" + exit_lbl);
+
+    lines.push(else_lbl + ":");
+    mut else_val_reg = "0";
+    if if_ast.has_else {
+        else_val_reg = emit_llvm_expression(if_ast.else_expr, inout temp_id, env_var, env_reg, "", "", inout lines);
+    }
+    lines.push("  br label %" + exit_lbl);
+
+    lines.push(exit_lbl + ":");
+    result_reg = "%t" + int_to_str(temp_id);
+    temp_id = temp_id + 1;
+    lines.push("  " + result_reg + " = phi i64 [ " + then_val_reg + ", %" + then_lbl + " ], [ " + else_val_reg + ", %" + else_lbl + " ]");
 }
 
 // Lowers Pattern Matching to FIR SSA blocks
@@ -2375,6 +2479,48 @@ pub fn test_codegen_task_nursery_concurrency() -> bool {
     return true;
 }
 
+// Unit test 18: If/else conditional branching codegen validation
+pub fn test_codegen_if_else() -> bool {
+    let var_x = AstExpr(kind: 2, val: 0, name: "x", op: 0, left: None, right: None);
+    let lit42 = AstExpr(kind: 1, val: 42, name: "", op: 0, left: None, right: None);
+    let lit100 = AstExpr(kind: 1, val: 100, name: "", op: 0, left: None, right: None);
+    let lit0 = AstExpr(kind: 1, val: 0, name: "", op: 0, left: None, right: None);
+
+    let if_ast = AstIf(
+        cond_left: ref var_x,
+        cond_op: 1, // ==
+        cond_right: ref lit42,
+        then_expr: ref lit100,
+        has_else: true,
+        else_expr: ref lit0
+    );
+
+    mut temp_id: i64 = 0;
+    mut res_reg = "";
+    mut llvm_lines: List<String> = List::new();
+    emit_llvm_if_else(if_ast, 0, inout temp_id, "x", "%x", inout res_reg, inout llvm_lines);
+
+    if llvm_lines.len() < 8 {
+        return false;
+    }
+    if llvm_lines[1] != "  %t1 = icmp eq i64 %x, %t0" {
+        return false;
+    }
+    if llvm_lines[2] != "  br i1 %t1, label %if.then.0, label %if.else.0" {
+        return false;
+    }
+    mut has_phi = false;
+    mut i: i64 = 0;
+    while i < llvm_lines.len() {
+        let line = llvm_lines[i];
+        if line == "  %t4 = phi i64 [ %t2, %if.then.0 ], [ %t3, %if.else.0 ]" {
+            has_phi = true;
+        }
+        i = i + 1;
+    }
+    return has_phi;
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -2394,7 +2540,8 @@ pub fn main() {
     let t15 = test_codegen_channel_select();
     let t16 = test_codegen_timed_and_prioritized_channel_select();
     let t17 = test_codegen_task_nursery_concurrency();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 {
+    let t18 = test_codegen_if_else();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");

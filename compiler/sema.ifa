@@ -22,6 +22,25 @@ pub struct AstFunction {
     statements: List<AstStmt>
 }
 
+// High-level AST representation for While Loop
+pub struct AstWhile {
+    cond_left: ?ref AstExpr,
+    cond_op: i64, // 1: ==, 2: !=, 3: <, 4: <=, 5: >, 6: >=
+    cond_right: ?ref AstExpr,
+    body_target_var: String,
+    body_expr: ?ref AstExpr
+}
+
+// High-level AST representation for If/Else conditional branching
+pub struct AstIf {
+    cond_left: ?ref AstExpr,
+    cond_op: i64, // 1: ==, 2: !=, 3: <, 4: <=, 5: >, 6: >=
+    cond_right: ?ref AstExpr,
+    then_expr: ?ref AstExpr,
+    has_else: bool,
+    else_expr: ?ref AstExpr
+}
+
 // AST Expression Evaluator traversing generational references safely
 pub fn eval_expression(
     expr: ?ref AstExpr,
@@ -1482,6 +1501,84 @@ pub fn test_sema_comptime_evaluation() -> bool {
     return true;
 }
 
+pub fn eval_condition(left_val: i64, op: i64, right_val: i64) -> bool {
+    if op == 1 { return left_val == right_val; }
+    if op == 2 { return left_val != right_val; }
+    if op == 3 { return left_val < right_val; }
+    if op == 4 { return left_val <= right_val; }
+    if op == 5 { return left_val > right_val; }
+    if op == 6 { return left_val >= right_val; }
+    return false;
+}
+
+pub fn eval_while_loop(while_ast: AstWhile, mut cur_val: i64) -> i64 {
+    mut max_iters: i64 = 1000;
+    while max_iters > 0 {
+        let left_val = eval_expression(while_ast.cond_left, "x", cur_val, "", 0, "", 0);
+        let right_val = eval_expression(while_ast.cond_right, "x", cur_val, "", 0, "", 0);
+        let cond = eval_condition(left_val, while_ast.cond_op, right_val);
+        if !cond {
+            return cur_val;
+        }
+        cur_val = eval_expression(while_ast.body_expr, "x", cur_val, "", 0, "", 0);
+        max_iters = max_iters - 1;
+    }
+    return cur_val;
+}
+
+pub fn eval_if_else(if_ast: AstIf, var_val: i64) -> i64 {
+    let left_val = eval_expression(if_ast.cond_left, "x", var_val, "", 0, "", 0);
+    let right_val = eval_expression(if_ast.cond_right, "x", var_val, "", 0, "", 0);
+    let cond = eval_condition(left_val, if_ast.cond_op, right_val);
+    if cond {
+        return eval_expression(if_ast.then_expr, "x", var_val, "", 0, "", 0);
+    }
+    if if_ast.has_else {
+        return eval_expression(if_ast.else_expr, "x", var_val, "", 0, "", 0);
+    }
+    return 0;
+}
+
+// Unit test 18: While loop semantic evaluation
+pub fn test_sema_while_loop() -> bool {
+    let var_x = AstExpr(kind: 2, val: 0, name: "x", op: 0, left: None, right: None);
+    let lit0 = AstExpr(kind: 1, val: 0, name: "", op: 0, left: None, right: None);
+    let lit1 = AstExpr(kind: 1, val: 1, name: "", op: 0, left: None, right: None);
+    let decr = AstExpr(kind: 3, val: 0, name: "", op: 2, left: ref var_x, right: ref lit1);
+
+    let loop_ast = AstWhile(
+        cond_left: ref var_x,
+        cond_op: 5, // >
+        cond_right: ref lit0,
+        body_target_var: "x",
+        body_expr: ref decr
+    );
+
+    let res = eval_while_loop(loop_ast, 5);
+    return res == 0;
+}
+
+// Unit test 19: If/else branching semantic evaluation
+pub fn test_sema_if_else() -> bool {
+    let var_x = AstExpr(kind: 2, val: 0, name: "x", op: 0, left: None, right: None);
+    let lit42 = AstExpr(kind: 1, val: 42, name: "", op: 0, left: None, right: None);
+    let lit100 = AstExpr(kind: 1, val: 100, name: "", op: 0, left: None, right: None);
+    let lit0 = AstExpr(kind: 1, val: 0, name: "", op: 0, left: None, right: None);
+
+    let if_ast = AstIf(
+        cond_left: ref var_x,
+        cond_op: 1, // ==
+        cond_right: ref lit42,
+        then_expr: ref lit100,
+        has_else: true,
+        else_expr: ref lit0
+    );
+
+    let res_true = eval_if_else(if_ast, 42);
+    let res_false = eval_if_else(if_ast, 10);
+    return res_true == 100 && res_false == 0;
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
@@ -1501,7 +1598,9 @@ pub fn main() {
     let t15 = test_sema_local_type_inference();
     let t16 = test_sema_nested_pattern_matching();
     let t17 = test_sema_comptime_evaluation();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 {
+    let t18 = test_sema_while_loop();
+    let t19 = test_sema_if_else();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");

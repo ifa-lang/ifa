@@ -117,11 +117,17 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     let sema_infer_ok = sema::test_sema_local_type_inference();
     let sema_nested_ok = sema::test_sema_nested_pattern_matching();
     let sema_comptime_ok = sema::test_sema_comptime_evaluation();
+    let sema_while_ok = sema::test_sema_while_loop();
+    let sema_if_ok = sema::test_sema_if_else();
     let parser_comptime_ok = parser::test_parser_comptime_directives();
     let parser_macro_ok = parser::test_parser_syntax_macros();
+    let parser_while_ok = parser::test_parser_while_loop();
+    let parser_if_ok = parser::test_parser_if_else();
     let lexer_comptime_ok = lexer::test_lexer_comptime_directives();
     let lexer_macro_ok = lexer::test_lexer_syntax_macros();
-    if !sema_const_ok || !sema_enum_ok || !sema_global_ok || !sema_chan_tc_ok || !sema_chan_dir_ok || !sema_fiber_esc_ok || !sema_arena_xfer_ok || !sema_infer_ok || !sema_nested_ok || !sema_comptime_ok || !parser_comptime_ok || !parser_macro_ok || !lexer_comptime_ok || !lexer_macro_ok {
+    let lexer_while_ok = lexer::test_lexer_while_loop();
+    let lexer_if_ok = lexer::test_lexer_if_else();
+    if !sema_const_ok || !sema_enum_ok || !sema_global_ok || !sema_chan_tc_ok || !sema_chan_dir_ok || !sema_fiber_esc_ok || !sema_arena_xfer_ok || !sema_infer_ok || !sema_nested_ok || !sema_comptime_ok || !sema_while_ok || !sema_if_ok || !parser_comptime_ok || !parser_macro_ok || !parser_while_ok || !parser_if_ok || !lexer_comptime_ok || !lexer_macro_ok || !lexer_while_ok || !lexer_if_ok {
         return false;
     }
 
@@ -162,10 +168,11 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     let select_cg_ok = codegen_llvm::test_codegen_channel_select();
     let select_timed_cg_ok = codegen_llvm::test_codegen_timed_and_prioritized_channel_select();
     let nursery_cg_ok = codegen_llvm::test_codegen_task_nursery_concurrency();
+    let codegen_if_ok = codegen_llvm::test_codegen_if_else();
     let driver_mm_ok = driver::test_driver_multi_module_symbol_resolution();
     let driver_dag_ok = driver::test_driver_import_graph_and_transitive_deps();
     let driver_ffi_ok = driver::test_driver_ffi_header_and_php_bridge_generation();
-    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok || !fn_ptr_cg_ok || !thunk_cg_ok || !fiber_cg_ok || !chan_cg_ok || !select_cg_ok || !select_timed_cg_ok || !nursery_cg_ok || !driver_mm_ok || !driver_dag_ok || !driver_ffi_ok {
+    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok || !fn_ptr_cg_ok || !thunk_cg_ok || !fiber_cg_ok || !chan_cg_ok || !select_cg_ok || !select_timed_cg_ok || !nursery_cg_ok || !codegen_if_ok || !driver_mm_ok || !driver_dag_ok || !driver_ffi_ok {
         return false;
     }
 
