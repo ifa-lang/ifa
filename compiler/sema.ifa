@@ -1281,7 +1281,7 @@ pub fn test_sema_arena_transfer_ownership() -> bool {
 
 // Advanced Local Type Inference Representation and Environment
 pub struct InferredType {
-    kind: i64,      // 1: i64, 2: bool, 3: String, 4: Tuple, 5: Ref, 6: Channel, 7: Unknown
+    kind: i64,      // 1: i64, 2: bool, 3: String, 4: Tuple, 5: Ref, 6: Channel, 7: Unknown, 8: Optional (?T), 9: Union (T1 | T2)
     sub_kind1: i64, // First inner type parameter
     sub_kind2: i64, // Second inner type parameter
     name: String
@@ -1295,8 +1295,94 @@ pub fn make_type_bool() -> InferredType {
     return InferredType(kind: 2, sub_kind1: 0, sub_kind2: 0, name: "bool");
 }
 
+pub fn make_type_string() -> InferredType {
+    return InferredType(kind: 3, sub_kind1: 0, sub_kind2: 0, name: "String");
+}
+
 pub fn make_type_tuple(t1: i64, t2: i64) -> InferredType {
     return InferredType(kind: 4, sub_kind1: t1, sub_kind2: t2, name: "Tuple");
+}
+
+pub fn make_type_optional(inner: i64) -> InferredType {
+    mut inner_name = "i64";
+    if inner == 2 {
+        inner_name = "bool";
+    } else if inner == 3 {
+        inner_name = "String";
+    } else if inner == 4 {
+        inner_name = "Tuple";
+    } else if inner == 0 {
+        inner_name = "None";
+    }
+    return InferredType(kind: 8, sub_kind1: inner, sub_kind2: 0, name: "?" + inner_name);
+}
+
+pub fn make_type_union(t1: i64, t2: i64) -> InferredType {
+    mut n1 = "i64";
+    if t1 == 2 {
+        n1 = "bool";
+    } else if t1 == 3 {
+        n1 = "String";
+    } else if t1 == 4 {
+        n1 = "Tuple";
+    } else if t1 == 8 {
+        n1 = "Optional";
+    }
+
+    mut n2 = "i64";
+    if t2 == 2 {
+        n2 = "bool";
+    } else if t2 == 3 {
+        n2 = "String";
+    } else if t2 == 4 {
+        n2 = "Tuple";
+    } else if t2 == 8 {
+        n2 = "Optional";
+    }
+    return InferredType(kind: 9, sub_kind1: t1, sub_kind2: t2, name: n1 + " | " + n2);
+}
+
+pub fn unify_inferred_types(t1: InferredType, t2: InferredType) -> InferredType {
+    if t1.kind == 7 {
+        return t2;
+    }
+    if t2.kind == 7 {
+        return t1;
+    }
+    if t1.kind == t2.kind {
+        if t1.kind == 8 {
+            if t1.sub_kind1 == t2.sub_kind1 {
+                return t1;
+            }
+            if t1.sub_kind1 == 0 {
+                return t2;
+            }
+            if t2.sub_kind1 == 0 {
+                return t1;
+            }
+            return make_type_union(t1.sub_kind1, t2.sub_kind1);
+        }
+        if t1.kind == 9 {
+            return t1;
+        }
+        return t1;
+    }
+    // Handle None literal (kind 8, sub_kind1: 0) unified with non-optional T
+    if t1.kind == 8 && t1.sub_kind1 == 0 {
+        return make_type_optional(t2.kind);
+    }
+    if t2.kind == 8 && t2.sub_kind1 == 0 {
+        return make_type_optional(t1.kind);
+    }
+    // Optional ?T unified with base type T -> ?T
+    if t1.kind == 8 && t1.sub_kind1 == t2.kind {
+        return t1;
+    }
+    if t2.kind == 8 && t2.sub_kind1 == t1.kind {
+        return t2;
+    }
+    // Distinct types unify into a Sum / Union type T1 | T2
+    return make_type_union(t1.kind, t2.kind);
 }
 
 pub struct LocalTypeBinding {
@@ -1342,6 +1428,15 @@ pub fn infer_expression_type(expr: ?ref AstExpr, env: LocalTypeEnv) -> InferredT
     if k == 3 {
         // Binary operation
         let op = expr?.op ?? 0;
+        if op == 9 {
+            // Null coalescing (opt ?? default)
+            let t_left = infer_expression_type(expr?.left, env);
+            let t_right = infer_expression_type(expr?.right, env);
+            if t_left.kind == 8 && t_left.sub_kind1 != 0 {
+                return InferredType(kind: t_left.sub_kind1, sub_kind1: 0, sub_kind2: 0, name: "unwrapped");
+            }
+            return t_right;
+        }
         if op >= 5 && op <= 8 {
             return make_type_bool();
         }
@@ -1371,7 +1466,50 @@ pub fn infer_expression_type(expr: ?ref AstExpr, env: LocalTypeEnv) -> InferredT
         // Arena allocation or comptime evaluation
         return infer_expression_type(expr?.left, env);
     }
+    if k == 10 {
+        // None literal
+        return make_type_optional(0);
+    }
+    if k == 12 {
+        // String literal
+        return make_type_string();
+    }
     return InferredType(kind: 7, sub_kind1: 0, sub_kind2: 0, name: "unknown");
+}
+
+// Inferred return type of a function based on all return statements
+pub fn infer_function_return_type(func: AstFunction, env: LocalTypeEnv) -> InferredType {
+    mut ret_ty = InferredType(kind: 7, sub_kind1: 0, sub_kind2: 0, name: "unknown");
+    mut found_return = false;
+    mut i: i64 = 0;
+    while i < func.statements.len() {
+        let stmt = func.statements[i];
+        if stmt.is_return {
+            found_return = true;
+            if stmt.expr == None {
+                let none_ty = make_type_optional(0);
+                ret_ty = unify_inferred_types(ret_ty, none_ty);
+            } else {
+                let expr_ty = infer_expression_type(stmt.expr, env);
+                ret_ty = unify_inferred_types(ret_ty, expr_ty);
+            }
+        }
+        i = i + 1;
+    }
+    if !found_return {
+        return make_type_i64();
+    }
+    return ret_ty;
+}
+
+// Inferred return type of an if/else conditional branch
+pub fn infer_if_else_return_type(if_stmt: AstIf, env: LocalTypeEnv) -> InferredType {
+    let then_ty = infer_expression_type(if_stmt.then_expr, env);
+    if !if_stmt.has_else {
+        return make_type_optional(then_ty.kind);
+    }
+    let else_ty = infer_expression_type(if_stmt.else_expr, env);
+    return unify_inferred_types(then_ty, else_ty);
 }
 
 // Nested Pattern Matching Structures and Evaluator
@@ -1695,6 +1833,70 @@ pub fn test_sema_multi_and_variadic_call_eval() -> bool {
     return r3 == 42 && r_var == 42;
 }
 
+// Unit test 22: Optional (?T) and Union/Sum return type inference
+pub fn test_sema_optional_and_union_return_inference() -> bool {
+    mut env = make_local_type_env();
+    bind_local_type(inout env, "val", make_type_i64());
+    bind_local_type(inout env, "msg", make_type_string());
+    bind_local_type(inout env, "opt_val", make_type_optional(1));
+
+    // 1. Single return i64 -> i64
+    let lit42 = AstExpr(kind: 1, val: 42, name: "", op: 0, left: None, right: None);
+    mut stmts1: List<AstStmt> = List::new();
+    stmts1.push(AstStmt(is_return: true, target_var: "", expr: ref lit42));
+    let fn1 = AstFunction(name: "pure_val", param_name: "x", params: List::new(), statements: stmts1, is_variadic: false);
+    let ty1 = infer_function_return_type(fn1, env);
+    if ty1.kind != 1 {
+        return false;
+    }
+
+    // 2. Dual returns: return None and return 42 -> ?i64 (kind 8, sub_kind1 1)
+    mut stmts2: List<AstStmt> = List::new();
+    stmts2.push(AstStmt(is_return: true, target_var: "", expr: None));
+    stmts2.push(AstStmt(is_return: true, target_var: "", expr: ref lit42));
+    let fn2 = AstFunction(name: "find_val", param_name: "x", params: List::new(), statements: stmts2, is_variadic: false);
+    let ty2 = infer_function_return_type(fn2, env);
+    if ty2.kind != 8 || ty2.sub_kind1 != 1 {
+        return false;
+    }
+
+    // 3. Dual returns: return i64 (42) and return String ("ok") -> Union i64 | String (kind 9)
+    let lit_str = AstExpr(kind: 12, val: 0, name: "ok", op: 0, left: None, right: None);
+    mut stmts3: List<AstStmt> = List::new();
+    stmts3.push(AstStmt(is_return: true, target_var: "", expr: ref lit42));
+    stmts3.push(AstStmt(is_return: true, target_var: "", expr: ref lit_str));
+    let fn3 = AstFunction(name: "parse_or_msg", param_name: "x", params: List::new(), statements: stmts3, is_variadic: false);
+    let ty3 = infer_function_return_type(fn3, env);
+    if ty3.kind != 9 || ty3.sub_kind1 != 1 || ty3.sub_kind2 != 3 {
+        return false;
+    }
+
+    // 4. Null coalescing unwrap: opt_val ?? 10 -> i64
+    let var_opt = AstExpr(kind: 2, val: 0, name: "opt_val", op: 0, left: None, right: None);
+    let lit10 = AstExpr(kind: 1, val: 10, name: "", op: 0, left: None, right: None);
+    let coalesce_expr = AstExpr(kind: 3, val: 0, name: "", op: 9, left: ref var_opt, right: ref lit10);
+    let ty_coalesce = infer_expression_type(ref coalesce_expr, env);
+    if ty_coalesce.kind != 1 {
+        return false;
+    }
+
+    // 5. If/else without else -> Optional (?i64)
+    let if_branch = AstIf(
+        cond_left: ref lit42,
+        cond_op: 1,
+        cond_right: ref lit42,
+        then_expr: ref lit42,
+        has_else: false,
+        else_expr: None
+    );
+    let ty_if = infer_if_else_return_type(if_branch, env);
+    if ty_if.kind != 8 || ty_if.sub_kind1 != 1 {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
@@ -1718,7 +1920,8 @@ pub fn main() {
     let t19 = test_sema_if_else();
     let t20 = test_sema_direct_call_eval();
     let t21 = test_sema_multi_and_variadic_call_eval();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 {
+    let t22 = test_sema_optional_and_union_return_inference();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");

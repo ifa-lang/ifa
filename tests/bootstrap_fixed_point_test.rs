@@ -551,8 +551,33 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("208 passed; 0 failed"),
-        "Expected 208 passed unit tests, got:\n{}",
+        stdout.contains("test test_sema_optional_and_union_return_inference ... ok"),
+        "Modular sema optional and union return inference test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_try_catch_blocks ... ok"),
+        "Modular codegen try/catch blocks test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_error_propagation ... ok"),
+        "Modular codegen error propagation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_main_cli_project_scaffolding ... ok"),
+        "Modular main CLI project scaffolding test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_main_kori_manifest_generation ... ok"),
+        "Modular main kori manifest generation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("216 passed; 0 failed"),
+        "Expected 216 passed unit tests, got:\n{}",
         stdout
     );
 }

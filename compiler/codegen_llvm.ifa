@@ -2824,6 +2824,171 @@ pub fn test_codegen_variadic_function_signature() -> bool {
     return has_llvm_sig && has_fir_sig;
 }
 
+// High-level AST representation for Try/Catch execution block and panic recovery
+pub struct AstTryCatch {
+    target_var: String,
+    try_fn_name: String,
+    arg_var: String,
+    has_arg: bool,
+    err_var: String,
+    catch_fallback_val: i64,
+    propagate_on_error: bool
+}
+
+// Emits LLVM IR for Try/Catch block with runtime panic interception
+pub fn emit_llvm_try_catch(tc: AstTryCatch) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  ; === Try/Catch Block: " + tc.target_var + " ===");
+    mut arg_repr = "null";
+    if tc.has_arg {
+        arg_repr = "%" + tc.arg_var;
+    }
+    let err_reg = "%err." + tc.target_var;
+    lines.push("  " + err_reg + " = call i32 @ifa_rt_catch_panic(ptr @" + tc.try_fn_name + ", ptr " + arg_repr + ")");
+    let cmp_reg = "%is_ok." + tc.target_var;
+    lines.push("  " + cmp_reg + " = icmp eq i32 " + err_reg + ", 0");
+    lines.push("  br i1 " + cmp_reg + ", label %try.ok." + tc.target_var + ", label %try.err." + tc.target_var);
+    lines.push("");
+    lines.push("try.ok." + tc.target_var + ":");
+    lines.push("  br label %try.exit." + tc.target_var);
+    lines.push("");
+    lines.push("try.err." + tc.target_var + ":");
+    if tc.propagate_on_error {
+        lines.push("  call void @ifa_rt_dispatch_panic(i32 " + err_reg + ")");
+    }
+    lines.push("  br label %try.exit." + tc.target_var);
+    lines.push("");
+    lines.push("try.exit." + tc.target_var + ":");
+    lines.push("  %" + tc.target_var + " = phi i64 [ 0, %try.ok." + tc.target_var + " ], [ " + int_to_str(tc.catch_fallback_val) + ", %try.err." + tc.target_var + " ]");
+    return lines;
+}
+
+// Emits FIR for Try/Catch block
+pub fn emit_fir_try_catch(tc: AstTryCatch) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut arg_repr = "";
+    if tc.has_arg {
+        arg_repr = "%" + tc.arg_var;
+    }
+    lines.push("    fir.try @" + tc.try_fn_name + "(" + arg_repr + ") catch (%" + tc.err_var + ") {");
+    if tc.propagate_on_error {
+        lines.push("      fir.rethrow %" + tc.err_var);
+    } else {
+        lines.push("      fir.yield %" + tc.target_var + " = " + int_to_str(tc.catch_fallback_val));
+    }
+    lines.push("    }");
+    return lines;
+}
+
+// High-level AST representation for runtime error propagation (? operator / return on error)
+pub struct AstErrorPropagate {
+    source_call: String,
+    arg_var: String,
+    has_arg: bool,
+    target_var: String,
+    error_sentinel: i64
+}
+
+// Emits LLVM IR for runtime error propagation
+pub fn emit_llvm_error_propagation(prop: AstErrorPropagate) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  ; === Error Propagation: " + prop.target_var + " ===");
+    mut arg_repr = "";
+    if prop.has_arg {
+        arg_repr = "i64 %" + prop.arg_var;
+    }
+    let call_reg = "%raw_res." + prop.target_var;
+    lines.push("  " + call_reg + " = call i64 @" + prop.source_call + "(" + arg_repr + ")");
+    let cmp_reg = "%has_err." + prop.target_var;
+    lines.push("  " + cmp_reg + " = icmp eq i64 " + call_reg + ", " + int_to_str(prop.error_sentinel));
+    lines.push("  br i1 " + cmp_reg + ", label %err.propagate." + prop.target_var + ", label %err.ok." + prop.target_var);
+    lines.push("");
+    lines.push("err.propagate." + prop.target_var + ":");
+    lines.push("  ret i64 " + call_reg);
+    lines.push("");
+    lines.push("err.ok." + prop.target_var + ":");
+    lines.push("  %" + prop.target_var + " = phi i64 [ " + call_reg + ", %err.ok." + prop.target_var + " ]");
+    return lines;
+}
+
+// Emits FIR for runtime error propagation
+pub fn emit_fir_error_propagation(prop: AstErrorPropagate) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut arg_repr = "";
+    if prop.has_arg {
+        arg_repr = "%" + prop.arg_var;
+    }
+    lines.push("    %" + prop.target_var + " = fir.try_propagate @" + prop.source_call + "(" + arg_repr + ") err_code " + int_to_str(prop.error_sentinel));
+    return lines;
+}
+
+// Unit test 24: Try/Catch LLVM IR and FIR lowering
+pub fn test_codegen_try_catch_blocks() -> bool {
+    let tc = AstTryCatch(
+        target_var: "safe_res",
+        try_fn_name: "risky_operation",
+        arg_var: "task_ctx",
+        has_arg: true,
+        err_var: "panic_code",
+        catch_fallback_val: -1,
+        propagate_on_error: false
+    );
+
+    let llvm_lines = emit_llvm_try_catch(tc);
+    let fir_lines = emit_fir_try_catch(tc);
+
+    if llvm_lines.len() < 10 || fir_lines.len() < 3 {
+        return false;
+    }
+
+    let has_catch_call = llvm_lines[1] == "  %err.safe_res = call i32 @ifa_rt_catch_panic(ptr @risky_operation, ptr %task_ctx)";
+    mut has_phi = false;
+    mut i: i64 = 0;
+    while i < llvm_lines.len() {
+        if llvm_lines[i] == "  %safe_res = phi i64 [ 0, %try.ok.safe_res ], [ -1, %try.err.safe_res ]" {
+            has_phi = true;
+        }
+        i = i + 1;
+    }
+    let has_fir_try = fir_lines[0] == "    fir.try @risky_operation(%task_ctx) catch (%panic_code) {";
+
+    return has_catch_call && has_phi && has_fir_try;
+}
+
+// Unit test 25: Error propagation LLVM IR and FIR lowering
+pub fn test_codegen_error_propagation() -> bool {
+    let prop = AstErrorPropagate(
+        source_call: "parse_int_checked",
+        arg_var: "buf_ptr",
+        has_arg: true,
+        target_var: "parsed_num",
+        error_sentinel: -999
+    );
+
+    let llvm_lines = emit_llvm_error_propagation(prop);
+    let fir_lines = emit_fir_error_propagation(prop);
+
+    if llvm_lines.len() < 8 || fir_lines.len() < 1 {
+        return false;
+    }
+
+    mut has_call = false;
+    mut has_cmp = false;
+    mut i: i64 = 0;
+    while i < llvm_lines.len() {
+        if llvm_lines[i] == "  %raw_res.parsed_num = call i64 @parse_int_checked(i64 %buf_ptr)" {
+            has_call = true;
+        }
+        if llvm_lines[i] == "  %has_err.parsed_num = icmp eq i64 %raw_res.parsed_num, -999" {
+            has_cmp = true;
+        }
+        i = i + 1;
+    }
+    let has_fir_prop = fir_lines[0] == "    %parsed_num = fir.try_propagate @parse_int_checked(%buf_ptr) err_code -999";
+
+    return has_call && has_cmp && has_fir_prop;
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -2851,7 +3016,9 @@ pub fn main() {
     let t21 = test_codegen_function_with_direct_call_and_return_reg();
     let t22 = test_codegen_arbitrary_call_args();
     let t23 = test_codegen_variadic_function_signature();
-    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 {
+    let t24 = test_codegen_try_catch_blocks();
+    let t25 = test_codegen_error_propagation();
+    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");
