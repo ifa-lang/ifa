@@ -1,0 +1,306 @@
+// Pure IFA Self-Hosting Compiler - Parser Module (`compiler/parser.ifa`)
+// Recursive-descent AST parser utilizing generational references (`?ref AstExpr`) and arena pools.
+
+pub struct Token {
+    kind: i64,
+    value: i64,
+    lexeme: String
+}
+
+// AST Expression node leveraging generational references for recursive trees
+pub struct AstExpr {
+    kind: i64, // 1: Integer Literal, 2: Variable, 3: Binary Operation
+    val: i64,
+    name: String,
+    op: i64,   // 1: Add (+), 2: Sub (-), 3: Mul (*), 4: Div (/)
+    left: ?ref AstExpr,
+    right: ?ref AstExpr
+}
+
+// AST Statement node
+pub struct AstStmt {
+    is_return: bool,
+    target_var: String,
+    expr: ?ref AstExpr
+}
+
+// AST Function node
+pub struct AstFunction {
+    name: String,
+    param_name: String,
+    statements: List<AstStmt>
+}
+
+// Recursive-descent parser: primary expressions (literals, variables, parenthesized sub-trees)
+pub fn parse_primary(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstExpr {
+    if cursor >= tokens.len() {
+        return AstExpr(kind: 0, val: 0, name: "", op: 0, left: None, right: None);
+    }
+    let tok = tokens[cursor];
+    if tok.kind == 11 {
+        // Integer Literal
+        cursor = cursor + 1;
+        return AstExpr(kind: 1, val: tok.value, name: "", op: 0, left: None, right: None);
+    }
+    if tok.kind == 10 {
+        // Variable Identifier
+        cursor = cursor + 1;
+        return AstExpr(kind: 2, val: 0, name: tok.lexeme, op: 0, left: None, right: None);
+    }
+    if tok.kind == 30 {
+        // Left parenthesis '(' -> recursive sub-expression evaluation
+        cursor = cursor + 1;
+        let inner = parse_additive(inout cursor, tokens, inout pool);
+        if cursor < tokens.len() {
+            let rparen = tokens[cursor];
+            if rparen.kind == 31 {
+                cursor = cursor + 1; // Consume ')'
+            }
+        }
+        return inner;
+    }
+    return AstExpr(kind: 0, val: 0, name: "", op: 0, left: None, right: None);
+}
+
+// Recursive-descent parser: multiplicative expressions (* and /)
+pub fn parse_multiplicative(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstExpr {
+    mut current = parse_primary(inout cursor, tokens, inout pool);
+    mut parsing = true;
+    while parsing {
+        if cursor >= tokens.len() {
+            parsing = false;
+        } else {
+            let tok = tokens[cursor];
+            if tok.kind == 22 {
+                // Op: * (Multiplication)
+                cursor = cursor + 1;
+                pool.push(current);
+                let left_idx = pool.len() - 1;
+                let right_expr = parse_primary(inout cursor, tokens, inout pool);
+                pool.push(right_expr);
+                let right_idx = pool.len() - 1;
+                current = AstExpr(
+                    kind: 3,
+                    val: 0,
+                    name: "",
+                    op: 3,
+                    left: ref pool[left_idx],
+                    right: ref pool[right_idx]
+                );
+            } else if tok.kind == 23 {
+                // Op: / (Division)
+                cursor = cursor + 1;
+                pool.push(current);
+                let left_idx = pool.len() - 1;
+                let right_expr = parse_primary(inout cursor, tokens, inout pool);
+                pool.push(right_expr);
+                let right_idx = pool.len() - 1;
+                current = AstExpr(
+                    kind: 3,
+                    val: 0,
+                    name: "",
+                    op: 4,
+                    left: ref pool[left_idx],
+                    right: ref pool[right_idx]
+                );
+            } else {
+                parsing = false;
+            }
+        }
+    }
+    return current;
+}
+
+// Recursive-descent parser: additive expressions (+ and -)
+pub fn parse_additive(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstExpr {
+    mut current = parse_multiplicative(inout cursor, tokens, inout pool);
+    mut parsing = true;
+    while parsing {
+        if cursor >= tokens.len() {
+            parsing = false;
+        } else {
+            let tok = tokens[cursor];
+            if tok.kind == 20 {
+                // Op: + (Addition)
+                cursor = cursor + 1;
+                pool.push(current);
+                let left_idx = pool.len() - 1;
+                let right_expr = parse_multiplicative(inout cursor, tokens, inout pool);
+                pool.push(right_expr);
+                let right_idx = pool.len() - 1;
+                current = AstExpr(
+                    kind: 3,
+                    val: 0,
+                    name: "",
+                    op: 1,
+                    left: ref pool[left_idx],
+                    right: ref pool[right_idx]
+                );
+            } else if tok.kind == 21 {
+                // Op: - (Subtraction)
+                cursor = cursor + 1;
+                pool.push(current);
+                let left_idx = pool.len() - 1;
+                let right_expr = parse_multiplicative(inout cursor, tokens, inout pool);
+                pool.push(right_expr);
+                let right_idx = pool.len() - 1;
+                current = AstExpr(
+                    kind: 3,
+                    val: 0,
+                    name: "",
+                    op: 2,
+                    left: ref pool[left_idx],
+                    right: ref pool[right_idx]
+                );
+            } else {
+                parsing = false;
+            }
+        }
+    }
+    return current;
+}
+
+// Entrypoint for expression parsing
+pub fn parse_expression(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstExpr {
+    return parse_additive(inout cursor, tokens, inout pool);
+}
+
+// Recursive-descent parser: statement declarations (`let var = expr;` and `return expr;`)
+pub fn parse_statement(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstStmt {
+    let tok = tokens[cursor];
+    if tok.kind == 2 {
+        // let <var> = <expr>;
+        cursor = cursor + 1;
+        let var_tok = tokens[cursor];
+        let var_name = var_tok.lexeme;
+        cursor = cursor + 1;
+        if cursor < tokens.len() && tokens[cursor].kind == 24 {
+            cursor = cursor + 1; // Consume '='
+        }
+        let expr = parse_expression(inout cursor, tokens, inout pool);
+        pool.push(expr);
+        let expr_idx = pool.len() - 1;
+        if cursor < tokens.len() && tokens[cursor].kind == 35 {
+            cursor = cursor + 1; // Consume ';'
+        }
+        return AstStmt(is_return: false, target_var: var_name, expr: ref pool[expr_idx]);
+    }
+    if tok.kind == 4 {
+        // return <expr>;
+        cursor = cursor + 1;
+        let expr = parse_expression(inout cursor, tokens, inout pool);
+        pool.push(expr);
+        let expr_idx = pool.len() - 1;
+        if cursor < tokens.len() && tokens[cursor].kind == 35 {
+            cursor = cursor + 1; // Consume ';'
+        }
+        return AstStmt(is_return: true, target_var: "", expr: ref pool[expr_idx]);
+    }
+    return AstStmt(is_return: false, target_var: "", expr: None);
+}
+
+// Recursive-descent parser: function declarations (`fn name(param: T) -> R { ... }`)
+pub fn parse_function(inout cursor: i64, tokens: List<Token>, inout pool: List<AstExpr>) -> AstFunction {
+    cursor = cursor + 1; // Consume 'fn'
+    let fn_tok = tokens[cursor];
+    let fn_name = fn_tok.lexeme;
+    cursor = cursor + 1; // Consume function name
+    cursor = cursor + 1; // Consume '('
+    if cursor < tokens.len() && tokens[cursor].kind == 5 {
+        cursor = cursor + 1; // Consume optional 'inout'
+    }
+    let param_tok = tokens[cursor];
+    let param_name = param_tok.lexeme;
+    cursor = cursor + 1; // Consume parameter name
+    cursor = cursor + 1; // Consume ':'
+    cursor = cursor + 1; // Consume parameter type
+    cursor = cursor + 1; // Consume ')'
+    cursor = cursor + 1; // Consume '->'
+    cursor = cursor + 1; // Consume return type
+    cursor = cursor + 1; // Consume '{'
+
+    mut stmts: List<AstStmt> = List::new();
+    mut parsing = true;
+    while parsing {
+        if cursor >= tokens.len() {
+            parsing = false;
+        } else if tokens[cursor].kind == 33 {
+            cursor = cursor + 1; // Consume '}'
+            parsing = false;
+        } else {
+            let stmt = parse_statement(inout cursor, tokens, inout pool);
+            stmts.push(stmt);
+        }
+    }
+
+    return AstFunction(name: fn_name, param_name: param_name, statements: stmts);
+}
+
+// Unit test 1: Generational reference AST construction
+pub fn test_parser_ast_building() -> bool {
+    mut node_left = AstExpr(kind: 2, val: 0, name: "x", op: 0, left: None, right: None);
+    mut node_right = AstExpr(kind: 1, val: 40, name: "", op: 0, left: None, right: None);
+
+    let bin_expr = AstExpr(
+        kind: 3,
+        val: 0,
+        name: "",
+        op: 1,
+        left: ref node_left,
+        right: ref node_right
+    );
+
+    if bin_expr.kind != 3 {
+        return false;
+    }
+    if bin_expr.op != 1 {
+        return false;
+    }
+    return true;
+}
+
+// Unit test 2: Operator precedence parsing (2 + 3 * 4)
+pub fn test_parser_precedence() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 11, value: 2, lexeme: "2"));
+    tokens.push(Token(kind: 20, value: 0, lexeme: "+"));
+    tokens.push(Token(kind: 11, value: 3, lexeme: "3"));
+    tokens.push(Token(kind: 22, value: 0, lexeme: "*"));
+    tokens.push(Token(kind: 11, value: 4, lexeme: "4"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let root = parse_expression(inout cur, tokens, inout pool);
+
+    return root.op == 1; // Root must be '+' addition, with '*' sub-expression on right
+}
+
+// Unit test 3: Parenthesized sub-expression grouping ((2 + 3) * 4)
+pub fn test_parser_paren_precedence() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 11, value: 2, lexeme: "2"));
+    tokens.push(Token(kind: 20, value: 0, lexeme: "+"));
+    tokens.push(Token(kind: 11, value: 3, lexeme: "3"));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 22, value: 0, lexeme: "*"));
+    tokens.push(Token(kind: 11, value: 4, lexeme: "4"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    let root = parse_expression(inout cur, tokens, inout pool);
+
+    return root.op == 3; // Root must be '*' multiplication
+}
+
+pub fn main() {
+    println("=== IFA Compiler Parser Module ===");
+    let t1 = test_parser_ast_building();
+    let t2 = test_parser_precedence();
+    let t3 = test_parser_paren_precedence();
+    if t1 && t2 && t3 {
+        println("Parser validation tests: ALL PASSED");
+    } else {
+        println("Parser validation tests: FAILED");
+    }
+}

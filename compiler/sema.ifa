@@ -1,0 +1,189 @@
+// Pure IFA Self-Hosting Compiler - Semantic Analysis & Evaluation Module (`compiler/sema.ifa`)
+// Typage, symbol resolution, generational reference traversal, and AST function evaluation.
+
+pub struct AstExpr {
+    kind: i64, // 1: Integer Literal, 2: Variable, 3: Binary Operation
+    val: i64,
+    name: String,
+    op: i64,   // 1: Add (+), 2: Sub (-), 3: Mul (*), 4: Div (/)
+    left: ?ref AstExpr,
+    right: ?ref AstExpr
+}
+
+pub struct AstStmt {
+    is_return: bool,
+    target_var: String,
+    expr: ?ref AstExpr
+}
+
+pub struct AstFunction {
+    name: String,
+    param_name: String,
+    statements: List<AstStmt>
+}
+
+// AST Expression Evaluator traversing generational references safely
+pub fn eval_expression(
+    expr: ?ref AstExpr,
+    param_name: String,
+    param_val: i64,
+    v1_name: String,
+    v1_val: i64,
+    v2_name: String,
+    v2_val: i64
+) -> i64 {
+    let k = expr?.kind ?? 0;
+    if k == 1 {
+        // Integer Literal
+        return expr?.val ?? 0;
+    }
+    if k == 2 {
+        // Variable resolution
+        let name = expr?.name ?? "";
+        if name == param_name {
+            return param_val;
+        }
+        if name == v1_name {
+            return v1_val;
+        }
+        if name == v2_name {
+            return v2_val;
+        }
+        return 0;
+    }
+    if k == 3 {
+        // Binary operation evaluated recursively
+        let left_val = eval_expression(expr?.left, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
+        let right_val = eval_expression(expr?.right, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
+
+        let op = expr?.op ?? 0;
+        if op == 1 {
+            return left_val + right_val;
+        }
+        if op == 2 {
+            return left_val - right_val;
+        }
+        if op == 3 {
+            return left_val * right_val;
+        }
+        if op == 4 {
+            if right_val != 0 {
+                return left_val / right_val;
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+// AST Function Executor with environment tracking
+pub fn execute_ast_function(func: AstFunction, arg_val: i64) -> i64 {
+    mut v1_name = "";
+    mut v1_val: i64 = 0;
+    mut v2_name = "";
+    mut v2_val: i64 = 0;
+
+    mut i: i64 = 0;
+    while i < func.statements.len() {
+        let stmt = func.statements[i];
+        if stmt.is_return {
+            return eval_expression(stmt.expr, func.param_name, arg_val, v1_name, v1_val, v2_name, v2_val);
+        } else {
+            if v1_name == "" {
+                v1_name = stmt.target_var;
+                v1_val = eval_expression(stmt.expr, func.param_name, arg_val, v1_name, v1_val, v2_name, v2_val);
+            } else {
+                v2_name = stmt.target_var;
+                v2_val = eval_expression(stmt.expr, func.param_name, arg_val, v1_name, v1_val, v2_name, v2_val);
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Generic container demonstrating polymorphic methods in self-hosting IFA compiler
+pub struct CompilerResult<T> {
+    success: bool,
+    payload: T
+}
+
+pub fn wrap_result<T>(val: T) -> CompilerResult<T> {
+    return CompilerResult(success: true, payload: val);
+}
+
+pub fn unwrap<T>(res: CompilerResult<T>) -> T {
+    return res.payload;
+}
+
+// Trait and bounded generic container in self-hosting IFA compiler
+pub trait Diagnosable {
+    fn diagnose(self) -> String;
+}
+
+pub struct CompileDiagnostic {
+    code: String,
+    message: String,
+}
+
+pub fn diagnose(d: CompileDiagnostic) -> String {
+    return d.message;
+}
+
+pub struct DiagnosticReporter<T: Diagnosable> {
+    entry: T,
+}
+
+pub fn report_entry<T: Diagnosable>(rep: DiagnosticReporter<T>) -> String {
+    return rep.entry.diagnose();
+}
+
+// Unit test 1: Semantic evaluation over generational AST nodes
+pub fn test_sema_eval() -> bool {
+    mut node_left = AstExpr(kind: 2, val: 0, name: "x", op: 0, left: None, right: None);
+    mut node_right = AstExpr(kind: 1, val: 40, name: "", op: 0, left: None, right: None);
+
+    let bin_expr = AstExpr(
+        kind: 3,
+        val: 0,
+        name: "",
+        op: 1,
+        left: ref node_left,
+        right: ref node_right
+    );
+
+    let result = eval_expression(ref bin_expr, "x", 2, "bonus", 40, "", 0);
+    return result == 42;
+}
+
+// Unit test 2: Polymorphic method dispatch on generic result container
+pub fn test_sema_polymorphic_method() -> bool {
+    let res = wrap_result(42);
+    let unwrapped = res.unwrap();
+    if unwrapped != 42 {
+        return false;
+    }
+    let res_str = wrap_result("ifa_sema_ok");
+    let unwrapped_str = res_str.unwrap();
+    return unwrapped_str == "ifa_sema_ok";
+}
+
+// Unit test 3: Generic trait bound verification
+pub fn test_sema_generic_trait_bound() -> bool {
+    let diag = CompileDiagnostic(code: "E0001", message: "type mismatch");
+    let rep = DiagnosticReporter(entry: diag);
+    let msg = report_entry(rep);
+    return msg == "type mismatch";
+}
+
+pub fn main() {
+    println("=== IFA Compiler Sema Module ===");
+    let t1 = test_sema_eval();
+    let t2 = test_sema_polymorphic_method();
+    let t3 = test_sema_generic_trait_bound();
+    if t1 && t2 && t3 {
+        println("Sema validation tests: ALL PASSED");
+    } else {
+        println("Sema validation tests: FAILED");
+    }
+}

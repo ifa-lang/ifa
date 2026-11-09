@@ -2,7 +2,7 @@ use crate::cfg::ControlFlowGraph;
 use crate::dominance::DominanceTree;
 use crate::ir::*;
 use ifa_span::{Span, Symbol, INTERNER};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Representation of an interprocedural call-site (caller, block, instruction index, argument values).
 type CallSite = (Symbol, BlockId, usize, Vec<ValueId>);
@@ -114,7 +114,7 @@ impl GenOptStats {
 #[derive(Debug, Clone)]
 pub struct NaturalLoop {
     pub header: BlockId,
-    pub blocks: HashSet<BlockId>,
+    pub blocks: BTreeSet<BlockId>,
     pub preheader: Option<BlockId>,
 }
 
@@ -1656,9 +1656,13 @@ impl GenerationalOptPass {
         cfg: &ControlFlowGraph,
         dom_tree: &DominanceTree,
     ) -> Vec<NaturalLoop> {
-        let mut back_edges: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-        for (&block_id, succs) in &cfg.successors {
-            for &succ in succs {
+        let mut back_edges: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
+        let mut sorted_succs: Vec<_> = cfg.successors.iter().collect();
+        sorted_succs.sort_by_key(|(&b, _)| b);
+        for (&block_id, succs) in sorted_succs {
+            let mut sorted_s = succs.clone();
+            sorted_s.sort();
+            for succ in sorted_s {
                 if dom_tree.dominates(succ, block_id) {
                     back_edges.entry(succ).or_default().push(block_id);
                 }
@@ -1666,8 +1670,9 @@ impl GenerationalOptPass {
         }
 
         let mut loops = Vec::new();
-        for (header, srcs) in back_edges {
-            let mut loop_blocks = HashSet::new();
+        for (header, mut srcs) in back_edges {
+            srcs.sort();
+            let mut loop_blocks = BTreeSet::new();
             loop_blocks.insert(header);
             let mut worklist = VecDeque::new();
 
@@ -1679,7 +1684,9 @@ impl GenerationalOptPass {
 
             while let Some(b) = worklist.pop_front() {
                 if let Some(preds) = cfg.predecessors.get(&b) {
-                    for &pred in preds {
+                    let mut sorted_preds = preds.clone();
+                    sorted_preds.sort();
+                    for pred in sorted_preds {
                         if loop_blocks.insert(pred) {
                             worklist.push_back(pred);
                         }

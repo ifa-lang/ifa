@@ -1159,5 +1159,31 @@ impl FirModule {
                 self.functions.push(f);
             }
         }
+        self.sort_deterministically();
+    }
+
+    /// Sorts all functions, structs, enums, and constants into canonical lexicographical order
+    /// to guarantee bit-for-bit reproducible SSA generation and binary emission.
+    pub fn sort_deterministically(&mut self) {
+        self.functions.sort_by(|a, b| {
+            ifa_span::INTERNER
+                .resolve(&a.name)
+                .cmp(&ifa_span::INTERNER.resolve(&b.name))
+        });
+        self.structs.sort_by(|a, b| {
+            ifa_span::INTERNER
+                .resolve(&a.name)
+                .cmp(&ifa_span::INTERNER.resolve(&b.name))
+        });
+        self.enums.sort_by(|a, b| {
+            ifa_span::INTERNER
+                .resolve(&a.name)
+                .cmp(&ifa_span::INTERNER.resolve(&b.name))
+        });
+        self.constants.sort_by(|a, b| {
+            ifa_span::INTERNER
+                .resolve(&a.name)
+                .cmp(&ifa_span::INTERNER.resolve(&b.name))
+        });
     }
 }

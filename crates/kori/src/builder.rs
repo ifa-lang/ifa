@@ -505,7 +505,8 @@ impl BuildOrchestrator {
         Ok(artifacts)
     }
 
-    fn resolve_module_file(base_dir: &Path, module_path: &[Symbol]) -> Option<PathBuf> {
+    /// Resolve a module import path to its corresponding `.ifa` file on disk.
+    pub fn resolve_module_file(base_dir: &Path, module_path: &[Symbol]) -> Option<PathBuf> {
         if module_path.is_empty() {
             return None;
         }
@@ -589,101 +590,88 @@ impl BuildOrchestrator {
                     let mod_key = format!("{}:{}", pkg_name, path_str);
                     let local_alias = im.alias.unwrap_or_else(|| *im.path.last().unwrap());
 
-                    // Check if binary module metadata cache is valid and up to date
-                    if let Some(cached_meta) = cache.get_module_metadata(&mod_key, &sub_fingerprint)
-                    {
-                        let mod_sym = cached_meta.to_module_symbol(local_alias, &im.path, im.span);
-                        let path_sym = INTERNER.intern(&path_str);
-                        symbols.modules.insert(local_alias, mod_sym.clone());
-                        symbols.modules.insert(path_sym, mod_sym.clone());
-                        if let Some(last) = im.path.last() {
-                            symbols.modules.insert(*last, mod_sym);
+                    let sub_source =
+                        fs::read_to_string(&sub_path).map_err(|e| KoriError::CompilationError {
+                            package: pkg_name.to_string(),
+                            message: format!(
+                                "Failed to read module `{}`: {}",
+                                sub_path.display(),
+                                e
+                            ),
+                        })?;
+
+                    let sub_file_id = sm.add_file(sub_path.to_string_lossy(), &sub_source);
+                    let sub_tokens = tokenize(sub_file_id, &sub_source);
+                    let (sub_prog, sub_parse_diags) = parse(sub_file_id, sub_tokens);
+                    if !sub_parse_diags.is_empty() {
+                        let mut msg = String::new();
+                        for diag in &sub_parse_diags {
+                            msg.push_str(&diag.render_to_string(&sm));
                         }
-                    } else {
-                        let sub_source = fs::read_to_string(&sub_path).map_err(|e| {
+                        return Err(KoriError::CompilationError {
+                            package: pkg_name.to_string(),
+                            message: msg,
+                        });
+                    }
+
+                    let sub_analysis = analyze(&sm, &sub_prog);
+                    if sub_analysis.has_errors() {
+                        let mut msg = String::new();
+                        for diag in &sub_analysis.diagnostics {
+                            msg.push_str(&diag.render_to_string(&sm));
+                        }
+                        return Err(KoriError::CompilationError {
+                            package: pkg_name.to_string(),
+                            message: msg,
+                        });
+                    }
+
+                    // Lower submodule to FIR and collect
+                    let sub_fir = compile_to_fir(&sub_prog, &sub_analysis.symbols, true, true)
+                        .map_err(|errors| {
+                            let mut msg = String::new();
+                            for diag in &errors {
+                                msg.push_str(&diag.render_to_string(&sm));
+                            }
                             KoriError::CompilationError {
                                 package: pkg_name.to_string(),
-                                message: format!(
-                                    "Failed to read module `{}`: {}",
-                                    sub_path.display(),
-                                    e
-                                ),
+                                message: msg,
                             }
                         })?;
 
-                        let sub_file_id = sm.add_file(sub_path.to_string_lossy(), &sub_source);
-                        let sub_tokens = tokenize(sub_file_id, &sub_source);
-                        let (sub_prog, sub_parse_diags) = parse(sub_file_id, sub_tokens);
-                        if !sub_parse_diags.is_empty() {
-                            let mut msg = String::new();
-                            for diag in &sub_parse_diags {
-                                msg.push_str(&diag.render_to_string(&sm));
-                            }
-                            return Err(KoriError::CompilationError {
-                                package: pkg_name.to_string(),
-                                message: msg,
-                            });
-                        }
+                    // Store binary module metadata into cache
+                    let meta = ModuleMetadata::from_symbols_and_fir(
+                        &path_str,
+                        pkg_name,
+                        &sub_fingerprint,
+                        &sub_analysis.symbols,
+                        &sub_fir,
+                    );
+                    let _ = cache.store_module_metadata(&mod_key, &meta);
 
-                        let sub_analysis = analyze(&sm, &sub_prog);
-                        if sub_analysis.has_errors() {
-                            let mut msg = String::new();
-                            for diag in &sub_analysis.diagnostics {
-                                msg.push_str(&diag.render_to_string(&sm));
-                            }
-                            return Err(KoriError::CompilationError {
-                                package: pkg_name.to_string(),
-                                message: msg,
-                            });
-                        }
+                    sub_fir_modules.push(sub_fir);
 
-                        // Lower submodule to FIR and collect
-                        let sub_fir = compile_to_fir(&sub_prog, &sub_analysis.symbols, true, true)
-                            .map_err(|errors| {
-                                let mut msg = String::new();
-                                for diag in &errors {
-                                    msg.push_str(&diag.render_to_string(&sm));
-                                }
-                                KoriError::CompilationError {
-                                    package: pkg_name.to_string(),
-                                    message: msg,
-                                }
-                            })?;
+                    // Build ModuleSymbol containing exported (is_pub) definitions
+                    let mut mod_sym =
+                        ModuleSymbol::new(local_alias, im.path.clone(), true, im.span);
+                    for f in sub_analysis.symbols.functions.values() {
+                        mod_sym.add_function(f.clone());
+                    }
+                    for s in sub_analysis.symbols.structs.values() {
+                        mod_sym.add_struct(s.clone());
+                    }
+                    for e in sub_analysis.symbols.enums.values() {
+                        mod_sym.add_enum(e.clone());
+                    }
+                    for c in sub_analysis.symbols.consts.values() {
+                        mod_sym.add_const(c.clone());
+                    }
 
-                        // Store binary module metadata into cache
-                        let meta = ModuleMetadata::from_symbols_and_fir(
-                            &path_str,
-                            pkg_name,
-                            &sub_fingerprint,
-                            &sub_analysis.symbols,
-                            &sub_fir,
-                        );
-                        let _ = cache.store_module_metadata(&mod_key, &meta);
-
-                        sub_fir_modules.push(sub_fir);
-
-                        // Build ModuleSymbol containing exported (is_pub) definitions
-                        let mut mod_sym =
-                            ModuleSymbol::new(local_alias, im.path.clone(), true, im.span);
-                        for f in sub_analysis.symbols.functions.values() {
-                            mod_sym.add_function(f.clone());
-                        }
-                        for s in sub_analysis.symbols.structs.values() {
-                            mod_sym.add_struct(s.clone());
-                        }
-                        for e in sub_analysis.symbols.enums.values() {
-                            mod_sym.add_enum(e.clone());
-                        }
-                        for c in sub_analysis.symbols.consts.values() {
-                            mod_sym.add_const(c.clone());
-                        }
-
-                        let path_sym = INTERNER.intern(&path_str);
-                        symbols.modules.insert(local_alias, mod_sym.clone());
-                        symbols.modules.insert(path_sym, mod_sym.clone());
-                        if let Some(last) = im.path.last() {
-                            symbols.modules.insert(*last, mod_sym);
-                        }
+                    let path_sym = INTERNER.intern(&path_str);
+                    symbols.modules.insert(local_alias, mod_sym.clone());
+                    symbols.modules.insert(path_sym, mod_sym.clone());
+                    if let Some(last) = im.path.last() {
+                        symbols.modules.insert(*last, mod_sym);
                     }
                 }
             }

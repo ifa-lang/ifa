@@ -6362,9 +6362,11 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
         }
     }
 
-    // 4. Lower non-generic functions
+    // 4. Lower non-generic functions in deterministic order
     let mut lowered_fn_names = HashSet::new();
-    for (fn_name, func_ast) in &all_functions {
+    let mut sorted_fns: Vec<_> = all_functions.iter().collect();
+    sorted_fns.sort_by_key(|a| INTERNER.resolve(a.0));
+    for (fn_name, func_ast) in sorted_fns {
         // Skip bare aliases for impl methods so we don't emit duplicates
         if !impl_methods.iter().any(|(m, _)| m == fn_name)
             && impl_methods.iter().any(|(_, f_name)| f_name == fn_name)
@@ -6406,19 +6408,25 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
         }
     }
 
-    // 5. Monomorphize all generic function instances
+    // 5. Monomorphize all generic function instances in deterministic order
     let mut worklist: Vec<(Symbol, Vec<ifa_sema::types::Type>)> = Vec::new();
-    for (fn_name, instances) in &symbols.generic_function_instances {
+    let mut sorted_fn_instances: Vec<_> = symbols.generic_function_instances.iter().collect();
+    sorted_fn_instances.sort_by_key(|a| INTERNER.resolve(a.0));
+    for (fn_name, instances) in sorted_fn_instances {
         for type_args in instances {
             worklist.push((*fn_name, type_args.clone()));
         }
     }
 
     // Automatically enqueue monomorphic instances of methods for all instantiated generic structs
-    for (st_name, instances) in &symbols.generic_struct_instances {
+    let mut sorted_st_instances: Vec<_> = symbols.generic_struct_instances.iter().collect();
+    sorted_st_instances.sort_by_key(|a| INTERNER.resolve(a.0));
+    for (st_name, instances) in sorted_st_instances {
         for type_args in instances {
             if let Some(methods) = symbols.type_methods.get(st_name) {
-                for m_name in methods.keys() {
+                let mut sorted_methods: Vec<_> = methods.keys().collect();
+                sorted_methods.sort_by_key(|a| INTERNER.resolve(a));
+                for m_name in sorted_methods {
                     let base_mangled_method = INTERNER.intern(&format!(
                         "{}__{}",
                         INTERNER.resolve(st_name),
@@ -6488,5 +6496,6 @@ pub fn lower_program(program: &Program, symbols: &SymbolTable) -> FirModule {
         }
     }
 
+    module.sort_deterministically();
     module
 }

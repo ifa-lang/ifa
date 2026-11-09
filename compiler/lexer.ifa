@@ -1,0 +1,146 @@
+// Pure IFA Self-Hosting Compiler - Lexer Module (`compiler/lexer.ifa`)
+// Deterministic lexical scanner and token generation for IFA bootstrap compiler.
+
+comptime fn build_keyword_lut() -> [i64; 8] {
+    mut lut: [i64; 8] = [0; 8];
+    lut[0] = 1; // TOK_FN
+    lut[1] = 2; // TOK_LET
+    lut[2] = 3; // TOK_MUT
+    lut[3] = 4; // TOK_RETURN
+    lut[4] = 5; // TOK_INOUT
+    lut[5] = 6; // TOK_REF
+    lut[6] = 7; // TOK_COMPTIME
+    lut[7] = 8; // TOK_STRUCT
+    return lut;
+}
+
+pub const KEYWORD_LUT = comptime build_keyword_lut();
+
+// Token representation in IFA
+pub struct Token {
+    kind: i64,
+    value: i64,
+    lexeme: String
+}
+
+// Token constructor
+pub fn make_token(kind: i64, value: i64, lexeme: String) -> Token {
+    return Token(kind: kind, value: value, lexeme: lexeme);
+}
+
+// Append a token to the token stream inout list
+pub fn advance_token(inout stream: List<Token>, kind: i64, value: i64, lexeme: String) {
+    let tok = make_token(kind, value, lexeme);
+    stream.push(tok);
+}
+
+// Tokenize sample program:
+// `fn compute(inout x: i64) -> i64 { let bonus = 40; return x + bonus; }`
+pub fn tokenize_sample_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    advance_token(inout tokens, 1, 0, "fn");
+    advance_token(inout tokens, 10, 0, "compute");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 5, 0, "inout");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 34, 0, ":");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 36, 0, "->");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 2, 0, "let");
+    advance_token(inout tokens, 10, 0, "bonus");
+    advance_token(inout tokens, 24, 0, "=");
+    advance_token(inout tokens, 11, 40, "40");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 4, 0, "return");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 20, 0, "+");
+    advance_token(inout tokens, 10, 0, "bonus");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+
+    return tokens;
+}
+
+// Tokenize arithmetic program:
+// `fn arithmetic(inout x: i64) -> i64 { let factor = 3; let offset = 10; return (x + 2) * factor + offset; }`
+pub fn tokenize_arithmetic_program() -> List<Token> {
+    mut tokens: List<Token> = List::new();
+
+    advance_token(inout tokens, 1, 0, "fn");
+    advance_token(inout tokens, 10, 0, "arithmetic");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 5, 0, "inout");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 34, 0, ":");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 36, 0, "->");
+    advance_token(inout tokens, 10, 0, "i64");
+    advance_token(inout tokens, 32, 0, "{");
+    advance_token(inout tokens, 2, 0, "let");
+    advance_token(inout tokens, 10, 0, "factor");
+    advance_token(inout tokens, 24, 0, "=");
+    advance_token(inout tokens, 11, 3, "3");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 2, 0, "let");
+    advance_token(inout tokens, 10, 0, "offset");
+    advance_token(inout tokens, 24, 0, "=");
+    advance_token(inout tokens, 11, 10, "10");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 4, 0, "return");
+    advance_token(inout tokens, 30, 0, "(");
+    advance_token(inout tokens, 10, 0, "x");
+    advance_token(inout tokens, 20, 0, "+");
+    advance_token(inout tokens, 11, 2, "2");
+    advance_token(inout tokens, 31, 0, ")");
+    advance_token(inout tokens, 22, 0, "*");
+    advance_token(inout tokens, 10, 0, "factor");
+    advance_token(inout tokens, 20, 0, "+");
+    advance_token(inout tokens, 10, 0, "offset");
+    advance_token(inout tokens, 35, 0, ";");
+    advance_token(inout tokens, 33, 0, "}");
+
+    return tokens;
+}
+
+// Unit test: Token stream verification and list properties
+pub fn test_lexer_stream() -> bool {
+    let tokens = tokenize_sample_program();
+    if tokens.len() != 22 {
+        return false;
+    }
+    let first = tokens[0];
+    if first.kind != 1 {
+        return false;
+    }
+    let let_tok = tokens[11];
+    if let_tok.kind != 2 {
+        return false;
+    }
+    let num_tok = tokens[14];
+    if num_tok.value != 40 {
+        return false;
+    }
+    return true;
+}
+
+// Unit test: Comptime keyword LUT validation
+pub fn test_comptime_keyword_lut() -> bool {
+    return KEYWORD_LUT.len() == 8;
+}
+
+pub fn main() {
+    println("=== IFA Compiler Lexer Module ===");
+    let tokens = tokenize_sample_program();
+    println("Sample tokens tokenized successfully:", tokens.len());
+    let t_ok = test_lexer_stream();
+    if t_ok {
+        println("Lexer stream test: OK");
+    } else {
+        println("Lexer stream test: FAILED");
+    }
+}

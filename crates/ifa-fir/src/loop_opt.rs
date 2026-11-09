@@ -26,7 +26,7 @@ use crate::cfg::ControlFlowGraph;
 use crate::dominance::DominanceTree;
 use crate::gen_opt::GenerationalOptPass;
 use crate::ir::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Statistics collected by the Loop Optimization (Fusion & Tiling) pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -339,7 +339,7 @@ impl LoopOptPass {
     fn extract_induction_info(
         func: &FirFunction,
         header_id: BlockId,
-        blocks: &HashSet<BlockId>,
+        blocks: &BTreeSet<BlockId>,
     ) -> Option<LoopInductionInfo> {
         let header = func.get_block(header_id)?;
         let term = header.terminator.as_ref()?;

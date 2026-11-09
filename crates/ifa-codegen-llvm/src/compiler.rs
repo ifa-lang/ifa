@@ -231,21 +231,16 @@ impl LlvmCompiler {
         output_bin: &Path,
         lto: &str,
     ) -> Result<(), LlvmCodegenError> {
-        static STUB_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let stub_id = STUB_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let rt_path = std::env::temp_dir().join(format!(
-            "ifa_llvm_runtime_stub_{}_{}_{}.c",
-            std::process::id(),
-            stub_id,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let rt_path = object_path.with_extension("rt.c");
         let _ = fs::write(&rt_path, ifa_codegen_cranelift::RUNTIME_STUB_C);
 
         let mut clang_cmd = Command::new("clang");
-        clang_cmd.arg(object_path).arg(&rt_path).arg("-no-pie");
+        clang_cmd
+            .arg(object_path)
+            .arg(&rt_path)
+            .arg("-no-pie")
+            .arg("-fno-ident")
+            .arg("-Wl,--build-id=none");
         if !lto.is_empty() && lto != "none" {
             clang_cmd.arg(format!("-flto={}", lto));
         }

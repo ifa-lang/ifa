@@ -14,7 +14,7 @@ pub use escape::{
 };
 pub use exclusivity::{check_call_exclusivity, AccessPath, PathAliasKind, PathSegment};
 pub use symbol_table::{
-    CapturedVariable, FunctionSymbol, StructSymbol, SymbolTable, VariableSymbol,
+    CapturedVariable, FunctionSymbol, ModuleSymbol, StructSymbol, SymbolTable, VariableSymbol,
 };
 pub use types::{FloatType, IntType, Type};
 

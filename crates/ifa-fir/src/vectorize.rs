@@ -5,7 +5,7 @@ use crate::ir::*;
 use crate::types::FirType;
 use ifa_sema::types::{FloatType, IntType};
 use ifa_span::{Symbol, INTERNER};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Statistics collected by the SIMD auto-vectorization pipeline.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1343,7 +1343,7 @@ impl VectorizePass {
     fn is_loop_side_effect_free(
         &mut self,
         func: &FirFunction,
-        loop_blocks: &HashSet<BlockId>,
+        loop_blocks: &BTreeSet<BlockId>,
     ) -> (bool, bool) {
         let mut has_pure_calls = false;
         for &b_id in loop_blocks {

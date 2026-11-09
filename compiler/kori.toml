@@ -1,0 +1,28 @@
+[package]
+name = "ifac"
+version = "0.1.0"
+edition = "2026"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
+license = "MIT OR Apache-2.0"
+description = "Pure IFA Self-Hosting Compiler"
+
+[targets]
+bin = [
+    { name = "ifac", path = "main.ifa" }
+]
+
+[profiles.dev]
+backend = "llvm"
+opt_level = 0
+debug_assertions = true
+lto = "none"
+strip_symbols = false
+gen_checks = true
+
+[profiles.release]
+backend = "llvm"
+opt_level = 2
+debug_assertions = false
+lto = "none"
+strip_symbols = false
+gen_checks = false

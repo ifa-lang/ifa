@@ -528,6 +528,7 @@ dependencies = [
  "ifa-runtime",
  "ifa-sema",
  "ifa-span",
+ "ifa-stdlib",
  "ifa-wasm",
  "kori",
  "serde_json",

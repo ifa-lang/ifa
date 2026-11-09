@@ -6,12 +6,12 @@ use ifa_fir::{
     ValueId,
 };
 use ifa_span::INTERNER;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Emits canonical textual LLVM IR (.ll) from FIR SSA modules.
 pub struct LlvmIrEmitter<'a> {
     target: &'a LlvmTargetConfig,
-    string_literals: HashMap<String, String>,
+    string_literals: BTreeMap<String, String>,
     next_str_id: usize,
 }
 
@@ -20,7 +20,7 @@ impl<'a> LlvmIrEmitter<'a> {
     pub fn new(target: &'a LlvmTargetConfig) -> Self {
         Self {
             target,
-            string_literals: HashMap::new(),
+            string_literals: BTreeMap::new(),
             next_str_id: 0,
         }
     }
@@ -1654,7 +1654,7 @@ impl<'a> LlvmIrEmitter<'a> {
         }
 
         // 3.5. Emit structure type definitions
-        let mut declared_structs = std::collections::HashSet::new();
+        let mut declared_structs = BTreeSet::new();
         if !module.structs.is_empty() {
             out.push_str("; Structure Type Definitions\n");
             for st in &module.structs {
@@ -1673,10 +1673,27 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push('\n');
         }
 
-        // Also emit synthesized structure definitions (e.g. closures, environment records)
-        let mut synthesized_structs: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        // Also emit synthesized structure definitions (e.g. closures, environment records, generic instances) in deterministic order
+        let mut synthesized_structs: BTreeMap<String, usize> = BTreeMap::new();
         for func in &module.functions {
+            for p in &func.params {
+                if let ifa_fir::FirType::Struct(name, fields) = &p.ty {
+                    let st_name = INTERNER.resolve(name);
+                    if !declared_structs.contains(&st_name)
+                        && !synthesized_structs.contains_key(&st_name)
+                    {
+                        synthesized_structs.insert(st_name, fields.len());
+                    }
+                }
+            }
+            if let ifa_fir::FirType::Struct(name, fields) = &func.ret_ty {
+                let st_name = INTERNER.resolve(name);
+                if !declared_structs.contains(&st_name)
+                    && !synthesized_structs.contains_key(&st_name)
+                {
+                    synthesized_structs.insert(st_name, fields.len());
+                }
+            }
             for block in &func.blocks {
                 for inst in &block.instructions {
                     if let ValueExpr::StructInit { name, fields } = &inst.expr {
@@ -1864,9 +1881,15 @@ impl<'a> LlvmIrEmitter<'a> {
                 let param_types: Vec<String> = func
                     .params
                     .iter()
-                    .map(|p| match &p.ty {
-                        ifa_fir::FirType::Array(..) => "ptr".to_string(),
-                        _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()),
+                    .map(|p| {
+                        if p.mode == ifa_fir::ParamMode::InOut {
+                            "ptr".to_string()
+                        } else {
+                            match &p.ty {
+                                ifa_fir::FirType::Array(..) => "ptr".to_string(),
+                                _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "i64".to_string()),
+                            }
+                        }
                     })
                     .collect();
                 let strict_attr = if func.is_strict {
@@ -2060,11 +2083,18 @@ impl<'a> LlvmIrEmitter<'a> {
             .params
             .iter()
             .map(|p| {
-                let ty = match &p.ty {
-                    ifa_fir::FirType::Array(..) => "ptr".to_string(),
-                    _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "ptr".to_string()),
+                let ty = if p.mode == ifa_fir::ParamMode::InOut {
+                    "ptr".to_string()
+                } else {
+                    match &p.ty {
+                        ifa_fir::FirType::Array(..) => "ptr".to_string(),
+                        _ => fir_to_llvm_type(&p.ty).unwrap_or_else(|_| "ptr".to_string()),
+                    }
                 };
-                if (func.is_strict || p.noalias || fn_name.contains("__"))
+                if (func.is_strict
+                    || p.noalias
+                    || fn_name.contains("__")
+                    || p.mode == ifa_fir::ParamMode::InOut)
                     && ty == "ptr"
                     && fn_name != "main"
                     && !fn_name.starts_with("ifa_rt_")

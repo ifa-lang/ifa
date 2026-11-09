@@ -28,3 +28,8 @@ clap.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+ifa-stdlib.workspace = true
+
+[[test]]
+name = "bootstrap_fixed_point_test"
+path = "../../tests/bootstrap_fixed_point_test.rs"

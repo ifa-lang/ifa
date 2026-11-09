@@ -1208,18 +1208,8 @@ impl AotCompiler {
         let compilers = ["cc", "gcc", "clang"];
         let mut last_err = String::new();
 
-        static STUB_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let stub_id = STUB_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let rt_stub = RUNTIME_STUB_C;
-        let rt_path = std::env::temp_dir().join(format!(
-            "ifa_runtime_stub_{}_{}_{}.c",
-            std::process::id(),
-            stub_id,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let rt_path = object_path.with_extension("rt.c");
         fs::write(&rt_path, rt_stub)?;
 
         for compiler in &compilers {
@@ -1227,6 +1217,8 @@ impl AotCompiler {
                 .arg(object_path)
                 .arg(&rt_path)
                 .arg("-no-pie")
+                .arg("-fno-ident")
+                .arg("-Wl,--build-id=none")
                 .arg("-o")
                 .arg(output_binary)
                 .status();

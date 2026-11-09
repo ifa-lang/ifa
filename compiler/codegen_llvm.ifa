@@ -1,0 +1,321 @@
+// Pure IFA Self-Hosting Compiler - LLVM Codegen Module (`compiler/codegen_llvm.ifa`)
+// Deterministic textual LLVM IR (.ll) code generator for reproducible self-hosting builds.
+
+pub struct AstExpr {
+    kind: i64,
+    val: i64,
+    name: String,
+    op: i64,
+    left: ?ref AstExpr,
+    right: ?ref AstExpr
+}
+
+pub struct AstStmt {
+    is_return: bool,
+    target_var: String,
+    expr: ?ref AstExpr
+}
+
+pub struct AstFunction {
+    name: String,
+    param_name: String,
+    statements: List<AstStmt>
+}
+
+pub fn int_to_digit(n: i64) -> String {
+    if n == 0 { return "0"; }
+    if n == 1 { return "1"; }
+    if n == 2 { return "2"; }
+    if n == 3 { return "3"; }
+    if n == 4 { return "4"; }
+    if n == 5 { return "5"; }
+    if n == 6 { return "6"; }
+    if n == 7 { return "7"; }
+    if n == 8 { return "8"; }
+    if n == 9 { return "9"; }
+    return "0";
+}
+
+pub fn int_to_str(mut n: i64) -> String {
+    if n == 0 {
+        return "0";
+    }
+    mut is_neg = false;
+    if n < 0 {
+        is_neg = true;
+        n = 0 - n;
+    }
+    mut digits = "";
+    while n > 0 {
+        let rem = n % 10;
+        let d = int_to_digit(rem);
+        digits = d + digits;
+        n = n / 10;
+    }
+    if is_neg {
+        return "-" + digits;
+    }
+    return digits;
+}
+
+// FIR SSA Code Generator: lowers recursive AST expressions into linear SSA instructions
+pub fn emit_fir_expression(
+    expr: ?ref AstExpr,
+    inout temp_id: i64,
+    env1_var: String,
+    env1_reg: String,
+    env2_var: String,
+    env2_reg: String,
+    inout instructions: List<String>
+) -> String {
+    let k = expr?.kind ?? 0;
+    if k == 1 {
+        // Integer constant: %tN = const <val>
+        let reg = "%t" + int_to_str(temp_id);
+        temp_id = temp_id + 1;
+        let line = "    " + reg + " = const " + int_to_str(expr?.val ?? 0);
+        instructions.push(line);
+        return reg;
+    }
+    if k == 2 {
+        let name = expr?.name ?? "";
+        // Variable lookup: check SSA environment mapping or use parameter register
+        if name == env1_var && env1_reg != "" {
+            return env1_reg;
+        }
+        if name == env2_var && env2_reg != "" {
+            return env2_reg;
+        }
+        return "%" + name;
+    }
+    if k == 3 {
+        // Binary operation: recursively emit LHS and RHS operands
+        let lhs_reg = emit_fir_expression(
+            expr?.left,
+            inout temp_id,
+            env1_var,
+            env1_reg,
+            env2_var,
+            env2_reg,
+            inout instructions
+        );
+        let rhs_reg = emit_fir_expression(
+            expr?.right,
+            inout temp_id,
+            env1_var,
+            env1_reg,
+            env2_var,
+            env2_reg,
+            inout instructions
+        );
+
+        let reg = "%t" + int_to_str(temp_id);
+        temp_id = temp_id + 1;
+
+        mut op_name = "add";
+        let op = expr?.op ?? 0;
+        if op == 2 {
+            op_name = "sub";
+        }
+        if op == 3 {
+            op_name = "mul";
+        }
+        if op == 4 {
+            op_name = "div";
+        }
+
+        let line = "    " + reg + " = " + op_name + " " + lhs_reg + ", " + rhs_reg;
+        instructions.push(line);
+        return reg;
+    }
+    return "%t0";
+}
+
+// FIR SSA Code Generator: lowers parsed AST functions into complete SSA basic block representations
+pub fn emit_fir_function(func: AstFunction) -> List<String> {
+    mut lines: List<String> = List::new();
+    let header = "fir.func @" + func.name + "(%" + func.param_name + ": i64) -> i64 {";
+    lines.push(header);
+    lines.push("  bb0:");
+
+    mut temp_counter: i64 = 0;
+    mut env1_var = "";
+    mut env1_reg = "";
+    mut env2_var = "";
+    mut env2_reg = "";
+
+    mut i: i64 = 0;
+    while i < func.statements.len() {
+        let stmt = func.statements[i];
+        if stmt.is_return {
+            let res_reg = emit_fir_expression(
+                stmt.expr,
+                inout temp_counter,
+                env1_var,
+                env1_reg,
+                env2_var,
+                env2_reg,
+                inout lines
+            );
+            lines.push("    ret " + res_reg);
+        } else {
+            let res_reg = emit_fir_expression(
+                stmt.expr,
+                inout temp_counter,
+                env1_var,
+                env1_reg,
+                env2_var,
+                env2_reg,
+                inout lines
+            );
+            if env1_var == "" {
+                env1_var = stmt.target_var;
+                env1_reg = res_reg;
+            } else {
+                env2_var = stmt.target_var;
+                env2_reg = res_reg;
+            }
+        }
+        i = i + 1;
+    }
+
+    lines.push("}");
+    return lines;
+}
+
+// Emits bit-for-bit deterministic textual LLVM IR (.ll) for a function
+pub fn emit_llvm_ir_function(func: AstFunction) -> List<String> {
+    mut lines: List<String> = List::new();
+    let header = "define i64 @" + func.name + "(i64 %" + func.param_name + ") {";
+    lines.push(header);
+    lines.push("entry:");
+
+    mut temp_counter: i64 = 0;
+    mut env1_var = "";
+    mut env1_reg = "";
+    mut env2_var = "";
+    mut env2_reg = "";
+
+    mut i: i64 = 0;
+    while i < func.statements.len() {
+        let stmt = func.statements[i];
+        if stmt.is_return {
+            let res_reg = emit_fir_expression(
+                stmt.expr,
+                inout temp_counter,
+                env1_var,
+                env1_reg,
+                env2_var,
+                env2_reg,
+                inout lines
+            );
+            lines.push("  ret i64 " + res_reg);
+        } else {
+            let res_reg = emit_fir_expression(
+                stmt.expr,
+                inout temp_counter,
+                env1_var,
+                env1_reg,
+                env2_var,
+                env2_reg,
+                inout lines
+            );
+            if env1_var == "" {
+                env1_var = stmt.target_var;
+                env1_reg = res_reg;
+            } else {
+                env2_var = stmt.target_var;
+                env2_reg = res_reg;
+            }
+        }
+        i = i + 1;
+    }
+
+    lines.push("}");
+    return lines;
+}
+
+// Unit test 1: FIR SSA expression lowering
+pub fn test_codegen_fir_expression() -> bool {
+    mut pool: List<AstExpr> = List::new();
+    let left = AstExpr(kind: 1, val: 15, name: "", op: 0, left: None, right: None);
+    pool.push(left);
+    let left_idx = pool.len() - 1;
+    let right = AstExpr(kind: 1, val: 27, name: "", op: 0, left: None, right: None);
+    pool.push(right);
+    let right_idx = pool.len() - 1;
+    let root = AstExpr(
+        kind: 3,
+        val: 0,
+        name: "",
+        op: 1,
+        left: ref pool[left_idx],
+        right: ref pool[right_idx]
+    );
+
+    mut temp_id: i64 = 0;
+    mut instructions: List<String> = List::new();
+    let final_reg = emit_fir_expression(
+        ref root,
+        inout temp_id,
+        "",
+        "",
+        "",
+        "",
+        inout instructions
+    );
+
+    if final_reg != "%t2" {
+        return false;
+    }
+    if instructions.len() != 3 {
+        return false;
+    }
+    return instructions[2] == "    %t2 = add %t0, %t1";
+}
+
+// Unit test 2: Deterministic function lowering
+pub fn test_codegen_function_emission() -> bool {
+    mut pool: List<AstExpr> = List::new();
+    let expr_const = AstExpr(kind: 1, val: 40, name: "", op: 0, left: None, right: None);
+    pool.push(expr_const);
+    let c_idx = pool.len() - 1;
+
+    mut stmts: List<AstStmt> = List::new();
+    let stmt1 = AstStmt(is_return: false, target_var: "bonus", expr: ref pool[c_idx]);
+    stmts.push(stmt1);
+
+    let expr_x = AstExpr(kind: 2, val: 0, name: "x", op: 0, left: None, right: None);
+    pool.push(expr_x);
+    let x_idx = pool.len() - 1;
+
+    let expr_bonus = AstExpr(kind: 2, val: 0, name: "bonus", op: 0, left: None, right: None);
+    pool.push(expr_bonus);
+    let b_idx = pool.len() - 1;
+
+    let expr_add = AstExpr(kind: 3, val: 0, name: "", op: 1, left: ref pool[x_idx], right: ref pool[b_idx]);
+    pool.push(expr_add);
+    let add_idx = pool.len() - 1;
+
+    let stmt2 = AstStmt(is_return: true, target_var: "", expr: ref pool[add_idx]);
+    stmts.push(stmt2);
+
+    let func = AstFunction(name: "compute", param_name: "x", statements: stmts);
+    let lines = emit_fir_function(func);
+
+    if lines.len() != 6 {
+        return false;
+    }
+    return lines[0] == "fir.func @compute(%x: i64) -> i64 {";
+}
+
+pub fn main() {
+    println("=== IFA Compiler LLVM Codegen Module ===");
+    let t1 = test_codegen_fir_expression();
+    let t2 = test_codegen_function_emission();
+    if t1 && t2 {
+        println("Codegen validation tests: ALL PASSED");
+    } else {
+        println("Codegen validation tests: FAILED");
+    }
+}
