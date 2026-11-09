@@ -606,8 +606,38 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("228 passed; 0 failed"),
-        "Expected 228 passed unit tests, got:\n{}",
+        stdout.contains("test test_codegen_arena_allocation_and_reset ... ok"),
+        "Modular codegen arena allocation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_gen_ref_check ... ok"),
+        "Modular codegen gen ref check test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_cow_make_mut ... ok"),
+        "Modular codegen cow make mut test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_generational_memory_runtime_assembly ... ok"),
+        "Modular driver generational memory runtime assembly test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_generational_ref_safety ... ok"),
+        "Modular sema generational ref safety test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_cow_inplace_exclusivity ... ok"),
+        "Modular sema cow inplace exclusivity test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("240 passed; 0 failed"),
+        "Expected 240 passed unit tests, got:\n{}",
         stdout
     );
 }

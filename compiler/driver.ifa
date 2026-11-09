@@ -141,6 +141,15 @@ pub fn assemble_full_llvm_module_with_opt(
     full_module.push("declare i32 @ifa_rt_arena_transfer_owner(i16, i64)");
     full_module.push("declare i32 @ifa_rt_arena_verify_owner(i16, i64)");
     full_module.push("");
+    full_module.push("; IFA Generational Memory and CoW Runtime Declarations");
+    full_module.push("declare ptr @ifa_rt_gen_alloc(i64, i64, i16)");
+    full_module.push("declare i16 @ifa_rt_arena_create(i64)");
+    full_module.push("declare void @ifa_rt_arena_reset(i16)");
+    full_module.push("declare void @ifa_rt_arena_destroy(i16)");
+    full_module.push("declare ptr @ifa_rt_arena_alloc(i16, i64, i64)");
+    full_module.push("declare void @ifa_panic_uaf(ptr, i32, i32, i16)");
+    full_module.push("declare ptr @ifa_rt_cow_make_mut(ptr, i64, i64)");
+    full_module.push("");
 
     mut i: i64 = 0;
     while i < func_lines.len() {
@@ -187,6 +196,15 @@ pub fn assemble_full_llvm_module(func_lines: List<String>, target_triple: String
     full_module.push("declare i64 @ifa_rt_fiber_spawn_with_arena(ptr, ptr)");
     full_module.push("declare i32 @ifa_rt_arena_transfer_owner(i16, i64)");
     full_module.push("declare i32 @ifa_rt_arena_verify_owner(i16, i64)");
+    full_module.push("");
+    full_module.push("; IFA Generational Memory and CoW Runtime Declarations");
+    full_module.push("declare ptr @ifa_rt_gen_alloc(i64, i64, i16)");
+    full_module.push("declare i16 @ifa_rt_arena_create(i64)");
+    full_module.push("declare void @ifa_rt_arena_reset(i16)");
+    full_module.push("declare void @ifa_rt_arena_destroy(i16)");
+    full_module.push("declare ptr @ifa_rt_arena_alloc(i16, i64, i64)");
+    full_module.push("declare void @ifa_panic_uaf(ptr, i32, i32, i16)");
+    full_module.push("declare ptr @ifa_rt_cow_make_mut(ptr, i64, i64)");
     full_module.push("");
 
     mut i: i64 = 0;
@@ -1039,7 +1057,7 @@ pub fn test_driver_full_module_assembly() -> bool {
     fn_lines.push("}");
 
     let full_ir = assemble_full_llvm_module(fn_lines, "x86_64-unknown-linux-gnu");
-    if full_ir.len() != 39 {
+    if full_ir.len() != 48 {
         return false;
     }
     if full_ir[6] != "declare void @ifa_rt_println(ptr)" {
@@ -1081,7 +1099,7 @@ pub fn test_driver_full_module_assembly() -> bool {
     if full_ir[18] != "declare ptr @ifa_rt_args_get(i64)" {
         return false;
     }
-    return full_ir[38] == "}";
+    return full_ir[47] == "}";
 }
 
 // Unit Test 5: Verify driver compilation result structure
@@ -1474,6 +1492,47 @@ pub fn test_driver_simd_vectorization_metadata_assembly() -> bool {
     return has_intrinsic_add8 && has_intrinsic_fadd8 && has_meta_head && has_meta_width8;
 }
 
+// Unit Test 14: Verify full LLVM module assembly contains generational memory and CoW declarations
+pub fn test_driver_generational_memory_runtime_assembly() -> bool {
+    mut fn_lines: List<String> = List::new();
+    fn_lines.push("define i64 @arena_test() #0 {");
+    fn_lines.push("entry:");
+    fn_lines.push("  ret i64 0");
+    fn_lines.push("}");
+
+    let ir = assemble_full_llvm_module(fn_lines, "x86_64-unknown-linux-gnu");
+    if ir.len() < 40 {
+        return false;
+    }
+
+    mut has_gen_alloc = false;
+    mut has_arena_create = false;
+    mut has_arena_reset = false;
+    mut has_panic_uaf = false;
+    mut has_cow_make_mut = false;
+    mut i: i64 = 0;
+    while i < ir.len() {
+        if ir[i] == "declare ptr @ifa_rt_gen_alloc(i64, i64, i16)" {
+            has_gen_alloc = true;
+        }
+        if ir[i] == "declare i16 @ifa_rt_arena_create(i64)" {
+            has_arena_create = true;
+        }
+        if ir[i] == "declare void @ifa_rt_arena_reset(i16)" {
+            has_arena_reset = true;
+        }
+        if ir[i] == "declare void @ifa_panic_uaf(ptr, i32, i32, i16)" {
+            has_panic_uaf = true;
+        }
+        if ir[i] == "declare ptr @ifa_rt_cow_make_mut(ptr, i64, i64)" {
+            has_cow_make_mut = true;
+        }
+        i = i + 1;
+    }
+
+    return has_gen_alloc && has_arena_create && has_arena_reset && has_panic_uaf && has_cow_make_mut;
+}
+
 pub fn main() {
     println("=== IFA Compiler Driver & I/O Module ===");
     let t1 = test_driver_default_config();
@@ -1489,8 +1548,9 @@ pub fn main() {
     let t11 = test_driver_opt_level_flags();
     let t12 = test_driver_llvm_opt_module_assembly();
     let t13 = test_driver_simd_vectorization_metadata_assembly();
+    let t14 = test_driver_generational_memory_runtime_assembly();
 
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 {
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 {
         println("Driver validation tests: ALL PASSED");
     } else {
         println("Driver validation tests: FAILED");

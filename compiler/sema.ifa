@@ -1995,6 +1995,88 @@ pub fn test_sema_simd_disjoint_slice_aliasing() -> bool {
     return res_clean.is_vectorizable && res_clean.memory_disjoint && res_clean.recommended_width == 8;
 }
 
+// Validates generational reference lifetime and safety (prevents dangling pointers and cross-arena escapes)
+pub struct GenRefValidation {
+    is_safe: bool,
+    allows_mutation: bool,
+    target_arena: i64,
+    has_escape_risk: bool
+}
+
+pub fn analyze_generational_ref_safety(
+    target_type: String,
+    arena_id: i64,
+    is_mutable: bool,
+    escapes_fiber: bool
+) -> GenRefValidation {
+    if escapes_fiber && arena_id > 0 {
+        // Scoped arenas cannot escape their defining fiber scope
+        return GenRefValidation(
+            is_safe: false,
+            allows_mutation: false,
+            target_arena: arena_id,
+            has_escape_risk: true
+        );
+    }
+
+    if is_mutable && target_type == "const" {
+        return GenRefValidation(
+            is_safe: false,
+            allows_mutation: false,
+            target_arena: arena_id,
+            has_escape_risk: false
+        );
+    }
+
+    return GenRefValidation(
+        is_safe: true,
+        allows_mutation: is_mutable,
+        target_arena: arena_id,
+        has_escape_risk: false
+    );
+}
+
+// Validates Copy-on-Write uniqueness for guaranteed in-place mutation without invisible copies
+pub fn analyze_cow_inplace_exclusivity(is_unique_owner: bool, ref_count: i64) -> bool {
+    // If refcount is exactly 1 or static unique owner, in-place zero-cost mutation is guaranteed
+    if is_unique_owner || ref_count == 1 {
+        return true;
+    }
+    return false;
+}
+
+// Unit test 25: Semantic verification of generational reference lifetime and arena scoping
+pub fn test_sema_generational_ref_safety() -> bool {
+    // Safe arena-bound local reference
+    let v_safe = analyze_generational_ref_safety("AstNode", 1, true, false);
+    if !v_safe.is_safe || !v_safe.allows_mutation || v_safe.has_escape_risk {
+        return false;
+    }
+
+    // Unsafe reference escaping fiber boundary with scoped arena
+    let v_escape = analyze_generational_ref_safety("AstNode", 1, false, true);
+    if v_escape.is_safe || !v_escape.has_escape_risk {
+        return false;
+    }
+
+    // Global arena reference (arena 0) allowed to escape
+    let v_global = analyze_generational_ref_safety("AstNode", 0, false, true);
+    return v_global.is_safe && !v_global.has_escape_risk;
+}
+
+// Unit test 26: Semantic verification of Copy-on-Write guaranteed in-place mutation
+pub fn test_sema_cow_inplace_exclusivity() -> bool {
+    // Unique owner: in-place guaranteed
+    let ok_unique = analyze_cow_inplace_exclusivity(true, 1);
+    let ok_ref1 = analyze_cow_inplace_exclusivity(false, 1);
+
+    // Shared reference (refcount > 1): requires copy before mutation
+    let shared_2 = analyze_cow_inplace_exclusivity(false, 2);
+    let shared_5 = analyze_cow_inplace_exclusivity(false, 5);
+
+    return ok_unique && ok_ref1 && !shared_2 && !shared_5;
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
@@ -2021,7 +2103,9 @@ pub fn main() {
     let t22 = test_sema_optional_and_union_return_inference();
     let t23 = test_sema_simd_vector_eligibility_and_width();
     let t24 = test_sema_simd_disjoint_slice_aliasing();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 {
+    let t25 = test_sema_generational_ref_safety();
+    let t26 = test_sema_cow_inplace_exclusivity();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");

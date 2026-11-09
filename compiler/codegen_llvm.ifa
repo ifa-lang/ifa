@@ -246,6 +246,41 @@ pub struct AstTaskNursery {
     use_isolated_arenas: bool
 }
 
+// AST: Generational arena creation
+pub struct AstArenaCreate {
+    target_var: String,
+    capacity_bytes: i64
+}
+
+// AST: Generational memory allocation
+pub struct AstArenaAlloc {
+    target_var: String,
+    arena_id: i64,
+    size_bytes: i64,
+    align_bytes: i64
+}
+
+// AST: Generational arena reset
+pub struct AstArenaReset {
+    arena_var: String
+}
+
+// AST: Generational reference safety verification
+pub struct AstGenRefCheck {
+    ptr_var: String,
+    expected_gen: i64,
+    arena_id: i64,
+    target_checked_var: String
+}
+
+// AST: Guaranteed in-place Copy-on-Write mutation
+pub struct AstCowMakeMut {
+    target_var: String,
+    src_var: String,
+    elem_size: i64,
+    align_bytes: i64
+}
+
 pub fn mangle_generic_method(
     trait_name: String,
     struct_name: String,
@@ -3409,6 +3444,173 @@ pub fn test_codegen_simd_metadata_and_fir() -> bool {
     return has_head && has_vec_enable && has_width && has_interleave && has_unroll && has_predicate && has_progress;
 }
 
+// Emits LLVM IR for scoped arena creation
+pub fn emit_llvm_arena_create(ac: AstArenaCreate) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  %" + ac.target_var + " = call i16 @ifa_rt_arena_create(i64 " + int_to_str(ac.capacity_bytes) + ")");
+    return lines;
+}
+
+// Emits FIR SSA for scoped arena creation
+pub fn emit_fir_arena_create(ac: AstArenaCreate) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + ac.target_var + " = fir.arena_create capacity=" + int_to_str(ac.capacity_bytes));
+    return lines;
+}
+
+// Emits LLVM IR for generational memory allocation in arena
+pub fn emit_llvm_arena_alloc(aa: AstArenaAlloc) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  %" + aa.target_var + " = call ptr @ifa_rt_gen_alloc(i64 " + int_to_str(aa.size_bytes) + ", i64 " + int_to_str(aa.align_bytes) + ", i16 " + int_to_str(aa.arena_id) + ")");
+    return lines;
+}
+
+// Emits FIR SSA for generational memory allocation
+pub fn emit_fir_arena_alloc(aa: AstArenaAlloc) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + aa.target_var + " = fir.arena_alloc arena=" + int_to_str(aa.arena_id) + ", size=" + int_to_str(aa.size_bytes) + ", align=" + int_to_str(aa.align_bytes));
+    return lines;
+}
+
+// Emits LLVM IR for arena reset invalidating live references in O(1)
+pub fn emit_llvm_arena_reset(ar: AstArenaReset) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  call void @ifa_rt_arena_reset(i16 %" + ar.arena_var + ")");
+    return lines;
+}
+
+// Emits FIR SSA for arena reset
+pub fn emit_fir_arena_reset(ar: AstArenaReset) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    fir.arena_reset %" + ar.arena_var);
+    return lines;
+}
+
+// Emits LLVM IR for generational reference check guarding against UAF
+pub fn emit_llvm_gen_ref_check(chk: AstGenRefCheck) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  ; === Generational Reference Guard: %" + chk.target_checked_var + " ===");
+    lines.push("  %" + chk.target_checked_var + ".hdr_ptr = getelementptr i8, ptr %" + chk.ptr_var + ", i64 -8");
+    lines.push("  %" + chk.target_checked_var + ".hdr = load i64, ptr %" + chk.target_checked_var + ".hdr_ptr, align 8");
+    lines.push("  %" + chk.target_checked_var + ".cur_gen = trunc i64 %" + chk.target_checked_var + ".hdr to i32");
+    lines.push("  %" + chk.target_checked_var + ".gen_ok = icmp eq i32 %" + chk.target_checked_var + ".cur_gen, " + int_to_str(chk.expected_gen));
+    lines.push("  br i1 %" + chk.target_checked_var + ".gen_ok, label %" + chk.target_checked_var + ".ok, label %" + chk.target_checked_var + ".fail");
+    lines.push(chk.target_checked_var + ".fail:");
+    lines.push("  call void @ifa_panic_uaf(ptr %" + chk.ptr_var + ", i32 " + int_to_str(chk.expected_gen) + ", i32 %" + chk.target_checked_var + ".cur_gen, i16 " + int_to_str(chk.arena_id) + ")");
+    lines.push("  unreachable");
+    lines.push(chk.target_checked_var + ".ok:");
+    return lines;
+}
+
+// Emits FIR SSA for generational reference check
+pub fn emit_fir_gen_ref_check(chk: AstGenRefCheck) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + chk.target_checked_var + " = fir.gen_ref_check %" + chk.ptr_var + ", gen=" + int_to_str(chk.expected_gen) + ", arena=" + int_to_str(chk.arena_id));
+    return lines;
+}
+
+// Emits LLVM IR for Copy-on-Write in-place mutation guarantee
+pub fn emit_llvm_cow_make_mut(cow: AstCowMakeMut) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("  ; === Copy-on-Write In-Place Check: %" + cow.target_var + " ===");
+    lines.push("  %" + cow.target_var + " = call ptr @ifa_rt_cow_make_mut(ptr %" + cow.src_var + ", i64 " + int_to_str(cow.elem_size) + ", i64 " + int_to_str(cow.align_bytes) + ")");
+    return lines;
+}
+
+// Emits FIR SSA for Copy-on-Write in-place mutation
+pub fn emit_fir_cow_make_mut(cow: AstCowMakeMut) -> List<String> {
+    mut lines: List<String> = List::new();
+    lines.push("    %" + cow.target_var + " = fir.cow_make_mut %" + cow.src_var + ", size=" + int_to_str(cow.elem_size) + ", align=" + int_to_str(cow.align_bytes));
+    return lines;
+}
+
+// Unit test 29: Scoped arena creation, generational allocation and reset
+pub fn test_codegen_arena_allocation_and_reset() -> bool {
+    let ac = AstArenaCreate(target_var: "arena_hdl", capacity_bytes: 65536);
+    let llvm_ac = emit_llvm_arena_create(ac);
+    let fir_ac = emit_fir_arena_create(ac);
+    if llvm_ac.len() != 1 || fir_ac.len() != 1 {
+        return false;
+    }
+    if llvm_ac[0] != "  %arena_hdl = call i16 @ifa_rt_arena_create(i64 65536)" {
+        return false;
+    }
+    if fir_ac[0] != "    %arena_hdl = fir.arena_create capacity=65536" {
+        return false;
+    }
+
+    let aa = AstArenaAlloc(target_var: "buf_ptr", arena_id: 1, size_bytes: 1024, align_bytes: 8);
+    let llvm_aa = emit_llvm_arena_alloc(aa);
+    let fir_aa = emit_fir_arena_alloc(aa);
+    if llvm_aa.len() != 1 || fir_aa.len() != 1 {
+        return false;
+    }
+    if llvm_aa[0] != "  %buf_ptr = call ptr @ifa_rt_gen_alloc(i64 1024, i64 8, i16 1)" {
+        return false;
+    }
+    if fir_aa[0] != "    %buf_ptr = fir.arena_alloc arena=1, size=1024, align=8" {
+        return false;
+    }
+
+    let ar = AstArenaReset(arena_var: "arena_hdl");
+    let llvm_ar = emit_llvm_arena_reset(ar);
+    let fir_ar = emit_fir_arena_reset(ar);
+    if llvm_ar.len() != 1 || fir_ar.len() != 1 {
+        return false;
+    }
+    if llvm_ar[0] != "  call void @ifa_rt_arena_reset(i16 %arena_hdl)" {
+        return false;
+    }
+    return fir_ar[0] == "    fir.arena_reset %arena_hdl";
+}
+
+// Unit test 30: Generational reference safety verification and UAF guard emission
+pub fn test_codegen_gen_ref_check() -> bool {
+    let chk = AstGenRefCheck(
+        ptr_var: "raw_node_ptr",
+        expected_gen: 7,
+        arena_id: 2,
+        target_checked_var: "safe_node_ref"
+    );
+
+    let llvm_lines = emit_llvm_gen_ref_check(chk);
+    let fir_lines = emit_fir_gen_ref_check(chk);
+
+    if llvm_lines.len() != 10 || fir_lines.len() != 1 {
+        return false;
+    }
+
+    let has_hdr_ptr = llvm_lines[1] == "  %safe_node_ref.hdr_ptr = getelementptr i8, ptr %raw_node_ptr, i64 -8";
+    let has_load_hdr = llvm_lines[2] == "  %safe_node_ref.hdr = load i64, ptr %safe_node_ref.hdr_ptr, align 8";
+    let has_cmp = llvm_lines[4] == "  %safe_node_ref.gen_ok = icmp eq i32 %safe_node_ref.cur_gen, 7";
+    let has_panic = llvm_lines[7] == "  call void @ifa_panic_uaf(ptr %raw_node_ptr, i32 7, i32 %safe_node_ref.cur_gen, i16 2)";
+    let has_fir = fir_lines[0] == "    %safe_node_ref = fir.gen_ref_check %raw_node_ptr, gen=7, arena=2";
+
+    return has_hdr_ptr && has_load_hdr && has_cmp && has_panic && has_fir;
+}
+
+// Unit test 31: Guaranteed Copy-on-Write in-place mutation lowering
+pub fn test_codegen_cow_make_mut() -> bool {
+    let cow = AstCowMakeMut(
+        target_var: "mut_ast_buf",
+        src_var: "shared_ast_buf",
+        elem_size: 4096,
+        align_bytes: 8
+    );
+
+    let llvm_lines = emit_llvm_cow_make_mut(cow);
+    let fir_lines = emit_fir_cow_make_mut(cow);
+
+    if llvm_lines.len() != 2 || fir_lines.len() != 1 {
+        return false;
+    }
+
+    let has_llvm = llvm_lines[1] == "  %mut_ast_buf = call ptr @ifa_rt_cow_make_mut(ptr %shared_ast_buf, i64 4096, i64 8)";
+    let has_fir = fir_lines[0] == "    %mut_ast_buf = fir.cow_make_mut %shared_ast_buf, size=4096, align=8";
+
+    return has_llvm && has_fir;
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -3441,7 +3643,10 @@ pub fn main() {
     let t26 = test_codegen_simd_avx2_vector_add();
     let t27 = test_codegen_simd_neon_dot_product();
     let t28 = test_codegen_simd_metadata_and_fir();
-    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 {
+    let t29 = test_codegen_arena_allocation_and_reset();
+    let t30 = test_codegen_gen_ref_check();
+    let t31 = test_codegen_cow_make_mut();
+    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");

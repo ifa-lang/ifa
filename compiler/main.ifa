@@ -201,7 +201,13 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     let sema_simd_elig_ok = sema::test_sema_simd_vector_eligibility_and_width();
     let sema_simd_alias_ok = sema::test_sema_simd_disjoint_slice_aliasing();
     let driver_simd_ok = driver::test_driver_simd_vectorization_metadata_assembly();
-    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok || !fn_ptr_cg_ok || !thunk_cg_ok || !fiber_cg_ok || !chan_cg_ok || !select_cg_ok || !select_timed_cg_ok || !nursery_cg_ok || !codegen_if_ok || !driver_mm_ok || !driver_dag_ok || !driver_ffi_ok || !pipe_basic_ok || !pipe_multi_ok || !pipe_mut_ok || !pipe_full_ok || !pipe_ir_ok || !pipe_ir_call_ok || !pipe_ir_multi_call_ok || !cg_call_zero_ok || !cg_call_multi_ok || !cg_call_fn_ok || !cg_args_ok || !cg_var_ok || !cg_simd_avx2_ok || !cg_simd_neon_ok || !cg_simd_meta_ok || !sema_simd_elig_ok || !sema_simd_alias_ok || !driver_simd_ok {
+    let cg_arena_ok = codegen_llvm::test_codegen_arena_allocation_and_reset();
+    let cg_ref_chk_ok = codegen_llvm::test_codegen_gen_ref_check();
+    let cg_cow_ok = codegen_llvm::test_codegen_cow_make_mut();
+    let sema_ref_safe_ok = sema::test_sema_generational_ref_safety();
+    let sema_cow_excl_ok = sema::test_sema_cow_inplace_exclusivity();
+    let driver_gen_mem_ok = driver::test_driver_generational_memory_runtime_assembly();
+    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok || !fn_ptr_cg_ok || !thunk_cg_ok || !fiber_cg_ok || !chan_cg_ok || !select_cg_ok || !select_timed_cg_ok || !nursery_cg_ok || !codegen_if_ok || !driver_mm_ok || !driver_dag_ok || !driver_ffi_ok || !pipe_basic_ok || !pipe_multi_ok || !pipe_mut_ok || !pipe_full_ok || !pipe_ir_ok || !pipe_ir_call_ok || !pipe_ir_multi_call_ok || !cg_call_zero_ok || !cg_call_multi_ok || !cg_call_fn_ok || !cg_args_ok || !cg_var_ok || !cg_simd_avx2_ok || !cg_simd_neon_ok || !cg_simd_meta_ok || !sema_simd_elig_ok || !sema_simd_alias_ok || !driver_simd_ok || !cg_arena_ok || !cg_ref_chk_ok || !cg_cow_ok || !sema_ref_safe_ok || !sema_cow_excl_ok || !driver_gen_mem_ok {
         return false;
     }
 

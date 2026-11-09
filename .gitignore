@@ -7,3 +7,4 @@ target/
 *.bak
 .DS_Store
 *.orig
+CRON_*.md
