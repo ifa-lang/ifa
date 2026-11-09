@@ -2187,6 +2187,8 @@ impl<'a> LlvmIrEmitter<'a> {
 
         // Precompute SSA value types within this function
         let mut value_types: HashMap<ifa_fir::ValueId, ifa_fir::FirType> = HashMap::new();
+        let mut null_values: std::collections::HashSet<ifa_fir::ValueId> =
+            std::collections::HashSet::new();
         for p in &func.params {
             if p.mode == ifa_fir::ParamMode::InOut {
                 value_types.insert(p.val, ifa_fir::FirType::Pointer(Box::new(p.ty.clone())));
@@ -2200,6 +2202,9 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             for inst in &block.instructions {
                 if let Some(res) = inst.result {
+                    if let ValueExpr::Constant(ConstantValue::Null) = &inst.expr {
+                        null_values.insert(res);
+                    }
                     let ty = match &inst.expr {
                         ValueExpr::Constant(ConstantValue::Float(_, f_ty)) => {
                             ifa_fir::FirType::Float(*f_ty)
@@ -2375,9 +2380,12 @@ impl<'a> LlvmIrEmitter<'a> {
                                 || callee == "ifa_rt_fs_file_size"
                             {
                                 ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
-                            } else if let Some(target_fn) =
-                                module.functions.iter().find(|f| f.name == *name)
-                            {
+                            } else if let Some(target_fn) = module.functions.iter().find(|f| {
+                                f.name == *name
+                                    || f.name == INTERNER.intern(&callee)
+                                    || callee.ends_with(&format!("::{}", INTERNER.resolve(&f.name)))
+                                    || callee.ends_with(&format!("__{}", INTERNER.resolve(&f.name)))
+                            }) {
                                 target_fn.ret_ty.clone()
                             } else {
                                 ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
@@ -2769,6 +2777,7 @@ impl<'a> LlvmIrEmitter<'a> {
                         &inst.expr,
                         module,
                         &value_types,
+                        &null_values,
                         &array_allocas,
                         &array_ptrs,
                         &strided_slice_info,
@@ -2781,6 +2790,7 @@ impl<'a> LlvmIrEmitter<'a> {
                         &inst.expr,
                         module,
                         &value_types,
+                        &null_values,
                         &array_allocas,
                         &array_ptrs,
                         &strided_slice_info,
@@ -2831,6 +2841,7 @@ impl<'a> LlvmIrEmitter<'a> {
         args: &[ifa_fir::ValueId],
         param_types: &[String],
         value_types: &HashMap<ifa_fir::ValueId, ifa_fir::FirType>,
+        null_values: &std::collections::HashSet<ifa_fir::ValueId>,
         array_allocas: &HashMap<ifa_fir::ValueId, ifa_fir::ValueId>,
         out: &mut String,
     ) -> Vec<String> {
@@ -2888,27 +2899,37 @@ impl<'a> LlvmIrEmitter<'a> {
                     }
                 }
             } else if p_ty == "ptr" {
-                if let Some(p) = array_allocas.get(a) {
+                if null_values.contains(a) {
+                    args_str.push("ptr null".to_string());
+                } else if let Some(p) = array_allocas.get(a) {
                     args_str.push(format!("ptr %v{}", p.0));
                 } else {
                     args_str.push(format!("ptr %v{}", a.0));
                 }
-            } else if p_ty.starts_with("{ i1,")
-                && !matches!(arg_fir_ty, Some(ifa_fir::FirType::Optional(_)))
-            {
-                let inner_ty = p_ty
-                    .strip_prefix("{ i1, ")
-                    .and_then(|s| s.strip_suffix(" }"))
-                    .unwrap_or("i64");
-                out.push_str(&format!(
-                    "  %opt_wrap_t0_{}_{} = insertvalue {} undef, i1 1, 0\n",
-                    prefix_id, i, p_ty
-                ));
-                out.push_str(&format!(
-                    "  %opt_wrap_{}_{} = insertvalue {} %opt_wrap_t0_{}_{}, {} %v{}, 1\n",
-                    prefix_id, i, p_ty, prefix_id, i, inner_ty, a.0
-                ));
-                args_str.push(format!("{} %opt_wrap_{}_{}", p_ty, prefix_id, i));
+            } else if p_ty.starts_with("{ i1,") {
+                if matches!(arg_fir_ty, Some(ifa_fir::FirType::Optional(_))) {
+                    args_str.push(format!("{} %v{}", p_ty, a.0));
+                } else if null_values.contains(a) {
+                    out.push_str(&format!(
+                        "  %opt_none_{}_{} = insertvalue {} undef, i1 0, 0\n",
+                        prefix_id, i, p_ty
+                    ));
+                    args_str.push(format!("{} %opt_none_{}_{}", p_ty, prefix_id, i));
+                } else {
+                    let inner_ty = p_ty
+                        .strip_prefix("{ i1, ")
+                        .and_then(|s| s.strip_suffix(" }"))
+                        .unwrap_or("i64");
+                    out.push_str(&format!(
+                        "  %opt_wrap_t0_{}_{} = insertvalue {} undef, i1 1, 0\n",
+                        prefix_id, i, p_ty
+                    ));
+                    out.push_str(&format!(
+                        "  %opt_wrap_{}_{} = insertvalue {} %opt_wrap_t0_{}_{}, {} %v{}, 1\n",
+                        prefix_id, i, p_ty, prefix_id, i, inner_ty, a.0
+                    ));
+                    args_str.push(format!("{} %opt_wrap_{}_{}", p_ty, prefix_id, i));
+                }
             } else if p_ty.starts_with("%struct.") {
                 match arg_fir_ty {
                     Some(ifa_fir::FirType::Struct(..)) => {
@@ -2989,6 +3010,7 @@ impl<'a> LlvmIrEmitter<'a> {
         expr: &ValueExpr,
         module: &FirModule,
         value_types: &HashMap<ifa_fir::ValueId, ifa_fir::FirType>,
+        null_values: &std::collections::HashSet<ifa_fir::ValueId>,
         array_allocas: &HashMap<ifa_fir::ValueId, ifa_fir::ValueId>,
         array_ptrs: &HashMap<ifa_fir::ValueId, String>,
         strided_slice_info: &HashMap<ifa_fir::ValueId, (ifa_fir::ValueId, Option<i64>)>,
@@ -3080,30 +3102,109 @@ impl<'a> LlvmIrEmitter<'a> {
                     ));
                 } else if matches!(
                     value_types.get(lhs),
+                    Some(ifa_fir::FirType::String)
+                        | Some(ifa_fir::FirType::Str)
+                        | Some(ifa_fir::FirType::Optional(_))
+                ) && matches!(
+                    value_types.get(rhs),
+                    Some(ifa_fir::FirType::String)
+                        | Some(ifa_fir::FirType::Str)
+                        | Some(ifa_fir::FirType::Optional(_))
+                ) && (matches!(
+                    value_types.get(lhs),
                     Some(ifa_fir::FirType::String) | Some(ifa_fir::FirType::Str)
                 ) || matches!(
                     value_types.get(rhs),
                     Some(ifa_fir::FirType::String) | Some(ifa_fir::FirType::Str)
-                ) {
+                )) {
+                    let (lhs_ptr, lhs_cond) = match value_types.get(lhs) {
+                        Some(ifa_fir::FirType::Optional(inner))
+                            if matches!(
+                                &**inner,
+                                ifa_fir::FirType::String | ifa_fir::FirType::Str
+                            ) =>
+                        {
+                            out.push_str(&format!(
+                                "  %opt_has_{}_lhs = extractvalue {{ i1, ptr }} %v{}, 0\n",
+                                res_id, lhs.0
+                            ));
+                            out.push_str(&format!(
+                                "  %opt_val_{}_lhs = extractvalue {{ i1, ptr }} %v{}, 1\n",
+                                res_id, lhs.0
+                            ));
+                            (
+                                format!("%opt_val_{}_lhs", res_id),
+                                Some(format!("%opt_has_{}_lhs", res_id)),
+                            )
+                        }
+                        _ => (format!("%v{}", lhs.0), None),
+                    };
+                    let (rhs_ptr, rhs_cond) = match value_types.get(rhs) {
+                        Some(ifa_fir::FirType::Optional(inner))
+                            if matches!(
+                                &**inner,
+                                ifa_fir::FirType::String | ifa_fir::FirType::Str
+                            ) =>
+                        {
+                            out.push_str(&format!(
+                                "  %opt_has_{}_rhs = extractvalue {{ i1, ptr }} %v{}, 0\n",
+                                res_id, rhs.0
+                            ));
+                            out.push_str(&format!(
+                                "  %opt_val_{}_rhs = extractvalue {{ i1, ptr }} %v{}, 1\n",
+                                res_id, rhs.0
+                            ));
+                            (
+                                format!("%opt_val_{}_rhs", res_id),
+                                Some(format!("%opt_has_{}_rhs", res_id)),
+                            )
+                        }
+                        _ => (format!("%v{}", rhs.0), None),
+                    };
+
+                    out.push_str(&format!(
+                        "  %raw_eq_{} = call i1 @ifa_rt_string_eq(ptr {}, ptr {})\n",
+                        res_id, lhs_ptr, rhs_ptr
+                    ));
+
+                    let eq_val = match (lhs_cond, rhs_cond) {
+                        (Some(c1), Some(c2)) => {
+                            out.push_str(&format!("  %c1_none_{} = xor i1 {}, true\n", res_id, c1));
+                            out.push_str(&format!("  %c2_none_{} = xor i1 {}, true\n", res_id, c2));
+                            out.push_str(&format!(
+                                "  %both_none_{} = and i1 %c1_none_{}, %c2_none_{}\n",
+                                res_id, res_id, res_id
+                            ));
+                            out.push_str(&format!(
+                                "  %both_some_{} = and i1 {}, {}\n",
+                                res_id, c1, c2
+                            ));
+                            out.push_str(&format!(
+                                "  %both_eq_{} = and i1 %both_some_{}, %raw_eq_{}\n",
+                                res_id, res_id, res_id
+                            ));
+                            out.push_str(&format!(
+                                "  %final_eq_{} = or i1 %both_none_{}, %both_eq_{}\n",
+                                res_id, res_id, res_id
+                            ));
+                            format!("%final_eq_{}", res_id)
+                        }
+                        (Some(c), None) | (None, Some(c)) => {
+                            out.push_str(&format!(
+                                "  %final_eq_{} = and i1 {}, %raw_eq_{}\n",
+                                res_id, c, res_id
+                            ));
+                            format!("%final_eq_{}", res_id)
+                        }
+                        (None, None) => format!("%raw_eq_{}", res_id),
+                    };
+
                     if *op == BinaryOp::Eq {
-                        out.push_str(&format!(
-                            "  %v{} = call i1 @ifa_rt_string_eq(ptr %v{}, ptr %v{})\n",
-                            res_id, lhs.0, rhs.0
-                        ));
+                        out.push_str(&format!("  %v{} = or i1 {}, 0\n", res_id, eq_val));
                     } else if *op == BinaryOp::Ne {
-                        out.push_str(&format!(
-                            "  %cmp_eq_{} = call i1 @ifa_rt_string_eq(ptr %v{}, ptr %v{})\n",
-                            res_id, lhs.0, rhs.0
-                        ));
-                        out.push_str(&format!(
-                            "  %v{} = xor i1 %cmp_eq_{}, true\n",
-                            res_id, res_id
-                        ));
+                        out.push_str(&format!("  %v{} = xor i1 {}, true\n", res_id, eq_val));
                     } else {
-                        out.push_str(&format!(
-                            "  %v{} = icmp eq ptr %v{}, %v{}\n",
-                            res_id, lhs.0, rhs.0
-                        ));
+                        out.push_str(&format!("  %v{} = or i1 {}, 0\n", res_id, eq_val));
                     }
                 } else if matches!(value_types.get(lhs), Some(ifa_fir::FirType::Optional(_)))
                     || matches!(value_types.get(rhs), Some(ifa_fir::FirType::Optional(_)))
@@ -3351,8 +3452,12 @@ impl<'a> LlvmIrEmitter<'a> {
                     out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
                 } else {
                     let (ret_ty_str, param_types) = if let Some(target_fn) =
-                        module.functions.iter().find(|f| f.name == *name)
-                    {
+                        module.functions.iter().find(|f| {
+                            f.name == *name
+                                || f.name == INTERNER.intern(&callee)
+                                || callee.ends_with(&format!("::{}", INTERNER.resolve(&f.name)))
+                                || callee.ends_with(&format!("__{}", INTERNER.resolve(&f.name)))
+                        }) {
                         let ret_ty = if target_fn.is_coroutine() {
                             "ptr".to_string()
                         } else {
@@ -3504,6 +3609,7 @@ impl<'a> LlvmIrEmitter<'a> {
                         args,
                         &param_types,
                         value_types,
+                        null_values,
                         array_allocas,
                         out,
                     );
@@ -4619,6 +4725,7 @@ impl<'a> LlvmIrEmitter<'a> {
                     args,
                     &param_types,
                     value_types,
+                    null_values,
                     array_allocas,
                     out,
                 );
@@ -5146,6 +5253,7 @@ impl<'a> LlvmIrEmitter<'a> {
         expr: &ValueExpr,
         module: &FirModule,
         value_types: &HashMap<ifa_fir::ValueId, ifa_fir::FirType>,
+        null_values: &std::collections::HashSet<ifa_fir::ValueId>,
         array_allocas: &HashMap<ifa_fir::ValueId, ifa_fir::ValueId>,
         array_ptrs: &HashMap<ifa_fir::ValueId, String>,
         strided_slice_info: &HashMap<ifa_fir::ValueId, (ifa_fir::ValueId, Option<i64>)>,
@@ -5210,8 +5318,12 @@ impl<'a> LlvmIrEmitter<'a> {
                     }
                 } else {
                     let (ret_ty_str, param_types) = if let Some(target_fn) =
-                        module.functions.iter().find(|f| f.name == *name)
-                    {
+                        module.functions.iter().find(|f| {
+                            f.name == *name
+                                || f.name == INTERNER.intern(&callee)
+                                || callee.ends_with(&format!("::{}", INTERNER.resolve(&f.name)))
+                                || callee.ends_with(&format!("__{}", INTERNER.resolve(&f.name)))
+                        }) {
                         let ret_ty = if target_fn.is_coroutine() {
                             "ptr".to_string()
                         } else {
@@ -5362,6 +5474,7 @@ impl<'a> LlvmIrEmitter<'a> {
                         args,
                         &param_types,
                         value_types,
+                        null_values,
                         array_allocas,
                         out,
                     );
@@ -5958,6 +6071,7 @@ impl<'a> LlvmIrEmitter<'a> {
                     args,
                     &param_types,
                     value_types,
+                    null_values,
                     array_allocas,
                     out,
                 );
@@ -6077,6 +6191,12 @@ impl<'a> LlvmIrEmitter<'a> {
     ) {
         let ty = value_types.get(&part);
         match ty {
+            Some(ifa_fir::FirType::String) | Some(ifa_fir::FirType::Str) => {
+                out.push_str(&format!(
+                    "  %fmt_{}_{} = bitcast ptr %v{} to ptr\n",
+                    res_id, step, part.0
+                ));
+            }
             Some(ifa_fir::FirType::Int(ity)) => {
                 let int_ty_str = match ity {
                     ifa_sema::types::IntType::I8 | ifa_sema::types::IntType::U8 => "i8",

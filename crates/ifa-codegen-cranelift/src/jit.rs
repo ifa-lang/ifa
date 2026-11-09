@@ -104,6 +104,10 @@ impl JitEngine {
         builder.symbol("ifa_rt_now_ns", ifa_rt_now_ns as *const u8);
         builder.symbol("ifa_rt_string_concat", ifa_rt_string_concat as *const u8);
         builder.symbol(
+            "ifa_rt_string_eq",
+            ifa_runtime::ffi::ifa_rt_string_eq as *const u8,
+        );
+        builder.symbol(
             "ifa_rt_string_from_i64",
             ifa_rt_string_from_i64 as *const u8,
         );
@@ -527,6 +531,16 @@ impl JitEngine {
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids
             .insert("ifa_rt_string_concat".into(), str_concat_id);
+
+        let mut str_eq_sig = Signature::new(call_conv);
+        str_eq_sig.params.push(AbiParam::new(ptr_type));
+        str_eq_sig.params.push(AbiParam::new(ptr_type));
+        str_eq_sig.returns.push(AbiParam::new(types::I8));
+        let str_eq_id = self
+            .module
+            .declare_function("ifa_rt_string_eq", Linkage::Import, &str_eq_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids.insert("ifa_rt_string_eq".into(), str_eq_id);
 
         let mut str_i64_sig = Signature::new(call_conv);
         str_i64_sig.params.push(AbiParam::new(types::I64));

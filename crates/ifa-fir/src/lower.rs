@@ -673,10 +673,30 @@ impl<'a> FunctionLoweringContext<'a> {
                             .unwrap_or_default();
                         Some(FirType::Enum(en_name, variants))
                     } else {
+                        for module in self.symbols.modules.values() {
+                            if let Some(f) = module.functions.get(fn_name) {
+                                return Some(FirType::from_sema_type(&f.ret_ty));
+                            }
+                        }
                         None
                     }
                 } else if let ExprKind::Path(path) = &callee.kind {
                     if path.len() >= 2 {
+                        let mod_sym = path[0];
+                        let member_sym = path[path.len() - 1];
+                        if let Some(m) = self.symbols.lookup_module(&mod_sym) {
+                            if let Some(f) = m.functions.get(&member_sym) {
+                                return Some(FirType::from_sema_type(&f.ret_ty));
+                            }
+                        }
+                        let mangled = INTERNER.intern(&format!(
+                            "{}__{}",
+                            INTERNER.resolve(&path[path.len() - 2]),
+                            INTERNER.resolve(&member_sym)
+                        ));
+                        if let Some(f) = self.symbols.lookup_function(&mangled) {
+                            return Some(FirType::from_sema_type(&f.ret_ty));
+                        }
                         if let Some((en_name, _, _)) = self.lookup_qualified_variant_info(
                             path[path.len() - 2],
                             path[path.len() - 1],
@@ -691,6 +711,14 @@ impl<'a> FunctionLoweringContext<'a> {
                         }
                     }
                     if let Some(last) = path.last() {
+                        if let Some(f) = self.symbols.lookup_function(last) {
+                            return Some(FirType::from_sema_type(&f.ret_ty));
+                        }
+                        for module in self.symbols.modules.values() {
+                            if let Some(f) = module.functions.get(last) {
+                                return Some(FirType::from_sema_type(&f.ret_ty));
+                            }
+                        }
                         if let Some((en_name, _, _)) = self.lookup_variant_info(*last) {
                             let variants = self
                                 .module_enums

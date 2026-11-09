@@ -442,6 +442,19 @@ pub fn emit_fir_expression(
         instructions.push(line);
         return reg;
     }
+    if k == 15 {
+        // CoW Mutability Annotation (inout / sink): forward inner expression
+        let cow_reg = emit_fir_expression(
+            expr?.left,
+            inout temp_id,
+            env1_var,
+            env1_reg,
+            env2_var,
+            env2_reg,
+            inout instructions
+        );
+        return cow_reg;
+    }
     return "%t0";
 }
 
@@ -546,6 +559,19 @@ pub fn emit_llvm_expression(
         let line = "  " + reg + " = call i64 @" + callee + "(" + arg_str + ")";
         instructions.push(line);
         return reg;
+    }
+    if k == 15 {
+        // CoW Mutability Annotation (inout / sink): forward inner expression
+        let cow_llvm_reg = emit_llvm_expression(
+            expr?.left,
+            inout temp_id,
+            env1_var,
+            env1_reg,
+            env2_var,
+            env2_reg,
+            inout instructions
+        );
+        return cow_llvm_reg;
     }
     return "%t0";
 }

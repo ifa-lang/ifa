@@ -987,8 +987,52 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                         BinaryOp::BitXor => self.builder.ins().bxor(l, r),
                         BinaryOp::Shl => self.builder.ins().ishl(l, r),
                         BinaryOp::Shr => self.builder.ins().sshr(l, r),
-                        BinaryOp::Eq => self.builder.ins().icmp(IntCC::Equal, l, r),
-                        BinaryOp::Ne => self.builder.ins().icmp(IntCC::NotEqual, l, r),
+                        BinaryOp::Eq => {
+                            let is_str = matches!(
+                                self.value_types.get(lhs),
+                                Some(FirType::String) | Some(FirType::Str)
+                            ) || matches!(
+                                self.value_types.get(rhs),
+                                Some(FirType::String) | Some(FirType::Str)
+                            );
+                            if is_str {
+                                if let Some(func_id) = self.func_ids.get("ifa_rt_string_eq") {
+                                    let local_func = self
+                                        .module
+                                        .declare_func_in_func(*func_id, self.builder.func);
+                                    let call = self.builder.ins().call(local_func, &[l, r]);
+                                    let res = self.builder.inst_results(call)[0];
+                                    self.builder.ins().icmp_imm_s(IntCC::NotEqual, res, 0)
+                                } else {
+                                    self.builder.ins().icmp(IntCC::Equal, l, r)
+                                }
+                            } else {
+                                self.builder.ins().icmp(IntCC::Equal, l, r)
+                            }
+                        }
+                        BinaryOp::Ne => {
+                            let is_str = matches!(
+                                self.value_types.get(lhs),
+                                Some(FirType::String) | Some(FirType::Str)
+                            ) || matches!(
+                                self.value_types.get(rhs),
+                                Some(FirType::String) | Some(FirType::Str)
+                            );
+                            if is_str {
+                                if let Some(func_id) = self.func_ids.get("ifa_rt_string_eq") {
+                                    let local_func = self
+                                        .module
+                                        .declare_func_in_func(*func_id, self.builder.func);
+                                    let call = self.builder.ins().call(local_func, &[l, r]);
+                                    let res = self.builder.inst_results(call)[0];
+                                    self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0)
+                                } else {
+                                    self.builder.ins().icmp(IntCC::NotEqual, l, r)
+                                }
+                            } else {
+                                self.builder.ins().icmp(IntCC::NotEqual, l, r)
+                            }
+                        }
                         BinaryOp::Lt => self.builder.ins().icmp(IntCC::SignedLessThan, l, r),
                         BinaryOp::Le => self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, l, r),
                         BinaryOp::Gt => self.builder.ins().icmp(IntCC::SignedGreaterThan, l, r),
@@ -2356,6 +2400,12 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
 
     fn translate_part_to_str_ptr(&mut self, part: ValueId) -> ClValue {
         let val = self.value_map[&part];
+        if matches!(
+            self.value_types.get(&part),
+            Some(FirType::String) | Some(FirType::Str)
+        ) {
+            return val;
+        }
         let val_ty = self.builder.func.dfg.value_type(val);
         if val_ty == types::I64 || val_ty == types::I32 {
             let i64_val = if val_ty == types::I32 {

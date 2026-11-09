@@ -541,6 +541,16 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_parser_arena_direct_ast_construction ... ok"),
+        "Modular parser arena direct AST construction test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_cow_mutability_annotations ... ok"),
+        "Modular parser cow mutability annotations test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_driver_opt_level_flags ... ok"),
         "Modular driver opt level flags test missing from output:\n{}",
         stdout
@@ -636,8 +646,18 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("240 passed; 0 failed"),
-        "Expected 240 passed unit tests, got:\n{}",
+        stdout.contains("test test_sema_disjoint_access_paths ... ok"),
+        "Modular sema disjoint access paths test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_interprocedural_access_path_propagation ... ok"),
+        "Modular sema interprocedural access path propagation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("248 passed; 0 failed"),
+        "Expected 248 passed unit tests, got:\n{}",
         stdout
     );
 }

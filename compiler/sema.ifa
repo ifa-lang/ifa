@@ -183,8 +183,8 @@ pub fn eval_expression(
             return tup_val - ((tup_val / 1000) * 1000);
         }
     }
-    if k == 6 || k == 7 || k == 8 || k == 9 {
-        // Arena allocation (6), macro invocation (7), comptime expression (8), or ArgCons (9)
+    if k == 6 || k == 7 || k == 8 || k == 9 || k == 15 {
+        // Arena allocation (6), macro invocation (7), comptime expression (8), ArgCons (9), or CoW Mutability (15)
         return eval_expression(expr?.left, param_name, param_val, v1_name, v1_val, v2_name, v2_val);
     }
     return 0;
@@ -1462,8 +1462,8 @@ pub fn infer_expression_type(expr: ?ref AstExpr, env: LocalTypeEnv) -> InferredT
         }
         return make_type_i64();
     }
-    if k == 6 || k == 8 {
-        // Arena allocation or comptime evaluation
+    if k == 6 || k == 8 || k == 15 {
+        // Arena allocation, comptime evaluation, or CoW mutability annotation
         return infer_expression_type(expr?.left, env);
     }
     if k == 10 {
@@ -2077,6 +2077,286 @@ pub fn test_sema_cow_inplace_exclusivity() -> bool {
     return ok_unique && ok_ref1 && !shared_2 && !shared_5;
 }
 
+// Disjoint AccessPath segment representation (field, constant index, dereference)
+pub struct PathSegment {
+    kind: i64,       // 1: Field (.name), 2: Index ([i]), 3: Deref (*)
+    name: String,    // Field name when kind == 1
+    index: i64       // Constant index when kind == 2
+}
+
+pub fn make_field_segment(name: String) -> PathSegment {
+    return PathSegment(kind: 1, name: name, index: 0);
+}
+
+pub fn make_index_segment(index: i64) -> PathSegment {
+    return PathSegment(kind: 2, name: "", index: index);
+}
+
+pub fn make_deref_segment() -> PathSegment {
+    return PathSegment(kind: 3, name: "*", index: 0);
+}
+
+// A path-sensitive access descriptor representing variable, field, or index projections
+// (e.g. `node.left`, `ast.fields[0]`, `data.raw`).
+pub struct AccessPath {
+    root: String,
+    segments: List<PathSegment>,
+    mut_mode: i64 // 0: Read-only borrow ('in'), 1: Mutable borrow ('inout'), 2: Moved ('sink')
+}
+
+pub fn make_root_access_path(root: String, mut_mode: i64) -> AccessPath {
+    mut segs: List<PathSegment> = List::new();
+    return AccessPath(root: root, segments: segs, mut_mode: mut_mode);
+}
+
+pub fn make_field_access_path(root: String, field_name: String, mut_mode: i64) -> AccessPath {
+    mut segs: List<PathSegment> = List::new();
+    segs.push(make_field_segment(field_name));
+    return AccessPath(root: root, segments: segs, mut_mode: mut_mode);
+}
+
+pub fn make_index_access_path(root: String, index: i64, mut_mode: i64) -> AccessPath {
+    mut segs: List<PathSegment> = List::new();
+    segs.push(make_index_segment(index));
+    return AccessPath(root: root, segments: segs, mut_mode: mut_mode);
+}
+
+pub fn append_path_field(inout path: AccessPath, field_name: String) {
+    path.segments.push(make_field_segment(field_name));
+}
+
+pub fn append_path_index(inout path: AccessPath, index: i64) {
+    path.segments.push(make_index_segment(index));
+}
+
+// Classifies the aliasing relationship between two paths:
+// 0: Disjoint (guaranteed non-overlapping memory locations)
+// 1: Exact (referencing the exact same location)
+// 2: Prefix / Ancestor (one contains or nests the other)
+// 3: Partial / Overlapping
+pub fn classify_access_paths_alias(p1: AccessPath, p2: AccessPath) -> i64 {
+    // Distinct roots are provably disjoint
+    if p1.root != p2.root {
+        return 0; // Disjoint
+    }
+
+    let len1 = p1.segments.len();
+    let len2 = p2.segments.len();
+    mut min_len = len1;
+    if len2 < min_len {
+        min_len = len2;
+    }
+
+    mut i: i64 = 0;
+    while i < min_len {
+        let s1 = p1.segments[i];
+        let s2 = p2.segments[i];
+
+        if s1.kind != s2.kind {
+            // Incompatible segment kinds at same depth are disjoint
+            return 0; // Disjoint
+        }
+
+        if s1.kind == 1 {
+            // Field projection
+            if s1.name != s2.name {
+                // Distinct fields (e.g. .left vs .right) are provably disjoint!
+                return 0; // Disjoint
+            }
+        } else if s1.kind == 2 {
+            // Index projection
+            if s1.index != s2.index {
+                // Distinct constant indices (e.g. [0] vs [1]) are provably disjoint!
+                return 0; // Disjoint
+            }
+        }
+        i = i + 1;
+    }
+
+    if len1 == len2 {
+        return 1; // Exact match
+    }
+
+    // One path is an ancestor prefix of the other (e.g. `node` and `node.left`)
+    return 2; // Prefix
+}
+
+pub fn are_access_paths_disjoint(p1: AccessPath, p2: AccessPath) -> bool {
+    return classify_access_paths_alias(p1, p2) == 0;
+}
+
+// Interprocedural function access summary describing access paths modified or read relative to parameters
+pub struct FunctionAccessSummary {
+    fn_name: String,
+    param_paths: List<AccessPath>
+}
+
+pub fn make_function_access_summary(fn_name: String) -> FunctionAccessSummary {
+    mut paths: List<AccessPath> = List::new();
+    return FunctionAccessSummary(fn_name: fn_name, param_paths: paths);
+}
+
+pub fn add_summary_path(inout summary: FunctionAccessSummary, path: AccessPath) {
+    summary.param_paths.push(path);
+}
+
+// Projects a callee parameter-relative access path into the caller's context:
+// E.g. Caller passes `tree.lhs` as actual arg, Callee summary accesses `param0.node_val` ->
+// Resulting caller projected access path is `tree.lhs.node_val`.
+pub fn project_interprocedural_access_path(
+    caller_arg_path: AccessPath,
+    callee_rel_path: AccessPath
+) -> AccessPath {
+    mut projected = make_root_access_path(caller_arg_path.root, callee_rel_path.mut_mode);
+
+    // Append caller argument base segments
+    mut i: i64 = 0;
+    while i < caller_arg_path.segments.len() {
+        projected.segments.push(caller_arg_path.segments[i]);
+        i = i + 1;
+    }
+
+    // Append callee parameter-relative segments
+    mut j: i64 = 0;
+    while j < callee_rel_path.segments.len() {
+        projected.segments.push(callee_rel_path.segments[j]);
+        j = j + 1;
+    }
+
+    return projected;
+}
+
+// Validates interprocedural call exclusivity:
+// Ensures that all projected mutable access paths (`inout` / `sink`) between simultaneous
+// call arguments and caller active borrows are provably disjoint (zero aliasing violations).
+pub fn validate_interprocedural_call_exclusivity(
+    caller_args: List<AccessPath>,
+    callee_summary: FunctionAccessSummary
+) -> bool {
+    mut projected_paths: List<AccessPath> = List::new();
+
+    mut idx: i64 = 0;
+    while idx < caller_args.len() && idx < callee_summary.param_paths.len() {
+        let proj = project_interprocedural_access_path(caller_args[idx], callee_summary.param_paths[idx]);
+        projected_paths.push(proj);
+        idx = idx + 1;
+    }
+
+    // Check pairwise exclusivity among all projected mutable paths
+    mut a: i64 = 0;
+    while a < projected_paths.len() {
+        mut b = a + 1;
+        while b < projected_paths.len() {
+            let p_a = projected_paths[a];
+            let p_b = projected_paths[b];
+
+            // If either access is mutable (inout = 1 or sink = 2), paths MUST be disjoint
+            if p_a.mut_mode != 0 || p_b.mut_mode != 0 {
+                if !are_access_paths_disjoint(p_a, p_b) {
+                    return false; // Aliasing violation!
+                }
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+
+    return true; // Exclusivity guaranteed!
+}
+
+// Unit test 27: Semantic verification of path-sensitive disjoint access paths (AccessPath)
+pub fn test_sema_disjoint_access_paths() -> bool {
+    // 1. Distinct roots: disjoint
+    let p_x = make_root_access_path("x", 1);
+    let p_y = make_root_access_path("y", 1);
+    if !are_access_paths_disjoint(p_x, p_y) {
+        return false;
+    }
+
+    // 2. Same root, distinct field projections: provably disjoint! (p.left vs p.right)
+    let p_left = make_field_access_path("node", "left", 1);
+    let p_right = make_field_access_path("node", "right", 1);
+    if !are_access_paths_disjoint(p_left, p_right) {
+        return false;
+    }
+
+    // 3. Same root, same field: exact alias (not disjoint)
+    let p_left_dup = make_field_access_path("node", "left", 1);
+    if are_access_paths_disjoint(p_left, p_left_dup) {
+        return false;
+    }
+    if classify_access_paths_alias(p_left, p_left_dup) != 1 {
+        return false;
+    }
+
+    // 4. Same root, ancestor prefix vs sub-field: prefix alias (not disjoint)
+    let p_root = make_root_access_path("node", 1);
+    if are_access_paths_disjoint(p_root, p_left) {
+        return false;
+    }
+    if classify_access_paths_alias(p_root, p_left) != 2 {
+        return false;
+    }
+
+    // 5. Distinct constant indices: provably disjoint! (arr[0] vs arr[1])
+    let p_idx0 = make_index_access_path("arr", 0, 1);
+    let p_idx1 = make_index_access_path("arr", 1, 1);
+    if !are_access_paths_disjoint(p_idx0, p_idx1) {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit test 28: Interprocedural propagation and exclusivity validation of disjoint access paths
+pub fn test_sema_interprocedural_access_path_propagation() -> bool {
+    // Scenario 1: Callee mutates param0.lhs and param1.rhs
+    mut summary = make_function_access_summary("swap_subtrees");
+    add_summary_path(inout summary, make_field_access_path("param0", "lhs", 1));
+    add_summary_path(inout summary, make_field_access_path("param1", "rhs", 1));
+
+    // Caller passes disjoint fields of same root: call swap_subtrees(inout root.a, inout root.b)
+    mut valid_args: List<AccessPath> = List::new();
+    valid_args.push(make_field_access_path("root", "a", 1));
+    valid_args.push(make_field_access_path("root", "b", 1));
+
+    let ok_valid = validate_interprocedural_call_exclusivity(valid_args, summary);
+    if !ok_valid {
+        return false;
+    }
+
+    // Scenario 2: Caller passes aliased / overlapping arguments mutating the same target field
+    mut aliased_summary = make_function_access_summary("mutate_same_field");
+    add_summary_path(inout aliased_summary, make_field_access_path("p0", "lhs", 1));
+    add_summary_path(inout aliased_summary, make_field_access_path("p1", "lhs", 1));
+
+    mut aliased_args: List<AccessPath> = List::new();
+    aliased_args.push(make_field_access_path("root", "a", 1));
+    aliased_args.push(make_field_access_path("root", "a", 1));
+
+    let ok_aliased = validate_interprocedural_call_exclusivity(aliased_args, aliased_summary);
+    if ok_aliased {
+        return false; // Should be rejected with exclusivity violation!
+    }
+
+    // Scenario 3: Callee mutates deep nested fields on same caller argument: param0.left vs param1.right on root.a
+    mut nested_summary = make_function_access_summary("mutate_children");
+    add_summary_path(inout nested_summary, make_field_access_path("p0", "left", 1));
+    add_summary_path(inout nested_summary, make_field_access_path("p1", "right", 1));
+
+    mut nested_args: List<AccessPath> = List::new();
+    nested_args.push(make_field_access_path("tree", "node", 1));
+    nested_args.push(make_field_access_path("tree", "node", 1));
+
+    // Projected paths: tree.node.left vs tree.node.right -> PROVABLY DISJOINT!
+    let ok_nested = validate_interprocedural_call_exclusivity(nested_args, nested_summary);
+    if !ok_nested {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
@@ -2105,7 +2385,9 @@ pub fn main() {
     let t24 = test_sema_simd_disjoint_slice_aliasing();
     let t25 = test_sema_generational_ref_safety();
     let t26 = test_sema_cow_inplace_exclusivity();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 {
+    let t27 = test_sema_disjoint_access_paths();
+    let t28 = test_sema_interprocedural_access_path_propagation();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");

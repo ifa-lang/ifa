@@ -1088,6 +1088,24 @@ impl AotCompiler {
         self.func_ids
             .insert("ifa_rt_string_concat".into(), str_concat_id);
 
+        let mut str_eq_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        str_eq_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        str_eq_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        str_eq_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I8,
+            ));
+        let str_eq_id = self
+            .module
+            .declare_function("ifa_rt_string_eq", Linkage::Import, &str_eq_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids.insert("ifa_rt_string_eq".into(), str_eq_id);
+
         let mut str_i64_sig = cranelift_codegen::ir::Signature::new(call_conv);
         str_i64_sig
             .params
