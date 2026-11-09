@@ -569,6 +569,195 @@ pub fn test_sema_enum_resolution() -> bool {
     return d_missing == -1;
 }
 
+// Struct symbol table and lookup
+pub struct StructSymbolTable {
+    names: List<String>,
+    field_counts: List<i64>,
+    field_structs: List<String>,
+    field_names: List<String>,
+    field_types: List<String>
+}
+
+pub fn make_struct_table() -> StructSymbolTable {
+    return StructSymbolTable(
+        names: List::new(),
+        field_counts: List::new(),
+        field_structs: List::new(),
+        field_names: List::new(),
+        field_types: List::new()
+    );
+}
+
+pub fn register_struct(
+    inout table: StructSymbolTable,
+    name: String,
+    field_names: List<String>,
+    field_types: List<String>
+) {
+    table.names.push(name);
+    table.field_counts.push(field_names.len());
+    mut i: i64 = 0;
+    while i < field_names.len() {
+        table.field_structs.push(name);
+        table.field_names.push(field_names[i]);
+        table.field_types.push(field_types[i]);
+        i = i + 1;
+    }
+}
+
+pub fn has_struct(table: StructSymbolTable, name: String) -> bool {
+    mut i: i64 = 0;
+    while i < table.names.len() {
+        if table.names[i] == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn get_struct_field_count(table: StructSymbolTable, name: String) -> i64 {
+    mut i: i64 = 0;
+    while i < table.names.len() {
+        if table.names[i] == name {
+            return table.field_counts[i];
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Trait symbol table and lookup
+pub struct TraitSymbolTable {
+    names: List<String>,
+    method_counts: List<i64>,
+    method_traits: List<String>,
+    method_names: List<String>
+}
+
+pub fn make_trait_table() -> TraitSymbolTable {
+    return TraitSymbolTable(
+        names: List::new(),
+        method_counts: List::new(),
+        method_traits: List::new(),
+        method_names: List::new()
+    );
+}
+
+pub fn register_trait(
+    inout table: TraitSymbolTable,
+    name: String,
+    method_names: List<String>
+) {
+    table.names.push(name);
+    table.method_counts.push(method_names.len());
+    mut i: i64 = 0;
+    while i < method_names.len() {
+        table.method_traits.push(name);
+        table.method_names.push(method_names[i]);
+        i = i + 1;
+    }
+}
+
+pub fn has_trait(table: TraitSymbolTable, name: String) -> bool {
+    mut i: i64 = 0;
+    while i < table.names.len() {
+        if table.names[i] == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn get_trait_method_count(table: TraitSymbolTable, name: String) -> i64 {
+    mut i: i64 = 0;
+    while i < table.names.len() {
+        if table.names[i] == name {
+            return table.method_counts[i];
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Unified Global Symbol Table aggregating multi-file program symbols
+pub struct GlobalSymbolTable {
+    type_aliases: TypeAliasTable,
+    constants: ConstSymbolTable,
+    enums: EnumSymbolTable,
+    structs: StructSymbolTable,
+    traits: TraitSymbolTable
+}
+
+pub fn make_global_symbol_table() -> GlobalSymbolTable {
+    return GlobalSymbolTable(
+        type_aliases: make_type_alias_table(),
+        constants: make_const_table(),
+        enums: make_enum_table(),
+        structs: make_struct_table(),
+        traits: make_trait_table()
+    );
+}
+
+// Unit test 10: Unified Global Symbol Table resolution
+pub fn test_sema_global_symbol_table() -> bool {
+    mut global_table = make_global_symbol_table();
+
+    // 1. Alias
+    register_type_alias(inout global_table.type_aliases, "Byte", "u8");
+    let res_alias = resolve_type_alias(global_table.type_aliases, "Byte");
+    if res_alias != "u8" {
+        return false;
+    }
+
+    // 2. Const
+    register_const(inout global_table.constants, "PAGE_SIZE", 4096);
+    if !has_const(global_table.constants, "PAGE_SIZE") {
+        return false;
+    }
+    let res_const = resolve_const(global_table.constants, "PAGE_SIZE");
+    if res_const != 4096 {
+        return false;
+    }
+
+    // 3. Enum
+    register_enum_variant(inout global_table.enums, "Color", "Red", 0);
+    register_enum_variant(inout global_table.enums, "Color", "Green", 1);
+    let res_disc = resolve_enum_discriminant(global_table.enums, "Color", "Green");
+    if res_disc != 1 {
+        return false;
+    }
+
+    // 4. Struct
+    mut pt_fnames: List<String> = List::new();
+    pt_fnames.push("x");
+    pt_fnames.push("y");
+    mut pt_ftypes: List<String> = List::new();
+    pt_ftypes.push("i64");
+    pt_ftypes.push("i64");
+    register_struct(inout global_table.structs, "Point", pt_fnames, pt_ftypes);
+    if !has_struct(global_table.structs, "Point") {
+        return false;
+    }
+    if get_struct_field_count(global_table.structs, "Point") != 2 {
+        return false;
+    }
+
+    // 5. Trait
+    mut tr_methods: List<String> = List::new();
+    tr_methods.push("describe");
+    register_trait(inout global_table.traits, "Describable", tr_methods);
+    if !has_trait(global_table.traits, "Describable") {
+        return false;
+    }
+    if get_trait_method_count(global_table.traits, "Describable") != 1 {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
@@ -580,7 +769,8 @@ pub fn main() {
     let t7 = test_sema_arena_allocation();
     let t8 = test_sema_const_resolution();
     let t9 = test_sema_enum_resolution();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 {
+    let t10 = test_sema_global_symbol_table();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");

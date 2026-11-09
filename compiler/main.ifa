@@ -109,7 +109,8 @@ pub fn test_selfhost_modular_pipeline() -> bool {
 
     let sema_const_ok = sema::test_sema_const_resolution();
     let sema_enum_ok = sema::test_sema_enum_resolution();
-    if !sema_const_ok || !sema_enum_ok {
+    let sema_global_ok = sema::test_sema_global_symbol_table();
+    if !sema_const_ok || !sema_enum_ok || !sema_global_ok {
         return false;
     }
 
@@ -141,7 +142,9 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     let comp_fn_ok = codegen_llvm::test_codegen_complex_function();
     let const_cg_ok = codegen_llvm::test_codegen_global_constants();
     let enum_cg_ok = codegen_llvm::test_codegen_enum_definitions();
-    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok {
+    let struct_cg_ok = codegen_llvm::test_codegen_struct_definitions();
+    let vtable_cg_ok = codegen_llvm::test_codegen_vtable_dispatch();
+    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok {
         return false;
     }
 

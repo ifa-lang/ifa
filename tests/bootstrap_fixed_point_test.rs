@@ -256,6 +256,21 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_codegen_struct_definitions ... ok"),
+        "Modular codegen struct definitions test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_vtable_dispatch ... ok"),
+        "Modular codegen vtable dispatch test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_global_symbol_table ... ok"),
+        "Modular sema global symbol table test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_driver_full_module_assembly ... ok"),
         "Modular driver tests missing from output:\n{}",
         stdout
@@ -271,8 +286,8 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("89 passed; 0 failed"),
-        "Expected 89 passed unit tests, got:\n{}",
+        stdout.contains("95 passed; 0 failed"),
+        "Expected 95 passed unit tests, got:\n{}",
         stdout
     );
 }

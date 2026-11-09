@@ -1977,6 +1977,64 @@ impl<'a> FirInterpreter<'a> {
                             ))
                         }
                     }
+                    FirValue::FieldPointer { base_addr, path } => {
+                        let target = self
+                            .stack_memory
+                            .get_mut(base_addr)
+                            .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                        let sub_struct = navigate_value_mut(target, path)?;
+                        if let FirValue::Struct { fields, .. } = sub_struct {
+                            if let Some(field) = fields.get_mut(*field_idx) {
+                                if let FirValue::Array(items) = field {
+                                    items.push(val_to_push);
+                                    Ok(FirValue::Unit)
+                                } else {
+                                    Err(InterpError::TypeMismatch(
+                                        "Struct field is not an array".into(),
+                                    ))
+                                }
+                            } else {
+                                Err(InterpError::Panic(format!(
+                                    "Field index {} out of bounds",
+                                    field_idx
+                                )))
+                            }
+                        } else {
+                            Err(InterpError::TypeMismatch(
+                                "Referenced target is not a struct".into(),
+                            ))
+                        }
+                    }
+                    FirValue::HeapFieldPointer {
+                        slot,
+                        generation,
+                        path,
+                    } => {
+                        self.heap.check(*slot, *generation)?;
+                        let heap_target = self.heap.deref_mut(*slot)?;
+                        let sub_struct = navigate_value_mut(heap_target, path)?;
+                        if let FirValue::Struct { fields, .. } = sub_struct {
+                            if let Some(field) = fields.get_mut(*field_idx) {
+                                if let FirValue::Array(items) = field {
+                                    items.push(val_to_push);
+                                    Ok(FirValue::Unit)
+                                } else {
+                                    Err(InterpError::TypeMismatch(
+                                        "Struct field is not an array".into(),
+                                    ))
+                                }
+                            } else {
+                                Err(InterpError::Panic(format!(
+                                    "Field index {} out of bounds",
+                                    field_idx
+                                )))
+                            }
+                        } else {
+                            Err(InterpError::TypeMismatch(
+                                "Referenced target is not a struct".into(),
+                            ))
+                        }
+                    }
                     _ => Err(InterpError::TypeMismatch(
                         "StructPushField requires pointer or reference".into(),
                     )),

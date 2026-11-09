@@ -94,6 +94,39 @@ pub struct AstEnumDef {
     variants: List<AstEnumVariantDef>
 }
 
+// AST: Struct Field Definition for LLVM codegen
+pub struct AstStructFieldDef {
+    name: String,
+    ty: String
+}
+
+// AST: Struct Definition for LLVM codegen
+pub struct AstStructDef {
+    is_pub: bool,
+    name: String,
+    fields: List<AstStructFieldDef>
+}
+
+// AST: Struct Instantiation Field Value
+pub struct AstStructInitField {
+    name: String,
+    val: i64
+}
+
+// AST: Struct Instantiation for LLVM codegen
+pub struct AstStructInit {
+    struct_name: String,
+    target_var: String,
+    fields: List<AstStructInitField>
+}
+
+// AST: VTable Definition for Trait Dispatch
+pub struct AstVTableDef {
+    trait_name: String,
+    struct_name: String,
+    method_names: List<String>
+}
+
 pub fn mangle_generic_method(
     trait_name: String,
     struct_name: String,
@@ -1153,6 +1186,252 @@ pub fn test_codegen_enum_definitions() -> bool {
     return true;
 }
 
+// Emits textual LLVM type definition for Struct
+pub fn emit_llvm_struct_type(s: AstStructDef) -> String {
+    mut line = "%" + s.name + " = type { ";
+    mut i: i64 = 0;
+    while i < s.fields.len() {
+        if i > 0 {
+            line = line + ", ";
+        }
+        line = line + s.fields[i].ty;
+        i = i + 1;
+    }
+    line = line + " }";
+    return line;
+}
+
+// Emits FIR type definition for Struct
+pub fn emit_fir_struct_type(s: AstStructDef) -> String {
+    mut line = "fir.type @" + s.name + " = !fir.struct<";
+    mut i: i64 = 0;
+    while i < s.fields.len() {
+        if i > 0 {
+            line = line + ", ";
+        }
+        line = line + s.fields[i].name + ": " + s.fields[i].ty;
+        i = i + 1;
+    }
+    line = line + ">";
+    return line;
+}
+
+// Emits LLVM IR local stack instantiation for a struct
+pub fn emit_llvm_struct_instantiation(init: AstStructInit, struct_def: AstStructDef) -> List<String> {
+    mut lines: List<String> = List::new();
+    let ptr_var = "%" + init.target_var;
+    lines.push("  " + ptr_var + " = alloca %" + init.struct_name + ", align 8");
+    mut i: i64 = 0;
+    while i < init.fields.len() {
+        let field_idx_str = int_to_str(i);
+        let gep_var = ptr_var + ".f" + field_idx_str;
+        lines.push("  " + gep_var + " = getelementptr inbounds %" + init.struct_name + ", ptr " + ptr_var + ", i32 0, i32 " + field_idx_str);
+        let field_ty = struct_def.fields[i].ty;
+        let field_val_str = int_to_str(init.fields[i].val);
+        lines.push("  store " + field_ty + " " + field_val_str + ", ptr " + gep_var + ", align 8");
+        i = i + 1;
+    }
+    return lines;
+}
+
+// Emits FIR stack instantiation for a struct
+pub fn emit_fir_struct_instantiation(init: AstStructInit) -> List<String> {
+    mut lines: List<String> = List::new();
+    let ptr_var = "%" + init.target_var;
+    lines.push("    " + ptr_var + " = fir.alloca !" + init.struct_name);
+    mut i: i64 = 0;
+    while i < init.fields.len() {
+        let field_idx_str = int_to_str(i);
+        let val_str = int_to_str(init.fields[i].val);
+        lines.push("    fir.struct_set " + ptr_var + "[" + field_idx_str + "] = " + val_str);
+        i = i + 1;
+    }
+    return lines;
+}
+
+// Emits textual LLVM global constant vtable definition
+pub fn emit_llvm_vtable(vt: AstVTableDef) -> String {
+    let vt_name = "@" + vt.struct_name + "$" + vt.trait_name + "$vtable";
+    let count_str = int_to_str(vt.method_names.len());
+    mut s = vt_name + " = constant [" + count_str + " x ptr] [";
+    mut i: i64 = 0;
+    while i < vt.method_names.len() {
+        if i > 0 {
+            s = s + ", ";
+        }
+        s = s + "ptr @" + vt.struct_name + "$" + vt.method_names[i];
+        i = i + 1;
+    }
+    s = s + "], align 8";
+    return s;
+}
+
+// Emits FIR global vtable definition
+pub fn emit_fir_vtable(vt: AstVTableDef) -> String {
+    let vt_name = "fir.vtable @" + vt.struct_name + "$" + vt.trait_name + " = [";
+    mut s = vt_name;
+    mut i: i64 = 0;
+    while i < vt.method_names.len() {
+        if i > 0 {
+            s = s + ", ";
+        }
+        s = s + "@" + vt.struct_name + "$" + vt.method_names[i];
+        i = i + 1;
+    }
+    s = s + "]";
+    return s;
+}
+
+// Emits LLVM indirect method call via vtable dispatch
+pub fn emit_llvm_vtable_call(
+    vt: AstVTableDef,
+    method_idx: i64,
+    self_var: String,
+    res_var: String
+) -> List<String> {
+    mut lines: List<String> = List::new();
+    let count_str = int_to_str(vt.method_names.len());
+    let vt_name = "@" + vt.struct_name + "$" + vt.trait_name + "$vtable";
+    let slot_reg = "%vt_slot." + res_var;
+    let fn_reg = "%fn_ptr." + res_var;
+    let idx_str = int_to_str(method_idx);
+    lines.push("  " + slot_reg + " = getelementptr inbounds [" + count_str + " x ptr], ptr " + vt_name + ", i64 0, i64 " + idx_str);
+    lines.push("  " + fn_reg + " = load ptr, ptr " + slot_reg + ", align 8");
+    lines.push("  %" + res_var + " = call i64 " + fn_reg + "(ptr %" + self_var + ")");
+    return lines;
+}
+
+// Emits FIR indirect method call via vtable dispatch
+pub fn emit_fir_vtable_call(
+    vt: AstVTableDef,
+    method_idx: i64,
+    self_var: String,
+    res_var: String
+) -> List<String> {
+    mut lines: List<String> = List::new();
+    let fn_reg = "%fn_ptr." + res_var;
+    let vt_ref = "@" + vt.struct_name + "$" + vt.trait_name;
+    let idx_str = int_to_str(method_idx);
+    lines.push("    " + fn_reg + " = fir.vtable_get " + vt_ref + "[" + idx_str + "]");
+    lines.push("    %" + res_var + " = fir.call_indirect " + fn_reg + "(%" + self_var + ")");
+    return lines;
+}
+
+// Unit test 9: Struct definition and instantiation LLVM and FIR emission
+pub fn test_codegen_struct_definitions() -> bool {
+    mut fields: List<AstStructFieldDef> = List::new();
+    fields.push(AstStructFieldDef(name: "x", ty: "i64"));
+    fields.push(AstStructFieldDef(name: "y", ty: "i64"));
+
+    let struct_def = AstStructDef(is_pub: true, name: "Point", fields: fields);
+
+    let ty_llvm = emit_llvm_struct_type(struct_def);
+    if ty_llvm != "%Point = type { i64, i64 }" {
+        return false;
+    }
+
+    let ty_fir = emit_fir_struct_type(struct_def);
+    if ty_fir != "fir.type @Point = !fir.struct<x: i64, y: i64>" {
+        return false;
+    }
+
+    mut init_fields: List<AstStructInitField> = List::new();
+    init_fields.push(AstStructInitField(name: "x", val: 10));
+    init_fields.push(AstStructInitField(name: "y", val: 32));
+
+    let inst = AstStructInit(
+        struct_name: "Point",
+        target_var: "pt",
+        fields: init_fields
+    );
+
+    let llvm_inst = emit_llvm_struct_instantiation(inst, struct_def);
+    if llvm_inst.len() != 5 {
+        return false;
+    }
+    if llvm_inst[0] != "  %pt = alloca %Point, align 8" {
+        return false;
+    }
+    if llvm_inst[1] != "  %pt.f0 = getelementptr inbounds %Point, ptr %pt, i32 0, i32 0" {
+        return false;
+    }
+    if llvm_inst[2] != "  store i64 10, ptr %pt.f0, align 8" {
+        return false;
+    }
+    if llvm_inst[3] != "  %pt.f1 = getelementptr inbounds %Point, ptr %pt, i32 0, i32 1" {
+        return false;
+    }
+    if llvm_inst[4] != "  store i64 32, ptr %pt.f1, align 8" {
+        return false;
+    }
+
+    let fir_inst = emit_fir_struct_instantiation(inst);
+    if fir_inst.len() != 3 {
+        return false;
+    }
+    if fir_inst[0] != "    %pt = fir.alloca !Point" {
+        return false;
+    }
+    if fir_inst[1] != "    fir.struct_set %pt[0] = 10" {
+        return false;
+    }
+    if fir_inst[2] != "    fir.struct_set %pt[1] = 32" {
+        return false;
+    }
+
+    return true;
+}
+
+// Unit test 10: Trait vtable emission and dynamic dispatch
+pub fn test_codegen_vtable_dispatch() -> bool {
+    mut methods: List<String> = List::new();
+    methods.push("describe");
+    methods.push("compute_hash");
+
+    let vt = AstVTableDef(
+        trait_name: "Describable",
+        struct_name: "Point",
+        method_names: methods
+    );
+
+    let llvm_vt = emit_llvm_vtable(vt);
+    if llvm_vt != "@Point$Describable$vtable = constant [2 x ptr] [ptr @Point$describe, ptr @Point$compute_hash], align 8" {
+        return false;
+    }
+
+    let fir_vt = emit_fir_vtable(vt);
+    if fir_vt != "fir.vtable @Point$Describable = [@Point$describe, @Point$compute_hash]" {
+        return false;
+    }
+
+    let llvm_call = emit_llvm_vtable_call(vt, 0, "pt", "res");
+    if llvm_call.len() != 3 {
+        return false;
+    }
+    if llvm_call[0] != "  %vt_slot.res = getelementptr inbounds [2 x ptr], ptr @Point$Describable$vtable, i64 0, i64 0" {
+        return false;
+    }
+    if llvm_call[1] != "  %fn_ptr.res = load ptr, ptr %vt_slot.res, align 8" {
+        return false;
+    }
+    if llvm_call[2] != "  %res = call i64 %fn_ptr.res(ptr %pt)" {
+        return false;
+    }
+
+    let fir_call = emit_fir_vtable_call(vt, 1, "pt", "hash_val");
+    if fir_call.len() != 2 {
+        return false;
+    }
+    if fir_call[0] != "    %fn_ptr.hash_val = fir.vtable_get @Point$Describable[1]" {
+        return false;
+    }
+    if fir_call[1] != "    %hash_val = fir.call_indirect %fn_ptr.hash_val(%pt)" {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -1163,7 +1442,9 @@ pub fn main() {
     let t6 = test_codegen_complex_function();
     let t7 = test_codegen_global_constants();
     let t8 = test_codegen_enum_definitions();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 {
+    let t9 = test_codegen_struct_definitions();
+    let t10 = test_codegen_vtable_dispatch();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");
