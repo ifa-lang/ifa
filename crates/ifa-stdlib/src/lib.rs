@@ -37,8 +37,8 @@ pub use json::{
     decode as decode_json, encode as encode_json, encode_pretty as encode_json_pretty, JsonValue,
 };
 pub use process::{
-    find_system_tool, invoke_assembler, invoke_linker, run as process_run,
-    Command as ProcessCommand, ExitStatus as ProcessExitStatus, ProcessOutput,
+    find_best_assembler, find_best_linker, find_system_tool, invoke_assembler, invoke_linker,
+    run as process_run, Command as ProcessCommand, ExitStatus as ProcessExitStatus, ProcessOutput,
 };
 pub use sync::{
     bounded, channel, AtomicFlag, AtomicInt, Receiver, RingBuffer, Select, Sender, WaitGroup,

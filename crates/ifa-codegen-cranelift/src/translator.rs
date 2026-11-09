@@ -1068,6 +1068,14 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 let lookup_name = match fn_name.as_str() {
                     "process::args_count" | "env::args_count" | "args_count" => "ifa_rt_args_count",
                     "process::args_get" | "env::args_get" | "args_get" => "ifa_rt_args_get",
+                    "process::exec" | "exec" => "ifa_rt_process_exec",
+                    "process::exec_output" | "exec_output" => "ifa_rt_process_exec_output",
+                    "process::exec_stderr" | "exec_stderr" => "ifa_rt_process_exec_stderr",
+                    "process::exec_with_stdin" | "exec_with_stdin" => {
+                        "ifa_rt_process_exec_with_stdin"
+                    }
+                    "process::find_linker" | "find_linker" => "ifa_rt_process_find_linker",
+                    "process::find_tool" | "find_tool" => "ifa_rt_process_find_tool",
                     _ => fn_name.as_str(),
                 };
                 if let Some(res) = self.try_lower_simd_reduction(&fn_name, args) {

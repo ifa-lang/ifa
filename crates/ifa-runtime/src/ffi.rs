@@ -1329,6 +1329,207 @@ pub extern "C" fn ifa_rt_process_exec_output(cmd: *const u8, args: *const u8) ->
     }
 }
 
+/// Execute an external command and capture stderr as a heap-allocated null-terminated C string.
+#[no_mangle]
+pub extern "C" fn ifa_rt_process_exec_stderr(cmd: *const u8, args: *const u8) -> *mut u8 {
+    let empty_alloc = || {
+        let layout = std::alloc::Layout::from_size_align(1, 1).unwrap();
+        unsafe {
+            let mem = std::alloc::alloc(layout);
+            if !mem.is_null() {
+                *mem = 0;
+            }
+            mem
+        }
+    };
+    if cmd.is_null() {
+        return empty_alloc();
+    }
+    let cmd_str = unsafe {
+        match std::ffi::CStr::from_ptr(cmd as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return empty_alloc(),
+        }
+    };
+    let args_str = if args.is_null() {
+        ""
+    } else {
+        unsafe {
+            std::ffi::CStr::from_ptr(args as *const std::os::raw::c_char)
+                .to_str()
+                .unwrap_or("")
+        }
+    };
+    let mut command = std::process::Command::new(cmd_str);
+    if !args_str.is_empty() {
+        for arg in args_str.split_whitespace() {
+            command.arg(arg);
+        }
+    }
+    let output = match command.output() {
+        Ok(out) => out.stderr,
+        Err(_) => Vec::new(),
+    };
+    let mut bytes = output;
+    bytes.push(0);
+    let len = bytes.len();
+    let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, len);
+        mem
+    }
+}
+
+/// Execute an external command with standard input provided, returning exit status code.
+#[no_mangle]
+pub extern "C" fn ifa_rt_process_exec_with_stdin(
+    cmd: *const u8,
+    args: *const u8,
+    stdin_str: *const u8,
+) -> i64 {
+    if cmd.is_null() {
+        return -1;
+    }
+    let cmd_str = unsafe {
+        match std::ffi::CStr::from_ptr(cmd as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+    let args_str = if args.is_null() {
+        ""
+    } else {
+        unsafe {
+            std::ffi::CStr::from_ptr(args as *const std::os::raw::c_char)
+                .to_str()
+                .unwrap_or("")
+        }
+    };
+    let stdin_bytes = if stdin_str.is_null() {
+        None
+    } else {
+        unsafe {
+            std::ffi::CStr::from_ptr(stdin_str as *const std::os::raw::c_char)
+                .to_str()
+                .ok()
+                .map(|s| s.as_bytes().to_vec())
+        }
+    };
+    let mut command = std::process::Command::new(cmd_str);
+    if !args_str.is_empty() {
+        for arg in args_str.split_whitespace() {
+            command.arg(arg);
+        }
+    }
+    if let Some(ref input) = stdin_bytes {
+        use std::io::Write;
+        command.stdin(std::process::Stdio::piped());
+        let mut child = match command.spawn() {
+            Ok(c) => c,
+            Err(_) => return -1,
+        };
+        if let Some(mut cin) = child.stdin.take() {
+            let _ = cin.write_all(input);
+            let _ = cin.flush();
+        }
+        match child.wait() {
+            Ok(status) => status.code().unwrap_or(1) as i64,
+            Err(_) => -1,
+        }
+    } else {
+        match command.status() {
+            Ok(status) => status.code().unwrap_or(1) as i64,
+            Err(_) => -1,
+        }
+    }
+}
+
+/// Detect the most optimal system linker tool name (`mold`, `lld`, `clang`, or `ld`).
+#[no_mangle]
+pub extern "C" fn ifa_rt_process_find_linker() -> *mut u8 {
+    let candidates = ["mold", "lld", "ld.lld", "clang", "gcc", "ld"];
+    let mut resolved = "clang";
+    for cand in candidates {
+        if which_tool_exists(cand) {
+            resolved = cand;
+            break;
+        }
+    }
+    let bytes = format!("{}\0", resolved).into_bytes();
+    let len = bytes.len();
+    let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, len);
+        mem
+    }
+}
+
+/// Locate a tool executable on system path. Returns full path or empty string if not found.
+#[no_mangle]
+pub extern "C" fn ifa_rt_process_find_tool(tool_name: *const u8) -> *mut u8 {
+    let empty_alloc = || {
+        let layout = std::alloc::Layout::from_size_align(1, 1).unwrap();
+        unsafe {
+            let mem = std::alloc::alloc(layout);
+            if !mem.is_null() {
+                *mem = 0;
+            }
+            mem
+        }
+    };
+    if tool_name.is_null() {
+        return empty_alloc();
+    }
+    let name_str = unsafe {
+        match std::ffi::CStr::from_ptr(tool_name as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return empty_alloc(),
+        }
+    };
+    let found_path = find_tool_path(name_str).unwrap_or_default();
+    let bytes = format!("{}\0", found_path).into_bytes();
+    let len = bytes.len();
+    let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, len);
+        mem
+    }
+}
+
+fn which_tool_exists(name: &str) -> bool {
+    find_tool_path(name).is_some()
+}
+
+fn find_tool_path(name: &str) -> Option<String> {
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = std::path::Path::new(&dir).join(name);
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    for dir in &["/usr/bin", "/usr/local/bin", "/bin"] {
+        let candidate = std::path::Path::new(dir).join(name);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
 /// Read an environment variable. Returns empty string if unset.
 #[no_mangle]
 pub extern "C" fn ifa_rt_env_var(name: *const u8) -> *mut u8 {

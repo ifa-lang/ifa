@@ -18,6 +18,7 @@ pub const RUNTIME_STUB_C: &str = r#"
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 void println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } fflush(stdout); }
 void ifa_rt_println(const char *s) { if (s) { puts(s); } else { putchar('\n'); } fflush(stdout); }
@@ -664,6 +665,96 @@ char* ifa_rt_process_exec_output(const char* cmd, const char* args) {
     return buf;
 }
 
+char* ifa_rt_process_exec_stderr(const char* cmd, const char* args) {
+    if (!cmd) {
+        char* empty = (char*)malloc(1);
+        empty[0] = '\0';
+        return empty;
+    }
+    char full_cmd[1024];
+    if (args && strlen(args) > 0) {
+        snprintf(full_cmd, sizeof(full_cmd), "%s %s 2>&1 1>/dev/null", cmd, args);
+    } else {
+        snprintf(full_cmd, sizeof(full_cmd), "%s 2>&1 1>/dev/null", cmd);
+    }
+    FILE* pipe = popen(full_cmd, "r");
+    if (!pipe) {
+        char* empty = (char*)malloc(1);
+        empty[0] = '\0';
+        return empty;
+    }
+    size_t cap = 1024;
+    size_t len = 0;
+    char* buf = (char*)malloc(cap);
+    if (!buf) { pclose(pipe); abort(); }
+    while (1) {
+        size_t rd = fread(buf + len, 1, cap - len - 1, pipe);
+        if (rd == 0) break;
+        len += rd;
+        if (len + 128 >= cap) {
+            cap *= 2;
+            buf = (char*)realloc(buf, cap);
+            if (!buf) { pclose(pipe); abort(); }
+        }
+    }
+    buf[len] = '\0';
+    pclose(pipe);
+    return buf;
+}
+
+int64_t ifa_rt_process_exec_with_stdin(const char* cmd, const char* args, const char* stdin_str) {
+    if (!cmd) return -1;
+    char full_cmd[1024];
+    if (args && strlen(args) > 0) {
+        snprintf(full_cmd, sizeof(full_cmd), "%s %s", cmd, args);
+    } else {
+        snprintf(full_cmd, sizeof(full_cmd), "%s", cmd);
+    }
+    FILE* pipe = popen(full_cmd, "w");
+    if (!pipe) return -1;
+    if (stdin_str && strlen(stdin_str) > 0) {
+        fwrite(stdin_str, 1, strlen(stdin_str), pipe);
+    }
+    int code = pclose(pipe);
+    return (int64_t)code;
+}
+
+char* ifa_rt_process_find_linker(void) {
+    const char* cand = "clang";
+    if (access("/usr/bin/mold", X_OK) == 0 || access("/usr/local/bin/mold", X_OK) == 0) {
+        cand = "mold";
+    } else if (access("/usr/bin/lld", X_OK) == 0 || access("/usr/local/bin/lld", X_OK) == 0) {
+        cand = "lld";
+    }
+    char* out = (char*)malloc(strlen(cand) + 1);
+    strcpy(out, cand);
+    return out;
+}
+
+char* ifa_rt_process_find_tool(const char* name) {
+    if (!name) {
+        char* empty = (char*)malloc(1);
+        empty[0] = '\0';
+        return empty;
+    }
+    char buf[512];
+    snprintf(buf, sizeof(buf), "/usr/bin/%s", name);
+    if (access(buf, X_OK) == 0) {
+        char* out = (char*)malloc(strlen(buf) + 1);
+        strcpy(out, buf);
+        return out;
+    }
+    snprintf(buf, sizeof(buf), "/usr/local/bin/%s", name);
+    if (access(buf, X_OK) == 0) {
+        char* out = (char*)malloc(strlen(buf) + 1);
+        strcpy(out, buf);
+        return out;
+    }
+    char* empty = (char*)malloc(1);
+    empty[0] = '\0';
+    return empty;
+}
+
 char* ifa_rt_env_var(const char* name) {
     if (!name) {
         char* empty = (char*)malloc(1);
@@ -1187,6 +1278,120 @@ impl AotCompiler {
         self.func_ids
             .insert("process::args_get".into(), args_get_id);
         self.func_ids.insert("args_get".into(), args_get_id);
+
+        // Process intrinsics
+        let mut proc_exec_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        proc_exec_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        proc_exec_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        proc_exec_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        let proc_exec_id = self
+            .module
+            .declare_function("ifa_rt_process_exec", Linkage::Import, &proc_exec_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_process_exec".into(), proc_exec_id);
+        self.func_ids.insert("process::exec".into(), proc_exec_id);
+
+        let mut proc_out_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        proc_out_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        proc_out_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        proc_out_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        let proc_out_id = self
+            .module
+            .declare_function("ifa_rt_process_exec_output", Linkage::Import, &proc_out_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_process_exec_output".into(), proc_out_id);
+        self.func_ids
+            .insert("process::exec_output".into(), proc_out_id);
+
+        let proc_err_id = self
+            .module
+            .declare_function("ifa_rt_process_exec_stderr", Linkage::Import, &proc_out_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_process_exec_stderr".into(), proc_err_id);
+        self.func_ids
+            .insert("process::exec_stderr".into(), proc_err_id);
+
+        let mut proc_stdin_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        proc_stdin_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        proc_stdin_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        proc_stdin_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        proc_stdin_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        let proc_stdin_id = self
+            .module
+            .declare_function(
+                "ifa_rt_process_exec_with_stdin",
+                Linkage::Import,
+                &proc_stdin_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_process_exec_with_stdin".into(), proc_stdin_id);
+        self.func_ids
+            .insert("process::exec_with_stdin".into(), proc_stdin_id);
+
+        let mut proc_find_linker_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        proc_find_linker_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        let proc_find_linker_id = self
+            .module
+            .declare_function(
+                "ifa_rt_process_find_linker",
+                Linkage::Import,
+                &proc_find_linker_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_process_find_linker".into(), proc_find_linker_id);
+        self.func_ids
+            .insert("process::find_linker".into(), proc_find_linker_id);
+
+        let mut proc_find_tool_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        proc_find_tool_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        proc_find_tool_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        let proc_find_tool_id = self
+            .module
+            .declare_function(
+                "ifa_rt_process_find_tool",
+                Linkage::Import,
+                &proc_find_tool_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_process_find_tool".into(), proc_find_tool_id);
+        self.func_ids
+            .insert("process::find_tool".into(), proc_find_tool_id);
 
         // Register stackless coroutine intrinsics
         let mut coro_create_sig = cranelift_codegen::ir::Signature::new(call_conv);

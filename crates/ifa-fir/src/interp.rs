@@ -2202,6 +2202,247 @@ impl<'a> FirInterpreter<'a> {
                     } else {
                         Ok(FirValue::String(String::new()))
                     }
+                } else if fn_name == "fs::write_string" || fn_name == "write_string" {
+                    let path = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let content = evaluated_args
+                        .get(1)
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let ok = std::fs::write(path, content).is_ok();
+                    Ok(FirValue::Bool(ok))
+                } else if fn_name == "fs::exists" || fn_name == "exists" {
+                    let path = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    Ok(FirValue::Bool(std::path::Path::new(path).exists()))
+                } else if fn_name == "fs::file_size" || fn_name == "file_size" {
+                    let path = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let sz = std::fs::metadata(path)
+                        .map(|m| m.len() as i128)
+                        .unwrap_or(0);
+                    Ok(FirValue::Int(sz))
+                } else if fn_name == "process::exec"
+                    || fn_name == "exec"
+                    || fn_name == "ifa_rt_process_exec"
+                {
+                    let cmd_name = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let args_str = evaluated_args
+                        .get(1)
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let mut command = std::process::Command::new(cmd_name);
+                    if !args_str.is_empty() {
+                        for arg in args_str.split_whitespace() {
+                            command.arg(arg);
+                        }
+                    }
+                    let code = command
+                        .status()
+                        .map(|s| s.code().unwrap_or(1) as i128)
+                        .unwrap_or(-1);
+                    Ok(FirValue::Int(code))
+                } else if fn_name == "process::exec_output"
+                    || fn_name == "exec_output"
+                    || fn_name == "ifa_rt_process_exec_output"
+                {
+                    let cmd_name = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let args_str = evaluated_args
+                        .get(1)
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let mut command = std::process::Command::new(cmd_name);
+                    if !args_str.is_empty() {
+                        for arg in args_str.split_whitespace() {
+                            command.arg(arg);
+                        }
+                    }
+                    let out = command
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                        .unwrap_or_default();
+                    Ok(FirValue::String(out))
+                } else if fn_name == "process::exec_stderr"
+                    || fn_name == "exec_stderr"
+                    || fn_name == "ifa_rt_process_exec_stderr"
+                {
+                    let cmd_name = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let args_str = evaluated_args
+                        .get(1)
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let mut command = std::process::Command::new(cmd_name);
+                    if !args_str.is_empty() {
+                        for arg in args_str.split_whitespace() {
+                            command.arg(arg);
+                        }
+                    }
+                    let out = command
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+                        .unwrap_or_default();
+                    Ok(FirValue::String(out))
+                } else if fn_name == "process::exec_with_stdin"
+                    || fn_name == "exec_with_stdin"
+                    || fn_name == "ifa_rt_process_exec_with_stdin"
+                {
+                    let cmd_name = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let args_str = evaluated_args
+                        .get(1)
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let stdin_str = evaluated_args
+                        .get(2)
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let mut command = std::process::Command::new(cmd_name);
+                    if !args_str.is_empty() {
+                        for arg in args_str.split_whitespace() {
+                            command.arg(arg);
+                        }
+                    }
+                    use std::io::Write;
+                    command.stdin(std::process::Stdio::piped());
+                    let mut child = match command.spawn() {
+                        Ok(c) => c,
+                        Err(_) => return Ok(FirValue::Int(-1)),
+                    };
+                    if let Some(mut cin) = child.stdin.take() {
+                        let _ = cin.write_all(stdin_str.as_bytes());
+                    }
+                    let code = child
+                        .wait()
+                        .map(|s| s.code().unwrap_or(1) as i128)
+                        .unwrap_or(-1);
+                    Ok(FirValue::Int(code))
+                } else if fn_name == "process::find_linker"
+                    || fn_name == "find_linker"
+                    || fn_name == "ifa_rt_process_find_linker"
+                {
+                    let candidates = ["mold", "lld", "ld.lld", "clang", "gcc", "ld"];
+                    let mut resolved = "clang".to_string();
+                    if let Ok(path_var) = std::env::var("PATH") {
+                        'cand_loop: for cand in candidates {
+                            for dir in std::env::split_paths(&path_var) {
+                                if dir.join(cand).is_file() {
+                                    resolved = cand.to_string();
+                                    break 'cand_loop;
+                                }
+                            }
+                        }
+                    }
+                    Ok(FirValue::String(resolved))
+                } else if fn_name == "process::find_tool"
+                    || fn_name == "find_tool"
+                    || fn_name == "ifa_rt_process_find_tool"
+                {
+                    let tool_name = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let mut found = String::new();
+                    if let Ok(path_var) = std::env::var("PATH") {
+                        for dir in std::env::split_paths(&path_var) {
+                            let cand = dir.join(tool_name);
+                            if cand.is_file() {
+                                found = cand.to_string_lossy().into_owned();
+                                break;
+                            }
+                        }
+                    }
+                    Ok(FirValue::String(found))
+                } else if fn_name == "process::env_var"
+                    || fn_name == "env_var"
+                    || fn_name == "ifa_rt_env_var"
+                {
+                    let var_name = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let val = std::env::var(var_name).unwrap_or_default();
+                    Ok(FirValue::String(val))
+                } else if fn_name == "process::args_count"
+                    || fn_name == "args_count"
+                    || fn_name == "ifa_rt_args_count"
+                {
+                    let count = std::env::args().count() as i128;
+                    Ok(FirValue::Int(count))
+                } else if fn_name == "process::args_get"
+                    || fn_name == "args_get"
+                    || fn_name == "ifa_rt_args_get"
+                {
+                    let idx = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as usize,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    let arg = std::env::args().nth(idx).unwrap_or_default();
+                    Ok(FirValue::String(arg))
                 } else if let Some(target_func) = self.find_function(&fn_name) {
                     // Direct function call to another FIR function in module
                     let func_clone = target_func.clone();

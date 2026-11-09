@@ -122,6 +122,10 @@ pub fn assemble_full_llvm_module_with_opt(
     full_module.push("declare i64 @ifa_rt_fs_file_size(ptr)");
     full_module.push("declare i64 @ifa_rt_process_exec(ptr, ptr)");
     full_module.push("declare ptr @ifa_rt_process_exec_output(ptr, ptr)");
+    full_module.push("declare ptr @ifa_rt_process_exec_stderr(ptr, ptr)");
+    full_module.push("declare i64 @ifa_rt_process_exec_with_stdin(ptr, ptr, ptr)");
+    full_module.push("declare ptr @ifa_rt_process_find_linker()");
+    full_module.push("declare ptr @ifa_rt_process_find_tool(ptr)");
     full_module.push("declare ptr @ifa_rt_env_var(ptr)");
     full_module.push("declare i64 @ifa_rt_args_count()");
     full_module.push("declare ptr @ifa_rt_args_get(i64)");
@@ -178,6 +182,10 @@ pub fn assemble_full_llvm_module(func_lines: List<String>, target_triple: String
     full_module.push("declare i64 @ifa_rt_fs_file_size(ptr)");
     full_module.push("declare i64 @ifa_rt_process_exec(ptr, ptr)");
     full_module.push("declare ptr @ifa_rt_process_exec_output(ptr, ptr)");
+    full_module.push("declare ptr @ifa_rt_process_exec_stderr(ptr, ptr)");
+    full_module.push("declare i64 @ifa_rt_process_exec_with_stdin(ptr, ptr, ptr)");
+    full_module.push("declare ptr @ifa_rt_process_find_linker()");
+    full_module.push("declare ptr @ifa_rt_process_find_tool(ptr)");
     full_module.push("declare ptr @ifa_rt_env_var(ptr)");
     full_module.push("declare i64 @ifa_rt_args_count()");
     full_module.push("declare ptr @ifa_rt_args_get(i64)");
@@ -944,18 +952,38 @@ pub fn write_ir_to_file(path: String, ir_lines: List<String>) -> bool {
     return fs::write_string(path, content);
 }
 
+pub fn select_best_linker() -> String {
+    let lk = process::find_linker();
+    if lk == "" {
+        return "clang";
+    }
+    return lk;
+}
+
 pub fn compile_llvm_to_object(input_ll: String, output_o: String, opt_level: i64) -> i64 {
     mut opt_str = "-O2";
     if opt_level == 0 { opt_str = "-O0"; }
     if opt_level == 1 { opt_str = "-O1"; }
     if opt_level == 3 { opt_str = "-O3"; }
     let args = "-c " + opt_str + " --target=x86_64-unknown-linux-gnu " + input_ll + " -o " + output_o;
-    return process::exec("clang", args);
+    let status = process::exec("clang", args);
+    return status;
+}
+
+pub fn link_object_to_executable_with_linker(input_o: String, output_bin: String, linker: String) -> i64 {
+    mut args = input_o + " -no-pie -Wl,--build-id=none -o " + output_bin;
+    if linker == "mold" {
+        args = input_o + " -fuse-ld=mold -no-pie -Wl,--build-id=none -o " + output_bin;
+    } else if linker == "lld" {
+        args = input_o + " -fuse-ld=lld -no-pie -Wl,--build-id=none -o " + output_bin;
+    }
+    let status = process::exec("clang", args);
+    return status;
 }
 
 pub fn link_object_to_executable(input_o: String, output_bin: String) -> i64 {
-    let args = input_o + " -no-pie -Wl,--build-id=none -o " + output_bin;
-    return process::exec("clang", args);
+    let linker = select_best_linker();
+    return link_object_to_executable_with_linker(input_o, output_bin, linker);
 }
 
 pub fn compile_full_pipeline(
@@ -1057,7 +1085,7 @@ pub fn test_driver_full_module_assembly() -> bool {
     fn_lines.push("}");
 
     let full_ir = assemble_full_llvm_module(fn_lines, "x86_64-unknown-linux-gnu");
-    if full_ir.len() != 48 {
+    if full_ir.len() != 52 {
         return false;
     }
     if full_ir[6] != "declare void @ifa_rt_println(ptr)" {
@@ -1069,37 +1097,43 @@ pub fn test_driver_full_module_assembly() -> bool {
     if full_ir[14] != "declare i64 @ifa_rt_process_exec(ptr, ptr)" {
         return false;
     }
-    if full_ir[17] != "declare i64 @ifa_rt_args_count()" {
+    if full_ir[16] != "declare ptr @ifa_rt_process_exec_stderr(ptr, ptr)" {
         return false;
     }
-    if full_ir[21] != "declare void @ifa_rt_fiber_yield()" {
+    if full_ir[18] != "declare ptr @ifa_rt_process_find_linker()" {
         return false;
     }
-    if full_ir[22] != "declare i64 @ifa_rt_fiber_spawn(ptr, ptr)" {
+    if full_ir[21] != "declare i64 @ifa_rt_args_count()" {
         return false;
     }
-    if full_ir[24] != "declare ptr @ifa_rt_channel_create(i64)" {
+    if full_ir[22] != "declare ptr @ifa_rt_args_get(i64)" {
         return false;
     }
-    if full_ir[29] != "declare i64 @ifa_rt_channel_select(ptr, i64, i32)" {
+    if full_ir[25] != "declare void @ifa_rt_fiber_yield()" {
         return false;
     }
-    if full_ir[30] != "declare i64 @ifa_rt_channel_select_timed(ptr, ptr, i64, i64, i32)" {
+    if full_ir[26] != "declare i64 @ifa_rt_fiber_spawn(ptr, ptr)" {
         return false;
     }
-    if full_ir[31] != "declare i64 @ifa_rt_fiber_spawn_with_arena(ptr, ptr)" {
+    if full_ir[28] != "declare ptr @ifa_rt_channel_create(i64)" {
         return false;
     }
-    if full_ir[32] != "declare i32 @ifa_rt_arena_transfer_owner(i16, i64)" {
+    if full_ir[33] != "declare i64 @ifa_rt_channel_select(ptr, i64, i32)" {
         return false;
     }
-    if full_ir[33] != "declare i32 @ifa_rt_arena_verify_owner(i16, i64)" {
+    if full_ir[34] != "declare i64 @ifa_rt_channel_select_timed(ptr, ptr, i64, i64, i32)" {
         return false;
     }
-    if full_ir[18] != "declare ptr @ifa_rt_args_get(i64)" {
+    if full_ir[35] != "declare i64 @ifa_rt_fiber_spawn_with_arena(ptr, ptr)" {
         return false;
     }
-    return full_ir[47] == "}";
+    if full_ir[36] != "declare i32 @ifa_rt_arena_transfer_owner(i16, i64)" {
+        return false;
+    }
+    if full_ir[37] != "declare i32 @ifa_rt_arena_verify_owner(i16, i64)" {
+        return false;
+    }
+    return full_ir[51] == "}";
 }
 
 // Unit Test 5: Verify driver compilation result structure
@@ -1533,6 +1567,19 @@ pub fn test_driver_generational_memory_runtime_assembly() -> bool {
     return has_gen_alloc && has_arena_create && has_arena_reset && has_panic_uaf && has_cow_make_mut;
 }
 
+// Unit Test 15: Verify system linker selection and native process bindings
+pub fn test_driver_linker_selection_and_process_bindings() -> bool {
+    let linker = select_best_linker();
+    if linker != "mold" && linker != "lld" && linker != "clang" && linker != "gcc" && linker != "ld" {
+        return false;
+    }
+    let echo_status = process::exec("sh", "-c true");
+    if echo_status != 0 {
+        return false;
+    }
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Driver & I/O Module ===");
     let t1 = test_driver_default_config();
@@ -1549,8 +1596,9 @@ pub fn main() {
     let t12 = test_driver_llvm_opt_module_assembly();
     let t13 = test_driver_simd_vectorization_metadata_assembly();
     let t14 = test_driver_generational_memory_runtime_assembly();
+    let t15 = test_driver_linker_selection_and_process_bindings();
 
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 {
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 {
         println("Driver validation tests: ALL PASSED");
     } else {
         println("Driver validation tests: FAILED");

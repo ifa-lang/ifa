@@ -127,6 +127,30 @@ impl JitEngine {
             "ifa_rt_args_get",
             ifa_runtime::ffi::ifa_rt_args_get as *const u8,
         );
+        builder.symbol(
+            "ifa_rt_process_exec",
+            ifa_runtime::ffi::ifa_rt_process_exec as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_process_exec_output",
+            ifa_runtime::ffi::ifa_rt_process_exec_output as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_process_exec_stderr",
+            ifa_runtime::ffi::ifa_rt_process_exec_stderr as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_process_exec_with_stdin",
+            ifa_runtime::ffi::ifa_rt_process_exec_with_stdin as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_process_find_linker",
+            ifa_runtime::ffi::ifa_rt_process_find_linker as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_process_find_tool",
+            ifa_runtime::ffi::ifa_rt_process_find_tool as *const u8,
+        );
         builder.symbol("ifa_rt_coro_create", ifa_rt_coro_create as *const u8);
         builder.symbol(
             "ifa_rt_coro_create_custom",
@@ -595,6 +619,90 @@ impl JitEngine {
         self.func_ids
             .insert("process::args_get".into(), args_get_id);
         self.func_ids.insert("args_get".into(), args_get_id);
+
+        // Process intrinsics
+        let mut proc_exec_sig = Signature::new(call_conv);
+        proc_exec_sig.params.push(AbiParam::new(ptr_type));
+        proc_exec_sig.params.push(AbiParam::new(ptr_type));
+        proc_exec_sig.returns.push(AbiParam::new(types::I64));
+        let proc_exec_id = self
+            .module
+            .declare_function("ifa_rt_process_exec", Linkage::Import, &proc_exec_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_process_exec".into(), proc_exec_id);
+        self.func_ids.insert("process::exec".into(), proc_exec_id);
+
+        let mut proc_out_sig = Signature::new(call_conv);
+        proc_out_sig.params.push(AbiParam::new(ptr_type));
+        proc_out_sig.params.push(AbiParam::new(ptr_type));
+        proc_out_sig.returns.push(AbiParam::new(ptr_type));
+        let proc_out_id = self
+            .module
+            .declare_function("ifa_rt_process_exec_output", Linkage::Import, &proc_out_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_process_exec_output".into(), proc_out_id);
+        self.func_ids
+            .insert("process::exec_output".into(), proc_out_id);
+
+        let proc_err_id = self
+            .module
+            .declare_function("ifa_rt_process_exec_stderr", Linkage::Import, &proc_out_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_process_exec_stderr".into(), proc_err_id);
+        self.func_ids
+            .insert("process::exec_stderr".into(), proc_err_id);
+
+        let mut proc_stdin_sig = Signature::new(call_conv);
+        proc_stdin_sig.params.push(AbiParam::new(ptr_type));
+        proc_stdin_sig.params.push(AbiParam::new(ptr_type));
+        proc_stdin_sig.params.push(AbiParam::new(ptr_type));
+        proc_stdin_sig.returns.push(AbiParam::new(types::I64));
+        let proc_stdin_id = self
+            .module
+            .declare_function(
+                "ifa_rt_process_exec_with_stdin",
+                Linkage::Import,
+                &proc_stdin_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_process_exec_with_stdin".into(), proc_stdin_id);
+        self.func_ids
+            .insert("process::exec_with_stdin".into(), proc_stdin_id);
+
+        let mut proc_find_linker_sig = Signature::new(call_conv);
+        proc_find_linker_sig.returns.push(AbiParam::new(ptr_type));
+        let proc_find_linker_id = self
+            .module
+            .declare_function(
+                "ifa_rt_process_find_linker",
+                Linkage::Import,
+                &proc_find_linker_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_process_find_linker".into(), proc_find_linker_id);
+        self.func_ids
+            .insert("process::find_linker".into(), proc_find_linker_id);
+
+        let mut proc_find_tool_sig = Signature::new(call_conv);
+        proc_find_tool_sig.params.push(AbiParam::new(ptr_type));
+        proc_find_tool_sig.returns.push(AbiParam::new(ptr_type));
+        let proc_find_tool_id = self
+            .module
+            .declare_function(
+                "ifa_rt_process_find_tool",
+                Linkage::Import,
+                &proc_find_tool_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_process_find_tool".into(), proc_find_tool_id);
+        self.func_ids
+            .insert("process::find_tool".into(), proc_find_tool_id);
 
         // Register stackless coroutine intrinsics
         let mut coro_create_sig = Signature::new(call_conv);

@@ -175,6 +175,10 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_fs_file_size(ptr)\n");
             out.push_str("declare i64 @ifa_rt_process_exec(ptr, ptr)\n");
             out.push_str("declare ptr @ifa_rt_process_exec_output(ptr, ptr)\n");
+            out.push_str("declare ptr @ifa_rt_process_exec_stderr(ptr, ptr)\n");
+            out.push_str("declare i64 @ifa_rt_process_exec_with_stdin(ptr, ptr, ptr)\n");
+            out.push_str("declare ptr @ifa_rt_process_find_linker()\n");
+            out.push_str("declare ptr @ifa_rt_process_find_tool(ptr)\n");
             out.push_str("declare ptr @ifa_rt_env_var(ptr)\n");
             out.push_str("declare i64 @ifa_rt_args_count()\n");
             out.push_str("declare ptr @ifa_rt_args_get(i64)\n");
@@ -255,6 +259,10 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_fs_file_size(ptr)\n");
             out.push_str("declare i64 @ifa_rt_process_exec(ptr, ptr)\n");
             out.push_str("declare ptr @ifa_rt_process_exec_output(ptr, ptr)\n");
+            out.push_str("declare ptr @ifa_rt_process_exec_stderr(ptr, ptr)\n");
+            out.push_str("declare i64 @ifa_rt_process_exec_with_stdin(ptr, ptr, ptr)\n");
+            out.push_str("declare ptr @ifa_rt_process_find_linker()\n");
+            out.push_str("declare ptr @ifa_rt_process_find_tool(ptr)\n");
             out.push_str("declare ptr @ifa_rt_env_var(ptr)\n");
             out.push_str("declare i64 @ifa_rt_args_count()\n");
             out.push_str("declare ptr @ifa_rt_args_get(i64)\n");
@@ -2348,7 +2356,19 @@ impl<'a> LlvmIrEmitter<'a> {
                                 } else {
                                     ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                                 }
-                            } else if callee == "process::args_get"
+                            } else if callee == "process::exec_output"
+                                || callee == "exec_output"
+                                || callee == "ifa_rt_process_exec_output"
+                                || callee == "process::exec_stderr"
+                                || callee == "exec_stderr"
+                                || callee == "ifa_rt_process_exec_stderr"
+                                || callee == "process::find_linker"
+                                || callee == "find_linker"
+                                || callee == "ifa_rt_process_find_linker"
+                                || callee == "process::find_tool"
+                                || callee == "find_tool"
+                                || callee == "ifa_rt_process_find_tool"
+                                || callee == "process::args_get"
                                 || callee == "env::args_get"
                                 || callee == "args_get"
                                 || callee == "ifa_rt_args_get"
@@ -2375,6 +2395,9 @@ impl<'a> LlvmIrEmitter<'a> {
                                 || callee == "process::exec"
                                 || callee == "exec"
                                 || callee == "ifa_rt_process_exec"
+                                || callee == "process::exec_with_stdin"
+                                || callee == "exec_with_stdin"
+                                || callee == "ifa_rt_process_exec_with_stdin"
                                 || callee == "fs::file_size"
                                 || callee == "file_size"
                                 || callee == "ifa_rt_fs_file_size"
@@ -3422,6 +3445,12 @@ impl<'a> LlvmIrEmitter<'a> {
                     "fs::file_size" | "file_size" => "ifa_rt_fs_file_size",
                     "process::exec" | "exec" => "ifa_rt_process_exec",
                     "process::exec_output" | "exec_output" => "ifa_rt_process_exec_output",
+                    "process::exec_stderr" | "exec_stderr" => "ifa_rt_process_exec_stderr",
+                    "process::exec_with_stdin" | "exec_with_stdin" => {
+                        "ifa_rt_process_exec_with_stdin"
+                    }
+                    "process::find_linker" | "find_linker" => "ifa_rt_process_find_linker",
+                    "process::find_tool" | "find_tool" => "ifa_rt_process_find_tool",
                     "process::env_var" | "env_var" => "ifa_rt_env_var",
                     "process::args_count" | "env::args_count" | "args_count" => "ifa_rt_args_count",
                     "process::args_get" | "env::args_get" | "args_get" => "ifa_rt_args_get",
@@ -3492,12 +3521,23 @@ impl<'a> LlvmIrEmitter<'a> {
                             "i64".to_string(),
                             vec!["ptr".to_string(), "ptr".to_string()],
                         )
-                    } else if norm_callee == "ifa_rt_process_exec_output" {
+                    } else if norm_callee == "ifa_rt_process_exec_output"
+                        || norm_callee == "ifa_rt_process_exec_stderr"
+                    {
                         (
                             "ptr".to_string(),
                             vec!["ptr".to_string(), "ptr".to_string()],
                         )
-                    } else if norm_callee == "ifa_rt_env_var" {
+                    } else if norm_callee == "ifa_rt_process_exec_with_stdin" {
+                        (
+                            "i64".to_string(),
+                            vec!["ptr".to_string(), "ptr".to_string(), "ptr".to_string()],
+                        )
+                    } else if norm_callee == "ifa_rt_process_find_linker" {
+                        ("ptr".to_string(), Vec::new())
+                    } else if norm_callee == "ifa_rt_process_find_tool"
+                        || norm_callee == "ifa_rt_env_var"
+                    {
                         ("ptr".to_string(), vec!["ptr".to_string()])
                     } else if norm_callee == "ifa_rt_args_count" {
                         ("i64".to_string(), Vec::new())
@@ -5291,6 +5331,12 @@ impl<'a> LlvmIrEmitter<'a> {
                     "fs::file_size" | "file_size" => "ifa_rt_fs_file_size",
                     "process::exec" | "exec" => "ifa_rt_process_exec",
                     "process::exec_output" | "exec_output" => "ifa_rt_process_exec_output",
+                    "process::exec_stderr" | "exec_stderr" => "ifa_rt_process_exec_stderr",
+                    "process::exec_with_stdin" | "exec_with_stdin" => {
+                        "ifa_rt_process_exec_with_stdin"
+                    }
+                    "process::find_linker" | "find_linker" => "ifa_rt_process_find_linker",
+                    "process::find_tool" | "find_tool" => "ifa_rt_process_find_tool",
                     "process::env_var" | "env_var" => "ifa_rt_env_var",
                     "process::args_count" | "env::args_count" | "args_count" => "ifa_rt_args_count",
                     "process::args_get" | "env::args_get" | "args_get" => "ifa_rt_args_get",
@@ -5358,12 +5404,23 @@ impl<'a> LlvmIrEmitter<'a> {
                             "i64".to_string(),
                             vec!["ptr".to_string(), "ptr".to_string()],
                         )
-                    } else if norm_callee == "ifa_rt_process_exec_output" {
+                    } else if norm_callee == "ifa_rt_process_exec_output"
+                        || norm_callee == "ifa_rt_process_exec_stderr"
+                    {
                         (
                             "ptr".to_string(),
                             vec!["ptr".to_string(), "ptr".to_string()],
                         )
-                    } else if norm_callee == "ifa_rt_env_var" {
+                    } else if norm_callee == "ifa_rt_process_exec_with_stdin" {
+                        (
+                            "i64".to_string(),
+                            vec!["ptr".to_string(), "ptr".to_string(), "ptr".to_string()],
+                        )
+                    } else if norm_callee == "ifa_rt_process_find_linker" {
+                        ("ptr".to_string(), Vec::new())
+                    } else if norm_callee == "ifa_rt_process_find_tool"
+                        || norm_callee == "ifa_rt_env_var"
+                    {
                         ("ptr".to_string(), vec!["ptr".to_string()])
                     } else if norm_callee == "ifa_rt_args_count" {
                         ("i64".to_string(), Vec::new())

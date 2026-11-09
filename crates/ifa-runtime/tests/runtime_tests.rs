@@ -2447,6 +2447,68 @@ fn test_runtime_fs_and_process_primitives() {
         );
     }
 
+    // 6b. Process exec stderr
+    let sh_cmd = std::ffi::CString::new("sh").unwrap();
+    let err_args = std::ffi::CString::new("-c echo_error_message >&2").unwrap();
+    let err_ptr =
+        ifa_rt_process_exec_stderr(sh_cmd.as_ptr() as *const u8, err_args.as_ptr() as *const u8);
+    assert!(!err_ptr.is_null());
+    let err_str = unsafe {
+        std::ffi::CStr::from_ptr(err_ptr as *const std::os::raw::c_char)
+            .to_str()
+            .unwrap()
+    };
+    assert!(err_str.contains("echo_error_message"));
+    unsafe {
+        std::alloc::dealloc(
+            err_ptr,
+            std::alloc::Layout::from_size_align(err_str.len() + 1, 1).unwrap(),
+        );
+    }
+
+    // 6c. Process exec with stdin
+    let cat_cmd = std::ffi::CString::new("cat").unwrap();
+    let empty_args = std::ffi::CString::new("").unwrap();
+    let stdin_input = std::ffi::CString::new("hello_stdin_stream").unwrap();
+    let cat_status = ifa_rt_process_exec_with_stdin(
+        cat_cmd.as_ptr() as *const u8,
+        empty_args.as_ptr() as *const u8,
+        stdin_input.as_ptr() as *const u8,
+    );
+    assert_eq!(cat_status, 0);
+
+    // 6d. Process find linker and tool
+    let linker_ptr = ifa_rt_process_find_linker();
+    assert!(!linker_ptr.is_null());
+    let linker_str = unsafe {
+        std::ffi::CStr::from_ptr(linker_ptr as *const std::os::raw::c_char)
+            .to_str()
+            .unwrap()
+    };
+    assert!(!linker_str.is_empty());
+    unsafe {
+        std::alloc::dealloc(
+            linker_ptr,
+            std::alloc::Layout::from_size_align(linker_str.len() + 1, 1).unwrap(),
+        );
+    }
+
+    let tool_query = std::ffi::CString::new("sh").unwrap();
+    let tool_ptr = ifa_rt_process_find_tool(tool_query.as_ptr() as *const u8);
+    assert!(!tool_ptr.is_null());
+    let tool_path_str = unsafe {
+        std::ffi::CStr::from_ptr(tool_ptr as *const std::os::raw::c_char)
+            .to_str()
+            .unwrap()
+    };
+    assert!(tool_path_str.contains("sh"));
+    unsafe {
+        std::alloc::dealloc(
+            tool_ptr,
+            std::alloc::Layout::from_size_align(tool_path_str.len() + 1, 1).unwrap(),
+        );
+    }
+
     // 7. Env var
     let env_name = std::ffi::CString::new("PATH").unwrap();
     let env_ptr = ifa_rt_env_var(env_name.as_ptr() as *const u8);

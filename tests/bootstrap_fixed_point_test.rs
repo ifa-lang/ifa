@@ -351,6 +351,11 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_driver_linker_selection_and_process_bindings ... ok"),
+        "Modular driver linker selection test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_codegen_timed_and_prioritized_channel_select ... ok"),
         "Modular codegen timed select test missing from output:\n{}",
         stdout
@@ -656,8 +661,8 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("248 passed; 0 failed"),
-        "Expected 248 passed unit tests, got:\n{}",
+        stdout.contains("250 passed; 0 failed"),
+        "Expected 250 passed unit tests, got:\n{}",
         stdout
     );
 }
