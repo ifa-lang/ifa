@@ -1377,6 +1377,268 @@ pub fn parse_program(tokens: List<Token>, inout pool: List<AstExpr>) -> AstProgr
     );
 }
 
+// Syntax error diagnostic representation for compiler parser
+pub struct ParseDiagnostic {
+    message: String,
+    token_kind: i64,
+    token_lexeme: String,
+    cursor_pos: i64
+}
+
+pub fn make_parse_diagnostic(msg: String, kind: i64, lex: String, pos: i64) -> ParseDiagnostic {
+    return ParseDiagnostic(message: msg, token_kind: kind, token_lexeme: lex, cursor_pos: pos);
+}
+
+/// Panic mode error recovery: advances cursor until reaching a safe synchronization boundary
+/// (semicolon, block closing brace, or start of a new statement/declaration).
+pub fn synchronize_to_statement_boundary(inout cursor: i64, tokens: List<Token>) {
+    while cursor < tokens.len() {
+        let k = tokens[cursor].kind;
+        if k == 35 {
+            // Semicolon ';': consume to complete synchronization
+            cursor = cursor + 1;
+            return;
+        }
+        if k == 33 || k == 0 {
+            // Closing brace '}' or EOF: do not consume, allow enclosing parser to exit
+            return;
+        }
+        // Beginning of a new statement or top-level item:
+        if k == 1 || k == 2 || k == 3 || k == 4 || k == 8 || k == 9 || k == 12 || k == 15 || k == 17 || k == 18 || k == 19 || k == 26 || k == 27 || k == 28 || k == 51 || k == 52 {
+            return;
+        }
+        cursor = cursor + 1;
+    }
+}
+
+/// Parse a single statement with explicit diagnostic recording and panic-mode error recovery.
+pub fn parse_statement_with_recovery(
+    inout cursor: i64,
+    tokens: List<Token>,
+    inout pool: List<AstExpr>,
+    inout diagnostics: List<ParseDiagnostic>
+) -> AstStmt {
+    if cursor >= tokens.len() {
+        return AstStmt(is_return: false, target_var: "", expr: None);
+    }
+    let tok = tokens[cursor];
+    // Valid statement starts: let(2), mut(3), return(4), ident(10)
+    if tok.kind == 2 || tok.kind == 3 || tok.kind == 4 || tok.kind == 10 {
+        return parse_statement(inout cursor, tokens, inout pool);
+    }
+    // Unexpected token: record diagnostic and trigger panic-mode synchronization
+    let diag = make_parse_diagnostic(
+        "unexpected token at start of statement: " + tok.lexeme,
+        tok.kind,
+        tok.lexeme,
+        cursor
+    );
+    diagnostics.push(diag);
+    synchronize_to_statement_boundary(inout cursor, tokens);
+    return AstStmt(is_return: false, target_var: "_error_", expr: None);
+}
+
+/// Parse a function body with panic-mode recovery on erroneous statements.
+pub fn parse_function_with_recovery(
+    inout cursor: i64,
+    tokens: List<Token>,
+    inout pool: List<AstExpr>,
+    inout diagnostics: List<ParseDiagnostic>
+) -> AstFunction {
+    if cursor >= tokens.len() {
+        mut empty_stmts: List<AstStmt> = List::new();
+        return AstFunction(name: "compute", param_name: "x", params: List::new(), statements: empty_stmts, is_variadic: false);
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 1 {
+        cursor = cursor + 1; // Consume 'fn'
+    }
+    mut fn_name = "";
+    if cursor < tokens.len() && tokens[cursor].kind == 10 {
+        fn_name = tokens[cursor].lexeme;
+        cursor = cursor + 1;
+    } else {
+        fn_name = "compute";
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 30 {
+        cursor = cursor + 1; // Consume '('
+    }
+    mut params: List<String> = List::new();
+    mut is_variadic = false;
+    if cursor < tokens.len() && tokens[cursor].kind != 31 {
+        while cursor < tokens.len() && tokens[cursor].kind != 31 {
+            if tokens[cursor].kind == 37 {
+                cursor = cursor + 1;
+                is_variadic = true;
+                break;
+            }
+            if tokens[cursor].kind == 5 || tokens[cursor].kind == 6 || tokens[cursor].kind == 7 {
+                cursor = cursor + 1;
+            }
+            if cursor < tokens.len() && tokens[cursor].kind == 10 {
+                let pname = tokens[cursor].lexeme;
+                cursor = cursor + 1;
+                params.push(pname);
+            }
+            if cursor < tokens.len() && tokens[cursor].kind == 34 {
+                cursor = cursor + 1;
+                if cursor < tokens.len() && tokens[cursor].kind == 10 {
+                    cursor = cursor + 1;
+                }
+            }
+            if cursor < tokens.len() && tokens[cursor].kind == 39 {
+                cursor = cursor + 1;
+            } else {
+                break;
+            }
+        }
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 31 {
+        cursor = cursor + 1; // Consume ')'
+    }
+    mut param_name = "";
+    if params.len() > 0 {
+        param_name = params[0];
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 36 {
+        cursor = cursor + 1; // Consume '->'
+        if cursor < tokens.len() && tokens[cursor].kind == 30 {
+            cursor = cursor + 1;
+            while cursor < tokens.len() && tokens[cursor].kind != 31 {
+                cursor = cursor + 1;
+            }
+            if cursor < tokens.len() && tokens[cursor].kind == 31 {
+                cursor = cursor + 1;
+            }
+        } else if cursor < tokens.len() && tokens[cursor].kind == 10 {
+            cursor = cursor + 1;
+        }
+    }
+    if cursor < tokens.len() && tokens[cursor].kind == 32 {
+        cursor = cursor + 1; // Consume '{'
+    }
+
+    mut stmts: List<AstStmt> = List::new();
+    mut parsing = true;
+    while parsing {
+        if cursor >= tokens.len() {
+            parsing = false;
+        } else if tokens[cursor].kind == 33 {
+            cursor = cursor + 1; // Consume '}'
+            parsing = false;
+        } else if tokens[cursor].kind == 0 {
+            parsing = false;
+        } else {
+            let stmt = parse_statement_with_recovery(inout cursor, tokens, inout pool, inout diagnostics);
+            stmts.push(stmt);
+        }
+    }
+
+    return AstFunction(name: fn_name, param_name: param_name, params: params, statements: stmts, is_variadic: is_variadic);
+}
+
+/// Parse entire program module while recording diagnostics and recovering from syntax errors.
+pub fn parse_program_with_diagnostics(
+    tokens: List<Token>,
+    inout pool: List<AstExpr>,
+    inout diagnostics: List<ParseDiagnostic>
+) -> AstProgram {
+    mut traits: List<AstTrait> = List::new();
+    mut impls: List<AstImpl> = List::new();
+    mut structs: List<AstStruct> = List::new();
+    mut type_aliases: List<AstTypeAlias> = List::new();
+    mut arenas: List<AstArenaDecl> = List::new();
+    mut constants: List<AstConst> = List::new();
+    mut enums: List<AstEnum> = List::new();
+    mut comptime_blocks: List<AstComptimeBlock> = List::new();
+    mut macros: List<AstMacroDef> = List::new();
+    mut functions: List<AstFunction> = List::new();
+
+    mut cursor: i64 = 0;
+    while cursor < tokens.len() {
+        let tok = tokens[cursor];
+        if tok.kind == 0 {
+            cursor = tokens.len();
+        } else if tok.kind == 15 {
+            if cursor + 1 < tokens.len() {
+                let next = tokens[cursor + 1];
+                if next.kind == 17 {
+                    let alias = parse_type_alias(inout cursor, tokens);
+                    type_aliases.push(alias);
+                } else if next.kind == 19 {
+                    let cn = parse_const(inout cursor, tokens);
+                    constants.push(cn);
+                } else if next.kind == 26 {
+                    let en = parse_enum(inout cursor, tokens);
+                    enums.push(en);
+                } else if next.kind == 9 {
+                    let tr = parse_trait(inout cursor, tokens);
+                    traits.push(tr);
+                } else if next.kind == 8 {
+                    let st = parse_struct(inout cursor, tokens);
+                    structs.push(st);
+                } else if next.kind == 1 {
+                    cursor = cursor + 1; // Consume 'pub'
+                    let f = parse_function_with_recovery(inout cursor, tokens, inout pool, inout diagnostics);
+                    functions.push(f);
+                } else {
+                    let diag = make_parse_diagnostic("unrecognized item after pub: " + next.lexeme, next.kind, next.lexeme, cursor + 1);
+                    diagnostics.push(diag);
+                    cursor = cursor + 1;
+                }
+            } else {
+                cursor = cursor + 1;
+            }
+        } else if tok.kind == 17 {
+            let alias = parse_type_alias(inout cursor, tokens);
+            type_aliases.push(alias);
+        } else if tok.kind == 18 {
+            let ar = parse_arena_decl(inout cursor, tokens);
+            arenas.push(ar);
+        } else if tok.kind == 19 {
+            let cn = parse_const(inout cursor, tokens);
+            constants.push(cn);
+        } else if tok.kind == 26 {
+            let en = parse_enum(inout cursor, tokens);
+            enums.push(en);
+        } else if tok.kind == 9 {
+            let tr = parse_trait(inout cursor, tokens);
+            traits.push(tr);
+        } else if tok.kind == 12 {
+            let im = parse_impl(inout cursor, tokens, inout pool);
+            impls.push(im);
+        } else if tok.kind == 8 {
+            let st = parse_struct(inout cursor, tokens);
+            structs.push(st);
+        } else if tok.kind == 51 {
+            let md = parse_macro_def(inout cursor, tokens, inout pool);
+            macros.push(md);
+        } else if tok.kind == 52 {
+            let cb = parse_comptime_block(inout cursor, tokens, inout pool);
+            comptime_blocks.push(cb);
+        } else if tok.kind == 1 {
+            let f = parse_function_with_recovery(inout cursor, tokens, inout pool, inout diagnostics);
+            functions.push(f);
+        } else {
+            let diag = make_parse_diagnostic("unexpected top-level token: " + tok.lexeme, tok.kind, tok.lexeme, cursor);
+            diagnostics.push(diag);
+            synchronize_to_statement_boundary(inout cursor, tokens);
+        }
+    }
+
+    return AstProgram(
+        traits: traits,
+        impls: impls,
+        structs: structs,
+        type_aliases: type_aliases,
+        arenas: arenas,
+        constants: constants,
+        enums: enums,
+        comptime_blocks: comptime_blocks,
+        macros: macros,
+        functions: functions
+    );
+}
+
 // Unit test 1: Generational reference AST construction
 pub fn test_parser_ast_building() -> bool {
     mut node_left = AstExpr(kind: 2, val: 0, name: "x", op: 0, left: None, right: None);
@@ -2138,6 +2400,79 @@ pub fn test_parser_variadic_function() -> bool {
     return f.params[0] == "fmt";
 }
 
+// Unit test 24: Panic mode error recovery inside function body
+pub fn test_parser_panic_mode_recovery() -> bool {
+    mut tokens: List<Token> = List::new();
+    tokens.push(Token(kind: 1, value: 0, lexeme: "fn"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "calc"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    // Valid statement: let a = 10;
+    tokens.push(Token(kind: 2, value: 0, lexeme: "let"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "a"));
+    tokens.push(Token(kind: 24, value: 0, lexeme: "="));
+    tokens.push(Token(kind: 11, value: 10, lexeme: "10"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    // Erroneous token sequence: !!! garbage ;
+    tokens.push(Token(kind: 50, value: 0, lexeme: "!"));
+    tokens.push(Token(kind: 50, value: 0, lexeme: "!"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    // Valid statement after recovery: return a;
+    tokens.push(Token(kind: 4, value: 0, lexeme: "return"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "a"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+
+    mut cur: i64 = 0;
+    mut pool: List<AstExpr> = List::new();
+    mut diagnostics: List<ParseDiagnostic> = List::new();
+    let f = parse_function_with_recovery(inout cur, tokens, inout pool, inout diagnostics);
+    // Should have recorded 1 diagnostic for the unexpected token
+    if diagnostics.len() != 1 {
+        return false;
+    }
+    // And should have recovered to successfully parse 3 statement nodes (including the placeholder for the error)
+    if f.statements.len() != 3 {
+        return false;
+    }
+    // The last statement must be the return statement
+    if !f.statements[2].is_return {
+        return false;
+    }
+    return true;
+}
+
+// Unit test 25: Program module diagnostics recording
+pub fn test_parser_syntax_diagnostics() -> bool {
+    mut tokens: List<Token> = List::new();
+    // Unexpected stray token at module level
+    tokens.push(Token(kind: 50, value: 0, lexeme: "!"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    // Valid function following the error
+    tokens.push(Token(kind: 1, value: 0, lexeme: "fn"));
+    tokens.push(Token(kind: 10, value: 0, lexeme: "valid_fn"));
+    tokens.push(Token(kind: 30, value: 0, lexeme: "("));
+    tokens.push(Token(kind: 31, value: 0, lexeme: ")"));
+    tokens.push(Token(kind: 32, value: 0, lexeme: "{"));
+    tokens.push(Token(kind: 4, value: 0, lexeme: "return"));
+    tokens.push(Token(kind: 11, value: 1, lexeme: "1"));
+    tokens.push(Token(kind: 35, value: 0, lexeme: ";"));
+    tokens.push(Token(kind: 33, value: 0, lexeme: "}"));
+    tokens.push(Token(kind: 0, value: 0, lexeme: ""));
+
+    mut pool: List<AstExpr> = List::new();
+    mut diagnostics: List<ParseDiagnostic> = List::new();
+    let prog = parse_program_with_diagnostics(tokens, inout pool, inout diagnostics);
+    if diagnostics.len() != 1 {
+        return false;
+    }
+    if prog.functions.len() != 1 {
+        return false;
+    }
+    return prog.functions[0].name == "valid_fn";
+}
+
 pub fn main() {
     println("=== IFA Compiler Parser Module ===");
     let t1 = test_parser_ast_building();
@@ -2163,7 +2498,9 @@ pub fn main() {
     let t21 = test_parser_direct_call();
     let t22 = test_parser_arbitrary_call_args();
     let t23 = test_parser_variadic_function();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 {
+    let t24 = test_parser_panic_mode_recovery();
+    let t25 = test_parser_syntax_diagnostics();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 {
         println("Parser validation tests: ALL PASSED");
     } else {
         println("Parser validation tests: FAILED");

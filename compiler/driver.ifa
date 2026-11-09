@@ -66,6 +66,28 @@ pub fn build_assembler_command(assembler_bin: String, input_asm: String, output_
     return base_cmd;
 }
 
+/// Returns LLVM optimization flag string corresponding to numeric opt_level
+pub fn get_llvm_opt_flag(opt_level: i64) -> String {
+    if opt_level == 0 { return "-O0"; }
+    if opt_level == 1 { return "-O1"; }
+    if opt_level == 3 { return "-O3"; }
+    return "-O2";
+}
+
+/// Returns LLVM function attributes corresponding to optimization level (-O1, -O2, -O3)
+pub fn get_llvm_function_attributes(opt_level: i64) -> String {
+    if opt_level == 0 {
+        return "attributes #0 = { noinline optnone \"target-cpu\"=\"generic\" }";
+    }
+    if opt_level == 1 {
+        return "attributes #0 = { optsize nounwind \"target-cpu\"=\"generic\" }";
+    }
+    if opt_level == 3 {
+        return "attributes #0 = { nounwind \"target-cpu\"=\"generic\" }";
+    }
+    return "attributes #0 = { nounwind \"target-cpu\"=\"generic\" }";
+}
+
 pub fn emit_header_metadata(target: String, opt_level: i64) -> List<String> {
     mut meta: List<String> = List::new();
     meta.push("; ModuleID = 'ifac_selfhost'");
@@ -73,6 +95,64 @@ pub fn emit_header_metadata(target: String, opt_level: i64) -> List<String> {
     meta.push("target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"");
     meta.push("target triple = \"" + target + "\"");
     return meta;
+}
+
+/// Assembles a complete LLVM IR module incorporating optimization metadata and function attributes.
+pub fn assemble_full_llvm_module_with_opt(
+    func_lines: List<String>,
+    target_triple: String,
+    opt_level: i64
+) -> List<String> {
+    mut full_module: List<String> = List::new();
+    full_module.push("; ModuleID = 'ifac_selfhost'");
+    full_module.push("; IFA Pure Self-Hosting Deterministic Compiler Target");
+    let opt_flag = get_llvm_opt_flag(opt_level);
+    full_module.push("; Optimization: " + opt_flag);
+    full_module.push("target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"");
+    full_module.push("target triple = \"" + target_triple + "\"");
+    full_module.push("");
+    full_module.push("; Standard IFA Runtime Declarations");
+    full_module.push("declare void @ifa_rt_println(ptr)");
+    full_module.push("declare void @ifa_rt_print(ptr)");
+    full_module.push("declare void @ifa_rt_println_i64(i64)");
+    full_module.push("declare void @ifa_rt_print_i64(i64)");
+    full_module.push("declare ptr @ifa_rt_fs_read_to_string(ptr)");
+    full_module.push("declare i1 @ifa_rt_fs_write_string(ptr, ptr)");
+    full_module.push("declare i1 @ifa_rt_fs_exists(ptr)");
+    full_module.push("declare i64 @ifa_rt_fs_file_size(ptr)");
+    full_module.push("declare i64 @ifa_rt_process_exec(ptr, ptr)");
+    full_module.push("declare ptr @ifa_rt_process_exec_output(ptr, ptr)");
+    full_module.push("declare ptr @ifa_rt_env_var(ptr)");
+    full_module.push("declare i64 @ifa_rt_args_count()");
+    full_module.push("declare ptr @ifa_rt_args_get(i64)");
+    full_module.push("");
+    full_module.push("; IFA Fiber and Channel Concurrency Declarations");
+    full_module.push("declare void @ifa_rt_fiber_yield()");
+    full_module.push("declare i64 @ifa_rt_fiber_spawn(ptr, ptr)");
+    full_module.push("declare void @ifa_rt_fiber_join(i64)");
+    full_module.push("declare ptr @ifa_rt_channel_create(i64)");
+    full_module.push("declare void @ifa_rt_channel_destroy(ptr)");
+    full_module.push("declare i32 @ifa_rt_channel_send(ptr, ptr)");
+    full_module.push("declare i32 @ifa_rt_channel_recv(ptr, ptr)");
+    full_module.push("declare void @ifa_rt_channel_close(ptr)");
+    full_module.push("declare i64 @ifa_rt_channel_select(ptr, i64, i32)");
+    full_module.push("declare i64 @ifa_rt_channel_select_timed(ptr, ptr, i64, i64, i32)");
+    full_module.push("declare i64 @ifa_rt_fiber_spawn_with_arena(ptr, ptr)");
+    full_module.push("declare i32 @ifa_rt_arena_transfer_owner(i16, i64)");
+    full_module.push("declare i32 @ifa_rt_arena_verify_owner(i16, i64)");
+    full_module.push("");
+
+    mut i: i64 = 0;
+    while i < func_lines.len() {
+        full_module.push(func_lines[i]);
+        i = i + 1;
+    }
+
+    full_module.push("");
+    let attr_line = get_llvm_function_attributes(opt_level);
+    full_module.push(attr_line);
+
+    return full_module;
 }
 
 pub fn assemble_full_llvm_module(func_lines: List<String>, target_triple: String) -> List<String> {
@@ -1278,6 +1358,44 @@ pub fn test_driver_ffi_header_and_php_bridge_generation() -> bool {
     return true;
 }
 
+// Unit Test 11: Verify LLVM optimization level flags and function attributes
+pub fn test_driver_opt_level_flags() -> bool {
+    let f0 = get_llvm_opt_flag(0);
+    let f1 = get_llvm_opt_flag(1);
+    let f2 = get_llvm_opt_flag(2);
+    let f3 = get_llvm_opt_flag(3);
+    if f0 != "-O0" || f1 != "-O1" || f2 != "-O2" || f3 != "-O3" {
+        return false;
+    }
+    let a0 = get_llvm_function_attributes(0);
+    let a1 = get_llvm_function_attributes(1);
+    let a2 = get_llvm_function_attributes(2);
+    let a3 = get_llvm_function_attributes(3);
+    if a0 == "" || a1 == "" || a2 == "" || a3 == "" {
+        return false;
+    }
+    return true;
+}
+
+// Unit Test 12: Verify full LLVM module assembly with explicit optimization level
+pub fn test_driver_llvm_opt_module_assembly() -> bool {
+    mut fn_lines: List<String> = List::new();
+    fn_lines.push("define i64 @calc() #0 {");
+    fn_lines.push("entry:");
+    fn_lines.push("  ret i64 100");
+    fn_lines.push("}");
+
+    let ir_o3 = assemble_full_llvm_module_with_opt(fn_lines, "x86_64-unknown-linux-gnu", 3);
+    if ir_o3.len() < 40 {
+        return false;
+    }
+    if ir_o3[2] != "; Optimization: -O3" {
+        return false;
+    }
+    let last = ir_o3[ir_o3.len() - 1];
+    return last == "attributes #0 = { nounwind \"target-cpu\"=\"generic\" }";
+}
+
 pub fn main() {
     println("=== IFA Compiler Driver & I/O Module ===");
     let t1 = test_driver_default_config();
@@ -1290,8 +1408,10 @@ pub fn main() {
     let t8 = test_driver_multi_module_symbol_resolution();
     let t9 = test_driver_import_graph_and_transitive_deps();
     let t10 = test_driver_ffi_header_and_php_bridge_generation();
+    let t11 = test_driver_opt_level_flags();
+    let t12 = test_driver_llvm_opt_module_assembly();
 
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 {
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 {
         println("Driver validation tests: ALL PASSED");
     } else {
         println("Driver validation tests: FAILED");

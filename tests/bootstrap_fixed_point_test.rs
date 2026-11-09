@@ -521,8 +521,38 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("196 passed; 0 failed"),
-        "Expected 196 passed unit tests, got:\n{}",
+        stdout.contains("test test_lexer_complex_string_escapes ... ok"),
+        "Modular lexer complex string escapes test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_lexer_raw_strings ... ok"),
+        "Modular lexer raw strings test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_panic_mode_recovery ... ok"),
+        "Modular parser panic mode recovery test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_parser_syntax_diagnostics ... ok"),
+        "Modular parser syntax diagnostics test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_opt_level_flags ... ok"),
+        "Modular driver opt level flags test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_llvm_opt_module_assembly ... ok"),
+        "Modular driver llvm opt module assembly test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("208 passed; 0 failed"),
+        "Expected 208 passed unit tests, got:\n{}",
         stdout
     );
 }

@@ -765,11 +765,20 @@ fn keyword_kind(word: String) -> i64 {
     return 10;
 }
 
+/// Convert a single hex ASCII character to its 0..15 numeric value, or -1 if invalid.
+fn hex_digit_val(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    return -1;
+}
+
 /// Build a single-character string from an ASCII codepoint.
 /// Returns an empty string for codepoints outside printable ASCII.
 fn char_to_string(c: i64) -> String {
     // Map codepoint to a precomputed single-char string.
-    // We cover the full printable ASCII range 32-126 plus common escapes.
+    // We cover the full printable ASCII range 32-126 plus common escapes and control characters.
+    if c == 0   { return "\0"; }
     if c == 32  { return " "; }
     if c == 10  { return "\n"; }
     if c == 9   { return "\t"; }
@@ -931,8 +940,30 @@ pub fn tokenize_source(src: String) -> List<Token> {
                     }
                     advance_token(inout tokens, 11, num_val, num_lex);
                 } else {
-                    // --- Identifier or keyword ---
-                    if is_alpha(c) {
+                    // --- Raw string literal: r"..." or r#"..."# ---
+                    if c == 114 && i + 1 < n && string_char_at(src, i + 1) == 34 {
+                        mut sl: String = "";
+                        i = i + 2; // consume r"
+                        while i < n && string_char_at(src, i) != 34 {
+                            sl = sl + char_to_string(string_char_at(src, i));
+                            i = i + 1;
+                        }
+                        if i < n && string_char_at(src, i) == 34 {
+                            i = i + 1; // consume closing "
+                        }
+                        advance_token(inout tokens, 60, 0, sl);
+                    } else if c == 114 && i + 2 < n && string_char_at(src, i + 1) == 35 && string_char_at(src, i + 2) == 34 {
+                        mut sl: String = "";
+                        i = i + 3; // consume r#"
+                        while i < n && !(string_char_at(src, i) == 34 && i + 1 < n && string_char_at(src, i + 1) == 35) {
+                            sl = sl + char_to_string(string_char_at(src, i));
+                            i = i + 1;
+                        }
+                        if i + 1 < n && string_char_at(src, i) == 34 && string_char_at(src, i + 1) == 35 {
+                            i = i + 2; // consume closing "#
+                        }
+                        advance_token(inout tokens, 60, 0, sl);
+                    } else if is_alpha(c) {
                         mut word: String = "";
                         while i < n && is_alnum(string_char_at(src, i)) {
                             word = word + char_to_string(string_char_at(src, i));
@@ -942,27 +973,45 @@ pub fn tokenize_source(src: String) -> List<Token> {
                         let kv: i64 = if word == "true" { 1 } else { 0 };
                         advance_token(inout tokens, kk, kv, word);
                     } else {
-                        // --- String literal ---
+                        // --- String literal with escape sequences ---
                         if c == 34 {
                             mut sl: String = "";
                             i = i + 1; // consume opening quote
                             while i < n && string_char_at(src, i) != 34 {
                                 let sc = string_char_at(src, i);
-                                // Simple backslash escape pass-through
+                                // Backslash escape sequences
                                 if sc == 92 && i + 1 < n {
                                     i = i + 1;
                                     let esc = string_char_at(src, i);
                                     if esc == 110 { sl = sl + "\n"; }
-                                    if esc == 116 { sl = sl + "\t"; }
-                                    if esc == 114 { sl = sl + "\r"; }
-                                    if esc == 34  { sl = sl + "\""; }
-                                    if esc == 92  { sl = sl + "\\"; }
+                                    else if esc == 116 { sl = sl + "\t"; }
+                                    else if esc == 114 { sl = sl + "\r"; }
+                                    else if esc == 34  { sl = sl + "\""; }
+                                    else if esc == 39  { sl = sl + "'"; }
+                                    else if esc == 92  { sl = sl + "\\"; }
+                                    else if esc == 48  { sl = sl + "\0"; }
+                                    else if esc == 120 && i + 2 < n {
+                                        // Hex escape \xHH
+                                        let h1 = hex_digit_val(string_char_at(src, i + 1));
+                                        let h2 = hex_digit_val(string_char_at(src, i + 2));
+                                        if h1 >= 0 && h2 >= 0 {
+                                            let byte_val = h1 * 16 + h2;
+                                            sl = sl + char_to_string(byte_val);
+                                            i = i + 2;
+                                        } else {
+                                            sl = sl + "\\x";
+                                        }
+                                    } else {
+                                        sl = sl + "\\" + char_to_string(esc);
+                                    }
                                 } else {
                                     sl = sl + char_to_string(sc);
                                 }
                                 i = i + 1;
                             }
-                            i = i + 1; // consume closing quote
+                            if i < n && string_char_at(src, i) == 34 {
+                                i = i + 1; // consume closing quote
+                            }
                             advance_token(inout tokens, 60, 0, sl);
                         } else {
                             // --- Operators and punctuation ---
@@ -1171,6 +1220,30 @@ pub fn test_lexer_variadic_token() -> bool {
     return has_ellipsis;
 }
 
+// Unit test: tokenize_source handles complex string escape sequences
+pub fn test_lexer_complex_string_escapes() -> bool {
+    let src = "let s = \"hello\\nworld\\t\\x41\\x42\\0\\\'\\\"\";";
+    let tokens = tokenize_source(src);
+    if tokens.len() < 5 { return false; }
+    if tokens[3].kind != 60 { return false; }
+    let lex = tokens[3].lexeme;
+    return string_len(lex) > 0;
+}
+
+// Unit test: tokenize_source handles raw strings (r"..." and r#"..."#)
+pub fn test_lexer_raw_strings() -> bool {
+    let src1 = "let r1 = r\"C:\\path\\to\\file\";";
+    let tokens1 = tokenize_source(src1);
+    if tokens1.len() < 5 || tokens1[3].kind != 60 { return false; }
+    if tokens1[3].lexeme != "C:\\path\\to\\file" { return false; }
+
+    let src2 = "let r2 = r#\"raw \"quotes\" here\"#;";
+    let tokens2 = tokenize_source(src2);
+    if tokens2.len() < 5 || tokens2[3].kind != 60 { return false; }
+    if tokens2[3].lexeme != "raw \"quotes\" here" { return false; }
+    return true;
+}
+
 pub fn main() {
     println("=== IFA Compiler Lexer Module ===");
     let tokens = tokenize_sample_program();
@@ -1190,7 +1263,9 @@ pub fn main() {
     let t_src_int = test_tokenize_source_integers();
     let t_src_cmt = test_tokenize_source_comments();
     let t_variadic = test_lexer_variadic_token();
-    if t_ok && t_lut && t_alias && t_tuple && t_arena && t_const && t_enum && t_comptime && t_macro && t_while && t_if_else && t_src_basic && t_src_int && t_src_cmt && t_variadic {
+    let t_escapes = test_lexer_complex_string_escapes();
+    let t_raw = test_lexer_raw_strings();
+    if t_ok && t_lut && t_alias && t_tuple && t_arena && t_const && t_enum && t_comptime && t_macro && t_while && t_if_else && t_src_basic && t_src_int && t_src_cmt && t_variadic && t_escapes && t_raw {
         println("Lexer stream test: OK");
     } else {
         println("Lexer stream test: FAILED");
