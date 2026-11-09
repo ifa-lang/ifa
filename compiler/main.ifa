@@ -5,6 +5,7 @@ import lexer;
 import parser;
 import sema;
 import codegen_llvm;
+import driver;
 
 pub fn test_selfhost_modular_pipeline() -> bool {
     let tokens = lexer::tokenize_sample_program();
@@ -61,6 +62,21 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     mut match_pool: List<parser::AstExpr> = List::new();
     let parsed_match = parser::parse_match(inout cur_m, match_tokens, inout match_pool);
     if parsed_match.target_var != "val" || parsed_match.arms.len() != 3 {
+        return false;
+    }
+
+    // Driver orchestration and native pipeline validation
+    let cfg = driver::make_default_config("sample.ifa", "sample.ll");
+    if !driver::validate_compiler_config(cfg) {
+        return false;
+    }
+    let llvm_lines = codegen_llvm::emit_llvm_ir_function(codegen_fn);
+    let full_ir = driver::assemble_full_llvm_module(llvm_lines, cfg.target_triple);
+    if full_ir.len() < 20 {
+        return false;
+    }
+    let cmd = driver::build_toolchain_command("clang", "sample.o", "sample.bin");
+    if cmd == "" {
         return false;
     }
 
@@ -126,6 +142,14 @@ pub fn main() {
         println(fir_lines[fi]);
         fi = fi + 1;
     }
+
+    // 6. Driver orchestration validation
+    let cfg = driver::make_default_config("sample.ifa", "sample.ll");
+    let llvm_lines = codegen_llvm::emit_llvm_ir_function(codegen_fn);
+    let full_ir = driver::assemble_full_llvm_module(llvm_lines, cfg.target_triple);
+    println("Driver assembled full LLVM IR module: " + codegen_llvm::int_to_str(full_ir.len()) + " lines");
+    let cmd = driver::build_toolchain_command("clang", "ifac.o", "ifac");
+    println("Native toolchain invocation command: " + cmd);
 
     println("Self-hosting modular bootstrap validation: SUCCESS (42)");
 }

@@ -589,6 +589,16 @@ size_t ifa_rt_format_stack_trace(char* buffer, size_t buffer_len);
  */
 int32_t ifa_rt_fiber_status(uint64_t fiber_id);
 
+/* --- Deterministic File System and Process Execution API --- */
+
+char* ifa_rt_fs_read_to_string(const char* path);
+bool ifa_rt_fs_write_string(const char* path, const char* content);
+bool ifa_rt_fs_exists(const char* path);
+uint64_t ifa_rt_fs_file_size(const char* path);
+int64_t ifa_rt_process_exec(const char* cmd, const char* args);
+char* ifa_rt_process_exec_output(const char* cmd, const char* args);
+char* ifa_rt_env_var(const char* name);
+
 #ifdef __cplusplus
 }
 #endif

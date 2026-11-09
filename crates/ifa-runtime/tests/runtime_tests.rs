@@ -2385,3 +2385,84 @@ fn test_multi_arena_gemm_and_normalizations() {
     }
     assert_eq!(rms_dst, [2.0, 3.0, 4.0, 5.0]);
 }
+
+#[test]
+fn test_runtime_fs_and_process_primitives() {
+    let temp_dir = std::env::temp_dir().join(format!("ifa_rt_fs_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let test_file = temp_dir.join("test.txt");
+    let test_path = std::ffi::CString::new(test_file.to_str().unwrap()).unwrap();
+    let content = std::ffi::CString::new("Hello from IFA Self-Hosting Compiler Runtime!").unwrap();
+
+    // 1. Write file
+    let write_ok = ifa_rt_fs_write_string(
+        test_path.as_ptr() as *const u8,
+        content.as_ptr() as *const u8,
+    );
+    assert!(write_ok);
+
+    // 2. Exists
+    let exists = ifa_rt_fs_exists(test_path.as_ptr() as *const u8);
+    assert!(exists);
+
+    // 3. File size
+    let size = ifa_rt_fs_file_size(test_path.as_ptr() as *const u8);
+    assert_eq!(size, 45);
+
+    // 4. Read to string
+    let read_ptr = ifa_rt_fs_read_to_string(test_path.as_ptr() as *const u8);
+    assert!(!read_ptr.is_null());
+    let read_str = unsafe {
+        std::ffi::CStr::from_ptr(read_ptr as *const std::os::raw::c_char)
+            .to_str()
+            .unwrap()
+    };
+    assert_eq!(read_str, "Hello from IFA Self-Hosting Compiler Runtime!");
+    unsafe {
+        std::alloc::dealloc(
+            read_ptr,
+            std::alloc::Layout::from_size_align(read_str.len() + 1, 1).unwrap(),
+        );
+    }
+
+    // 5. Process exec
+    let cmd = std::ffi::CString::new("echo").unwrap();
+    let args = std::ffi::CString::new("IFA_DETERMINISTIC_BUILD").unwrap();
+    let status = ifa_rt_process_exec(cmd.as_ptr() as *const u8, args.as_ptr() as *const u8);
+    assert_eq!(status, 0);
+
+    // 6. Process exec output
+    let out_ptr = ifa_rt_process_exec_output(cmd.as_ptr() as *const u8, args.as_ptr() as *const u8);
+    assert!(!out_ptr.is_null());
+    let out_str = unsafe {
+        std::ffi::CStr::from_ptr(out_ptr as *const std::os::raw::c_char)
+            .to_str()
+            .unwrap()
+    };
+    assert!(out_str.contains("IFA_DETERMINISTIC_BUILD"));
+    unsafe {
+        std::alloc::dealloc(
+            out_ptr,
+            std::alloc::Layout::from_size_align(out_str.len() + 1, 1).unwrap(),
+        );
+    }
+
+    // 7. Env var
+    let env_name = std::ffi::CString::new("PATH").unwrap();
+    let env_ptr = ifa_rt_env_var(env_name.as_ptr() as *const u8);
+    assert!(!env_ptr.is_null());
+    let env_str = unsafe {
+        std::ffi::CStr::from_ptr(env_ptr as *const std::os::raw::c_char)
+            .to_str()
+            .unwrap()
+    };
+    assert!(!env_str.is_empty());
+    unsafe {
+        std::alloc::dealloc(
+            env_ptr,
+            std::alloc::Layout::from_size_align(env_str.len() + 1, 1).unwrap(),
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

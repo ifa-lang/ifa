@@ -571,6 +571,85 @@ impl SymbolTable {
         self.modules.insert(fs_name, fs_mod.clone());
         self.modules.insert(std_fs_name, fs_mod);
 
+        // 2b. Module `std::process` / `process`
+        let process_name = INTERNER.intern("process");
+        let std_process_name = INTERNER.intern("std::process");
+        let mut proc_mod = ModuleSymbol::new(
+            process_name,
+            vec![INTERNER.intern("std"), process_name],
+            true,
+            dummy,
+        );
+        let cmd_sym = INTERNER.intern("cmd");
+        let args_sym = INTERNER.intern("args");
+        let name_sym = INTERNER.intern("name");
+        proc_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("exec"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: cmd_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: args_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        proc_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("exec_output"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: cmd_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: args_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        proc_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("env_var"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: name_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        self.modules.insert(process_name, proc_mod.clone());
+        self.modules.insert(std_process_name, proc_mod);
+
         // 3. Module `net::http` / `http`
         let http_name = INTERNER.intern("http");
         let net_http_name = INTERNER.intern("net::http");

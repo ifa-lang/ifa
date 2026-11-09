@@ -168,7 +168,14 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare void @ifa_rt_coro_set_waiting_io(ptr, i64, ptr)\n");
             out.push_str("declare i32 @ifa_rt_coro_wake_io(i64, i64)\n");
             out.push_str("declare i64 @ifa_rt_reactor_poll(i32)\n");
-            out.push_str("declare i64 @ifa_rt_coro_pending_io_count()\n\n");
+            out.push_str("declare i64 @ifa_rt_coro_pending_io_count()\n");
+            out.push_str("declare ptr @ifa_rt_fs_read_to_string(ptr)\n");
+            out.push_str("declare i1 @ifa_rt_fs_write_string(ptr, ptr)\n");
+            out.push_str("declare i1 @ifa_rt_fs_exists(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_fs_file_size(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_process_exec(ptr, ptr)\n");
+            out.push_str("declare ptr @ifa_rt_process_exec_output(ptr, ptr)\n");
+            out.push_str("declare ptr @ifa_rt_env_var(ptr)\n\n");
         } else {
             out.push_str("; IFA Runtime Intrinsic Declarations\n");
             out.push_str("declare void @ifa_rt_println(ptr)\n");
@@ -236,7 +243,14 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare void @ifa_rt_coro_set_waiting_io(ptr, i64, ptr)\n");
             out.push_str("declare i32 @ifa_rt_coro_wake_io(i64, i64)\n");
             out.push_str("declare i64 @ifa_rt_reactor_poll(i32)\n");
-            out.push_str("declare i64 @ifa_rt_coro_pending_io_count()\n\n");
+            out.push_str("declare i64 @ifa_rt_coro_pending_io_count()\n");
+            out.push_str("declare ptr @ifa_rt_fs_read_to_string(ptr)\n");
+            out.push_str("declare i1 @ifa_rt_fs_write_string(ptr, ptr)\n");
+            out.push_str("declare i1 @ifa_rt_fs_exists(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_fs_file_size(ptr)\n");
+            out.push_str("declare i64 @ifa_rt_process_exec(ptr, ptr)\n");
+            out.push_str("declare ptr @ifa_rt_process_exec_output(ptr, ptr)\n");
+            out.push_str("declare ptr @ifa_rt_env_var(ptr)\n\n");
         }
 
         // LLVM Standard Coroutine Intrinsics
@@ -2986,7 +3000,17 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             ValueExpr::CallDirect { name, args } => {
                 let callee = INTERNER.resolve(name);
-                let callee_name = &callee;
+                let norm_callee = match callee.as_str() {
+                    "fs::read_to_string" | "read_to_string" => "ifa_rt_fs_read_to_string",
+                    "fs::write_string" | "write_string" => "ifa_rt_fs_write_string",
+                    "fs::exists" | "exists" => "ifa_rt_fs_exists",
+                    "fs::file_size" | "file_size" => "ifa_rt_fs_file_size",
+                    "process::exec" => "ifa_rt_process_exec",
+                    "process::exec_output" => "ifa_rt_process_exec_output",
+                    "process::env_var" => "ifa_rt_env_var",
+                    _ => callee.as_str(),
+                };
+                let callee_name = norm_callee;
                 if callee_name == "println" || callee_name == "ifa_rt_println" {
                     if let Some(arg) = args.first() {
                         out.push_str(&format!("  call void @ifa_rt_println(ptr %v{})\n", arg.0));
@@ -3025,6 +3049,26 @@ impl<'a> LlvmIrEmitter<'a> {
                             })
                             .collect();
                         (ret_ty, params)
+                    } else if norm_callee == "ifa_rt_fs_read_to_string" {
+                        ("ptr".to_string(), vec!["ptr".to_string()])
+                    } else if norm_callee == "ifa_rt_fs_write_string" {
+                        ("i1".to_string(), vec!["ptr".to_string(), "ptr".to_string()])
+                    } else if norm_callee == "ifa_rt_fs_exists" {
+                        ("i1".to_string(), vec!["ptr".to_string()])
+                    } else if norm_callee == "ifa_rt_fs_file_size" {
+                        ("i64".to_string(), vec!["ptr".to_string()])
+                    } else if norm_callee == "ifa_rt_process_exec" {
+                        (
+                            "i64".to_string(),
+                            vec!["ptr".to_string(), "ptr".to_string()],
+                        )
+                    } else if norm_callee == "ifa_rt_process_exec_output" {
+                        (
+                            "ptr".to_string(),
+                            vec!["ptr".to_string(), "ptr".to_string()],
+                        )
+                    } else if norm_callee == "ifa_rt_env_var" {
+                        ("ptr".to_string(), vec!["ptr".to_string()])
                     } else if callee.starts_with("ifa_simd_")
                         || callee.starts_with("ifa_simd_arena_")
                     {
@@ -4667,17 +4711,28 @@ impl<'a> LlvmIrEmitter<'a> {
             }
             ValueExpr::CallDirect { name, args } => {
                 let callee = INTERNER.resolve(name);
-                if callee == "println" {
+                let norm_callee = match callee.as_str() {
+                    "fs::read_to_string" | "read_to_string" => "ifa_rt_fs_read_to_string",
+                    "fs::write_string" | "write_string" => "ifa_rt_fs_write_string",
+                    "fs::exists" | "exists" => "ifa_rt_fs_exists",
+                    "fs::file_size" | "file_size" => "ifa_rt_fs_file_size",
+                    "process::exec" => "ifa_rt_process_exec",
+                    "process::exec_output" => "ifa_rt_process_exec_output",
+                    "process::env_var" => "ifa_rt_env_var",
+                    _ => callee.as_str(),
+                };
+                let callee_name = norm_callee;
+                if callee_name == "println" {
                     if let Some(arg) = args.first() {
                         out.push_str(&format!("  call void @ifa_rt_println(ptr %v{})\n", arg.0));
                     } else {
                         out.push_str("  call void @ifa_rt_println(ptr null)\n");
                     }
-                } else if callee == "print" {
+                } else if callee_name == "print" {
                     if let Some(arg) = args.first() {
                         out.push_str(&format!("  call void @ifa_rt_print(ptr %v{})\n", arg.0));
                     }
-                } else if callee == "ifa_rt_println_i64" {
+                } else if callee_name == "ifa_rt_println_i64" {
                     if let Some(arg) = args.first() {
                         out.push_str(&format!(
                             "  call void @ifa_rt_println_i64(i64 %v{})\n",
@@ -4702,6 +4757,26 @@ impl<'a> LlvmIrEmitter<'a> {
                             })
                             .collect();
                         (ret_ty, params)
+                    } else if norm_callee == "ifa_rt_fs_read_to_string" {
+                        ("ptr".to_string(), vec!["ptr".to_string()])
+                    } else if norm_callee == "ifa_rt_fs_write_string" {
+                        ("i1".to_string(), vec!["ptr".to_string(), "ptr".to_string()])
+                    } else if norm_callee == "ifa_rt_fs_exists" {
+                        ("i1".to_string(), vec!["ptr".to_string()])
+                    } else if norm_callee == "ifa_rt_fs_file_size" {
+                        ("i64".to_string(), vec!["ptr".to_string()])
+                    } else if norm_callee == "ifa_rt_process_exec" {
+                        (
+                            "i64".to_string(),
+                            vec!["ptr".to_string(), "ptr".to_string()],
+                        )
+                    } else if norm_callee == "ifa_rt_process_exec_output" {
+                        (
+                            "ptr".to_string(),
+                            vec!["ptr".to_string(), "ptr".to_string()],
+                        )
+                    } else if norm_callee == "ifa_rt_env_var" {
+                        ("ptr".to_string(), vec!["ptr".to_string()])
                     } else if callee.starts_with("ifa_simd_")
                         || callee.starts_with("ifa_simd_arena_")
                     {
@@ -4816,7 +4891,7 @@ impl<'a> LlvmIrEmitter<'a> {
                         out.push_str(&format!(
                             "  %{} = call ptr @{}({})\n",
                             eff_coro_id,
-                            callee,
+                            norm_callee,
                             args_str.join(", ")
                         ));
                         out.push_str(&format!(
@@ -4827,7 +4902,7 @@ impl<'a> LlvmIrEmitter<'a> {
                         out.push_str(&format!(
                             "  call {} @{}({})\n",
                             ret_ty_str,
-                            callee,
+                            norm_callee,
                             args_str.join(", ")
                         ));
                     }

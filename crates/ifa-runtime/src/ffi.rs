@@ -1106,6 +1106,209 @@ pub extern "C" fn ifa_rt_string_from_bool(val: bool) -> *mut u8 {
     }
 }
 
+/// Read an entire file into a heap-allocated null-terminated C string.
+/// Returns an empty null-terminated string on error or missing file.
+#[no_mangle]
+pub extern "C" fn ifa_rt_fs_read_to_string(path: *const u8) -> *mut u8 {
+    let path_str = if path.is_null() {
+        ""
+    } else {
+        unsafe {
+            std::ffi::CStr::from_ptr(path as *const std::os::raw::c_char)
+                .to_str()
+                .unwrap_or("")
+        }
+    };
+    let content = std::fs::read_to_string(path_str).unwrap_or_default();
+    let bytes = format!("{}\0", content).into_bytes();
+    let len = bytes.len();
+    let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, len);
+        mem
+    }
+}
+
+/// Write a null-terminated UTF-8 string to a file on disk.
+/// Returns true on success, false on error.
+#[no_mangle]
+pub extern "C" fn ifa_rt_fs_write_string(path: *const u8, content: *const u8) -> bool {
+    if path.is_null() || content.is_null() {
+        return false;
+    }
+    let path_str = unsafe {
+        match std::ffi::CStr::from_ptr(path as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+    let content_str = unsafe {
+        match std::ffi::CStr::from_ptr(content as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+    std::fs::write(path_str, content_str.as_bytes()).is_ok()
+}
+
+/// Check if a path exists on the filesystem.
+#[no_mangle]
+pub extern "C" fn ifa_rt_fs_exists(path: *const u8) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    let path_str = unsafe {
+        match std::ffi::CStr::from_ptr(path as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+    std::path::Path::new(path_str).exists()
+}
+
+/// Query size in bytes of a file. Returns 0 if inaccessible.
+#[no_mangle]
+pub extern "C" fn ifa_rt_fs_file_size(path: *const u8) -> u64 {
+    if path.is_null() {
+        return 0;
+    }
+    let path_str = unsafe {
+        match std::ffi::CStr::from_ptr(path as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return 0,
+        }
+    };
+    std::fs::metadata(path_str).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Execute an external command and return exit status code (0 for success).
+#[no_mangle]
+pub extern "C" fn ifa_rt_process_exec(cmd: *const u8, args: *const u8) -> i64 {
+    if cmd.is_null() {
+        return -1;
+    }
+    let cmd_str = unsafe {
+        match std::ffi::CStr::from_ptr(cmd as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+    let args_str = if args.is_null() {
+        ""
+    } else {
+        unsafe {
+            std::ffi::CStr::from_ptr(args as *const std::os::raw::c_char)
+                .to_str()
+                .unwrap_or("")
+        }
+    };
+    let mut command = std::process::Command::new(cmd_str);
+    if !args_str.is_empty() {
+        for arg in args_str.split_whitespace() {
+            command.arg(arg);
+        }
+    }
+    match command.status() {
+        Ok(status) => status.code().unwrap_or(1) as i64,
+        Err(_) => -1,
+    }
+}
+
+/// Execute an external command and capture stdout as a heap-allocated null-terminated C string.
+#[no_mangle]
+pub extern "C" fn ifa_rt_process_exec_output(cmd: *const u8, args: *const u8) -> *mut u8 {
+    let empty_alloc = || {
+        let layout = std::alloc::Layout::from_size_align(1, 1).unwrap();
+        unsafe {
+            let mem = std::alloc::alloc(layout);
+            if !mem.is_null() {
+                *mem = 0;
+            }
+            mem
+        }
+    };
+    if cmd.is_null() {
+        return empty_alloc();
+    }
+    let cmd_str = unsafe {
+        match std::ffi::CStr::from_ptr(cmd as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return empty_alloc(),
+        }
+    };
+    let args_str = if args.is_null() {
+        ""
+    } else {
+        unsafe {
+            std::ffi::CStr::from_ptr(args as *const std::os::raw::c_char)
+                .to_str()
+                .unwrap_or("")
+        }
+    };
+    let mut command = std::process::Command::new(cmd_str);
+    if !args_str.is_empty() {
+        for arg in args_str.split_whitespace() {
+            command.arg(arg);
+        }
+    }
+    let output = match command.output() {
+        Ok(out) => out.stdout,
+        Err(_) => Vec::new(),
+    };
+    let mut bytes = output;
+    bytes.push(0);
+    let len = bytes.len();
+    let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, len);
+        mem
+    }
+}
+
+/// Read an environment variable. Returns empty string if unset.
+#[no_mangle]
+pub extern "C" fn ifa_rt_env_var(name: *const u8) -> *mut u8 {
+    let empty_alloc = || {
+        let layout = std::alloc::Layout::from_size_align(1, 1).unwrap();
+        unsafe {
+            let mem = std::alloc::alloc(layout);
+            if !mem.is_null() {
+                *mem = 0;
+            }
+            mem
+        }
+    };
+    if name.is_null() {
+        return empty_alloc();
+    }
+    let name_str = unsafe {
+        match std::ffi::CStr::from_ptr(name as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return empty_alloc(),
+        }
+    };
+    let val = std::env::var(name_str).unwrap_or_default();
+    let bytes = format!("{}\0", val).into_bytes();
+    let len = bytes.len();
+    let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, len);
+        mem
+    }
+}
+
 /// Binary C-ABI representation of an IFA Error Union result (`Error!T`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

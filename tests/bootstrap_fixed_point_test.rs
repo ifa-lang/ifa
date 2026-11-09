@@ -41,6 +41,7 @@ fn test_modular_compiler_sources_exist() {
         "parser.ifa",
         "sema.ifa",
         "codegen_llvm.ifa",
+        "driver.ifa",
         "main.ifa",
     ];
 
@@ -125,13 +126,18 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_driver_full_module_assembly ... ok"),
+        "Modular driver tests missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_selfhost_modular_pipeline ... ok"),
         "Modular selfhost pipeline test missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("31 passed; 0 failed"),
-        "Expected 31 passed unit tests, got:\n{}",
+        stdout.contains("41 passed; 0 failed"),
+        "Expected 41 passed unit tests, got:\n{}",
         stdout
     );
 }

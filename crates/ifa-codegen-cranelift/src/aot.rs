@@ -511,6 +511,128 @@ int ifa_rt_buffer_verify_bounds(const void* ptr, size_t len, size_t required_min
     size_t actual_align = align == 0 ? 1 : align;
     return ((uintptr_t)ptr % actual_align) == 0;
 }
+
+char* ifa_rt_fs_read_to_string(const char* path) {
+    if (!path) {
+        char* empty = (char*)malloc(1);
+        empty[0] = '\0';
+        return empty;
+    }
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        char* empty = (char*)malloc(1);
+        empty[0] = '\0';
+        return empty;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) { sz = 0; }
+    char* buf = (char*)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); abort(); }
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    buf[rd] = '\0';
+    fclose(f);
+    return buf;
+}
+
+int8_t ifa_rt_fs_write_string(const char* path, const char* content) {
+    if (!path || !content) return 0;
+    FILE* f = fopen(path, "wb");
+    if (!f) return 0;
+    size_t len = strlen(content);
+    size_t written = fwrite(content, 1, len, f);
+    fclose(f);
+    return written == len ? 1 : 0;
+}
+
+int8_t ifa_rt_fs_exists(const char* path) {
+    if (!path) return 0;
+    FILE* f = fopen(path, "rb");
+    if (f) {
+        fclose(f);
+        return 1;
+    }
+    return 0;
+}
+
+uint64_t ifa_rt_fs_file_size(const char* path) {
+    if (!path) return 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fclose(f);
+    return sz >= 0 ? (uint64_t)sz : 0;
+}
+
+int64_t ifa_rt_process_exec(const char* cmd, const char* args) {
+    if (!cmd) return -1;
+    char full_cmd[1024];
+    if (args && strlen(args) > 0) {
+        snprintf(full_cmd, sizeof(full_cmd), "%s %s", cmd, args);
+    } else {
+        snprintf(full_cmd, sizeof(full_cmd), "%s", cmd);
+    }
+    int code = system(full_cmd);
+    return (int64_t)code;
+}
+
+char* ifa_rt_process_exec_output(const char* cmd, const char* args) {
+    if (!cmd) {
+        char* empty = (char*)malloc(1);
+        empty[0] = '\0';
+        return empty;
+    }
+    char full_cmd[1024];
+    if (args && strlen(args) > 0) {
+        snprintf(full_cmd, sizeof(full_cmd), "%s %s", cmd, args);
+    } else {
+        snprintf(full_cmd, sizeof(full_cmd), "%s", cmd);
+    }
+    FILE* pipe = popen(full_cmd, "r");
+    if (!pipe) {
+        char* empty = (char*)malloc(1);
+        empty[0] = '\0';
+        return empty;
+    }
+    size_t cap = 1024;
+    size_t len = 0;
+    char* buf = (char*)malloc(cap);
+    if (!buf) { pclose(pipe); abort(); }
+    while (1) {
+        size_t rd = fread(buf + len, 1, cap - len - 1, pipe);
+        if (rd == 0) break;
+        len += rd;
+        if (len + 128 >= cap) {
+            cap *= 2;
+            buf = (char*)realloc(buf, cap);
+            if (!buf) { pclose(pipe); abort(); }
+        }
+    }
+    buf[len] = '\0';
+    pclose(pipe);
+    return buf;
+}
+
+char* ifa_rt_env_var(const char* name) {
+    if (!name) {
+        char* empty = (char*)malloc(1);
+        empty[0] = '\0';
+        return empty;
+    }
+    const char* val = getenv(name);
+    if (!val) {
+        char* empty = (char*)malloc(1);
+        empty[0] = '\0';
+        return empty;
+    }
+    size_t len = strlen(val);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) abort();
+    memcpy(buf, val, len + 1);
+    return buf;
+}
 "#;
 
 /// Ahead-of-Time (AOT) compiler producing native object files (.o) and linked ELF binaries.
