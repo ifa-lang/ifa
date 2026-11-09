@@ -176,7 +176,8 @@ pub fn test_selfhost_modular_pipeline() -> bool {
     let pipe_multi_ok = test_pipeline_source_to_ast_multi_param();
     let pipe_mut_ok = test_pipeline_source_to_ast_mut_statements();
     let pipe_full_ok = test_pipeline_source_to_ast_program_full();
-    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok || !fn_ptr_cg_ok || !thunk_cg_ok || !fiber_cg_ok || !chan_cg_ok || !select_cg_ok || !select_timed_cg_ok || !nursery_cg_ok || !codegen_if_ok || !driver_mm_ok || !driver_dag_ok || !driver_ffi_ok || !pipe_basic_ok || !pipe_multi_ok || !pipe_mut_ok || !pipe_full_ok {
+    let pipe_ir_ok = test_pipeline_source_to_llvm_ir();
+    if !comp_fn_ok || !const_cg_ok || !enum_cg_ok || !struct_cg_ok || !vtable_cg_ok || !fn_ptr_cg_ok || !thunk_cg_ok || !fiber_cg_ok || !chan_cg_ok || !select_cg_ok || !select_timed_cg_ok || !nursery_cg_ok || !codegen_if_ok || !driver_mm_ok || !driver_dag_ok || !driver_ffi_ok || !pipe_basic_ok || !pipe_multi_ok || !pipe_mut_ok || !pipe_full_ok || !pipe_ir_ok {
         return false;
     }
 
@@ -240,6 +241,93 @@ pub fn test_pipeline_source_to_ast_program_full() -> bool {
         return false;
     }
     return prog.functions[0].name == "origin";
+}
+
+pub fn compile_ast_program_to_llvm_ir(prog: parser::AstProgram, target_triple: String) -> List<String> {
+    mut body_lines: List<String> = List::new();
+
+    // 1. Lower struct definitions to LLVM type declarations
+    mut si: i64 = 0;
+    while si < prog.structs.len() {
+        let s = prog.structs[si];
+        mut line = "%" + s.name + " = type { ";
+        mut fi: i64 = 0;
+        while fi < s.fields.len() {
+            if fi > 0 {
+                line = line + ", ";
+            }
+            let fty = s.fields[fi].ty;
+            if fty == "i64" || fty == "int" {
+                line = line + "i64";
+            } else if fty == "bool" {
+                line = line + "i1";
+            } else {
+                line = line + "ptr";
+            }
+            fi = fi + 1;
+        }
+        line = line + " }";
+        body_lines.push(line);
+        si = si + 1;
+    }
+
+    if prog.structs.len() > 0 {
+        body_lines.push("");
+    }
+
+    // 2. Lower constant declarations
+    mut ci: i64 = 0;
+    while ci < prog.constants.len() {
+        let c = prog.constants[ci];
+        let cline = "@" + c.name + " = constant i64 " + codegen_llvm::int_to_str(c.val);
+        body_lines.push(cline);
+        ci = ci + 1;
+    }
+
+    if prog.constants.len() > 0 {
+        body_lines.push("");
+    }
+
+    // 3. Lower parsed functions to LLVM IR
+    mut fni: i64 = 0;
+    while fni < prog.functions.len() {
+        let f = prog.functions[fni];
+        let cg_fn = codegen_llvm::AstFunction(
+            name: f.name,
+            param_name: f.param_name,
+            statements: f.statements
+        );
+        let fn_lines = codegen_llvm::emit_llvm_ir_function(cg_fn);
+        mut li: i64 = 0;
+        while li < fn_lines.len() {
+            body_lines.push(fn_lines[li]);
+            li = li + 1;
+        }
+        body_lines.push("");
+        fni = fni + 1;
+    }
+
+    return driver::assemble_full_llvm_module(body_lines, target_triple);
+}
+
+pub fn test_pipeline_source_to_llvm_ir() -> bool {
+    let src = "fn compute(x: i64) -> i64 { return x + 40; }";
+    let tokens = lexer::tokenize_source(src);
+    mut pool: List<parser::AstExpr> = List::new();
+    let prog = parser::parse_program(tokens, inout pool);
+    let ir_lines = compile_ast_program_to_llvm_ir(prog, "x86_64-unknown-linux-gnu");
+    if ir_lines.len() < 25 {
+        return false;
+    }
+    mut has_compute = false;
+    mut i: i64 = 0;
+    while i < ir_lines.len() {
+        if ir_lines[i] == "define i64 @compute(i64 %x) {" {
+            has_compute = true;
+        }
+        i = i + 1;
+    }
+    return has_compute;
 }
 
 pub fn parse_and_run_cli() -> bool {

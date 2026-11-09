@@ -456,6 +456,21 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_pipeline_source_to_llvm_ir ... ok"),
+        "Modular pipeline source to LLVM IR test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_llvm_ir_function_emission ... ok"),
+        "Modular codegen LLVM IR function emission test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_llvm_ir_zero_arg_function ... ok"),
+        "Modular codegen LLVM IR zero-arg function test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_sema_while_loop ... ok"),
         "Modular sema while loop test missing from output:\n{}",
         stdout
@@ -476,8 +491,8 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("167 passed; 0 failed"),
-        "Expected 167 passed unit tests, got:\n{}",
+        stdout.contains("172 passed; 0 failed"),
+        "Expected 172 passed unit tests, got:\n{}",
         stdout
     );
 }

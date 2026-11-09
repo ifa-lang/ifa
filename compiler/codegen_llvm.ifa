@@ -827,7 +827,11 @@ pub fn emit_llvm_complex_function(func: AstComplexFunction) -> List<String> {
 // FIR SSA Code Generator: lowers parsed AST functions into complete SSA basic block representations
 pub fn emit_fir_function(func: AstFunction) -> List<String> {
     mut lines: List<String> = List::new();
-    let header = "fir.func @" + func.name + "(%" + func.param_name + ": i64) -> i64 {";
+    let header = if func.param_name == "" {
+        "fir.func @" + func.name + "() -> i64 {"
+    } else {
+        "fir.func @" + func.name + "(%" + func.param_name + ": i64) -> i64 {"
+    };
     lines.push(header);
     lines.push("  bb0:");
 
@@ -879,7 +883,11 @@ pub fn emit_fir_function(func: AstFunction) -> List<String> {
 // Emits bit-for-bit deterministic textual LLVM IR (.ll) for a function
 pub fn emit_llvm_ir_function(func: AstFunction) -> List<String> {
     mut lines: List<String> = List::new();
-    let header = "define i64 @" + func.name + "(i64 %" + func.param_name + ") {";
+    let header = if func.param_name == "" {
+        "define i64 @" + func.name + "() {"
+    } else {
+        "define i64 @" + func.name + "(i64 %" + func.param_name + ") {"
+    };
     lines.push(header);
     lines.push("entry:");
 
@@ -893,7 +901,7 @@ pub fn emit_llvm_ir_function(func: AstFunction) -> List<String> {
     while i < func.statements.len() {
         let stmt = func.statements[i];
         if stmt.is_return {
-            let res_reg = emit_fir_expression(
+            let res_reg = emit_llvm_expression(
                 stmt.expr,
                 inout temp_counter,
                 env1_var,
@@ -904,7 +912,7 @@ pub fn emit_llvm_ir_function(func: AstFunction) -> List<String> {
             );
             lines.push("  ret i64 " + res_reg);
         } else {
-            let res_reg = emit_fir_expression(
+            let res_reg = emit_llvm_expression(
                 stmt.expr,
                 inout temp_counter,
                 env1_var,
@@ -1000,6 +1008,64 @@ pub fn test_codegen_function_emission() -> bool {
         return false;
     }
     return lines[0] == "fir.func @compute(%x: i64) -> i64 {";
+}
+
+// Unit test 2b: Textual LLVM IR function lowering with multi-step expression
+pub fn test_codegen_llvm_ir_function_emission() -> bool {
+    mut pool: List<AstExpr> = List::new();
+    let expr_const = AstExpr(kind: 1, val: 40, name: "", op: 0, left: None, right: None);
+    pool.push(expr_const);
+    let c_idx = pool.len() - 1;
+
+    let expr_x = AstExpr(kind: 2, val: 0, name: "x", op: 0, left: None, right: None);
+    pool.push(expr_x);
+    let x_idx = pool.len() - 1;
+
+    let expr_add = AstExpr(kind: 3, val: 0, name: "", op: 1, left: ref pool[x_idx], right: ref pool[c_idx]);
+    pool.push(expr_add);
+    let add_idx = pool.len() - 1;
+
+    mut stmts: List<AstStmt> = List::new();
+    let stmt = AstStmt(is_return: true, target_var: "", expr: ref pool[add_idx]);
+    stmts.push(stmt);
+
+    let func = AstFunction(name: "compute", param_name: "x", statements: stmts);
+    let lines = emit_llvm_ir_function(func);
+    if lines.len() != 6 {
+        return false;
+    }
+    if lines[0] != "define i64 @compute(i64 %x) {" {
+        return false;
+    }
+    if lines[1] != "entry:" {
+        return false;
+    }
+    return lines[5] == "}";
+}
+
+// Unit test 2c: Textual LLVM IR zero-arg function lowering
+pub fn test_codegen_llvm_ir_zero_arg_function() -> bool {
+    mut pool: List<AstExpr> = List::new();
+    let expr_const = AstExpr(kind: 1, val: 100, name: "", op: 0, left: None, right: None);
+    pool.push(expr_const);
+    let c_idx = pool.len() - 1;
+
+    mut stmts: List<AstStmt> = List::new();
+    let stmt = AstStmt(is_return: true, target_var: "", expr: ref pool[c_idx]);
+    stmts.push(stmt);
+
+    let func = AstFunction(name: "origin", param_name: "", statements: stmts);
+    let lines = emit_llvm_ir_function(func);
+    if lines.len() != 5 {
+        return false;
+    }
+    if lines[0] != "define i64 @origin() {" {
+        return false;
+    }
+    if lines[1] != "entry:" {
+        return false;
+    }
+    return lines[4] == "}";
 }
 
 // Unit test 3: While Loop Lowering (FIR SSA and textual LLVM IR)
@@ -2525,6 +2591,8 @@ pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
     let t2 = test_codegen_function_emission();
+    let t2b = test_codegen_llvm_ir_function_emission();
+    let t2c = test_codegen_llvm_ir_zero_arg_function();
     let t3 = test_codegen_while_loop();
     let t4 = test_codegen_pattern_match();
     let t5 = test_codegen_generic_method_call();
@@ -2541,7 +2609,7 @@ pub fn main() {
     let t16 = test_codegen_timed_and_prioritized_channel_select();
     let t17 = test_codegen_task_nursery_concurrency();
     let t18 = test_codegen_if_else();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 {
+    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");
