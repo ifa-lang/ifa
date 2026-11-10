@@ -936,8 +936,23 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("360 passed; 0 failed"),
-        "Expected 360 passed unit tests, got:\n{}",
+        stdout.contains("test test_driver_macho64_compact_unwind_and_dysymtab_generation ... ok"),
+        "Modular driver Mach-O 64 compact unwind and dysymtab test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_direct_macho64_symbolic_binary_assembler ... ok"),
+        "Modular driver direct macho64 symbolic binary assembler test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_cross_platform_symbolic_compliance ... ok"),
+        "Modular driver cross-platform symbolic compliance test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("366 passed; 0 failed"),
+        "Expected 366 passed unit tests, got:\n{}",
         stdout
     );
 }
@@ -1728,6 +1743,48 @@ fn test_direct_elf64_dwarf_symbolic_debug_determinism() {
     assert!(
         stdout.contains("test test_driver_symbolic_debugging_coverage_and_report ... ok"),
         "Symbolic debugging coverage report test missing from output:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_direct_macho64_symbolic_compliance_determinism() {
+    let _lock = BOOTSTRAP_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let root = get_workspace_root();
+    let kori_bin = get_kori_binary();
+    let manifest_path = root.join("compiler").join("kori.toml");
+
+    let test_run = Command::new(&kori_bin)
+        .arg("test")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .output()
+        .expect("Run modular compiler tests including Mach-O 64 compact unwind and cross-platform compliance");
+
+    assert!(
+        test_run.status.success(),
+        "Modular compiler unit tests failed with status: {:?}\nstdout: {}\nstderr: {}",
+        test_run.status,
+        String::from_utf8_lossy(&test_run.stdout),
+        String::from_utf8_lossy(&test_run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&test_run.stdout);
+    assert!(
+        stdout.contains("test test_driver_macho64_compact_unwind_and_dysymtab_generation ... ok"),
+        "Mach-O 64 compact unwind generation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_direct_macho64_symbolic_binary_assembler ... ok"),
+        "Direct Mach-O 64 symbolic binary assembler test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_cross_platform_symbolic_compliance ... ok"),
+        "Cross-platform symbolic compliance test missing from output:\n{}",
         stdout
     );
 }
