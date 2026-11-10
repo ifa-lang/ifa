@@ -1010,6 +1010,172 @@ pub fn link_object_to_executable(input_o: String, output_bin: String) -> i64 {
     return link_object_to_executable_with_linker(input_o, output_bin, linker);
 }
 
+// ---------------------------------------------------------------------------
+// Autonomous Process Command & System Linker Invocation Subsystem
+// ---------------------------------------------------------------------------
+
+pub struct ProcessCommand {
+    program: String,
+    args: List<String>
+}
+
+pub fn make_process_command(program: String) -> ProcessCommand {
+    return ProcessCommand(
+        program: program,
+        args: List::new()
+    );
+}
+
+pub fn process_command_add_arg(inout cmd: ProcessCommand, arg: String) {
+    cmd.args.push(arg);
+}
+
+pub fn process_command_render_args(cmd: ProcessCommand) -> String {
+    mut res: String = "";
+    mut i: i64 = 0;
+    while i < cmd.args.len() {
+        if i > 0 {
+            res = res + " ";
+        }
+        res = res + cmd.args[i];
+        i = i + 1;
+    }
+    return res;
+}
+
+pub struct SystemLinkerInvocation {
+    linker_name: String,
+    linker_path: String,
+    object_files: List<String>,
+    output_binary: String,
+    target_triple: String,
+    deterministic_flags: bool,
+    no_pie: bool,
+    is_direct_linker: bool
+}
+
+pub fn make_system_linker_invocation(
+    linker_name: String,
+    linker_path: String,
+    objects: List<String>,
+    output_bin: String,
+    triple: String,
+    deterministic: bool,
+    no_pie: bool,
+    direct: bool
+) -> SystemLinkerInvocation {
+    return SystemLinkerInvocation(
+        linker_name: linker_name,
+        linker_path: linker_path,
+        object_files: objects,
+        output_binary: output_bin,
+        target_triple: triple,
+        deterministic_flags: deterministic,
+        no_pie: no_pie,
+        is_direct_linker: direct
+    );
+}
+
+pub fn resolve_optimal_system_linker() -> String {
+    let mold = process::find_tool("mold");
+    if mold != "" {
+        return "mold";
+    }
+    let lld = process::find_tool("ld.lld");
+    if lld != "" {
+        return "lld";
+    }
+    let clang = process::find_tool("clang");
+    if clang != "" {
+        return "clang";
+    }
+    let gcc = process::find_tool("gcc");
+    if gcc != "" {
+        return "gcc";
+    }
+    let sys_linker = process::find_linker();
+    if sys_linker != "" {
+        return sys_linker;
+    }
+    return "ld";
+}
+
+pub fn linker_invocation_to_process_command(inv: SystemLinkerInvocation) -> ProcessCommand {
+    mut bin = inv.linker_path;
+    if bin == "" {
+        bin = inv.linker_name;
+    }
+    mut cmd = make_process_command(bin);
+    if inv.is_direct_linker {
+        process_command_add_arg(inout cmd, "-o");
+        process_command_add_arg(inout cmd, inv.output_binary);
+        mut i: i64 = 0;
+        while i < inv.object_files.len() {
+            process_command_add_arg(inout cmd, inv.object_files[i]);
+            i = i + 1;
+        }
+        if inv.deterministic_flags {
+            process_command_add_arg(inout cmd, "--build-id=none");
+        }
+    } else {
+        mut i: i64 = 0;
+        while i < inv.object_files.len() {
+            process_command_add_arg(inout cmd, inv.object_files[i]);
+            i = i + 1;
+        }
+        if inv.linker_name == "mold" {
+            process_command_add_arg(inout cmd, "-fuse-ld=mold");
+        } else if inv.linker_name == "lld" {
+            process_command_add_arg(inout cmd, "-fuse-ld=lld");
+        }
+        if inv.no_pie {
+            process_command_add_arg(inout cmd, "-no-pie");
+        }
+        if inv.deterministic_flags {
+            process_command_add_arg(inout cmd, "-Wl,--build-id=none");
+        }
+        process_command_add_arg(inout cmd, "-o");
+        process_command_add_arg(inout cmd, inv.output_binary);
+    }
+    return cmd;
+}
+
+pub fn build_system_linker_command_string(inv: SystemLinkerInvocation) -> String {
+    let cmd = linker_invocation_to_process_command(inv);
+    let rendered_args = process_command_render_args(cmd);
+    if rendered_args == "" {
+        return cmd.program;
+    }
+    return cmd.program + " " + rendered_args;
+}
+
+pub fn execute_system_linker_invocation(inv: SystemLinkerInvocation) -> i64 {
+    let cmd = linker_invocation_to_process_command(inv);
+    let rendered_args = process_command_render_args(cmd);
+    let status = process::exec(cmd.program, rendered_args);
+    return status;
+}
+
+pub fn link_multiple_objects_to_executable(
+    objects: List<String>,
+    output_bin: String,
+    target_triple: String
+) -> i64 {
+    let linker = resolve_optimal_system_linker();
+    let is_direct = (linker == "ld.lld" || linker == "mold");
+    let inv = make_system_linker_invocation(
+        linker,
+        linker,
+        objects,
+        output_bin,
+        target_triple,
+        true,
+        true,
+        is_direct
+    );
+    return execute_system_linker_invocation(inv);
+}
+
 pub fn compile_full_pipeline(
     config: CompilerConfig,
     emit_ir_only: bool,
@@ -3502,6 +3668,32 @@ pub fn register_stdlib_fs_symbols(inout catalog: MultiModuleCatalog) {
     register_module_symbol(inout catalog, "std/fs", "fs_remove_file", 6);
 }
 
+pub fn register_stdlib_process_symbols(inout catalog: MultiModuleCatalog) {
+    // Process command structure
+    register_module_symbol(inout catalog, "std/process", "ProcessCommand", 4);
+
+    // Command constructors and helpers
+    register_module_symbol(inout catalog, "std/process", "make_command", 6);
+    register_module_symbol(inout catalog, "std/process", "command_add_arg", 6);
+    register_module_symbol(inout catalog, "std/process", "command_render_args", 6);
+
+    // Low-level process execution intrinsics
+    register_module_symbol(inout catalog, "std/process", "process_exec", 6);
+    register_module_symbol(inout catalog, "std/process", "process_exec_output", 6);
+    register_module_symbol(inout catalog, "std/process", "process_exec_stderr", 6);
+    register_module_symbol(inout catalog, "std/process", "process_exec_with_stdin", 6);
+    register_module_symbol(inout catalog, "std/process", "process_find_linker", 6);
+    register_module_symbol(inout catalog, "std/process", "process_find_tool", 6);
+    register_module_symbol(inout catalog, "std/process", "process_env_var", 6);
+    register_module_symbol(inout catalog, "std/process", "process_args_count", 6);
+    register_module_symbol(inout catalog, "std/process", "process_args_get", 6);
+
+    // High-level toolchain command builders
+    register_module_symbol(inout catalog, "std/process", "build_linker_command", 6);
+    register_module_symbol(inout catalog, "std/process", "build_assembler_command", 6);
+    register_module_symbol(inout catalog, "std/process", "build_compiler_command", 6);
+}
+
 pub fn register_stdlib_pipeline_units(
     inout graph: ImportGraph,
     inout catalog: MultiModuleCatalog
@@ -3513,6 +3705,11 @@ pub fn register_stdlib_pipeline_units(
     mut dep_fs: List<String> = List::new();
     register_module(inout graph, "std/fs", "std/fs.ifa", dep_fs);
     register_stdlib_fs_symbols(inout catalog);
+
+    mut dep_proc: List<String> = List::new();
+    dep_proc.push("std/collections");
+    register_module(inout graph, "std/process", "std/process.ifa", dep_proc);
+    register_stdlib_process_symbols(inout catalog);
 }
 
 // Unit Test 30: Verify std/collections and std/fs integration in driver pipeline
@@ -3632,6 +3829,142 @@ pub fn test_driver_embedded_stdlib_bundle_resolution() -> bool {
     return cmds.len() == 4;
 }
 
+// Unit Test 32: Verify std/process and direct system linker invocation pipeline
+pub fn test_driver_stdlib_process_and_linker_invocation_pipeline() -> bool {
+    mut graph = make_import_graph();
+    mut catalog = make_module_catalog();
+    register_stdlib_pipeline_units(inout graph, inout catalog);
+
+    // Register linker orchestrator module importing std/process and std/collections
+    mut toolchain_deps: List<String> = List::new();
+    toolchain_deps.push("std/process");
+    toolchain_deps.push("std/collections");
+    register_module(inout graph, "linker_driver", "compiler/linker_driver.ifa", toolchain_deps);
+
+    register_module_symbol(inout catalog, "linker_driver", "invoke_toolchain_link", 6);
+
+    let plan = create_multi_file_compilation_plan(graph, "linker_driver");
+    if !plan.is_valid {
+        return false;
+    }
+    // Plan must contain: std/collections, std/process, linker_driver (topologically ordered)
+    if plan.modules_in_order.len() != 3 {
+        return false;
+    }
+    if plan.modules_in_order[0] != "std/collections" || plan.modules_in_order[1] != "std/process" || plan.modules_in_order[2] != "linker_driver" {
+        return false;
+    }
+
+    // Verify symbol resolution for std/process
+    let sym_make_cmd = resolve_module_symbol(catalog, "std/process", "make_command");
+    let sym_find_lk = resolve_module_symbol(catalog, "std/process", "process_find_linker");
+    let sym_build_lk = resolve_module_symbol(catalog, "std/process", "build_linker_command");
+
+    if sym_make_cmd != "std/process$make_command" {
+        return false;
+    }
+    if sym_find_lk != "std/process$process_find_linker" {
+        return false;
+    }
+    if sym_build_lk != "std/process$build_linker_command" {
+        return false;
+    }
+
+    // Verify linker invocation command construction
+    mut objs: List<String> = List::new();
+    objs.push("main.o");
+    objs.push("driver.o");
+    objs.push("codegen_llvm.o");
+
+    let lld_inv = make_system_linker_invocation(
+        "lld",
+        "clang",
+        objs,
+        "ifac_bin",
+        "x86_64-unknown-linux-gnu",
+        true,
+        true,
+        false
+    );
+    let lld_cmd_str = build_system_linker_command_string(lld_inv);
+    let expected_lld = "clang main.o driver.o codegen_llvm.o -fuse-ld=lld -no-pie -Wl,--build-id=none -o ifac_bin";
+    if lld_cmd_str != expected_lld {
+        return false;
+    }
+
+    let direct_lld_inv = make_system_linker_invocation(
+        "ld.lld",
+        "ld.lld",
+        objs,
+        "ifac_bin",
+        "x86_64-unknown-linux-gnu",
+        true,
+        false,
+        true
+    );
+    let direct_cmd_str = build_system_linker_command_string(direct_lld_inv);
+    let expected_direct = "ld.lld -o ifac_bin main.o driver.o codegen_llvm.o --build-id=none";
+    if direct_cmd_str != expected_direct {
+        return false;
+    }
+
+    // Construct IPO reachability with caller invoking std/process routines
+    mut ipo = make_ipo_call_graph();
+    mut callees: List<String> = List::new();
+    callees.push("std/process$process_find_linker");
+    callees.push("std/process$build_linker_command");
+    callees.push("std/collections$make_string_builder");
+    register_ipo_call_node(inout ipo, "linker_driver$invoke_toolchain_link", "linker_driver", callees, false, false, true);
+
+    mut roots: List<String> = List::new();
+    roots.push("linker_driver$invoke_toolchain_link");
+
+    let live = compute_ipo_reachability(ipo, roots);
+    if live.len() != 4 {
+        return false;
+    }
+    if !list_contains(live, "std/process$process_find_linker") {
+        return false;
+    }
+    if !list_contains(live, "std/process$build_linker_command") {
+        return false;
+    }
+
+    let ir_lines = lower_multi_file_modules_with_ipo(
+        graph,
+        catalog,
+        ipo,
+        "linker_driver",
+        roots,
+        "x86_64-unknown-linux-gnu",
+        2
+    );
+
+    if ir_lines.len() < 25 {
+        return false;
+    }
+
+    mut has_find_lk_decl = false;
+    mut has_build_lk_decl = false;
+    mut i: i64 = 0;
+    while i < ir_lines.len() {
+        let line = ir_lines[i];
+        if line == "declare i64 @std/process$process_find_linker(i64)" {
+            has_find_lk_decl = true;
+        } else if line == "declare i64 @std/process$build_linker_command(i64)" {
+            has_build_lk_decl = true;
+        }
+        i = i + 1;
+    }
+
+    if !has_find_lk_decl || !has_build_lk_decl {
+        return false;
+    }
+
+    let best_linker = resolve_optimal_system_linker();
+    return best_linker != "";
+}
+
 pub fn main() {
     println("=== IFA Compiler Driver & I/O Module ===");
     let t1 = test_driver_default_config();
@@ -3665,8 +3998,9 @@ pub fn main() {
     let t29 = test_driver_native_symbol_export_directives();
     let t30 = test_driver_stdlib_collections_and_fs_pipeline_integration();
     let t31 = test_driver_embedded_stdlib_bundle_resolution();
+    let t32 = test_driver_stdlib_process_and_linker_invocation_pipeline();
 
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 {
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 {
         println("Driver validation tests: ALL PASSED");
     } else {
         println("Driver validation tests: FAILED");

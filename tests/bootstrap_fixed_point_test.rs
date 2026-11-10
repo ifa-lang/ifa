@@ -881,8 +881,13 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("338 passed; 0 failed"),
-        "Expected 338 passed unit tests, got:\n{}",
+        stdout.contains("test test_driver_stdlib_process_and_linker_invocation_pipeline ... ok"),
+        "Modular driver stdlib process and linker invocation pipeline test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("340 passed; 0 failed"),
+        "Expected 340 passed unit tests, got:\n{}",
         stdout
     );
 }
