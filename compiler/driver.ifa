@@ -3453,6 +3453,185 @@ pub fn test_driver_native_symbol_export_directives() -> bool {
     return has_used;
 }
 
+// ---------------------------------------------------------------------------
+// Stdlib Modules (std/collections and std/fs) Pipeline Integration
+// ---------------------------------------------------------------------------
+
+pub fn register_stdlib_collections_symbols(inout catalog: MultiModuleCatalog) {
+    // Data structures
+    register_module_symbol(inout catalog, "std/collections", "List", 4);
+    register_module_symbol(inout catalog, "std/collections", "Map", 4);
+    register_module_symbol(inout catalog, "std/collections", "Set", 4);
+    register_module_symbol(inout catalog, "std/collections", "ByteBuffer", 4);
+    register_module_symbol(inout catalog, "std/collections", "StringBuilder", 4);
+
+    // List algorithms
+    register_module_symbol(inout catalog, "std/collections", "list_sort_strings", 6);
+    register_module_symbol(inout catalog, "std/collections", "list_sort_ints", 6);
+    register_module_symbol(inout catalog, "std/collections", "list_binary_search_ints", 6);
+
+    // Map operations
+    register_module_symbol(inout catalog, "std/collections", "make_map", 6);
+    register_module_symbol(inout catalog, "std/collections", "map_insert", 6);
+    register_module_symbol(inout catalog, "std/collections", "map_get", 6);
+    register_module_symbol(inout catalog, "std/collections", "map_has", 6);
+
+    // Set operations
+    register_module_symbol(inout catalog, "std/collections", "make_set", 6);
+    register_module_symbol(inout catalog, "std/collections", "set_insert", 6);
+    register_module_symbol(inout catalog, "std/collections", "set_contains", 6);
+
+    // ByteBuffer operations
+    register_module_symbol(inout catalog, "std/collections", "make_byte_buffer", 6);
+    register_module_symbol(inout catalog, "std/collections", "byte_buffer_write_u32_le", 6);
+    register_module_symbol(inout catalog, "std/collections", "byte_buffer_write_u64_le", 6);
+
+    // StringBuilder operations
+    register_module_symbol(inout catalog, "std/collections", "make_string_builder", 6);
+    register_module_symbol(inout catalog, "std/collections", "string_builder_append", 6);
+    register_module_symbol(inout catalog, "std/collections", "string_builder_append_line", 6);
+    register_module_symbol(inout catalog, "std/collections", "string_builder_to_string", 6);
+}
+
+pub fn register_stdlib_fs_symbols(inout catalog: MultiModuleCatalog) {
+    register_module_symbol(inout catalog, "std/fs", "fs_read_to_string", 6);
+    register_module_symbol(inout catalog, "std/fs", "fs_write_string", 6);
+    register_module_symbol(inout catalog, "std/fs", "fs_file_exists", 6);
+    register_module_symbol(inout catalog, "std/fs", "fs_file_size", 6);
+    register_module_symbol(inout catalog, "std/fs", "fs_create_dir_all", 6);
+    register_module_symbol(inout catalog, "std/fs", "fs_remove_file", 6);
+}
+
+pub fn register_stdlib_pipeline_units(
+    inout graph: ImportGraph,
+    inout catalog: MultiModuleCatalog
+) {
+    mut dep_coll: List<String> = List::new();
+    register_module(inout graph, "std/collections", "std/collections.ifa", dep_coll);
+    register_stdlib_collections_symbols(inout catalog);
+
+    mut dep_fs: List<String> = List::new();
+    register_module(inout graph, "std/fs", "std/fs.ifa", dep_fs);
+    register_stdlib_fs_symbols(inout catalog);
+}
+
+// Unit Test 30: Verify std/collections and std/fs integration in driver pipeline
+pub fn test_driver_stdlib_collections_and_fs_pipeline_integration() -> bool {
+    mut graph = make_import_graph();
+    mut catalog = make_module_catalog();
+    register_stdlib_pipeline_units(inout graph, inout catalog);
+
+    // Register user module importing std/collections and std/fs
+    mut user_deps: List<String> = List::new();
+    user_deps.push("std/collections");
+    user_deps.push("std/fs");
+    register_module(inout graph, "codegen_driver", "compiler/codegen_driver.ifa", user_deps);
+
+    register_module_symbol(inout catalog, "codegen_driver", "emit_all_artifacts", 6);
+
+    let plan = create_multi_file_compilation_plan(graph, "codegen_driver");
+    if !plan.is_valid {
+        return false;
+    }
+    if plan.modules_in_order.len() != 3 {
+        return false;
+    }
+
+    // Topological order must place dependencies before dependent module
+    let last_mod = plan.modules_in_order[2];
+    if last_mod != "codegen_driver" {
+        return false;
+    }
+
+    // Verify symbol resolution
+    let sym_sb = resolve_module_symbol(catalog, "std/collections", "make_string_builder");
+    let sym_read = resolve_module_symbol(catalog, "std/fs", "fs_read_to_string");
+    let sym_map = resolve_module_symbol(catalog, "std/collections", "make_map");
+
+    if sym_sb != "std/collections$make_string_builder" {
+        return false;
+    }
+    if sym_read != "std/fs$fs_read_to_string" {
+        return false;
+    }
+    if sym_map != "std/collections$make_map" {
+        return false;
+    }
+
+    // Construct IPO reachability with caller invoking collections and fs
+    mut ipo = make_ipo_call_graph();
+    mut callees: List<String> = List::new();
+    callees.push("std/collections$make_string_builder");
+    callees.push("std/collections$string_builder_to_string");
+    callees.push("std/fs$fs_read_to_string");
+    register_ipo_call_node(inout ipo, "codegen_driver$emit_all_artifacts", "codegen_driver", callees, false, false, true);
+
+    mut roots: List<String> = List::new();
+    roots.push("codegen_driver$emit_all_artifacts");
+
+    let live = compute_ipo_reachability(ipo, roots);
+    if live.len() != 4 {
+        return false;
+    }
+    if !list_contains(live, "std/collections$make_string_builder") {
+        return false;
+    }
+    if !list_contains(live, "std/fs$fs_read_to_string") {
+        return false;
+    }
+
+    let ir_lines = lower_multi_file_modules_with_ipo(
+        graph,
+        catalog,
+        ipo,
+        "codegen_driver",
+        roots,
+        "x86_64-unknown-linux-gnu",
+        2
+    );
+
+    if ir_lines.len() < 25 {
+        return false;
+    }
+
+    mut has_sb_decl = false;
+    mut has_fs_decl = false;
+    mut i: i64 = 0;
+    while i < ir_lines.len() {
+        let line = ir_lines[i];
+        if line == "declare i64 @std/collections$make_string_builder(i64)" {
+            has_sb_decl = true;
+        } else if line == "declare i64 @std/fs$fs_read_to_string(i64)" {
+            has_fs_decl = true;
+        }
+        i = i + 1;
+    }
+
+    return has_sb_decl && has_fs_decl;
+}
+
+// Unit Test 31: Verify embedded autonomous stdlib bundle resolution
+pub fn test_driver_embedded_stdlib_bundle_resolution() -> bool {
+    let pkg = build_autonomous_distribution_package("ifac", "0.1.0", "x86_64-unknown-linux-gnu");
+    let is_valid = verify_distribution_package_integrity(pkg);
+    if !is_valid {
+        return false;
+    }
+
+    // Verify all 9 standard modules are registered in manifest
+    if pkg.stdlib_modules.len() != 9 {
+        return false;
+    }
+
+    let json_manifest = generate_distribution_manifest_json(pkg);
+    if string_len(json_manifest) < 100 {
+        return false;
+    }
+
+    mut cmds = assemble_distribution_archive_commands(pkg, "/tmp/ifa_dist");
+    return cmds.len() == 4;
+}
+
 pub fn main() {
     println("=== IFA Compiler Driver & I/O Module ===");
     let t1 = test_driver_default_config();
@@ -3484,8 +3663,10 @@ pub fn main() {
     let t27 = test_driver_native_elf_symbol_table_generation();
     let t28 = test_driver_native_macho_symbol_table_generation();
     let t29 = test_driver_native_symbol_export_directives();
+    let t30 = test_driver_stdlib_collections_and_fs_pipeline_integration();
+    let t31 = test_driver_embedded_stdlib_bundle_resolution();
 
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 {
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 {
         println("Driver validation tests: ALL PASSED");
     } else {
         println("Driver validation tests: FAILED");

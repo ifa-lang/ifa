@@ -856,8 +856,33 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("328 passed; 0 failed"),
-        "Expected 328 passed unit tests, got:\n{}",
+        stdout.contains("test test_codegen_monomorphized_generic_struct ... ok"),
+        "Modular codegen monomorphized generic struct test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_monomorphized_struct_field_access ... ok"),
+        "Modular codegen monomorphized struct field access test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_codegen_explicit_arena_descriptor ... ok"),
+        "Modular codegen explicit arena descriptor test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_stdlib_collections_and_fs_pipeline_integration ... ok"),
+        "Modular driver stdlib collections and fs pipeline integration test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_embedded_stdlib_bundle_resolution ... ok"),
+        "Modular driver embedded stdlib bundle resolution test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("338 passed; 0 failed"),
+        "Expected 338 passed unit tests, got:\n{}",
         stdout
     );
 }

@@ -156,6 +156,39 @@ pub struct AstStructInit {
     fields: List<AstStructInitField>
 }
 
+// AST: Monomorphized Generic Struct Definition for LLVM codegen
+pub struct AstMonomorphizedStructDef {
+    generic_name: String,
+    type_args: List<String>,
+    mangled_name: String,
+    field_names: List<String>,
+    field_types: List<String>
+}
+
+// AST: Monomorphized Struct Instantiation for LLVM codegen
+pub struct AstMonomorphizedStructInit {
+    mangled_name: String,
+    target_var: String,
+    field_values: List<String>
+}
+
+// AST: Monomorphized Struct Field Access for LLVM codegen
+pub struct AstMonomorphizedFieldAccess {
+    mangled_name: String,
+    base_ptr: String,
+    field_idx: i64,
+    field_ty: String,
+    target_var: String
+}
+
+// AST: Explicit Arena Declaration for LLVM codegen
+pub struct AstExplicitArenaDecl {
+    name: String,
+    capacity: i64,
+    is_cow: bool,
+    page_size: i64
+}
+
 // AST: VTable Definition for Trait Dispatch
 pub struct AstVTableDef {
     trait_name: String,
@@ -1794,6 +1827,98 @@ pub fn emit_fir_struct_instantiation(init: AstStructInit) -> List<String> {
         lines.push("    fir.struct_set " + ptr_var + "[" + field_idx_str + "] = " + val_str);
         i = i + 1;
     }
+    return lines;
+}
+
+// Generates deterministic mangled name for a monomorphized generic struct (e.g. Box__i64, Pair__String__i64)
+pub fn mangle_monomorphized_struct_type(generic_name: String, type_args: List<String>) -> String {
+    mut mangled = generic_name;
+    mut i: i64 = 0;
+    while i < type_args.len() {
+        mangled = mangled + "__" + type_args[i];
+        i = i + 1;
+    }
+    return mangled;
+}
+
+// Emits textual LLVM type definition for a monomorphized generic struct
+pub fn emit_llvm_monomorphized_struct_type(def: AstMonomorphizedStructDef) -> String {
+    mut line = "%" + def.mangled_name + " = type { ";
+    mut i: i64 = 0;
+    while i < def.field_types.len() {
+        if i > 0 {
+            line = line + ", ";
+        }
+        line = line + def.field_types[i];
+        i = i + 1;
+    }
+    line = line + " }";
+    return line;
+}
+
+// Emits textual FIR type definition for a monomorphized generic struct
+pub fn emit_fir_monomorphized_struct_type(def: AstMonomorphizedStructDef) -> String {
+    mut line = "fir.type @" + def.mangled_name + " = !fir.struct<";
+    mut i: i64 = 0;
+    while i < def.field_names.len() {
+        if i > 0 {
+            line = line + ", ";
+        }
+        line = line + def.field_names[i] + ": " + def.field_types[i];
+        i = i + 1;
+    }
+    line = line + ">";
+    return line;
+}
+
+// Emits LLVM IR stack allocation and field initialization for a monomorphized struct
+pub fn emit_llvm_monomorphized_struct_init(init: AstMonomorphizedStructInit, def: AstMonomorphizedStructDef) -> List<String> {
+    mut lines: List<String> = List::new();
+    let ptr_var = "%" + init.target_var;
+    lines.push("  " + ptr_var + " = alloca %" + init.mangled_name + ", align 8");
+    mut i: i64 = 0;
+    while i < init.field_values.len() {
+        let field_idx_str = int_to_str(i);
+        let gep_var = ptr_var + ".f" + field_idx_str;
+        lines.push("  " + gep_var + " = getelementptr inbounds %" + init.mangled_name + ", ptr " + ptr_var + ", i32 0, i32 " + field_idx_str);
+        let field_ty = def.field_types[i];
+        let field_val = init.field_values[i];
+        lines.push("  store " + field_ty + " " + field_val + ", ptr " + gep_var + ", align 8");
+        i = i + 1;
+    }
+    return lines;
+}
+
+// Emits FIR stack allocation and field initialization for a monomorphized struct
+pub fn emit_fir_monomorphized_struct_init(init: AstMonomorphizedStructInit) -> List<String> {
+    mut lines: List<String> = List::new();
+    let ptr_var = "%" + init.target_var;
+    lines.push("    " + ptr_var + " = fir.alloca !" + init.mangled_name);
+    mut i: i64 = 0;
+    while i < init.field_values.len() {
+        let field_idx_str = int_to_str(i);
+        let field_val = init.field_values[i];
+        lines.push("    fir.struct_set " + ptr_var + "[" + field_idx_str + "] = " + field_val);
+        i = i + 1;
+    }
+    return lines;
+}
+
+// Emits LLVM IR GEP and load for a monomorphized struct field access
+pub fn emit_llvm_monomorphized_field_access(acc: AstMonomorphizedFieldAccess) -> List<String> {
+    mut lines: List<String> = List::new();
+    let idx_str = int_to_str(acc.field_idx);
+    let gep_var = "%" + acc.target_var + ".gep";
+    lines.push("  " + gep_var + " = getelementptr inbounds %" + acc.mangled_name + ", ptr %" + acc.base_ptr + ", i32 0, i32 " + idx_str);
+    lines.push("  %" + acc.target_var + " = load " + acc.field_ty + ", ptr " + gep_var + ", align 8");
+    return lines;
+}
+
+// Emits FIR GEP and load for a monomorphized struct field access
+pub fn emit_fir_monomorphized_field_access(acc: AstMonomorphizedFieldAccess) -> List<String> {
+    mut lines: List<String> = List::new();
+    let idx_str = int_to_str(acc.field_idx);
+    lines.push("    %" + acc.target_var + " = fir.struct_get %" + acc.base_ptr + "[" + idx_str + "] : " + acc.field_ty);
     return lines;
 }
 
@@ -3786,6 +3911,29 @@ pub fn emit_fir_arena_reset(ar: AstArenaReset) -> List<String> {
     return lines;
 }
 
+// Emits textual LLVM global descriptor definition for an explicit arena
+pub fn emit_llvm_explicit_arena_descriptor(decl: AstExplicitArenaDecl) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut cow_str: String = "i1 0";
+    if decl.is_cow {
+        cow_str = "i1 1";
+    }
+    let desc = "@arena_desc_" + decl.name + " = private constant { i64, i1, i64 } { i64 " + int_to_str(decl.capacity) + ", " + cow_str + ", i64 " + int_to_str(decl.page_size) + " }, align 8";
+    lines.push(desc);
+    return lines;
+}
+
+// Emits textual FIR descriptor definition for an explicit arena
+pub fn emit_fir_explicit_arena_descriptor(decl: AstExplicitArenaDecl) -> List<String> {
+    mut lines: List<String> = List::new();
+    mut cow_str: String = "false";
+    if decl.is_cow {
+        cow_str = "true";
+    }
+    lines.push("fir.arena_decl @" + decl.name + " capacity=" + int_to_str(decl.capacity) + ", cow=" + cow_str + ", page_size=" + int_to_str(decl.page_size));
+    return lines;
+}
+
 // Emits LLVM IR for generational reference check guarding against UAF
 pub fn emit_llvm_gen_ref_check(chk: AstGenRefCheck) -> List<String> {
     mut lines: List<String> = List::new();
@@ -4952,6 +5100,163 @@ pub fn test_codegen_computed_goto_dispatch_table() -> bool {
     return fir_br[0] == "    fir.indirectbr %target_block, [ ^op.add, ^op.sub, ^op.mul ]";
 }
 
+// Unit test 47: Deterministic LLVM IR and FIR emission for monomorphized generic struct
+pub fn test_codegen_monomorphized_generic_struct() -> bool {
+    mut type_args: List<String> = List::new();
+    type_args.push("String");
+    type_args.push("i64");
+
+    let mangled = mangle_monomorphized_struct_type("Pair", type_args);
+    if mangled != "Pair__String__i64" {
+        return false;
+    }
+
+    mut field_names: List<String> = List::new();
+    field_names.push("key");
+    field_names.push("val");
+
+    mut field_types: List<String> = List::new();
+    field_types.push("ptr");
+    field_types.push("i64");
+
+    let def = AstMonomorphizedStructDef(
+        generic_name: "Pair",
+        type_args: type_args,
+        mangled_name: mangled,
+        field_names: field_names,
+        field_types: field_types
+    );
+
+    let llvm_ty = emit_llvm_monomorphized_struct_type(def);
+    let fir_ty = emit_fir_monomorphized_struct_type(def);
+
+    if llvm_ty != "%Pair__String__i64 = type { ptr, i64 }" {
+        return false;
+    }
+    if fir_ty != "fir.type @Pair__String__i64 = !fir.struct<key: ptr, val: i64>" {
+        return false;
+    }
+
+    mut vals: List<String> = List::new();
+    vals.push("%k_ptr");
+    vals.push("42");
+
+    let init = AstMonomorphizedStructInit(
+        mangled_name: mangled,
+        target_var: "my_pair",
+        field_values: vals
+    );
+
+    let llvm_init = emit_llvm_monomorphized_struct_init(init, def);
+    let fir_init = emit_fir_monomorphized_struct_init(init);
+
+    if llvm_init.len() != 5 || fir_init.len() != 3 {
+        return false;
+    }
+    if llvm_init[0] != "  %my_pair = alloca %Pair__String__i64, align 8" {
+        return false;
+    }
+    if llvm_init[1] != "  %my_pair.f0 = getelementptr inbounds %Pair__String__i64, ptr %my_pair, i32 0, i32 0" {
+        return false;
+    }
+    if llvm_init[2] != "  store ptr %k_ptr, ptr %my_pair.f0, align 8" {
+        return false;
+    }
+    if llvm_init[3] != "  %my_pair.f1 = getelementptr inbounds %Pair__String__i64, ptr %my_pair, i32 0, i32 1" {
+        return false;
+    }
+    if llvm_init[4] != "  store i64 42, ptr %my_pair.f1, align 8" {
+        return false;
+    }
+
+    if fir_init[0] != "    %my_pair = fir.alloca !Pair__String__i64" {
+        return false;
+    }
+    if fir_init[1] != "    fir.struct_set %my_pair[0] = %k_ptr" {
+        return false;
+    }
+    return fir_init[2] == "    fir.struct_set %my_pair[1] = 42";
+}
+
+// Unit test 48: Deterministic LLVM IR and FIR emission for monomorphized struct field access
+pub fn test_codegen_monomorphized_struct_field_access() -> bool {
+    let acc0 = AstMonomorphizedFieldAccess(
+        mangled_name: "Pair__String__i64",
+        base_ptr: "pair_ptr",
+        field_idx: 0,
+        field_ty: "ptr",
+        target_var: "ret_key"
+    );
+    let acc1 = AstMonomorphizedFieldAccess(
+        mangled_name: "Pair__String__i64",
+        base_ptr: "pair_ptr",
+        field_idx: 1,
+        field_ty: "i64",
+        target_var: "ret_val"
+    );
+
+    let llvm_acc0 = emit_llvm_monomorphized_field_access(acc0);
+    let llvm_acc1 = emit_llvm_monomorphized_field_access(acc1);
+    let fir_acc0 = emit_fir_monomorphized_field_access(acc0);
+    let fir_acc1 = emit_fir_monomorphized_field_access(acc1);
+
+    if llvm_acc0.len() != 2 || llvm_acc1.len() != 2 {
+        return false;
+    }
+    if llvm_acc0[0] != "  %ret_key.gep = getelementptr inbounds %Pair__String__i64, ptr %pair_ptr, i32 0, i32 0" {
+        return false;
+    }
+    if llvm_acc0[1] != "  %ret_key = load ptr, ptr %ret_key.gep, align 8" {
+        return false;
+    }
+    if llvm_acc1[0] != "  %ret_val.gep = getelementptr inbounds %Pair__String__i64, ptr %pair_ptr, i32 0, i32 1" {
+        return false;
+    }
+    if llvm_acc1[1] != "  %ret_val = load i64, ptr %ret_val.gep, align 8" {
+        return false;
+    }
+
+    if fir_acc0[0] != "    %ret_key = fir.struct_get %pair_ptr[0] : ptr" {
+        return false;
+    }
+    return fir_acc1[0] == "    %ret_val = fir.struct_get %pair_ptr[1] : i64";
+}
+
+// Unit test 49: Deterministic LLVM IR and FIR descriptor emission for explicit arena declarations
+pub fn test_codegen_explicit_arena_descriptor() -> bool {
+    let arena_decl = AstExplicitArenaDecl(
+        name: "ast_arena",
+        capacity: 1048576,
+        is_cow: false,
+        page_size: 65536
+    );
+    let cow_decl = AstExplicitArenaDecl(
+        name: "cow_scratch",
+        capacity: 2097152,
+        is_cow: true,
+        page_size: 4096
+    );
+
+    let llvm_a = emit_llvm_explicit_arena_descriptor(arena_decl);
+    let llvm_c = emit_llvm_explicit_arena_descriptor(cow_decl);
+    let fir_a = emit_fir_explicit_arena_descriptor(arena_decl);
+    let fir_c = emit_fir_explicit_arena_descriptor(cow_decl);
+
+    if llvm_a.len() != 1 || llvm_c.len() != 1 || fir_a.len() != 1 || fir_c.len() != 1 {
+        return false;
+    }
+    if llvm_a[0] != "@arena_desc_ast_arena = private constant { i64, i1, i64 } { i64 1048576, i1 0, i64 65536 }, align 8" {
+        return false;
+    }
+    if llvm_c[0] != "@arena_desc_cow_scratch = private constant { i64, i1, i64 } { i64 2097152, i1 1, i64 4096 }, align 8" {
+        return false;
+    }
+    if fir_a[0] != "fir.arena_decl @ast_arena capacity=1048576, cow=false, page_size=65536" {
+        return false;
+    }
+    return fir_c[0] == "fir.arena_decl @cow_scratch capacity=2097152, cow=true, page_size=4096";
+}
+
 pub fn main() {
     println("=== IFA Compiler LLVM Codegen Module ===");
     let t1 = test_codegen_fir_expression();
@@ -5002,7 +5307,10 @@ pub fn main() {
     let t44 = test_codegen_symbol_lookup_table();
     let t45 = test_codegen_checksum_verification();
     let t46 = test_codegen_computed_goto_dispatch_table();
-    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 && t33 && t34 && t35 && t36 && t37 && t38 && t39 && t40 && t41 && t42 && t43 && t44 && t45 && t46 {
+    let t47 = test_codegen_monomorphized_generic_struct();
+    let t48 = test_codegen_monomorphized_struct_field_access();
+    let t49 = test_codegen_explicit_arena_descriptor();
+    if t1 && t2 && t2b && t2c && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 && t33 && t34 && t35 && t36 && t37 && t38 && t39 && t40 && t41 && t42 && t43 && t44 && t45 && t46 && t47 && t48 && t49 {
         println("Codegen validation tests: ALL PASSED");
     } else {
         println("Codegen validation tests: FAILED");
