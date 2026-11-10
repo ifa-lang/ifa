@@ -966,8 +966,24 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("372 passed; 0 failed"),
-        "Expected 372 passed unit tests, got:\n{}",
+        stdout.contains("test test_driver_pe_coff_base_relocations_and_aslr ... ok"),
+        "Modular driver PE32+/COFF base relocations test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout
+            .contains("test test_driver_direct_pe_coff_relocatable_dll_and_aslr_assembler ... ok"),
+        "Modular driver direct PE32+/COFF relocatable DLL and ASLR test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_tri_platform_relocation_compliance ... ok"),
+        "Modular driver tri-platform relocation compliance test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("378 passed; 0 failed"),
+        "Expected 378 passed unit tests, got:\n{}",
         stdout
     );
 }
@@ -1850,6 +1866,49 @@ fn test_direct_pe_coff_symbolic_compliance_determinism() {
     assert!(
         stdout.contains("test test_driver_tri_platform_symbolic_compliance ... ok"),
         "Universal tri-platform symbolic compliance test missing from output:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_direct_pe_coff_base_relocations_and_dll_determinism() {
+    let _lock = BOOTSTRAP_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let root = get_workspace_root();
+    let kori_bin = get_kori_binary();
+    let manifest_path = root.join("compiler").join("kori.toml");
+
+    let test_run = Command::new(&kori_bin)
+        .arg("test")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .output()
+        .expect("Run modular compiler tests including PE32+/COFF base relocations and relocatable DLL assembler");
+
+    assert!(
+        test_run.status.success(),
+        "Modular compiler unit tests failed with status: {:?}\nstdout: {}\nstderr: {}",
+        test_run.status,
+        String::from_utf8_lossy(&test_run.stdout),
+        String::from_utf8_lossy(&test_run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&test_run.stdout);
+    assert!(
+        stdout.contains("test test_driver_pe_coff_base_relocations_and_aslr ... ok"),
+        "PE32+/COFF base relocations test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout
+            .contains("test test_driver_direct_pe_coff_relocatable_dll_and_aslr_assembler ... ok"),
+        "Direct PE32+/COFF relocatable DLL and ASLR test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_tri_platform_relocation_compliance ... ok"),
+        "Universal tri-platform relocation compliance test missing from output:\n{}",
         stdout
     );
 }
