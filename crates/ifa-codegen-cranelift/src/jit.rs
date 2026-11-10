@@ -192,6 +192,30 @@ impl JitEngine {
             ifa_runtime::ffi::ifa_rt_process_find_tool as *const u8,
         );
         builder.symbol(
+            "ifa_rt_process_current_dir",
+            ifa_runtime::ffi::ifa_rt_process_current_dir as *const u8,
+        );
+        builder.symbol(
+            "process::current_dir",
+            ifa_runtime::ffi::ifa_rt_process_current_dir as *const u8,
+        );
+        builder.symbol(
+            "current_dir",
+            ifa_runtime::ffi::ifa_rt_process_current_dir as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_process_set_current_dir",
+            ifa_runtime::ffi::ifa_rt_process_set_current_dir as *const u8,
+        );
+        builder.symbol(
+            "process::set_current_dir",
+            ifa_runtime::ffi::ifa_rt_process_set_current_dir as *const u8,
+        );
+        builder.symbol(
+            "set_current_dir",
+            ifa_runtime::ffi::ifa_rt_process_set_current_dir as *const u8,
+        );
+        builder.symbol(
             "ifa_rt_fs_read_to_string",
             ifa_runtime::ffi::ifa_rt_fs_read_to_string as *const u8,
         );
@@ -293,6 +317,39 @@ impl JitEngine {
             "copy_file",
             ifa_runtime::ffi::ifa_rt_fs_copy_file as *const u8,
         );
+        builder.symbol(
+            "ifa_rt_fs_remove_dir",
+            ifa_runtime::ffi::ifa_rt_fs_remove_dir as *const u8,
+        );
+        builder.symbol(
+            "fs::remove_dir",
+            ifa_runtime::ffi::ifa_rt_fs_remove_dir as *const u8,
+        );
+        builder.symbol(
+            "remove_dir",
+            ifa_runtime::ffi::ifa_rt_fs_remove_dir as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_fs_remove_dir_all",
+            ifa_runtime::ffi::ifa_rt_fs_remove_dir_all as *const u8,
+        );
+        builder.symbol(
+            "fs::remove_dir_all",
+            ifa_runtime::ffi::ifa_rt_fs_remove_dir_all as *const u8,
+        );
+        builder.symbol(
+            "remove_dir_all",
+            ifa_runtime::ffi::ifa_rt_fs_remove_dir_all as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_fs_rename",
+            ifa_runtime::ffi::ifa_rt_fs_rename as *const u8,
+        );
+        builder.symbol(
+            "fs::rename",
+            ifa_runtime::ffi::ifa_rt_fs_rename as *const u8,
+        );
+        builder.symbol("rename", ifa_runtime::ffi::ifa_rt_fs_rename as *const u8);
         builder.symbol("ifa_rt_coro_create", ifa_rt_coro_create as *const u8);
         builder.symbol(
             "ifa_rt_coro_create_custom",
@@ -887,6 +944,36 @@ impl JitEngine {
         self.func_ids
             .insert("process::find_tool".into(), proc_find_tool_id);
 
+        let mut proc_cwd_sig = Signature::new(call_conv);
+        proc_cwd_sig.returns.push(AbiParam::new(ptr_type));
+        let proc_cwd_id = self
+            .module
+            .declare_function("ifa_rt_process_current_dir", Linkage::Import, &proc_cwd_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_process_current_dir".into(), proc_cwd_id);
+        self.func_ids
+            .insert("process::current_dir".into(), proc_cwd_id);
+        self.func_ids.insert("current_dir".into(), proc_cwd_id);
+
+        let mut proc_set_cwd_sig = Signature::new(call_conv);
+        proc_set_cwd_sig.params.push(AbiParam::new(ptr_type));
+        proc_set_cwd_sig.returns.push(AbiParam::new(types::I8));
+        let proc_set_cwd_id = self
+            .module
+            .declare_function(
+                "ifa_rt_process_set_current_dir",
+                Linkage::Import,
+                &proc_set_cwd_sig,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_process_set_current_dir".into(), proc_set_cwd_id);
+        self.func_ids
+            .insert("process::set_current_dir".into(), proc_set_cwd_id);
+        self.func_ids
+            .insert("set_current_dir".into(), proc_set_cwd_id);
+
         // File system intrinsics
         let mut fs_read_sig = Signature::new(call_conv);
         fs_read_sig.params.push(AbiParam::new(ptr_type));
@@ -983,6 +1070,35 @@ impl JitEngine {
             .insert("ifa_rt_fs_copy_file".into(), fs_copy_id);
         self.func_ids.insert("fs::copy_file".into(), fs_copy_id);
         self.func_ids.insert("copy_file".into(), fs_copy_id);
+
+        let fs_rmdir_id = self
+            .module
+            .declare_function("ifa_rt_fs_remove_dir", Linkage::Import, &fs_exists_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_remove_dir".into(), fs_rmdir_id);
+        self.func_ids.insert("fs::remove_dir".into(), fs_rmdir_id);
+        self.func_ids.insert("remove_dir".into(), fs_rmdir_id);
+
+        let fs_rmdir_all_id = self
+            .module
+            .declare_function("ifa_rt_fs_remove_dir_all", Linkage::Import, &fs_exists_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_remove_dir_all".into(), fs_rmdir_all_id);
+        self.func_ids
+            .insert("fs::remove_dir_all".into(), fs_rmdir_all_id);
+        self.func_ids
+            .insert("remove_dir_all".into(), fs_rmdir_all_id);
+
+        let fs_rename_id = self
+            .module
+            .declare_function("ifa_rt_fs_rename", Linkage::Import, &fs_write_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_rename".into(), fs_rename_id);
+        self.func_ids.insert("fs::rename".into(), fs_rename_id);
+        self.func_ids.insert("rename".into(), fs_rename_id);
 
         // Register stackless coroutine intrinsics
         let mut coro_create_sig = Signature::new(call_conv);

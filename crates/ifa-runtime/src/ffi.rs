@@ -1309,6 +1309,57 @@ pub extern "C" fn ifa_rt_fs_copy_file(src: *const u8, dst: *const u8) -> bool {
     std::fs::copy(src_str, dst_str).is_ok()
 }
 
+/// Remove an empty directory on disk. Returns true on success, false on error.
+#[no_mangle]
+pub extern "C" fn ifa_rt_fs_remove_dir(path: *const u8) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    let path_str = unsafe {
+        match std::ffi::CStr::from_ptr(path as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+    std::fs::remove_dir(path_str).is_ok()
+}
+
+/// Recursively remove a directory and all of its contents on disk. Returns true on success, false on error.
+#[no_mangle]
+pub extern "C" fn ifa_rt_fs_remove_dir_all(path: *const u8) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    let path_str = unsafe {
+        match std::ffi::CStr::from_ptr(path as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+    std::fs::remove_dir_all(path_str).is_ok()
+}
+
+/// Rename or move a file or directory on disk. Returns true on success, false on error.
+#[no_mangle]
+pub extern "C" fn ifa_rt_fs_rename(src: *const u8, dst: *const u8) -> bool {
+    if src.is_null() || dst.is_null() {
+        return false;
+    }
+    let src_str = unsafe {
+        match std::ffi::CStr::from_ptr(src as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+    let dst_str = unsafe {
+        match std::ffi::CStr::from_ptr(dst as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+    std::fs::rename(src_str, dst_str).is_ok()
+}
+
 /// Return the byte-length of a null-terminated UTF-8 C string (excluding the null terminator).
 /// Returns 0 for a null pointer.
 #[no_mangle]
@@ -1706,6 +1757,51 @@ pub extern "C" fn ifa_rt_env_var(name: *const u8) -> *mut u8 {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, len);
         mem
     }
+}
+
+/// Query the current working directory of the process. Returns empty string on error.
+#[no_mangle]
+pub extern "C" fn ifa_rt_process_current_dir() -> *mut u8 {
+    let empty_alloc = || {
+        let layout = std::alloc::Layout::from_size_align(1, 1).unwrap();
+        unsafe {
+            let mem = std::alloc::alloc(layout);
+            if !mem.is_null() {
+                *mem = 0;
+            }
+            mem
+        }
+    };
+    let cur_str = match std::env::current_dir() {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => return empty_alloc(),
+    };
+    let bytes = format!("{}\0", cur_str).into_bytes();
+    let len = bytes.len();
+    let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, len);
+        mem
+    }
+}
+
+/// Set the current working directory of the process. Returns true on success, false on error.
+#[no_mangle]
+pub extern "C" fn ifa_rt_process_set_current_dir(path: *const u8) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    let path_str = unsafe {
+        match std::ffi::CStr::from_ptr(path as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+    std::env::set_current_dir(path_str).is_ok()
 }
 
 /// Retrieve process command-line arguments reliably across platforms.

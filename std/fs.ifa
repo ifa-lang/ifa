@@ -218,6 +218,18 @@ pub fn fs_copy_file(src: String, dst: String) -> bool {
     return copy_file(src, dst);
 }
 
+pub fn fs_remove_dir(path: String) -> bool {
+    return remove_dir(path);
+}
+
+pub fn fs_remove_dir_all(path: String) -> bool {
+    return remove_dir_all(path);
+}
+
+pub fn fs_rename(src: String, dst: String) -> bool {
+    return rename(src, dst);
+}
+
 pub fn fs_append_string(path: String, content: String) -> bool {
     let existing = if fs_exists(path) { fs_read_to_string(path) } else { "" };
     return fs_write_string(path, existing + content);
@@ -520,6 +532,34 @@ pub fn test_fs_path_relative_and_extension() -> bool {
         && ext2 == "compiler/driver.ll";
 }
 
+pub fn test_fs_rename_and_dir_removal() -> bool {
+    let base_dir = "/tmp/ifa_test_fs_lifecycle";
+    let sub_dir = "/tmp/ifa_test_fs_lifecycle/child";
+    let _ = fs_create_dir_all(sub_dir);
+    let original = path_join(sub_dir, "orig.txt");
+    let renamed = path_join(sub_dir, "renamed.txt");
+
+    let _ = fs_write_string(original, "lifecycle payload");
+    let ren_ok = fs_rename(original, renamed);
+    if !ren_ok || fs_exists(original) || !fs_exists(renamed) {
+        let _ = fs_remove_dir_all(base_dir);
+        return false;
+    }
+
+    let _ = fs_remove_file(renamed);
+    let rmdir_empty = fs_remove_dir(sub_dir);
+    if !rmdir_empty || fs_exists(sub_dir) {
+        let _ = fs_remove_dir_all(base_dir);
+        return false;
+    }
+
+    let _ = fs_create_dir_all(sub_dir);
+    let _ = fs_write_string(path_join(sub_dir, "test.txt"), "abc");
+    let rmdir_all_ok = fs_remove_dir_all(base_dir);
+
+    return rmdir_all_ok && !fs_exists(base_dir);
+}
+
 pub fn test_fs_all() -> bool {
     let t1 = test_fs_path_join();
     let t2 = test_fs_path_dirname();
@@ -533,7 +573,8 @@ pub fn test_fs_all() -> bool {
     let t10 = test_fs_copy_and_dir_inspection();
     let t11 = test_fs_walk_and_filter();
     let t12 = test_fs_path_relative_and_extension();
-    return t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12;
+    let t13 = test_fs_rename_and_dir_removal();
+    return t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13;
 }
 
 pub fn main() {

@@ -2473,6 +2473,49 @@ impl<'a> FirInterpreter<'a> {
                         })
                         .unwrap_or("");
                     Ok(FirValue::Bool(std::fs::copy(src, dst).is_ok()))
+                } else if fn_name == "fs::remove_dir"
+                    || fn_name == "remove_dir"
+                    || fn_name == "ifa_rt_fs_remove_dir"
+                {
+                    let path = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    Ok(FirValue::Bool(std::fs::remove_dir(path).is_ok()))
+                } else if fn_name == "fs::remove_dir_all"
+                    || fn_name == "remove_dir_all"
+                    || fn_name == "ifa_rt_fs_remove_dir_all"
+                {
+                    let path = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    Ok(FirValue::Bool(std::fs::remove_dir_all(path).is_ok()))
+                } else if fn_name == "fs::rename"
+                    || fn_name == "rename"
+                    || fn_name == "ifa_rt_fs_rename"
+                {
+                    let src = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let dst = evaluated_args
+                        .get(1)
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    Ok(FirValue::Bool(std::fs::rename(src, dst).is_ok()))
                 } else if fn_name == "process::exec"
                     || fn_name == "exec"
                     || fn_name == "ifa_rt_process_exec"
@@ -2676,6 +2719,26 @@ impl<'a> FirInterpreter<'a> {
                         .unwrap_or(0);
                     let arg = std::env::args().nth(idx).unwrap_or_default();
                     Ok(FirValue::String(arg))
+                } else if fn_name == "process::current_dir"
+                    || fn_name == "current_dir"
+                    || fn_name == "ifa_rt_process_current_dir"
+                {
+                    let cwd = std::env::current_dir()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    Ok(FirValue::String(cwd))
+                } else if fn_name == "process::set_current_dir"
+                    || fn_name == "set_current_dir"
+                    || fn_name == "ifa_rt_process_set_current_dir"
+                {
+                    let path = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    Ok(FirValue::Bool(std::env::set_current_dir(path).is_ok()))
                 } else if fn_name == "net::tcp_listen"
                     || fn_name == "tcp_listen"
                     || fn_name == "ifa_rt_async_tcp_listen"

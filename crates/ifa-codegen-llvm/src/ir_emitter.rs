@@ -173,6 +173,9 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare ptr @ifa_rt_fs_read_dir(ptr)\n");
             out.push_str("declare i1 @ifa_rt_fs_is_dir(ptr)\n");
             out.push_str("declare i1 @ifa_rt_fs_copy_file(ptr, ptr)\n");
+            out.push_str("declare i1 @ifa_rt_fs_remove_dir(ptr)\n");
+            out.push_str("declare i1 @ifa_rt_fs_remove_dir_all(ptr)\n");
+            out.push_str("declare i1 @ifa_rt_fs_rename(ptr, ptr)\n");
             out.push_str("declare i1 @ifa_rt_fs_write_string(ptr, ptr)\n");
             out.push_str("declare i1 @ifa_rt_fs_exists(ptr)\n");
             out.push_str("declare i64 @ifa_rt_fs_file_size(ptr)\n");
@@ -184,6 +187,8 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_process_exec_with_stdin(ptr, ptr, ptr)\n");
             out.push_str("declare ptr @ifa_rt_process_find_linker()\n");
             out.push_str("declare ptr @ifa_rt_process_find_tool(ptr)\n");
+            out.push_str("declare ptr @ifa_rt_process_current_dir()\n");
+            out.push_str("declare i1 @ifa_rt_process_set_current_dir(ptr)\n");
             out.push_str("declare ptr @ifa_rt_env_var(ptr)\n");
             out.push_str("declare i64 @ifa_rt_args_count()\n");
             out.push_str("declare ptr @ifa_rt_args_get(i64)\n");
@@ -265,6 +270,9 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare ptr @ifa_rt_fs_read_dir(ptr)\n");
             out.push_str("declare i1 @ifa_rt_fs_is_dir(ptr)\n");
             out.push_str("declare i1 @ifa_rt_fs_copy_file(ptr, ptr)\n");
+            out.push_str("declare i1 @ifa_rt_fs_remove_dir(ptr)\n");
+            out.push_str("declare i1 @ifa_rt_fs_remove_dir_all(ptr)\n");
+            out.push_str("declare i1 @ifa_rt_fs_rename(ptr, ptr)\n");
             out.push_str("declare i1 @ifa_rt_fs_write_string(ptr, ptr)\n");
             out.push_str("declare i1 @ifa_rt_fs_exists(ptr)\n");
             out.push_str("declare i64 @ifa_rt_fs_file_size(ptr)\n");
@@ -276,6 +284,8 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_process_exec_with_stdin(ptr, ptr, ptr)\n");
             out.push_str("declare ptr @ifa_rt_process_find_linker()\n");
             out.push_str("declare ptr @ifa_rt_process_find_tool(ptr)\n");
+            out.push_str("declare ptr @ifa_rt_process_current_dir()\n");
+            out.push_str("declare i1 @ifa_rt_process_set_current_dir(ptr)\n");
             out.push_str("declare ptr @ifa_rt_env_var(ptr)\n");
             out.push_str("declare i64 @ifa_rt_args_count()\n");
             out.push_str("declare ptr @ifa_rt_args_get(i64)\n");
@@ -2395,6 +2405,9 @@ impl<'a> LlvmIrEmitter<'a> {
                                 || callee == "fs::read_dir"
                                 || callee == "read_dir"
                                 || callee == "ifa_rt_fs_read_dir"
+                                || callee == "process::current_dir"
+                                || callee == "current_dir"
+                                || callee == "ifa_rt_process_current_dir"
                                 || callee == "string_substr"
                                 || callee == "String::substr"
                                 || callee == "substring"
@@ -2416,6 +2429,18 @@ impl<'a> LlvmIrEmitter<'a> {
                                 || callee == "fs::copy_file"
                                 || callee == "copy_file"
                                 || callee == "ifa_rt_fs_copy_file"
+                                || callee == "fs::remove_dir"
+                                || callee == "remove_dir"
+                                || callee == "ifa_rt_fs_remove_dir"
+                                || callee == "fs::remove_dir_all"
+                                || callee == "remove_dir_all"
+                                || callee == "ifa_rt_fs_remove_dir_all"
+                                || callee == "fs::rename"
+                                || callee == "rename"
+                                || callee == "ifa_rt_fs_rename"
+                                || callee == "process::set_current_dir"
+                                || callee == "set_current_dir"
+                                || callee == "ifa_rt_process_set_current_dir"
                                 || callee == "fs::write_string"
                                 || callee == "write_string"
                                 || callee == "ifa_rt_fs_write_string"
@@ -3560,6 +3585,9 @@ impl<'a> LlvmIrEmitter<'a> {
                     "fs::read_dir" | "read_dir" => "ifa_rt_fs_read_dir",
                     "fs::is_dir" | "is_dir" => "ifa_rt_fs_is_dir",
                     "fs::copy_file" | "copy_file" => "ifa_rt_fs_copy_file",
+                    "fs::remove_dir" | "remove_dir" => "ifa_rt_fs_remove_dir",
+                    "fs::remove_dir_all" | "remove_dir_all" => "ifa_rt_fs_remove_dir_all",
+                    "fs::rename" | "rename" => "ifa_rt_fs_rename",
                     "fs::write_string" | "write_string" => "ifa_rt_fs_write_string",
                     "fs::exists" | "exists" => "ifa_rt_fs_exists",
                     "fs::file_size" | "file_size" => "ifa_rt_fs_file_size",
@@ -3573,6 +3601,10 @@ impl<'a> LlvmIrEmitter<'a> {
                     }
                     "process::find_linker" | "find_linker" => "ifa_rt_process_find_linker",
                     "process::find_tool" | "find_tool" => "ifa_rt_process_find_tool",
+                    "process::current_dir" | "current_dir" => "ifa_rt_process_current_dir",
+                    "process::set_current_dir" | "set_current_dir" => {
+                        "ifa_rt_process_set_current_dir"
+                    }
                     "process::env_var" | "env_var" => "ifa_rt_env_var",
                     "process::args_count" | "env::args_count" | "args_count" => "ifa_rt_args_count",
                     "process::args_get" | "env::args_get" | "args_get" => "ifa_rt_args_get",
@@ -3637,12 +3669,16 @@ impl<'a> LlvmIrEmitter<'a> {
                         ("ptr".to_string(), vec!["ptr".to_string()])
                     } else if norm_callee == "ifa_rt_fs_write_string"
                         || norm_callee == "ifa_rt_fs_copy_file"
+                        || norm_callee == "ifa_rt_fs_rename"
                     {
                         ("i1".to_string(), vec!["ptr".to_string(), "ptr".to_string()])
                     } else if norm_callee == "ifa_rt_fs_exists"
                         || norm_callee == "ifa_rt_fs_is_dir"
                         || norm_callee == "ifa_rt_fs_remove_file"
                         || norm_callee == "ifa_rt_fs_create_dir_all"
+                        || norm_callee == "ifa_rt_fs_remove_dir"
+                        || norm_callee == "ifa_rt_fs_remove_dir_all"
+                        || norm_callee == "ifa_rt_process_set_current_dir"
                     {
                         ("i1".to_string(), vec!["ptr".to_string()])
                     } else if norm_callee == "ifa_rt_fs_file_size" {
@@ -3664,7 +3700,9 @@ impl<'a> LlvmIrEmitter<'a> {
                             "i64".to_string(),
                             vec!["ptr".to_string(), "ptr".to_string(), "ptr".to_string()],
                         )
-                    } else if norm_callee == "ifa_rt_process_find_linker" {
+                    } else if norm_callee == "ifa_rt_process_find_linker"
+                        || norm_callee == "ifa_rt_process_current_dir"
+                    {
                         ("ptr".to_string(), Vec::new())
                     } else if norm_callee == "ifa_rt_process_find_tool"
                         || norm_callee == "ifa_rt_env_var"
@@ -5576,6 +5614,9 @@ impl<'a> LlvmIrEmitter<'a> {
                     "fs::read_dir" | "read_dir" => "ifa_rt_fs_read_dir",
                     "fs::is_dir" | "is_dir" => "ifa_rt_fs_is_dir",
                     "fs::copy_file" | "copy_file" => "ifa_rt_fs_copy_file",
+                    "fs::remove_dir" | "remove_dir" => "ifa_rt_fs_remove_dir",
+                    "fs::remove_dir_all" | "remove_dir_all" => "ifa_rt_fs_remove_dir_all",
+                    "fs::rename" | "rename" => "ifa_rt_fs_rename",
                     "fs::write_string" | "write_string" => "ifa_rt_fs_write_string",
                     "fs::exists" | "exists" => "ifa_rt_fs_exists",
                     "fs::file_size" | "file_size" => "ifa_rt_fs_file_size",
@@ -5589,6 +5630,10 @@ impl<'a> LlvmIrEmitter<'a> {
                     }
                     "process::find_linker" | "find_linker" => "ifa_rt_process_find_linker",
                     "process::find_tool" | "find_tool" => "ifa_rt_process_find_tool",
+                    "process::current_dir" | "current_dir" => "ifa_rt_process_current_dir",
+                    "process::set_current_dir" | "set_current_dir" => {
+                        "ifa_rt_process_set_current_dir"
+                    }
                     "process::env_var" | "env_var" => "ifa_rt_env_var",
                     "process::args_count" | "env::args_count" | "args_count" => "ifa_rt_args_count",
                     "process::args_get" | "env::args_get" | "args_get" => "ifa_rt_args_get",
@@ -5650,12 +5695,16 @@ impl<'a> LlvmIrEmitter<'a> {
                         ("ptr".to_string(), vec!["ptr".to_string()])
                     } else if norm_callee == "ifa_rt_fs_write_string"
                         || norm_callee == "ifa_rt_fs_copy_file"
+                        || norm_callee == "ifa_rt_fs_rename"
                     {
                         ("i1".to_string(), vec!["ptr".to_string(), "ptr".to_string()])
                     } else if norm_callee == "ifa_rt_fs_exists"
                         || norm_callee == "ifa_rt_fs_is_dir"
                         || norm_callee == "ifa_rt_fs_remove_file"
                         || norm_callee == "ifa_rt_fs_create_dir_all"
+                        || norm_callee == "ifa_rt_fs_remove_dir"
+                        || norm_callee == "ifa_rt_fs_remove_dir_all"
+                        || norm_callee == "ifa_rt_process_set_current_dir"
                     {
                         ("i1".to_string(), vec!["ptr".to_string()])
                     } else if norm_callee == "ifa_rt_fs_file_size" {
@@ -5677,7 +5726,9 @@ impl<'a> LlvmIrEmitter<'a> {
                             "i64".to_string(),
                             vec!["ptr".to_string(), "ptr".to_string(), "ptr".to_string()],
                         )
-                    } else if norm_callee == "ifa_rt_process_find_linker" {
+                    } else if norm_callee == "ifa_rt_process_find_linker"
+                        || norm_callee == "ifa_rt_process_current_dir"
+                    {
                         ("ptr".to_string(), Vec::new())
                     } else if norm_callee == "ifa_rt_process_find_tool"
                         || norm_callee == "ifa_rt_env_var"

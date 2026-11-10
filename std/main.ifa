@@ -32,13 +32,15 @@ pub fn test_std_all() -> bool {
         && fs::test_fs_append_and_lines_io()
         && fs::test_fs_copy_and_dir_inspection()
         && fs::test_fs_walk_and_filter()
-        && fs::test_fs_path_relative_and_extension();
+        && fs::test_fs_path_relative_and_extension()
+        && fs::test_fs_rename_and_dir_removal();
 
     let t_process = process::test_process_find_linker()
         && process::test_process_find_tool()
         && process::test_process_build_linker_command()
         && process::test_process_build_assembler_command()
-        && process::test_process_echo();
+        && process::test_process_echo()
+        && process::test_process_cwd();
 
     let t_collections = collections::test_collections_list()
         && collections::test_collections_map()

@@ -67,6 +67,14 @@ pub fn process_args_get(index: i64) -> String {
     return args_get(index);
 }
 
+pub fn process_current_dir() -> String {
+    return current_dir();
+}
+
+pub fn process_set_current_dir(path: String) -> bool {
+    return set_current_dir(path);
+}
+
 // High-Level Toolchain Builders
 pub fn build_linker_command(
     linker_bin: String,
@@ -131,13 +139,19 @@ pub fn test_process_echo() -> bool {
     return len >= 22;
 }
 
+pub fn test_process_cwd() -> bool {
+    let cwd = process_current_dir();
+    return string_len(cwd) > 0;
+}
+
 pub fn test_process_all() -> bool {
     let t1 = test_process_find_linker();
     let t2 = test_process_find_tool();
     let t3 = test_process_build_linker_command();
     let t4 = test_process_build_assembler_command();
     let t5 = test_process_echo();
-    return t1 && t2 && t3 && t4 && t5;
+    let t6 = test_process_cwd();
+    return t1 && t2 && t3 && t4 && t5 && t6;
 }
 
 pub fn main() {

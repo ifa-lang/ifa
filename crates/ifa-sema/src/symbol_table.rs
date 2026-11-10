@@ -624,6 +624,62 @@ impl SymbolTable {
             ret_ty: Type::Bool,
             span: dummy,
         });
+        fs_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("remove_dir"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: path_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        fs_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("remove_dir_all"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: path_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        fs_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("rename"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("src"),
+                    ty: Type::String,
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("dst"),
+                    ty: Type::String,
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
         self.modules.insert(fs_name, fs_mod.clone());
         self.modules.insert(std_fs_name, fs_mod);
 
@@ -729,6 +785,33 @@ impl SymbolTable {
                 span: dummy,
             }],
             ret_ty: Type::String,
+            span: dummy,
+        });
+        proc_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("current_dir"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        proc_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("set_current_dir"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: path_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
             span: dummy,
         });
         self.modules.insert(process_name, proc_mod.clone());
@@ -1928,6 +2011,67 @@ impl SymbolTable {
             span: dummy,
         });
 
+        let remove_dir_sym = INTERNER.intern("remove_dir");
+        let remove_dir_all_sym = INTERNER.intern("remove_dir_all");
+        let rename_sym = INTERNER.intern("rename");
+
+        let _ = self.define_function(FunctionSymbol {
+            name: remove_dir_sym,
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: path_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: remove_dir_all_sym,
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: path_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: rename_sym,
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: src_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: dst_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+
         // Global process intrinsics
         let exec_sym = INTERNER.intern("exec");
         let exec_output_sym = INTERNER.intern("exec_output");
@@ -2109,6 +2253,37 @@ impl SymbolTable {
                 span: dummy,
             }],
             ret_ty: Type::String,
+            span: dummy,
+        });
+
+        let current_dir_sym = INTERNER.intern("current_dir");
+        let set_current_dir_sym = INTERNER.intern("set_current_dir");
+
+        let _ = self.define_function(FunctionSymbol {
+            name: current_dir_sym,
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: set_current_dir_sym,
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: path_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
             span: dummy,
         });
 

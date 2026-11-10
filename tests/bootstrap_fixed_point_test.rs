@@ -1373,6 +1373,11 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_fs_rename_and_dir_removal ... ok"),
+        "Std fs rename and dir removal test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_process_find_linker ... ok"),
         "Std process find linker test missing from output:\n{}",
         stdout
@@ -1395,6 +1400,11 @@ fn test_autonomous_stdlib_unit_tests() {
     assert!(
         stdout.contains("test test_process_echo ... ok"),
         "Std process echo test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_process_cwd ... ok"),
+        "Std process cwd test missing from output:\n{}",
         stdout
     );
     assert!(
@@ -1593,8 +1603,8 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("129 passed; 0 failed"),
-        "Expected 129 passed std unit tests, got:\n{}",
+        stdout.contains("133 passed; 0 failed"),
+        "Expected 133 passed std unit tests, got:\n{}",
         stdout
     );
 }

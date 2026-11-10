@@ -2435,6 +2435,33 @@ fn test_runtime_fs_and_process_primitives() {
     assert!(copy_ok);
     assert!(ifa_rt_fs_exists(copied_path.as_ptr() as *const u8));
 
+    // 4c. Test rename
+    let renamed_file = temp_dir.join("test_renamed.txt");
+    let renamed_path = std::ffi::CString::new(renamed_file.to_str().unwrap()).unwrap();
+    let rename_ok = ifa_rt_fs_rename(
+        copied_path.as_ptr() as *const u8,
+        renamed_path.as_ptr() as *const u8,
+    );
+    assert!(rename_ok);
+    assert!(!ifa_rt_fs_exists(copied_path.as_ptr() as *const u8));
+    assert!(ifa_rt_fs_exists(renamed_path.as_ptr() as *const u8));
+
+    // 4d. Test remove_dir and remove_dir_all
+    let sub_dir = temp_dir.join("sub_test_dir");
+    let sub_dir_c = std::ffi::CString::new(sub_dir.to_str().unwrap()).unwrap();
+    assert!(ifa_rt_fs_create_dir_all(sub_dir_c.as_ptr() as *const u8));
+    assert!(ifa_rt_fs_is_dir(sub_dir_c.as_ptr() as *const u8));
+    assert!(ifa_rt_fs_remove_dir(sub_dir_c.as_ptr() as *const u8));
+    assert!(!ifa_rt_fs_exists(sub_dir_c.as_ptr() as *const u8));
+
+    let nested_dir = temp_dir.join("nested_dir").join("child");
+    let nested_root = temp_dir.join("nested_dir");
+    let nested_dir_c = std::ffi::CString::new(nested_dir.to_str().unwrap()).unwrap();
+    let nested_root_c = std::ffi::CString::new(nested_root.to_str().unwrap()).unwrap();
+    assert!(ifa_rt_fs_create_dir_all(nested_dir_c.as_ptr() as *const u8));
+    assert!(ifa_rt_fs_remove_dir_all(nested_root_c.as_ptr() as *const u8));
+    assert!(!ifa_rt_fs_exists(nested_root_c.as_ptr() as *const u8));
+
     let temp_dir_path = std::ffi::CString::new(temp_dir.to_str().unwrap()).unwrap();
     assert!(ifa_rt_fs_is_dir(temp_dir_path.as_ptr() as *const u8));
     assert!(!ifa_rt_fs_is_dir(test_path.as_ptr() as *const u8));
@@ -2447,7 +2474,7 @@ fn test_runtime_fs_and_process_primitives() {
             .unwrap()
     };
     assert!(dir_list_str.contains("test.txt"));
-    assert!(dir_list_str.contains("test_copy.txt"));
+    assert!(dir_list_str.contains("test_renamed.txt"));
     unsafe {
         std::alloc::dealloc(
             dir_list_ptr,
@@ -2584,6 +2611,22 @@ fn test_runtime_fs_and_process_primitives() {
         std::alloc::dealloc(
             invalid_arg_ptr,
             std::alloc::Layout::from_size_align(1, 1).unwrap(),
+        );
+    }
+
+    // 9. Process current dir
+    let cwd_ptr = ifa_rt_process_current_dir();
+    assert!(!cwd_ptr.is_null());
+    let cwd_str = unsafe {
+        std::ffi::CStr::from_ptr(cwd_ptr as *const std::os::raw::c_char)
+            .to_str()
+            .unwrap()
+    };
+    assert!(!cwd_str.is_empty());
+    unsafe {
+        std::alloc::dealloc(
+            cwd_ptr,
+            std::alloc::Layout::from_size_align(cwd_str.len() + 1, 1).unwrap(),
         );
     }
 
