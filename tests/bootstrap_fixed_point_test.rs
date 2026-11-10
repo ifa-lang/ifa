@@ -951,8 +951,23 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("366 passed; 0 failed"),
-        "Expected 366 passed unit tests, got:\n{}",
+        stdout.contains("test test_driver_pe_coff_pdata_and_exception_directory ... ok"),
+        "Modular driver PE32+/COFF .pdata exception directory test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_direct_pe_coff_symbolic_binary_assembler ... ok"),
+        "Modular driver direct PE32+/COFF symbolic binary assembler test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_tri_platform_symbolic_compliance ... ok"),
+        "Modular driver universal tri-platform symbolic compliance test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("372 passed; 0 failed"),
+        "Expected 372 passed unit tests, got:\n{}",
         stdout
     );
 }
@@ -1640,6 +1655,14 @@ fn test_cross_target_deterministic_hash_regression_bench() {
             "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
         ),
         ("aarch64-apple-darwin", "e-m:o-i64:64-i128:128-n32:64-S128"),
+        (
+            "x86_64-pc-windows-msvc",
+            "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+        ),
+        (
+            "aarch64-pc-windows-msvc",
+            "e-m:w-p:64:64-i32:32-i64:64-i128:128-n32:64-S128",
+        ),
     ];
 
     for (target, expected_datalayout) in &targets {
@@ -1785,6 +1808,48 @@ fn test_direct_macho64_symbolic_compliance_determinism() {
     assert!(
         stdout.contains("test test_driver_cross_platform_symbolic_compliance ... ok"),
         "Cross-platform symbolic compliance test missing from output:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_direct_pe_coff_symbolic_compliance_determinism() {
+    let _lock = BOOTSTRAP_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let root = get_workspace_root();
+    let kori_bin = get_kori_binary();
+    let manifest_path = root.join("compiler").join("kori.toml");
+
+    let test_run = Command::new(&kori_bin)
+        .arg("test")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .output()
+        .expect("Run modular compiler tests including PE32+/COFF .pdata exception directory and tri-platform compliance");
+
+    assert!(
+        test_run.status.success(),
+        "Modular compiler unit tests failed with status: {:?}\nstdout: {}\nstderr: {}",
+        test_run.status,
+        String::from_utf8_lossy(&test_run.stdout),
+        String::from_utf8_lossy(&test_run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&test_run.stdout);
+    assert!(
+        stdout.contains("test test_driver_pe_coff_pdata_and_exception_directory ... ok"),
+        "PE32+/COFF .pdata exception directory test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_direct_pe_coff_symbolic_binary_assembler ... ok"),
+        "Direct PE32+/COFF symbolic binary assembler test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_tri_platform_symbolic_compliance ... ok"),
+        "Universal tri-platform symbolic compliance test missing from output:\n{}",
         stdout
     );
 }
