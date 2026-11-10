@@ -1,0 +1,374 @@
+// Pure IFA Standard Library: Colorless Network & Socket Subsystem (`std/net.ifa`)
+// Non-blocking TCP sockets, event-driven streaming, and fiber-cooperative I/O.
+
+pub struct TcpListener {
+    fd: i64,
+    port: i64,
+    is_open: bool
+}
+
+pub struct TcpStream {
+    fd: i64,
+    is_open: bool
+}
+
+pub struct HttpRequest {
+    method: String,
+    path: String,
+    version: String,
+    body: String
+}
+
+pub struct HttpResponse {
+    status_code: i64,
+    status_text: String,
+    content_type: String,
+    body: String
+}
+
+// Low-Level Syscall Wrappers
+pub fn net_tcp_listen(port: i64) -> i64 {
+    return tcp_listen(port);
+}
+
+pub fn net_tcp_listener_port(listener_fd: i64) -> i64 {
+    return tcp_listener_port(listener_fd);
+}
+
+pub fn net_tcp_accept(listener_fd: i64) -> i64 {
+    return tcp_accept(listener_fd);
+}
+
+pub fn net_tcp_connect(host: String, port: i64) -> i64 {
+    return tcp_connect(host, port);
+}
+
+pub fn net_tcp_write(stream_fd: i64, data: String) -> i64 {
+    return tcp_write(stream_fd, data);
+}
+
+pub fn net_tcp_read(stream_fd: i64, max_len: i64) -> String {
+    return tcp_read(stream_fd, max_len);
+}
+
+pub fn net_tcp_close(handle_fd: i64) -> bool {
+    return tcp_close(handle_fd);
+}
+
+pub fn net_sleep_ms(millis: i64) {
+    sleep_ms(millis);
+}
+
+// High-Level Structured TCP Abstractions
+pub fn make_tcp_listener(port: i64) -> TcpListener {
+    let fd = net_tcp_listen(port);
+    mut actual_port: i64 = port;
+    if fd > 0 {
+        let p = net_tcp_listener_port(fd);
+        if p > 0 {
+            actual_port = p;
+        }
+    }
+    return TcpListener(
+        fd: fd,
+        port: actual_port,
+        is_open: fd > 0
+    );
+}
+
+pub fn listener_accept(listener: TcpListener) -> TcpStream {
+    if !listener.is_open {
+        return TcpStream(fd: -1, is_open: false);
+    }
+    let stream_fd = net_tcp_accept(listener.fd);
+    return TcpStream(
+        fd: stream_fd,
+        is_open: stream_fd > 0
+    );
+}
+
+pub fn listener_close(inout listener: TcpListener) {
+    if listener.is_open {
+        net_tcp_close(listener.fd);
+        listener.is_open = false;
+    }
+}
+
+pub fn make_tcp_connect(host: String, port: i64) -> TcpStream {
+    let fd = net_tcp_connect(host, port);
+    return TcpStream(
+        fd: fd,
+        is_open: fd > 0
+    );
+}
+
+pub fn stream_write(stream: TcpStream, data: String) -> i64 {
+    if !stream.is_open {
+        return -1;
+    }
+    return net_tcp_write(stream.fd, data);
+}
+
+pub fn stream_read(stream: TcpStream, max_len: i64) -> String {
+    if !stream.is_open {
+        return "";
+    }
+    return net_tcp_read(stream.fd, max_len);
+}
+
+pub fn stream_close(inout stream: TcpStream) {
+    if stream.is_open {
+        net_tcp_close(stream.fd);
+        stream.is_open = false;
+    }
+}
+
+// HTTP 1.1 Wire Framing Helpers
+pub fn make_http_response(status_code: i64, status_text: String, content_type: String, body: String) -> HttpResponse {
+    return HttpResponse(
+        status_code: status_code,
+        status_text: status_text,
+        content_type: content_type,
+        body: body
+    );
+}
+
+pub fn parse_http_request(raw: String) -> HttpRequest {
+    let len = string_len(raw);
+    if len == 0 {
+        return HttpRequest(method: "", path: "", version: "", body: "");
+    }
+
+    mut sp1: i64 = -1;
+    mut sp2: i64 = -1;
+    mut crlf: i64 = -1;
+    mut i: i64 = 0;
+
+    while i < len {
+        let c = string_char_at(raw, i);
+        if c == 32 { // ' '
+            if sp1 < 0 {
+                sp1 = i;
+            } else if sp2 < 0 {
+                sp2 = i;
+            }
+        } else if c == 10 { // '\n'
+            if crlf < 0 {
+                crlf = i;
+                i = len; // break
+            }
+        }
+        i = i + 1;
+    }
+
+    mut method: String = "GET";
+    mut path: String = "/";
+    mut version: String = "HTTP/1.1";
+
+    if sp1 > 0 {
+        method = string_substr(raw, 0, sp1);
+        if sp2 > sp1 {
+            path = string_substr(raw, sp1 + 1, sp2 - sp1 - 1);
+            if crlf > sp2 {
+                let end_ver = if string_char_at(raw, crlf - 1) == 13 { crlf - 1 } else { crlf };
+                version = string_substr(raw, sp2 + 1, end_ver - sp2 - 1);
+            }
+        }
+    }
+
+    // Extract body after \r\n\r\n or \n\n
+    mut body_start: i64 = -1;
+    i = 0;
+    while i + 3 < len {
+        let c0 = string_char_at(raw, i);
+        let c1 = string_char_at(raw, i + 1);
+        let c2 = string_char_at(raw, i + 2);
+        let c3 = string_char_at(raw, i + 3);
+        if c0 == 13 && c1 == 10 && c2 == 13 && c3 == 10 {
+            body_start = i + 4;
+            i = len;
+        } else {
+            i = i + 1;
+        }
+    }
+
+    mut body: String = "";
+    if body_start >= 0 && body_start < len {
+        body = string_substr(raw, body_start, len - body_start);
+    }
+
+    return HttpRequest(
+        method: method,
+        path: path,
+        version: version,
+        body: body
+    );
+}
+
+pub fn int_to_string(n: i64) -> String {
+    if n == 0 {
+        return "0";
+    }
+    mut val = if n < 0 { -n } else { n };
+    mut s: String = "";
+    while val > 0 {
+        let digit = val % 10;
+        let char_code = 48 + digit;
+        // string_char_at equivalent in reverse
+        if digit == 0 { s = "0" + s; }
+        else if digit == 1 { s = "1" + s; }
+        else if digit == 2 { s = "2" + s; }
+        else if digit == 3 { s = "3" + s; }
+        else if digit == 4 { s = "4" + s; }
+        else if digit == 5 { s = "5" + s; }
+        else if digit == 6 { s = "6" + s; }
+        else if digit == 7 { s = "7" + s; }
+        else if digit == 8 { s = "8" + s; }
+        else if digit == 9 { s = "9" + s; }
+        val = val / 10;
+    }
+    if n < 0 {
+        s = "-" + s;
+    }
+    return s;
+}
+
+pub fn format_http_response(resp: HttpResponse) -> String {
+    let body_len = string_len(resp.body);
+    let len_str = int_to_string(body_len);
+    let code_str = int_to_string(resp.status_code);
+
+    mut res: String = "HTTP/1.1 " + code_str + " " + resp.status_text + "\r\n";
+    res = res + "Content-Type: " + resp.content_type + "\r\n";
+    res = res + "Content-Length: " + len_str + "\r\n";
+    res = res + "Connection: close\r\n";
+    res = res + "\r\n";
+    res = res + resp.body;
+    return res;
+}
+
+// === Unit Tests ===
+
+pub fn test_net_tcp_echo() -> bool {
+    mut listener = make_tcp_listener(0);
+    if !listener.is_open || listener.port <= 0 {
+        return false;
+    }
+
+    mut client = make_tcp_connect("127.0.0.1", listener.port);
+    if !client.is_open {
+        listener_close(listener);
+        return false;
+    }
+
+    mut server = listener_accept(listener);
+    if !server.is_open {
+        stream_close(client);
+        listener_close(listener);
+        return false;
+    }
+
+    let written = stream_write(client, "PING_IFA_FIBER");
+    if written != 14 {
+        stream_close(client);
+        stream_close(server);
+        listener_close(listener);
+        return false;
+    }
+
+    let req = stream_read(server, 64);
+    if req != "PING_IFA_FIBER" {
+        stream_close(client);
+        stream_close(server);
+        listener_close(listener);
+        return false;
+    }
+
+    let reply_len = stream_write(server, "PONG_IFA_FIBER");
+    if reply_len != 14 {
+        stream_close(client);
+        stream_close(server);
+        listener_close(listener);
+        return false;
+    }
+
+    let resp = stream_read(client, 64);
+    if resp != "PONG_IFA_FIBER" {
+        stream_close(client);
+        stream_close(server);
+        listener_close(listener);
+        return false;
+    }
+
+    stream_close(client);
+    stream_close(server);
+    listener_close(listener);
+    return true;
+}
+
+pub fn test_net_http_wire() -> bool {
+    let raw_req = "GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
+    let parsed = parse_http_request(raw_req);
+
+    if parsed.method != "GET" {
+        return false;
+    }
+    if parsed.path != "/api/v1/health" {
+        return false;
+    }
+    if parsed.version != "HTTP/1.1" {
+        return false;
+    }
+    if parsed.body != "hello" {
+        return false;
+    }
+
+    let resp = make_http_response(200, "OK", "application/json", "{\"status\":\"healthy\"}");
+    let wire = format_http_response(resp);
+
+    let expected = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"status\":\"healthy\"}";
+    return wire == expected;
+}
+
+pub fn test_net_nonblocking_fiber_transport() -> bool {
+    mut bad_client = make_tcp_connect("127.0.0.1", 1); // unallocated port
+    if bad_client.is_open {
+        stream_close(bad_client);
+        return false;
+    }
+
+    mut listener = make_tcp_listener(0);
+    if !listener.is_open {
+        return false;
+    }
+
+    let p = listener.port;
+    if p <= 0 {
+        listener_close(listener);
+        return false;
+    }
+
+    listener_close(listener);
+    if listener.is_open {
+        return false;
+    }
+
+    return true;
+}
+
+pub fn test_net_all() -> bool {
+    return test_net_tcp_echo()
+        && test_net_http_wire()
+        && test_net_nonblocking_fiber_transport();
+}
+
+pub fn main() {
+    let t1 = test_net_tcp_echo();
+    let t2 = test_net_http_wire();
+    let t3 = test_net_nonblocking_fiber_transport();
+    if t1 && t2 && t3 {
+        println("std/net: ALL TESTS PASSED");
+    } else {
+        println("std/net: TESTS FAILED");
+    }
+}

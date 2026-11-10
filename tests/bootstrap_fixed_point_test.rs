@@ -1388,13 +1388,53 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_crypto_blake3_empty ... ok"),
+        "Std crypto BLAKE3 empty test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_crypto_blake3_abc ... ok"),
+        "Std crypto BLAKE3 abc test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_crypto_blake3_ifa ... ok"),
+        "Std crypto BLAKE3 ifa test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_crypto_blake3_tree ... ok"),
+        "Std crypto BLAKE3 tree test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_tcp_echo ... ok"),
+        "Std net tcp echo test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_http_wire ... ok"),
+        "Std net http wire test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_nonblocking_fiber_transport ... ok"),
+        "Std net nonblocking fiber transport test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_all ... ok"),
+        "Std net all test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("55 passed; 0 failed"),
-        "Expected 55 passed std unit tests, got:\n{}",
+        stdout.contains("71 passed; 0 failed"),
+        "Expected 71 passed std unit tests, got:\n{}",
         stdout
     );
 }

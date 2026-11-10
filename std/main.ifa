@@ -5,6 +5,7 @@ import crypto;
 import fs;
 import process;
 import collections;
+import net;
 
 pub fn test_std_all() -> bool {
     let t_crypto = crypto::test_crypto_fnv1a()
@@ -12,7 +13,11 @@ pub fn test_std_all() -> bool {
         && crypto::test_crypto_sha256_empty()
         && crypto::test_crypto_sha256_abc()
         && crypto::test_crypto_constant_time_eq()
-        && crypto::test_crypto_hmac();
+        && crypto::test_crypto_hmac()
+        && crypto::test_crypto_blake3_empty()
+        && crypto::test_crypto_blake3_abc()
+        && crypto::test_crypto_blake3_ifa()
+        && crypto::test_crypto_blake3_tree();
 
     let t_fs = fs::test_fs_path_join()
         && fs::test_fs_path_dirname()
@@ -35,7 +40,9 @@ pub fn test_std_all() -> bool {
         && collections::test_collections_byte_buffer()
         && collections::test_collections_string_builder();
 
-    return t_crypto && t_fs && t_process && t_collections;
+    let t_net = net::test_net_all();
+
+    return t_crypto && t_fs && t_process && t_collections && t_net;
 }
 
 pub fn main() {

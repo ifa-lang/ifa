@@ -104,7 +104,22 @@ mod tests {
     #[test]
     fn test_blake3_hashing() {
         let hex = blake3_hex(b"IFA Programming Language");
-        assert_eq!(hex.len(), 64);
+        assert_eq!(
+            hex,
+            "eb6b3c8bcf187f9b99c2dacccec7b871b2b31f746b005e5cf58c81947cb3b438"
+        );
+        assert_eq!(
+            blake3_hex(b""),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        );
+        assert_eq!(
+            blake3_hex(b"abc"),
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+        );
+        assert_eq!(
+            blake3_hex(&vec![b'A'; 2000]),
+            "fc6985444b763593734965947a328514e93ef2bae12db668a6d64147c5dcdde3"
+        );
     }
 
     #[test]

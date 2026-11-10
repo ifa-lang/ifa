@@ -346,6 +346,9 @@ pub struct FirInterpreter<'a> {
     pub captured_output: Vec<String>,
     pub channels: HashMap<u64, VecDeque<FirValue>>,
     next_chan_id: u64,
+    pub tcp_listeners: HashMap<i64, std::net::TcpListener>,
+    pub tcp_streams: HashMap<i64, std::net::TcpStream>,
+    next_socket_id: i64,
 }
 
 impl<'a> FirInterpreter<'a> {
@@ -358,6 +361,9 @@ impl<'a> FirInterpreter<'a> {
             captured_output: Vec::new(),
             channels: HashMap::new(),
             next_chan_id: 1,
+            tcp_listeners: HashMap::new(),
+            tcp_streams: HashMap::new(),
+            next_socket_id: 1,
         }
     }
 
@@ -2591,6 +2597,202 @@ impl<'a> FirInterpreter<'a> {
                         .unwrap_or(0);
                     let arg = std::env::args().nth(idx).unwrap_or_default();
                     Ok(FirValue::String(arg))
+                } else if fn_name == "net::tcp_listen"
+                    || fn_name == "tcp_listen"
+                    || fn_name == "ifa_rt_async_tcp_listen"
+                {
+                    let port = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as u16,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    let bind_addr = format!("127.0.0.1:{}", port);
+                    match std::net::TcpListener::bind(&bind_addr) {
+                        Ok(listener) => {
+                            let _ = listener.set_nonblocking(false);
+                            let sock_id = self.next_socket_id;
+                            self.next_socket_id += 1;
+                            self.tcp_listeners.insert(sock_id, listener);
+                            Ok(FirValue::Int(sock_id as i128))
+                        }
+                        Err(_) => Ok(FirValue::Int(-1)),
+                    }
+                } else if fn_name == "net::tcp_listener_port" || fn_name == "tcp_listener_port" {
+                    let sock_id = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as i64,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    if let Some(listener) = self.tcp_listeners.get(&sock_id) {
+                        let port = listener
+                            .local_addr()
+                            .map(|a| a.port() as i128)
+                            .unwrap_or(-1);
+                        Ok(FirValue::Int(port))
+                    } else {
+                        Ok(FirValue::Int(-1))
+                    }
+                } else if fn_name == "net::tcp_accept"
+                    || fn_name == "tcp_accept"
+                    || fn_name == "ifa_rt_async_tcp_accept"
+                {
+                    let sock_id = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as i64,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    if let Some(listener) = self.tcp_listeners.get(&sock_id) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                let _ = stream
+                                    .set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                                let _ = stream
+                                    .set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                                let stream_id = self.next_socket_id;
+                                self.next_socket_id += 1;
+                                self.tcp_streams.insert(stream_id, stream);
+                                Ok(FirValue::Int(stream_id as i128))
+                            }
+                            Err(_) => Ok(FirValue::Int(-1)),
+                        }
+                    } else {
+                        Ok(FirValue::Int(-1))
+                    }
+                } else if fn_name == "net::tcp_connect"
+                    || fn_name == "tcp_connect"
+                    || fn_name == "ifa_rt_async_tcp_connect"
+                {
+                    let host = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "127.0.0.1",
+                        })
+                        .unwrap_or("127.0.0.1");
+                    let port = evaluated_args
+                        .get(1)
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as u16,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    let target = format!("{}:{}", host, port);
+                    match std::net::TcpStream::connect(&target) {
+                        Ok(stream) => {
+                            let _ =
+                                stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                            let _ =
+                                stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                            let stream_id = self.next_socket_id;
+                            self.next_socket_id += 1;
+                            self.tcp_streams.insert(stream_id, stream);
+                            Ok(FirValue::Int(stream_id as i128))
+                        }
+                        Err(_) => Ok(FirValue::Int(-1)),
+                    }
+                } else if fn_name == "net::tcp_write"
+                    || fn_name == "tcp_write"
+                    || fn_name == "ifa_rt_async_write"
+                {
+                    let stream_id = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as i64,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    let payload = evaluated_args
+                        .get(1)
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_bytes().to_vec(),
+                            FirValue::Array(items) => items
+                                .iter()
+                                .filter_map(|it| match it {
+                                    FirValue::Int(b) => Some(*b as u8),
+                                    _ => None,
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        })
+                        .unwrap_or_default();
+                    if let Some(stream) = self.tcp_streams.get_mut(&stream_id) {
+                        use std::io::Write;
+                        match stream.write_all(&payload) {
+                            Ok(()) => {
+                                let _ = stream.flush();
+                                Ok(FirValue::Int(payload.len() as i128))
+                            }
+                            Err(_) => Ok(FirValue::Int(-1)),
+                        }
+                    } else {
+                        Ok(FirValue::Int(-1))
+                    }
+                } else if fn_name == "net::tcp_read"
+                    || fn_name == "tcp_read"
+                    || fn_name == "ifa_rt_async_read"
+                {
+                    let stream_id = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as i64,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    let max_len = evaluated_args
+                        .get(1)
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as usize,
+                            _ => 1024,
+                        })
+                        .unwrap_or(1024);
+                    if let Some(stream) = self.tcp_streams.get_mut(&stream_id) {
+                        use std::io::Read;
+                        let mut buf = vec![0u8; max_len.min(65536)];
+                        match stream.read(&mut buf) {
+                            Ok(n) => {
+                                buf.truncate(n);
+                                let s = String::from_utf8_lossy(&buf).into_owned();
+                                Ok(FirValue::String(s))
+                            }
+                            Err(_) => Ok(FirValue::String(String::new())),
+                        }
+                    } else {
+                        Ok(FirValue::String(String::new()))
+                    }
+                } else if fn_name == "net::tcp_close"
+                    || fn_name == "tcp_close"
+                    || fn_name == "ifa_rt_async_close"
+                {
+                    let sock_id = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as i64,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    let closed_stream = self.tcp_streams.remove(&sock_id).is_some();
+                    let closed_listener = self.tcp_listeners.remove(&sock_id).is_some();
+                    let success = closed_stream || closed_listener;
+                    Ok(FirValue::Bool(success))
+                } else if fn_name == "net::sleep_ms"
+                    || fn_name == "sleep_ms"
+                    || fn_name == "ifa_rt_async_sleep"
+                {
+                    let millis = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as u64,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    std::thread::sleep(std::time::Duration::from_millis(millis));
+                    Ok(FirValue::Unit)
                 } else if let Some(target_func) = self.find_function(&fn_name) {
                     // Direct function call to another FIR function in module
                     let func_clone = target_func.clone();

@@ -683,6 +683,177 @@ impl SymbolTable {
         self.modules.insert(env_name, proc_mod.clone());
         self.modules.insert(std_env_name, proc_mod);
 
+        // 2c. Module `std::net` / `net`
+        let net_name = INTERNER.intern("net");
+        let std_net_name = INTERNER.intern("std::net");
+        let mut net_mod = ModuleSymbol::new(
+            net_name,
+            vec![INTERNER.intern("std"), net_name],
+            true,
+            dummy,
+        );
+        let port_sym = INTERNER.intern("port");
+        let host_sym = INTERNER.intern("host");
+        let fd_sym = INTERNER.intern("fd");
+        let data_sym = INTERNER.intern("data");
+        let max_len_sym = INTERNER.intern("max_len");
+        let millis_sym = INTERNER.intern("millis");
+
+        net_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("tcp_listen"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: port_sym,
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        net_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("tcp_listener_port"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: fd_sym,
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        net_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("tcp_accept"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: fd_sym,
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        net_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("tcp_connect"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: host_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: port_sym,
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        net_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("tcp_write"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: fd_sym,
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: data_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        net_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("tcp_read"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: fd_sym,
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: max_len_sym,
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        net_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("tcp_close"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: fd_sym,
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        net_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("sleep_ms"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: millis_sym,
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Unit,
+            span: dummy,
+        });
+        self.modules.insert(net_name, net_mod.clone());
+        self.modules.insert(std_net_name, net_mod);
+
         // 3. Module `net::http` / `http`
         let http_name = INTERNER.intern("http");
         let net_http_name = INTERNER.intern("net::http");
@@ -1605,6 +1776,160 @@ impl SymbolTable {
                 span: dummy,
             }],
             ret_ty: Type::String,
+            span: dummy,
+        });
+
+        // Global network builtins
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("tcp_listen"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: port_sym,
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("tcp_listener_port"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("fd"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("tcp_accept"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("fd"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("tcp_connect"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("host"),
+                    ty: Type::String,
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: port_sym,
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("tcp_write"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("fd"),
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("data"),
+                    ty: Type::String,
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("tcp_read"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("fd"),
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("max_len"),
+                    ty: Type::Int(crate::types::IntType::I64),
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("tcp_close"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("fd"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("sleep_ms"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("millis"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Unit,
             span: dummy,
         });
     }
