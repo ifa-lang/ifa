@@ -48,7 +48,10 @@ pub fn test_std_all() -> bool {
         && collections::test_collections_set()
         && collections::test_collections_byte_buffer()
         && collections::test_collections_string_builder()
-        && collections::test_collections_ring_buffer();
+        && collections::test_collections_ring_buffer()
+        && collections::test_collections_int_map()
+        && collections::test_collections_binary_heap()
+        && collections::test_collections_deque();
 
     let t_net = net::test_net_all();
 

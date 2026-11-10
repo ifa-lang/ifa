@@ -547,3 +547,260 @@ impl fmt::Display for StringBuilder {
         write!(f, "{}", self.buffer)
     }
 }
+
+/// Fixed-capacity circular ring buffer with FIFO semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingBuffer<T> {
+    data: Vec<Option<T>>,
+    head: usize,
+    tail: usize,
+    count: usize,
+    capacity: usize,
+}
+
+impl<T: Clone> RingBuffer<T> {
+    /// Create a new fixed-capacity ring buffer.
+    pub fn new(capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "RingBuffer capacity must be strictly positive"
+        );
+        let mut data = Vec::with_capacity(capacity);
+        data.resize(capacity, None);
+        Self {
+            data,
+            head: 0,
+            tail: 0,
+            count: 0,
+            capacity,
+        }
+    }
+
+    /// Return current number of elements.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Return maximum capacity.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Check if buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Check if buffer has reached capacity.
+    pub fn is_full(&self) -> bool {
+        self.count == self.capacity
+    }
+
+    /// Push an element to the back. Returns false if full.
+    pub fn push(&mut self, item: T) -> bool {
+        if self.is_full() {
+            return false;
+        }
+        self.data[self.tail] = Some(item);
+        self.tail = (self.tail + 1) % self.capacity;
+        self.count += 1;
+        true
+    }
+
+    /// Pop an element from the front. Returns None if empty.
+    pub fn pop(&mut self) -> Option<T> {
+        if self.is_empty() {
+            return None;
+        }
+        let item = self.data[self.head].take();
+        self.head = (self.head + 1) % self.capacity;
+        self.count -= 1;
+        item
+    }
+
+    /// Peek the front element without removing it.
+    pub fn peek(&self) -> Option<&T> {
+        if self.is_empty() {
+            None
+        } else {
+            self.data[self.head].as_ref()
+        }
+    }
+
+    /// Clear all elements.
+    pub fn clear(&mut self) {
+        for slot in &mut self.data {
+            *slot = None;
+        }
+        self.head = 0;
+        self.tail = 0;
+        self.count = 0;
+    }
+}
+
+/// Deterministic binary heap (min-heap or max-heap priority queue).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryHeap<T: Ord> {
+    items: Vec<T>,
+    is_min: bool,
+}
+
+impl<T: Ord> BinaryHeap<T> {
+    /// Create an empty min-heap (lowest elements popped first).
+    pub fn new_min() -> Self {
+        Self {
+            items: Vec::new(),
+            is_min: true,
+        }
+    }
+
+    /// Create an empty max-heap (highest elements popped first).
+    pub fn new_max() -> Self {
+        Self {
+            items: Vec::new(),
+            is_min: false,
+        }
+    }
+
+    /// Return number of elements in the heap.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Check if heap is empty.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Clear all elements.
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    /// Peek root element without removing it.
+    pub fn peek(&self) -> Option<&T> {
+        self.items.first()
+    }
+
+    /// Push an element into the heap and sift up.
+    pub fn push(&mut self, item: T) {
+        self.items.push(item);
+        let mut idx = self.items.len() - 1;
+        while idx > 0 {
+            let parent = (idx - 1) / 2;
+            let should_swap = if self.is_min {
+                self.items[idx] < self.items[parent]
+            } else {
+                self.items[idx] > self.items[parent]
+            };
+
+            if should_swap {
+                self.items.swap(idx, parent);
+                idx = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Pop the root element and sift down.
+    pub fn pop(&mut self) -> Option<T> {
+        if self.items.is_empty() {
+            return None;
+        }
+        let root = self.items.swap_remove(0);
+        if !self.items.is_empty() {
+            let mut idx = 0;
+            let n = self.items.len();
+            loop {
+                let left = 2 * idx + 1;
+                let right = 2 * idx + 2;
+                let mut target = idx;
+
+                if self.is_min {
+                    if left < n && self.items[left] < self.items[target] {
+                        target = left;
+                    }
+                    if right < n && self.items[right] < self.items[target] {
+                        target = right;
+                    }
+                } else {
+                    if left < n && self.items[left] > self.items[target] {
+                        target = left;
+                    }
+                    if right < n && self.items[right] > self.items[target] {
+                        target = right;
+                    }
+                }
+
+                if target != idx {
+                    self.items.swap(idx, target);
+                    idx = target;
+                } else {
+                    break;
+                }
+            }
+        }
+        Some(root)
+    }
+}
+
+/// Deterministic double-ended queue with amortized O(1) operations.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Deque<T> {
+    inner: std::collections::VecDeque<T>,
+}
+
+impl<T> Deque<T> {
+    /// Create an empty deque.
+    pub fn new() -> Self {
+        Self {
+            inner: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Return number of elements in the deque.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Check if deque is empty.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Clear all elements.
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    /// Push an element to the back.
+    pub fn push_back(&mut self, item: T) {
+        self.inner.push_back(item);
+    }
+
+    /// Push an element to the front.
+    pub fn push_front(&mut self, item: T) {
+        self.inner.push_front(item);
+    }
+
+    /// Pop an element from the front.
+    pub fn pop_front(&mut self) -> Option<T> {
+        self.inner.pop_front()
+    }
+
+    /// Pop an element from the back.
+    pub fn pop_back(&mut self) -> Option<T> {
+        self.inner.pop_back()
+    }
+
+    /// Peek the front element.
+    pub fn peek_front(&self) -> Option<&T> {
+        self.inner.front()
+    }
+
+    /// Peek the back element.
+    pub fn peek_back(&self) -> Option<&T> {
+        self.inner.back()
+    }
+}

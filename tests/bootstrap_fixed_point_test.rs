@@ -1240,7 +1240,7 @@ fn test_bootstrap_triple_compilation_and_fixed_point_hash() {
 
 #[test]
 fn test_stdlib_compiler_essentials() {
-    use ifa_stdlib::collections::{ByteBuffer, List, Map, Set, StringBuilder};
+    use ifa_stdlib::collections::{BinaryHeap, ByteBuffer, Deque, List, Map, Set, StringBuilder};
     use ifa_stdlib::fs::walk_dir_files;
 
     // 1. Collections: List, Map, Set determinism
@@ -1264,6 +1264,38 @@ fn test_stdlib_compiler_essentials() {
     list.push(2);
     list.sort();
     assert_eq!(list.as_slice(), &[1, 2, 3]);
+
+    // Priority Queue / BinaryHeap (Min and Max)
+    let mut min_heap = BinaryHeap::new_min();
+    min_heap.push(30);
+    min_heap.push(10);
+    min_heap.push(20);
+    assert_eq!(min_heap.peek(), Some(&10));
+    assert_eq!(min_heap.pop(), Some(10));
+    assert_eq!(min_heap.pop(), Some(20));
+    assert_eq!(min_heap.pop(), Some(30));
+    assert_eq!(min_heap.pop(), None);
+
+    let mut max_heap = BinaryHeap::new_max();
+    max_heap.push(10);
+    max_heap.push(30);
+    max_heap.push(20);
+    assert_eq!(max_heap.peek(), Some(&30));
+    assert_eq!(max_heap.pop(), Some(30));
+    assert_eq!(max_heap.pop(), Some(20));
+    assert_eq!(max_heap.pop(), Some(10));
+
+    // Deque (double-ended queue)
+    let mut dq = Deque::new();
+    dq.push_back(2);
+    dq.push_front(1);
+    dq.push_back(3);
+    assert_eq!(dq.peek_front(), Some(&1));
+    assert_eq!(dq.peek_back(), Some(&3));
+    assert_eq!(dq.pop_front(), Some(1));
+    assert_eq!(dq.pop_back(), Some(3));
+    assert_eq!(dq.pop_front(), Some(2));
+    assert!(dq.is_empty());
 
     // 2. StringBuilder & ByteBuffer
     let mut sb = StringBuilder::new();
@@ -1571,6 +1603,21 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_collections_int_map ... ok"),
+        "Std collections int map test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_collections_binary_heap ... ok"),
+        "Std collections binary heap test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_collections_deque ... ok"),
+        "Std collections deque test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_json_primitives ... ok"),
         "Std json primitives test missing from output:\n{}",
         stdout
@@ -1741,8 +1788,8 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("173 passed; 0 failed"),
-        "Expected 173 passed std unit tests, got:\n{}",
+        stdout.contains("179 passed; 0 failed"),
+        "Expected 179 passed std unit tests, got:\n{}",
         stdout
     );
 }

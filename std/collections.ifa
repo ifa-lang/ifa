@@ -651,6 +651,329 @@ pub fn ring_buffer_clear(inout rb: RingBuffer) {
 }
 
 // ---------------------------------------------------------------------------
+// 7. Deterministic Ordered IntMap (i64 -> i64)
+// ---------------------------------------------------------------------------
+
+pub struct IntMap {
+    keys: List<i64>,
+    values: List<i64>
+}
+
+pub fn int_map_new() -> IntMap {
+    return IntMap(
+        keys: List::new(),
+        values: List::new()
+    );
+}
+
+pub fn int_map_len(map: IntMap) -> i64 {
+    return map.keys.len();
+}
+
+pub fn int_map_is_empty(map: IntMap) -> bool {
+    return map.keys.len() == 0;
+}
+
+pub fn int_map_contains(map: IntMap, key: i64) -> bool {
+    mut i: i64 = 0;
+    while i < map.keys.len() {
+        if map.keys[i] == key {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn int_map_get(map: IntMap, key: i64, default_val: i64) -> i64 {
+    mut i: i64 = 0;
+    while i < map.keys.len() {
+        if map.keys[i] == key {
+            return map.values[i];
+        }
+        i = i + 1;
+    }
+    return default_val;
+}
+
+pub fn int_map_insert(inout map: IntMap, key: i64, val: i64) -> bool {
+    mut i: i64 = 0;
+    while i < map.keys.len() {
+        if map.keys[i] == key {
+            map.values[i] = val;
+            return false;
+        }
+        i = i + 1;
+    }
+    map.keys.push(key);
+    map.values.push(val);
+    mut k: i64 = map.keys.len() - 1;
+    while k > 0 {
+        if map.keys[k] < map.keys[k - 1] {
+            let tmp_k = map.keys[k];
+            let tmp_v = map.values[k];
+            map.keys[k] = map.keys[k - 1];
+            map.values[k] = map.values[k - 1];
+            map.keys[k - 1] = tmp_k;
+            map.values[k - 1] = tmp_v;
+            k = k - 1;
+        } else {
+            k = 0;
+        }
+    }
+    return true;
+}
+
+pub fn int_map_remove(inout map: IntMap, key: i64) -> bool {
+    mut idx: i64 = -1;
+    mut i: i64 = 0;
+    while i < map.keys.len() {
+        if map.keys[i] == key {
+            idx = i;
+            i = map.keys.len();
+        } else {
+            i = i + 1;
+        }
+    }
+    if idx == -1 {
+        return false;
+    }
+    mut new_keys: List<i64> = List::new();
+    mut new_vals: List<i64> = List::new();
+    mut j: i64 = 0;
+    while j < map.keys.len() {
+        if j != idx {
+            new_keys.push(map.keys[j]);
+            new_vals.push(map.values[j]);
+        }
+        j = j + 1;
+    }
+    map.keys = new_keys;
+    map.values = new_vals;
+    return true;
+}
+
+pub fn int_map_clear(inout map: IntMap) {
+    map.keys = List::new();
+    map.values = List::new();
+}
+
+// ---------------------------------------------------------------------------
+// 8. Deterministic BinaryHeap (Min/Max Priority Queue)
+// ---------------------------------------------------------------------------
+
+pub struct BinaryHeap {
+    items: List<i64>,
+    is_min_heap: bool
+}
+
+pub fn binary_heap_new_min() -> BinaryHeap {
+    return BinaryHeap(
+        items: List::new(),
+        is_min_heap: true
+    );
+}
+
+pub fn binary_heap_new_max() -> BinaryHeap {
+    return BinaryHeap(
+        items: List::new(),
+        is_min_heap: false
+    );
+}
+
+pub fn binary_heap_len(heap: BinaryHeap) -> i64 {
+    return heap.items.len();
+}
+
+pub fn binary_heap_is_empty(heap: BinaryHeap) -> bool {
+    return heap.items.len() == 0;
+}
+
+pub fn binary_heap_peek(heap: BinaryHeap) -> i64 {
+    if heap.items.len() == 0 {
+        return 0;
+    }
+    return heap.items[0];
+}
+
+pub fn binary_heap_clear(inout heap: BinaryHeap) {
+    heap.items = List::new();
+}
+
+pub fn binary_heap_push(inout heap: BinaryHeap, val: i64) {
+    heap.items.push(val);
+    mut idx: i64 = heap.items.len() - 1;
+    while idx > 0 {
+        let parent = (idx - 1) / 2;
+        mut should_swap: bool = false;
+        if heap.is_min_heap {
+            if heap.items[idx] < heap.items[parent] {
+                should_swap = true;
+            }
+        } else {
+            if heap.items[idx] > heap.items[parent] {
+                should_swap = true;
+            }
+        }
+        if should_swap {
+            list_swap_ints(heap.items, idx, parent);
+            idx = parent;
+        } else {
+            idx = 0;
+        }
+    }
+}
+
+pub fn binary_heap_pop(inout heap: BinaryHeap) -> i64 {
+    let len = heap.items.len();
+    if len == 0 {
+        return 0;
+    }
+    let root = heap.items[0];
+    if len == 1 {
+        heap.items = List::new();
+        return root;
+    }
+    let last = heap.items[len - 1];
+    mut new_items: List<i64> = List::new();
+    mut i: i64 = 0;
+    while i < len - 1 {
+        new_items.push(heap.items[i]);
+        i = i + 1;
+    }
+    new_items[0] = last;
+    heap.items = new_items;
+
+    mut idx: i64 = 0;
+    let n = heap.items.len();
+    mut cont: bool = true;
+    while cont {
+        let left = 2 * idx + 1;
+        let right = 2 * idx + 2;
+        mut target = idx;
+
+        if left < n {
+            if heap.is_min_heap {
+                if heap.items[left] < heap.items[target] {
+                    target = left;
+                }
+            } else {
+                if heap.items[left] > heap.items[target] {
+                    target = left;
+                }
+            }
+        }
+
+        if right < n {
+            if heap.is_min_heap {
+                if heap.items[right] < heap.items[target] {
+                    target = right;
+                }
+            } else {
+                if heap.items[right] > heap.items[target] {
+                    target = right;
+                }
+            }
+        }
+
+        if target != idx {
+            list_swap_ints(heap.items, idx, target);
+            idx = target;
+        } else {
+            cont = false;
+        }
+    }
+
+    return root;
+}
+
+// ---------------------------------------------------------------------------
+// 9. IntDeque (Double-Ended Linear Queue)
+// ---------------------------------------------------------------------------
+
+pub struct IntDeque {
+    items: List<i64>
+}
+
+pub fn deque_new() -> IntDeque {
+    return IntDeque(items: List::new());
+}
+
+pub fn deque_len(dq: IntDeque) -> i64 {
+    return dq.items.len();
+}
+
+pub fn deque_is_empty(dq: IntDeque) -> bool {
+    return dq.items.len() == 0;
+}
+
+pub fn deque_clear(inout dq: IntDeque) {
+    dq.items = List::new();
+}
+
+pub fn deque_push_back(inout dq: IntDeque, val: i64) {
+    dq.items.push(val);
+}
+
+pub fn deque_push_front(inout dq: IntDeque, val: i64) {
+    mut new_items: List<i64> = List::new();
+    new_items.push(val);
+    mut i: i64 = 0;
+    while i < dq.items.len() {
+        new_items.push(dq.items[i]);
+        i = i + 1;
+    }
+    dq.items = new_items;
+}
+
+pub fn deque_peek_front(dq: IntDeque) -> i64 {
+    if dq.items.len() == 0 {
+        return 0;
+    }
+    return dq.items[0];
+}
+
+pub fn deque_peek_back(dq: IntDeque) -> i64 {
+    let len = dq.items.len();
+    if len == 0 {
+        return 0;
+    }
+    return dq.items[len - 1];
+}
+
+pub fn deque_pop_front(inout dq: IntDeque) -> i64 {
+    let len = dq.items.len();
+    if len == 0 {
+        return 0;
+    }
+    let front = dq.items[0];
+    mut new_items: List<i64> = List::new();
+    mut i: i64 = 1;
+    while i < len {
+        new_items.push(dq.items[i]);
+        i = i + 1;
+    }
+    dq.items = new_items;
+    return front;
+}
+
+pub fn deque_pop_back(inout dq: IntDeque) -> i64 {
+    let len = dq.items.len();
+    if len == 0 {
+        return 0;
+    }
+    let back = dq.items[len - 1];
+    mut new_items: List<i64> = List::new();
+    mut i: i64 = 0;
+    while i < len - 1 {
+        new_items.push(dq.items[i]);
+        i = i + 1;
+    }
+    dq.items = new_items;
+    return back;
+}
+
+// ---------------------------------------------------------------------------
 // Unit Tests for Standard Collections Subsystem
 // ---------------------------------------------------------------------------
 
@@ -837,6 +1160,89 @@ pub fn test_collections_ring_buffer() -> bool {
     return t_init && t_push && t_peek && t_pop && t_wrap && t_drain;
 }
 
+pub fn test_collections_int_map() -> bool {
+    mut map = int_map_new();
+    let i1 = int_map_insert(map, 300, 30);
+    let i2 = int_map_insert(map, 100, 10);
+    let i3 = int_map_insert(map, 200, 20);
+    let i4 = int_map_insert(map, 100, 15);
+
+    let t1 = i1 && i2 && i3 && !i4;
+    let t2 = int_map_len(map) == 3;
+    let t3 = int_map_contains(map, 200) && !int_map_contains(map, 500);
+    let t4 = int_map_get(map, 100, -1) == 15
+        && int_map_get(map, 200, -1) == 20
+        && int_map_get(map, 300, -1) == 30
+        && int_map_get(map, 500, -1) == -1;
+
+    let t5 = map.keys[0] == 100 && map.keys[1] == 200 && map.keys[2] == 300;
+
+    let rem = int_map_remove(map, 200);
+    let t6 = rem && !int_map_contains(map, 200) && int_map_len(map) == 2;
+
+    int_map_clear(map);
+    let t7 = int_map_is_empty(map) && int_map_len(map) == 0;
+
+    return t1 && t2 && t3 && t4 && t5 && t6 && t7;
+}
+
+pub fn test_collections_binary_heap() -> bool {
+    mut min_heap = binary_heap_new_min();
+    binary_heap_push(min_heap, 40);
+    binary_heap_push(min_heap, 10);
+    binary_heap_push(min_heap, 30);
+    binary_heap_push(min_heap, 20);
+    binary_heap_push(min_heap, 50);
+
+    let t1 = binary_heap_len(min_heap) == 5 && binary_heap_peek(min_heap) == 10;
+    let p1 = binary_heap_pop(min_heap);
+    let p2 = binary_heap_pop(min_heap);
+    let p3 = binary_heap_pop(min_heap);
+    let p4 = binary_heap_pop(min_heap);
+    let p5 = binary_heap_pop(min_heap);
+    let t2 = p1 == 10 && p2 == 20 && p3 == 30 && p4 == 40 && p5 == 50 && binary_heap_is_empty(min_heap);
+
+    mut max_heap = binary_heap_new_max();
+    binary_heap_push(max_heap, 40);
+    binary_heap_push(max_heap, 10);
+    binary_heap_push(max_heap, 30);
+    binary_heap_push(max_heap, 20);
+    binary_heap_push(max_heap, 50);
+
+    let t3 = binary_heap_len(max_heap) == 5 && binary_heap_peek(max_heap) == 50;
+    let m1 = binary_heap_pop(max_heap);
+    let m2 = binary_heap_pop(max_heap);
+    let m3 = binary_heap_pop(max_heap);
+    let m4 = binary_heap_pop(max_heap);
+    let m5 = binary_heap_pop(max_heap);
+    let t4 = m1 == 50 && m2 == 40 && m3 == 30 && m4 == 20 && m5 == 10 && binary_heap_is_empty(max_heap);
+
+    return t1 && t2 && t3 && t4;
+}
+
+pub fn test_collections_deque() -> bool {
+    mut dq = deque_new();
+    let t1 = deque_is_empty(dq) && deque_len(dq) == 0;
+
+    deque_push_back(dq, 20);
+    deque_push_front(dq, 10);
+    deque_push_back(dq, 30);
+    deque_push_front(dq, 5);
+
+    let t2 = deque_len(dq) == 4
+        && deque_peek_front(dq) == 5
+        && deque_peek_back(dq) == 30;
+
+    let pop_f1 = deque_pop_front(dq);
+    let pop_b1 = deque_pop_back(dq);
+    let pop_f2 = deque_pop_front(dq);
+    let pop_b2 = deque_pop_back(dq);
+
+    let t3 = pop_f1 == 5 && pop_b1 == 30 && pop_f2 == 10 && pop_b2 == 20 && deque_is_empty(dq);
+
+    return t1 && t2 && t3;
+}
+
 pub fn test_collections_all() -> bool {
     let t1 = test_collections_list();
     let t2 = test_collections_map();
@@ -844,7 +1250,10 @@ pub fn test_collections_all() -> bool {
     let t4 = test_collections_byte_buffer();
     let t5 = test_collections_string_builder();
     let t6 = test_collections_ring_buffer();
-    return t1 && t2 && t3 && t4 && t5 && t6;
+    let t7 = test_collections_int_map();
+    let t8 = test_collections_binary_heap();
+    let t9 = test_collections_deque();
+    return t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9;
 }
 
 pub fn main() {

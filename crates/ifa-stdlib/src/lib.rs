@@ -10,7 +10,7 @@ pub mod json;
 pub mod process;
 pub mod sync;
 
-pub use collections::{ByteBuffer, List, Map, Set, StringBuilder};
+pub use collections::{BinaryHeap, ByteBuffer, Deque, List, Map, Set, StringBuilder};
 pub use crypto::{blake3, blake3_hex, sha256, sha256_hex};
 pub use csv::{decode as decode_csv, encode as encode_csv, CsvTable};
 pub use fmt::{
