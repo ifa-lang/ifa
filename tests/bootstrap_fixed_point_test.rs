@@ -901,8 +901,28 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("346 passed; 0 failed"),
-        "Expected 346 passed unit tests, got:\n{}",
+        stdout.contains("test test_driver_ipo_constant_folding_and_propagation ... ok"),
+        "Modular driver ipo constant folding and propagation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_direct_elf64_shared_library_assembler ... ok"),
+        "Modular driver direct elf64 shared library assembler test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_direct_macho64_shared_library_assembler ... ok"),
+        "Modular driver direct macho64 shared library assembler test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_cross_target_shared_library_relocations ... ok"),
+        "Modular driver cross target shared library relocations test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("354 passed; 0 failed"),
+        "Expected 354 passed unit tests, got:\n{}",
         stdout
     );
 }
@@ -1531,4 +1551,131 @@ fn test_external_source_compilation_via_ifac() {
     );
 
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_cross_target_deterministic_hash_regression_bench() {
+    let _lock = BOOTSTRAP_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let root = get_workspace_root();
+    let kori_bin = get_kori_binary();
+    let manifest_path = root.join("compiler").join("kori.toml");
+    let target_dev_dir = root.join("compiler").join("target").join("dev");
+    let ifac_bin = target_dev_dir.join("ifac");
+
+    // Ensure ifac executable is built and up to date
+    let build = Command::new(&kori_bin)
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .arg("--force")
+        .output()
+        .expect("Build ifac compiler");
+    assert!(
+        build.status.success(),
+        "Failed to build ifac compiler:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let temp_bench = std::env::temp_dir().join(format!(
+        "ifa_cross_target_bench_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&temp_bench).expect("create bench temp dir");
+
+    let sample_src = temp_bench.join("cross_sample.ifa");
+    fs::write(
+        &sample_src,
+        "pub struct Vec3 {\n    x: i64,\n    y: i64,\n    z: i64\n}\npub fn make_vec(x: i64, y: i64, z: i64) -> Vec3 {\n    return Vec3(x: x, y: y, z: z);\n}\npub fn main() {\n    let v = make_vec(1, 2, 3);\n    println(\"Determinism check: 42\");\n}\n",
+    )
+    .expect("write sample source");
+
+    // Cross-compilation target triples to validate for deterministic hashes
+    let targets = [
+        (
+            "x86_64-unknown-linux-gnu",
+            "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+        ),
+        (
+            "aarch64-unknown-linux-gnu",
+            "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128",
+        ),
+        (
+            "x86_64-apple-darwin",
+            "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+        ),
+        ("aarch64-apple-darwin", "e-m:o-i64:64-i128:128-n32:64-S128"),
+    ];
+
+    for (target, expected_datalayout) in &targets {
+        // Run A
+        let out_ll_a = temp_bench.join(format!("sample_{}_a.ll", target));
+        let run_a = Command::new(&ifac_bin)
+            .arg("-S")
+            .arg(&sample_src)
+            .arg("--target")
+            .arg(target)
+            .arg("-o")
+            .arg(&out_ll_a)
+            .output()
+            .expect("Run cross emission A");
+        assert!(
+            run_a.status.success(),
+            "Target {} compilation A failed:\nstdout: {}\nstderr: {}",
+            target,
+            String::from_utf8_lossy(&run_a.stdout),
+            String::from_utf8_lossy(&run_a.stderr)
+        );
+
+        // Run B (with independent output file to verify bit-for-bit repeatability)
+        let out_ll_b = temp_bench.join(format!("sample_{}_b.ll", target));
+        let run_b = Command::new(&ifac_bin)
+            .arg("-S")
+            .arg(&sample_src)
+            .arg("--target")
+            .arg(target)
+            .arg("-o")
+            .arg(&out_ll_b)
+            .output()
+            .expect("Run cross emission B");
+        assert!(
+            run_b.status.success(),
+            "Target {} compilation B failed:\nstdout: {}\nstderr: {}",
+            target,
+            String::from_utf8_lossy(&run_b.stdout),
+            String::from_utf8_lossy(&run_b.stderr)
+        );
+
+        let content_a = fs::read_to_string(&out_ll_a).expect("read ll A");
+        let content_b = fs::read_to_string(&out_ll_b).expect("read ll B");
+
+        assert!(
+            content_a.contains(&format!("target triple = \"{}\"", target)),
+            "Target triple missing from output: {}",
+            target
+        );
+        assert!(
+            content_a.contains(&format!("target datalayout = \"{}\"", expected_datalayout)),
+            "Target datalayout missing or incorrect for target {}:\nExpected: {}\nOutput: {}",
+            target,
+            expected_datalayout,
+            content_a
+        );
+
+        let hash_a = sha256_hex(content_a.as_bytes());
+        let hash_b = sha256_hex(content_b.as_bytes());
+
+        assert_eq!(
+            hash_a, hash_b,
+            "Cross-target non-determinism detected for target {}: hash_a={} != hash_b={}",
+            target, hash_a, hash_b
+        );
+    }
+
+    let _ = fs::remove_dir_all(&temp_bench);
 }

@@ -7,5 +7,5 @@ version = 1
 name = "ifac"
 version = "0.1.0"
 source = "root"
-checksum = "6dc1ad179a0aa8f469a1bba051632942481f1d5153656394b1071610877da93d"
+checksum = "9fde6e78517508bc63de6e60463d3a3dbd25359c95e8ada22481094673a90006"
 dependencies = []

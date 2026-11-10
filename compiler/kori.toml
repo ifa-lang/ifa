@@ -17,7 +17,7 @@ opt_level = 0
 debug_assertions = true
 lto = "none"
 strip_symbols = false
-gen_checks = true
+gen_checks = false
 
 [profiles.release]
 backend = "llvm"

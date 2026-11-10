@@ -187,9 +187,11 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i1 @ifa_rt_string_eq(ptr, ptr)\n");
             out.push_str("declare i64 @ifa_rt_string_len(ptr)\n");
             out.push_str("declare i64 @ifa_rt_string_char_at(ptr, i64)\n");
-            out.push_str("declare ptr @ifa_rt_string_substr(ptr, i64, i64)\n\n");
+            out.push_str("declare ptr @ifa_rt_string_substr(ptr, i64, i64)\n");
+            out.push_str("declare ptr @calloc(i64, i64)\n\n");
         } else {
             out.push_str("; IFA Runtime Intrinsic Declarations\n");
+            out.push_str("declare ptr @calloc(i64, i64)\n");
             out.push_str("declare void @ifa_rt_println(ptr)\n");
             out.push_str("declare void @ifa_rt_print(ptr)\n");
             out.push_str("declare void @ifa_rt_println_i64(i64)\n");
@@ -2388,6 +2390,8 @@ impl<'a> LlvmIrEmitter<'a> {
                                 || callee == "String::substr"
                                 || callee == "substring"
                                 || callee == "ifa_rt_string_substr"
+                                || callee == "get_target_datalayout"
+                                || callee.ends_with("::get_target_datalayout")
                             {
                                 ifa_fir::FirType::String
                             } else if callee == "fs::exists"
@@ -3060,7 +3064,7 @@ impl<'a> LlvmIrEmitter<'a> {
         match expr {
             ValueExpr::Constant(c) => match c {
                 ConstantValue::Unit => {
-                    // Unit produces void, no SSA value assignment needed
+                    out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
                 }
                 ConstantValue::Bool(b) => {
                     out.push_str(&format!(
@@ -3419,6 +3423,12 @@ impl<'a> LlvmIrEmitter<'a> {
                     "  %v{} = alloca {}, align {}\n",
                     res_id, llvm_ty, align
                 ));
+                if matches!(ty, ifa_fir::FirType::Struct(..)) || llvm_ty.starts_with("%struct.") {
+                    out.push_str(&format!(
+                        "  store {} zeroinitializer, ptr %v{}, align {}\n",
+                        llvm_ty, res_id, align
+                    ));
+                }
             }
             ValueExpr::Load { ptr } => {
                 let (ty_str, align) = match value_types.get(ptr) {
@@ -3447,10 +3457,67 @@ impl<'a> LlvmIrEmitter<'a> {
                         _ => ("i64".to_string(), 8),
                     },
                 };
-                out.push_str(&format!(
-                    "  store {} %v{}, ptr %v{}, align {}\n",
-                    ty_str, val.0, ptr.0, align
-                ));
+                let ptr_is_list_struct = match value_types.get(ptr) {
+                    Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
+                        ifa_fir::FirType::Struct(s_sym, _) => {
+                            let s_name = INTERNER.resolve(s_sym);
+                            if s_name.starts_with("List") || s_name.contains("List") {
+                                Some(s_name)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+
+                if let Some(s_name) = ptr_is_list_struct {
+                    if ty_str == "ptr" {
+                        let arr_len: i64 = match value_types.get(val) {
+                            Some(ifa_fir::FirType::Array(_, len)) => *len as i64,
+                            Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
+                                ifa_fir::FirType::Array(_, len) => *len as i64,
+                                _ => 0,
+                            },
+                            _ => 0,
+                        };
+                        out.push_str(&format!(
+                            "  %st_p0_{}_{} = getelementptr inbounds %struct.{}, ptr %v{}, i32 0, i32 0\n",
+                            res_id, val.0, s_name, ptr.0
+                        ));
+                        out.push_str(&format!(
+                            "  store ptr %v{}, ptr %st_p0_{}_{}, align 8\n",
+                            val.0, res_id, val.0
+                        ));
+                        out.push_str(&format!(
+                            "  %st_p1_{}_{} = getelementptr inbounds %struct.{}, ptr %v{}, i32 0, i32 1\n",
+                            res_id, val.0, s_name, ptr.0
+                        ));
+                        out.push_str(&format!(
+                            "  store i64 {}, ptr %st_p1_{}_{}, align 8\n",
+                            arr_len, res_id, val.0
+                        ));
+                        out.push_str(&format!(
+                            "  %st_p2_{}_{} = getelementptr inbounds %struct.{}, ptr %v{}, i32 0, i32 2\n",
+                            res_id, val.0, s_name, ptr.0
+                        ));
+                        out.push_str(&format!(
+                            "  store i64 {}, ptr %st_p2_{}_{}, align 8\n",
+                            arr_len, res_id, val.0
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  store {} %v{}, ptr %v{}, align {}\n",
+                            ty_str, val.0, ptr.0, align
+                        ));
+                    }
+                } else {
+                    out.push_str(&format!(
+                        "  store {} %v{}, ptr %v{}, align {}\n",
+                        ty_str, val.0, ptr.0, align
+                    ));
+                }
             }
             ValueExpr::CallDirect { name, args } => {
                 let callee = INTERNER.resolve(name);
@@ -4284,17 +4351,21 @@ impl<'a> LlvmIrEmitter<'a> {
                 ));
             }
             ValueExpr::ArrayInit(elements) => {
-                let count = elements.len().max(1);
+                let count = if elements.is_empty() {
+                    256
+                } else {
+                    elements.len()
+                };
                 let (elem_ty_str, align) = elements
                     .first()
                     .and_then(|e| value_types.get(e))
                     .map(|ty| {
                         (
-                            fir_to_llvm_type(ty).unwrap_or_else(|_| "i64".to_string()),
+                            fir_to_llvm_type(ty).unwrap_or_else(|_| "ptr".to_string()),
                             llvm_align_for_type(ty),
                         )
                     })
-                    .unwrap_or_else(|| ("i64".to_string(), 8));
+                    .unwrap_or_else(|| ("ptr".to_string(), 8));
 
                 let total_bytes = count * align as usize;
                 let arr_align = if total_bytes >= 64 {
@@ -4307,24 +4378,31 @@ impl<'a> LlvmIrEmitter<'a> {
                     align.max(8)
                 };
 
-                out.push_str(&format!(
-                    "  %arr_alloc_{} = alloca [{} x {}], align {}\n",
-                    res_id, count, elem_ty_str, arr_align
-                ));
-                for (idx, elem) in elements.iter().enumerate() {
+                if elements.is_empty() {
                     out.push_str(&format!(
-                        "  %elem_ptr_{}_{} = getelementptr inbounds [{} x {}], ptr %arr_alloc_{}, i64 0, i64 {}\n",
-                        res_id, idx, count, elem_ty_str, res_id, idx
+                        "  %v{} = call ptr @calloc(i64 256, i64 64)\n",
+                        res_id
                     ));
+                } else {
                     out.push_str(&format!(
-                        "  store {} %v{}, ptr %elem_ptr_{}_{}, align {}\n",
-                        elem_ty_str, elem.0, res_id, idx, align
+                        "  %arr_alloc_{} = alloca [{} x {}], align {}\n",
+                        res_id, count, elem_ty_str, arr_align
+                    ));
+                    for (idx, elem) in elements.iter().enumerate() {
+                        out.push_str(&format!(
+                            "  %elem_ptr_{}_{} = getelementptr inbounds [{} x {}], ptr %arr_alloc_{}, i64 0, i64 {}\n",
+                            res_id, idx, count, elem_ty_str, res_id, idx
+                        ));
+                        out.push_str(&format!(
+                            "  store {} %v{}, ptr %elem_ptr_{}_{}, align {}\n",
+                            elem_ty_str, elem.0, res_id, idx, align
+                        ));
+                    }
+                    out.push_str(&format!(
+                        "  %v{} = getelementptr inbounds [{} x {}], ptr %arr_alloc_{}, i64 0, i64 0\n",
+                        res_id, count, elem_ty_str, res_id
                     ));
                 }
-                out.push_str(&format!(
-                    "  %v{} = getelementptr inbounds [{} x {}], ptr %arr_alloc_{}, i64 0, i64 0\n",
-                    res_id, count, elem_ty_str, res_id
-                ));
             }
             ValueExpr::StructInit { name, fields } => {
                 let s_name = INTERNER.resolve(name);
@@ -5221,14 +5299,98 @@ impl<'a> LlvmIrEmitter<'a> {
                             res_id, res_id
                         ));
                     }
+                    ifa_fir::FirType::Struct(s_sym, _) => {
+                        let s_name = INTERNER.resolve(s_sym);
+                        if s_name.starts_with("List") || s_name.contains("List") {
+                            out.push_str(&format!(
+                                "  %list_len_gep_{} = getelementptr inbounds %struct.{}, ptr %v{}, i32 0, i32 1\n",
+                                res_id, s_name, array.0
+                            ));
+                            out.push_str(&format!(
+                                "  %v{} = load i64, ptr %list_len_gep_{}, align 8\n",
+                                res_id, res_id
+                            ));
+                        } else {
+                            out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
+                        }
+                    }
                     _ => {
                         out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
                     }
                 },
+                Some(ifa_fir::FirType::Struct(s_sym, _)) => {
+                    let s_name = INTERNER.resolve(s_sym);
+                    if s_name.starts_with("List") || s_name.contains("List") {
+                        out.push_str(&format!(
+                            "  %v{} = extractvalue %struct.{} %v{}, 1\n",
+                            res_id, s_name, array.0
+                        ));
+                    } else {
+                        out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
+                    }
+                }
                 _ => {
                     out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
                 }
             },
+            ValueExpr::ArrayPush { array, val } => {
+                let ptr_is_list_struct = match value_types.get(array) {
+                    Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
+                        ifa_fir::FirType::Struct(s_sym, _) => {
+                            let s_name = INTERNER.resolve(s_sym);
+                            if s_name.starts_with("List") || s_name.contains("List") {
+                                Some(s_name)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(s_name) = ptr_is_list_struct {
+                    let (val_ty_str, val_align) = match value_types.get(val) {
+                        Some(ty) => (
+                            fir_to_llvm_type(ty).unwrap_or_else(|_| "ptr".to_string()),
+                            llvm_align_for_type(ty),
+                        ),
+                        _ => ("ptr".to_string(), 8),
+                    };
+                    out.push_str(&format!(
+                        "  %push_len_p_{} = getelementptr inbounds %struct.{}, ptr %v{}, i32 0, i32 1\n",
+                        res_id, s_name, array.0
+                    ));
+                    out.push_str(&format!(
+                        "  %push_old_len_{} = load i64, ptr %push_len_p_{}, align 8\n",
+                        res_id, res_id
+                    ));
+                    out.push_str(&format!(
+                        "  %push_data_p_{} = getelementptr inbounds %struct.{}, ptr %v{}, i32 0, i32 0\n",
+                        res_id, s_name, array.0
+                    ));
+                    out.push_str(&format!(
+                        "  %push_buf_{} = load ptr, ptr %push_data_p_{}, align 8\n",
+                        res_id, res_id
+                    ));
+                    out.push_str(&format!(
+                        "  %push_slot_{} = getelementptr inbounds {}, ptr %push_buf_{}, i64 %push_old_len_{}\n",
+                        res_id, val_ty_str, res_id, res_id
+                    ));
+                    out.push_str(&format!(
+                        "  store {} %v{}, ptr %push_slot_{}, align {}\n",
+                        val_ty_str, val.0, res_id, val_align
+                    ));
+                    out.push_str(&format!(
+                        "  %push_new_len_{} = add i64 %push_old_len_{}, 1\n",
+                        res_id, res_id
+                    ));
+                    out.push_str(&format!(
+                        "  store i64 %push_new_len_{}, ptr %push_len_p_{}, align 8\n",
+                        res_id, res_id
+                    ));
+                }
+                out.push_str(&format!("  %v{} = add i64 0, 0\n", res_id));
+            }
             ValueExpr::Yield => {
                 if is_coro {
                     let y_id = *coro_yield_idx;

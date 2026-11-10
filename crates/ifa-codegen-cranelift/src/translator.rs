@@ -262,6 +262,36 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                             },
                             _ => FirType::Pointer(Box::new(FirType::Int(IntType::I64))),
                         },
+                        ValueExpr::CallDirect { name, .. }
+                        | ValueExpr::BlockingCallDirect { name, .. } => {
+                            let callee = INTERNER.resolve(name);
+                            if callee == "process::args_get"
+                                || callee == "env::args_get"
+                                || callee == "args_get"
+                                || callee == "ifa_rt_args_get"
+                                || callee == "fs::read_to_string"
+                                || callee == "read_to_string"
+                                || callee == "ifa_rt_fs_read_to_string"
+                                || callee == "string_substr"
+                                || callee == "String::substr"
+                                || callee == "substring"
+                                || callee == "ifa_rt_string_substr"
+                                || callee == "get_target_datalayout"
+                                || callee.ends_with("::get_target_datalayout")
+                            {
+                                FirType::String
+                            } else if callee == "fs::exists"
+                                || callee == "exists"
+                                || callee == "ifa_rt_fs_exists"
+                                || callee == "fs::write_string"
+                                || callee == "write_string"
+                                || callee == "ifa_rt_fs_write_string"
+                            {
+                                FirType::Bool
+                            } else {
+                                FirType::Int(IntType::I64)
+                            }
+                        }
                         _ => FirType::Int(IntType::I64),
                     };
                     value_types.insert(res, ty);
@@ -2067,6 +2097,33 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                         Some(FirType::Pointer(inner)) => {
                             if let FirType::Array(_, len) = &**inner {
                                 Some(self.builder.ins().iconst(types::I64, *len as i64))
+                            } else if let FirType::Struct(name, _) = &**inner {
+                                let s_name = INTERNER.resolve(name);
+                                if s_name.starts_with("List") || s_name.contains("List") {
+                                    let ptr = self.value_map[array];
+                                    Some(self.builder.ins().load(
+                                        types::I64,
+                                        MemFlagsData::trusted(),
+                                        ptr,
+                                        8,
+                                    ))
+                                } else {
+                                    Some(self.builder.ins().iconst(types::I64, 0))
+                                }
+                            } else {
+                                Some(self.builder.ins().iconst(types::I64, 0))
+                            }
+                        }
+                        Some(FirType::Struct(name, _)) => {
+                            let s_name = INTERNER.resolve(name);
+                            if s_name.starts_with("List") || s_name.contains("List") {
+                                let ptr = self.value_map[array];
+                                Some(self.builder.ins().load(
+                                    types::I64,
+                                    MemFlagsData::trusted(),
+                                    ptr,
+                                    8,
+                                ))
                             } else {
                                 Some(self.builder.ins().iconst(types::I64, 0))
                             }
@@ -2422,6 +2479,12 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             self.value_types.get(&part),
             Some(FirType::String) | Some(FirType::Str)
         ) {
+            return val;
+        }
+        let is_int = matches!(self.value_types.get(&part), Some(FirType::Int(_)));
+        let is_float = matches!(self.value_types.get(&part), Some(FirType::Float(_)));
+        let is_bool = matches!(self.value_types.get(&part), Some(FirType::Bool));
+        if !is_int && !is_float && !is_bool && self.value_types.contains_key(&part) {
             return val;
         }
         let val_ty = self.builder.func.dfg.value_type(val);

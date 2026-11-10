@@ -729,6 +729,39 @@ impl<'a> FunctionLoweringContext<'a> {
                             return Some(FirType::Enum(en_name, variants));
                         }
                     }
+                    let full_name = {
+                        let parts: Vec<_> = path.iter().map(|s| INTERNER.resolve(s)).collect();
+                        parts.join("::")
+                    };
+                    if full_name == "process::args_get"
+                        || full_name == "env::args_get"
+                        || full_name == "args_get"
+                        || full_name == "fs::read_to_string"
+                        || full_name == "read_to_string"
+                        || full_name == "ifa_rt_fs_read_to_string"
+                        || full_name == "string_substr"
+                        || full_name == "String::substr"
+                        || full_name == "substring"
+                        || full_name == "get_target_datalayout"
+                        || full_name.ends_with("::get_target_datalayout")
+                    {
+                        return Some(FirType::String);
+                    } else if full_name == "fs::exists"
+                        || full_name == "exists"
+                        || full_name == "ifa_rt_fs_exists"
+                        || full_name == "fs::write_string"
+                        || full_name == "write_string"
+                        || full_name == "ifa_rt_fs_write_string"
+                    {
+                        return Some(FirType::Bool);
+                    } else if full_name == "process::args_count"
+                        || full_name == "args_count"
+                        || full_name == "fs::file_size"
+                        || full_name == "process::exec"
+                        || full_name == "process::exec_with_stdin"
+                    {
+                        return Some(FirType::Int(IntType::I64));
+                    }
                     None
                 } else {
                     None
@@ -3044,13 +3077,23 @@ impl<'a> FunctionLoweringContext<'a> {
                             if let Some(arg) = args.get(*idx) {
                                 ordered_fields.push(self.lower_expr(&arg.value));
                             } else {
-                                let unit_val = self.alloc_value();
-                                self.emit(
-                                    Some(unit_val),
-                                    ValueExpr::Constant(ConstantValue::Unit),
-                                    span,
-                                );
-                                ordered_fields.push(unit_val);
+                                let f_fir_ty = FirType::from_sema_type(&field_sym.ty);
+                                let def_c = match &f_fir_ty {
+                                    FirType::Bool => ConstantValue::Bool(false),
+                                    FirType::Int(i_ty) => ConstantValue::Int(0, *i_ty),
+                                    FirType::Float(f_ty) => ConstantValue::Float(0.0, *f_ty),
+                                    FirType::Char => ConstantValue::Char('\0'),
+                                    FirType::String | FirType::Str => {
+                                        ConstantValue::String(INTERNER.intern(""))
+                                    }
+                                    FirType::Pointer(_) | FirType::GenerationalRef(_) => {
+                                        ConstantValue::Null
+                                    }
+                                    _ => ConstantValue::Unit,
+                                };
+                                let def_val = self.alloc_value();
+                                self.emit(Some(def_val), ValueExpr::Constant(def_c), span);
+                                ordered_fields.push(def_val);
                             }
                         } else {
                             let unit_val = self.alloc_value();
@@ -4164,13 +4207,23 @@ impl<'a> FunctionLoweringContext<'a> {
                             {
                                 ordered_fields.push(self.lower_expr(f_expr));
                             } else {
-                                let unit_val = self.alloc_value();
-                                self.emit(
-                                    Some(unit_val),
-                                    ValueExpr::Constant(ConstantValue::Unit),
-                                    span,
-                                );
-                                ordered_fields.push(unit_val);
+                                let f_fir_ty = FirType::from_sema_type(&field_def.ty);
+                                let def_c = match &f_fir_ty {
+                                    FirType::Bool => ConstantValue::Bool(false),
+                                    FirType::Int(i_ty) => ConstantValue::Int(0, *i_ty),
+                                    FirType::Float(f_ty) => ConstantValue::Float(0.0, *f_ty),
+                                    FirType::Char => ConstantValue::Char('\0'),
+                                    FirType::String | FirType::Str => {
+                                        ConstantValue::String(INTERNER.intern(""))
+                                    }
+                                    FirType::Pointer(_) | FirType::GenerationalRef(_) => {
+                                        ConstantValue::Null
+                                    }
+                                    _ => ConstantValue::Unit,
+                                };
+                                let def_val = self.alloc_value();
+                                self.emit(Some(def_val), ValueExpr::Constant(def_c), span);
+                                ordered_fields.push(def_val);
                             }
                         }
                         (mangled_name, ordered_fields)
