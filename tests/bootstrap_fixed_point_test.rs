@@ -1488,6 +1488,16 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_net_http_chunked_streaming ... ok"),
+        "Std net HTTP chunked streaming test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_websocket_framing_and_roundtrip ... ok"),
+        "Std net WebSocket framing test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_collections_ring_buffer ... ok"),
         "Std collections ring buffer test missing from output:\n{}",
         stdout
@@ -1563,8 +1573,8 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("117 passed; 0 failed"),
-        "Expected 117 passed std unit tests, got:\n{}",
+        stdout.contains("121 passed; 0 failed"),
+        "Expected 121 passed std unit tests, got:\n{}",
         stdout
     );
 }
