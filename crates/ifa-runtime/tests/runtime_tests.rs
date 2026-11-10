@@ -2425,6 +2425,36 @@ fn test_runtime_fs_and_process_primitives() {
         );
     }
 
+    // 4b. Test copy_file, is_dir, and read_dir
+    let copied_file = temp_dir.join("test_copy.txt");
+    let copied_path = std::ffi::CString::new(copied_file.to_str().unwrap()).unwrap();
+    let copy_ok = ifa_rt_fs_copy_file(
+        test_path.as_ptr() as *const u8,
+        copied_path.as_ptr() as *const u8,
+    );
+    assert!(copy_ok);
+    assert!(ifa_rt_fs_exists(copied_path.as_ptr() as *const u8));
+
+    let temp_dir_path = std::ffi::CString::new(temp_dir.to_str().unwrap()).unwrap();
+    assert!(ifa_rt_fs_is_dir(temp_dir_path.as_ptr() as *const u8));
+    assert!(!ifa_rt_fs_is_dir(test_path.as_ptr() as *const u8));
+
+    let dir_list_ptr = ifa_rt_fs_read_dir(temp_dir_path.as_ptr() as *const u8);
+    assert!(!dir_list_ptr.is_null());
+    let dir_list_str = unsafe {
+        std::ffi::CStr::from_ptr(dir_list_ptr as *const std::os::raw::c_char)
+            .to_str()
+            .unwrap()
+    };
+    assert!(dir_list_str.contains("test.txt"));
+    assert!(dir_list_str.contains("test_copy.txt"));
+    unsafe {
+        std::alloc::dealloc(
+            dir_list_ptr,
+            std::alloc::Layout::from_size_align(dir_list_str.len() + 1, 1).unwrap(),
+        );
+    }
+
     // 5. Process exec
     let cmd = std::ffi::CString::new("echo").unwrap();
     let args = std::ffi::CString::new("IFA_DETERMINISTIC_BUILD").unwrap();

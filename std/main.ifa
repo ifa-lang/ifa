@@ -28,7 +28,11 @@ pub fn test_std_all() -> bool {
         && fs::test_fs_path_stem()
         && fs::test_fs_path_normalize()
         && fs::test_fs_path_is_absolute()
-        && fs::test_fs_io_roundtrip();
+        && fs::test_fs_io_roundtrip()
+        && fs::test_fs_append_and_lines_io()
+        && fs::test_fs_copy_and_dir_inspection()
+        && fs::test_fs_walk_and_filter()
+        && fs::test_fs_path_relative_and_extension();
 
     let t_process = process::test_process_find_linker()
         && process::test_process_find_tool()

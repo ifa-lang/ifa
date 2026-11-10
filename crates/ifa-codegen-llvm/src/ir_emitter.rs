@@ -170,6 +170,9 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_reactor_poll(i32)\n");
             out.push_str("declare i64 @ifa_rt_coro_pending_io_count()\n");
             out.push_str("declare ptr @ifa_rt_fs_read_to_string(ptr)\n");
+            out.push_str("declare ptr @ifa_rt_fs_read_dir(ptr)\n");
+            out.push_str("declare i1 @ifa_rt_fs_is_dir(ptr)\n");
+            out.push_str("declare i1 @ifa_rt_fs_copy_file(ptr, ptr)\n");
             out.push_str("declare i1 @ifa_rt_fs_write_string(ptr, ptr)\n");
             out.push_str("declare i1 @ifa_rt_fs_exists(ptr)\n");
             out.push_str("declare i64 @ifa_rt_fs_file_size(ptr)\n");
@@ -259,6 +262,9 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_reactor_poll(i32)\n");
             out.push_str("declare i64 @ifa_rt_coro_pending_io_count()\n");
             out.push_str("declare ptr @ifa_rt_fs_read_to_string(ptr)\n");
+            out.push_str("declare ptr @ifa_rt_fs_read_dir(ptr)\n");
+            out.push_str("declare i1 @ifa_rt_fs_is_dir(ptr)\n");
+            out.push_str("declare i1 @ifa_rt_fs_copy_file(ptr, ptr)\n");
             out.push_str("declare i1 @ifa_rt_fs_write_string(ptr, ptr)\n");
             out.push_str("declare i1 @ifa_rt_fs_exists(ptr)\n");
             out.push_str("declare i64 @ifa_rt_fs_file_size(ptr)\n");
@@ -2386,6 +2392,9 @@ impl<'a> LlvmIrEmitter<'a> {
                                 || callee == "fs::read_to_string"
                                 || callee == "read_to_string"
                                 || callee == "ifa_rt_fs_read_to_string"
+                                || callee == "fs::read_dir"
+                                || callee == "read_dir"
+                                || callee == "ifa_rt_fs_read_dir"
                                 || callee == "string_substr"
                                 || callee == "String::substr"
                                 || callee == "substring"
@@ -2401,6 +2410,12 @@ impl<'a> LlvmIrEmitter<'a> {
                             } else if callee == "fs::exists"
                                 || callee == "exists"
                                 || callee == "ifa_rt_fs_exists"
+                                || callee == "fs::is_dir"
+                                || callee == "is_dir"
+                                || callee == "ifa_rt_fs_is_dir"
+                                || callee == "fs::copy_file"
+                                || callee == "copy_file"
+                                || callee == "ifa_rt_fs_copy_file"
                                 || callee == "fs::write_string"
                                 || callee == "write_string"
                                 || callee == "ifa_rt_fs_write_string"
@@ -3542,6 +3557,9 @@ impl<'a> LlvmIrEmitter<'a> {
                 let callee = INTERNER.resolve(name);
                 let norm_callee = match callee.as_str() {
                     "fs::read_to_string" | "read_to_string" => "ifa_rt_fs_read_to_string",
+                    "fs::read_dir" | "read_dir" => "ifa_rt_fs_read_dir",
+                    "fs::is_dir" | "is_dir" => "ifa_rt_fs_is_dir",
+                    "fs::copy_file" | "copy_file" => "ifa_rt_fs_copy_file",
                     "fs::write_string" | "write_string" => "ifa_rt_fs_write_string",
                     "fs::exists" | "exists" => "ifa_rt_fs_exists",
                     "fs::file_size" | "file_size" => "ifa_rt_fs_file_size",
@@ -3613,11 +3631,16 @@ impl<'a> LlvmIrEmitter<'a> {
                             })
                             .collect();
                         (ret_ty, params)
-                    } else if norm_callee == "ifa_rt_fs_read_to_string" {
+                    } else if norm_callee == "ifa_rt_fs_read_to_string"
+                        || norm_callee == "ifa_rt_fs_read_dir"
+                    {
                         ("ptr".to_string(), vec!["ptr".to_string()])
-                    } else if norm_callee == "ifa_rt_fs_write_string" {
+                    } else if norm_callee == "ifa_rt_fs_write_string"
+                        || norm_callee == "ifa_rt_fs_copy_file"
+                    {
                         ("i1".to_string(), vec!["ptr".to_string(), "ptr".to_string()])
                     } else if norm_callee == "ifa_rt_fs_exists"
+                        || norm_callee == "ifa_rt_fs_is_dir"
                         || norm_callee == "ifa_rt_fs_remove_file"
                         || norm_callee == "ifa_rt_fs_create_dir_all"
                     {
@@ -5550,6 +5573,9 @@ impl<'a> LlvmIrEmitter<'a> {
                 let callee = INTERNER.resolve(name);
                 let norm_callee = match callee.as_str() {
                     "fs::read_to_string" | "read_to_string" => "ifa_rt_fs_read_to_string",
+                    "fs::read_dir" | "read_dir" => "ifa_rt_fs_read_dir",
+                    "fs::is_dir" | "is_dir" => "ifa_rt_fs_is_dir",
+                    "fs::copy_file" | "copy_file" => "ifa_rt_fs_copy_file",
                     "fs::write_string" | "write_string" => "ifa_rt_fs_write_string",
                     "fs::exists" | "exists" => "ifa_rt_fs_exists",
                     "fs::file_size" | "file_size" => "ifa_rt_fs_file_size",
@@ -5618,11 +5644,16 @@ impl<'a> LlvmIrEmitter<'a> {
                             })
                             .collect();
                         (ret_ty, params)
-                    } else if norm_callee == "ifa_rt_fs_read_to_string" {
+                    } else if norm_callee == "ifa_rt_fs_read_to_string"
+                        || norm_callee == "ifa_rt_fs_read_dir"
+                    {
                         ("ptr".to_string(), vec!["ptr".to_string()])
-                    } else if norm_callee == "ifa_rt_fs_write_string" {
+                    } else if norm_callee == "ifa_rt_fs_write_string"
+                        || norm_callee == "ifa_rt_fs_copy_file"
+                    {
                         ("i1".to_string(), vec!["ptr".to_string(), "ptr".to_string()])
                     } else if norm_callee == "ifa_rt_fs_exists"
+                        || norm_callee == "ifa_rt_fs_is_dir"
                         || norm_callee == "ifa_rt_fs_remove_file"
                         || norm_callee == "ifa_rt_fs_create_dir_all"
                     {

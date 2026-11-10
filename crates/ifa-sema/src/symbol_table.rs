@@ -568,6 +568,62 @@ impl SymbolTable {
             ret_ty: Type::Int(crate::types::IntType::U64),
             span: dummy,
         });
+        fs_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("read_dir"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: path_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        fs_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("is_dir"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: path_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        fs_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("copy_file"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("src"),
+                    ty: Type::String,
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: INTERNER.intern("dst"),
+                    ty: Type::String,
+                    span: dummy,
+                },
+            ],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
         self.modules.insert(fs_name, fs_mod.clone());
         self.modules.insert(std_fs_name, fs_mod);
 
@@ -1805,6 +1861,69 @@ impl SymbolTable {
                 ty: Type::String,
                 span: dummy,
             }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+
+        let read_dir_sym = INTERNER.intern("read_dir");
+        let is_dir_sym = INTERNER.intern("is_dir");
+        let copy_file_sym = INTERNER.intern("copy_file");
+        let src_sym = INTERNER.intern("src");
+        let dst_sym = INTERNER.intern("dst");
+
+        let _ = self.define_function(FunctionSymbol {
+            name: read_dir_sym,
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: path_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: is_dir_sym,
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: path_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Bool,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: copy_file_sym,
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: src_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+                ParamSymbol {
+                    mode: ParamMode::In,
+                    name: dst_sym,
+                    ty: Type::String,
+                    span: dummy,
+                },
+            ],
             ret_ty: Type::Bool,
             span: dummy,
         });

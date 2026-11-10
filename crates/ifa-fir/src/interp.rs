@@ -2421,6 +2421,58 @@ impl<'a> FirInterpreter<'a> {
                         .unwrap_or("");
                     let ok = std::fs::create_dir_all(path).is_ok();
                     Ok(FirValue::Bool(ok))
+                } else if fn_name == "fs::read_dir"
+                    || fn_name == "read_dir"
+                    || fn_name == "ifa_rt_fs_read_dir"
+                {
+                    let path = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let mut names = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(path) {
+                        for entry in entries.flatten() {
+                            if let Ok(name) = entry.file_name().into_string() {
+                                names.push(name);
+                            }
+                        }
+                    }
+                    names.sort();
+                    Ok(FirValue::String(names.join("\n")))
+                } else if fn_name == "fs::is_dir"
+                    || fn_name == "is_dir"
+                    || fn_name == "ifa_rt_fs_is_dir"
+                {
+                    let path = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    Ok(FirValue::Bool(std::path::Path::new(path).is_dir()))
+                } else if fn_name == "fs::copy_file"
+                    || fn_name == "copy_file"
+                    || fn_name == "ifa_rt_fs_copy_file"
+                {
+                    let src = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let dst = evaluated_args
+                        .get(1)
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    Ok(FirValue::Bool(std::fs::copy(src, dst).is_ok()))
                 } else if fn_name == "process::exec"
                     || fn_name == "exec"
                     || fn_name == "ifa_rt_process_exec"

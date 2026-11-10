@@ -279,6 +279,9 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                                 || callee == "fs::read_to_string"
                                 || callee == "read_to_string"
                                 || callee == "ifa_rt_fs_read_to_string"
+                                || callee == "fs::read_dir"
+                                || callee == "read_dir"
+                                || callee == "ifa_rt_fs_read_dir"
                                 || callee == "string_substr"
                                 || callee == "String::substr"
                                 || callee == "substring"
@@ -294,6 +297,12 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                             } else if callee == "fs::exists"
                                 || callee == "exists"
                                 || callee == "ifa_rt_fs_exists"
+                                || callee == "fs::is_dir"
+                                || callee == "is_dir"
+                                || callee == "ifa_rt_fs_is_dir"
+                                || callee == "fs::copy_file"
+                                || callee == "copy_file"
+                                || callee == "ifa_rt_fs_copy_file"
                                 || callee == "fs::write_string"
                                 || callee == "write_string"
                                 || callee == "ifa_rt_fs_write_string"
@@ -1144,6 +1153,9 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     "process::find_tool" | "find_tool" => "ifa_rt_process_find_tool",
                     "process::env_var" | "env_var" => "ifa_rt_env_var",
                     "fs::read_to_string" | "read_to_string" => "ifa_rt_fs_read_to_string",
+                    "fs::read_dir" | "read_dir" => "ifa_rt_fs_read_dir",
+                    "fs::is_dir" | "is_dir" => "ifa_rt_fs_is_dir",
+                    "fs::copy_file" | "copy_file" => "ifa_rt_fs_copy_file",
                     "fs::write_string" | "write_string" => "ifa_rt_fs_write_string",
                     "fs::exists" | "exists" => "ifa_rt_fs_exists",
                     "fs::file_size" | "file_size" => "ifa_rt_fs_file_size",

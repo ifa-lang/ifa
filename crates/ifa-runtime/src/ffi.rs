@@ -1237,6 +1237,78 @@ pub extern "C" fn ifa_rt_fs_create_dir_all(path: *const u8) -> bool {
     std::fs::create_dir_all(path_str).is_ok()
 }
 
+/// Read entries of a directory on disk, sorted lexicographically and joined by newline '\n'.
+/// Returns an empty null-terminated string on error or if the directory is empty.
+#[no_mangle]
+pub extern "C" fn ifa_rt_fs_read_dir(path: *const u8) -> *mut u8 {
+    let path_str = if path.is_null() {
+        ""
+    } else {
+        unsafe {
+            std::ffi::CStr::from_ptr(path as *const std::os::raw::c_char)
+                .to_str()
+                .unwrap_or("")
+        }
+    };
+    let mut names = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(path_str) {
+        for entry in entries.flatten() {
+            if let Ok(name) = entry.file_name().into_string() {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    let content = names.join("\n");
+    let bytes = format!("{}\0", content).into_bytes();
+    let len = bytes.len();
+    let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, len);
+        mem
+    }
+}
+
+/// Check if a path points to an existing directory.
+#[no_mangle]
+pub extern "C" fn ifa_rt_fs_is_dir(path: *const u8) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    let path_str = unsafe {
+        match std::ffi::CStr::from_ptr(path as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+    std::path::Path::new(path_str).is_dir()
+}
+
+/// Copy a file on disk. Returns true on success, false on error.
+#[no_mangle]
+pub extern "C" fn ifa_rt_fs_copy_file(src: *const u8, dst: *const u8) -> bool {
+    if src.is_null() || dst.is_null() {
+        return false;
+    }
+    let src_str = unsafe {
+        match std::ffi::CStr::from_ptr(src as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+    let dst_str = unsafe {
+        match std::ffi::CStr::from_ptr(dst as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+    std::fs::copy(src_str, dst_str).is_ok()
+}
+
 /// Return the byte-length of a null-terminated UTF-8 C string (excluding the null terminator).
 /// Returns 0 for a null pointer.
 #[no_mangle]

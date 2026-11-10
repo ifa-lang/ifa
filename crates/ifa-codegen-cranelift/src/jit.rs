@@ -260,6 +260,39 @@ impl JitEngine {
             "create_dir_all",
             ifa_runtime::ffi::ifa_rt_fs_create_dir_all as *const u8,
         );
+        builder.symbol(
+            "ifa_rt_fs_read_dir",
+            ifa_runtime::ffi::ifa_rt_fs_read_dir as *const u8,
+        );
+        builder.symbol(
+            "fs::read_dir",
+            ifa_runtime::ffi::ifa_rt_fs_read_dir as *const u8,
+        );
+        builder.symbol(
+            "read_dir",
+            ifa_runtime::ffi::ifa_rt_fs_read_dir as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_fs_is_dir",
+            ifa_runtime::ffi::ifa_rt_fs_is_dir as *const u8,
+        );
+        builder.symbol(
+            "fs::is_dir",
+            ifa_runtime::ffi::ifa_rt_fs_is_dir as *const u8,
+        );
+        builder.symbol("is_dir", ifa_runtime::ffi::ifa_rt_fs_is_dir as *const u8);
+        builder.symbol(
+            "ifa_rt_fs_copy_file",
+            ifa_runtime::ffi::ifa_rt_fs_copy_file as *const u8,
+        );
+        builder.symbol(
+            "fs::copy_file",
+            ifa_runtime::ffi::ifa_rt_fs_copy_file as *const u8,
+        );
+        builder.symbol(
+            "copy_file",
+            ifa_runtime::ffi::ifa_rt_fs_copy_file as *const u8,
+        );
         builder.symbol("ifa_rt_coro_create", ifa_rt_coro_create as *const u8);
         builder.symbol(
             "ifa_rt_coro_create_custom",
@@ -923,6 +956,33 @@ impl JitEngine {
         self.func_ids
             .insert("fs::create_dir_all".into(), fs_mkdir_id);
         self.func_ids.insert("create_dir_all".into(), fs_mkdir_id);
+
+        let fs_read_dir_id = self
+            .module
+            .declare_function("ifa_rt_fs_read_dir", Linkage::Import, &fs_read_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_read_dir".into(), fs_read_dir_id);
+        self.func_ids.insert("fs::read_dir".into(), fs_read_dir_id);
+        self.func_ids.insert("read_dir".into(), fs_read_dir_id);
+
+        let fs_is_dir_id = self
+            .module
+            .declare_function("ifa_rt_fs_is_dir", Linkage::Import, &fs_exists_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_is_dir".into(), fs_is_dir_id);
+        self.func_ids.insert("fs::is_dir".into(), fs_is_dir_id);
+        self.func_ids.insert("is_dir".into(), fs_is_dir_id);
+
+        let fs_copy_id = self
+            .module
+            .declare_function("ifa_rt_fs_copy_file", Linkage::Import, &fs_write_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_copy_file".into(), fs_copy_id);
+        self.func_ids.insert("fs::copy_file".into(), fs_copy_id);
+        self.func_ids.insert("copy_file".into(), fs_copy_id);
 
         // Register stackless coroutine intrinsics
         let mut coro_create_sig = Signature::new(call_conv);

@@ -183,6 +183,166 @@ pub fn fs_create_dir_all(path: String) -> bool {
     return create_dir_all(path);
 }
 
+pub fn fs_read_dir(path: String) -> List<String> {
+    let raw = read_dir(path);
+    mut res: List<String> = List::new();
+    let len = string_len(raw);
+    if len == 0 {
+        return res;
+    }
+    mut start: i64 = 0;
+    mut i: i64 = 0;
+    while i < len {
+        let c = string_char_at(raw, i);
+        if c == 10 { // '\n'
+            if i > start {
+                let entry = string_substr(raw, start, i - start);
+                res.push(entry);
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < len {
+        let entry = string_substr(raw, start, len - start);
+        res.push(entry);
+    }
+    return res;
+}
+
+pub fn fs_is_dir(path: String) -> bool {
+    return is_dir(path);
+}
+
+pub fn fs_copy_file(src: String, dst: String) -> bool {
+    return copy_file(src, dst);
+}
+
+pub fn fs_append_string(path: String, content: String) -> bool {
+    let existing = if fs_exists(path) { fs_read_to_string(path) } else { "" };
+    return fs_write_string(path, existing + content);
+}
+
+pub fn fs_read_lines(path: String) -> List<String> {
+    let raw = fs_read_to_string(path);
+    mut res: List<String> = List::new();
+    let len = string_len(raw);
+    if len == 0 {
+        return res;
+    }
+    mut start: i64 = 0;
+    mut i: i64 = 0;
+    while i < len {
+        let c = string_char_at(raw, i);
+        if c == 10 { // '\n'
+            mut line_len = i - start;
+            if line_len > 0 && string_char_at(raw, start + line_len - 1) == 13 { // '\r'
+                line_len = line_len - 1;
+            }
+            let line = string_substr(raw, start, line_len);
+            res.push(line);
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < len {
+        mut line_len = len - start;
+        if line_len > 0 && string_char_at(raw, start + line_len - 1) == 13 {
+            line_len = line_len - 1;
+        }
+        let line = string_substr(raw, start, line_len);
+        res.push(line);
+    }
+    return res;
+}
+
+pub fn fs_write_lines(path: String, lines: List<String>) -> bool {
+    mut content: String = "";
+    mut i: i64 = 0;
+    while i < lines.len() {
+        content = content + lines[i] + "\n";
+        i = i + 1;
+    }
+    return fs_write_string(path, content);
+}
+
+pub fn path_with_extension(path: String, new_ext: String) -> String {
+    let stem_str = path_stem(path);
+    let dir_str = path_dirname(path);
+    let file_with_ext = if new_ext == "" { stem_str } else { stem_str + "." + new_ext };
+    if dir_str == "." {
+        return file_with_ext;
+    }
+    return path_join(dir_str, file_with_ext);
+}
+
+pub fn path_relative(base: String, target: String) -> String {
+    let norm_base = path_normalize(base);
+    let norm_target = path_normalize(target);
+    let base_len = string_len(norm_base);
+    let target_len = string_len(norm_target);
+    if base_len == 0 {
+        return norm_target;
+    }
+    if norm_base == norm_target {
+        return ".";
+    }
+    if target_len > base_len {
+        let prefix = string_substr(norm_target, 0, base_len);
+        if prefix == norm_base {
+            let sep_char = string_char_at(norm_target, base_len);
+            if path_is_separator(sep_char) {
+                return string_substr(norm_target, base_len + 1, target_len - base_len - 1);
+            }
+        }
+    }
+    return norm_target;
+}
+
+pub fn fs_walk_dir(root: String) -> List<String> {
+    mut results: List<String> = List::new();
+    if !fs_exists(root) {
+        return results;
+    }
+    mut queue: List<String> = List::new();
+    queue.push(root);
+    mut head: i64 = 0;
+    while head < queue.len() {
+        let current = queue[head];
+        head = head + 1;
+        if fs_is_dir(current) {
+            let entries = fs_read_dir(current);
+            mut i: i64 = 0;
+            while i < entries.len() {
+                let entry_name = entries[i];
+                if entry_name != "." && entry_name != ".." {
+                    let sub_path = path_join(current, entry_name);
+                    results.push(sub_path);
+                    if fs_is_dir(sub_path) {
+                        queue.push(sub_path);
+                    }
+                }
+                i = i + 1;
+            }
+        }
+    }
+    return results;
+}
+
+pub fn fs_walk_matching(root: String, extension: String) -> List<String> {
+    let all = fs_walk_dir(root);
+    mut filtered: List<String> = List::new();
+    mut i: i64 = 0;
+    while i < all.len() {
+        let p = all[i];
+        if path_has_extension(p, extension) {
+            filtered.push(p);
+        }
+        i = i + 1;
+    }
+    return filtered;
+}
+
 // Automated Test Suites for std/fs
 pub fn test_fs_path_join() -> bool {
     let j1 = path_join("compiler", "driver.ifa");
@@ -274,6 +434,92 @@ pub fn test_fs_io_roundtrip() -> bool {
     return r_ok;
 }
 
+pub fn test_fs_append_and_lines_io() -> bool {
+    let test_file = "/tmp/ifa_std_fs_lines_test.txt";
+    mut lines: List<String> = List::new();
+    lines.push("alpha");
+    lines.push("beta");
+    lines.push("gamma");
+
+    let w_ok = fs_write_lines(test_file, lines);
+    if !w_ok {
+        return false;
+    }
+
+    let append_ok = fs_append_string(test_file, "delta\n");
+    if !append_ok {
+        let _ = fs_remove_file(test_file);
+        return false;
+    }
+
+    let read_lines = fs_read_lines(test_file);
+    let _ = fs_remove_file(test_file);
+
+    if read_lines.len() != 4 {
+        return false;
+    }
+    return read_lines[0] == "alpha"
+        && read_lines[1] == "beta"
+        && read_lines[2] == "gamma"
+        && read_lines[3] == "delta";
+}
+
+pub fn test_fs_copy_and_dir_inspection() -> bool {
+    let src = "/tmp/ifa_std_fs_src.txt";
+    let dst = "/tmp/ifa_std_fs_dst.txt";
+    let _ = fs_write_string(src, "deterministic-copy-content");
+
+    let c_ok = fs_copy_file(src, dst);
+    if !c_ok {
+        let _ = fs_remove_file(src);
+        return false;
+    }
+
+    let dst_ex = fs_exists(dst);
+    let is_dir_file = fs_is_dir(src);
+    let is_dir_tmp = fs_is_dir("/tmp");
+
+    let _ = fs_remove_file(src);
+    let _ = fs_remove_file(dst);
+
+    return dst_ex && !is_dir_file && is_dir_tmp;
+}
+
+pub fn test_fs_walk_and_filter() -> bool {
+    let test_dir = "/tmp/ifa_walk_test_sandbox";
+    let sub_dir = "/tmp/ifa_walk_test_sandbox/nested";
+    let _ = fs_create_dir_all(sub_dir);
+
+    let f1 = path_join(test_dir, "file_a.ifa");
+    let f2 = path_join(test_dir, "file_b.txt");
+    let f3 = path_join(sub_dir, "file_c.ifa");
+
+    let _ = fs_write_string(f1, "module a;");
+    let _ = fs_write_string(f2, "text");
+    let _ = fs_write_string(f3, "module c;");
+
+    let walked = fs_walk_dir(test_dir);
+    let matching_ifa = fs_walk_matching(test_dir, "ifa");
+
+    let _ = fs_remove_file(f1);
+    let _ = fs_remove_file(f2);
+    let _ = fs_remove_file(f3);
+
+    return walked.len() >= 3 && matching_ifa.len() == 2;
+}
+
+pub fn test_fs_path_relative_and_extension() -> bool {
+    let rel1 = path_relative("/root/ifa", "/root/ifa/std/fs.ifa");
+    let rel2 = path_relative("/root/ifa", "/root/ifa");
+    let ext1 = path_with_extension("driver.ifa", "o");
+    let ext2 = path_with_extension("compiler/driver", "ll");
+
+    return rel1 == "std/fs.ifa"
+        && rel2 == "."
+        && ext1 == "driver.o"
+        && ext2 == "compiler/driver.ll";
+}
+
 pub fn test_fs_all() -> bool {
     let t1 = test_fs_path_join();
     let t2 = test_fs_path_dirname();
@@ -283,7 +529,11 @@ pub fn test_fs_all() -> bool {
     let t6 = test_fs_path_normalize();
     let t7 = test_fs_path_is_absolute();
     let t8 = test_fs_io_roundtrip();
-    return t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8;
+    let t9 = test_fs_append_and_lines_io();
+    let t10 = test_fs_copy_and_dir_inspection();
+    let t11 = test_fs_walk_and_filter();
+    let t12 = test_fs_path_relative_and_extension();
+    return t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12;
 }
 
 pub fn main() {

@@ -4175,6 +4175,16 @@ pub fn register_stdlib_fs_symbols(inout catalog: MultiModuleCatalog) {
     register_module_symbol(inout catalog, "std/fs", "fs_file_size", 6);
     register_module_symbol(inout catalog, "std/fs", "fs_create_dir_all", 6);
     register_module_symbol(inout catalog, "std/fs", "fs_remove_file", 6);
+    register_module_symbol(inout catalog, "std/fs", "fs_read_dir", 6);
+    register_module_symbol(inout catalog, "std/fs", "fs_is_dir", 6);
+    register_module_symbol(inout catalog, "std/fs", "fs_copy_file", 6);
+    register_module_symbol(inout catalog, "std/fs", "fs_append_string", 6);
+    register_module_symbol(inout catalog, "std/fs", "fs_read_lines", 6);
+    register_module_symbol(inout catalog, "std/fs", "fs_write_lines", 6);
+    register_module_symbol(inout catalog, "std/fs", "fs_walk_dir", 6);
+    register_module_symbol(inout catalog, "std/fs", "fs_walk_matching", 6);
+    register_module_symbol(inout catalog, "std/fs", "path_relative", 6);
+    register_module_symbol(inout catalog, "std/fs", "path_with_extension", 6);
 }
 
 pub fn register_stdlib_process_symbols(inout catalog: MultiModuleCatalog) {
