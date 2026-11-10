@@ -854,6 +854,78 @@ impl SymbolTable {
         self.modules.insert(net_name, net_mod.clone());
         self.modules.insert(std_net_name, net_mod);
 
+        // 2d. Module `std::time` / `time`
+        let time_name = INTERNER.intern("time");
+        let std_time_name = INTERNER.intern("std::time");
+        let mut time_mod = ModuleSymbol::new(
+            time_name,
+            vec![INTERNER.intern("std"), time_name],
+            true,
+            dummy,
+        );
+        time_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("unix_secs"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        time_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("unix_millis"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        time_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("unix_nanos"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        time_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("monotonic_nanos"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        time_mod.add_function(FunctionSymbol {
+            name: INTERNER.intern("sleep_ms"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: INTERNER.intern("millis"),
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::Unit,
+            span: dummy,
+        });
+        self.modules.insert(time_name, time_mod.clone());
+        self.modules.insert(std_time_name, time_mod);
+
         // 3. Module `net::http` / `http`
         let http_name = INTERNER.intern("http");
         let net_http_name = INTERNER.intern("net::http");
@@ -1482,6 +1554,40 @@ impl SymbolTable {
             span: dummy,
         });
 
+        let code_sym = INTERNER.intern("code");
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("string_from_char"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: code_sym,
+                ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            }],
+            ret_ty: Type::String,
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("string_to_int"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: vec![ParamSymbol {
+                mode: ParamMode::In,
+                name: str_sym,
+                ty: Type::String,
+                span: dummy,
+            }],
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+
         // Global filesystem intrinsics
         let read_to_string_sym = INTERNER.intern("read_to_string");
         let write_string_sym = INTERNER.intern("write_string");
@@ -1930,6 +2036,51 @@ impl SymbolTable {
                 span: dummy,
             }],
             ret_ty: Type::Unit,
+            span: dummy,
+        });
+
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("time_unix_secs"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("time_unix_millis"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("time_unix_nanos"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Int(crate::types::IntType::I64),
+            span: dummy,
+        });
+        let _ = self.define_function(FunctionSymbol {
+            name: INTERNER.intern("time_monotonic_nanos"),
+            is_pub: true,
+            is_strict: false,
+            is_comptime: false,
+            is_extern: None,
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Int(crate::types::IntType::I64),
             span: dummy,
         });
     }

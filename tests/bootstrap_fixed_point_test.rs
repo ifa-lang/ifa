@@ -1428,13 +1428,83 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_collections_ring_buffer ... ok"),
+        "Std collections ring buffer test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_json_primitives ... ok"),
+        "Std json primitives test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_json_arrays ... ok"),
+        "Std json arrays test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_json_objects ... ok"),
+        "Std json objects test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_json_escaped_strings ... ok"),
+        "Std json escaped strings test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_json_nested_structure ... ok"),
+        "Std json nested structure test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_json_pretty_formatting ... ok"),
+        "Std json pretty formatting test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_json_all ... ok"),
+        "Std json all test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_time_leap_year ... ok"),
+        "Std time leap year test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_time_epoch_zero ... ok"),
+        "Std time epoch zero test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_time_known_timestamp ... ok"),
+        "Std time known timestamp test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_time_duration_arithmetic ... ok"),
+        "Std time duration arithmetic test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_time_instant_elapsed ... ok"),
+        "Std time instant elapsed test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_time_all ... ok"),
+        "Std time all test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("71 passed; 0 failed"),
-        "Expected 71 passed std unit tests, got:\n{}",
+        stdout.contains("99 passed; 0 failed"),
+        "Expected 99 passed std unit tests, got:\n{}",
         stdout
     );
 }

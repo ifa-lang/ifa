@@ -1,11 +1,13 @@
 // Pure IFA Standard Library: Main Entrypoint (`std/main.ifa`)
-// Root module aggregating crypto, fs, process, and collections autonomous subsystems.
+// Root module aggregating crypto, fs, process, collections, net, time, and json autonomous subsystems.
 
 import crypto;
 import fs;
 import process;
 import collections;
 import net;
+import time;
+import json;
 
 pub fn test_std_all() -> bool {
     let t_crypto = crypto::test_crypto_fnv1a()
@@ -38,11 +40,16 @@ pub fn test_std_all() -> bool {
         && collections::test_collections_map()
         && collections::test_collections_set()
         && collections::test_collections_byte_buffer()
-        && collections::test_collections_string_builder();
+        && collections::test_collections_string_builder()
+        && collections::test_collections_ring_buffer();
 
     let t_net = net::test_net_all();
 
-    return t_crypto && t_fs && t_process && t_collections && t_net;
+    let t_time = time::test_time_all();
+
+    let t_json = json::test_json_all();
+
+    return t_crypto && t_fs && t_process && t_collections && t_net && t_time && t_json;
 }
 
 pub fn main() {

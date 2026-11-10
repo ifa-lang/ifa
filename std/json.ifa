@@ -1,0 +1,688 @@
+// Pure IFA Standard Library: JSON Parsing & Synthesis Subsystem (`std/json.ifa`)
+// Deterministic recursive JSON parser and serializer with structured values and escape handling.
+
+pub struct JsonValue {
+    kind: i64, // 0: Null, 1: Bool, 2: Number, 3: String, 4: Array, 5: Object
+    bool_val: bool,
+    int_val: i64,
+    str_val: String,
+    arr_val: List<JsonValue>,
+    obj_keys: List<String>,
+    obj_vals: List<JsonValue>
+}
+
+// ---------------------------------------------------------------------------
+// 1. Constructors & Basic Helpers
+// ---------------------------------------------------------------------------
+
+pub fn json_null() -> JsonValue {
+    return JsonValue(
+        kind: 0,
+        bool_val: false,
+        int_val: 0,
+        str_val: "",
+        arr_val: List::new(),
+        obj_keys: List::new(),
+        obj_vals: List::new()
+    );
+}
+
+pub fn json_bool(b: bool) -> JsonValue {
+    return JsonValue(
+        kind: 1,
+        bool_val: b,
+        int_val: 0,
+        str_val: "",
+        arr_val: List::new(),
+        obj_keys: List::new(),
+        obj_vals: List::new()
+    );
+}
+
+pub fn json_int(n: i64) -> JsonValue {
+    return JsonValue(
+        kind: 2,
+        bool_val: false,
+        int_val: n,
+        str_val: "",
+        arr_val: List::new(),
+        obj_keys: List::new(),
+        obj_vals: List::new()
+    );
+}
+
+pub fn json_string(s: String) -> JsonValue {
+    return JsonValue(
+        kind: 3,
+        bool_val: false,
+        int_val: 0,
+        str_val: s,
+        arr_val: List::new(),
+        obj_keys: List::new(),
+        obj_vals: List::new()
+    );
+}
+
+pub fn json_array() -> JsonValue {
+    return JsonValue(
+        kind: 4,
+        bool_val: false,
+        int_val: 0,
+        str_val: "",
+        arr_val: List::new(),
+        obj_keys: List::new(),
+        obj_vals: List::new()
+    );
+}
+
+pub fn json_object() -> JsonValue {
+    return JsonValue(
+        kind: 5,
+        bool_val: false,
+        int_val: 0,
+        str_val: "",
+        arr_val: List::new(),
+        obj_keys: List::new(),
+        obj_vals: List::new()
+    );
+}
+
+pub fn json_is_null(v: JsonValue) -> bool {
+    return v.kind == 0;
+}
+
+pub fn json_is_bool(v: JsonValue) -> bool {
+    return v.kind == 1;
+}
+
+pub fn json_is_number(v: JsonValue) -> bool {
+    return v.kind == 2;
+}
+
+pub fn json_is_string(v: JsonValue) -> bool {
+    return v.kind == 3;
+}
+
+pub fn json_is_array(v: JsonValue) -> bool {
+    return v.kind == 4;
+}
+
+pub fn json_is_object(v: JsonValue) -> bool {
+    return v.kind == 5;
+}
+
+pub fn json_get_bool(v: JsonValue) -> bool {
+    return v.bool_val;
+}
+
+pub fn json_get_int(v: JsonValue) -> i64 {
+    return v.int_val;
+}
+
+pub fn json_get_string(v: JsonValue) -> String {
+    return v.str_val;
+}
+
+// ---------------------------------------------------------------------------
+// 2. Array Operations
+// ---------------------------------------------------------------------------
+
+pub fn json_array_push(inout arr: JsonValue, item: JsonValue) {
+    if arr.kind == 4 {
+        arr.arr_val.push(item);
+    }
+}
+
+pub fn json_array_len(arr: JsonValue) -> i64 {
+    if arr.kind == 4 {
+        return arr.arr_val.len();
+    }
+    return 0;
+}
+
+pub fn json_array_get(arr: JsonValue, idx: i64) -> JsonValue {
+    if arr.kind == 4 && idx >= 0 && idx < arr.arr_val.len() {
+        return arr.arr_val[idx];
+    }
+    return json_null();
+}
+
+// ---------------------------------------------------------------------------
+// 3. Object Operations
+// ---------------------------------------------------------------------------
+
+pub fn json_object_set(inout obj: JsonValue, key: String, val: JsonValue) {
+    if obj.kind != 5 {
+        return;
+    }
+    mut i: i64 = 0;
+    while i < obj.obj_keys.len() {
+        if obj.obj_keys[i] == key {
+            obj.obj_vals[i] = val;
+            return;
+        }
+        i = i + 1;
+    }
+    obj.obj_keys.push(key);
+    obj.obj_vals.push(val);
+}
+
+pub fn json_object_get(obj: JsonValue, key: String) -> JsonValue {
+    if obj.kind != 5 {
+        return json_null();
+    }
+    mut i: i64 = 0;
+    while i < obj.obj_keys.len() {
+        if obj.obj_keys[i] == key {
+            return obj.obj_vals[i];
+        }
+        i = i + 1;
+    }
+    return json_null();
+}
+
+pub fn json_object_has(obj: JsonValue, key: String) -> bool {
+    if obj.kind != 5 {
+        return false;
+    }
+    mut i: i64 = 0;
+    while i < obj.obj_keys.len() {
+        if obj.obj_keys[i] == key {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn json_object_len(obj: JsonValue) -> i64 {
+    if obj.kind == 5 {
+        return obj.obj_keys.len();
+    }
+    return 0;
+}
+
+pub fn json_object_key_at(obj: JsonValue, idx: i64) -> String {
+    if obj.kind == 5 && idx >= 0 && idx < obj.obj_keys.len() {
+        return obj.obj_keys[idx];
+    }
+    return "";
+}
+
+pub fn json_object_val_at(obj: JsonValue, idx: i64) -> JsonValue {
+    if obj.kind == 5 && idx >= 0 && idx < obj.obj_vals.len() {
+        return obj.obj_vals[idx];
+    }
+    return json_null();
+}
+
+// ---------------------------------------------------------------------------
+// 4. String Escaping & Serialization
+// ---------------------------------------------------------------------------
+
+pub fn int_to_digit(d: i64) -> String {
+    if d == 0 { return "0"; }
+    if d == 1 { return "1"; }
+    if d == 2 { return "2"; }
+    if d == 3 { return "3"; }
+    if d == 4 { return "4"; }
+    if d == 5 { return "5"; }
+    if d == 6 { return "6"; }
+    if d == 7 { return "7"; }
+    if d == 8 { return "8"; }
+    if d == 9 { return "9"; }
+    return "0";
+}
+
+pub fn int_to_str(mut n: i64) -> String {
+    if n == 0 {
+        return "0";
+    }
+    mut is_neg = false;
+    if n < 0 {
+        is_neg = true;
+        n = 0 - n;
+    }
+    mut digits = "";
+    while n > 0 {
+        let rem = n % 10;
+        let d = int_to_digit(rem);
+        digits = d + digits;
+        n = n / 10;
+    }
+    if is_neg {
+        return "-" + digits;
+    }
+    return digits;
+}
+
+pub fn json_escape_string(s: String) -> String {
+    let len = string_len(s);
+    mut out: String = "";
+    mut i: i64 = 0;
+    while i < len {
+        let c = string_char_at(s, i);
+        if c == 34 { // '"'
+            out = out + "\\\"";
+        } else if c == 92 { // '\'
+            out = out + "\\\\";
+        } else if c == 10 { // '\n'
+            out = out + "\\n";
+        } else if c == 9 { // '\t'
+            out = out + "\\t";
+        } else if c == 13 { // '\r'
+            out = out + "\\r";
+        } else {
+            out = out + string_substr(s, i, 1);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn json_stringify(v: JsonValue) -> String {
+    if v.kind == 0 {
+        return "null";
+    }
+    if v.kind == 1 {
+        if v.bool_val {
+            return "true";
+        }
+        return "false";
+    }
+    if v.kind == 2 {
+        return int_to_str(v.int_val);
+    }
+    if v.kind == 3 {
+        return "\"" + json_escape_string(v.str_val) + "\"";
+    }
+    if v.kind == 4 {
+        mut out: String = "[";
+        mut i: i64 = 0;
+        let count = v.arr_val.len();
+        while i < count {
+            out = out + json_stringify(v.arr_val[i]);
+            if i + 1 < count {
+                out = out + ",";
+            }
+            i = i + 1;
+        }
+        return out + "]";
+    }
+    if v.kind == 5 {
+        mut out: String = "{";
+        mut i: i64 = 0;
+        let count = v.obj_keys.len();
+        while i < count {
+            out = out + "\"" + json_escape_string(v.obj_keys[i]) + "\":" + json_stringify(v.obj_vals[i]);
+            if i + 1 < count {
+                out = out + ",";
+            }
+            i = i + 1;
+        }
+        return out + "}";
+    }
+    return "null";
+}
+
+pub fn json_make_indent(level: i64) -> String {
+    mut s: String = "";
+    mut i: i64 = 0;
+    while i < level {
+        s = s + "  ";
+        i = i + 1;
+    }
+    return s;
+}
+
+pub fn json_stringify_pretty_rec(v: JsonValue, indent_level: i64) -> String {
+    if v.kind != 4 && v.kind != 5 {
+        return json_stringify(v);
+    }
+    let cur_indent = json_make_indent(indent_level);
+    let next_indent = json_make_indent(indent_level + 1);
+
+    if v.kind == 4 {
+        let count = v.arr_val.len();
+        if count == 0 {
+            return "[]";
+        }
+        mut out: String = "[\n";
+        mut i: i64 = 0;
+        while i < count {
+            out = out + next_indent + json_stringify_pretty_rec(v.arr_val[i], indent_level + 1);
+            if i + 1 < count {
+                out = out + ",\n";
+            } else {
+                out = out + "\n";
+            }
+            i = i + 1;
+        }
+        return out + cur_indent + "]";
+    }
+
+    if v.kind == 5 {
+        let count = v.obj_keys.len();
+        if count == 0 {
+            return "{}";
+        }
+        mut out: String = "{\n";
+        mut i: i64 = 0;
+        while i < count {
+            out = out + next_indent + "\"" + json_escape_string(v.obj_keys[i]) + "\": " + json_stringify_pretty_rec(v.obj_vals[i], indent_level + 1);
+            if i + 1 < count {
+                out = out + ",\n";
+            } else {
+                out = out + "\n";
+            }
+            i = i + 1;
+        }
+        return out + cur_indent + "}";
+    }
+    return "null";
+}
+
+pub fn json_stringify_pretty(v: JsonValue) -> String {
+    return json_stringify_pretty_rec(v, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Recursive JSON Parser
+// ---------------------------------------------------------------------------
+
+pub fn json_skip_whitespace(s: String, inout pos: i64, len: i64) {
+    while pos < len {
+        let c = string_char_at(s, pos);
+        if c == 32 || c == 9 || c == 10 || c == 13 { // ' ', '\t', '\n', '\r'
+            pos = pos + 1;
+        } else {
+            return;
+        }
+    }
+}
+
+pub fn json_parse_string(s: String, inout pos: i64, len: i64) -> String {
+    pos = pos + 1; // skip leading '"'
+    mut out: String = "";
+    while pos < len {
+        let c = string_char_at(s, pos);
+        if c == 34 { // closing '"'
+            pos = pos + 1;
+            return out;
+        }
+        if c == 92 { // '\'
+            pos = pos + 1;
+            if pos < len {
+                let esc = string_char_at(s, pos);
+                if esc == 34 { out = out + "\""; }
+                else if esc == 92 { out = out + "\\"; }
+                else if esc == 110 { out = out + "\n"; }
+                else if esc == 116 { out = out + "\t"; }
+                else if esc == 114 { out = out + "\r"; }
+                else { out = out + string_substr(s, pos, 1); }
+                pos = pos + 1;
+            }
+        } else {
+            out = out + string_substr(s, pos, 1);
+            pos = pos + 1;
+        }
+    }
+    return out;
+}
+
+pub fn json_parse_number(s: String, inout pos: i64, len: i64) -> i64 {
+    mut sign: i64 = 1;
+    if pos < len && string_char_at(s, pos) == 45 { // '-'
+        sign = -1;
+        pos = pos + 1;
+    }
+    mut val: i64 = 0;
+    while pos < len {
+        let c = string_char_at(s, pos);
+        if c >= 48 && c <= 57 {
+            val = val * 10 + (c - 48);
+            pos = pos + 1;
+        } else {
+            return sign * val;
+        }
+    }
+    return sign * val;
+}
+
+pub fn json_parse_value(s: String, inout pos: i64, len: i64) -> JsonValue {
+    json_skip_whitespace(s, pos, len);
+    if pos >= len {
+        return json_null();
+    }
+    let c = string_char_at(s, pos);
+
+    // 1. null
+    if c == 110 { // 'n'
+        if pos + 4 <= len && string_substr(s, pos, 4) == "null" {
+            pos = pos + 4;
+            return json_null();
+        }
+    }
+
+    // 2. true
+    if c == 116 { // 't'
+        if pos + 4 <= len && string_substr(s, pos, 4) == "true" {
+            pos = pos + 4;
+            return json_bool(true);
+        }
+    }
+
+    // 3. false
+    if c == 102 { // 'f'
+        if pos + 5 <= len && string_substr(s, pos, 5) == "false" {
+            pos = pos + 5;
+            return json_bool(false);
+        }
+    }
+
+    // 4. String
+    if c == 34 { // '"'
+        let str_val = json_parse_string(s, pos, len);
+        return json_string(str_val);
+    }
+
+    // 5. Number
+    if c == 45 || (c >= 48 && c <= 57) { // '-', '0'..'9'
+        let num_val = json_parse_number(s, pos, len);
+        return json_int(num_val);
+    }
+
+    // 6. Array
+    if c == 91 { // '['
+        pos = pos + 1;
+        mut arr = json_array();
+        json_skip_whitespace(s, pos, len);
+        if pos < len && string_char_at(s, pos) == 93 { // ']'
+            pos = pos + 1;
+            return arr;
+        }
+        while pos < len {
+            let elem = json_parse_value(s, pos, len);
+            json_array_push(arr, elem);
+            json_skip_whitespace(s, pos, len);
+            if pos < len {
+                let sep = string_char_at(s, pos);
+                if sep == 44 { // ','
+                    pos = pos + 1;
+                } else if sep == 93 { // ']'
+                    pos = pos + 1;
+                    return arr;
+                }
+            }
+        }
+        return arr;
+    }
+
+    // 7. Object
+    if c == 123 { // '{'
+        pos = pos + 1;
+        mut obj = json_object();
+        json_skip_whitespace(s, pos, len);
+        if pos < len && string_char_at(s, pos) == 125 { // '}'
+            pos = pos + 1;
+            return obj;
+        }
+        while pos < len {
+            json_skip_whitespace(s, pos, len);
+            if pos < len && string_char_at(s, pos) == 34 { // key '"'
+                let key = json_parse_string(s, pos, len);
+                json_skip_whitespace(s, pos, len);
+                if pos < len && string_char_at(s, pos) == 58 { // ':'
+                    pos = pos + 1;
+                    let val = json_parse_value(s, pos, len);
+                    json_object_set(obj, key, val);
+                }
+            }
+            json_skip_whitespace(s, pos, len);
+            if pos < len {
+                let sep = string_char_at(s, pos);
+                if sep == 44 { // ','
+                    pos = pos + 1;
+                } else if sep == 125 { // '}'
+                    pos = pos + 1;
+                    return obj;
+                }
+            }
+        }
+        return obj;
+    }
+
+    return json_null();
+}
+
+pub fn json_parse(s: String) -> JsonValue {
+    mut pos: i64 = 0;
+    let len = string_len(s);
+    return json_parse_value(s, pos, len);
+}
+
+// ---------------------------------------------------------------------------
+// 6. Unit Tests for JSON Subsystem
+// ---------------------------------------------------------------------------
+
+pub fn test_json_primitives() -> bool {
+    let j_null = json_parse("null");
+    let j_true = json_parse("true");
+    let j_false = json_parse("false");
+    let j_pos = json_parse("12345");
+    let j_neg = json_parse("-42");
+    let j_str = json_parse("\"hello IFA\"");
+
+    let t1 = json_is_null(j_null) && json_stringify(j_null) == "null";
+    let t2 = json_is_bool(j_true) && json_get_bool(j_true) && json_stringify(j_true) == "true";
+    let t3 = json_is_bool(j_false) && !json_get_bool(j_false) && json_stringify(j_false) == "false";
+    let t4 = json_is_number(j_pos) && json_get_int(j_pos) == 12345 && json_stringify(j_pos) == "12345";
+    let t5 = json_is_number(j_neg) && json_get_int(j_neg) == -42 && json_stringify(j_neg) == "-42";
+    let t6 = json_is_string(j_str) && json_get_string(j_str) == "hello IFA" && json_stringify(j_str) == "\"hello IFA\"";
+
+    return t1 && t2 && t3 && t4 && t5 && t6;
+}
+
+pub fn test_json_arrays() -> bool {
+    let raw = "[1, 2, 3, \"test\", false]";
+    let parsed = json_parse(raw);
+
+    let t1 = json_is_array(parsed) && json_array_len(parsed) == 5;
+    let t2 = json_get_int(json_array_get(parsed, 0)) == 1;
+    let t3 = json_get_int(json_array_get(parsed, 1)) == 2;
+    let t4 = json_get_int(json_array_get(parsed, 2)) == 3;
+    let t5 = json_get_string(json_array_get(parsed, 3)) == "test";
+    let t6 = json_get_bool(json_array_get(parsed, 4)) == false;
+
+    mut arr = json_array();
+    json_array_push(arr, json_int(100));
+    json_array_push(arr, json_int(200));
+    let t7 = json_stringify(arr) == "[100,200]";
+
+    return t1 && t2 && t3 && t4 && t5 && t6 && t7;
+}
+
+pub fn test_json_objects() -> bool {
+    let raw = "{\"name\": \"IFA\", \"version\": 1, \"active\": true}";
+    let parsed = json_parse(raw);
+
+    let t1 = json_is_object(parsed) && json_object_len(parsed) == 3;
+    let t2 = json_object_has(parsed, "name") && json_get_string(json_object_get(parsed, "name")) == "IFA";
+    let t3 = json_object_has(parsed, "version") && json_get_int(json_object_get(parsed, "version")) == 1;
+    let t4 = json_object_has(parsed, "active") && json_get_bool(json_object_get(parsed, "active")) == true;
+    let t5 = !json_object_has(parsed, "missing");
+
+    mut obj = json_object();
+    json_object_set(obj, "alpha", json_int(10));
+    json_object_set(obj, "beta", json_string("val"));
+    let str_obj = json_stringify(obj);
+    let t6 = str_obj == "{\"alpha\":10,\"beta\":\"val\"}";
+
+    return t1 && t2 && t3 && t4 && t5 && t6;
+}
+
+pub fn test_json_escaped_strings() -> bool {
+    let raw = "\"line 1\\nline 2\\tquoted \\\"word\\\"\"";
+    let parsed = json_parse(raw);
+    let s = json_get_string(parsed);
+    let expected = "line 1\nline 2\tquoted \"word\"";
+    let t1 = s == expected;
+
+    let reserialized = json_stringify(parsed);
+    let t2 = reserialized == raw;
+
+    return t1 && t2;
+}
+
+pub fn test_json_nested_structure() -> bool {
+    let raw = "{\"package\": {\"name\": \"compiler\", \"deps\": [\"std\", \"core\"]}, \"status\": 200}";
+    let parsed = json_parse(raw);
+
+    let t1 = json_is_object(parsed);
+    let status_val = json_get_int(json_object_get(parsed, "status"));
+    let t2 = status_val == 200;
+
+    let pkg_val = json_object_get(parsed, "package");
+    let t3 = json_is_object(pkg_val);
+    let pkg_name = json_get_string(json_object_get(pkg_val, "name"));
+    let t4 = pkg_name == "compiler";
+
+    let deps_arr = json_object_get(pkg_val, "deps");
+    let t5 = json_is_array(deps_arr) && json_array_len(deps_arr) == 2;
+    let dep0 = json_get_string(json_array_get(deps_arr, 0));
+    let dep1 = json_get_string(json_array_get(deps_arr, 1));
+    let t6 = dep0 == "std" && dep1 == "core";
+
+    return t1 && t2 && t3 && t4 && t5 && t6;
+}
+
+pub fn test_json_pretty_formatting() -> bool {
+    mut obj = json_object();
+    json_object_set(obj, "id", json_int(42));
+    mut arr = json_array();
+    json_array_push(arr, json_string("one"));
+    json_array_push(arr, json_string("two"));
+    json_object_set(obj, "items", arr);
+
+    let pretty = json_stringify_pretty(obj);
+    let expected = "{\n  \"id\": 42,\n  \"items\": [\n    \"one\",\n    \"two\"\n  ]\n}";
+    return pretty == expected;
+}
+
+pub fn test_json_all() -> bool {
+    let t1 = test_json_primitives();
+    let t2 = test_json_arrays();
+    let t3 = test_json_objects();
+    let t4 = test_json_escaped_strings();
+    let t5 = test_json_nested_structure();
+    let t6 = test_json_pretty_formatting();
+    return t1 && t2 && t3 && t4 && t5 && t6;
+}
+
+pub fn main() {
+    if test_json_all() {
+        println("std/json: ALL TESTS PASSED");
+    } else {
+        println("std/json: TESTS FAILED");
+    }
+}

@@ -2307,6 +2307,31 @@ impl<'a> FirInterpreter<'a> {
                     } else {
                         Ok(FirValue::String(String::new()))
                     }
+                } else if fn_name == "string_from_char"
+                    || fn_name == "string_from_char_code"
+                    || fn_name == "char_to_string"
+                {
+                    let code = match evaluated_args.first() {
+                        Some(FirValue::Int(c)) => *c as u32,
+                        _ => 0,
+                    };
+                    let s = char::from_u32(code)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default();
+                    Ok(FirValue::String(s))
+                } else if fn_name == "string_to_int" || fn_name == "str_to_int" {
+                    let s = match evaluated_args.first() {
+                        Some(FirValue::String(s)) => s.trim(),
+                        _ => "",
+                    };
+                    let val = s.parse::<i64>().unwrap_or(0);
+                    Ok(FirValue::Int(val as i128))
+                } else if fn_name == "int_to_str" || fn_name == "int_to_string" {
+                    let val = match evaluated_args.first() {
+                        Some(FirValue::Int(i)) => *i as i64,
+                        _ => 0,
+                    };
+                    Ok(FirValue::String(val.to_string()))
                 } else if fn_name == "fs::read_to_string"
                     || fn_name == "read_to_string"
                     || fn_name == "ifa_rt_fs_read_to_string"
@@ -2793,6 +2818,30 @@ impl<'a> FirInterpreter<'a> {
                         .unwrap_or(0);
                     std::thread::sleep(std::time::Duration::from_millis(millis));
                     Ok(FirValue::Unit)
+                } else if fn_name == "time::unix_secs" || fn_name == "time_unix_secs" {
+                    let secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    Ok(FirValue::Int(secs as i128))
+                } else if fn_name == "time::unix_millis" || fn_name == "time_unix_millis" {
+                    let millis = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    Ok(FirValue::Int(millis as i128))
+                } else if fn_name == "time::unix_nanos" || fn_name == "time_unix_nanos" {
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0);
+                    Ok(FirValue::Int(nanos as i128))
+                } else if fn_name == "time::monotonic_nanos" || fn_name == "time_monotonic_nanos" {
+                    static MONOTONIC_ORIGIN: std::sync::OnceLock<std::time::Instant> =
+                        std::sync::OnceLock::new();
+                    let origin = MONOTONIC_ORIGIN.get_or_init(std::time::Instant::now);
+                    let nanos = origin.elapsed().as_nanos() as i64;
+                    Ok(FirValue::Int(nanos as i128))
                 } else if let Some(target_func) = self.find_function(&fn_name) {
                     // Direct function call to another FIR function in module
                     let func_clone = target_func.clone();

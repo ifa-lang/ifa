@@ -1,0 +1,337 @@
+// Pure IFA Standard Library: Time & Chrono Subsystem (`std/time.ifa`)
+// Deterministic time, duration arithmetic, civil calendar, and ISO 8601 UTC formatting.
+
+pub struct Instant {
+    nanos: i64
+}
+
+pub struct Duration {
+    secs: i64,
+    nanos: i64
+}
+
+pub struct DateTime {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64
+}
+
+// ---------------------------------------------------------------------------
+// 1. Instant & Monotonic Clock
+// ---------------------------------------------------------------------------
+
+pub fn instant_now() -> Instant {
+    return Instant(nanos: time_monotonic_nanos());
+}
+
+pub fn instant_elapsed_nanos(inst: Instant) -> i64 {
+    let now = time_monotonic_nanos();
+    if now >= inst.nanos {
+        return now - inst.nanos;
+    }
+    return 0;
+}
+
+pub fn instant_elapsed_millis(inst: Instant) -> i64 {
+    let ns = instant_elapsed_nanos(inst);
+    return ns / 1000000;
+}
+
+pub fn instant_duration_since(inst: Instant, earlier: Instant) -> Duration {
+    if inst.nanos >= earlier.nanos {
+        let diff = inst.nanos - earlier.nanos;
+        return duration_from_nanos(diff);
+    }
+    return duration_from_nanos(0);
+}
+
+// ---------------------------------------------------------------------------
+// 2. Duration Arithmetic
+// ---------------------------------------------------------------------------
+
+pub fn duration_from_secs(s: i64) -> Duration {
+    return Duration(secs: s, nanos: 0);
+}
+
+pub fn duration_from_millis(ms: i64) -> Duration {
+    let s = ms / 1000;
+    let rem_ms = ms % 1000;
+    return Duration(secs: s, nanos: rem_ms * 1000000);
+}
+
+pub fn duration_from_nanos(ns: i64) -> Duration {
+    let s = ns / 1000000000;
+    let rem_ns = ns % 1000000000;
+    return Duration(secs: s, nanos: rem_ns);
+}
+
+pub fn duration_as_secs(d: Duration) -> i64 {
+    return d.secs;
+}
+
+pub fn duration_as_millis(d: Duration) -> i64 {
+    return d.secs * 1000 + (d.nanos / 1000000);
+}
+
+pub fn duration_as_nanos(d: Duration) -> i64 {
+    return d.secs * 1000000000 + d.nanos;
+}
+
+pub fn duration_add(d1: Duration, d2: Duration) -> Duration {
+    mut total_nanos = d1.nanos + d2.nanos;
+    mut total_secs = d1.secs + d2.secs;
+    if total_nanos >= 1000000000 {
+        total_secs = total_secs + (total_nanos / 1000000000);
+        total_nanos = total_nanos % 1000000000;
+    }
+    return Duration(secs: total_secs, nanos: total_nanos);
+}
+
+// ---------------------------------------------------------------------------
+// 3. System Clocks & Real-time Unix Timestamps
+// ---------------------------------------------------------------------------
+
+pub fn unix_secs() -> i64 {
+    return time_unix_secs();
+}
+
+pub fn unix_millis() -> i64 {
+    return time_unix_millis();
+}
+
+pub fn unix_nanos() -> i64 {
+    return time_unix_nanos();
+}
+
+// ---------------------------------------------------------------------------
+// 4. Civil Calendar & ISO 8601 UTC Formatting
+// ---------------------------------------------------------------------------
+
+pub fn is_leap_year(year: i64) -> bool {
+    if year % 400 == 0 {
+        return true;
+    }
+    if year % 100 == 0 {
+        return false;
+    }
+    return year % 4 == 0;
+}
+
+pub fn days_in_year(year: i64) -> i64 {
+    if is_leap_year(year) {
+        return 366;
+    }
+    return 365;
+}
+
+pub fn days_in_month(year: i64, month: i64) -> i64 {
+    if month == 1 || month == 3 || month == 5 || month == 7 || month == 8 || month == 10 || month == 12 {
+        return 31;
+    }
+    if month == 4 || month == 6 || month == 9 || month == 11 {
+        return 30;
+    }
+    if month == 2 {
+        if is_leap_year(year) {
+            return 29;
+        }
+        return 28;
+    }
+    return 30;
+}
+
+pub fn datetime_from_unix_secs(unix_secs: i64) -> DateTime {
+    mut remaining_secs = unix_secs;
+    let sec = remaining_secs % 60;
+    remaining_secs = remaining_secs / 60;
+    let min = remaining_secs % 60;
+    remaining_secs = remaining_secs / 60;
+    let hour = remaining_secs % 24;
+    mut days = remaining_secs / 24;
+
+    mut yr: i64 = 1970;
+    while days >= days_in_year(yr) {
+        days = days - days_in_year(yr);
+        yr = yr + 1;
+    }
+
+    mut m: i64 = 1;
+    while m <= 12 {
+        let dim = days_in_month(yr, m);
+        if days < dim {
+            return DateTime(
+                year: yr,
+                month: m,
+                day: days + 1,
+                hour: hour,
+                minute: min,
+                second: sec
+            );
+        }
+        days = days - dim;
+        m = m + 1;
+    }
+
+    return DateTime(
+        year: yr,
+        month: 12,
+        day: 31,
+        hour: hour,
+        minute: min,
+        second: sec
+    );
+}
+
+pub fn int_to_digit(d: i64) -> String {
+    if d == 0 { return "0"; }
+    if d == 1 { return "1"; }
+    if d == 2 { return "2"; }
+    if d == 3 { return "3"; }
+    if d == 4 { return "4"; }
+    if d == 5 { return "5"; }
+    if d == 6 { return "6"; }
+    if d == 7 { return "7"; }
+    if d == 8 { return "8"; }
+    if d == 9 { return "9"; }
+    return "0";
+}
+
+pub fn int_to_str(mut n: i64) -> String {
+    if n == 0 {
+        return "0";
+    }
+    mut is_neg = false;
+    if n < 0 {
+        is_neg = true;
+        n = 0 - n;
+    }
+    mut digits = "";
+    while n > 0 {
+        let rem = n % 10;
+        let d = int_to_digit(rem);
+        digits = d + digits;
+        n = n / 10;
+    }
+    if is_neg {
+        return "-" + digits;
+    }
+    return digits;
+}
+
+pub fn format_two_digits(val: i64) -> String {
+    if val < 10 {
+        return "0" + int_to_str(val);
+    }
+    return int_to_str(val);
+}
+
+pub fn format_four_digits(val: i64) -> String {
+    if val < 10 {
+        return "000" + int_to_str(val);
+    } else if val < 100 {
+        return "00" + int_to_str(val);
+    } else if val < 1000 {
+        return "0" + int_to_str(val);
+    }
+    return int_to_str(val);
+}
+
+pub fn datetime_to_iso8601(dt: DateTime) -> String {
+    return format_four_digits(dt.year)
+        + "-"
+        + format_two_digits(dt.month)
+        + "-"
+        + format_two_digits(dt.day)
+        + "T"
+        + format_two_digits(dt.hour)
+        + ":"
+        + format_two_digits(dt.minute)
+        + ":"
+        + format_two_digits(dt.second)
+        + "Z";
+}
+
+// ---------------------------------------------------------------------------
+// 5. Unit Tests for Time Subsystem
+// ---------------------------------------------------------------------------
+
+pub fn test_time_leap_year() -> bool {
+    let t1 = is_leap_year(2000);  // 400 div -> true
+    let t2 = !is_leap_year(1900); // 100 div -> false
+    let t3 = is_leap_year(2024);  // 4 div -> true
+    let t4 = !is_leap_year(2023); // false
+    return t1 && t2 && t3 && t4;
+}
+
+pub fn test_time_epoch_zero() -> bool {
+    let dt = datetime_from_unix_secs(0);
+    let iso = datetime_to_iso8601(dt);
+    return iso == "1970-01-01T00:00:00Z"
+        && dt.year == 1970
+        && dt.month == 1
+        && dt.day == 1
+        && dt.hour == 0
+        && dt.minute == 0
+        && dt.second == 0;
+}
+
+pub fn test_time_known_timestamp() -> bool {
+    // 1700000000 = 2023-11-14T22:13:20Z
+    let dt = datetime_from_unix_secs(1700000000);
+    let iso = datetime_to_iso8601(dt);
+    return iso == "2023-11-14T22:13:20Z"
+        && dt.year == 2023
+        && dt.month == 11
+        && dt.day == 14
+        && dt.hour == 22
+        && dt.minute == 13
+        && dt.second == 20;
+}
+
+pub fn test_time_duration_arithmetic() -> bool {
+    let d1 = duration_from_secs(15);
+    let d2 = duration_from_millis(500);
+    let d3 = duration_add(d1, d2);
+
+    let t1 = duration_as_millis(d3) == 15500;
+    let t2 = duration_as_secs(d3) == 15;
+    let t3 = duration_as_nanos(d3) == 15500000000;
+
+    let d4 = duration_from_nanos(2500000000);
+    let t4 = duration_as_secs(d4) == 2 && duration_as_millis(d4) == 2500;
+
+    return t1 && t2 && t3 && t4;
+}
+
+pub fn test_time_instant_elapsed() -> bool {
+    let start = instant_now();
+    let elapsed = instant_elapsed_nanos(start);
+    let is_valid = elapsed >= 0;
+
+    let earlier = Instant(nanos: 1000);
+    let later = Instant(nanos: 3500);
+    let diff = instant_duration_since(later, earlier);
+    let t_diff = duration_as_nanos(diff) == 2500;
+
+    return is_valid && t_diff;
+}
+
+pub fn test_time_all() -> bool {
+    let t1 = test_time_leap_year();
+    let t2 = test_time_epoch_zero();
+    let t3 = test_time_known_timestamp();
+    let t4 = test_time_duration_arithmetic();
+    let t5 = test_time_instant_elapsed();
+    return t1 && t2 && t3 && t4 && t5;
+}
+
+pub fn main() {
+    if test_time_all() {
+        println("std/time: ALL TESTS PASSED");
+    } else {
+        println("std/time: TESTS FAILED");
+    }
+}
