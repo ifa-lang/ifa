@@ -15,7 +15,7 @@ use std::process::{Command, ExitCode};
 
 mod doc;
 mod tooling;
-use tooling::{format_source, init_project, lint_program};
+use tooling::{init_project, lint_program};
 
 #[derive(ClapParser)]
 #[command(name = "ifa")]
@@ -33,10 +33,10 @@ enum Commands {
         /// Project directory name
         name: String,
     },
-    /// Format IFA source file canonically
+    /// Format IFA source file or package canonically
     Fmt {
-        /// Source file path (.ifa)
-        file: PathBuf,
+        /// Source file path (.ifa) or directory (defaults to current directory)
+        file: Option<PathBuf>,
         /// Check if file is formatted without modifying
         #[arg(long)]
         check: bool,
@@ -227,29 +227,57 @@ fn main() -> ExitCode {
         },
 
         Commands::Fmt { file, check } => {
-            let src = match fs::read_to_string(&file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: impossible de lire le fichier {:?}: {}", file, e);
-                    return ExitCode::FAILURE;
-                }
-            };
+            let target = file.unwrap_or_else(|| PathBuf::from("."));
+            let opts = kori::fmt::FormatOptions::default();
+            match kori::fmt::format_project_or_file(&target, check, &opts) {
+                Ok(report) => {
+                    if report.total_files == 0 {
+                        println!("No .ifa files found in {:?}", target);
+                        return ExitCode::SUCCESS;
+                    }
 
-            let formatted = format_source(&src);
-            if check {
-                if formatted != src {
-                    eprintln!("error: {:?} is not canonically formatted", file);
-                    return ExitCode::FAILURE;
+                    if check {
+                        if report.is_clean() {
+                            println!(
+                                "Checked {} file(s): all canonically formatted.",
+                                report.total_files
+                            );
+                            ExitCode::SUCCESS
+                        } else {
+                            eprintln!(
+                                "error: {} of {} file(s) are not canonically formatted:",
+                                report.changed_files.len(),
+                                report.total_files
+                            );
+                            for f in &report.changed_files {
+                                eprintln!("    {}", f.display());
+                            }
+                            ExitCode::FAILURE
+                        }
+                    } else {
+                        if report.changed_files.is_empty() {
+                            println!(
+                                "Checked {} file(s): already canonically formatted.",
+                                report.total_files
+                            );
+                        } else {
+                            println!(
+                                "Formatted {} of {} file(s):",
+                                report.changed_files.len(),
+                                report.total_files
+                            );
+                            for f in &report.changed_files {
+                                println!("    {}", f.display());
+                            }
+                        }
+                        ExitCode::SUCCESS
+                    }
                 }
-                println!("{:?} is properly formatted", file);
-            } else {
-                if let Err(e) = fs::write(&file, formatted) {
-                    eprintln!("error: failed to write formatted file {:?}: {}", file, e);
-                    return ExitCode::FAILURE;
+                Err(e) => {
+                    eprintln!("error formatting {:?}: {}", target, e);
+                    ExitCode::FAILURE
                 }
-                println!("Formatted {:?}", file);
             }
-            ExitCode::SUCCESS
         }
 
         Commands::Lint { file } => {

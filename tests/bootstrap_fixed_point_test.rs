@@ -14,6 +14,7 @@ use std::sync::{Mutex, OnceLock};
 
 static BOOTSTRAP_TEST_MUTEX: Mutex<()> = Mutex::new(());
 static KORI_BIN_CACHE: OnceLock<PathBuf> = OnceLock::new();
+static IFA_BIN_CACHE: OnceLock<PathBuf> = OnceLock::new();
 
 fn get_workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -48,6 +49,36 @@ fn get_kori_binary() -> PathBuf {
                     .status()
                     .expect("Build kori binary");
                 assert!(status.success(), "Failed to build kori binary");
+            }
+            path
+        })
+        .clone()
+}
+
+fn get_ifa_binary() -> PathBuf {
+    IFA_BIN_CACHE
+        .get_or_init(|| {
+            let mut path = std::env::current_exe().expect("current test executable");
+            path.pop();
+            if path.ends_with("deps") {
+                path.pop();
+            }
+            path.push("ifa");
+            if !path.exists() {
+                let workspace_ifa = get_workspace_root()
+                    .join("target")
+                    .join("debug")
+                    .join("ifa");
+                if workspace_ifa.exists() {
+                    return workspace_ifa;
+                }
+                let status = Command::new("cargo")
+                    .arg("build")
+                    .arg("-p")
+                    .arg("ifa-cli")
+                    .status()
+                    .expect("Build ifa binary");
+                assert!(status.success(), "Failed to build ifa binary");
             }
             path
         })
@@ -2447,4 +2478,125 @@ fn test_industrial_dogfooding_http_service_and_data_processor_cli() {
         "Data processor CLI run output missing success banner:\n{}",
         cli_run_stdout
     );
+}
+
+#[test]
+fn test_canonical_code_formatting_tooling_kori_and_ifa() {
+    let _lock = BOOTSTRAP_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let kori_bin = get_kori_binary();
+    let ifa_bin = get_ifa_binary();
+
+    let tmp_dir = std::env::temp_dir().join(format!("ifa_tooling_fmt_test_{}", std::process::id()));
+    fs::create_dir_all(tmp_dir.join("src")).expect("create test tmp dir");
+    let test_file = tmp_dir.join("src").join("matrix.ifa");
+
+    let unformatted_code = r#"//  Raw mathematical vector and matrix compute
+pub fn   vector_dot( a:List<i64>,b:List<i64> )->i64{
+mut sum:i64 = 0;
+mut i:i64 = 0;
+while i < a.len() {
+sum = sum + a[i]*b[i];
+i = i + 1;
+}
+return sum;
+}
+"#;
+    fs::write(&test_file, unformatted_code).expect("write test file");
+
+    // 1. Verify `kori fmt --check` flags unformatted file with exit code 1
+    let kori_check_res = Command::new(&kori_bin)
+        .arg("fmt")
+        .arg("--check")
+        .arg(&test_file)
+        .output()
+        .expect("Run kori fmt --check");
+
+    assert!(
+        !kori_check_res.status.success(),
+        "kori fmt --check should fail on unformatted file"
+    );
+    let check_stderr = String::from_utf8_lossy(&kori_check_res.stderr);
+    assert!(
+        check_stderr.contains("are not canonically formatted"),
+        "kori fmt --check output missing diagnostics: {}",
+        check_stderr
+    );
+
+    // 2. Format in-place using `kori fmt`
+    let kori_fmt_res = Command::new(&kori_bin)
+        .arg("fmt")
+        .arg(&test_file)
+        .output()
+        .expect("Run kori fmt");
+
+    assert!(
+        kori_fmt_res.status.success(),
+        "kori fmt failed: {}",
+        String::from_utf8_lossy(&kori_fmt_res.stderr)
+    );
+
+    let formatted_code = fs::read_to_string(&test_file).expect("read formatted code");
+    assert!(
+        formatted_code.contains("pub fn vector_dot(a: List<i64>, b: List<i64>) -> i64 {"),
+        "Formatted signature mismatch:\n{}",
+        formatted_code
+    );
+    assert!(
+        formatted_code.contains("    mut sum: i64 = 0;"),
+        "Formatted indentation mismatch:\n{}",
+        formatted_code
+    );
+
+    // 3. Verify `ifa fmt --check` confirms the file is now canonically formatted
+    let ifa_check_res = Command::new(&ifa_bin)
+        .arg("fmt")
+        .arg("--check")
+        .arg(&test_file)
+        .output()
+        .expect("Run ifa fmt --check");
+
+    assert!(
+        ifa_check_res.status.success(),
+        "ifa fmt --check failed on canonically formatted file: {}",
+        String::from_utf8_lossy(&ifa_check_res.stderr)
+    );
+    let ifa_check_stdout = String::from_utf8_lossy(&ifa_check_res.stdout);
+    assert!(
+        ifa_check_stdout.contains("all canonically formatted"),
+        "ifa fmt --check output mismatch: {}",
+        ifa_check_stdout
+    );
+
+    // 4. Test recursive directory formatting across whole tree
+    let test_file2 = tmp_dir.join("src").join("tensor.ifa");
+    fs::write(&test_file2, "fn tensor_id( x:i64 )->i64{\nreturn x;\n}\n")
+        .expect("write tensor.ifa");
+
+    let kori_dir_fmt_res = Command::new(&kori_bin)
+        .arg("fmt")
+        .arg(&tmp_dir)
+        .output()
+        .expect("Run kori fmt on directory");
+
+    assert!(
+        kori_dir_fmt_res.status.success(),
+        "kori fmt on directory failed: {}",
+        String::from_utf8_lossy(&kori_dir_fmt_res.stderr)
+    );
+
+    let kori_dir_check_res = Command::new(&kori_bin)
+        .arg("fmt")
+        .arg("--check")
+        .arg(&tmp_dir)
+        .output()
+        .expect("Run kori fmt --check on directory");
+
+    assert!(
+        kori_dir_check_res.status.success(),
+        "kori fmt --check on directory should succeed after formatting"
+    );
+
+    let _ = fs::remove_dir_all(tmp_dir);
 }

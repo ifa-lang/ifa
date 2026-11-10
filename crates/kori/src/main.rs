@@ -92,6 +92,14 @@ enum Commands {
     Tree,
     /// Resolve and pin dependencies into deterministic kori.lock
     Lock,
+    /// Canonically format IFA source files in the project or a specific file
+    Fmt {
+        /// Optional path to source file (.ifa) or directory (defaults to current project)
+        path: Option<PathBuf>,
+        /// Check if files are canonically formatted without writing changes to disk
+        #[arg(long)]
+        check: bool,
+    },
     /// Package the project into a deterministic redistributable archive
     Package {
         /// Optional custom output directory
@@ -181,6 +189,7 @@ fn main() -> ExitCode {
         Commands::Remove { name } => handle_remove(&current_dir, &name),
         Commands::Tree => handle_tree(&current_dir),
         Commands::Lock => handle_lock(&current_dir),
+        Commands::Fmt { path, check } => handle_fmt(&current_dir, path, check),
         Commands::Package {
             out_dir,
             manifest_path,
@@ -526,6 +535,61 @@ fn handle_lock(current_dir: &Path) -> ExitCode {
         }
         Err(e) => {
             eprintln!("error: failed to resolve dependencies: {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn handle_fmt(current_dir: &Path, target_path: Option<PathBuf>, check: bool) -> ExitCode {
+    let target = target_path.unwrap_or_else(|| current_dir.to_path_buf());
+    let opts = kori::fmt::FormatOptions::default();
+
+    match kori::fmt::format_project_or_file(&target, check, &opts) {
+        Ok(report) => {
+            if report.total_files == 0 {
+                println!("No .ifa files found in {:?}", target);
+                return ExitCode::SUCCESS;
+            }
+
+            if check {
+                if report.is_clean() {
+                    println!(
+                        "Checked {} file(s): all canonically formatted.",
+                        report.total_files
+                    );
+                    ExitCode::SUCCESS
+                } else {
+                    eprintln!(
+                        "error: {} of {} file(s) are not canonically formatted:",
+                        report.changed_files.len(),
+                        report.total_files
+                    );
+                    for file in &report.changed_files {
+                        eprintln!("    {}", file.display());
+                    }
+                    ExitCode::FAILURE
+                }
+            } else {
+                if report.changed_files.is_empty() {
+                    println!(
+                        "Checked {} file(s): already canonically formatted.",
+                        report.total_files
+                    );
+                } else {
+                    println!(
+                        "Formatted {} of {} file(s):",
+                        report.changed_files.len(),
+                        report.total_files
+                    );
+                    for file in &report.changed_files {
+                        println!("    {}", file.display());
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+        }
+        Err(e) => {
+            eprintln!("error formatting {:?}: {}", target, e);
             ExitCode::FAILURE
         }
     }

@@ -45,44 +45,9 @@ pub fn main() -> () {
 }
 
 /// Canonically format IFA source code: normalize indentation, remove trailing whitespace.
+#[allow(dead_code)]
 pub fn format_source(src: &str) -> String {
-    let mut formatted = String::with_capacity(src.len());
-    let mut indent_level: usize = 0;
-
-    for line in src.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            formatted.push('\n');
-            continue;
-        }
-
-        // Adjust indent for closing brace at the start of the line
-        if trimmed.starts_with('}') || trimmed.starts_with(']') || trimmed.starts_with(')') {
-            indent_level = indent_level.saturating_sub(1);
-        }
-
-        // Indent with 4 spaces per level
-        for _ in 0..indent_level {
-            formatted.push_str("    ");
-        }
-        formatted.push_str(trimmed);
-        formatted.push('\n');
-
-        // Increase indent if line ends with opening brace, bracket, or parenthesis
-        let open_counts = trimmed
-            .chars()
-            .filter(|&c| c == '{' || c == '[' || c == '(')
-            .count();
-        let close_counts = trimmed
-            .chars()
-            .filter(|&c| c == '}' || c == ']' || c == ')')
-            .count();
-        if open_counts > close_counts {
-            indent_level += open_counts - close_counts;
-        }
-    }
-
-    formatted
+    kori::fmt::format_ifa_source(src)
 }
 
 /// Static linting on AST to enforce IFA canonical naming conventions and best practices.
