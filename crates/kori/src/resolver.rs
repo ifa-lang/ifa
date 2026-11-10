@@ -68,7 +68,11 @@ impl DependencyResolver {
 
             for path in entries {
                 let content = fs::read(&path)?;
-                hasher.update(path.to_string_lossy().as_bytes());
+                let rel_path = path
+                    .strip_prefix(root_dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy();
+                hasher.update(rel_path.as_bytes());
                 hasher.update(&content);
             }
         }
@@ -184,16 +188,36 @@ impl DependencyResolver {
         name: &str,
         spec: &DependencySpec,
         parent_dir: &Path,
-        _existing_lock: Option<&Lockfile>,
+        existing_lock: Option<&Lockfile>,
     ) -> Result<(ResolvedPackage, Manifest), KoriError> {
-        match spec {
+        let locked_entry = existing_lock.and_then(|l| l.find_package(name));
+
+        let (pkg, manifest) = match spec {
             DependencySpec::Simple(ver_req_str) => {
+                let effective_req = if let Some(locked) = locked_entry {
+                    if let Ok(req) = semver::VersionReq::parse(ver_req_str) {
+                        if let Ok(locked_v) = semver::Version::parse(&locked.version) {
+                            if req.matches(&locked_v) {
+                                Some(locked.version.as_str())
+                            } else {
+                                Some(ver_req_str.as_str())
+                            }
+                        } else {
+                            Some(ver_req_str.as_str())
+                        }
+                    } else {
+                        Some(ver_req_str.as_str())
+                    }
+                } else {
+                    Some(ver_req_str.as_str())
+                };
+
                 // If a local sibling directory with matching name and manifest exists, use it
                 let local_path = parent_dir.join(name);
                 if local_path.join("kori.toml").exists() {
-                    self.load_local_package(name, &local_path, Some(ver_req_str))
+                    self.load_local_package(name, &local_path, effective_req)?
                 } else {
-                    self.resolve_remote_package(name, Some(ver_req_str), None)
+                    self.resolve_remote_package(name, effective_req, None)?
                 }
             }
             DependencySpec::Detailed(detailed) => {
@@ -203,31 +227,66 @@ impl DependencyResolver {
                     } else {
                         parent_dir.join(path)
                     };
-                    self.load_local_package(name, &target_path, detailed.version.as_deref())
+                    self.load_local_package(name, &target_path, detailed.version.as_deref())?
                 } else if let Some(ver_str) = &detailed.version {
+                    let effective_req = if let Some(locked) = locked_entry {
+                        if let Ok(req) = semver::VersionReq::parse(ver_str) {
+                            if let Ok(locked_v) = semver::Version::parse(&locked.version) {
+                                if req.matches(&locked_v) {
+                                    Some(locked.version.as_str())
+                                } else {
+                                    Some(ver_str.as_str())
+                                }
+                            } else {
+                                Some(ver_str.as_str())
+                            }
+                        } else {
+                            Some(ver_str.as_str())
+                        }
+                    } else {
+                        Some(ver_str.as_str())
+                    };
+
                     let local_path = parent_dir.join(name);
                     if local_path.join("kori.toml").exists() {
-                        self.load_local_package(name, &local_path, Some(ver_str))
+                        self.load_local_package(name, &local_path, effective_req)?
                     } else {
                         self.resolve_remote_package(
                             name,
-                            Some(ver_str),
+                            effective_req,
                             detailed.registry.as_deref(),
-                        )
+                        )?
                     }
                 } else if let Some(git_url) = &detailed.git {
-                    Err(KoriError::PackageNotFound(format!(
+                    return Err(KoriError::PackageNotFound(format!(
                         "Git dependency `{}` ({}) requires git fetcher module.",
                         name, git_url
-                    )))
+                    )));
                 } else {
-                    Err(KoriError::InvalidManifest(format!(
+                    return Err(KoriError::InvalidManifest(format!(
                         "Dependency `{}` must specify either `path` or `version`",
                         name
-                    )))
+                    )));
+                }
+            }
+        };
+
+        // If locked entry specifies a checksum, verify it matches
+        if let Some(locked) = locked_entry {
+            if let Some(ref expected_cs) = locked.checksum {
+                if let Some(ref actual_cs) = pkg.checksum {
+                    if expected_cs != actual_cs {
+                        return Err(KoriError::ChecksumMismatch {
+                            package: name.to_string(),
+                            expected: expected_cs.clone(),
+                            calculated: actual_cs.clone(),
+                        });
+                    }
                 }
             }
         }
+
+        Ok((pkg, manifest))
     }
 
     fn resolve_remote_package(

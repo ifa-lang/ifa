@@ -34,6 +34,13 @@ fn get_kori_binary() -> PathBuf {
             }
             path.push("kori");
             if !path.exists() {
+                let workspace_kori = get_workspace_root()
+                    .join("target")
+                    .join("debug")
+                    .join("kori");
+                if workspace_kori.exists() {
+                    return workspace_kori;
+                }
                 let status = Command::new("cargo")
                     .arg("build")
                     .arg("-p")
@@ -1563,6 +1570,31 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_json_canonical_serialization ... ok"),
+        "Std json canonical serialization test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_json_strict_parser ... ok"),
+        "Std json strict parser test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_json_pointer ... ok"),
+        "Std json pointer test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_json_deep_eq_and_clone ... ok"),
+        "Std json deep eq and clone test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_json_merge_and_remove ... ok"),
+        "Std json merge and remove test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_json_all ... ok"),
         "Std json all test missing from output:\n{}",
         stdout
@@ -1603,8 +1635,8 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("133 passed; 0 failed"),
-        "Expected 133 passed std unit tests, got:\n{}",
+        stdout.contains("143 passed; 0 failed"),
+        "Expected 143 passed std unit tests, got:\n{}",
         stdout
     );
 }

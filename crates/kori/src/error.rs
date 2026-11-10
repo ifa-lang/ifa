@@ -47,4 +47,13 @@ pub enum KoriError {
 
     #[error("Registry error: {0}")]
     Registry(String),
+
+    #[error(
+        "Checksum mismatch for package `{package}`: expected {expected}, calculated {calculated}"
+    )]
+    ChecksumMismatch {
+        package: String,
+        expected: String,
+        calculated: String,
+    },
 }

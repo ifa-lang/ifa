@@ -981,3 +981,141 @@ pub fn double_val(x: i64) -> i64 {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_lockfile_blake3_cryptographic_verification_and_tamper_detection() {
+    let mut lock = Lockfile::default();
+    let expected_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    lock.packages.push(LockedPackage {
+        name: "secure-dep".to_string(),
+        version: "1.2.0".to_string(),
+        source: "path+../secure-dep".to_string(),
+        checksum: Some(expected_hash.to_string()),
+        dependencies: vec![],
+    });
+
+    // 1. Lockfile query and validation methods
+    assert!(lock.contains_package("secure-dep", "1.2.0"));
+    assert!(!lock.contains_package("secure-dep", "1.0.0"));
+    assert_eq!(lock.package_names(), vec!["secure-dep"]);
+
+    // Matching checksum succeeds
+    let verify_ok = lock.verify_package_checksum("secure-dep", expected_hash);
+    assert!(verify_ok.unwrap());
+
+    // Mismatched checksum triggers ChecksumMismatch error
+    let verify_bad = lock.verify_package_checksum(
+        "secure-dep",
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    );
+    assert!(matches!(
+        verify_bad,
+        Err(kori::error::KoriError::ChecksumMismatch { package, .. }) if package == "secure-dep"
+    ));
+
+    // Package without checksum returns Ok(false)
+    lock.packages.push(LockedPackage {
+        name: "unverified".to_string(),
+        version: "0.1.0".to_string(),
+        source: "path+../unverified".to_string(),
+        checksum: None,
+        dependencies: vec![],
+    });
+    assert!(!lock
+        .verify_package_checksum("unverified", "any-hash")
+        .unwrap());
+
+    // 2. Integration test with DependencyResolver and source tampering detection
+    let temp_dir = std::env::temp_dir().join(format!("kori_checksum_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let app_dir = temp_dir.join("my-app");
+    let dep_dir = temp_dir.join("crypto-lib");
+    fs::create_dir_all(app_dir.join("src")).unwrap();
+    fs::create_dir_all(dep_dir.join("src")).unwrap();
+
+    // Setup dep-a
+    let dep_manifest_content = r#"
+[package]
+name = "crypto-lib"
+version = "0.2.1"
+edition = "2026"
+authors = ["Test <test@ifa.lang>"]
+"#;
+    fs::write(dep_dir.join("kori.toml"), dep_manifest_content).unwrap();
+    fs::write(
+        dep_dir.join("src").join("lib.ifa"),
+        "pub fn secure_op() -> i64 { return 42; }",
+    )
+    .unwrap();
+
+    // Compute expected BLAKE3 checksum
+    let calculated_checksum = DependencyResolver::compute_package_checksum(&dep_dir).unwrap();
+    assert!(!calculated_checksum.is_empty());
+
+    // Setup root app depending on crypto-lib
+    let app_manifest_content = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2026"
+authors = ["Test <test@ifa.lang>"]
+
+[dependencies]
+crypto-lib = { version = "0.2.1", path = "../crypto-lib" }
+"#;
+    fs::write(app_dir.join("kori.toml"), app_manifest_content).unwrap();
+    fs::write(
+        app_dir.join("src").join("main.ifa"),
+        "import crypto_lib; fn main() { println(\"test\"); }",
+    )
+    .unwrap();
+
+    let app_manifest: Manifest = app_manifest_content.parse().unwrap();
+    let resolver = DependencyResolver::new(app_dir.clone());
+
+    // Initial resolution without existing lock: locks the computed checksum
+    let (order, generated_lock) = resolver.resolve(&app_manifest, None).unwrap();
+    assert_eq!(order.len(), 2);
+    let locked_dep = generated_lock
+        .find_package("crypto-lib")
+        .expect("Locked crypto-lib must exist");
+    assert_eq!(
+        locked_dep.checksum.as_deref(),
+        Some(calculated_checksum.as_str())
+    );
+
+    // Resolving again with existing lock: succeeds seamlessly
+    let (order2, _) = resolver
+        .resolve(&app_manifest, Some(&generated_lock))
+        .unwrap();
+    assert_eq!(order2.len(), 2);
+
+    // Tamper with crypto-lib source code!
+    fs::write(
+        dep_dir.join("src").join("lib.ifa"),
+        "pub fn secure_op() -> i64 { return 999; } // TAMPERED",
+    )
+    .unwrap();
+
+    // Resolving with existing lockfile MUST detect tamper and fail with ChecksumMismatch!
+    let tampered_result = resolver.resolve(&app_manifest, Some(&generated_lock));
+    assert!(
+        matches!(
+            tampered_result,
+            Err(kori::error::KoriError::ChecksumMismatch {
+                ref package,
+                ref expected,
+                ref calculated
+            }) if package == "crypto-lib"
+                && expected == &calculated_checksum
+                && calculated != &calculated_checksum
+        ),
+        "Expected ChecksumMismatch error on tampered dependency source, got: {:?}",
+        tampered_result
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

@@ -72,6 +72,50 @@ impl Lockfile {
         self.packages.iter().find(|p| p.name == name)
     }
 
+    /// Check if a package with specific name and version exists in lockfile.
+    pub fn contains_package(&self, name: &str, version: &str) -> bool {
+        self.packages
+            .iter()
+            .any(|p| p.name == name && p.version == version)
+    }
+
+    /// Verify BLAKE3 checksum for a locked package.
+    /// Returns Ok(true) if matched, Ok(false) if no checksum was recorded,
+    /// or Err(KoriError::ChecksumMismatch) if corrupted/tampered.
+    pub fn verify_package_checksum(&self, name: &str, calculated: &str) -> Result<bool, KoriError> {
+        if let Some(pkg) = self.find_package(name) {
+            if let Some(ref expected) = pkg.checksum {
+                if expected == calculated {
+                    return Ok(true);
+                } else {
+                    return Err(KoriError::ChecksumMismatch {
+                        package: name.to_string(),
+                        expected: expected.clone(),
+                        calculated: calculated.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Remove a package from the lockfile by name.
+    pub fn remove_package(&mut self, name: &str) -> bool {
+        if let Some(pos) = self.packages.iter().position(|p| p.name == name) {
+            self.packages.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return sorted list of all locked package names.
+    pub fn package_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.packages.iter().map(|p| p.name.clone()).collect();
+        names.sort();
+        names
+    }
+
     /// Insert or update a package entry in the lockfile.
     pub fn update_package(&mut self, pkg: LockedPackage) {
         if let Some(pos) = self.packages.iter().position(|p| p.name == pkg.name) {

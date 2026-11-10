@@ -7,5 +7,5 @@ version = 1
 name = "ifa-http-service"
 version = "0.1.0"
 source = "root"
-checksum = "1ad364606dc6d450c98b91718eccc4c670c0db24ecb2f3603d53de3e743c5525"
+checksum = "377fee340efba01cacab7773c05b896b8705b7bc82e27ea05f07e3e565cfb577"
 dependencies = []
