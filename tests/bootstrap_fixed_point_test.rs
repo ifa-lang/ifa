@@ -1468,6 +1468,26 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_net_udp_roundtrip ... ok"),
+        "Std net UDP roundtrip test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_http_router_and_query_params ... ok"),
+        "Std net HTTP router test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_http_headers_and_status_categories ... ok"),
+        "Std net HTTP headers test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_http_patch_and_head ... ok"),
+        "Std net HTTP patch/head test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_collections_ring_buffer ... ok"),
         "Std collections ring buffer test missing from output:\n{}",
         stdout
@@ -1543,8 +1563,8 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("109 passed; 0 failed"),
-        "Expected 109 passed std unit tests, got:\n{}",
+        stdout.contains("117 passed; 0 failed"),
+        "Expected 117 passed std unit tests, got:\n{}",
         stdout
     );
 }

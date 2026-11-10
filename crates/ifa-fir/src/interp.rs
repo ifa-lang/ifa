@@ -348,6 +348,7 @@ pub struct FirInterpreter<'a> {
     next_chan_id: u64,
     pub tcp_listeners: HashMap<i64, std::net::TcpListener>,
     pub tcp_streams: HashMap<i64, std::net::TcpStream>,
+    pub udp_sockets: HashMap<i64, std::net::UdpSocket>,
     next_socket_id: i64,
 }
 
@@ -363,6 +364,7 @@ impl<'a> FirInterpreter<'a> {
             next_chan_id: 1,
             tcp_listeners: HashMap::new(),
             tcp_streams: HashMap::new(),
+            udp_sockets: HashMap::new(),
             next_socket_id: 1,
         }
     }
@@ -2792,6 +2794,8 @@ impl<'a> FirInterpreter<'a> {
                     }
                 } else if fn_name == "net::tcp_close"
                     || fn_name == "tcp_close"
+                    || fn_name == "net::udp_close"
+                    || fn_name == "udp_close"
                     || fn_name == "ifa_rt_async_close"
                 {
                     let sock_id = evaluated_args
@@ -2803,8 +2807,130 @@ impl<'a> FirInterpreter<'a> {
                         .unwrap_or(0);
                     let closed_stream = self.tcp_streams.remove(&sock_id).is_some();
                     let closed_listener = self.tcp_listeners.remove(&sock_id).is_some();
-                    let success = closed_stream || closed_listener;
+                    let closed_udp = self.udp_sockets.remove(&sock_id).is_some();
+                    let success = closed_stream || closed_listener || closed_udp;
                     Ok(FirValue::Bool(success))
+                } else if fn_name == "net::udp_bind"
+                    || fn_name == "udp_bind"
+                    || fn_name == "ifa_rt_async_udp_bind"
+                {
+                    let port = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as u16,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    let bind_addr = format!("127.0.0.1:{}", port);
+                    match std::net::UdpSocket::bind(&bind_addr) {
+                        Ok(socket) => {
+                            let _ = socket
+                                .set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                            let _ = socket
+                                .set_write_timeout(Some(std::time::Duration::from_millis(500)));
+                            let sock_id = self.next_socket_id;
+                            self.next_socket_id += 1;
+                            self.udp_sockets.insert(sock_id, socket);
+                            Ok(FirValue::Int(sock_id as i128))
+                        }
+                        Err(_) => Ok(FirValue::Int(-1)),
+                    }
+                } else if fn_name == "net::udp_socket_port"
+                    || fn_name == "udp_socket_port"
+                    || fn_name == "ifa_rt_async_udp_port"
+                {
+                    let sock_id = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as i64,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    if let Some(socket) = self.udp_sockets.get(&sock_id) {
+                        let port = socket.local_addr().map(|a| a.port() as i128).unwrap_or(-1);
+                        Ok(FirValue::Int(port))
+                    } else {
+                        Ok(FirValue::Int(-1))
+                    }
+                } else if fn_name == "net::udp_send_to"
+                    || fn_name == "udp_send_to"
+                    || fn_name == "ifa_rt_async_udp_send_to"
+                {
+                    let sock_id = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as i64,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    let host = evaluated_args
+                        .get(1)
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "127.0.0.1",
+                        })
+                        .unwrap_or("127.0.0.1");
+                    let port = evaluated_args
+                        .get(2)
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as u16,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    let payload = evaluated_args
+                        .get(3)
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_bytes().to_vec(),
+                            FirValue::Array(items) => items
+                                .iter()
+                                .filter_map(|it| match it {
+                                    FirValue::Int(b) => Some(*b as u8),
+                                    _ => None,
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        })
+                        .unwrap_or_default();
+                    if let Some(socket) = self.udp_sockets.get(&sock_id) {
+                        let target = format!("{}:{}", host, port);
+                        match socket.send_to(&payload, &target) {
+                            Ok(n) => Ok(FirValue::Int(n as i128)),
+                            Err(_) => Ok(FirValue::Int(-1)),
+                        }
+                    } else {
+                        Ok(FirValue::Int(-1))
+                    }
+                } else if fn_name == "net::udp_recv_from"
+                    || fn_name == "udp_recv_from"
+                    || fn_name == "ifa_rt_async_udp_recv_from"
+                {
+                    let sock_id = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as i64,
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    let max_len = evaluated_args
+                        .get(1)
+                        .map(|a| match a {
+                            FirValue::Int(i) => *i as usize,
+                            _ => 1024,
+                        })
+                        .unwrap_or(1024);
+                    if let Some(socket) = self.udp_sockets.get(&sock_id) {
+                        let mut buf = vec![0u8; max_len.min(65536)];
+                        match socket.recv_from(&mut buf) {
+                            Ok((n, _addr)) => {
+                                buf.truncate(n);
+                                let s = String::from_utf8_lossy(&buf).into_owned();
+                                Ok(FirValue::String(s))
+                            }
+                            Err(_) => Ok(FirValue::String(String::new())),
+                        }
+                    } else {
+                        Ok(FirValue::String(String::new()))
+                    }
                 } else if fn_name == "net::sleep_ms"
                     || fn_name == "sleep_ms"
                     || fn_name == "ifa_rt_async_sleep"

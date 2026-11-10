@@ -618,3 +618,66 @@ fn test_unified_select_wait_table_fd_read_and_io_token() {
         libc::close(pipe_fds[1]);
     }
 }
+
+#[test]
+fn test_async_udp_socket_echo_and_reactor_ffi() {
+    use ifa_runtime::reactor::AsyncUdpSocket;
+    use ifa_runtime::{
+        ifa_rt_async_close, ifa_rt_async_udp_bind, ifa_rt_async_udp_port,
+        ifa_rt_async_udp_recv_from, ifa_rt_async_udp_send_to,
+    };
+
+    // 1. Rust native AsyncUdpSocket layer
+    let server_sock = AsyncUdpSocket::bind("127.0.0.1:0").expect("bind server udp");
+    let server_addr = server_sock.local_addr().expect("local addr");
+    let client_sock = AsyncUdpSocket::bind("127.0.0.1:0").expect("bind client udp");
+
+    let sent = client_sock
+        .send_to(b"IFA_UDP_DATAGRAM", server_addr)
+        .expect("send_to");
+    assert_eq!(sent, 16);
+
+    let mut recv_buf = [0u8; 32];
+    let (received, sender) = server_sock.recv_from(&mut recv_buf).expect("recv_from");
+    assert_eq!(received, 16);
+    assert_eq!(&recv_buf[..received], b"IFA_UDP_DATAGRAM");
+
+    // Reply back
+    let replied = server_sock
+        .send_to(b"IFA_UDP_REPLY", sender)
+        .expect("server reply");
+    assert_eq!(replied, 13);
+
+    let mut reply_buf = [0u8; 32];
+    let (n_reply, _) = client_sock.recv_from(&mut reply_buf).expect("client recv");
+    assert_eq!(n_reply, 13);
+    assert_eq!(&reply_buf[..n_reply], b"IFA_UDP_REPLY");
+
+    // 2. C-ABI FFI Async Reactor layer
+    let s_id = ifa_rt_async_udp_bind(0);
+    assert!(s_id >= 1000);
+    let s_port = ifa_rt_async_udp_port(s_id);
+    assert!(s_port > 0);
+
+    let c_id = ifa_rt_async_udp_bind(0);
+    assert!(c_id >= 1000);
+
+    let host_cstr = std::ffi::CString::new("127.0.0.1").unwrap();
+    let msg = b"FFI_UDP_PAYLOAD";
+    let sent_ffi = ifa_rt_async_udp_send_to(
+        c_id,
+        host_cstr.as_ptr() as *const u8,
+        s_port as u16,
+        msg.as_ptr(),
+        msg.len(),
+    );
+    assert_eq!(sent_ffi, msg.len() as isize);
+
+    let mut ffi_recv_buf = [0u8; 64];
+    let n_ffi = ifa_rt_async_udp_recv_from(s_id, ffi_recv_buf.as_mut_ptr(), ffi_recv_buf.len());
+    assert_eq!(n_ffi, msg.len() as isize);
+    assert_eq!(&ffi_recv_buf[..n_ffi as usize], msg);
+
+    assert_eq!(ifa_rt_async_close(s_id), 0);
+    assert_eq!(ifa_rt_async_close(c_id), 0);
+}

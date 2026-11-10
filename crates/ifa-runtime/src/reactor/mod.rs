@@ -13,7 +13,7 @@ pub mod nonblocking;
 
 pub use io_uring::{IoUringConnector, IoUringCqe, IoUringSqe, KernelTimespec};
 pub use iocp::{IocpCompletionPacket, IocpConnector, IocpOpCode};
-pub use nonblocking::{AsyncTcpListener, AsyncTcpStream, AsyncTimer};
+pub use nonblocking::{AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -27,6 +27,7 @@ pub struct AsyncReactor {
     next_token_id: AtomicU64,
     listeners: Mutex<HashMap<i32, AsyncTcpListener>>,
     streams: Mutex<HashMap<i32, AsyncTcpStream>>,
+    udp_sockets: Mutex<HashMap<i32, AsyncUdpSocket>>,
 }
 
 impl AsyncReactor {
@@ -38,6 +39,7 @@ impl AsyncReactor {
             next_token_id: AtomicU64::new(1),
             listeners: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
+            udp_sockets: Mutex::new(HashMap::new()),
         }
     }
 
@@ -298,14 +300,66 @@ impl AsyncReactor {
         stream.write_all(buf)
     }
 
-    /// Close listener or stream.
+    /// Bind a new async UDP socket.
+    pub fn udp_bind(&self, port: u16) -> std::io::Result<i32> {
+        let addr = format!("0.0.0.0:{}", port);
+        let socket = AsyncUdpSocket::bind(&addr)?;
+        let id = self.next_handle_id.fetch_add(1, Ordering::Relaxed);
+        let mut map = self.udp_sockets.lock().unwrap();
+        map.insert(id, socket);
+        Ok(id)
+    }
+
+    /// Retrieve local port of a UDP socket.
+    pub fn udp_port(&self, sock_id: i32) -> std::io::Result<u16> {
+        let map = self.udp_sockets.lock().unwrap();
+        let socket = map.get(&sock_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "udp socket not found")
+        })?;
+        Ok(socket.local_addr()?.port())
+    }
+
+    /// Send datagram to remote host and port.
+    pub fn udp_send_to(
+        &self,
+        sock_id: i32,
+        host: &str,
+        port: u16,
+        data: &[u8],
+    ) -> std::io::Result<usize> {
+        let map = self.udp_sockets.lock().unwrap();
+        let socket = map.get(&sock_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "udp socket not found")
+        })?;
+        let target = format!("{}:{}", host, port);
+        socket.send_to(data, &target)
+    }
+
+    /// Receive datagram from UDP socket.
+    pub fn udp_recv_from(
+        &self,
+        sock_id: i32,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, std::net::SocketAddr)> {
+        let map = self.udp_sockets.lock().unwrap();
+        let socket = map.get(&sock_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "udp socket not found")
+        })?;
+        socket.recv_from(buf)
+    }
+
+    /// Close listener, stream, or UDP socket.
     pub fn close(&self, handle_id: i32) -> bool {
         let mut listeners = self.listeners.lock().unwrap();
         if listeners.remove(&handle_id).is_some() {
             return true;
         }
         let mut streams = self.streams.lock().unwrap();
-        streams.remove(&handle_id).is_some()
+        if streams.remove(&handle_id).is_some() {
+            return true;
+        }
+        let mut udp = self.udp_sockets.lock().unwrap();
+        udp.remove(&handle_id).is_some()
     }
 }
 
@@ -413,5 +467,58 @@ pub extern "C" fn ifa_rt_async_close(handle_fd: i32) -> i32 {
         0
     } else {
         -1
+    }
+}
+
+/// Bind an asynchronous UDP socket on specified port (0 for ephemeral).
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_udp_bind(port: u16) -> i32 {
+    GLOBAL_REACTOR.udp_bind(port).unwrap_or(-1)
+}
+
+/// Retrieve the bound port of an asynchronous UDP socket.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_udp_port(sock_id: i32) -> i32 {
+    GLOBAL_REACTOR
+        .udp_port(sock_id)
+        .map(|p| p as i32)
+        .unwrap_or(-1)
+}
+
+/// Asynchronously send datagram through UDP socket.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_udp_send_to(
+    sock_id: i32,
+    host: *const u8,
+    port: u16,
+    buf: *const u8,
+    len: usize,
+) -> isize {
+    if host.is_null() || buf.is_null() {
+        return -1;
+    }
+    let host_str = unsafe {
+        match std::ffi::CStr::from_ptr(host as *const std::ffi::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+    let slice = unsafe { std::slice::from_raw_parts(buf, len) };
+    match GLOBAL_REACTOR.udp_send_to(sock_id, host_str, port, slice) {
+        Ok(n) => n as isize,
+        Err(_) => -1,
+    }
+}
+
+/// Asynchronously receive datagram from UDP socket.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_udp_recv_from(sock_id: i32, buf: *mut u8, len: usize) -> isize {
+    if buf.is_null() || len == 0 {
+        return 0;
+    }
+    let slice = unsafe { std::slice::from_raw_parts_mut(buf, len) };
+    match GLOBAL_REACTOR.udp_recv_from(sock_id, slice) {
+        Ok((n, _)) => n as isize,
+        Err(_) => -1,
     }
 }

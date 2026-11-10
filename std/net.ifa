@@ -12,6 +12,22 @@ pub struct TcpStream {
     is_open: bool
 }
 
+pub struct UdpSocket {
+    fd: i64,
+    port: i64,
+    is_open: bool
+}
+
+pub struct HttpRoute {
+    method: String,
+    path: String,
+    handler_id: i64
+}
+
+pub struct HttpRouter {
+    routes: List<HttpRoute>
+}
+
 pub struct HttpRequest {
     method: String,
     path: String,
@@ -71,6 +87,26 @@ pub fn net_tcp_read(stream_fd: i64, max_len: i64) -> String {
 
 pub fn net_tcp_close(handle_fd: i64) -> bool {
     return tcp_close(handle_fd);
+}
+
+pub fn net_udp_bind(port: i64) -> i64 {
+    return udp_bind(port);
+}
+
+pub fn net_udp_socket_port(sock_id: i64) -> i64 {
+    return udp_socket_port(sock_id);
+}
+
+pub fn net_udp_send_to(sock_id: i64, host: String, port: i64, data: String) -> i64 {
+    return udp_send_to(sock_id, host, port, data);
+}
+
+pub fn net_udp_recv_from(sock_id: i64, max_len: i64) -> String {
+    return udp_recv_from(sock_id, max_len);
+}
+
+pub fn net_udp_close(handle_fd: i64) -> bool {
+    return udp_close(handle_fd);
 }
 
 pub fn net_sleep_ms(millis: i64) {
@@ -138,6 +174,44 @@ pub fn stream_close(inout stream: TcpStream) {
     if stream.is_open {
         net_tcp_close(stream.fd);
         stream.is_open = false;
+    }
+}
+
+// High-Level Structured UDP Abstractions
+pub fn make_udp_socket(port: i64) -> UdpSocket {
+    let fd = net_udp_bind(port);
+    mut actual_port: i64 = port;
+    if fd > 0 {
+        let p = net_udp_socket_port(fd);
+        if p > 0 {
+            actual_port = p;
+        }
+    }
+    return UdpSocket(
+        fd: fd,
+        port: actual_port,
+        is_open: fd > 0
+    );
+}
+
+pub fn udp_socket_send(socket: UdpSocket, host: String, port: i64, data: String) -> i64 {
+    if !socket.is_open {
+        return -1;
+    }
+    return net_udp_send_to(socket.fd, host, port, data);
+}
+
+pub fn udp_socket_recv(socket: UdpSocket, max_len: i64) -> String {
+    if !socket.is_open {
+        return "";
+    }
+    return net_udp_recv_from(socket.fd, max_len);
+}
+
+pub fn udp_socket_close(inout socket: UdpSocket) {
+    if socket.is_open {
+        net_udp_close(socket.fd);
+        socket.is_open = false;
     }
 }
 
@@ -572,6 +646,175 @@ pub fn http_delete(host: String, port: i64, path: String) -> HttpResponse {
     return parse_http_response(resp_str);
 }
 
+pub fn http_patch_json(host: String, port: i64, path: String, json_body: String) -> HttpResponse {
+    mut stream = make_tcp_connect(host, port);
+    if !stream.is_open {
+        return HttpResponse(status_code: 503, status_text: "Service Unavailable", content_type: "text/plain", body: "Connection failed");
+    }
+
+    let req = HttpRequest(method: "PATCH", path: path, version: "HTTP/1.1", body: json_body);
+    let wire = format_http_request(req, host);
+    stream_write(stream, wire);
+    let resp_str = stream_read(stream, 65536);
+    stream_close(stream);
+    return parse_http_response(resp_str);
+}
+
+pub fn http_head(host: String, port: i64, path: String) -> HttpResponse {
+    mut stream = make_tcp_connect(host, port);
+    if !stream.is_open {
+        return HttpResponse(status_code: 503, status_text: "Service Unavailable", content_type: "text/plain", body: "Connection failed");
+    }
+
+    let req = HttpRequest(method: "HEAD", path: path, version: "HTTP/1.1", body: "");
+    let wire = format_http_request(req, host);
+    stream_write(stream, wire);
+    let resp_str = stream_read(stream, 65536);
+    stream_close(stream);
+    return parse_http_response(resp_str);
+}
+
+// HTTP Status Predicates
+pub fn http_is_info(code: i64) -> bool {
+    return code >= 100 && code <= 199;
+}
+
+pub fn http_is_success(code: i64) -> bool {
+    return code >= 200 && code <= 299;
+}
+
+pub fn http_is_redirect(code: i64) -> bool {
+    return code >= 300 && code <= 399;
+}
+
+pub fn http_is_client_error(code: i64) -> bool {
+    return code >= 400 && code <= 499;
+}
+
+pub fn http_is_server_error(code: i64) -> bool {
+    return code >= 500 && code <= 599;
+}
+
+// HTTP Header and Query String Parsing Helpers
+pub fn http_get_header(raw: String, name: String) -> String {
+    let raw_len = string_len(raw);
+    let name_len = string_len(name);
+    if raw_len == 0 || name_len == 0 {
+        return "";
+    }
+
+    mut i: i64 = 0;
+    while i < raw_len {
+        let line_start = i;
+        mut line_end = raw_len;
+        mut j = i;
+        while j < raw_len {
+            if string_char_at(raw, j) == 10 { // '\n'
+                line_end = j;
+                j = raw_len;
+            }
+            j = j + 1;
+        }
+
+        let actual_end = if line_end > line_start && string_char_at(raw, line_end - 1) == 13 {
+            line_end - 1
+        } else {
+            line_end
+        };
+
+        if actual_end - line_start > name_len + 1 {
+            mut is_match = true;
+            mut k: i64 = 0;
+            while k < name_len {
+                mut c1 = string_char_at(raw, line_start + k);
+                mut c2 = string_char_at(name, k);
+                if c1 >= 65 && c1 <= 90 { c1 = c1 + 32; }
+                if c2 >= 65 && c2 <= 90 { c2 = c2 + 32; }
+                if c1 != c2 {
+                    is_match = false;
+                    k = name_len;
+                }
+                k = k + 1;
+            }
+            if is_match && string_char_at(raw, line_start + name_len) == 58 { // ':'
+                mut val_start = line_start + name_len + 1;
+                while val_start < actual_end && string_char_at(raw, val_start) == 32 {
+                    val_start = val_start + 1;
+                }
+                return string_substr(raw, val_start, actual_end - val_start);
+            }
+        }
+
+        i = line_end + 1;
+    }
+
+    return "";
+}
+
+pub fn url_get_query_param(query: String, key: String) -> String {
+    let q_len = string_len(query);
+    let k_len = string_len(key);
+    if q_len == 0 || k_len == 0 {
+        return "";
+    }
+
+    mut i: i64 = 0;
+    while i < q_len {
+        let pair_start = i;
+        mut pair_end = q_len;
+        mut j = i;
+        while j < q_len {
+            if string_char_at(query, j) == 38 { // '&'
+                pair_end = j;
+                j = q_len;
+            }
+            j = j + 1;
+        }
+
+        if pair_end - pair_start > k_len && string_char_at(query, pair_start + k_len) == 61 { // '='
+            mut match_key = true;
+            mut k: i64 = 0;
+            while k < k_len {
+                if string_char_at(query, pair_start + k) != string_char_at(key, k) {
+                    match_key = false;
+                    k = k_len;
+                }
+                k = k + 1;
+            }
+            if match_key {
+                let val_start = pair_start + k_len + 1;
+                return string_substr(query, val_start, pair_end - val_start);
+            }
+        }
+
+        i = pair_end + 1;
+    }
+
+    return "";
+}
+
+// HTTP Router
+pub fn make_http_router() -> HttpRouter {
+    return HttpRouter(routes: List::new());
+}
+
+pub fn router_add_route(inout router: HttpRouter, method: String, path: String, handler_id: i64) {
+    router.routes.push(HttpRoute(method: method, path: path, handler_id: handler_id));
+}
+
+pub fn router_match_route(router: HttpRouter, method: String, path: String) -> i64 {
+    mut i: i64 = 0;
+    let n = router.routes.len();
+    while i < n {
+        let r = router.routes[i];
+        if r.method == method && r.path == path {
+            return r.handler_id;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
 // === Unit Tests ===
 
 pub fn test_net_tcp_echo() -> bool {
@@ -915,6 +1158,182 @@ pub fn test_net_http_put_and_delete() -> bool {
     return true;
 }
 
+pub fn test_net_udp_roundtrip() -> bool {
+    mut server_sock = make_udp_socket(0);
+    if !server_sock.is_open || server_sock.port <= 0 {
+        return false;
+    }
+
+    mut client_sock = make_udp_socket(0);
+    if !client_sock.is_open {
+        udp_socket_close(server_sock);
+        return false;
+    }
+
+    let payload = "UDP_FIBER_PING";
+    let sent = udp_socket_send(client_sock, "127.0.0.1", server_sock.port, payload);
+    if sent != 14 {
+        udp_socket_close(client_sock);
+        udp_socket_close(server_sock);
+        return false;
+    }
+
+    let received = udp_socket_recv(server_sock, 1024);
+    if received != "UDP_FIBER_PING" {
+        udp_socket_close(client_sock);
+        udp_socket_close(server_sock);
+        return false;
+    }
+
+    // Server responds back to client
+    let reply_sent = udp_socket_send(server_sock, "127.0.0.1", client_sock.port, "UDP_FIBER_PONG");
+    if reply_sent != 14 {
+        udp_socket_close(client_sock);
+        udp_socket_close(server_sock);
+        return false;
+    }
+
+    let client_received = udp_socket_recv(client_sock, 1024);
+    if client_received != "UDP_FIBER_PONG" {
+        udp_socket_close(client_sock);
+        udp_socket_close(server_sock);
+        return false;
+    }
+
+    udp_socket_close(client_sock);
+    udp_socket_close(server_sock);
+    return true;
+}
+
+pub fn test_net_http_router_and_query_params() -> bool {
+    mut router = make_http_router();
+    router_add_route(inout router, "GET", "/api/v1/health", 101);
+    router_add_route(inout router, "POST", "/api/v1/orders", 102);
+    router_add_route(inout router, "GET", "/api/v1/orders", 103);
+    router_add_route(inout router, "DELETE", "/api/v1/orders", 104);
+
+    if router_match_route(router, "GET", "/api/v1/health") != 101 { return false; }
+    if router_match_route(router, "POST", "/api/v1/orders") != 102 { return false; }
+    if router_match_route(router, "GET", "/api/v1/orders") != 103 { return false; }
+    if router_match_route(router, "DELETE", "/api/v1/orders") != 104 { return false; }
+    if router_match_route(router, "PUT", "/api/v1/orders") != -1 { return false; }
+    if router_match_route(router, "GET", "/api/v1/unknown") != -1 { return false; }
+
+    let q = "search=colorless&limit=50&active=true";
+    let p_search = url_get_query_param(q, "search");
+    let p_limit = url_get_query_param(q, "limit");
+    let p_active = url_get_query_param(q, "active");
+    let p_missing = url_get_query_param(q, "offset");
+
+    if p_search != "colorless" { return false; }
+    if p_limit != "50" { return false; }
+    if p_active != "true" { return false; }
+    if p_missing != "" { return false; }
+
+    return true;
+}
+
+pub fn test_net_http_headers_and_status_categories() -> bool {
+    if !http_is_info(100) || !http_is_info(101) || http_is_info(200) { return false; }
+    if !http_is_success(200) || !http_is_success(201) || !http_is_success(204) || http_is_success(400) { return false; }
+    if !http_is_redirect(301) || !http_is_redirect(302) || http_is_redirect(200) { return false; }
+    if !http_is_client_error(400) || !http_is_client_error(404) || !http_is_client_error(422) || http_is_client_error(500) { return false; }
+    if !http_is_server_error(500) || !http_is_server_error(502) || !http_is_server_error(503) || http_is_server_error(200) { return false; }
+
+    let raw_msg = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-RateLimit-Limit: 100\r\nAuthorization: Bearer test_token_xyz\r\n\r\n{\"ok\":true}";
+    let ct = http_get_header(raw_msg, "Content-Type");
+    let rl = http_get_header(raw_msg, "X-RateLimit-Limit");
+    let auth = http_get_header(raw_msg, "Authorization");
+    let none = http_get_header(raw_msg, "X-Unknown");
+
+    if ct != "application/json" { return false; }
+    if rl != "100" { return false; }
+    if auth != "Bearer test_token_xyz" { return false; }
+    if none != "" { return false; }
+
+    return true;
+}
+
+pub fn test_net_http_patch_and_head() -> bool {
+    mut listener = make_tcp_listener(0);
+    if !listener.is_open || listener.port <= 0 {
+        return false;
+    }
+
+    // Test PATCH
+    mut client_patch = make_tcp_connect("127.0.0.1", listener.port);
+    if !client_patch.is_open {
+        listener_close(listener);
+        return false;
+    }
+    mut server_patch = listener_accept(listener);
+    if !server_patch.is_open {
+        stream_close(client_patch);
+        listener_close(listener);
+        return false;
+    }
+
+    let req_patch = HttpRequest(method: "PATCH", path: "/v1/items/42", version: "HTTP/1.1", body: "{\"active\":false}");
+    stream_write(client_patch, format_http_request(req_patch, "localhost"));
+    let raw_patch = stream_read(server_patch, 1024);
+    let parsed_patch = parse_http_request(raw_patch);
+    if parsed_patch.method != "PATCH" || parsed_patch.path != "/v1/items/42" || parsed_patch.body != "{\"active\":false}" {
+        stream_close(client_patch);
+        stream_close(server_patch);
+        listener_close(listener);
+        return false;
+    }
+    let resp_patch = make_json_response(200, "{\"patched\":true}");
+    stream_write(server_patch, format_http_response(resp_patch));
+    let client_patch_resp = parse_http_response(stream_read(client_patch, 1024));
+    if client_patch_resp.status_code != 200 || client_patch_resp.body != "{\"patched\":true}" {
+        stream_close(client_patch);
+        stream_close(server_patch);
+        listener_close(listener);
+        return false;
+    }
+    stream_close(client_patch);
+    stream_close(server_patch);
+
+    // Test HEAD
+    mut client_head = make_tcp_connect("127.0.0.1", listener.port);
+    if !client_head.is_open {
+        listener_close(listener);
+        return false;
+    }
+    mut server_head = listener_accept(listener);
+    if !server_head.is_open {
+        stream_close(client_head);
+        listener_close(listener);
+        return false;
+    }
+
+    let req_head = HttpRequest(method: "HEAD", path: "/v1/items/42", version: "HTTP/1.1", body: "");
+    stream_write(client_head, format_http_request(req_head, "localhost"));
+    let raw_head = stream_read(server_head, 1024);
+    let parsed_head = parse_http_request(raw_head);
+    if parsed_head.method != "HEAD" || parsed_head.path != "/v1/items/42" {
+        stream_close(client_head);
+        stream_close(server_head);
+        listener_close(listener);
+        return false;
+    }
+    let resp_head = make_json_response(200, "");
+    stream_write(server_head, format_http_response(resp_head));
+    let client_head_resp = parse_http_response(stream_read(client_head, 1024));
+    if client_head_resp.status_code != 200 {
+        stream_close(client_head);
+        stream_close(server_head);
+        listener_close(listener);
+        return false;
+    }
+    stream_close(client_head);
+    stream_close(server_head);
+
+    listener_close(listener);
+    return true;
+}
+
 pub fn test_net_all() -> bool {
     return test_net_tcp_echo()
         && test_net_http_wire()
@@ -923,7 +1342,11 @@ pub fn test_net_all() -> bool {
         && test_net_http_client_and_response_parsing()
         && test_net_http_client_server_roundtrip()
         && test_net_http_status_helpers()
-        && test_net_http_put_and_delete();
+        && test_net_http_put_and_delete()
+        && test_net_udp_roundtrip()
+        && test_net_http_router_and_query_params()
+        && test_net_http_headers_and_status_categories()
+        && test_net_http_patch_and_head();
 }
 
 pub fn main() {
@@ -935,7 +1358,11 @@ pub fn main() {
     let t6 = test_net_http_client_server_roundtrip();
     let t7 = test_net_http_status_helpers();
     let t8 = test_net_http_put_and_delete();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 {
+    let t9 = test_net_udp_roundtrip();
+    let t10 = test_net_http_router_and_query_params();
+    let t11 = test_net_http_headers_and_status_categories();
+    let t12 = test_net_http_patch_and_head();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");

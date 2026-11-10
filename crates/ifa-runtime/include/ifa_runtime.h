@@ -439,6 +439,10 @@ int32_t ifa_rt_async_tcp_accept(int32_t listener_fd);
 int32_t ifa_rt_async_tcp_connect(const char* host, uint16_t port);
 intptr_t ifa_rt_async_read(int32_t stream_fd, uint8_t* buf, size_t len);
 intptr_t ifa_rt_async_write(int32_t stream_fd, const uint8_t* buf, size_t len);
+int32_t ifa_rt_async_udp_bind(uint16_t port);
+int32_t ifa_rt_async_udp_port(int32_t sock_id);
+intptr_t ifa_rt_async_udp_send_to(int32_t sock_id, const char* host, uint16_t port, const uint8_t* buf, size_t len);
+intptr_t ifa_rt_async_udp_recv_from(int32_t sock_id, uint8_t* buf, size_t len);
 int32_t ifa_rt_async_close(int32_t handle_fd);
 
 uint64_t ifa_rt_coro_register_io_uring_read(ifa_coroutine_t* coro, int32_t fd, uint8_t* buf, uint32_t len, uint64_t offset, int64_t* out_result);

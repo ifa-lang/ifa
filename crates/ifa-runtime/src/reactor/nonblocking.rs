@@ -152,6 +152,86 @@ impl AsyncTcpStream {
     }
 }
 
+/// Asynchronous non-blocking UDP socket managed by the fiber reactor.
+pub struct AsyncUdpSocket {
+    inner: std::net::UdpSocket,
+}
+
+impl AsyncUdpSocket {
+    /// Bind UDP socket to a local address and configure non-blocking mode.
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        let socket = std::net::UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
+        Ok(Self { inner: socket })
+    }
+
+    /// Asynchronously send datagram to remote address, yielding calling fiber if socket buffer is full.
+    pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
+        let mut spins = 0;
+        loop {
+            match self.inner.send_to(buf, &addr) {
+                Ok(n) => return Ok(n),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    spins += 1;
+                    if spins < 16 {
+                        std::hint::spin_loop();
+                    } else {
+                        GLOBAL_SCHEDULER.yield_now();
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Asynchronously receive datagram from socket, yielding calling fiber until packet arrives.
+    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, std::net::SocketAddr)> {
+        let mut spins = 0;
+        loop {
+            match self.inner.recv_from(buf) {
+                Ok((n, addr)) => return Ok((n, addr)),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    spins += 1;
+                    if spins < 16 {
+                        std::hint::spin_loop();
+                    } else {
+                        GLOBAL_SCHEDULER.yield_now();
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Non-blocking attempt to receive datagram immediately.
+    pub fn try_recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> io::Result<Option<(usize, std::net::SocketAddr)>> {
+        match self.inner.recv_from(buf) {
+            Ok((n, addr)) => Ok(Some((n, addr))),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Non-blocking attempt to send datagram immediately.
+    pub fn try_send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<Option<usize>> {
+        match self.inner.send_to(buf, addr) {
+            Ok(n) => Ok(Some(n)),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Retrieve local socket address.
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
 /// Asynchronous non-blocking timer for fibers.
 pub struct AsyncTimer;
 
