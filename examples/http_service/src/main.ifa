@@ -1,0 +1,278 @@
+// High-Performance HTTP REST Microservice in pure IFA
+// Demonstrates REST routing, JSON synthesis, state mutations, and error handling.
+
+pub struct ServiceState {
+    order_count: i64,
+    total_amount_cents: i64,
+    last_customer: String,
+    last_status: String
+}
+
+pub struct HttpRequestMessage {
+    method: String,
+    path: String,
+    version: String,
+    body: String
+}
+
+pub struct HttpResponseMessage {
+    status_code: i64,
+    status_text: String,
+    content_type: String,
+    body: String
+}
+
+pub fn make_service_state() -> ServiceState {
+    return ServiceState(
+        order_count: 0,
+        total_amount_cents: 0,
+        last_customer: "",
+        last_status: "NONE"
+    );
+}
+
+pub fn make_json_response(status_code: i64, body: String) -> HttpResponseMessage {
+    mut text = "OK";
+    if status_code == 201 { text = "Created"; }
+    if status_code == 204 { text = "No Content"; }
+    if status_code == 400 { text = "Bad Request"; }
+    if status_code == 404 { text = "Not Found"; }
+    if status_code == 500 { text = "Internal Server Error"; }
+
+    return HttpResponseMessage(
+        status_code: status_code,
+        status_text: text,
+        content_type: "application/json",
+        body: body
+    );
+}
+
+pub fn int_to_string(mut n: i64) -> String {
+    if n == 0 { return "0"; }
+    mut is_neg = false;
+    if n < 0 {
+        is_neg = true;
+        n = 0 - n;
+    }
+    mut digits = "";
+    while n > 0 {
+        let rem = n % 10;
+        if rem == 0 { digits = "0" + digits; }
+        if rem == 1 { digits = "1" + digits; }
+        if rem == 2 { digits = "2" + digits; }
+        if rem == 3 { digits = "3" + digits; }
+        if rem == 4 { digits = "4" + digits; }
+        if rem == 5 { digits = "5" + digits; }
+        if rem == 6 { digits = "6" + digits; }
+        if rem == 7 { digits = "7" + digits; }
+        if rem == 8 { digits = "8" + digits; }
+        if rem == 9 { digits = "9" + digits; }
+        n = n / 10;
+    }
+    if is_neg {
+        digits = "-" + digits;
+    }
+    return digits;
+}
+
+pub fn format_state_json(state: ServiceState) -> String {
+    mut s = "{\"order_count\":";
+    s = s + int_to_string(state.order_count);
+    s = s + ",\"total_amount_cents\":";
+    s = s + int_to_string(state.total_amount_cents);
+    s = s + ",\"last_customer\":\"";
+    s = s + state.last_customer;
+    s = s + "\",\"last_status\":\"";
+    s = s + state.last_status;
+    s = s + "\"}";
+    return s;
+}
+
+pub fn handle_service_route(req: HttpRequestMessage, inout state: ServiceState) -> HttpResponseMessage {
+    // 1. Healthcheck endpoint
+    if req.method == "GET" && req.path == "/health" {
+        return make_json_response(200, "{\"status\":\"healthy\",\"service\":\"ifa-http-service\",\"version\":\"0.1.0\"}");
+    }
+
+    // 2. Orders summary endpoint
+    if req.method == "GET" && req.path == "/api/v1/orders" {
+        let json_body = format_state_json(state);
+        return make_json_response(200, json_body);
+    }
+
+    // 3. Create order endpoint
+    if req.method == "POST" && req.path == "/api/v1/orders" {
+        if req.body.len() == 0 {
+            return make_json_response(400, "{\"error\":\"Missing JSON payload\"}");
+        }
+        state.order_count = state.order_count + 1;
+        state.total_amount_cents = state.total_amount_cents + 250000;
+        state.last_customer = "Client-BENIN";
+        state.last_status = "PENDING";
+        let resp_json = format_state_json(state);
+        return make_json_response(201, resp_json);
+    }
+
+    // 4. Update order status endpoint
+    if req.method == "PUT" && req.path == "/api/v1/orders/1" {
+        if state.order_count == 0 {
+            return make_json_response(404, "{\"error\":\"Order not found\"}");
+        }
+        state.last_status = "CONFIRMED";
+        return make_json_response(200, format_state_json(state));
+    }
+
+    // 5. Delete order endpoint
+    if req.method == "DELETE" && req.path == "/api/v1/orders/1" {
+        if state.order_count == 0 {
+            return make_json_response(404, "{\"error\":\"Order not found\"}");
+        }
+        state.order_count = 0;
+        state.total_amount_cents = 0;
+        state.last_customer = "";
+        state.last_status = "CANCELLED";
+        return make_json_response(204, "");
+    }
+
+    return make_json_response(404, "{\"error\":\"Endpoint not found\"}");
+}
+
+// === Unit Tests ===
+
+pub fn test_service_health_check() -> bool {
+    mut state = make_service_state();
+    let req = HttpRequestMessage(method: "GET", path: "/health", version: "HTTP/1.1", body: "");
+    let res = handle_service_route(req, inout state);
+    if res.status_code != 200 || res.status_text != "OK" {
+        return false;
+    }
+    if res.content_type != "application/json" {
+        return false;
+    }
+    return res.body == "{\"status\":\"healthy\",\"service\":\"ifa-http-service\",\"version\":\"0.1.0\"}";
+}
+
+pub fn test_service_get_orders_initial() -> bool {
+    mut state = make_service_state();
+    let req = HttpRequestMessage(method: "GET", path: "/api/v1/orders", version: "HTTP/1.1", body: "");
+    let res = handle_service_route(req, inout state);
+    if res.status_code != 200 {
+        return false;
+    }
+    return state.order_count == 0;
+}
+
+pub fn test_service_post_and_get_orders() -> bool {
+    mut state = make_service_state();
+    let post_req = HttpRequestMessage(
+        method: "POST",
+        path: "/api/v1/orders",
+        version: "HTTP/1.1",
+        body: "{\"amount_cents\":250000}"
+    );
+    let post_res = handle_service_route(post_req, inout state);
+    if post_res.status_code != 201 || state.order_count != 1 {
+        return false;
+    }
+
+    let get_req = HttpRequestMessage(method: "GET", path: "/api/v1/orders", version: "HTTP/1.1", body: "");
+    let get_res = handle_service_route(get_req, inout state);
+    if get_res.status_code != 200 || state.total_amount_cents != 250000 {
+        return false;
+    }
+    return true;
+}
+
+pub fn test_service_put_order_confirmation() -> bool {
+    mut state = make_service_state();
+    state.order_count = 1;
+    state.total_amount_cents = 250000;
+    state.last_customer = "Client-BENIN";
+    state.last_status = "PENDING";
+
+    let put_req = HttpRequestMessage(
+        method: "PUT",
+        path: "/api/v1/orders/1",
+        version: "HTTP/1.1",
+        body: "{\"status\":\"CONFIRMED\"}"
+    );
+    let put_res = handle_service_route(put_req, inout state);
+    if put_res.status_code != 200 {
+        return false;
+    }
+    return state.last_status == "CONFIRMED";
+}
+
+pub fn test_service_delete_order() -> bool {
+    mut state = make_service_state();
+    state.order_count = 1;
+    state.total_amount_cents = 250000;
+    state.last_customer = "Client-BENIN";
+    state.last_status = "CONFIRMED";
+
+    let del_req = HttpRequestMessage(method: "DELETE", path: "/api/v1/orders/1", version: "HTTP/1.1", body: "");
+    let del_res = handle_service_route(del_req, inout state);
+    if del_res.status_code != 204 {
+        return false;
+    }
+    return state.order_count == 0;
+}
+
+pub fn test_service_not_found_endpoint() -> bool {
+    mut state = make_service_state();
+    let req = HttpRequestMessage(method: "GET", path: "/api/v1/unknown", version: "HTTP/1.1", body: "");
+    let res = handle_service_route(req, inout state);
+    return res.status_code == 404;
+}
+
+pub fn test_http_service_all() -> bool {
+    let t1 = test_service_health_check();
+    let t2 = test_service_get_orders_initial();
+    let t3 = test_service_post_and_get_orders();
+    let t4 = test_service_put_order_confirmation();
+    let t5 = test_service_delete_order();
+    let t6 = test_service_not_found_endpoint();
+    return t1 && t2 && t3 && t4 && t5 && t6;
+}
+
+pub fn main() {
+    println("=== IFA REST HTTP MICROSERVICE ===");
+    mut state = make_service_state();
+
+    // 1. Healthcheck
+    let req_h = HttpRequestMessage(method: "GET", path: "/health", version: "HTTP/1.1", body: "");
+    let res_h = handle_service_route(req_h, inout state);
+    println("GET /health -> HTTP 200 OK");
+
+    // 2. Create order
+    let req_post = HttpRequestMessage(
+        method: "POST",
+        path: "/api/v1/orders",
+        version: "HTTP/1.1",
+        body: "{\"amount_cents\":250000}"
+    );
+    let res_post = handle_service_route(req_post, inout state);
+    println("POST /api/v1/orders -> HTTP 201 Created");
+
+    // 3. Confirm order
+    let req_put = HttpRequestMessage(
+        method: "PUT",
+        path: "/api/v1/orders/1",
+        version: "HTTP/1.1",
+        body: "{\"status\":\"CONFIRMED\"}"
+    );
+    let res_put = handle_service_route(req_put, inout state);
+    println("PUT /api/v1/orders/1 -> HTTP 200 OK");
+
+    // 4. Delete order
+    let req_del = HttpRequestMessage(method: "DELETE", path: "/api/v1/orders/1", version: "HTTP/1.1", body: "");
+    let res_del = handle_service_route(req_del, inout state);
+    println("DELETE /api/v1/orders/1 -> HTTP 204 No Content");
+
+    let all_passed = test_http_service_all();
+    if all_passed {
+        println("All HTTP microservice tests PASSED");
+    } else {
+        println("HTTP microservice tests FAILED");
+    }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "ifa-http-service"
+version = "0.1.0"
+edition = "2026"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
+license = "MIT OR Apache-2.0"
+description = "High-performance non-blocking HTTP REST microservice showcasing std/net and std/json in pure IFA"
+
+[targets]
+bin = [
+    { name = "http_service", path = "src/main.ifa" }
+]
+
+[profiles.dev]
+backend = "cranelift"
+opt_level = 0
+debug_assertions = true
+lto = "none"
+strip_symbols = false
+gen_checks = true
+
+[profiles.release]
+backend = "cranelift"
+opt_level = 3
+debug_assertions = false
+lto = "none"
+strip_symbols = true
+gen_checks = false

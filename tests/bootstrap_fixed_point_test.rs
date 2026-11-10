@@ -997,8 +997,23 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("384 passed; 0 failed"),
-        "Expected 384 passed unit tests, got:\n{}",
+        stdout.contains("test test_driver_pe_coff_export_directory_and_eat_generation ... ok"),
+        "Modular driver PE32+/COFF export directory and EAT test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_direct_pe_coff_shared_library_with_exports_and_relocs ... ok"),
+        "Modular driver direct PE32+/COFF shared library with exports and relocs test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_tri_platform_export_symbol_compliance ... ok"),
+        "Modular driver tri-platform export compliance test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("390 passed; 0 failed"),
+        "Expected 390 passed unit tests, got:\n{}",
         stdout
     );
 }
@@ -1443,6 +1458,16 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_net_http_status_helpers ... ok"),
+        "Std net HTTP status helpers test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_http_put_and_delete ... ok"),
+        "Std net HTTP put/delete test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_collections_ring_buffer ... ok"),
         "Std collections ring buffer test missing from output:\n{}",
         stdout
@@ -1518,8 +1543,8 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("105 passed; 0 failed"),
-        "Expected 105 passed std unit tests, got:\n{}",
+        stdout.contains("109 passed; 0 failed"),
+        "Expected 109 passed std unit tests, got:\n{}",
         stdout
     );
 }
@@ -2092,6 +2117,50 @@ fn test_direct_pe_coff_dynamic_imports_and_delay_load_determinism() {
         stdout
             .contains("test test_driver_direct_pe_coff_dynamic_import_executable_assembler ... ok"),
         "Direct PE32+/COFF dynamic import executable assembler test missing from output:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_direct_pe_coff_export_directory_and_tri_platform_compliance() {
+    let _lock = BOOTSTRAP_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let root = get_workspace_root();
+    let kori_bin = get_kori_binary();
+    let manifest_path = root.join("compiler").join("kori.toml");
+
+    let test_run = Command::new(&kori_bin)
+        .arg("test")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .output()
+        .expect("Run modular compiler tests including PE32+/COFF export directory (.edata) and universal export compliance");
+
+    assert!(
+        test_run.status.success(),
+        "Modular compiler unit tests failed with status: {:?}\nstdout: {}\nstderr: {}",
+        test_run.status,
+        String::from_utf8_lossy(&test_run.stdout),
+        String::from_utf8_lossy(&test_run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&test_run.stdout);
+    assert!(
+        stdout.contains("test test_driver_pe_coff_export_directory_and_eat_generation ... ok"),
+        "PE32+/COFF IDT and EAT test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains(
+            "test test_driver_direct_pe_coff_shared_library_with_exports_and_relocs ... ok"
+        ),
+        "PE32+/COFF shared library with exports test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_tri_platform_export_symbol_compliance ... ok"),
+        "Direct universal tri-platform export compliance test missing from output:\n{}",
         stdout
     );
 }

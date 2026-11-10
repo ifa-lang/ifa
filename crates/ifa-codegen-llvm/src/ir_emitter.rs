@@ -5276,6 +5276,12 @@ impl<'a> LlvmIrEmitter<'a> {
                 }
             }
             ValueExpr::ArrayLen { array } => match value_types.get(array) {
+                Some(ifa_fir::FirType::Str | ifa_fir::FirType::String) => {
+                    out.push_str(&format!(
+                        "  %v{} = call i64 @ifa_rt_string_len(ptr %v{})\n",
+                        res_id, array.0
+                    ));
+                }
                 Some(ifa_fir::FirType::Array(_, len)) => {
                     out.push_str(&format!("  %v{} = add i64 {}, 0\n", res_id, len));
                 }
@@ -5286,6 +5292,16 @@ impl<'a> LlvmIrEmitter<'a> {
                     ));
                 }
                 Some(ifa_fir::FirType::Pointer(inner)) => match &**inner {
+                    ifa_fir::FirType::Str | ifa_fir::FirType::String => {
+                        out.push_str(&format!(
+                            "  %str_ld_{} = load ptr, ptr %v{}, align 8\n",
+                            res_id, array.0
+                        ));
+                        out.push_str(&format!(
+                            "  %v{} = call i64 @ifa_rt_string_len(ptr %str_ld_{})\n",
+                            res_id, res_id
+                        ));
+                    }
                     ifa_fir::FirType::Array(_, len) => {
                         out.push_str(&format!("  %v{} = add i64 {}, 0\n", res_id, len));
                     }

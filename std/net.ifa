@@ -516,6 +516,62 @@ pub fn http_post_json(host: String, port: i64, path: String, json_body: String) 
     return parse_http_response(resp_str);
 }
 
+pub fn http_status_text(code: i64) -> String {
+    if code == 200 { return "OK"; }
+    if code == 201 { return "Created"; }
+    if code == 202 { return "Accepted"; }
+    if code == 204 { return "No Content"; }
+    if code == 301 { return "Moved Permanently"; }
+    if code == 302 { return "Found"; }
+    if code == 400 { return "Bad Request"; }
+    if code == 401 { return "Unauthorized"; }
+    if code == 403 { return "Forbidden"; }
+    if code == 404 { return "Not Found"; }
+    if code == 405 { return "Method Not Allowed"; }
+    if code == 409 { return "Conflict"; }
+    if code == 422 { return "Unprocessable Entity"; }
+    if code == 500 { return "Internal Server Error"; }
+    if code == 502 { return "Bad Gateway"; }
+    if code == 503 { return "Service Unavailable"; }
+    return "Unknown";
+}
+
+pub fn make_json_response(status_code: i64, json_body: String) -> HttpResponse {
+    return make_http_response(status_code, http_status_text(status_code), "application/json", json_body);
+}
+
+pub fn make_text_response(status_code: i64, text_body: String) -> HttpResponse {
+    return make_http_response(status_code, http_status_text(status_code), "text/plain", text_body);
+}
+
+pub fn http_put_json(host: String, port: i64, path: String, json_body: String) -> HttpResponse {
+    mut stream = make_tcp_connect(host, port);
+    if !stream.is_open {
+        return HttpResponse(status_code: 503, status_text: "Service Unavailable", content_type: "text/plain", body: "Connection failed");
+    }
+
+    let req = HttpRequest(method: "PUT", path: path, version: "HTTP/1.1", body: json_body);
+    let wire = format_http_request(req, host);
+    stream_write(stream, wire);
+    let resp_str = stream_read(stream, 65536);
+    stream_close(stream);
+    return parse_http_response(resp_str);
+}
+
+pub fn http_delete(host: String, port: i64, path: String) -> HttpResponse {
+    mut stream = make_tcp_connect(host, port);
+    if !stream.is_open {
+        return HttpResponse(status_code: 503, status_text: "Service Unavailable", content_type: "text/plain", body: "Connection failed");
+    }
+
+    let req = HttpRequest(method: "DELETE", path: path, version: "HTTP/1.1", body: "");
+    let wire = format_http_request(req, host);
+    stream_write(stream, wire);
+    let resp_str = stream_read(stream, 65536);
+    stream_close(stream);
+    return parse_http_response(resp_str);
+}
+
 // === Unit Tests ===
 
 pub fn test_net_tcp_echo() -> bool {
@@ -760,13 +816,114 @@ pub fn test_net_http_client_server_roundtrip() -> bool {
     return true;
 }
 
+pub fn test_net_http_status_helpers() -> bool {
+    if http_status_text(200) != "OK" { return false; }
+    if http_status_text(201) != "Created" { return false; }
+    if http_status_text(204) != "No Content" { return false; }
+    if http_status_text(400) != "Bad Request" { return false; }
+    if http_status_text(404) != "Not Found" { return false; }
+    if http_status_text(500) != "Internal Server Error" { return false; }
+
+    let r_json = make_json_response(201, "{\"status\":\"created\"}");
+    if r_json.status_code != 201 || r_json.status_text != "Created" { return false; }
+    if r_json.content_type != "application/json" || r_json.body != "{\"status\":\"created\"}" { return false; }
+
+    let r_txt = make_text_response(404, "Route not found");
+    if r_txt.status_code != 404 || r_txt.status_text != "Not Found" { return false; }
+    if r_txt.content_type != "text/plain" || r_txt.body != "Route not found" { return false; }
+
+    return true;
+}
+
+pub fn test_net_http_put_and_delete() -> bool {
+    mut listener = make_tcp_listener(0);
+    if !listener.is_open || listener.port <= 0 {
+        return false;
+    }
+
+    // Test PUT
+    mut client_put = make_tcp_connect("127.0.0.1", listener.port);
+    if !client_put.is_open {
+        listener_close(listener);
+        return false;
+    }
+    mut server_put = listener_accept(listener);
+    if !server_put.is_open {
+        stream_close(client_put);
+        listener_close(listener);
+        return false;
+    }
+
+    let req_put = HttpRequest(method: "PUT", path: "/v1/resource/1", version: "HTTP/1.1", body: "{\"updated\":true}");
+    stream_write(client_put, format_http_request(req_put, "localhost"));
+    let raw_put = stream_read(server_put, 1024);
+    let parsed_put = parse_http_request(raw_put);
+    if parsed_put.method != "PUT" || parsed_put.path != "/v1/resource/1" || parsed_put.body != "{\"updated\":true}" {
+        stream_close(client_put);
+        stream_close(server_put);
+        listener_close(listener);
+        return false;
+    }
+    let resp_put = make_json_response(200, "{\"success\":true}");
+    stream_write(server_put, format_http_response(resp_put));
+    let client_put_resp = parse_http_response(stream_read(client_put, 1024));
+    if client_put_resp.status_code != 200 || client_put_resp.body != "{\"success\":true}" {
+        stream_close(client_put);
+        stream_close(server_put);
+        listener_close(listener);
+        return false;
+    }
+    stream_close(client_put);
+    stream_close(server_put);
+
+    // Test DELETE
+    mut client_del = make_tcp_connect("127.0.0.1", listener.port);
+    if !client_del.is_open {
+        listener_close(listener);
+        return false;
+    }
+    mut server_del = listener_accept(listener);
+    if !server_del.is_open {
+        stream_close(client_del);
+        listener_close(listener);
+        return false;
+    }
+
+    let req_del = HttpRequest(method: "DELETE", path: "/v1/resource/1", version: "HTTP/1.1", body: "");
+    stream_write(client_del, format_http_request(req_del, "localhost"));
+    let raw_del = stream_read(server_del, 1024);
+    let parsed_del = parse_http_request(raw_del);
+    if parsed_del.method != "DELETE" || parsed_del.path != "/v1/resource/1" {
+        stream_close(client_del);
+        stream_close(server_del);
+        listener_close(listener);
+        return false;
+    }
+    let resp_del = make_json_response(204, "");
+    stream_write(server_del, format_http_response(resp_del));
+    let client_del_resp = parse_http_response(stream_read(client_del, 1024));
+    if client_del_resp.status_code != 204 {
+        stream_close(client_del);
+        stream_close(server_del);
+        listener_close(listener);
+        return false;
+    }
+
+    stream_close(client_del);
+    stream_close(server_del);
+    listener_close(listener);
+    return true;
+}
+
 pub fn test_net_all() -> bool {
     return test_net_tcp_echo()
         && test_net_http_wire()
         && test_net_nonblocking_fiber_transport()
         && test_net_url_parsing_and_formatting()
         && test_net_http_client_and_response_parsing()
-        && test_net_http_client_server_roundtrip();
+        && test_net_http_client_server_roundtrip()
+        && test_net_http_status_helpers()
+        && test_net_http_put_and_delete();
 }
 
 pub fn main() {
@@ -776,7 +933,9 @@ pub fn main() {
     let t4 = test_net_url_parsing_and_formatting();
     let t5 = test_net_http_client_and_response_parsing();
     let t6 = test_net_http_client_server_roundtrip();
-    if t1 && t2 && t3 && t4 && t5 && t6 {
+    let t7 = test_net_http_status_helpers();
+    let t8 = test_net_http_put_and_delete();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");

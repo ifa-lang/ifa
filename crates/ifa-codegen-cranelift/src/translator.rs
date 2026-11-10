@@ -2091,11 +2091,40 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                 } else {
                     let arr_ty = self.value_types.get(array);
                     match arr_ty {
+                        Some(FirType::Str | FirType::String) => {
+                            if let Some(&callee_id) = self.func_ids.get("ifa_rt_string_len") {
+                                let local_func = self
+                                    .module
+                                    .declare_func_in_func(callee_id, self.builder.func);
+                                let str_ptr = self.value_map[array];
+                                let call = self.builder.ins().call(local_func, &[str_ptr]);
+                                Some(self.builder.inst_results(call)[0])
+                            } else {
+                                Some(self.builder.ins().iconst(types::I64, 0))
+                            }
+                        }
                         Some(FirType::Array(_, len)) => {
                             Some(self.builder.ins().iconst(types::I64, *len as i64))
                         }
                         Some(FirType::Pointer(inner)) => {
-                            if let FirType::Array(_, len) = &**inner {
+                            if matches!(&**inner, FirType::Str | FirType::String) {
+                                if let Some(&callee_id) = self.func_ids.get("ifa_rt_string_len") {
+                                    let local_func = self
+                                        .module
+                                        .declare_func_in_func(callee_id, self.builder.func);
+                                    let ptr = self.value_map[array];
+                                    let str_ptr = self.builder.ins().load(
+                                        self.module.target_config().pointer_type(),
+                                        MemFlagsData::trusted(),
+                                        ptr,
+                                        0,
+                                    );
+                                    let call = self.builder.ins().call(local_func, &[str_ptr]);
+                                    Some(self.builder.inst_results(call)[0])
+                                } else {
+                                    Some(self.builder.ins().iconst(types::I64, 0))
+                                }
+                            } else if let FirType::Array(_, len) = &**inner {
                                 Some(self.builder.ins().iconst(types::I64, *len as i64))
                             } else if let FirType::Struct(name, _) = &**inner {
                                 let s_name = INTERNER.resolve(name);
