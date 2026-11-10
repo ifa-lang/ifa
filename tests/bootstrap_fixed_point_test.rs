@@ -886,8 +886,23 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("340 passed; 0 failed"),
-        "Expected 340 passed unit tests, got:\n{}",
+        stdout.contains("test test_driver_direct_elf64_binary_assembler ... ok"),
+        "Modular driver direct elf64 binary assembler test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_direct_macho64_binary_assembler ... ok"),
+        "Modular driver direct macho64 binary assembler test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_driver_linkerless_cross_target_emission ... ok"),
+        "Modular driver linkerless cross-target emission test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("346 passed; 0 failed"),
+        "Expected 346 passed unit tests, got:\n{}",
         stdout
     );
 }
