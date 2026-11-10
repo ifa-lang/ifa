@@ -12,6 +12,22 @@ pub struct TcpStream {
     is_open: bool
 }
 
+pub struct TcpConnection {
+    id: i64,
+    fd: i64,
+    is_active: bool,
+    bytes_sent: i64,
+    bytes_recv: i64
+}
+
+pub struct TcpServer {
+    listener: TcpListener,
+    clients: List<TcpStream>,
+    max_clients: i64,
+    is_running: bool,
+    total_accepted: i64
+}
+
 pub struct UdpSocket {
     fd: i64,
     port: i64,
@@ -182,6 +198,102 @@ pub fn stream_close(inout stream: TcpStream) {
     if stream.is_open {
         net_tcp_close(stream.fd);
         stream.is_open = false;
+    }
+}
+
+// Multi-Connection Cooperative TCP Server Abstractions
+pub fn make_tcp_server(port: i64, max_clients: i64) -> TcpServer {
+    let listener = make_tcp_listener(port);
+    return TcpServer(
+        listener: listener,
+        clients: List::new(),
+        max_clients: max_clients,
+        is_running: listener.is_open,
+        total_accepted: 0
+    );
+}
+
+pub fn tcp_server_port(server: TcpServer) -> i64 {
+    return server.listener.port;
+}
+
+pub fn tcp_server_client_count(server: TcpServer) -> i64 {
+    return server.clients.len();
+}
+
+pub fn tcp_server_accept_client(inout server: TcpServer) -> bool {
+    if !server.is_running || !server.listener.is_open {
+        return false;
+    }
+    if server.clients.len() >= server.max_clients {
+        return false;
+    }
+    let client = listener_accept(server.listener);
+    if client.is_open {
+        server.clients.push(client);
+        server.total_accepted = server.total_accepted + 1;
+        return true;
+    }
+    return false;
+}
+
+pub fn tcp_server_broadcast(inout server: TcpServer, message: String) -> i64 {
+    if !server.is_running {
+        return 0;
+    }
+    mut delivered: i64 = 0;
+    mut i: i64 = 0;
+    while i < server.clients.len() {
+        let stream = server.clients[i];
+        if stream.is_open {
+            let written = stream_write(stream, message);
+            if written > 0 {
+                delivered = delivered + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return delivered;
+}
+
+pub fn tcp_server_poll(inout server: TcpServer) -> List<String> {
+    mut msgs: List<String> = List::new();
+    if !server.is_running {
+        return msgs;
+    }
+    mut i: i64 = 0;
+    while i < server.clients.len() {
+        let stream = server.clients[i];
+        if stream.is_open {
+            let chunk = stream_read(stream, 4096);
+            if chunk.len() > 0 {
+                msgs.push(chunk);
+            }
+        }
+        i = i + 1;
+    }
+    return msgs;
+}
+
+pub fn tcp_server_disconnect_client(inout server: TcpServer, index: i64) -> bool {
+    if index >= 0 && index < server.clients.len() {
+        mut client = server.clients[index];
+        stream_close(client);
+        return true;
+    }
+    return false;
+}
+
+pub fn tcp_server_close(inout server: TcpServer) {
+    if server.is_running {
+        server.is_running = false;
+        mut i: i64 = 0;
+        while i < server.clients.len() {
+            mut client = server.clients[i];
+            stream_close(client);
+            i = i + 1;
+        }
+        listener_close(server.listener);
     }
 }
 
@@ -1852,6 +1964,89 @@ pub fn test_net_websocket_framing_and_roundtrip() -> bool {
     return true;
 }
 
+pub fn test_net_tcp_server_multiple_clients() -> bool {
+    mut server = make_tcp_server(0, 8);
+    if !server.is_running {
+        return false;
+    }
+    let port = tcp_server_port(server);
+    if port <= 0 {
+        tcp_server_close(server);
+        return false;
+    }
+
+    // Connect client 1
+    mut c1 = make_tcp_connect("127.0.0.1", port);
+    if !c1.is_open {
+        tcp_server_close(server);
+        return false;
+    }
+    let acc1 = tcp_server_accept_client(server);
+    if !acc1 || tcp_server_client_count(server) != 1 {
+        stream_close(c1);
+        tcp_server_close(server);
+        return false;
+    }
+
+    // Connect client 2
+    mut c2 = make_tcp_connect("127.0.0.1", port);
+    if !c2.is_open {
+        stream_close(c1);
+        tcp_server_close(server);
+        return false;
+    }
+    let acc2 = tcp_server_accept_client(server);
+    if !acc2 || tcp_server_client_count(server) != 2 {
+        stream_close(c1);
+        stream_close(c2);
+        tcp_server_close(server);
+        return false;
+    }
+
+    // Server broadcasts to both clients
+    let delivered = tcp_server_broadcast(server, "IFA_MULTI_CLIENT_BROADCAST");
+    if delivered != 2 {
+        stream_close(c1);
+        stream_close(c2);
+        tcp_server_close(server);
+        return false;
+    }
+
+    // Clients read broadcast
+    let r1 = stream_read(c1, 1024);
+    let r2 = stream_read(c2, 1024);
+    if r1 != "IFA_MULTI_CLIENT_BROADCAST" || r2 != "IFA_MULTI_CLIENT_BROADCAST" {
+        stream_close(c1);
+        stream_close(c2);
+        tcp_server_close(server);
+        return false;
+    }
+
+    // Client 1 sends message to server
+    stream_write(c1, "PAYLOAD_CLIENT_1");
+    let msgs = tcp_server_poll(server);
+    if msgs.len() != 1 || msgs[0] != "PAYLOAD_CLIENT_1" {
+        stream_close(c1);
+        stream_close(c2);
+        tcp_server_close(server);
+        return false;
+    }
+
+    // Disconnect client 0
+    let dis = tcp_server_disconnect_client(server, 0);
+    if !dis {
+        stream_close(c1);
+        stream_close(c2);
+        tcp_server_close(server);
+        return false;
+    }
+
+    stream_close(c1);
+    stream_close(c2);
+    tcp_server_close(server);
+    return true;
+}
+
 pub fn test_net_all() -> bool {
     return test_net_tcp_echo()
         && test_net_http_wire()
@@ -1866,7 +2061,8 @@ pub fn test_net_all() -> bool {
         && test_net_http_headers_and_status_categories()
         && test_net_http_patch_and_head()
         && test_net_http_chunked_streaming()
-        && test_net_websocket_framing_and_roundtrip();
+        && test_net_websocket_framing_and_roundtrip()
+        && test_net_tcp_server_multiple_clients();
 }
 
 pub fn main() {
@@ -1884,7 +2080,8 @@ pub fn main() {
     let t12 = test_net_http_patch_and_head();
     let t13 = test_net_http_chunked_streaming();
     let t14 = test_net_websocket_framing_and_roundtrip();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 {
+    let t15 = test_net_tcp_server_multiple_clients();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");

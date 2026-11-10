@@ -50,7 +50,112 @@ pub fn handle_hover(doc: &Document, position: Position) -> Option<Hover> {
         });
     }
 
-    // 3. Semantic Analysis Lookup
+    // 3. Standard Library Core Structures Documentation
+    let stdlib_doc = match word {
+        "RingBuffer" => Some(
+            "**`RingBuffer`** — Fixed-capacity circular FIFO buffer (`std/collections`).\n\n\
+             Guarantees constant-time $O(1)$ operations with zero dynamic heap allocations after initialization.\n\n\
+             ```ifa\n\
+             pub struct RingBuffer {\n\
+                 capacity: int,\n\
+                 len: int,\n\
+                 head: int,\n\
+                 tail: int,\n\
+                 is_full: bool\n\
+             }\n\
+             ```",
+        ),
+        "BinaryHeap" => Some(
+            "**`BinaryHeap`** — Deterministic priority queue binary heap (`std/collections`).\n\n\
+             Supports configurable Max-Heap and Min-Heap modes with logarithmic $O(\\log N)$ insertions and root extractions.\n\n\
+             ```ifa\n\
+             pub struct BinaryHeap {\n\
+                 len: int,\n\
+                 is_max: bool\n\
+             }\n\
+             ```",
+        ),
+        "Deque" | "IntDeque" => Some(
+            "**`Deque`** — Double-ended queue (`std/collections`).\n\n\
+             Provides amortized $O(1)$ push/pop operations at both ends (`push_front`, `push_back`, `pop_front`, `pop_back`).\n\n\
+             ```ifa\n\
+             pub struct Deque {\n\
+                 len: int\n\
+             }\n\
+             ```",
+        ),
+        "IntMap" => Some(
+            "**`IntMap`** — High-performance 64-bit integer hash map with linear probing (`std/collections`).\n\n\
+             Deterministic hashing without runtime boxing overhead.\n\n\
+             ```ifa\n\
+             pub struct IntMap {\n\
+                 len: int\n\
+             }\n\
+             ```",
+        ),
+        "ByteBuffer" => Some(
+            "**`ByteBuffer`** — Contiguous byte sequence buffer with endianness control (`std/collections`).\n\n\
+             Optimized for low-level protocol encoders, network frame builders, and binary serializers.",
+        ),
+        "TcpServer" => Some(
+            "**`TcpServer`** — Non-blocking multi-connection TCP server (`std/net`).\n\n\
+             Orchestrates concurrent client streams without thread blocking, interfacable with colorless fibers reactor.\n\n\
+             ```ifa\n\
+             pub struct TcpServer {\n\
+                 listener: TcpListener,\n\
+                 clients: List<TcpStream>,\n\
+                 max_clients: int,\n\
+                 is_running: bool,\n\
+                 total_accepted: int\n\
+             }\n\
+             ```",
+        ),
+        "TcpStream" => Some(
+            "**`TcpStream`** — Non-blocking TCP network stream socket (`std/net`).\n\n\
+             Supports cooperative read, write, and timeout handling over colorless fibers.",
+        ),
+        "TcpListener" => Some(
+            "**`TcpListener`** — Non-blocking TCP socket listener (`std/net`).\n\n\
+             Binds to a network port and cooperatively accepts client connections.",
+        ),
+        "JsonValue" => Some(
+            "**`JsonValue`** — Universal deterministic JSON AST node (`std/json`).\n\n\
+             Supports RFC 8785 canonical serialization, RFC 6901 pointer resolution, and deep recursive merging.\n\n\
+             ```ifa\n\
+             pub struct JsonValue {\n\
+                 kind: int, // 0: Null, 1: Bool, 2: Number, 3: String, 4: Array, 5: Object\n\
+                 bool_val: bool,\n\
+                 int_val: int,\n\
+                 str_val: string,\n\
+                 arr_val: List<JsonValue>,\n\
+                 obj_keys: List<string>,\n\
+                 obj_vals: List<JsonValue>\n\
+             }\n\
+             ```",
+        ),
+        "Channel" => Some(
+            "**`Channel`** — Typed fiber synchronization message channel (`std/sync`).\n\n\
+             Supports bounded (backpressured) and unbounded cooperative rendezvous queues.",
+        ),
+        "Mutex" => Some(
+            "**`Mutex`** — Colorless fiber mutual exclusion lock (`std/sync`).\n\n\
+             Enforces critical section isolation without starving OS threads or consuming CPU spin cycles.",
+        ),
+        "AtomicInt" => Some(
+            "**`AtomicInt`** — 64-bit atomic integer (`std/sync`).\n\n\
+             Provides wait-free atomics including Compare-And-Swap (CAS), fetch-add, and sequential consistency.",
+        ),
+        _ => None,
+    };
+
+    if let Some(doc_str) = stdlib_doc {
+        return Some(Hover {
+            contents: MarkupContent::markdown(doc_str),
+            range: Some(range),
+        });
+    }
+
+    // 4. Semantic Analysis Lookup
     if let Some(analysis) = &doc.analysis {
         let symbol = sym(word);
 

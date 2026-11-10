@@ -7,6 +7,7 @@ pub mod http;
 pub mod io;
 pub mod iter;
 pub mod json;
+pub mod net;
 pub mod process;
 pub mod sync;
 
@@ -35,6 +36,9 @@ pub use io::{BufferedReader, BufferedWriter, MemoryStream};
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};
 pub use json::{
     decode as decode_json, encode as encode_json, encode_pretty as encode_json_pretty, JsonValue,
+};
+pub use net::{
+    ConnectionInfo, TcpListener as NetTcpListener, TcpServer, TcpStream as NetTcpStream,
 };
 pub use process::{
     find_best_assembler, find_best_linker, find_system_tool, invoke_assembler, invoke_linker,

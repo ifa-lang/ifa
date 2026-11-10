@@ -15,6 +15,270 @@ fn extract_struct_from_ast_type(ty: &ifa_ast::Type) -> Option<ifa_span::Symbol> 
     }
 }
 
+fn get_stdlib_completions_for_struct(name: &str) -> Option<Vec<CompletionItem>> {
+    let mut items = Vec::new();
+    match name {
+        "RingBuffer" => {
+            items.push(
+                CompletionItem::new("capacity", CompletionItemKind::Field)
+                    .with_detail("capacity: int")
+                    .with_doc("Fixed capacity of circular ring buffer"),
+            );
+            items.push(
+                CompletionItem::new("len", CompletionItemKind::Field)
+                    .with_detail("len: int")
+                    .with_doc("Current number of active items in ring buffer"),
+            );
+            items.push(
+                CompletionItem::new("head", CompletionItemKind::Field)
+                    .with_detail("head: int")
+                    .with_doc("Current head read index"),
+            );
+            items.push(
+                CompletionItem::new("tail", CompletionItemKind::Field)
+                    .with_detail("tail: int")
+                    .with_doc("Current tail write index"),
+            );
+            items.push(
+                CompletionItem::new("is_full", CompletionItemKind::Field)
+                    .with_detail("is_full: bool")
+                    .with_doc("Whether buffer has reached maximum capacity"),
+            );
+            items.push(
+                CompletionItem::new("push", CompletionItemKind::Method)
+                    .with_detail("fn push(inout self, val: int) -> bool")
+                    .with_doc("Push item into ring buffer, overwriting oldest if full"),
+            );
+            items.push(
+                CompletionItem::new("pop", CompletionItemKind::Method)
+                    .with_detail("fn pop(inout self) -> int")
+                    .with_doc("Pop oldest item in FIFO order"),
+            );
+            items.push(
+                CompletionItem::new("peek", CompletionItemKind::Method)
+                    .with_detail("fn peek(self) -> int")
+                    .with_doc("Inspect oldest item without removing"),
+            );
+            Some(items)
+        }
+        "BinaryHeap" => {
+            items.push(
+                CompletionItem::new("len", CompletionItemKind::Field)
+                    .with_detail("len: int")
+                    .with_doc("Number of elements in binary heap"),
+            );
+            items.push(
+                CompletionItem::new("is_max", CompletionItemKind::Field)
+                    .with_detail("is_max: bool")
+                    .with_doc("True for Max-Heap, false for Min-Heap"),
+            );
+            items.push(
+                CompletionItem::new("push", CompletionItemKind::Method)
+                    .with_detail("fn push(inout self, val: int)")
+                    .with_doc("Insert element maintaining logarithmic heap invariant"),
+            );
+            items.push(
+                CompletionItem::new("pop", CompletionItemKind::Method)
+                    .with_detail("fn pop(inout self) -> int")
+                    .with_doc("Extract root element (maximum or minimum)"),
+            );
+            items.push(
+                CompletionItem::new("peek", CompletionItemKind::Method)
+                    .with_detail("fn peek(self) -> int")
+                    .with_doc("View root element without removal"),
+            );
+            Some(items)
+        }
+        "Deque" | "IntDeque" => {
+            items.push(
+                CompletionItem::new("len", CompletionItemKind::Field)
+                    .with_detail("len: int")
+                    .with_doc("Number of elements in deque"),
+            );
+            items.push(
+                CompletionItem::new("push_front", CompletionItemKind::Method)
+                    .with_detail("fn push_front(inout self, val: int)")
+                    .with_doc("Prepend element to front"),
+            );
+            items.push(
+                CompletionItem::new("push_back", CompletionItemKind::Method)
+                    .with_detail("fn push_back(inout self, val: int)")
+                    .with_doc("Append element to back"),
+            );
+            items.push(
+                CompletionItem::new("pop_front", CompletionItemKind::Method)
+                    .with_detail("fn pop_front(inout self) -> int")
+                    .with_doc("Remove and return element from front"),
+            );
+            items.push(
+                CompletionItem::new("pop_back", CompletionItemKind::Method)
+                    .with_detail("fn pop_back(inout self) -> int")
+                    .with_doc("Remove and return element from back"),
+            );
+            Some(items)
+        }
+        "IntMap" => {
+            items.push(
+                CompletionItem::new("len", CompletionItemKind::Field)
+                    .with_detail("len: int")
+                    .with_doc("Number of key-value pairs in int map"),
+            );
+            items.push(
+                CompletionItem::new("get", CompletionItemKind::Method)
+                    .with_detail("fn get(self, key: int) -> int")
+                    .with_doc("Lookup value by integer key"),
+            );
+            items.push(
+                CompletionItem::new("set", CompletionItemKind::Method)
+                    .with_detail("fn set(inout self, key: int, val: int) -> bool")
+                    .with_doc("Insert or update key-value pair"),
+            );
+            items.push(
+                CompletionItem::new("remove", CompletionItemKind::Method)
+                    .with_detail("fn remove(inout self, key: int) -> bool")
+                    .with_doc("Remove key-value pair"),
+            );
+            items.push(
+                CompletionItem::new("has", CompletionItemKind::Method)
+                    .with_detail("fn has(self, key: int) -> bool")
+                    .with_doc("Check if key exists in map"),
+            );
+            Some(items)
+        }
+        "ByteBuffer" => {
+            items.push(
+                CompletionItem::new("len", CompletionItemKind::Field)
+                    .with_detail("len: int")
+                    .with_doc("Total written bytes in buffer"),
+            );
+            items.push(
+                CompletionItem::new("capacity", CompletionItemKind::Field)
+                    .with_detail("capacity: int")
+                    .with_doc("Allocated capacity"),
+            );
+            items.push(
+                CompletionItem::new("write_u8", CompletionItemKind::Method)
+                    .with_detail("fn write_u8(inout self, val: int)")
+                    .with_doc("Write single byte"),
+            );
+            items.push(
+                CompletionItem::new("read_u8", CompletionItemKind::Method)
+                    .with_detail("fn read_u8(self, offset: int) -> int")
+                    .with_doc("Read single byte at offset"),
+            );
+            items.push(
+                CompletionItem::new("write_u32_le", CompletionItemKind::Method)
+                    .with_detail("fn write_u32_le(inout self, val: int)")
+                    .with_doc("Write 32-bit little-endian integer"),
+            );
+            items.push(
+                CompletionItem::new("read_u32_le", CompletionItemKind::Method)
+                    .with_detail("fn read_u32_le(self, offset: int) -> int")
+                    .with_doc("Read 32-bit little-endian integer"),
+            );
+            Some(items)
+        }
+        "TcpServer" => {
+            items.push(
+                CompletionItem::new("listener", CompletionItemKind::Field)
+                    .with_detail("listener: TcpListener")
+                    .with_doc("Bound non-blocking TCP socket listener"),
+            );
+            items.push(
+                CompletionItem::new("clients", CompletionItemKind::Field)
+                    .with_detail("clients: List<TcpStream>")
+                    .with_doc("List of currently connected active client streams"),
+            );
+            items.push(
+                CompletionItem::new("max_clients", CompletionItemKind::Field)
+                    .with_detail("max_clients: int")
+                    .with_doc("Maximum allowed concurrent client connections"),
+            );
+            items.push(
+                CompletionItem::new("is_running", CompletionItemKind::Field)
+                    .with_detail("is_running: bool")
+                    .with_doc("Server running state"),
+            );
+            items.push(
+                CompletionItem::new("total_accepted", CompletionItemKind::Field)
+                    .with_detail("total_accepted: int")
+                    .with_doc("Total connection count accepted since start"),
+            );
+            Some(items)
+        }
+        "TcpStream" => {
+            items.push(
+                CompletionItem::new("fd", CompletionItemKind::Field)
+                    .with_detail("fd: int")
+                    .with_doc("Operating system socket file descriptor"),
+            );
+            items.push(
+                CompletionItem::new("is_open", CompletionItemKind::Field)
+                    .with_detail("is_open: bool")
+                    .with_doc("Whether the TCP stream is active and open"),
+            );
+            Some(items)
+        }
+        "TcpListener" => {
+            items.push(
+                CompletionItem::new("fd", CompletionItemKind::Field)
+                    .with_detail("fd: int")
+                    .with_doc("Listening socket file descriptor"),
+            );
+            items.push(
+                CompletionItem::new("port", CompletionItemKind::Field)
+                    .with_detail("port: int")
+                    .with_doc("Bound local TCP port number"),
+            );
+            items.push(
+                CompletionItem::new("is_open", CompletionItemKind::Field)
+                    .with_detail("is_open: bool")
+                    .with_doc("Whether the listener socket is actively accepting"),
+            );
+            Some(items)
+        }
+        "JsonValue" => {
+            items.push(
+                CompletionItem::new("kind", CompletionItemKind::Field)
+                    .with_detail("kind: int")
+                    .with_doc("0: Null, 1: Bool, 2: Number/Int, 3: String, 4: Array, 5: Object"),
+            );
+            items.push(
+                CompletionItem::new("bool_val", CompletionItemKind::Field)
+                    .with_detail("bool_val: bool")
+                    .with_doc("Boolean payload"),
+            );
+            items.push(
+                CompletionItem::new("int_val", CompletionItemKind::Field)
+                    .with_detail("int_val: int")
+                    .with_doc("64-bit signed integer payload"),
+            );
+            items.push(
+                CompletionItem::new("str_val", CompletionItemKind::Field)
+                    .with_detail("str_val: string")
+                    .with_doc("String payload"),
+            );
+            items.push(
+                CompletionItem::new("arr_val", CompletionItemKind::Field)
+                    .with_detail("arr_val: List<JsonValue>")
+                    .with_doc("Heterogeneous elements list"),
+            );
+            items.push(
+                CompletionItem::new("obj_keys", CompletionItemKind::Field)
+                    .with_detail("obj_keys: List<string>")
+                    .with_doc("Ordered object keys"),
+            );
+            items.push(
+                CompletionItem::new("obj_vals", CompletionItemKind::Field)
+                    .with_detail("obj_vals: List<JsonValue>")
+                    .with_doc("Ordered object values"),
+            );
+            Some(items)
+        }
+        _ => None,
+    }
+}
+
 pub fn handle_completion(doc: &Document, position: Position) -> CompletionList {
     let mut items = Vec::new();
 
@@ -93,6 +357,7 @@ pub fn handle_completion(doc: &Document, position: Position) -> CompletionList {
             }
 
             if let Some(s_sym) = struct_name {
+                let resolved_name = s_sym.resolve();
                 if let Some(str_sym) = analysis.symbols.structs.get(&s_sym) {
                     for field in &str_sym.fields {
                         let field_name = field.name.resolve();
@@ -107,7 +372,20 @@ pub fn handle_completion(doc: &Document, position: Position) -> CompletionList {
                         is_incomplete: false,
                         items,
                     };
+                } else if let Some(stdlib_items) = get_stdlib_completions_for_struct(&resolved_name)
+                {
+                    return CompletionList {
+                        is_incomplete: false,
+                        items: stdlib_items,
+                    };
                 }
+            }
+
+            if let Some(stdlib_items) = get_stdlib_completions_for_struct(&receiver) {
+                return CompletionList {
+                    is_incomplete: false,
+                    items: stdlib_items,
+                };
             }
         }
     }
@@ -325,7 +603,107 @@ pub fn handle_completion(doc: &Document, position: Position) -> CompletionList {
         );
     }
 
-    // 3. User Symbols from Semantic Analysis
+    // 3. Official IFA Standard Library Core Structures & Types
+    let stdlib_structs = [
+        (
+            "RingBuffer",
+            "Fixed-capacity circular FIFO ring buffer (`std/collections`)",
+        ),
+        (
+            "BinaryHeap",
+            "Deterministic binary heap priority queue (`std/collections`)",
+        ),
+        (
+            "Deque",
+            "Double-ended queue supporting O(1) front/back operations (`std/collections`)",
+        ),
+        (
+            "IntMap",
+            "Ordered integer key-value hash map (`std/collections`)",
+        ),
+        (
+            "ByteBuffer",
+            "Contiguous byte sequence buffer with endianness control (`std/collections`)",
+        ),
+        (
+            "StringBuilder",
+            "Deterministic mutable string builder (`std/collections`)",
+        ),
+        (
+            "List",
+            "Dynamic contiguous growable list (`std/collections`)",
+        ),
+        (
+            "Map",
+            "Ordered associative key-value map (`std/collections`)",
+        ),
+        ("Set", "Ordered unique elements set (`std/collections`)"),
+        (
+            "TcpServer",
+            "Non-blocking multi-connection TCP server (`std/net`)",
+        ),
+        (
+            "TcpStream",
+            "Non-blocking TCP network stream socket (`std/net`)",
+        ),
+        (
+            "TcpListener",
+            "Non-blocking TCP socket listener (`std/net`)",
+        ),
+        ("TcpConnection", "Managed TCP client connection (`std/net`)"),
+        ("UdpSocket", "UDP datagram network socket (`std/net`)"),
+        (
+            "HttpRequest",
+            "Structured HTTP request representation (`std/net`)",
+        ),
+        (
+            "HttpResponse",
+            "Structured HTTP response representation (`std/net`)",
+        ),
+        (
+            "HttpRouter",
+            "Deterministic HTTP path and method router (`std/net`)",
+        ),
+        (
+            "Url",
+            "Structured URL parser and representation (`std/net`)",
+        ),
+        (
+            "JsonValue",
+            "Universal deterministic JSON AST representation (`std/json`)",
+        ),
+        (
+            "JsonParseResult",
+            "JSON parse outcome and error diagnostic (`std/json`)",
+        ),
+        (
+            "Channel",
+            "Colorless fiber typed message channel (`std/sync`)",
+        ),
+        (
+            "Mutex",
+            "Colorless fiber cooperative mutual exclusion lock (`std/sync`)",
+        ),
+        (
+            "AtomicInt",
+            "Atomic 64-bit integer with CAS synchronization (`std/sync`)",
+        ),
+        ("AtomicFlag", "Atomic boolean flag (`std/sync`)"),
+        (
+            "WaitGroup",
+            "Deterministic fiber barrier synchronization counter (`std/sync`)",
+        ),
+    ];
+
+    for (st, detail) in stdlib_structs {
+        items.push(
+            CompletionItem::new(st, CompletionItemKind::Struct)
+                .with_detail(format!("Standard Library Struct `{}`", st))
+                .with_doc(detail),
+        );
+    }
+
+    // 4. User Symbols from Semantic Analysis
     if let Some(analysis) = &doc.analysis {
         // Functions
         for (f_sym, func) in &analysis.symbols.functions {

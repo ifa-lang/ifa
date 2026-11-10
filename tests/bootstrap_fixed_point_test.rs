@@ -1598,6 +1598,11 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_net_tcp_server_multiple_clients ... ok"),
+        "Std net TCP server multiple clients test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_collections_ring_buffer ... ok"),
         "Std collections ring buffer test missing from output:\n{}",
         stdout
@@ -1670,6 +1675,16 @@ fn test_autonomous_stdlib_unit_tests() {
     assert!(
         stdout.contains("test test_json_merge_and_remove ... ok"),
         "Std json merge and remove test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_json_heterogeneous_arrays ... ok"),
+        "Std json heterogeneous arrays test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_json_deep_merge_and_flatten ... ok"),
+        "Std json deep merge and flatten test missing from output:\n{}",
         stdout
     );
     assert!(
@@ -1788,8 +1803,8 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("179 passed; 0 failed"),
-        "Expected 179 passed std unit tests, got:\n{}",
+        stdout.contains("185 passed; 0 failed"),
+        "Expected 185 passed std unit tests, got:\n{}",
         stdout
     );
 }

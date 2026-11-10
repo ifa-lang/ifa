@@ -1039,4 +1039,142 @@ mod tests {
             labels
         );
     }
+
+    #[test]
+    fn test_lsp_stdlib_structures_completion_and_hover() {
+        let mut server = LanguageServer::new();
+
+        // 1. Verify global completion includes standard library structures
+        let doc_code = "fn main() {\n    \n}\n";
+        let open_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/stdlib_demo.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": doc_code
+                }
+            }
+        })
+        .to_string();
+        server.handle_message(&open_notif);
+
+        let comp_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": { "uri": "file:///workspace/stdlib_demo.ifa" },
+                "position": { "line": 1, "character": 4 }
+            }
+        })
+        .to_string();
+        let (comp_resp, _) = server.handle_message(&comp_req);
+        assert!(comp_resp.is_some());
+        let comp_val: serde_json::Value = serde_json::from_str(&comp_resp.unwrap()).unwrap();
+        let items = comp_val["result"]["items"].as_array().unwrap();
+        let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+
+        assert!(
+            labels.contains(&"RingBuffer"),
+            "Stdlib RingBuffer missing from completions"
+        );
+        assert!(
+            labels.contains(&"BinaryHeap"),
+            "Stdlib BinaryHeap missing from completions"
+        );
+        assert!(
+            labels.contains(&"TcpServer"),
+            "Stdlib TcpServer missing from completions"
+        );
+        assert!(
+            labels.contains(&"JsonValue"),
+            "Stdlib JsonValue missing from completions"
+        );
+
+        // 2. Verify dot access completion on standard library structure
+        let dot_code = "fn run(rb: RingBuffer) {\n    rb.\n}\n";
+        let change_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/stdlib_demo.ifa",
+                    "version": 2
+                },
+                "contentChanges": [{ "text": dot_code }]
+            }
+        })
+        .to_string();
+        server.handle_message(&change_notif);
+
+        let dot_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": { "uri": "file:///workspace/stdlib_demo.ifa" },
+                "position": { "line": 1, "character": 7 }
+            }
+        })
+        .to_string();
+        let (dot_resp, _) = server.handle_message(&dot_req);
+        assert!(dot_resp.is_some());
+        let dot_val: serde_json::Value = serde_json::from_str(&dot_resp.unwrap()).unwrap();
+        let dot_items = dot_val["result"]["items"].as_array().unwrap();
+        let dot_labels: Vec<&str> = dot_items
+            .iter()
+            .filter_map(|i| i["label"].as_str())
+            .collect();
+
+        assert!(
+            dot_labels.contains(&"capacity"),
+            "RingBuffer.capacity missing: {:?}",
+            dot_labels
+        );
+        assert!(
+            dot_labels.contains(&"push"),
+            "RingBuffer.push missing: {:?}",
+            dot_labels
+        );
+        assert!(
+            dot_labels.contains(&"pop"),
+            "RingBuffer.pop missing: {:?}",
+            dot_labels
+        );
+        assert!(
+            dot_labels.contains(&"peek"),
+            "RingBuffer.peek missing: {:?}",
+            dot_labels
+        );
+
+        // 3. Verify hover documentation on standard library structures
+        let hover_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": { "uri": "file:///workspace/stdlib_demo.ifa" },
+                "position": { "line": 0, "character": 12 }
+            }
+        })
+        .to_string();
+        let (hover_resp, _) = server.handle_message(&hover_req);
+        assert!(hover_resp.is_some());
+        let hover_val: serde_json::Value = serde_json::from_str(&hover_resp.unwrap()).unwrap();
+        let contents = hover_val["result"]["contents"]["value"].as_str().unwrap();
+
+        assert!(
+            contents.contains("RingBuffer"),
+            "Hover contents mismatch: {}",
+            contents
+        );
+        assert!(
+            contents.contains("Fixed-capacity circular FIFO buffer"),
+            "Hover doc mismatch: {}",
+            contents
+        );
+    }
 }

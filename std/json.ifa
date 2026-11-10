@@ -181,6 +181,111 @@ pub fn json_array_set(inout arr: JsonValue, idx: i64, val: JsonValue) -> bool {
     return false;
 }
 
+pub fn json_is_int(v: JsonValue) -> bool {
+    return v.kind == 2;
+}
+
+pub fn json_array_pop(inout arr: JsonValue) -> JsonValue {
+    if arr.kind != 4 || arr.arr_val.len() == 0 {
+        return json_null();
+    }
+    let last_idx = arr.arr_val.len() - 1;
+    let item = arr.arr_val[last_idx];
+    mut new_arr: List<JsonValue> = List::new();
+    mut i: i64 = 0;
+    while i < last_idx {
+        new_arr.push(arr.arr_val[i]);
+        i = i + 1;
+    }
+    arr.arr_val = new_arr;
+    return item;
+}
+
+pub fn json_array_insert(inout arr: JsonValue, idx: i64, val: JsonValue) -> bool {
+    if arr.kind != 4 || idx < 0 || idx > arr.arr_val.len() {
+        return false;
+    }
+    mut new_arr: List<JsonValue> = List::new();
+    mut i: i64 = 0;
+    let count = arr.arr_val.len();
+    while i < count {
+        if i == idx {
+            new_arr.push(json_clone(val));
+        }
+        new_arr.push(arr.arr_val[i]);
+        i = i + 1;
+    }
+    if idx == count {
+        new_arr.push(json_clone(val));
+    }
+    arr.arr_val = new_arr;
+    return true;
+}
+
+pub fn json_array_remove(inout arr: JsonValue, idx: i64) -> bool {
+    if arr.kind != 4 || idx < 0 || idx >= arr.arr_val.len() {
+        return false;
+    }
+    mut new_arr: List<JsonValue> = List::new();
+    mut i: i64 = 0;
+    let count = arr.arr_val.len();
+    while i < count {
+        if i != idx {
+            new_arr.push(arr.arr_val[i]);
+        }
+        i = i + 1;
+    }
+    arr.arr_val = new_arr;
+    return true;
+}
+
+pub fn json_array_concat(inout arr: JsonValue, other: JsonValue) -> bool {
+    if arr.kind != 4 || other.kind != 4 {
+        return false;
+    }
+    mut i: i64 = 0;
+    let count = other.arr_val.len();
+    while i < count {
+        arr.arr_val.push(json_clone(other.arr_val[i]));
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn json_array_filter_by_kind(arr: JsonValue, target_kind: i64) -> JsonValue {
+    mut res = json_array();
+    if arr.kind != 4 {
+        return res;
+    }
+    mut i: i64 = 0;
+    let count = arr.arr_val.len();
+    while i < count {
+        let item = arr.arr_val[i];
+        if item.kind == target_kind {
+            json_array_push(res, json_clone(item));
+        }
+        i = i + 1;
+    }
+    return res;
+}
+
+pub fn json_array_map_keys(arr: JsonValue, key: String) -> JsonValue {
+    mut res = json_array();
+    if arr.kind != 4 {
+        return res;
+    }
+    mut i: i64 = 0;
+    let count = arr.arr_val.len();
+    while i < count {
+        let item = arr.arr_val[i];
+        if item.kind == 5 && json_object_has(item, key) {
+            json_array_push(res, json_object_get(item, key));
+        }
+        i = i + 1;
+    }
+    return res;
+}
+
 // ---------------------------------------------------------------------------
 // 3. Object Operations & Safe Getters
 // ---------------------------------------------------------------------------
@@ -716,6 +821,70 @@ pub fn json_merge(inout target: JsonValue, source: JsonValue) {
         json_object_set(target, source.obj_keys[i], json_clone(source.obj_vals[i]));
         i = i + 1;
     }
+}
+
+pub fn json_deep_merge(inout target: JsonValue, source: JsonValue) {
+    if target.kind != 5 || source.kind != 5 {
+        target = json_clone(source);
+        return;
+    }
+    mut i: i64 = 0;
+    let count = source.obj_keys.len();
+    while i < count {
+        let key = source.obj_keys[i];
+        let src_val = source.obj_vals[i];
+        if json_object_has(target, key) {
+            mut tgt_val = json_object_get(target, key);
+            if tgt_val.kind == 5 && src_val.kind == 5 {
+                json_deep_merge(tgt_val, src_val);
+                json_object_set(target, key, tgt_val);
+            } else {
+                json_object_set(target, key, json_clone(src_val));
+            }
+        } else {
+            json_object_set(target, key, json_clone(src_val));
+        }
+        i = i + 1;
+    }
+}
+
+pub fn json_flatten_into(inout out_obj: JsonValue, prefix: String, val: JsonValue) {
+    if val.kind == 5 {
+        mut i: i64 = 0;
+        let count = val.obj_keys.len();
+        while i < count {
+            let k = val.obj_keys[i];
+            let v = val.obj_vals[i];
+            mut next_key = k;
+            if prefix.len() > 0 {
+                next_key = prefix + "." + k;
+            }
+            json_flatten_into(out_obj, next_key, v);
+            i = i + 1;
+        }
+    } else if val.kind == 4 {
+        mut j: i64 = 0;
+        let count = val.arr_val.len();
+        while j < count {
+            let elem = val.arr_val[j];
+            mut next_key = int_to_str(j);
+            if prefix.len() > 0 {
+                next_key = prefix + "." + int_to_str(j);
+            }
+            json_flatten_into(out_obj, next_key, elem);
+            j = j + 1;
+        }
+    } else {
+        if prefix.len() > 0 {
+            json_object_set(out_obj, prefix, json_clone(val));
+        }
+    }
+}
+
+pub fn json_flatten(val: JsonValue, prefix: String) -> JsonValue {
+    mut out_obj = json_object();
+    json_flatten_into(out_obj, prefix, val);
+    return out_obj;
 }
 
 // ---------------------------------------------------------------------------
@@ -1386,6 +1555,70 @@ pub fn test_json_merge_and_remove() -> bool {
     return t1 && t2 && t3 && t4 && t5;
 }
 
+pub fn test_json_heterogeneous_arrays() -> bool {
+    mut arr = json_array();
+    json_array_push(arr, json_int(100));
+    json_array_push(arr, json_string("test"));
+    json_array_push(arr, json_bool(true));
+    json_array_push(arr, json_null());
+
+    mut obj_item = json_object();
+    json_object_set(obj_item, "sub_id", json_int(777));
+    json_array_push(arr, obj_item);
+
+    let t1 = json_array_len(arr) == 5;
+    let t2 = json_is_int(json_array_get(arr, 0)) && json_get_int(json_array_get(arr, 0)) == 100;
+    let t3 = json_is_string(json_array_get(arr, 1)) && json_get_string(json_array_get(arr, 1)) == "test";
+    let t4 = json_is_bool(json_array_get(arr, 2)) && json_get_bool(json_array_get(arr, 2)) == true;
+    let t5 = json_is_null(json_array_get(arr, 3));
+    let t6 = json_is_object(json_array_get(arr, 4));
+
+    // Array pop
+    let popped = json_array_pop(arr);
+    let t7 = popped.kind == 5 && json_array_len(arr) == 4;
+
+    // Array insert
+    let ins = json_array_insert(arr, 1, json_string("inserted"));
+    let t8 = ins && json_array_len(arr) == 5 && json_get_string(json_array_get(arr, 1)) == "inserted";
+
+    // Array remove
+    let rem = json_array_remove(arr, 1);
+    let t9 = rem && json_array_len(arr) == 4 && json_get_string(json_array_get(arr, 1)) == "test";
+
+    // Filter by kind (e.g. integers)
+    let ints_only = json_array_filter_by_kind(arr, 2);
+    let t10 = json_array_len(ints_only) == 1 && json_get_int(json_array_get(ints_only, 0)) == 100;
+
+    return t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10;
+}
+
+pub fn test_json_deep_merge_and_flatten() -> bool {
+    let raw_base = "{\"server\":{\"host\":\"127.0.0.1\",\"port\":8080},\"mode\":\"debug\"}";
+    let raw_ext = "{\"server\":{\"port\":9000,\"tls\":true},\"active\":true}";
+
+    mut doc_base = json_parse(raw_base);
+    let doc_ext = json_parse(raw_ext);
+
+    json_deep_merge(doc_base, doc_ext);
+
+    let server_sub = json_get_object(doc_base, "server");
+    let t1 = json_get_string(json_object_get(server_sub, "host")) == "127.0.0.1";
+    let t2 = json_get_int(json_object_get(server_sub, "port")) == 9000;
+    let t3 = json_get_bool(json_object_get(server_sub, "tls")) == true;
+    let t4 = json_get_string(json_object_get(doc_base, "mode")) == "debug";
+    let t5 = json_get_bool(json_object_get(doc_base, "active")) == true;
+
+    // Flatten
+    let flat = json_flatten(doc_base, "");
+    let t6 = json_get_string(json_object_get(flat, "server.host")) == "127.0.0.1";
+    let t7 = json_get_int(json_object_get(flat, "server.port")) == 9000;
+    let t8 = json_get_bool(json_object_get(flat, "server.tls")) == true;
+    let t9 = json_get_string(json_object_get(flat, "mode")) == "debug";
+    let t10 = json_get_bool(json_object_get(flat, "active")) == true;
+
+    return t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10;
+}
+
 pub fn test_json_all() -> bool {
     let t1 = test_json_primitives();
     let t2 = test_json_arrays();
@@ -1398,7 +1631,9 @@ pub fn test_json_all() -> bool {
     let t9 = test_json_pointer();
     let t10 = test_json_deep_eq_and_clone();
     let t11 = test_json_merge_and_remove();
-    return t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11;
+    let t12 = test_json_heterogeneous_arrays();
+    let t13 = test_json_deep_merge_and_flatten();
+    return t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13;
 }
 
 pub fn main() {

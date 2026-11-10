@@ -75,6 +75,126 @@ impl JsonValue {
             _ => None,
         }
     }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, JsonValue::Null)
+    }
+
+    pub fn is_bool(&self) -> bool {
+        matches!(self, JsonValue::Bool(_))
+    }
+
+    pub fn is_number(&self) -> bool {
+        matches!(self, JsonValue::Number(_))
+    }
+
+    pub fn is_string(&self) -> bool {
+        matches!(self, JsonValue::String(_))
+    }
+
+    pub fn is_array(&self) -> bool {
+        matches!(self, JsonValue::Array(_))
+    }
+
+    pub fn is_object(&self) -> bool {
+        matches!(self, JsonValue::Object(_))
+    }
+
+    pub fn array_len(&self) -> usize {
+        match self {
+            JsonValue::Array(arr) => arr.len(),
+            _ => 0,
+        }
+    }
+
+    pub fn array_push(&mut self, val: JsonValue) -> bool {
+        match self {
+            JsonValue::Array(arr) => {
+                arr.push(val);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn array_pop(&mut self) -> Option<JsonValue> {
+        match self {
+            JsonValue::Array(arr) => arr.pop(),
+            _ => None,
+        }
+    }
+
+    pub fn array_insert(&mut self, idx: usize, val: JsonValue) -> bool {
+        match self {
+            JsonValue::Array(arr) if idx <= arr.len() => {
+                arr.insert(idx, val);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn array_remove(&mut self, idx: usize) -> Option<JsonValue> {
+        match self {
+            JsonValue::Array(arr) if idx < arr.len() => Some(arr.remove(idx)),
+            _ => None,
+        }
+    }
+
+    /// Recursively merge another JSON tree into this one deterministically.
+    pub fn deep_merge(&mut self, other: JsonValue) {
+        match (self, other) {
+            (JsonValue::Object(target_map), JsonValue::Object(source_map)) => {
+                for (k, v) in source_map {
+                    if let Some(target_child) = target_map.get_mut(&k) {
+                        target_child.deep_merge(v);
+                    } else {
+                        target_map.insert(k, v);
+                    }
+                }
+            }
+            (this, other) => {
+                *this = other;
+            }
+        }
+    }
+
+    /// Flatten nested JSON structure into dot-separated key-value pairs deterministically.
+    pub fn flatten(&self, prefix: &str) -> BTreeMap<String, JsonValue> {
+        let mut map = BTreeMap::new();
+        self.flatten_recursive(prefix, &mut map);
+        map
+    }
+
+    fn flatten_recursive(&self, prefix: &str, out: &mut BTreeMap<String, JsonValue>) {
+        match self {
+            JsonValue::Object(obj) => {
+                for (k, v) in obj {
+                    let next_key = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{}.{}", prefix, k)
+                    };
+                    v.flatten_recursive(&next_key, out);
+                }
+            }
+            JsonValue::Array(arr) => {
+                for (idx, elem) in arr.iter().enumerate() {
+                    let next_key = if prefix.is_empty() {
+                        format!("{}", idx)
+                    } else {
+                        format!("{}.{}", prefix, idx)
+                    };
+                    elem.flatten_recursive(&next_key, out);
+                }
+            }
+            primitive => {
+                if !prefix.is_empty() {
+                    out.insert(prefix.to_string(), primitive.clone());
+                }
+            }
+        }
+    }
 }
 
 impl fmt::Display for JsonValue {
@@ -443,5 +563,67 @@ impl<'a> JsonParser<'a> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_heterogeneous_arrays_and_mutation() {
+        let raw = r#"[42, "ifa", true, null, {"key": "val"}]"#;
+        let mut val = decode(raw).expect("decode heterogeneous array");
+        assert!(val.is_array());
+        assert_eq!(val.array_len(), 5);
+
+        assert_eq!(val.index(0).unwrap().as_i64(), Some(42));
+        assert_eq!(val.index(1).unwrap().as_str(), Some("ifa"));
+        assert_eq!(val.index(2).unwrap().as_bool(), Some(true));
+        assert!(val.index(3).unwrap().is_null());
+        assert!(val.index(4).unwrap().is_object());
+
+        // Array pop
+        let popped = val.array_pop().expect("pop item");
+        assert!(popped.is_object());
+        assert_eq!(val.array_len(), 4);
+
+        // Array insert
+        assert!(val.array_insert(1, JsonValue::String("inserted".to_string())));
+        assert_eq!(val.array_len(), 5);
+        assert_eq!(val.index(1).unwrap().as_str(), Some("inserted"));
+
+        // Array remove
+        let removed = val.array_remove(1).expect("remove item");
+        assert_eq!(removed.as_str(), Some("inserted"));
+        assert_eq!(val.array_len(), 4);
+    }
+
+    #[test]
+    fn test_deep_merge_and_flatten() {
+        let base_raw = r#"{"server":{"host":"127.0.0.1","port":8080},"env":"dev"}"#;
+        let ext_raw = r#"{"server":{"port":9000,"tls":true},"debug":true}"#;
+
+        let mut base = decode(base_raw).unwrap();
+        let ext = decode(ext_raw).unwrap();
+
+        base.deep_merge(ext);
+
+        let server_obj = base.get("server").unwrap().as_object().unwrap();
+        assert_eq!(server_obj.get("host").unwrap().as_str(), Some("127.0.0.1"));
+        assert_eq!(server_obj.get("port").unwrap().as_i64(), Some(9000));
+        assert_eq!(server_obj.get("tls").unwrap().as_bool(), Some(true));
+        assert_eq!(base.get("env").unwrap().as_str(), Some("dev"));
+        assert_eq!(base.get("debug").unwrap().as_bool(), Some(true));
+
+        let flattened = base.flatten("");
+        assert_eq!(
+            flattened.get("server.host").unwrap().as_str(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(flattened.get("server.port").unwrap().as_i64(), Some(9000));
+        assert_eq!(flattened.get("server.tls").unwrap().as_bool(), Some(true));
+        assert_eq!(flattened.get("env").unwrap().as_str(), Some("dev"));
+        assert_eq!(flattened.get("debug").unwrap().as_bool(), Some(true));
     }
 }
