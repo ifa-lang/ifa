@@ -622,6 +622,38 @@ char* ifa_rt_env_var(const char* name);
 int64_t ifa_rt_args_count(void);
 char* ifa_rt_args_get(int64_t index);
 
+/* --- Colorless Fiber Synchronization Primitives (Mutex, CondVar, Atomics) --- */
+typedef struct ifa_mutex_handle ifa_mutex_handle_t;
+typedef struct ifa_condvar_handle ifa_condvar_handle_t;
+typedef struct ifa_atomic_handle ifa_atomic_handle_t;
+
+ifa_mutex_handle_t* ifa_rt_mutex_create(void);
+void ifa_rt_mutex_destroy(ifa_mutex_handle_t* m);
+int32_t ifa_rt_mutex_lock(ifa_mutex_handle_t* m);
+int32_t ifa_rt_mutex_try_lock(ifa_mutex_handle_t* m);
+int32_t ifa_rt_mutex_unlock(ifa_mutex_handle_t* m);
+int32_t ifa_rt_mutex_is_locked(ifa_mutex_handle_t* m);
+
+ifa_condvar_handle_t* ifa_rt_condvar_create(void);
+void ifa_rt_condvar_destroy(ifa_condvar_handle_t* cv);
+int32_t ifa_rt_condvar_wait(ifa_condvar_handle_t* cv, ifa_mutex_handle_t* m);
+int32_t ifa_rt_condvar_wait_timeout(ifa_condvar_handle_t* cv, ifa_mutex_handle_t* m, int64_t timeout_ms);
+int32_t ifa_rt_condvar_notify_one(ifa_condvar_handle_t* cv);
+int32_t ifa_rt_condvar_notify_all(ifa_condvar_handle_t* cv);
+
+ifa_atomic_handle_t* ifa_rt_atomic_create(int64_t initial_val);
+void ifa_rt_atomic_destroy(ifa_atomic_handle_t* a);
+int64_t ifa_rt_atomic_load(ifa_atomic_handle_t* a);
+void ifa_rt_atomic_store(ifa_atomic_handle_t* a, int64_t val);
+int64_t ifa_rt_atomic_fetch_add(ifa_atomic_handle_t* a, int64_t delta);
+int64_t ifa_rt_atomic_fetch_sub(ifa_atomic_handle_t* a, int64_t delta);
+int64_t ifa_rt_atomic_cas(ifa_atomic_handle_t* a, int64_t expected, int64_t desired);
+
+int32_t ifa_rt_channel_send_int(ifa_channel_handle_t* chan, int64_t val);
+int32_t ifa_rt_channel_recv_int(ifa_channel_handle_t* chan, int64_t* out_val);
+int32_t ifa_rt_channel_try_send_int(ifa_channel_handle_t* chan, int64_t val);
+int32_t ifa_rt_channel_try_recv_int(ifa_channel_handle_t* chan, int64_t* out_val);
+
 #ifdef __cplusplus
 }
 #endif

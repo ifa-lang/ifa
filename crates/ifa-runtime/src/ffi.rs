@@ -4848,3 +4848,422 @@ pub unsafe extern "C" fn ifa_simd_multi_arena_rmsnorm_f64(
         }
     }
 }
+
+// ============================================================================
+// Colorless Fiber Synchronization Primitives (Mutex, CondVar, Atomics, Channel)
+// ============================================================================
+
+/// Opaque wrapper around a cooperative fiber Mutex for C-ABI FFI.
+pub struct IfaMutexHandle {
+    locked: std::sync::atomic::AtomicBool,
+    owner: std::sync::atomic::AtomicU64,
+    waiters: std::sync::atomic::AtomicUsize,
+    notif: std::sync::Condvar,
+    notif_mutex: std::sync::Mutex<()>,
+}
+
+/// Create a new cooperative fiber Mutex.
+#[no_mangle]
+pub extern "C" fn ifa_rt_mutex_create() -> *mut IfaMutexHandle {
+    Box::into_raw(Box::new(IfaMutexHandle {
+        locked: std::sync::atomic::AtomicBool::new(false),
+        owner: std::sync::atomic::AtomicU64::new(0),
+        waiters: std::sync::atomic::AtomicUsize::new(0),
+        notif: std::sync::Condvar::new(),
+        notif_mutex: std::sync::Mutex::new(()),
+    }))
+}
+
+/// Destroy a cooperative fiber Mutex and release associated memory.
+#[no_mangle]
+pub extern "C" fn ifa_rt_mutex_destroy(m: *mut IfaMutexHandle) {
+    if !m.is_null() {
+        unsafe {
+            drop(Box::from_raw(m));
+        }
+    }
+}
+
+/// Attempt to acquire a cooperative fiber Mutex non-blockingly.
+/// Returns 1 on success, 0 if busy, -1 on null handle.
+#[no_mangle]
+pub extern "C" fn ifa_rt_mutex_try_lock(m: *mut IfaMutexHandle) -> i32 {
+    if m.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*m };
+    if handle
+        .locked
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+    {
+        handle.owner.store(
+            crate::fiber::current_fiber_id(),
+            std::sync::atomic::Ordering::Release,
+        );
+        1
+    } else {
+        0
+    }
+}
+
+/// Acquire a cooperative fiber Mutex, yielding fiber execution cooperatively on contention.
+/// Returns 0 on success, -1 on null handle.
+#[no_mangle]
+pub extern "C" fn ifa_rt_mutex_lock(m: *mut IfaMutexHandle) -> i32 {
+    if m.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*m };
+    let cur_id = crate::fiber::current_fiber_id();
+    let mut spins: u32 = 0;
+    handle
+        .waiters
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    while handle
+        .locked
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        spins += 1;
+        if spins < 32 {
+            std::hint::spin_loop();
+        } else if spins < 64 {
+            GLOBAL_SCHEDULER.yield_now();
+        } else {
+            let guard = handle.notif_mutex.lock().unwrap();
+            if handle.locked.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = handle
+                    .notif
+                    .wait_timeout(guard, std::time::Duration::from_micros(250));
+            }
+        }
+    }
+    handle
+        .owner
+        .store(cur_id, std::sync::atomic::Ordering::Release);
+    handle
+        .waiters
+        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    0
+}
+
+/// Release a cooperative fiber Mutex and notify waiting fibers.
+/// Returns 0 on success, -1 on null handle.
+#[no_mangle]
+pub extern "C" fn ifa_rt_mutex_unlock(m: *mut IfaMutexHandle) -> i32 {
+    if m.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*m };
+    handle.owner.store(0, std::sync::atomic::Ordering::Release);
+    handle
+        .locked
+        .store(false, std::sync::atomic::Ordering::Release);
+    if handle.waiters.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        handle.notif.notify_one();
+    }
+    0
+}
+
+/// Check if a cooperative fiber Mutex is currently locked.
+/// Returns 1 if locked, 0 if unlocked or null.
+#[no_mangle]
+pub extern "C" fn ifa_rt_mutex_is_locked(m: *mut IfaMutexHandle) -> i32 {
+    if m.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*m };
+    if handle.locked.load(std::sync::atomic::Ordering::Acquire) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Opaque wrapper around a cooperative fiber CondVar for C-ABI FFI.
+pub struct IfaCondVarHandle {
+    seq: std::sync::atomic::AtomicU64,
+    waiters: std::sync::atomic::AtomicUsize,
+    notif: std::sync::Condvar,
+    notif_mutex: std::sync::Mutex<()>,
+}
+
+/// Create a new cooperative fiber CondVar.
+#[no_mangle]
+pub extern "C" fn ifa_rt_condvar_create() -> *mut IfaCondVarHandle {
+    Box::into_raw(Box::new(IfaCondVarHandle {
+        seq: std::sync::atomic::AtomicU64::new(0),
+        waiters: std::sync::atomic::AtomicUsize::new(0),
+        notif: std::sync::Condvar::new(),
+        notif_mutex: std::sync::Mutex::new(()),
+    }))
+}
+
+/// Destroy a cooperative fiber CondVar and release associated memory.
+#[no_mangle]
+pub extern "C" fn ifa_rt_condvar_destroy(cv: *mut IfaCondVarHandle) {
+    if !cv.is_null() {
+        unsafe {
+            drop(Box::from_raw(cv));
+        }
+    }
+}
+
+/// Wait on a cooperative CondVar, releasing the Mutex while waiting and re-acquiring it before return.
+/// Returns 0 on success, -1 on invalid argument.
+#[no_mangle]
+pub extern "C" fn ifa_rt_condvar_wait(cv: *mut IfaCondVarHandle, m: *mut IfaMutexHandle) -> i32 {
+    if cv.is_null() || m.is_null() {
+        return -1;
+    }
+    let cv_handle = unsafe { &*cv };
+    let initial_seq = cv_handle.seq.load(std::sync::atomic::Ordering::Acquire);
+    cv_handle
+        .waiters
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    ifa_rt_mutex_unlock(m);
+
+    let mut spins: u32 = 0;
+    while cv_handle.seq.load(std::sync::atomic::Ordering::Acquire) == initial_seq {
+        spins += 1;
+        if spins < 32 {
+            std::hint::spin_loop();
+        } else if spins < 64 {
+            GLOBAL_SCHEDULER.yield_now();
+        } else {
+            let guard = cv_handle.notif_mutex.lock().unwrap();
+            if cv_handle.seq.load(std::sync::atomic::Ordering::Relaxed) == initial_seq {
+                let _ = cv_handle
+                    .notif
+                    .wait_timeout(guard, std::time::Duration::from_micros(250));
+            }
+        }
+    }
+
+    cv_handle
+        .waiters
+        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    ifa_rt_mutex_lock(m);
+    0
+}
+
+/// Timed wait on a cooperative CondVar with timeout in milliseconds.
+/// Returns 1 if notified before timeout, 0 if timed out, -1 on error. Mutex is re-acquired in all cases.
+#[no_mangle]
+pub extern "C" fn ifa_rt_condvar_wait_timeout(
+    cv: *mut IfaCondVarHandle,
+    m: *mut IfaMutexHandle,
+    timeout_ms: i64,
+) -> i32 {
+    if cv.is_null() || m.is_null() {
+        return -1;
+    }
+    let cv_handle = unsafe { &*cv };
+    let initial_seq = cv_handle.seq.load(std::sync::atomic::Ordering::Acquire);
+    cv_handle
+        .waiters
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    ifa_rt_mutex_unlock(m);
+
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    let mut timed_out = false;
+    let mut spins: u32 = 0;
+    while cv_handle.seq.load(std::sync::atomic::Ordering::Acquire) == initial_seq {
+        if std::time::Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+        spins += 1;
+        if spins < 32 {
+            std::hint::spin_loop();
+        } else if spins < 64 {
+            GLOBAL_SCHEDULER.yield_now();
+        } else {
+            let guard = cv_handle.notif_mutex.lock().unwrap();
+            if cv_handle.seq.load(std::sync::atomic::Ordering::Relaxed) == initial_seq {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let _ = cv_handle
+                    .notif
+                    .wait_timeout(guard, remaining.min(std::time::Duration::from_millis(5)));
+            }
+        }
+    }
+
+    cv_handle
+        .waiters
+        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    ifa_rt_mutex_lock(m);
+    if timed_out {
+        0
+    } else {
+        1
+    }
+}
+
+/// Notify one waiting fiber on the CondVar.
+/// Returns 0 on success, -1 on null handle.
+#[no_mangle]
+pub extern "C" fn ifa_rt_condvar_notify_one(cv: *mut IfaCondVarHandle) -> i32 {
+    if cv.is_null() {
+        return -1;
+    }
+    let cv_handle = unsafe { &*cv };
+    cv_handle
+        .seq
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    cv_handle.notif.notify_one();
+    0
+}
+
+/// Notify all waiting fibers on the CondVar.
+/// Returns 0 on success, -1 on null handle.
+#[no_mangle]
+pub extern "C" fn ifa_rt_condvar_notify_all(cv: *mut IfaCondVarHandle) -> i32 {
+    if cv.is_null() {
+        return -1;
+    }
+    let cv_handle = unsafe { &*cv };
+    cv_handle
+        .seq
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    cv_handle.notif.notify_all();
+    0
+}
+
+/// Opaque wrapper around an atomic 64-bit integer for C-ABI FFI.
+pub struct IfaAtomicHandle(pub(crate) std::sync::atomic::AtomicI64);
+
+/// Create a new atomic 64-bit integer initialized to the specified value.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_create(initial_val: i64) -> *mut IfaAtomicHandle {
+    Box::into_raw(Box::new(IfaAtomicHandle(
+        std::sync::atomic::AtomicI64::new(initial_val),
+    )))
+}
+
+/// Destroy an atomic 64-bit integer handle and release allocated memory.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_destroy(a: *mut IfaAtomicHandle) {
+    if !a.is_null() {
+        unsafe {
+            drop(Box::from_raw(a));
+        }
+    }
+}
+
+/// Atomically load 64-bit integer value with SeqCst ordering.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_load(a: *mut IfaAtomicHandle) -> i64 {
+    if a.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*a };
+    handle.0.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Atomically store 64-bit integer value with SeqCst ordering.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_store(a: *mut IfaAtomicHandle, val: i64) {
+    if !a.is_null() {
+        let handle = unsafe { &*a };
+        handle.0.store(val, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Atomically add delta to 64-bit integer value and return previous value.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_fetch_add(a: *mut IfaAtomicHandle, delta: i64) -> i64 {
+    if a.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*a };
+    handle
+        .0
+        .fetch_add(delta, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Atomically subtract delta from 64-bit integer value and return previous value.
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_fetch_sub(a: *mut IfaAtomicHandle, delta: i64) -> i64 {
+    if a.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*a };
+    handle
+        .0
+        .fetch_sub(delta, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Atomically compare and exchange 64-bit integer value.
+/// Returns previous value (equals expected if exchange succeeded).
+#[no_mangle]
+pub extern "C" fn ifa_rt_atomic_cas(a: *mut IfaAtomicHandle, expected: i64, desired: i64) -> i64 {
+    if a.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*a };
+    match handle.0.compare_exchange(
+        expected,
+        desired,
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+    ) {
+        Ok(v) => v,
+        Err(v) => v,
+    }
+}
+
+/// Send a 64-bit integer value over the channel.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_send_int(chan: *mut IfaChannelHandle, val: i64) -> i32 {
+    ifa_rt_channel_send(chan, val as usize as *mut u8)
+}
+
+/// Receive a 64-bit integer value from the channel.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_recv_int(chan: *mut IfaChannelHandle, out_val: *mut i64) -> i32 {
+    let mut ptr: *mut u8 = std::ptr::null_mut();
+    let res = ifa_rt_channel_recv(chan, &mut ptr);
+    if res == 0 && !out_val.is_null() {
+        unsafe {
+            *out_val = ptr as usize as i64;
+        }
+    }
+    res
+}
+
+/// Non-blocking send for a 64-bit integer value over the channel.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_try_send_int(chan: *mut IfaChannelHandle, val: i64) -> i32 {
+    ifa_rt_channel_try_send(chan, val as usize as *mut u8)
+}
+
+/// Non-blocking receive for a 64-bit integer value from the channel.
+#[no_mangle]
+pub extern "C" fn ifa_rt_channel_try_recv_int(
+    chan: *mut IfaChannelHandle,
+    out_val: *mut i64,
+) -> i32 {
+    let mut ptr: *mut u8 = std::ptr::null_mut();
+    let res = ifa_rt_channel_try_recv(chan, &mut ptr);
+    if res == 0 && !out_val.is_null() {
+        unsafe {
+            *out_val = ptr as usize as i64;
+        }
+    }
+    res
+}

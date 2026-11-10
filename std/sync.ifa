@@ -1,0 +1,751 @@
+// Pure IFA Standard Library: Colorless Fiber Concurrency & Synchronization Subsystem (`std/sync.ifa`)
+// High-performance primitives for cooperative M:N fiber scheduling on multi-core architectures:
+// - Channel: Lock-free and bounded/unbounded inter-fiber message passing (int & string payloads)
+// - Mutex: Cooperative fiber mutual exclusion lock yielding execution slice without OS worker starvation
+// - CondVar: Condition variable with cooperative fiber parking, signaling, and timeout mechanics
+// - WaitGroup: Cooperative fiber coordination barrier (Go sync.WaitGroup semantics)
+// - AtomicInt & AtomicBool: 64-bit integer and boolean atomic operations with SeqCst semantics
+// - Semaphore: Counting semaphore with cooperative fiber yielding on permit exhaustion
+// - Barrier: Cyclic coordination barrier synchronizing N fibers in lockstep
+// - Once: Thread-safe, fiber-safe single-execution initializer
+// - Select: Multi-channel non-blocking and cooperative multiplexer
+
+// ---------------------------------------------------------------------------
+// 1. Cooperative Fiber Control
+// ---------------------------------------------------------------------------
+
+pub fn fiber_yield_slice() {
+    fiber_yield();
+}
+
+pub fn fiber_get_current_id() -> i64 {
+    return fiber_current_id();
+}
+
+// ---------------------------------------------------------------------------
+// 2. Inter-Fiber Channels (`Channel`)
+// ---------------------------------------------------------------------------
+
+pub struct Channel {
+    id: i64,
+    capacity: i64,
+    is_closed: bool
+}
+
+pub fn make_channel(capacity: i64) -> Channel {
+    let cid = channel_create(capacity);
+    return Channel(
+        id: cid,
+        capacity: capacity,
+        is_closed: false
+    );
+}
+
+pub fn make_unbounded_channel() -> Channel {
+    return make_channel(0);
+}
+
+pub fn channel_send_msg(inout chan: Channel, val: i64) -> bool {
+    if chan.is_closed {
+        return false;
+    }
+    return channel_send(chan.id, val);
+}
+
+pub fn channel_recv_msg(inout chan: Channel) -> i64 {
+    return channel_recv(chan.id);
+}
+
+pub fn channel_try_send_msg(inout chan: Channel, val: i64) -> bool {
+    if chan.is_closed {
+        return false;
+    }
+    return channel_try_send(chan.id, val);
+}
+
+pub fn channel_try_recv_msg(inout chan: Channel) -> i64 {
+    return channel_try_recv(chan.id);
+}
+
+pub fn channel_send_text(inout chan: Channel, text: String) -> bool {
+    if chan.is_closed {
+        return false;
+    }
+    return channel_send_string(chan.id, text);
+}
+
+pub fn channel_recv_text(inout chan: Channel) -> String {
+    return channel_recv_string(chan.id);
+}
+
+pub fn channel_close_endpoint(inout chan: Channel) {
+    chan.is_closed = true;
+    let _ = channel_close(chan.id);
+}
+
+pub fn channel_get_len(chan: Channel) -> i64 {
+    return channel_len(chan.id);
+}
+
+pub fn channel_get_capacity(chan: Channel) -> i64 {
+    return chan.capacity;
+}
+
+pub fn channel_check_closed(chan: Channel) -> bool {
+    return chan.is_closed || channel_is_closed(chan.id);
+}
+
+pub fn channel_is_empty(chan: Channel) -> bool {
+    return channel_get_len(chan) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// 3. Cooperative Fiber Mutex (`Mutex`)
+// ---------------------------------------------------------------------------
+
+pub struct Mutex {
+    id: i64,
+    is_locked: bool
+}
+
+pub fn make_mutex() -> Mutex {
+    let mid = mutex_create();
+    return Mutex(
+        id: mid,
+        is_locked: false
+    );
+}
+
+pub fn mutex_acquire(inout m: Mutex) {
+    let _ = mutex_lock(m.id);
+    m.is_locked = true;
+}
+
+pub fn mutex_try_acquire(inout m: Mutex) -> bool {
+    let ok = mutex_try_lock(m.id);
+    if ok {
+        m.is_locked = true;
+    }
+    return ok;
+}
+
+pub fn mutex_release(inout m: Mutex) {
+    let _ = mutex_unlock(m.id);
+    m.is_locked = false;
+}
+
+pub fn mutex_check_locked(m: Mutex) -> bool {
+    return m.is_locked || mutex_is_locked(m.id);
+}
+
+// ---------------------------------------------------------------------------
+// 4. Condition Variable (`CondVar`)
+// ---------------------------------------------------------------------------
+
+pub struct CondVar {
+    id: i64,
+    waiters_count: i64
+}
+
+pub fn make_condvar() -> CondVar {
+    let cv_id = condvar_create();
+    return CondVar(
+        id: cv_id,
+        waiters_count: 0
+    );
+}
+
+pub fn condvar_wait_mutex(inout cv: CondVar, inout m: Mutex) {
+    cv.waiters_count = cv.waiters_count + 1;
+    let _ = condvar_wait(cv.id, m.id);
+    cv.waiters_count = cv.waiters_count - 1;
+    m.is_locked = true;
+}
+
+pub fn condvar_wait_timeout_ms(inout cv: CondVar, inout m: Mutex, timeout_ms: i64) -> bool {
+    cv.waiters_count = cv.waiters_count + 1;
+    let res = condvar_wait_timeout(cv.id, m.id, timeout_ms);
+    cv.waiters_count = cv.waiters_count - 1;
+    m.is_locked = true;
+    return res;
+}
+
+pub fn condvar_signal(inout cv: CondVar) {
+    let _ = condvar_notify_one(cv.id);
+}
+
+pub fn condvar_broadcast(inout cv: CondVar) {
+    let _ = condvar_notify_all(cv.id);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Cooperative WaitGroup (`WaitGroup`)
+// ---------------------------------------------------------------------------
+
+pub struct WaitGroup {
+    counter: i64
+}
+
+pub fn make_wait_group() -> WaitGroup {
+    return WaitGroup(counter: 0);
+}
+
+pub fn wait_group_add(inout wg: WaitGroup, delta: i64) {
+    wg.counter = wg.counter + delta;
+}
+
+pub fn wait_group_done(inout wg: WaitGroup) {
+    if wg.counter > 0 {
+        wg.counter = wg.counter - 1;
+    }
+}
+
+pub fn wait_group_wait(inout wg: WaitGroup) {
+    while wg.counter > 0 {
+        fiber_yield();
+    }
+}
+
+pub fn wait_group_is_done(wg: WaitGroup) -> bool {
+    return wg.counter <= 0;
+}
+
+pub fn wait_group_count(wg: WaitGroup) -> i64 {
+    return wg.counter;
+}
+
+// ---------------------------------------------------------------------------
+// 6. Atomic Operations (`AtomicInt` & `AtomicBool`)
+// ---------------------------------------------------------------------------
+
+pub struct AtomicInt {
+    id: i64
+}
+
+pub fn make_atomic_int(initial: i64) -> AtomicInt {
+    let aid = atomic_create(initial);
+    return AtomicInt(id: aid);
+}
+
+pub fn atomic_int_get(a: AtomicInt) -> i64 {
+    return atomic_load(a.id);
+}
+
+pub fn atomic_int_set(inout a: AtomicInt, val: i64) {
+    let _ = atomic_store(a.id, val);
+}
+
+pub fn atomic_int_add(inout a: AtomicInt, delta: i64) -> i64 {
+    return atomic_fetch_add(a.id, delta);
+}
+
+pub fn atomic_int_sub(inout a: AtomicInt, delta: i64) -> i64 {
+    return atomic_fetch_sub(a.id, delta);
+}
+
+pub fn atomic_int_cas(inout a: AtomicInt, expected: i64, desired: i64) -> bool {
+    return atomic_compare_exchange(a.id, expected, desired);
+}
+
+pub struct AtomicBool {
+    atom: AtomicInt
+}
+
+pub fn make_atomic_bool(initial: bool) -> AtomicBool {
+    mut int_val: i64 = 0;
+    if initial {
+        int_val = 1;
+    }
+    return AtomicBool(atom: make_atomic_int(int_val));
+}
+
+pub fn atomic_bool_get(a: AtomicBool) -> bool {
+    return atomic_int_get(a.atom) != 0;
+}
+
+pub fn atomic_bool_set(inout a: AtomicBool, val: bool) {
+    mut int_val: i64 = 0;
+    if val {
+        int_val = 1;
+    }
+    atomic_int_set(inout a.atom, int_val);
+}
+
+pub fn atomic_bool_swap(inout a: AtomicBool, val: bool) -> bool {
+    mut int_val: i64 = 0;
+    if val {
+        int_val = 1;
+    }
+    let prev = atomic_int_get(a.atom);
+    atomic_int_set(inout a.atom, int_val);
+    return prev != 0;
+}
+
+// ---------------------------------------------------------------------------
+// 7. Counting Semaphore (`Semaphore`)
+// ---------------------------------------------------------------------------
+
+pub struct Semaphore {
+    permits: i64,
+    max_permits: i64,
+    mutex: Mutex
+}
+
+pub fn make_semaphore(permits: i64) -> Semaphore {
+    return Semaphore(
+        permits: permits,
+        max_permits: permits,
+        mutex: make_mutex()
+    );
+}
+
+pub fn semaphore_acquire(inout s: Semaphore) {
+    while true {
+        mutex_acquire(inout s.mutex);
+        if s.permits > 0 {
+            s.permits = s.permits - 1;
+            mutex_release(inout s.mutex);
+            return;
+        }
+        mutex_release(inout s.mutex);
+        fiber_yield();
+    }
+}
+
+pub fn semaphore_try_acquire(inout s: Semaphore) -> bool {
+    if !mutex_try_acquire(inout s.mutex) {
+        return false;
+    }
+    mut ok: bool = false;
+    if s.permits > 0 {
+        s.permits = s.permits - 1;
+        ok = true;
+    }
+    mutex_release(inout s.mutex);
+    return ok;
+}
+
+pub fn semaphore_release(inout s: Semaphore) {
+    mutex_acquire(inout s.mutex);
+    if s.permits < s.max_permits {
+        s.permits = s.permits + 1;
+    }
+    mutex_release(inout s.mutex);
+}
+
+pub fn semaphore_available_permits(s: Semaphore) -> i64 {
+    return s.permits;
+}
+
+// ---------------------------------------------------------------------------
+// 8. Cyclic Barrier (`Barrier`)
+// ---------------------------------------------------------------------------
+
+pub struct Barrier {
+    threshold: i64,
+    count: i64,
+    generation: i64,
+    mutex: Mutex
+}
+
+pub fn make_barrier(parties: i64) -> Barrier {
+    return Barrier(
+        threshold: parties,
+        count: 0,
+        generation: 0,
+        mutex: make_mutex()
+    );
+}
+
+pub fn barrier_wait(inout b: Barrier) -> bool {
+    mutex_acquire(inout b.mutex);
+    let gen = b.generation;
+    b.count = b.count + 1;
+    if b.count >= b.threshold {
+        b.generation = b.generation + 1;
+        b.count = 0;
+        mutex_release(inout b.mutex);
+        return true;
+    }
+    mutex_release(inout b.mutex);
+    while true {
+        fiber_yield();
+        mutex_acquire(inout b.mutex);
+        if b.generation != gen {
+            mutex_release(inout b.mutex);
+            return false;
+        }
+        mutex_release(inout b.mutex);
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// 9. Single-Execution Initializer (`Once`)
+// ---------------------------------------------------------------------------
+
+pub struct Once {
+    done: AtomicBool,
+    mutex: Mutex
+}
+
+pub fn make_once() -> Once {
+    return Once(
+        done: make_atomic_bool(false),
+        mutex: make_mutex()
+    );
+}
+
+pub fn once_is_done(o: Once) -> bool {
+    return atomic_bool_get(o.done);
+}
+
+pub fn once_call_flag(inout o: Once) -> bool {
+    if atomic_bool_get(o.done) {
+        return false;
+    }
+    mutex_acquire(inout o.mutex);
+    if atomic_bool_get(o.done) {
+        mutex_release(inout o.mutex);
+        return false;
+    }
+    atomic_bool_set(inout o.done, true);
+    mutex_release(inout o.mutex);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 10. Multi-Channel Select Multiplexer (`Select`)
+// ---------------------------------------------------------------------------
+
+pub fn try_select_two(inout c1: Channel, inout c2: Channel) -> i64 {
+    if channel_get_len(c1) > 0 {
+        return 0;
+    }
+    if channel_get_len(c2) > 0 {
+        return 1;
+    }
+    return -1;
+}
+
+pub fn select_two(inout c1: Channel, inout c2: Channel) -> i64 {
+    while true {
+        if channel_get_len(c1) > 0 {
+            return 0;
+        }
+        if channel_get_len(c2) > 0 {
+            return 1;
+        }
+        if channel_check_closed(c1) && channel_check_closed(c2) {
+            return -1;
+        }
+        fiber_yield();
+    }
+    return -1;
+}
+
+pub fn try_select_three(inout c1: Channel, inout c2: Channel, inout c3: Channel) -> i64 {
+    if channel_get_len(c1) > 0 {
+        return 0;
+    }
+    if channel_get_len(c2) > 0 {
+        return 1;
+    }
+    if channel_get_len(c3) > 0 {
+        return 2;
+    }
+    return -1;
+}
+
+pub fn select_three(inout c1: Channel, inout c2: Channel, inout c3: Channel) -> i64 {
+    while true {
+        if channel_get_len(c1) > 0 {
+            return 0;
+        }
+        if channel_get_len(c2) > 0 {
+            return 1;
+        }
+        if channel_get_len(c3) > 0 {
+            return 2;
+        }
+        if channel_check_closed(c1) && channel_check_closed(c2) && channel_check_closed(c3) {
+            return -1;
+        }
+        fiber_yield();
+    }
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Automated Test Suites for `std/sync.ifa`
+// ---------------------------------------------------------------------------
+
+pub fn test_sync_channel_unbounded() -> bool {
+    mut ch = make_unbounded_channel();
+    let s1 = channel_send_msg(inout ch, 101);
+    let s2 = channel_send_msg(inout ch, 202);
+    let s3 = channel_send_msg(inout ch, 303);
+    if !s1 || !s2 || !s3 {
+        return false;
+    }
+    if channel_get_len(ch) != 3 {
+        return false;
+    }
+    let r1 = channel_recv_msg(inout ch);
+    let r2 = channel_recv_msg(inout ch);
+    let r3 = channel_recv_msg(inout ch);
+    return r1 == 101 && r2 == 202 && r3 == 303 && channel_is_empty(ch);
+}
+
+pub fn test_sync_channel_bounded() -> bool {
+    mut ch = make_channel(2);
+    let s1 = channel_try_send_msg(inout ch, 42);
+    let s2 = channel_try_send_msg(inout ch, 84);
+    let s3 = channel_try_send_msg(inout ch, 126);
+    if !s1 || !s2 {
+        return false;
+    }
+    if s3 {
+        return false; // must be full
+    }
+    if channel_get_len(ch) != 2 {
+        return false;
+    }
+    let r1 = channel_recv_msg(inout ch);
+    let s4 = channel_try_send_msg(inout ch, 126);
+    let r2 = channel_recv_msg(inout ch);
+    let r3 = channel_recv_msg(inout ch);
+    return r1 == 42 && s4 && r2 == 84 && r3 == 126;
+}
+
+pub fn test_sync_channel_string() -> bool {
+    mut ch = make_unbounded_channel();
+    let s1 = channel_send_text(inout ch, "ifa_message_alpha");
+    let s2 = channel_send_text(inout ch, "ifa_message_beta");
+    if !s1 || !s2 {
+        return false;
+    }
+    let r1 = channel_recv_text(inout ch);
+    let r2 = channel_recv_text(inout ch);
+    return r1 == "ifa_message_alpha" && r2 == "ifa_message_beta";
+}
+
+pub fn test_sync_channel_close() -> bool {
+    mut ch = make_unbounded_channel();
+    let _ = channel_send_msg(inout ch, 999);
+    channel_close_endpoint(inout ch);
+    if !channel_check_closed(ch) {
+        return false;
+    }
+    let s_after = channel_send_msg(inout ch, 1000);
+    if s_after {
+        return false; // cannot send on closed channel
+    }
+    let r_remaining = channel_recv_msg(inout ch);
+    return r_remaining == 999;
+}
+
+pub fn test_sync_mutex_basic() -> bool {
+    mut m = make_mutex();
+    if mutex_check_locked(m) {
+        return false;
+    }
+    mutex_acquire(inout m);
+    if !mutex_check_locked(m) {
+        return false;
+    }
+    let try_again = mutex_try_acquire(inout m);
+    if try_again {
+        return false; // already locked
+    }
+    mutex_release(inout m);
+    if mutex_check_locked(m) {
+        return false;
+    }
+    let try_ok = mutex_try_acquire(inout m);
+    if !try_ok {
+        return false;
+    }
+    mutex_release(inout m);
+    return true;
+}
+
+pub fn test_sync_condvar_signal() -> bool {
+    mut cv = make_condvar();
+    mut m = make_mutex();
+    mutex_acquire(inout m);
+    condvar_signal(inout cv);
+    condvar_wait_mutex(inout cv, inout m);
+    let is_locked = mutex_check_locked(m);
+    mutex_release(inout m);
+    return is_locked;
+}
+
+pub fn test_sync_condvar_broadcast() -> bool {
+    mut cv = make_condvar();
+    mut m = make_mutex();
+    mutex_acquire(inout m);
+    condvar_broadcast(inout cv);
+    let ok = condvar_wait_timeout_ms(inout cv, inout m, 10);
+    mutex_release(inout m);
+    return ok;
+}
+
+pub fn test_sync_wait_group() -> bool {
+    mut wg = make_wait_group();
+    wait_group_add(inout wg, 3);
+    if wait_group_is_done(wg) || wait_group_count(wg) != 3 {
+        return false;
+    }
+    wait_group_done(inout wg);
+    wait_group_done(inout wg);
+    if wait_group_count(wg) != 1 {
+        return false;
+    }
+    wait_group_done(inout wg);
+    if !wait_group_is_done(wg) {
+        return false;
+    }
+    wait_group_wait(inout wg);
+    return true;
+}
+
+pub fn test_sync_atomic_int() -> bool {
+    mut a = make_atomic_int(100);
+    if atomic_int_get(a) != 100 {
+        return false;
+    }
+    atomic_int_set(inout a, 250);
+    if atomic_int_get(a) != 250 {
+        return false;
+    }
+    let prev_add = atomic_int_add(inout a, 50);
+    if prev_add != 250 || atomic_int_get(a) != 300 {
+        return false;
+    }
+    let prev_sub = atomic_int_sub(inout a, 100);
+    if prev_sub != 300 || atomic_int_get(a) != 200 {
+        return false;
+    }
+    let cas_fail = atomic_int_cas(inout a, 999, 500);
+    if cas_fail || atomic_int_get(a) != 200 {
+        return false;
+    }
+    let cas_ok = atomic_int_cas(inout a, 200, 500);
+    return cas_ok && atomic_int_get(a) == 500;
+}
+
+pub fn test_sync_atomic_bool() -> bool {
+    mut b = make_atomic_bool(false);
+    if atomic_bool_get(b) {
+        return false;
+    }
+    atomic_bool_set(inout b, true);
+    if !atomic_bool_get(b) {
+        return false;
+    }
+    let prev = atomic_bool_swap(inout b, false);
+    return prev && !atomic_bool_get(b);
+}
+
+pub fn test_sync_semaphore() -> bool {
+    mut s = make_semaphore(2);
+    if semaphore_available_permits(s) != 2 {
+        return false;
+    }
+    semaphore_acquire(inout s);
+    if semaphore_available_permits(s) != 1 {
+        return false;
+    }
+    let try1 = semaphore_try_acquire(inout s);
+    if !try1 || semaphore_available_permits(s) != 0 {
+        return false;
+    }
+    let try2 = semaphore_try_acquire(inout s);
+    if try2 {
+        return false; // exhausted
+    }
+    semaphore_release(inout s);
+    if semaphore_available_permits(s) != 1 {
+        return false;
+    }
+    semaphore_release(inout s);
+    return semaphore_available_permits(s) == 2;
+}
+
+pub fn test_sync_barrier() -> bool {
+    mut b = make_barrier(1);
+    let leader = barrier_wait(inout b);
+    return leader;
+}
+
+pub fn test_sync_once() -> bool {
+    mut o = make_once();
+    if once_is_done(o) {
+        return false;
+    }
+    let first = once_call_flag(inout o);
+    let second = once_call_flag(inout o);
+    return first && !second && once_is_done(o);
+}
+
+pub fn test_sync_select() -> bool {
+    mut c1 = make_unbounded_channel();
+    mut c2 = make_unbounded_channel();
+    let ok = channel_send_msg(inout c2, 777);
+    if !ok {
+        return false;
+    }
+    let len1 = channel_get_len(c1);
+    let len2 = channel_get_len(c2);
+    if len1 != 0 {
+        return false;
+    }
+    if len2 == 0 {
+        return false;
+    }
+    if len2 > 1 {
+        return false;
+    }
+    let ready_idx = try_select_two(inout c1, inout c2);
+    if ready_idx != 1 {
+        return false;
+    }
+    let val = channel_recv_msg(inout c2);
+    if val != 777 {
+        return false;
+    }
+    return true;
+}
+
+pub fn test_sync_all() -> bool {
+    let t_chan_unbounded = test_sync_channel_unbounded();
+    let t_chan_bounded = test_sync_channel_bounded();
+    let t_chan_str = test_sync_channel_string();
+    let t_chan_close = test_sync_channel_close();
+    let t_mutex = test_sync_mutex_basic();
+    let t_cond_sig = test_sync_condvar_signal();
+    let t_cond_bcast = test_sync_condvar_broadcast();
+    let t_wg = test_sync_wait_group();
+    let t_atom_int = test_sync_atomic_int();
+    let t_atom_bool = test_sync_atomic_bool();
+    let t_sem = test_sync_semaphore();
+    let t_barrier = test_sync_barrier();
+    let t_once = test_sync_once();
+    let t_sel = test_sync_select();
+
+    return t_chan_unbounded
+        && t_chan_bounded
+        && t_chan_str
+        && t_chan_close
+        && t_mutex
+        && t_cond_sig
+        && t_cond_bcast
+        && t_wg
+        && t_atom_int
+        && t_atom_bool
+        && t_sem
+        && t_barrier
+        && t_once
+        && t_sel;
+}

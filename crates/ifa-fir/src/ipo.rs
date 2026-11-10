@@ -1087,6 +1087,11 @@ impl InterproceduralMemoryMap {
                                 }
                                 _ => {}
                             }
+                        } else {
+                            let callee_name = INTERNER.resolve(callee_sym);
+                            if !IpoPass::is_known_pure_intrinsic(&callee_name) {
+                                max_effect = MemoryEffect::Arbitrary;
+                            }
                         }
                     }
 
@@ -1466,7 +1471,19 @@ impl IpoPass {
                 | "string_len"
                 | "string_char_at"
                 | "flush"
-        )
+        ) || callee.starts_with("channel_")
+            || callee.starts_with("mutex_")
+            || callee.starts_with("condvar_")
+            || callee.starts_with("atomic_")
+            || callee.starts_with("fiber_")
+            || callee.starts_with("ifa_rt_channel_")
+            || callee.starts_with("ifa_rt_mutex_")
+            || callee.starts_with("ifa_rt_condvar_")
+            || callee.starts_with("ifa_rt_atomic_")
+            || callee.starts_with("ifa_rt_fiber_")
+            || callee.starts_with("tcp_")
+            || callee.starts_with("udp_")
+            || callee.starts_with("socket_")
     }
 
     /// Eliminates redundant calls to proven pure functions within each basic block.

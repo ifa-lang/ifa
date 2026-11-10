@@ -350,6 +350,12 @@ pub struct FirInterpreter<'a> {
     pub tcp_streams: HashMap<i64, std::net::TcpStream>,
     pub udp_sockets: HashMap<i64, std::net::UdpSocket>,
     next_socket_id: i64,
+    pub sync_mutexes: HashMap<i64, (bool, i64)>,
+    pub sync_condvars: HashMap<i64, (u64, usize)>,
+    pub sync_atomics: HashMap<i64, i64>,
+    pub sync_string_channels: HashMap<i64, (VecDeque<String>, usize, bool)>,
+    pub sync_int_channels: HashMap<i64, (VecDeque<i64>, usize, bool)>,
+    next_sync_id: i64,
 }
 
 impl<'a> FirInterpreter<'a> {
@@ -366,6 +372,12 @@ impl<'a> FirInterpreter<'a> {
             tcp_streams: HashMap::new(),
             udp_sockets: HashMap::new(),
             next_socket_id: 1,
+            sync_mutexes: HashMap::new(),
+            sync_condvars: HashMap::new(),
+            sync_atomics: HashMap::new(),
+            sync_string_channels: HashMap::new(),
+            sync_int_channels: HashMap::new(),
+            next_sync_id: 1,
         }
     }
 
@@ -3083,6 +3095,475 @@ impl<'a> FirInterpreter<'a> {
                     let origin = MONOTONIC_ORIGIN.get_or_init(std::time::Instant::now);
                     let nanos = origin.elapsed().as_nanos() as i64;
                     Ok(FirValue::Int(nanos as i128))
+                } else if fn_name == "sync::fiber_yield"
+                    || fn_name == "fiber_yield"
+                    || fn_name == "ifa_rt_fiber_yield"
+                {
+                    Ok(FirValue::Unit)
+                } else if fn_name == "sync::fiber_current_id"
+                    || fn_name == "fiber_current_id"
+                    || fn_name == "ifa_rt_fiber_current_id"
+                {
+                    Ok(FirValue::Int(1))
+                } else if fn_name == "sync::channel_create"
+                    || fn_name == "channel_create"
+                    || fn_name == "ifa_rt_channel_create"
+                {
+                    let cap = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    let id = self.next_sync_id;
+                    self.next_sync_id += 1;
+                    self.sync_int_channels
+                        .insert(id, (VecDeque::new(), cap, false));
+                    self.sync_string_channels
+                        .insert(id, (VecDeque::new(), cap, false));
+                    Ok(FirValue::Int(id as i128))
+                } else if fn_name == "sync::channel_destroy"
+                    || fn_name == "channel_destroy"
+                    || fn_name == "ifa_rt_channel_destroy"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    self.sync_int_channels.remove(&id);
+                    self.sync_string_channels.remove(&id);
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::channel_send"
+                    || fn_name == "channel_send"
+                    || fn_name == "ifa_rt_channel_send_int"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let val = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some((q, _cap, is_closed)) = self.sync_int_channels.get_mut(&id) {
+                        if !*is_closed {
+                            q.push_back(val);
+                            Ok(FirValue::Bool(true))
+                        } else {
+                            Ok(FirValue::Bool(false))
+                        }
+                    } else {
+                        Ok(FirValue::Bool(false))
+                    }
+                } else if fn_name == "sync::channel_recv"
+                    || fn_name == "channel_recv"
+                    || fn_name == "ifa_rt_channel_recv_int"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some((q, _, _)) = self.sync_int_channels.get_mut(&id) {
+                        if let Some(v) = q.pop_front() {
+                            Ok(FirValue::Int(v as i128))
+                        } else {
+                            Ok(FirValue::Int(0))
+                        }
+                    } else {
+                        Ok(FirValue::Int(0))
+                    }
+                } else if fn_name == "sync::channel_try_send"
+                    || fn_name == "channel_try_send"
+                    || fn_name == "ifa_rt_channel_try_send_int"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let val = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some((q, cap, is_closed)) = self.sync_int_channels.get_mut(&id) {
+                        if *is_closed || (*cap > 0 && q.len() >= *cap) {
+                            Ok(FirValue::Bool(false))
+                        } else {
+                            q.push_back(val);
+                            Ok(FirValue::Bool(true))
+                        }
+                    } else {
+                        Ok(FirValue::Bool(false))
+                    }
+                } else if fn_name == "sync::channel_try_recv"
+                    || fn_name == "channel_try_recv"
+                    || fn_name == "ifa_rt_channel_try_recv_int"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some((q, _, _)) = self.sync_int_channels.get_mut(&id) {
+                        if let Some(v) = q.pop_front() {
+                            Ok(FirValue::Int(v as i128))
+                        } else {
+                            Ok(FirValue::Int(-1))
+                        }
+                    } else {
+                        Ok(FirValue::Int(-1))
+                    }
+                } else if fn_name == "sync::channel_close"
+                    || fn_name == "channel_close"
+                    || fn_name == "ifa_rt_channel_close"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some((_, _, is_closed)) = self.sync_int_channels.get_mut(&id) {
+                        *is_closed = true;
+                    }
+                    if let Some((_, _, is_closed)) = self.sync_string_channels.get_mut(&id) {
+                        *is_closed = true;
+                    }
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::channel_is_closed"
+                    || fn_name == "channel_is_closed"
+                    || fn_name == "ifa_rt_channel_is_closed"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some((_, _, is_closed)) = self.sync_int_channels.get(&id) {
+                        Ok(FirValue::Bool(*is_closed))
+                    } else {
+                        Ok(FirValue::Bool(true))
+                    }
+                } else if fn_name == "sync::channel_len"
+                    || fn_name == "channel_len"
+                    || fn_name == "ifa_rt_channel_len"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let len = if let Some((q, _, _)) = self.sync_int_channels.get(&id) {
+                        q.len()
+                    } else if let Some((q, _, _)) = self.sync_string_channels.get(&id) {
+                        q.len()
+                    } else {
+                        0
+                    };
+                    Ok(FirValue::Int(len as i128))
+                } else if fn_name == "sync::channel_capacity"
+                    || fn_name == "channel_capacity"
+                    || fn_name == "ifa_rt_channel_capacity"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let cap = if let Some((_, cap, _)) = self.sync_int_channels.get(&id) {
+                        *cap
+                    } else if let Some((_, cap, _)) = self.sync_string_channels.get(&id) {
+                        *cap
+                    } else {
+                        0
+                    };
+                    Ok(FirValue::Int(cap as i128))
+                } else if fn_name == "sync::channel_send_string" || fn_name == "channel_send_string"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let s = match evaluated_args.get(1) {
+                        Some(FirValue::String(str_val)) => str_val.clone(),
+                        _ => String::new(),
+                    };
+                    if let Some((q, _cap, is_closed)) = self.sync_string_channels.get_mut(&id) {
+                        if !*is_closed {
+                            q.push_back(s);
+                            Ok(FirValue::Bool(true))
+                        } else {
+                            Ok(FirValue::Bool(false))
+                        }
+                    } else {
+                        Ok(FirValue::Bool(false))
+                    }
+                } else if fn_name == "sync::channel_recv_string" || fn_name == "channel_recv_string"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some((q, _, _)) = self.sync_string_channels.get_mut(&id) {
+                        if let Some(s) = q.pop_front() {
+                            Ok(FirValue::String(s))
+                        } else {
+                            Ok(FirValue::String(String::new()))
+                        }
+                    } else {
+                        Ok(FirValue::String(String::new()))
+                    }
+                } else if fn_name == "sync::mutex_create"
+                    || fn_name == "mutex_create"
+                    || fn_name == "ifa_rt_mutex_create"
+                {
+                    let id = self.next_sync_id;
+                    self.next_sync_id += 1;
+                    self.sync_mutexes.insert(id, (false, 0));
+                    Ok(FirValue::Int(id as i128))
+                } else if fn_name == "sync::mutex_destroy"
+                    || fn_name == "mutex_destroy"
+                    || fn_name == "ifa_rt_mutex_destroy"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    self.sync_mutexes.remove(&id);
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::mutex_lock"
+                    || fn_name == "mutex_lock"
+                    || fn_name == "ifa_rt_mutex_lock"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some(m) = self.sync_mutexes.get_mut(&id) {
+                        m.0 = true;
+                        m.1 = 1;
+                    }
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::mutex_try_lock"
+                    || fn_name == "mutex_try_lock"
+                    || fn_name == "ifa_rt_mutex_try_lock"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some(m) = self.sync_mutexes.get_mut(&id) {
+                        if !m.0 {
+                            m.0 = true;
+                            m.1 = 1;
+                            Ok(FirValue::Bool(true))
+                        } else {
+                            Ok(FirValue::Bool(false))
+                        }
+                    } else {
+                        Ok(FirValue::Bool(false))
+                    }
+                } else if fn_name == "sync::mutex_unlock"
+                    || fn_name == "mutex_unlock"
+                    || fn_name == "ifa_rt_mutex_unlock"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some(m) = self.sync_mutexes.get_mut(&id) {
+                        m.0 = false;
+                        m.1 = 0;
+                    }
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::mutex_is_locked"
+                    || fn_name == "mutex_is_locked"
+                    || fn_name == "ifa_rt_mutex_is_locked"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some(m) = self.sync_mutexes.get(&id) {
+                        Ok(FirValue::Bool(m.0))
+                    } else {
+                        Ok(FirValue::Bool(false))
+                    }
+                } else if fn_name == "sync::condvar_create"
+                    || fn_name == "condvar_create"
+                    || fn_name == "ifa_rt_condvar_create"
+                {
+                    let id = self.next_sync_id;
+                    self.next_sync_id += 1;
+                    self.sync_condvars.insert(id, (0, 0));
+                    Ok(FirValue::Int(id as i128))
+                } else if fn_name == "sync::condvar_destroy"
+                    || fn_name == "condvar_destroy"
+                    || fn_name == "ifa_rt_condvar_destroy"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    self.sync_condvars.remove(&id);
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::condvar_wait"
+                    || fn_name == "condvar_wait"
+                    || fn_name == "ifa_rt_condvar_wait"
+                {
+                    let cv_id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let m_id = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some(m) = self.sync_mutexes.get_mut(&m_id) {
+                        m.0 = false;
+                        m.1 = 0;
+                    }
+                    if let Some(cv) = self.sync_condvars.get_mut(&cv_id) {
+                        cv.1 += 1;
+                    }
+                    if let Some(m) = self.sync_mutexes.get_mut(&m_id) {
+                        m.0 = true;
+                        m.1 = 1;
+                    }
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::condvar_wait_timeout"
+                    || fn_name == "condvar_wait_timeout"
+                    || fn_name == "ifa_rt_condvar_wait_timeout"
+                {
+                    let m_id = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some(m) = self.sync_mutexes.get_mut(&m_id) {
+                        m.0 = false;
+                        m.1 = 0;
+                    }
+                    if let Some(m) = self.sync_mutexes.get_mut(&m_id) {
+                        m.0 = true;
+                        m.1 = 1;
+                    }
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::condvar_notify_one"
+                    || fn_name == "condvar_notify_one"
+                    || fn_name == "ifa_rt_condvar_notify_one"
+                {
+                    let cv_id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some(cv) = self.sync_condvars.get_mut(&cv_id) {
+                        cv.0 += 1;
+                        cv.1 = cv.1.saturating_sub(1);
+                    }
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::condvar_notify_all"
+                    || fn_name == "condvar_notify_all"
+                    || fn_name == "ifa_rt_condvar_notify_all"
+                {
+                    let cv_id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    if let Some(cv) = self.sync_condvars.get_mut(&cv_id) {
+                        cv.0 += 1000;
+                        cv.1 = 0;
+                    }
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::atomic_create"
+                    || fn_name == "atomic_create"
+                    || fn_name == "ifa_rt_atomic_create"
+                {
+                    let initial = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let id = self.next_sync_id;
+                    self.next_sync_id += 1;
+                    self.sync_atomics.insert(id, initial);
+                    Ok(FirValue::Int(id as i128))
+                } else if fn_name == "sync::atomic_destroy"
+                    || fn_name == "atomic_destroy"
+                    || fn_name == "ifa_rt_atomic_destroy"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    self.sync_atomics.remove(&id);
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::atomic_load"
+                    || fn_name == "atomic_load"
+                    || fn_name == "ifa_rt_atomic_load"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let v = self.sync_atomics.get(&id).copied().unwrap_or(0);
+                    Ok(FirValue::Int(v as i128))
+                } else if fn_name == "sync::atomic_store"
+                    || fn_name == "atomic_store"
+                    || fn_name == "ifa_rt_atomic_store"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let val = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    self.sync_atomics.insert(id, val);
+                    Ok(FirValue::Bool(true))
+                } else if fn_name == "sync::atomic_fetch_add"
+                    || fn_name == "atomic_fetch_add"
+                    || fn_name == "ifa_rt_atomic_fetch_add"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let delta = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let prev = self.sync_atomics.get(&id).copied().unwrap_or(0);
+                    self.sync_atomics.insert(id, prev + delta);
+                    Ok(FirValue::Int(prev as i128))
+                } else if fn_name == "sync::atomic_fetch_sub"
+                    || fn_name == "atomic_fetch_sub"
+                    || fn_name == "ifa_rt_atomic_fetch_sub"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let delta = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let prev = self.sync_atomics.get(&id).copied().unwrap_or(0);
+                    self.sync_atomics.insert(id, prev - delta);
+                    Ok(FirValue::Int(prev as i128))
+                } else if fn_name == "sync::atomic_compare_exchange"
+                    || fn_name == "atomic_compare_exchange"
+                    || fn_name == "ifa_rt_atomic_cas"
+                {
+                    let id = match evaluated_args.first() {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let expected = match evaluated_args.get(1) {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let desired = match evaluated_args.get(2) {
+                        Some(FirValue::Int(n)) => *n as i64,
+                        _ => 0,
+                    };
+                    let current = self.sync_atomics.get(&id).copied().unwrap_or(0);
+                    if current == expected {
+                        self.sync_atomics.insert(id, desired);
+                        Ok(FirValue::Bool(true))
+                    } else {
+                        Ok(FirValue::Bool(false))
+                    }
                 } else if let Some(target_func) = self.find_function(&fn_name) {
                     // Direct function call to another FIR function in module
                     let func_clone = target_func.clone();

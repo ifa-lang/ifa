@@ -4213,6 +4213,82 @@ pub fn register_stdlib_process_symbols(inout catalog: MultiModuleCatalog) {
     register_module_symbol(inout catalog, "std/process", "build_compiler_command", 6);
 }
 
+pub fn register_stdlib_sync_symbols(inout catalog: MultiModuleCatalog) {
+    // Structures
+    register_module_symbol(inout catalog, "std/sync", "Channel", 4);
+    register_module_symbol(inout catalog, "std/sync", "Mutex", 4);
+    register_module_symbol(inout catalog, "std/sync", "CondVar", 4);
+    register_module_symbol(inout catalog, "std/sync", "WaitGroup", 4);
+    register_module_symbol(inout catalog, "std/sync", "AtomicInt", 4);
+    register_module_symbol(inout catalog, "std/sync", "AtomicBool", 4);
+    register_module_symbol(inout catalog, "std/sync", "Semaphore", 4);
+    register_module_symbol(inout catalog, "std/sync", "Barrier", 4);
+    register_module_symbol(inout catalog, "std/sync", "Once", 4);
+
+    // Channel functions
+    register_module_symbol(inout catalog, "std/sync", "make_channel", 6);
+    register_module_symbol(inout catalog, "std/sync", "make_unbounded_channel", 6);
+    register_module_symbol(inout catalog, "std/sync", "channel_send_msg", 6);
+    register_module_symbol(inout catalog, "std/sync", "channel_recv_msg", 6);
+    register_module_symbol(inout catalog, "std/sync", "channel_try_send_msg", 6);
+    register_module_symbol(inout catalog, "std/sync", "channel_try_recv_msg", 6);
+    register_module_symbol(inout catalog, "std/sync", "channel_send_text", 6);
+    register_module_symbol(inout catalog, "std/sync", "channel_recv_text", 6);
+    register_module_symbol(inout catalog, "std/sync", "channel_close_endpoint", 6);
+    register_module_symbol(inout catalog, "std/sync", "channel_get_len", 6);
+    register_module_symbol(inout catalog, "std/sync", "channel_get_capacity", 6);
+    register_module_symbol(inout catalog, "std/sync", "channel_check_closed", 6);
+    register_module_symbol(inout catalog, "std/sync", "channel_is_empty", 6);
+
+    // Mutex functions
+    register_module_symbol(inout catalog, "std/sync", "make_mutex", 6);
+    register_module_symbol(inout catalog, "std/sync", "mutex_acquire", 6);
+    register_module_symbol(inout catalog, "std/sync", "mutex_try_acquire", 6);
+    register_module_symbol(inout catalog, "std/sync", "mutex_release", 6);
+    register_module_symbol(inout catalog, "std/sync", "mutex_check_locked", 6);
+
+    // CondVar functions
+    register_module_symbol(inout catalog, "std/sync", "make_condvar", 6);
+    register_module_symbol(inout catalog, "std/sync", "condvar_wait_mutex", 6);
+    register_module_symbol(inout catalog, "std/sync", "condvar_wait_timeout_ms", 6);
+    register_module_symbol(inout catalog, "std/sync", "condvar_signal", 6);
+    register_module_symbol(inout catalog, "std/sync", "condvar_broadcast", 6);
+
+    // WaitGroup functions
+    register_module_symbol(inout catalog, "std/sync", "make_wait_group", 6);
+    register_module_symbol(inout catalog, "std/sync", "wait_group_add", 6);
+    register_module_symbol(inout catalog, "std/sync", "wait_group_done", 6);
+    register_module_symbol(inout catalog, "std/sync", "wait_group_wait", 6);
+    register_module_symbol(inout catalog, "std/sync", "wait_group_is_done", 6);
+
+    // Atomics & helpers
+    register_module_symbol(inout catalog, "std/sync", "make_atomic_int", 6);
+    register_module_symbol(inout catalog, "std/sync", "atomic_int_get", 6);
+    register_module_symbol(inout catalog, "std/sync", "atomic_int_set", 6);
+    register_module_symbol(inout catalog, "std/sync", "atomic_int_add", 6);
+    register_module_symbol(inout catalog, "std/sync", "atomic_int_sub", 6);
+    register_module_symbol(inout catalog, "std/sync", "atomic_int_cas", 6);
+    register_module_symbol(inout catalog, "std/sync", "make_atomic_bool", 6);
+    register_module_symbol(inout catalog, "std/sync", "atomic_bool_get", 6);
+    register_module_symbol(inout catalog, "std/sync", "atomic_bool_set", 6);
+    register_module_symbol(inout catalog, "std/sync", "atomic_bool_swap", 6);
+
+    // Sync coordination
+    register_module_symbol(inout catalog, "std/sync", "make_semaphore", 6);
+    register_module_symbol(inout catalog, "std/sync", "semaphore_acquire", 6);
+    register_module_symbol(inout catalog, "std/sync", "semaphore_try_acquire", 6);
+    register_module_symbol(inout catalog, "std/sync", "semaphore_release", 6);
+    register_module_symbol(inout catalog, "std/sync", "make_barrier", 6);
+    register_module_symbol(inout catalog, "std/sync", "barrier_wait", 6);
+    register_module_symbol(inout catalog, "std/sync", "make_once", 6);
+    register_module_symbol(inout catalog, "std/sync", "once_is_done", 6);
+    register_module_symbol(inout catalog, "std/sync", "once_call_flag", 6);
+    register_module_symbol(inout catalog, "std/sync", "select_two", 6);
+    register_module_symbol(inout catalog, "std/sync", "try_select_two", 6);
+    register_module_symbol(inout catalog, "std/sync", "select_three", 6);
+    register_module_symbol(inout catalog, "std/sync", "try_select_three", 6);
+}
+
 pub fn register_stdlib_pipeline_units(
     inout graph: ImportGraph,
     inout catalog: MultiModuleCatalog
@@ -4229,6 +4305,10 @@ pub fn register_stdlib_pipeline_units(
     dep_proc.push("std/collections");
     register_module(inout graph, "std/process", "std/process.ifa", dep_proc);
     register_stdlib_process_symbols(inout catalog);
+
+    mut dep_sync: List<String> = List::new();
+    register_module(inout graph, "std/sync", "std/sync.ifa", dep_sync);
+    register_stdlib_sync_symbols(inout catalog);
 }
 
 // Unit Test 30: Verify std/collections and std/fs integration in driver pipeline

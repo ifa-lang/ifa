@@ -1630,13 +1630,88 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_sync_channel_unbounded ... ok"),
+        "Std sync channel unbounded test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sync_channel_bounded ... ok"),
+        "Std sync channel bounded test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sync_channel_string ... ok"),
+        "Std sync channel string test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sync_channel_close ... ok"),
+        "Std sync channel close test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sync_mutex_basic ... ok"),
+        "Std sync mutex test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sync_condvar_signal ... ok"),
+        "Std sync condvar signal test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sync_condvar_broadcast ... ok"),
+        "Std sync condvar broadcast test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sync_wait_group ... ok"),
+        "Std sync wait group test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sync_atomic_int ... ok"),
+        "Std sync atomic int test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sync_atomic_bool ... ok"),
+        "Std sync atomic bool test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sync_semaphore ... ok"),
+        "Std sync semaphore test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sync_barrier ... ok"),
+        "Std sync barrier test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sync_once ... ok"),
+        "Std sync once test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sync_select ... ok"),
+        "Std sync select test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sync_all ... ok"),
+        "Std sync all test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("143 passed; 0 failed"),
-        "Expected 143 passed std unit tests, got:\n{}",
+        stdout.contains("173 passed; 0 failed"),
+        "Expected 173 passed std unit tests, got:\n{}",
         stdout
     );
 }
