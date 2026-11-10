@@ -1076,6 +1076,16 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     }
                     "process::find_linker" | "find_linker" => "ifa_rt_process_find_linker",
                     "process::find_tool" | "find_tool" => "ifa_rt_process_find_tool",
+                    "process::env_var" | "env_var" => "ifa_rt_env_var",
+                    "fs::read_to_string" | "read_to_string" => "ifa_rt_fs_read_to_string",
+                    "fs::write_string" | "write_string" => "ifa_rt_fs_write_string",
+                    "fs::exists" | "exists" => "ifa_rt_fs_exists",
+                    "fs::file_size" | "file_size" => "ifa_rt_fs_file_size",
+                    "fs::remove_file" | "remove_file" => "ifa_rt_fs_remove_file",
+                    "fs::create_dir_all" | "create_dir_all" => "ifa_rt_fs_create_dir_all",
+                    "string_len" | "String::len" => "ifa_rt_string_len",
+                    "string_char_at" | "String::char_at" => "ifa_rt_string_char_at",
+                    "string_substr" | "String::substr" | "substring" => "ifa_rt_string_substr",
                     _ => fn_name.as_str(),
                 };
                 if let Some(res) = self.try_lower_simd_reduction(&fn_name, args) {

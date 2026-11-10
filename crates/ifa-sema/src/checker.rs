@@ -4622,6 +4622,7 @@ impl<'a> SemanticAnalyzer<'a> {
                     || callee_name.starts_with("ifa_rt_fs_")
                     || callee_name.starts_with("ifa_rt_process_")
                     || callee_name.starts_with("ifa_rt_args_")
+                    || callee_name.starts_with("ifa_rt_string_")
                     || callee_name == "ifa_rt_env_var";
                 if !is_allowed_intrinsic {
                     self.diagnostics.push(
@@ -4872,6 +4873,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 || fn_name.starts_with("ifa_rt_fs_")
                 || fn_name.starts_with("ifa_rt_process_")
                 || fn_name.starts_with("ifa_rt_args_")
+                || fn_name.starts_with("ifa_rt_string_")
                 || fn_name == "ifa_rt_env_var";
 
             if !is_allowed_intrinsic {

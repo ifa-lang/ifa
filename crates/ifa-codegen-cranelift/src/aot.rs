@@ -530,6 +530,45 @@ int64_t ifa_rt_string_char_at(const char* s, int64_t index) {
     return -1;
 }
 
+char* ifa_rt_string_substr(const char* s, int64_t start, int64_t len) {
+    if (!s || start < 0 || len <= 0) {
+        char* empty = (char*)malloc(1);
+        if (empty) empty[0] = '\0';
+        return empty;
+    }
+    const unsigned char* p = (const unsigned char*)s;
+    int64_t cur = 0;
+    const unsigned char* start_ptr = NULL;
+    const unsigned char* end_ptr = NULL;
+    while (*p) {
+        if ((*p & 0xC0) != 0x80) {
+            if (cur == start) {
+                start_ptr = p;
+            }
+            if (cur == start + len) {
+                end_ptr = p;
+                break;
+            }
+            cur++;
+        }
+        p++;
+    }
+    if (!start_ptr) {
+        char* empty = (char*)malloc(1);
+        if (empty) empty[0] = '\0';
+        return empty;
+    }
+    if (!end_ptr) {
+        end_ptr = p;
+    }
+    size_t byte_len = (size_t)(end_ptr - start_ptr);
+    char* buf = (char*)malloc(byte_len + 1);
+    if (!buf) abort();
+    memcpy(buf, start_ptr, byte_len);
+    buf[byte_len] = '\0';
+    return buf;
+}
+
 const char* ifa_rt_version_string(void) {
     return "IFA Runtime 0.1.0 (Zero-GC Generational Concurrency)";
 }
@@ -614,6 +653,18 @@ uint64_t ifa_rt_fs_file_size(const char* path) {
     long sz = ftell(f);
     fclose(f);
     return sz >= 0 ? (uint64_t)sz : 0;
+}
+
+int8_t ifa_rt_fs_remove_file(const char* path) {
+    if (!path) return 0;
+    return remove(path) == 0 ? 1 : 0;
+}
+
+int8_t ifa_rt_fs_create_dir_all(const char* path) {
+    if (!path) return 0;
+    char sub[1024];
+    snprintf(sub, sizeof(sub), "mkdir -p \"%s\"", path);
+    return system(sub) == 0 ? 1 : 0;
 }
 
 int64_t ifa_rt_process_exec(const char* cmd, const char* args) {
@@ -1239,6 +1290,33 @@ impl AotCompiler {
         self.func_ids
             .insert("String::char_at".into(), str_char_at_id);
 
+        let mut str_substr_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        str_substr_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        str_substr_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        str_substr_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        str_substr_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        let str_substr_id = self
+            .module
+            .declare_function("ifa_rt_string_substr", Linkage::Import, &str_substr_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_string_substr".into(), str_substr_id);
+        self.func_ids.insert("string_substr".into(), str_substr_id);
+        self.func_ids.insert("String::substr".into(), str_substr_id);
+        self.func_ids.insert("substring".into(), str_substr_id);
+
         let mut str_i64_sig = cranelift_codegen::ir::Signature::new(call_conv);
         str_i64_sig
             .params
@@ -1434,6 +1512,100 @@ impl AotCompiler {
             .insert("ifa_rt_process_find_tool".into(), proc_find_tool_id);
         self.func_ids
             .insert("process::find_tool".into(), proc_find_tool_id);
+
+        // File system intrinsics
+        let mut fs_read_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        fs_read_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        fs_read_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        let fs_read_id = self
+            .module
+            .declare_function("ifa_rt_fs_read_to_string", Linkage::Import, &fs_read_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_read_to_string".into(), fs_read_id);
+        self.func_ids
+            .insert("fs::read_to_string".into(), fs_read_id);
+        self.func_ids.insert("read_to_string".into(), fs_read_id);
+
+        let mut fs_write_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        fs_write_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        fs_write_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        fs_write_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I8,
+            ));
+        let fs_write_id = self
+            .module
+            .declare_function("ifa_rt_fs_write_string", Linkage::Import, &fs_write_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_write_string".into(), fs_write_id);
+        self.func_ids.insert("fs::write_string".into(), fs_write_id);
+        self.func_ids.insert("write_string".into(), fs_write_id);
+
+        let mut fs_exists_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        fs_exists_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        fs_exists_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I8,
+            ));
+        let fs_exists_id = self
+            .module
+            .declare_function("ifa_rt_fs_exists", Linkage::Import, &fs_exists_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_exists".into(), fs_exists_id);
+        self.func_ids.insert("fs::exists".into(), fs_exists_id);
+        self.func_ids.insert("exists".into(), fs_exists_id);
+
+        let mut fs_size_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        fs_size_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        fs_size_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        let fs_size_id = self
+            .module
+            .declare_function("ifa_rt_fs_file_size", Linkage::Import, &fs_size_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_file_size".into(), fs_size_id);
+        self.func_ids.insert("fs::file_size".into(), fs_size_id);
+        self.func_ids.insert("file_size".into(), fs_size_id);
+
+        let fs_remove_id = self
+            .module
+            .declare_function("ifa_rt_fs_remove_file", Linkage::Import, &fs_exists_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_remove_file".into(), fs_remove_id);
+        self.func_ids.insert("fs::remove_file".into(), fs_remove_id);
+        self.func_ids.insert("remove_file".into(), fs_remove_id);
+
+        let fs_mkdir_id = self
+            .module
+            .declare_function("ifa_rt_fs_create_dir_all", Linkage::Import, &fs_exists_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_create_dir_all".into(), fs_mkdir_id);
+        self.func_ids
+            .insert("fs::create_dir_all".into(), fs_mkdir_id);
+        self.func_ids.insert("create_dir_all".into(), fs_mkdir_id);
 
         // Register stackless coroutine intrinsics
         let mut coro_create_sig = cranelift_codegen::ir::Signature::new(call_conv);

@@ -1147,6 +1147,71 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_fs_path_join ... ok"),
+        "Std fs path join test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_fs_path_dirname ... ok"),
+        "Std fs path dirname test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_fs_path_basename ... ok"),
+        "Std fs path basename test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_fs_path_extension ... ok"),
+        "Std fs path extension test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_fs_path_stem ... ok"),
+        "Std fs path stem test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_fs_path_normalize ... ok"),
+        "Std fs path normalize test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_fs_path_is_absolute ... ok"),
+        "Std fs path is absolute test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_fs_io_roundtrip ... ok"),
+        "Std fs io roundtrip test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_process_find_linker ... ok"),
+        "Std process find linker test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_process_find_tool ... ok"),
+        "Std process find tool test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_process_build_linker_command ... ok"),
+        "Std process build linker command test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_process_build_assembler_command ... ok"),
+        "Std process build assembler command test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_process_echo ... ok"),
+        "Std process echo test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout

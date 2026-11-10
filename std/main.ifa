@@ -1,16 +1,34 @@
 // Pure IFA Standard Library: Main Entrypoint (`std/main.ifa`)
-// Root module for the pure IFA autonomous standard library.
+// Root module aggregating crypto, fs, and process autonomous subsystems.
 
 import crypto;
+import fs;
+import process;
 
 pub fn test_std_all() -> bool {
-    let t1 = crypto::test_crypto_fnv1a();
-    let t2 = crypto::test_crypto_murmur3();
-    let t3 = crypto::test_crypto_sha256_empty();
-    let t4 = crypto::test_crypto_sha256_abc();
-    let t5 = crypto::test_crypto_constant_time_eq();
-    let t6 = crypto::test_crypto_hmac();
-    return t1 && t2 && t3 && t4 && t5 && t6;
+    let t_crypto = crypto::test_crypto_fnv1a()
+        && crypto::test_crypto_murmur3()
+        && crypto::test_crypto_sha256_empty()
+        && crypto::test_crypto_sha256_abc()
+        && crypto::test_crypto_constant_time_eq()
+        && crypto::test_crypto_hmac();
+
+    let t_fs = fs::test_fs_path_join()
+        && fs::test_fs_path_dirname()
+        && fs::test_fs_path_basename()
+        && fs::test_fs_path_extension()
+        && fs::test_fs_path_stem()
+        && fs::test_fs_path_normalize()
+        && fs::test_fs_path_is_absolute()
+        && fs::test_fs_io_roundtrip();
+
+    let t_process = process::test_process_find_linker()
+        && process::test_process_find_tool()
+        && process::test_process_build_linker_command()
+        && process::test_process_build_assembler_command()
+        && process::test_process_echo();
+
+    return t_crypto && t_fs && t_process;
 }
 
 pub fn main() {

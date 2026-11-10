@@ -6,7 +6,7 @@
 use crate::builder::BuildOrchestrator;
 use crate::error::KoriError;
 use ifa_codegen_cranelift::JitEngine;
-use ifa_fir::{compile_to_fir, FirInterpreter, FirModule, FirValue};
+use ifa_fir::{compile_to_fir, FirInterpreter, FirModule, FirType, FirValue};
 use ifa_lexer::tokenize;
 use ifa_parser::parse;
 use ifa_sema::{analyze, analyze_with_symbols, ModuleSymbol, SymbolTable};
@@ -500,6 +500,13 @@ impl TestRunner {
 
     fn execute_single_test(&self, module: &FirModule, test_name: &str) -> TestStatus {
         if self.native {
+            let is_bool_ret = module
+                .functions
+                .iter()
+                .find(|f| INTERNER.resolve(&f.name) == test_name)
+                .map(|f| matches!(f.ret_ty, FirType::Bool))
+                .unwrap_or(false);
+
             match JitEngine::new() {
                 Ok(mut jit) => {
                     if let Err(e) = jit.compile_module(module) {
@@ -507,7 +514,16 @@ impl TestRunner {
                     }
                     match jit.run_function(test_name) {
                         Ok(code) => {
-                            if code == 0 {
+                            if is_bool_ret {
+                                if code == 1 {
+                                    TestStatus::Passed
+                                } else {
+                                    TestStatus::Failed(
+                                        "Native test returned false (assertion failure)"
+                                            .to_string(),
+                                    )
+                                }
+                            } else if code == 0 {
                                 TestStatus::Passed
                             } else {
                                 TestStatus::Failed(format!("Native test exited with code {}", code))

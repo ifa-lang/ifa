@@ -1,0 +1,295 @@
+// Pure IFA Standard Library: File System and Path Abstractions (`std/fs.ifa`)
+// Deterministic path manipulations, normalized tree walking abstractions, and I/O primitives.
+
+pub fn path_is_separator(c: i64) -> bool {
+    return c == 47 || c == 92; // '/' or '\\'
+}
+
+pub fn path_is_absolute(path: String) -> bool {
+    let len = string_len(path);
+    if len == 0 {
+        return false;
+    }
+    let first = string_char_at(path, 0);
+    return path_is_separator(first);
+}
+
+pub fn path_join(base: String, child: String) -> String {
+    let base_len = string_len(base);
+    let child_len = string_len(child);
+
+    if base_len == 0 {
+        return child;
+    }
+    if child_len == 0 {
+        return base;
+    }
+    if path_is_absolute(child) {
+        return child;
+    }
+
+    let last_base = string_char_at(base, base_len - 1);
+    if path_is_separator(last_base) {
+        return base + child;
+    }
+    return base + "/" + child;
+}
+
+pub fn path_basename(path: String) -> String {
+    let len = string_len(path);
+    if len == 0 {
+        return "";
+    }
+
+    mut i: i64 = len - 1;
+    while i >= 0 {
+        let c = string_char_at(path, i);
+        if path_is_separator(c) {
+            return string_substr(path, i + 1, len - i - 1);
+        }
+        i = i - 1;
+    }
+    return path;
+}
+
+pub fn path_dirname(path: String) -> String {
+    let len = string_len(path);
+    if len == 0 {
+        return ".";
+    }
+
+    mut i: i64 = len - 1;
+    while i >= 0 {
+        let c = string_char_at(path, i);
+        if path_is_separator(c) {
+            if i == 0 {
+                return "/";
+            }
+            return string_substr(path, 0, i);
+        }
+        i = i - 1;
+    }
+    return ".";
+}
+
+pub fn path_extension(path: String) -> String {
+    let base = path_basename(path);
+    let len = string_len(base);
+    if len <= 1 {
+        return "";
+    }
+
+    mut i: i64 = len - 1;
+    while i > 0 {
+        let c = string_char_at(base, i);
+        if c == 46 { // '.'
+            return string_substr(base, i + 1, len - i - 1);
+        }
+        i = i - 1;
+    }
+    return "";
+}
+
+pub fn path_stem(path: String) -> String {
+    let base = path_basename(path);
+    let len = string_len(base);
+    if len <= 1 {
+        return base;
+    }
+
+    mut i: i64 = len - 1;
+    while i > 0 {
+        let c = string_char_at(base, i);
+        if c == 46 { // '.'
+            return string_substr(base, 0, i);
+        }
+        i = i - 1;
+    }
+    return base;
+}
+
+pub fn path_has_extension(path: String, ext: String) -> bool {
+    let actual = path_extension(path);
+    return actual == ext;
+}
+
+pub fn path_normalize(path: String) -> String {
+    let len = string_len(path);
+    if len == 0 {
+        return "";
+    }
+
+    mut result: String = "";
+    mut prev_sep: bool = false;
+    mut i: i64 = 0;
+
+    while i < len {
+        let c = string_char_at(path, i);
+        let is_sep = path_is_separator(c);
+
+        if is_sep {
+            if !prev_sep {
+                result = result + "/";
+                prev_sep = true;
+            }
+        } else {
+            // Check for "/./" segment
+            if c == 46 && prev_sep {
+                let next_char = if i + 1 < len { string_char_at(path, i + 1) } else { 0 };
+                if path_is_separator(next_char) || i + 1 == len {
+                    i = i + 1; // skip '.'
+                    continue;
+                }
+            }
+            let ch_str = string_substr(path, i, 1);
+            result = result + ch_str;
+            prev_sep = false;
+        }
+        i = i + 1;
+    }
+
+    let r_len = string_len(result);
+    if r_len > 1 {
+        let last = string_char_at(result, r_len - 1);
+        if path_is_separator(last) {
+            return string_substr(result, 0, r_len - 1);
+        }
+    }
+    return result;
+}
+
+// Low-Level Native System File Operations
+pub fn fs_read_to_string(path: String) -> String {
+    return read_to_string(path);
+}
+
+pub fn fs_write_string(path: String, content: String) -> bool {
+    return write_string(path, content);
+}
+
+pub fn fs_exists(path: String) -> bool {
+    return exists(path);
+}
+
+pub fn fs_file_size(path: String) -> i64 {
+    return file_size(path);
+}
+
+pub fn fs_remove_file(path: String) -> bool {
+    return remove_file(path);
+}
+
+pub fn fs_create_dir_all(path: String) -> bool {
+    return create_dir_all(path);
+}
+
+// Automated Test Suites for std/fs
+pub fn test_fs_path_join() -> bool {
+    let j1 = path_join("compiler", "driver.ifa");
+    let j2 = path_join("compiler/", "driver.ifa");
+    let j3 = path_join("", "driver.ifa");
+    let j4 = path_join("compiler", "/root/ifa");
+    return j1 == "compiler/driver.ifa"
+        && j2 == "compiler/driver.ifa"
+        && j3 == "driver.ifa"
+        && j4 == "/root/ifa";
+}
+
+pub fn test_fs_path_dirname() -> bool {
+    let d1 = path_dirname("compiler/driver.ifa");
+    let d2 = path_dirname("/root/ifa/std/fs.ifa");
+    let d3 = path_dirname("driver.ifa");
+    let d4 = path_dirname("/root");
+    return d1 == "compiler"
+        && d2 == "/root/ifa/std"
+        && d3 == "."
+        && d4 == "/";
+}
+
+pub fn test_fs_path_basename() -> bool {
+    let b1 = path_basename("compiler/driver.ifa");
+    let b2 = path_basename("/root/ifa/std/fs.ifa");
+    let b3 = path_basename("driver.ifa");
+    return b1 == "driver.ifa"
+        && b2 == "fs.ifa"
+        && b3 == "driver.ifa";
+}
+
+pub fn test_fs_path_extension() -> bool {
+    let e1 = path_extension("driver.ifa");
+    let e2 = path_extension("archive.tar.gz");
+    let e3 = path_extension("Makefile");
+    let e4 = path_extension(".gitignore");
+    return e1 == "ifa"
+        && e2 == "gz"
+        && e3 == ""
+        && e4 == "";
+}
+
+pub fn test_fs_path_stem() -> bool {
+    let s1 = path_stem("driver.ifa");
+    let s2 = path_stem("compiler/codegen_llvm.ifa");
+    let s3 = path_stem("Makefile");
+    return s1 == "driver"
+        && s2 == "codegen_llvm"
+        && s3 == "Makefile";
+}
+
+pub fn test_fs_path_normalize() -> bool {
+    let n1 = path_normalize("compiler//driver.ifa");
+    let n2 = path_normalize("compiler/./driver.ifa");
+    let n3 = path_normalize("/root/ifa/std/");
+    return n1 == "compiler/driver.ifa"
+        && n2 == "compiler/driver.ifa"
+        && n3 == "/root/ifa/std";
+}
+
+pub fn test_fs_path_is_absolute() -> bool {
+    let a1 = path_is_absolute("/root/ifa");
+    let a2 = path_is_absolute("compiler/driver.ifa");
+    let a3 = path_is_absolute("");
+    return a1 && !a2 && !a3;
+}
+
+pub fn test_fs_io_roundtrip() -> bool {
+    let test_file = "/tmp/ifa_std_fs_test_roundtrip.txt";
+    let payload = "Deterministic IFA File System Roundtrip Verification 2026\n";
+    let w_ok = fs_write_string(test_file, payload);
+    if !w_ok {
+        return false;
+    }
+    let ex = fs_exists(test_file);
+    if !ex {
+        return false;
+    }
+    let sz = fs_file_size(test_file);
+    if sz <= 0 {
+        return false;
+    }
+    let read_back = fs_read_to_string(test_file);
+    if read_back != payload {
+        return false;
+    }
+    let r_ok = fs_remove_file(test_file);
+    return r_ok;
+}
+
+pub fn test_fs_all() -> bool {
+    let t1 = test_fs_path_join();
+    let t2 = test_fs_path_dirname();
+    let t3 = test_fs_path_basename();
+    let t4 = test_fs_path_extension();
+    let t5 = test_fs_path_stem();
+    let t6 = test_fs_path_normalize();
+    let t7 = test_fs_path_is_absolute();
+    let t8 = test_fs_io_roundtrip();
+    return t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8;
+}
+
+pub fn main() {
+    if test_fs_all() {
+        println("std/fs: ALL TESTS PASSED");
+    } else {
+        println("std/fs: TESTS FAILED");
+    }
+}

@@ -1,0 +1,149 @@
+// Pure IFA Standard Library: Process Execution and Linker Toolchain Module (`std/process.ifa`)
+// Deterministic process execution, toolchain detection, and command orchestration.
+
+pub struct ProcessCommand {
+    program: String,
+    args: List<String>
+}
+
+pub fn make_command(program: String) -> ProcessCommand {
+    return ProcessCommand(
+        program: program,
+        args: List::new()
+    );
+}
+
+pub fn command_add_arg(inout cmd: ProcessCommand, arg: String) {
+    cmd.args.push(arg);
+}
+
+pub fn command_render_args(cmd: ProcessCommand) -> String {
+    mut res: String = "";
+    mut i: i64 = 0;
+    while i < cmd.args.len() {
+        if i > 0 {
+            res = res + " ";
+        }
+        res = res + cmd.args[i];
+        i = i + 1;
+    }
+    return res;
+}
+
+// Low-Level Native Process Execution
+pub fn process_exec(cmd: String, args: String) -> i64 {
+    return exec(cmd, args);
+}
+
+pub fn process_exec_output(cmd: String, args: String) -> String {
+    return exec_output(cmd, args);
+}
+
+pub fn process_exec_stderr(cmd: String, args: String) -> String {
+    return exec_stderr(cmd, args);
+}
+
+pub fn process_exec_with_stdin(cmd: String, args: String, stdin_str: String) -> i64 {
+    return exec_with_stdin(cmd, args, stdin_str);
+}
+
+pub fn process_find_linker() -> String {
+    return find_linker();
+}
+
+pub fn process_find_tool(tool_name: String) -> String {
+    return find_tool(tool_name);
+}
+
+pub fn process_env_var(name: String) -> String {
+    return env_var(name);
+}
+
+pub fn process_args_count() -> i64 {
+    return args_count();
+}
+
+pub fn process_args_get(index: i64) -> String {
+    return args_get(index);
+}
+
+// High-Level Toolchain Builders
+pub fn build_linker_command(
+    linker_bin: String,
+    objects: List<String>,
+    output_bin: String,
+    extra_flags: String
+) -> String {
+    mut cmd: String = linker_bin;
+    mut i: i64 = 0;
+    while i < objects.len() {
+        cmd = cmd + " " + objects[i];
+        i = i + 1;
+    }
+    cmd = cmd + " -no-pie -Wl,--build-id=none";
+    if extra_flags != "" {
+        cmd = cmd + " " + extra_flags;
+    }
+    cmd = cmd + " -o " + output_bin;
+    return cmd;
+}
+
+pub fn build_assembler_command(assembler_bin: String, input_asm: String, output_obj: String) -> String {
+    let cmd = assembler_bin + " -c " + input_asm + " -o " + output_obj;
+    return cmd;
+}
+
+pub fn build_compiler_command(compiler_bin: String, input_src: String, output_bin: String) -> String {
+    let cmd = compiler_bin + " " + input_src + " -o " + output_bin;
+    return cmd;
+}
+
+// Automated Test Suites for std/process
+pub fn test_process_find_linker() -> bool {
+    let linker = process_find_linker();
+    let len = string_len(linker);
+    return len > 0;
+}
+
+pub fn test_process_find_tool() -> bool {
+    let sh_path = process_find_tool("sh");
+    let len = string_len(sh_path);
+    return len > 0;
+}
+
+pub fn test_process_build_linker_command() -> bool {
+    mut objs: List<String> = List::new();
+    objs.push("main.o");
+    objs.push("driver.o");
+    let cmd = build_linker_command("clang", objs, "ifac", "-lm -lpthread");
+    let expected = "clang main.o driver.o -no-pie -Wl,--build-id=none -lm -lpthread -o ifac";
+    return cmd == expected;
+}
+
+pub fn test_process_build_assembler_command() -> bool {
+    let cmd = build_assembler_command("clang", "module.ll", "module.o");
+    return cmd == "clang -c module.ll -o module.o";
+}
+
+pub fn test_process_echo() -> bool {
+    let out = process_exec_output("echo", "IFA_SYSTEM_PROCESS_TEST");
+    let len = string_len(out);
+    return len >= 22;
+}
+
+pub fn test_process_all() -> bool {
+    let t1 = test_process_find_linker();
+    let t2 = test_process_find_tool();
+    let t3 = test_process_build_linker_command();
+    let t4 = test_process_build_assembler_command();
+    let t5 = test_process_echo();
+    return t1 && t2 && t3 && t4 && t5;
+}
+
+pub fn main() {
+    if test_process_all() {
+        println("std/process: ALL TESTS PASSED");
+    } else {
+        println("std/process: TESTS FAILED");
+    }
+}

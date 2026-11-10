@@ -1207,6 +1207,36 @@ pub extern "C" fn ifa_rt_fs_file_size(path: *const u8) -> u64 {
     std::fs::metadata(path_str).map(|m| m.len()).unwrap_or(0)
 }
 
+/// Remove a file on disk. Returns true on success, false on error.
+#[no_mangle]
+pub extern "C" fn ifa_rt_fs_remove_file(path: *const u8) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    let path_str = unsafe {
+        match std::ffi::CStr::from_ptr(path as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+    std::fs::remove_file(path_str).is_ok()
+}
+
+/// Recursively create a directory on disk. Returns true on success, false on error.
+#[no_mangle]
+pub extern "C" fn ifa_rt_fs_create_dir_all(path: *const u8) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    let path_str = unsafe {
+        match std::ffi::CStr::from_ptr(path as *const std::os::raw::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    };
+    std::fs::create_dir_all(path_str).is_ok()
+}
+
 /// Return the byte-length of a null-terminated UTF-8 C string (excluding the null terminator).
 /// Returns 0 for a null pointer.
 #[no_mangle]
@@ -1238,6 +1268,46 @@ pub extern "C" fn ifa_rt_string_char_at(s: *const u8, index: i64) -> i64 {
     match st.chars().nth(index as usize) {
         Some(c) => c as i64,
         None => -1,
+    }
+}
+
+/// Return a substring of length `len` starting at character index `start`.
+/// Returns an empty string if out-of-bounds, negative or invalid.
+#[no_mangle]
+pub extern "C" fn ifa_rt_string_substr(s: *const u8, start: i64, len: i64) -> *mut u8 {
+    let empty_res = || {
+        let bytes = b"\0";
+        let layout = std::alloc::Layout::from_size_align(1, 1).unwrap();
+        unsafe {
+            let mem = std::alloc::alloc(layout);
+            if !mem.is_null() {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, 1);
+            }
+            mem
+        }
+    };
+
+    if s.is_null() || start < 0 || len <= 0 {
+        return empty_res();
+    }
+    let st = unsafe {
+        match std::ffi::CStr::from_ptr(s as *const std::os::raw::c_char).to_str() {
+            Ok(st) => st,
+            Err(_) => return empty_res(),
+        }
+    };
+    let start_idx = start as usize;
+    let count = len as usize;
+    let substr: String = st.chars().skip(start_idx).take(count).collect();
+    let bytes = format!("{}\0", substr).into_bytes();
+    let layout = std::alloc::Layout::from_size_align(bytes.len(), 1).unwrap();
+    unsafe {
+        let mem = std::alloc::alloc(layout);
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, bytes.len());
+        mem
     }
 }
 

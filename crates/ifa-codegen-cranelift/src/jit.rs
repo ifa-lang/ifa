@@ -132,6 +132,22 @@ impl JitEngine {
             ifa_runtime::ffi::ifa_rt_string_char_at as *const u8,
         );
         builder.symbol(
+            "ifa_rt_string_substr",
+            ifa_runtime::ffi::ifa_rt_string_substr as *const u8,
+        );
+        builder.symbol(
+            "string_substr",
+            ifa_runtime::ffi::ifa_rt_string_substr as *const u8,
+        );
+        builder.symbol(
+            "String::substr",
+            ifa_runtime::ffi::ifa_rt_string_substr as *const u8,
+        );
+        builder.symbol(
+            "substring",
+            ifa_runtime::ffi::ifa_rt_string_substr as *const u8,
+        );
+        builder.symbol(
             "ifa_rt_string_from_i64",
             ifa_rt_string_from_i64 as *const u8,
         );
@@ -174,6 +190,75 @@ impl JitEngine {
         builder.symbol(
             "ifa_rt_process_find_tool",
             ifa_runtime::ffi::ifa_rt_process_find_tool as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_fs_read_to_string",
+            ifa_runtime::ffi::ifa_rt_fs_read_to_string as *const u8,
+        );
+        builder.symbol(
+            "fs::read_to_string",
+            ifa_runtime::ffi::ifa_rt_fs_read_to_string as *const u8,
+        );
+        builder.symbol(
+            "read_to_string",
+            ifa_runtime::ffi::ifa_rt_fs_read_to_string as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_fs_write_string",
+            ifa_runtime::ffi::ifa_rt_fs_write_string as *const u8,
+        );
+        builder.symbol(
+            "fs::write_string",
+            ifa_runtime::ffi::ifa_rt_fs_write_string as *const u8,
+        );
+        builder.symbol(
+            "write_string",
+            ifa_runtime::ffi::ifa_rt_fs_write_string as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_fs_exists",
+            ifa_runtime::ffi::ifa_rt_fs_exists as *const u8,
+        );
+        builder.symbol(
+            "fs::exists",
+            ifa_runtime::ffi::ifa_rt_fs_exists as *const u8,
+        );
+        builder.symbol("exists", ifa_runtime::ffi::ifa_rt_fs_exists as *const u8);
+        builder.symbol(
+            "ifa_rt_fs_file_size",
+            ifa_runtime::ffi::ifa_rt_fs_file_size as *const u8,
+        );
+        builder.symbol(
+            "fs::file_size",
+            ifa_runtime::ffi::ifa_rt_fs_file_size as *const u8,
+        );
+        builder.symbol(
+            "file_size",
+            ifa_runtime::ffi::ifa_rt_fs_file_size as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_fs_remove_file",
+            ifa_runtime::ffi::ifa_rt_fs_remove_file as *const u8,
+        );
+        builder.symbol(
+            "fs::remove_file",
+            ifa_runtime::ffi::ifa_rt_fs_remove_file as *const u8,
+        );
+        builder.symbol(
+            "remove_file",
+            ifa_runtime::ffi::ifa_rt_fs_remove_file as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_fs_create_dir_all",
+            ifa_runtime::ffi::ifa_rt_fs_create_dir_all as *const u8,
+        );
+        builder.symbol(
+            "fs::create_dir_all",
+            ifa_runtime::ffi::ifa_rt_fs_create_dir_all as *const u8,
+        );
+        builder.symbol(
+            "create_dir_all",
+            ifa_runtime::ffi::ifa_rt_fs_create_dir_all as *const u8,
         );
         builder.symbol("ifa_rt_coro_create", ifa_rt_coro_create as *const u8);
         builder.symbol(
@@ -616,6 +701,21 @@ impl JitEngine {
         self.func_ids
             .insert("String::char_at".into(), str_char_at_id);
 
+        let mut str_substr_sig = Signature::new(call_conv);
+        str_substr_sig.params.push(AbiParam::new(ptr_type));
+        str_substr_sig.params.push(AbiParam::new(types::I64));
+        str_substr_sig.params.push(AbiParam::new(types::I64));
+        str_substr_sig.returns.push(AbiParam::new(ptr_type));
+        let str_substr_id = self
+            .module
+            .declare_function("ifa_rt_string_substr", Linkage::Import, &str_substr_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_string_substr".into(), str_substr_id);
+        self.func_ids.insert("string_substr".into(), str_substr_id);
+        self.func_ids.insert("String::substr".into(), str_substr_id);
+        self.func_ids.insert("substring".into(), str_substr_id);
+
         let mut str_i64_sig = Signature::new(call_conv);
         str_i64_sig.params.push(AbiParam::new(types::I64));
         str_i64_sig.returns.push(AbiParam::new(ptr_type));
@@ -753,6 +853,76 @@ impl JitEngine {
             .insert("ifa_rt_process_find_tool".into(), proc_find_tool_id);
         self.func_ids
             .insert("process::find_tool".into(), proc_find_tool_id);
+
+        // File system intrinsics
+        let mut fs_read_sig = Signature::new(call_conv);
+        fs_read_sig.params.push(AbiParam::new(ptr_type));
+        fs_read_sig.returns.push(AbiParam::new(ptr_type));
+        let fs_read_id = self
+            .module
+            .declare_function("ifa_rt_fs_read_to_string", Linkage::Import, &fs_read_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_read_to_string".into(), fs_read_id);
+        self.func_ids
+            .insert("fs::read_to_string".into(), fs_read_id);
+        self.func_ids.insert("read_to_string".into(), fs_read_id);
+
+        let mut fs_write_sig = Signature::new(call_conv);
+        fs_write_sig.params.push(AbiParam::new(ptr_type));
+        fs_write_sig.params.push(AbiParam::new(ptr_type));
+        fs_write_sig.returns.push(AbiParam::new(types::I8));
+        let fs_write_id = self
+            .module
+            .declare_function("ifa_rt_fs_write_string", Linkage::Import, &fs_write_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_write_string".into(), fs_write_id);
+        self.func_ids.insert("fs::write_string".into(), fs_write_id);
+        self.func_ids.insert("write_string".into(), fs_write_id);
+
+        let mut fs_exists_sig = Signature::new(call_conv);
+        fs_exists_sig.params.push(AbiParam::new(ptr_type));
+        fs_exists_sig.returns.push(AbiParam::new(types::I8));
+        let fs_exists_id = self
+            .module
+            .declare_function("ifa_rt_fs_exists", Linkage::Import, &fs_exists_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_exists".into(), fs_exists_id);
+        self.func_ids.insert("fs::exists".into(), fs_exists_id);
+        self.func_ids.insert("exists".into(), fs_exists_id);
+
+        let mut fs_size_sig = Signature::new(call_conv);
+        fs_size_sig.params.push(AbiParam::new(ptr_type));
+        fs_size_sig.returns.push(AbiParam::new(types::I64));
+        let fs_size_id = self
+            .module
+            .declare_function("ifa_rt_fs_file_size", Linkage::Import, &fs_size_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_file_size".into(), fs_size_id);
+        self.func_ids.insert("fs::file_size".into(), fs_size_id);
+        self.func_ids.insert("file_size".into(), fs_size_id);
+
+        let fs_remove_id = self
+            .module
+            .declare_function("ifa_rt_fs_remove_file", Linkage::Import, &fs_exists_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_remove_file".into(), fs_remove_id);
+        self.func_ids.insert("fs::remove_file".into(), fs_remove_id);
+        self.func_ids.insert("remove_file".into(), fs_remove_id);
+
+        let fs_mkdir_id = self
+            .module
+            .declare_function("ifa_rt_fs_create_dir_all", Linkage::Import, &fs_exists_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_fs_create_dir_all".into(), fs_mkdir_id);
+        self.func_ids
+            .insert("fs::create_dir_all".into(), fs_mkdir_id);
+        self.func_ids.insert("create_dir_all".into(), fs_mkdir_id);
 
         // Register stackless coroutine intrinsics
         let mut coro_create_sig = Signature::new(call_conv);

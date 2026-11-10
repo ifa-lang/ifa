@@ -2161,7 +2161,10 @@ impl<'a> FirInterpreter<'a> {
                     Ok(FirValue::Unit)
                 } else if fn_name == "new" || fn_name == "List::new" {
                     Ok(FirValue::Array(Vec::new()))
-                } else if fn_name == "string_len" || fn_name == "String::len" {
+                } else if fn_name == "string_len"
+                    || fn_name == "String::len"
+                    || fn_name == "ifa_rt_string_len"
+                {
                     if let Some(arg) = evaluated_args.first() {
                         match arg {
                             FirValue::String(s) => Ok(FirValue::Int(s.chars().count() as i128)),
@@ -2170,7 +2173,10 @@ impl<'a> FirInterpreter<'a> {
                     } else {
                         Ok(FirValue::Int(0))
                     }
-                } else if fn_name == "string_char_at" || fn_name == "String::char_at" {
+                } else if fn_name == "string_char_at"
+                    || fn_name == "String::char_at"
+                    || fn_name == "ifa_rt_string_char_at"
+                {
                     if evaluated_args.len() >= 2 {
                         let s = match &evaluated_args[0] {
                             FirValue::String(s) => s.as_str(),
@@ -2191,7 +2197,38 @@ impl<'a> FirInterpreter<'a> {
                     } else {
                         Ok(FirValue::Int(-1))
                     }
-                } else if fn_name == "fs::read_to_string" || fn_name == "read_to_string" {
+                } else if fn_name == "string_substr"
+                    || fn_name == "String::substr"
+                    || fn_name == "substring"
+                    || fn_name == "ifa_rt_string_substr"
+                {
+                    if evaluated_args.len() >= 3 {
+                        let s = match &evaluated_args[0] {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        };
+                        let start = match evaluated_args[1] {
+                            FirValue::Int(i) => i as i64,
+                            _ => -1,
+                        };
+                        let len = match evaluated_args[2] {
+                            FirValue::Int(i) => i as i64,
+                            _ => 0,
+                        };
+                        if start < 0 || len <= 0 {
+                            Ok(FirValue::String(String::new()))
+                        } else {
+                            let sub: String =
+                                s.chars().skip(start as usize).take(len as usize).collect();
+                            Ok(FirValue::String(sub))
+                        }
+                    } else {
+                        Ok(FirValue::String(String::new()))
+                    }
+                } else if fn_name == "fs::read_to_string"
+                    || fn_name == "read_to_string"
+                    || fn_name == "ifa_rt_fs_read_to_string"
+                {
                     if let Some(arg) = evaluated_args.first() {
                         let path = match arg {
                             FirValue::String(s) => s.as_str(),
@@ -2202,7 +2239,10 @@ impl<'a> FirInterpreter<'a> {
                     } else {
                         Ok(FirValue::String(String::new()))
                     }
-                } else if fn_name == "fs::write_string" || fn_name == "write_string" {
+                } else if fn_name == "fs::write_string"
+                    || fn_name == "write_string"
+                    || fn_name == "ifa_rt_fs_write_string"
+                {
                     let path = evaluated_args
                         .first()
                         .map(|a| match a {
@@ -2219,7 +2259,10 @@ impl<'a> FirInterpreter<'a> {
                         .unwrap_or("");
                     let ok = std::fs::write(path, content).is_ok();
                     Ok(FirValue::Bool(ok))
-                } else if fn_name == "fs::exists" || fn_name == "exists" {
+                } else if fn_name == "fs::exists"
+                    || fn_name == "exists"
+                    || fn_name == "ifa_rt_fs_exists"
+                {
                     let path = evaluated_args
                         .first()
                         .map(|a| match a {
@@ -2228,7 +2271,10 @@ impl<'a> FirInterpreter<'a> {
                         })
                         .unwrap_or("");
                     Ok(FirValue::Bool(std::path::Path::new(path).exists()))
-                } else if fn_name == "fs::file_size" || fn_name == "file_size" {
+                } else if fn_name == "fs::file_size"
+                    || fn_name == "file_size"
+                    || fn_name == "ifa_rt_fs_file_size"
+                {
                     let path = evaluated_args
                         .first()
                         .map(|a| match a {
@@ -2240,6 +2286,32 @@ impl<'a> FirInterpreter<'a> {
                         .map(|m| m.len() as i128)
                         .unwrap_or(0);
                     Ok(FirValue::Int(sz))
+                } else if fn_name == "fs::remove_file"
+                    || fn_name == "remove_file"
+                    || fn_name == "ifa_rt_fs_remove_file"
+                {
+                    let path = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let ok = std::fs::remove_file(path).is_ok();
+                    Ok(FirValue::Bool(ok))
+                } else if fn_name == "fs::create_dir_all"
+                    || fn_name == "create_dir_all"
+                    || fn_name == "ifa_rt_fs_create_dir_all"
+                {
+                    let path = evaluated_args
+                        .first()
+                        .map(|a| match a {
+                            FirValue::String(s) => s.as_str(),
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let ok = std::fs::create_dir_all(path).is_ok();
+                    Ok(FirValue::Bool(ok))
                 } else if fn_name == "process::exec"
                     || fn_name == "exec"
                     || fn_name == "ifa_rt_process_exec"
