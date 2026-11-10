@@ -108,6 +108,30 @@ impl JitEngine {
             ifa_runtime::ffi::ifa_rt_string_eq as *const u8,
         );
         builder.symbol(
+            "ifa_rt_string_len",
+            ifa_runtime::ffi::ifa_rt_string_len as *const u8,
+        );
+        builder.symbol(
+            "string_len",
+            ifa_runtime::ffi::ifa_rt_string_len as *const u8,
+        );
+        builder.symbol(
+            "String::len",
+            ifa_runtime::ffi::ifa_rt_string_len as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_string_char_at",
+            ifa_runtime::ffi::ifa_rt_string_char_at as *const u8,
+        );
+        builder.symbol(
+            "string_char_at",
+            ifa_runtime::ffi::ifa_rt_string_char_at as *const u8,
+        );
+        builder.symbol(
+            "String::char_at",
+            ifa_runtime::ffi::ifa_rt_string_char_at as *const u8,
+        );
+        builder.symbol(
             "ifa_rt_string_from_i64",
             ifa_rt_string_from_i64 as *const u8,
         );
@@ -565,6 +589,32 @@ impl JitEngine {
             .declare_function("ifa_rt_string_eq", Linkage::Import, &str_eq_sig)
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids.insert("ifa_rt_string_eq".into(), str_eq_id);
+
+        let mut str_len_sig = Signature::new(call_conv);
+        str_len_sig.params.push(AbiParam::new(ptr_type));
+        str_len_sig.returns.push(AbiParam::new(types::I64));
+        let str_len_id = self
+            .module
+            .declare_function("ifa_rt_string_len", Linkage::Import, &str_len_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids.insert("ifa_rt_string_len".into(), str_len_id);
+        self.func_ids.insert("string_len".into(), str_len_id);
+        self.func_ids.insert("String::len".into(), str_len_id);
+
+        let mut str_char_at_sig = Signature::new(call_conv);
+        str_char_at_sig.params.push(AbiParam::new(ptr_type));
+        str_char_at_sig.params.push(AbiParam::new(types::I64));
+        str_char_at_sig.returns.push(AbiParam::new(types::I64));
+        let str_char_at_id = self
+            .module
+            .declare_function("ifa_rt_string_char_at", Linkage::Import, &str_char_at_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_string_char_at".into(), str_char_at_id);
+        self.func_ids
+            .insert("string_char_at".into(), str_char_at_id);
+        self.func_ids
+            .insert("String::char_at".into(), str_char_at_id);
 
         let mut str_i64_sig = Signature::new(call_conv);
         str_i64_sig.params.push(AbiParam::new(types::I64));

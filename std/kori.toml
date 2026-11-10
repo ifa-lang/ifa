@@ -1,0 +1,20 @@
+[package]
+name = "std"
+version = "0.1.0"
+edition = "2026"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
+license = "MIT OR Apache-2.0"
+description = "Pure IFA Autonomous Standard Library"
+
+[targets]
+lib = { name = "std", path = "main.ifa" }
+
+[profiles.dev]
+backend = "llvm"
+opt_level = 0
+debug_assertions = true
+
+[profiles.release]
+backend = "llvm"
+opt_level = 2
+debug_assertions = false

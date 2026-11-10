@@ -1,0 +1,456 @@
+// Pure IFA Standard Library: Cryptography Module (`std/crypto.ifa`)
+// Deterministic hash functions, FNV-1a, Murmur3-32, SHA-256 (FIPS 180-4), HMAC, and constant-time equality.
+
+pub fn fnv1a_str(s: String) -> i64 {
+    mut hash: i64 = -3750763034362895579; // 0xcbf29ce484222325 as signed i64
+    let prime: i64 = 1099511628211;       // 0x100000001b3
+    let len = string_len(s);
+    mut i: i64 = 0;
+    while i < len {
+        let c = string_char_at(s, i);
+        hash = hash ^ c;
+        hash = hash * prime;
+        i = i + 1;
+    }
+    return hash;
+}
+
+pub fn fnv1a_bytes(bytes: List<i64>) -> i64 {
+    mut hash: i64 = -3750763034362895579;
+    let prime: i64 = 1099511628211;
+    mut i: i64 = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        hash = hash ^ b;
+        hash = hash * prime;
+        i = i + 1;
+    }
+    return hash;
+}
+
+pub fn rotr32(x: i64, n: i64) -> i64 {
+    let masked = x & 4294967295;
+    let r = ((masked >> n) | (masked << (32 - n))) & 4294967295;
+    return r;
+}
+
+pub fn rotl32(x: i64, n: i64) -> i64 {
+    let masked = x & 4294967295;
+    let r = ((masked << n) | (masked >> (32 - n))) & 4294967295;
+    return r;
+}
+
+pub fn murmur3_32(s: String, seed: i64) -> i64 {
+    mut h: i64 = seed & 4294967295;
+    let c1: i64 = 3432918353; // 0xcc9e2d51
+    let c2: i64 = 461845907;  // 0x1b873593
+    let len = string_len(s);
+
+    mut i: i64 = 0;
+    while i + 4 <= len {
+        let b0 = string_char_at(s, i);
+        let b1 = string_char_at(s, i + 1);
+        let b2 = string_char_at(s, i + 2);
+        let b3 = string_char_at(s, i + 3);
+        mut k: i64 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        k = (k * c1) & 4294967295;
+        k = rotl32(k, 15);
+        k = (k * c2) & 4294967295;
+
+        h = h ^ k;
+        h = rotl32(h, 13);
+        h = ((h * 5) + 3864292196) & 4294967295; // 0xe6546b64
+        i = i + 4;
+    }
+
+    mut rem: i64 = 0;
+    let rem_len = len - i;
+    if rem_len == 3 {
+        rem = rem ^ (string_char_at(s, i + 2) << 16);
+        rem = rem ^ (string_char_at(s, i + 1) << 8);
+        rem = rem ^ string_char_at(s, i);
+        rem = (rem * c1) & 4294967295;
+        rem = rotl32(rem, 15);
+        rem = (rem * c2) & 4294967295;
+        h = h ^ rem;
+    } else if rem_len == 2 {
+        rem = rem ^ (string_char_at(s, i + 1) << 8);
+        rem = rem ^ string_char_at(s, i);
+        rem = (rem * c1) & 4294967295;
+        rem = rotl32(rem, 15);
+        rem = (rem * c2) & 4294967295;
+        h = h ^ rem;
+    } else if rem_len == 1 {
+        rem = rem ^ string_char_at(s, i);
+        rem = (rem * c1) & 4294967295;
+        rem = rotl32(rem, 15);
+        rem = (rem * c2) & 4294967295;
+        h = h ^ rem;
+    }
+
+    h = (h ^ len) & 4294967295;
+    h = (h ^ (h >> 16)) & 4294967295;
+    h = (h * 2246822507) & 4294967295; // 0x85ebca6b
+    h = (h ^ (h >> 13)) & 4294967295;
+    h = (h * 3266489909) & 4294967295; // 0xc2b2ae35
+    h = (h ^ (h >> 16)) & 4294967295;
+    return h;
+}
+
+// === SHA-256 (FIPS 180-4) Implementation ===
+
+pub fn get_sha256_k_table() -> List<i64> {
+    mut k: List<i64> = List::new();
+    k.push(1116352408); k.push(1899447441); k.push(3049323471); k.push(3921009573);
+    k.push(961987163);  k.push(1508970993); k.push(2453635748); k.push(2870763221);
+    k.push(3624381080); k.push(310598401);  k.push(607225278);  k.push(1426881987);
+    k.push(1925078388); k.push(2162078206); k.push(2614888103); k.push(3248222580);
+    k.push(3835390401); k.push(4022224774); k.push(264347078);  k.push(604807628);
+    k.push(770255983);  k.push(1249150122); k.push(1555081692); k.push(1996064986);
+    k.push(2554220882); k.push(2821834349); k.push(2952996808); k.push(3210313671);
+    k.push(3336571891); k.push(3584528711); k.push(113926993);  k.push(338241895);
+    k.push(666307205);  k.push(773529912);  k.push(1294757372); k.push(1396182291);
+    k.push(1695183700); k.push(1986661051); k.push(2177026350); k.push(2456956037);
+    k.push(2730485921); k.push(2820302411); k.push(3259730800); k.push(3345764771);
+    k.push(3516065817); k.push(3600352804); k.push(4094571909); k.push(275423344);
+    k.push(430227734);  k.push(506948616);  k.push(659060556);  k.push(883997877);
+    k.push(958139571);  k.push(1322822218); k.push(1537002063); k.push(1747873779);
+    k.push(1955562222); k.push(2024104815); k.push(2227730452); k.push(2361852424);
+    k.push(2428436474); k.push(2756734187); k.push(3204031479); k.push(3329325298);
+    return k;
+}
+
+pub fn hex_nibble(n: i64) -> String {
+    let v = n & 15;
+    if v == 0 { return "0"; }
+    if v == 1 { return "1"; }
+    if v == 2 { return "2"; }
+    if v == 3 { return "3"; }
+    if v == 4 { return "4"; }
+    if v == 5 { return "5"; }
+    if v == 6 { return "6"; }
+    if v == 7 { return "7"; }
+    if v == 8 { return "8"; }
+    if v == 9 { return "9"; }
+    if v == 10 { return "a"; }
+    if v == 11 { return "b"; }
+    if v == 12 { return "c"; }
+    if v == 13 { return "d"; }
+    if v == 14 { return "e"; }
+    return "f";
+}
+
+pub fn byte_to_hex(b: i64) -> String {
+    let hi = (b >> 4) & 15;
+    let lo = b & 15;
+    return hex_nibble(hi) + hex_nibble(lo);
+}
+
+pub fn bytes_to_hex(bytes: List<i64>) -> String {
+    mut s = "";
+    mut i: i64 = 0;
+    while i < bytes.len() {
+        s = s + byte_to_hex(bytes[i]);
+        i = i + 1;
+    }
+    return s;
+}
+
+pub fn hex_char_to_val(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }        // '0'-'9'
+    if c >= 97 && c <= 102 { return c - 97 + 10; }  // 'a'-'f'
+    if c >= 65 && c <= 70 { return c - 65 + 10; }   // 'A'-'F'
+    return 0;
+}
+
+pub fn hex_to_bytes(hex: String) -> List<i64> {
+    mut list: List<i64> = List::new();
+    let len = string_len(hex);
+    mut i: i64 = 0;
+    while i + 1 < len {
+        let hi = hex_char_to_val(string_char_at(hex, i));
+        let lo = hex_char_to_val(string_char_at(hex, i + 1));
+        list.push((hi << 4) | lo);
+        i = i + 2;
+    }
+    return list;
+}
+
+pub fn sha256_process_chunk(
+    offset: i64,
+    msg: List<i64>,
+    k_table: List<i64>,
+    state: List<i64>
+) -> List<i64> {
+    mut w: List<i64> = List::new();
+
+    // 16 words from chunk
+    mut j: i64 = 0;
+    while j < 16 {
+        let b0 = msg[offset + (j * 4)];
+        let b1 = msg[offset + (j * 4) + 1];
+        let b2 = msg[offset + (j * 4) + 2];
+        let b3 = msg[offset + (j * 4) + 3];
+        let word = ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) & 4294967295;
+        w.push(word);
+        j = j + 1;
+    }
+
+    // Extend to 64 words
+    while j < 64 {
+        let w_im2 = w[j - 2];
+        let s1 = (rotr32(w_im2, 17) ^ rotr32(w_im2, 19) ^ (w_im2 >> 10)) & 4294967295;
+        let w_im15 = w[j - 15];
+        let s0 = (rotr32(w_im15, 7) ^ rotr32(w_im15, 18) ^ (w_im15 >> 3)) & 4294967295;
+        let word = (w[j - 16] + s0 + w[j - 7] + s1) & 4294967295;
+        w.push(word);
+        j = j + 1;
+    }
+
+    // Compression loop
+    mut a = state[0];
+    mut b = state[1];
+    mut c = state[2];
+    mut d = state[3];
+    mut e = state[4];
+    mut f = state[5];
+    mut g = state[6];
+    mut h_val = state[7];
+
+    mut round_idx: i64 = 0;
+    while round_idx < 64 {
+        let s1 = (rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)) & 4294967295;
+        let not_e = e ^ 4294967295;
+        let ch = ((e & f) ^ (not_e & g)) & 4294967295;
+        let temp1 = (h_val + s1 + ch + k_table[round_idx] + w[round_idx]) & 4294967295;
+        let s0 = (rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)) & 4294967295;
+        let maj = ((a & b) ^ (a & c) ^ (b & c)) & 4294967295;
+        let temp2 = (s0 + maj) & 4294967295;
+
+        h_val = g;
+        g = f;
+        f = e;
+        e = (d + temp1) & 4294967295;
+        d = c;
+        c = b;
+        b = a;
+        a = (temp1 + temp2) & 4294967295;
+
+        round_idx = round_idx + 1;
+    }
+
+    mut new_state: List<i64> = List::new();
+    new_state.push((state[0] + a) & 4294967295);
+    new_state.push((state[1] + b) & 4294967295);
+    new_state.push((state[2] + c) & 4294967295);
+    new_state.push((state[3] + d) & 4294967295);
+    new_state.push((state[4] + e) & 4294967295);
+    new_state.push((state[5] + f) & 4294967295);
+    new_state.push((state[6] + g) & 4294967295);
+    new_state.push((state[7] + h_val) & 4294967295);
+    return new_state;
+}
+
+pub fn sha256_bytes(data: List<i64>) -> List<i64> {
+    let k_table = get_sha256_k_table();
+
+    mut state: List<i64> = List::new();
+    state.push(1779033703); // 0x6a09e667
+    state.push(3144134277); // 0xbb67ae85
+    state.push(1013904242); // 0x3c6ef372
+    state.push(2773480762); // 0xa54ff53a
+    state.push(1359893119); // 0x510e527f
+    state.push(2600822924); // 0x9b05688c
+    state.push(528734635);  // 0x1f83d9ab
+    state.push(1541459225); // 0x5be0cd19
+
+    let orig_len = data.len();
+    let bit_len: i64 = orig_len * 8;
+
+    mut msg: List<i64> = List::new();
+    mut i: i64 = 0;
+    while i < orig_len {
+        msg.push(data[i] & 255);
+        i = i + 1;
+    }
+
+    // Append single '1' bit (0x80)
+    msg.push(128);
+
+    // Append zeros until length % 64 == 56
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
+
+    // Append 64-bit big-endian length
+    msg.push((bit_len >> 56) & 255);
+    msg.push((bit_len >> 48) & 255);
+    msg.push((bit_len >> 40) & 255);
+    msg.push((bit_len >> 32) & 255);
+    msg.push((bit_len >> 24) & 255);
+    msg.push((bit_len >> 16) & 255);
+    msg.push((bit_len >> 8) & 255);
+    msg.push(bit_len & 255);
+
+    // Process 64-byte chunks
+    mut chunk_idx: i64 = 0;
+    let num_chunks = msg.len() / 64;
+
+    while chunk_idx < num_chunks {
+        let offset = chunk_idx * 64;
+        state = sha256_process_chunk(offset, msg, k_table, state);
+        chunk_idx = chunk_idx + 1;
+    }
+
+    mut digest: List<i64> = List::new();
+    mut w_idx: i64 = 0;
+    while w_idx < 8 {
+        let val = state[w_idx];
+        digest.push((val >> 24) & 255);
+        digest.push((val >> 16) & 255);
+        digest.push((val >> 8) & 255);
+        digest.push(val & 255);
+        w_idx = w_idx + 1;
+    }
+
+    return digest;
+}
+
+pub fn sha256_hex(input: String) -> String {
+    mut bytes: List<i64> = List::new();
+    let len = string_len(input);
+    mut i: i64 = 0;
+    while i < len {
+        bytes.push(string_char_at(input, i));
+        i = i + 1;
+    }
+    let digest = sha256_bytes(bytes);
+    return bytes_to_hex(digest);
+}
+
+pub fn constant_time_eq(a: String, b: String) -> bool {
+    let len_a = string_len(a);
+    let len_b = string_len(b);
+    mut diff: i64 = len_a ^ len_b;
+    let min_len = if len_a < len_b { len_a } else { len_b };
+    mut i: i64 = 0;
+    while i < min_len {
+        diff = diff | (string_char_at(a, i) ^ string_char_at(b, i));
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+pub fn hmac_sha256(key: String, message: String) -> String {
+    mut k_bytes: List<i64> = List::new();
+    let k_len = string_len(key);
+    if k_len > 64 {
+        mut raw: List<i64> = List::new();
+        mut i: i64 = 0;
+        while i < k_len {
+            raw.push(string_char_at(key, i));
+            i = i + 1;
+        }
+        k_bytes = sha256_bytes(raw);
+    } else {
+        mut i: i64 = 0;
+        while i < k_len {
+            k_bytes.push(string_char_at(key, i));
+            i = i + 1;
+        }
+    }
+    while k_bytes.len() < 64 {
+        k_bytes.push(0);
+    }
+
+    mut i_key_pad: List<i64> = List::new();
+    mut o_key_pad: List<i64> = List::new();
+    mut i: i64 = 0;
+    while i < 64 {
+        i_key_pad.push(k_bytes[i] ^ 54);  // 0x36
+        o_key_pad.push(k_bytes[i] ^ 92);  // 0x5c
+        i = i + 1;
+    }
+
+    // Inner hash: sha256(i_key_pad || message)
+    let msg_len = string_len(message);
+    i = 0;
+    while i < msg_len {
+        i_key_pad.push(string_char_at(message, i));
+        i = i + 1;
+    }
+    let inner_hash = sha256_bytes(i_key_pad);
+
+    // Outer hash: sha256(o_key_pad || inner_hash)
+    i = 0;
+    while i < inner_hash.len() {
+        o_key_pad.push(inner_hash[i]);
+        i = i + 1;
+    }
+    let outer_hash = sha256_bytes(o_key_pad);
+    return bytes_to_hex(outer_hash);
+}
+
+// === Unit Tests ===
+
+pub fn test_crypto_fnv1a() -> bool {
+    let h1 = fnv1a_str("hello");
+    let h2 = fnv1a_str("hello");
+    let h3 = fnv1a_str("world");
+    if h1 != h2 {
+        return false;
+    }
+    if h1 == h3 {
+        return false;
+    }
+    return true;
+}
+
+pub fn test_crypto_murmur3() -> bool {
+    let m1 = murmur3_32("compiler_symbol", 42);
+    let m2 = murmur3_32("compiler_symbol", 42);
+    let m3 = murmur3_32("compiler_symbol", 99);
+    if m1 != m2 {
+        return false;
+    }
+    if m1 == m3 {
+        return false;
+    }
+    return true;
+}
+
+pub fn test_crypto_sha256_empty() -> bool {
+    let empty_hash = sha256_hex("");
+    return empty_hash == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+}
+
+pub fn test_crypto_sha256_abc() -> bool {
+    let abc_hash = sha256_hex("abc");
+    return abc_hash == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+}
+
+pub fn test_crypto_constant_time_eq() -> bool {
+    let eq1 = constant_time_eq("deadbeef", "deadbeef");
+    let eq2 = constant_time_eq("deadbeef", "deadfeed");
+    let eq3 = constant_time_eq("deadbeef", "dead");
+    return eq1 && !eq2 && !eq3;
+}
+
+pub fn test_crypto_hmac() -> bool {
+    let hmac_res = hmac_sha256("key", "The quick brown fox jumps over the lazy dog");
+    return hmac_res == "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8";
+}
+
+pub fn main() {
+    let t1 = test_crypto_fnv1a();
+    let t2 = test_crypto_murmur3();
+    let t3 = test_crypto_sha256_empty();
+    let t4 = test_crypto_sha256_abc();
+    let t5 = test_crypto_constant_time_eq();
+    let t6 = test_crypto_hmac();
+    if t1 && t2 && t3 && t4 && t5 && t6 {
+        println("std/crypto: ALL TESTS PASSED");
+    } else {
+        println("std/crypto: TESTS FAILED");
+    }
+}

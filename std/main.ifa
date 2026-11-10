@@ -1,0 +1,22 @@
+// Pure IFA Standard Library: Main Entrypoint (`std/main.ifa`)
+// Root module for the pure IFA autonomous standard library.
+
+import crypto;
+
+pub fn test_std_all() -> bool {
+    let t1 = crypto::test_crypto_fnv1a();
+    let t2 = crypto::test_crypto_murmur3();
+    let t3 = crypto::test_crypto_sha256_empty();
+    let t4 = crypto::test_crypto_sha256_abc();
+    let t5 = crypto::test_crypto_constant_time_eq();
+    let t6 = crypto::test_crypto_hmac();
+    return t1 && t2 && t3 && t4 && t5 && t6;
+}
+
+pub fn main() {
+    if test_std_all() {
+        println("std: ALL SUBSYSTEM TESTS PASSED");
+    } else {
+        println("std: SUBSYSTEM TESTS FAILED");
+    }
+}

@@ -1197,6 +1197,48 @@ impl AotCompiler {
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         self.func_ids.insert("ifa_rt_string_eq".into(), str_eq_id);
 
+        let mut str_len_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        str_len_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        str_len_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        let str_len_id = self
+            .module
+            .declare_function("ifa_rt_string_len", Linkage::Import, &str_len_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids.insert("ifa_rt_string_len".into(), str_len_id);
+        self.func_ids.insert("string_len".into(), str_len_id);
+        self.func_ids.insert("String::len".into(), str_len_id);
+
+        let mut str_char_at_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        str_char_at_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(ptr_type));
+        str_char_at_sig
+            .params
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        str_char_at_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        let str_char_at_id = self
+            .module
+            .declare_function("ifa_rt_string_char_at", Linkage::Import, &str_char_at_sig)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        self.func_ids
+            .insert("ifa_rt_string_char_at".into(), str_char_at_id);
+        self.func_ids
+            .insert("string_char_at".into(), str_char_at_id);
+        self.func_ids
+            .insert("String::char_at".into(), str_char_at_id);
+
         let mut str_i64_sig = cranelift_codegen::ir::Signature::new(call_conv);
         str_i64_sig
             .params

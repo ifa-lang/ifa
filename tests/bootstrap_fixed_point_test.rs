@@ -1091,6 +1091,69 @@ fn test_stdlib_compiler_essentials() {
 }
 
 #[test]
+fn test_autonomous_stdlib_unit_tests() {
+    let _lock = BOOTSTRAP_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let root = get_workspace_root();
+    let kori_bin = get_kori_binary();
+    let manifest_path = root.join("std").join("kori.toml");
+
+    let test_status = Command::new(&kori_bin)
+        .arg("test")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .output()
+        .expect("Failed to execute `kori test` on pure IFA autonomous stdlib");
+
+    let stdout = String::from_utf8_lossy(&test_status.stdout);
+    let stderr = String::from_utf8_lossy(&test_status.stderr);
+
+    assert!(
+        test_status.status.success(),
+        "`kori test` failed on std/kori.toml:\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
+
+    assert!(
+        stdout.contains("test test_crypto_fnv1a ... ok"),
+        "Std crypto FNV-1a test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_crypto_murmur3 ... ok"),
+        "Std crypto Murmur3 test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_crypto_sha256_empty ... ok"),
+        "Std crypto SHA256 empty test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_crypto_sha256_abc ... ok"),
+        "Std crypto SHA256 abc test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_crypto_constant_time_eq ... ok"),
+        "Std crypto constant time eq test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_crypto_hmac ... ok"),
+        "Std crypto HMAC test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_std_all ... ok"),
+        "Std all subsystem tests missing from output:\n{}",
+        stdout
+    );
+}
+
+#[test]
 fn test_autonomous_selfhost_driver_triple_stage_execution() {
     let _lock = BOOTSTRAP_TEST_MUTEX
         .lock()

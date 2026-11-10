@@ -77,6 +77,8 @@ struct LoopInductionInfo {
     induction_var: ValueId,
     limit_val: ValueId,
     step_const: i64,
+    start_const: Option<i64>,
+    start_val: Option<ValueId>,
 }
 
 /// Loop Optimization Pass for SSA FIR.
@@ -240,9 +242,16 @@ impl LoopOptPass {
                         let mut tile_size: u32 = if max_tile_fit >= 32 { 32 } else { 16 };
 
                         // Adapt tile size to statically known outer loop trip count if available
-                        if let Some(outer_info) =
-                            Self::extract_induction_info(func, outer.header, &outer.blocks)
-                        {
+                        let empty_loaded_ptr = HashMap::new();
+                        let empty_constants = HashMap::new();
+                        if let Some(outer_info) = Self::extract_induction_info(
+                            func,
+                            outer.header,
+                            &outer.blocks,
+                            &empty_loaded_ptr,
+                            &empty_constants,
+                            &cfg,
+                        ) {
                             for block in &func.blocks {
                                 for inst in &block.instructions {
                                     if inst.result == Some(outer_info.limit_val) {
@@ -340,6 +349,9 @@ impl LoopOptPass {
         func: &FirFunction,
         header_id: BlockId,
         blocks: &BTreeSet<BlockId>,
+        loaded_ptr: &HashMap<ValueId, ValueId>,
+        constants: &HashMap<ValueId, i64>,
+        cfg: &ControlFlowGraph,
     ) -> Option<LoopInductionInfo> {
         let header = func.get_block(header_id)?;
         let term = header.terminator.as_ref()?;
@@ -418,6 +430,77 @@ impl LoopOptPass {
             }
         }
 
+        let preheader = cfg
+            .predecessors
+            .get(&header_id)
+            .and_then(|preds| preds.iter().find(|&&p| !blocks.contains(&p)).copied());
+
+        let mut start_const = None;
+        let mut start_val = None;
+
+        if let Some(pre_id) = preheader {
+            if let Some(pre_block) = func.get_block(pre_id) {
+                if let Some(&ptr) = loaded_ptr.get(&ind_var) {
+                    for inst in pre_block.instructions.iter().rev() {
+                        if let ValueExpr::Store { ptr: p, val } = &inst.expr {
+                            if *p == ptr {
+                                if let Some(&c) = constants.get(val) {
+                                    start_const = Some(c);
+                                } else {
+                                    start_val = Some(*val);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if start_const.is_none() && start_val.is_none() {
+            if let Some((p_idx, _)) = header
+                .params
+                .iter()
+                .enumerate()
+                .find(|(_, (v, _))| *v == ind_var)
+            {
+                if let Some(pre_id) = preheader {
+                    if let Some(pre_block) = func.get_block(pre_id) {
+                        if let Some(term) = &pre_block.terminator {
+                            let branch_args = match term {
+                                Terminator::Branch { args, .. } => Some(args),
+                                Terminator::BranchCond {
+                                    then_block,
+                                    then_args,
+                                    else_block,
+                                    else_args,
+                                    ..
+                                } => {
+                                    if *then_block == header_id {
+                                        Some(then_args)
+                                    } else if *else_block == header_id {
+                                        Some(else_args)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            };
+                            if let Some(args) = branch_args {
+                                if let Some(&arg) = args.get(p_idx) {
+                                    if let Some(&c) = constants.get(&arg) {
+                                        start_const = Some(c);
+                                    } else {
+                                        start_val = Some(arg);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Some(LoopInductionInfo {
             header: header_id,
             body: then_b,
@@ -425,6 +508,8 @@ impl LoopOptPass {
             induction_var: ind_var,
             limit_val: limit,
             step_const: step,
+            start_const,
+            start_val,
         })
     }
 
@@ -467,14 +552,26 @@ impl LoopOptPass {
                     continue;
                 }
 
-                let info_a = match Self::extract_induction_info(func, loop_a.header, &loop_a.blocks)
-                {
+                let info_a = match Self::extract_induction_info(
+                    func,
+                    loop_a.header,
+                    &loop_a.blocks,
+                    &loaded_ptr,
+                    &constants,
+                    &cfg,
+                ) {
                     Some(info) => info,
                     None => continue,
                 };
 
-                let info_b = match Self::extract_induction_info(func, loop_b.header, &loop_b.blocks)
-                {
+                let info_b = match Self::extract_induction_info(
+                    func,
+                    loop_b.header,
+                    &loop_b.blocks,
+                    &loaded_ptr,
+                    &constants,
+                    &cfg,
+                ) {
                     Some(info) => info,
                     None => continue,
                 };
@@ -562,7 +659,18 @@ impl LoopOptPass {
                     }
                 }
 
-                // Check bound and step compatibility (both symbolic and constant bounds)
+                // Check start, bound, and step compatibility
+                let same_start = match (info_a.start_const, info_b.start_const) {
+                    (Some(ca), Some(cb)) => ca == cb,
+                    _ => match (info_a.start_val, info_b.start_val) {
+                        (Some(va), Some(vb)) => va == vb,
+                        _ => false,
+                    },
+                };
+                if !same_start {
+                    continue;
+                }
+
                 let same_limit = info_a.limit_val == info_b.limit_val
                     || (constants.contains_key(&info_a.limit_val)
                         && constants.get(&info_a.limit_val) == constants.get(&info_b.limit_val))
@@ -583,6 +691,19 @@ impl LoopOptPass {
                     None => continue,
                 };
 
+                // Loops must not dynamically resize arrays via ArrayPush
+                if body_a_block
+                    .instructions
+                    .iter()
+                    .any(|i| matches!(&i.expr, ValueExpr::ArrayPush { .. }))
+                    || body_b_block
+                        .instructions
+                        .iter()
+                        .any(|i| matches!(&i.expr, ValueExpr::ArrayPush { .. }))
+                {
+                    continue;
+                }
+
                 let is_ind_a = |idx: ValueId| -> bool {
                     idx == info_a.induction_var
                         || (loaded_ptr.contains_key(&idx)
@@ -593,6 +714,50 @@ impl LoopOptPass {
                         || (loaded_ptr.contains_key(&idx)
                             && loaded_ptr.get(&idx) == loaded_ptr.get(&info_b.induction_var))
                 };
+
+                // Track arrays written in body_a
+                let mut array_written_in_a: HashSet<ValueId> = HashSet::new();
+                for inst in &body_a_block.instructions {
+                    if let ValueExpr::SetElement { base, .. } = &inst.expr {
+                        let real = loaded_ptr.get(base).copied().unwrap_or(*base);
+                        array_written_in_a.insert(real);
+                        array_written_in_a.insert(*base);
+                    }
+                }
+
+                // If body_a reads from an array it also writes to, but at index != ind_a, stencil recurrence!
+                let mut has_stencil_recurrence = false;
+                for inst in &body_a_block.instructions {
+                    if let ValueExpr::GetElement { base, index } = &inst.expr {
+                        let real = loaded_ptr.get(base).copied().unwrap_or(*base);
+                        if (array_written_in_a.contains(&real) || array_written_in_a.contains(base))
+                            && !is_ind_a(*index)
+                        {
+                            has_stencil_recurrence = true;
+                            break;
+                        }
+                    }
+                }
+                if has_stencil_recurrence {
+                    continue;
+                }
+
+                // If body_b reads from an array written in body_a, but at index != ind_b, cannot fuse!
+                let mut body_b_non_elementwise_read = false;
+                for inst in &body_b_block.instructions {
+                    if let ValueExpr::GetElement { base, index } = &inst.expr {
+                        let real = loaded_ptr.get(base).copied().unwrap_or(*base);
+                        if (array_written_in_a.contains(&real) || array_written_in_a.contains(base))
+                            && !is_ind_b(*index)
+                        {
+                            body_b_non_elementwise_read = true;
+                            break;
+                        }
+                    }
+                }
+                if body_b_non_elementwise_read {
+                    continue;
+                }
 
                 // Track scalar loop-carried accumulators in body_a (loaded and stored)
                 let mut loaded_ptrs_a: HashSet<ValueId> = HashSet::new();
@@ -686,14 +851,14 @@ impl LoopOptPass {
 
                 // Perform Loop Fusion transformation
                 // 1. Rename induction variable in body_b instructions to body_a's induction var
+                let mut full_substitutions = forward_replacements.clone();
+                full_substitutions.insert(info_b.induction_var, info_a.induction_var);
+
                 let mut fused_b_insts = Vec::new();
                 for mut inst in body_b_block.instructions {
                     // Skip induction variable loads that are forwarded
                     if let Some(r) = inst.result {
-                        if forward_replacements.contains_key(&r) {
-                            continue;
-                        }
-                        if Some(r) == ind_b_inc_result {
+                        if forward_replacements.contains_key(&r) || Some(r) == ind_b_inc_result {
                             continue;
                         }
                     }
@@ -721,86 +886,10 @@ impl LoopOptPass {
                         }
                     }
 
-                    // Rewrite operand uses: ind_b -> ind_a, and forwarded values
-                    let ind_b = info_b.induction_var;
-                    let ind_a = info_a.induction_var;
-
-                    match &mut inst.expr {
-                        ValueExpr::Binary { lhs, rhs, .. } => {
-                            if *lhs == ind_b {
-                                *lhs = ind_a;
-                            }
-                            if *rhs == ind_b {
-                                *rhs = ind_a;
-                            }
-                            if let Some(&fw) = forward_replacements.get(lhs) {
-                                *lhs = fw;
-                            }
-                            if let Some(&fw) = forward_replacements.get(rhs) {
-                                *rhs = fw;
-                            }
-                        }
-                        ValueExpr::Unary { val, .. } => {
-                            if *val == ind_b {
-                                *val = ind_a;
-                            }
-                            if let Some(&fw) = forward_replacements.get(val) {
-                                *val = fw;
-                            }
-                        }
-                        ValueExpr::GetElement { base, index }
-                        | ValueExpr::GetElementPtr { base, index } => {
-                            if *index == ind_b {
-                                *index = ind_a;
-                            }
-                            if let Some(&fw) = forward_replacements.get(index) {
-                                *index = fw;
-                            }
-                            if let Some(&fw) = forward_replacements.get(base) {
-                                *base = fw;
-                            }
-                        }
-                        ValueExpr::SetElement { base, index, val } => {
-                            if *index == ind_b {
-                                *index = ind_a;
-                            }
-                            if let Some(&fw) = forward_replacements.get(index) {
-                                *index = fw;
-                            }
-                            if let Some(&fw) = forward_replacements.get(base) {
-                                *base = fw;
-                            }
-                            if let Some(&fw) = forward_replacements.get(val) {
-                                *val = fw;
-                            }
-                        }
-                        ValueExpr::Store { ptr, val } => {
-                            if let Some(&fw) = forward_replacements.get(val) {
-                                *val = fw;
-                            }
-                            if let Some(&fw) = forward_replacements.get(ptr) {
-                                *ptr = fw;
-                            }
-                        }
-                        ValueExpr::Load { ptr } => {
-                            if let Some(&fw) = forward_replacements.get(ptr) {
-                                *ptr = fw;
-                            }
-                        }
-                        ValueExpr::BoundsCheck { base, index, .. } => {
-                            if *index == ind_b {
-                                *index = ind_a;
-                            }
-                            if let Some(&fw) = forward_replacements.get(index) {
-                                *index = fw;
-                            }
-                            if let Some(&fw) = forward_replacements.get(base) {
-                                *base = fw;
-                            }
-                        }
-                        _ => {}
-                    }
-
+                    crate::sroa::SroaPass::substitute_instruction_operands(
+                        &mut inst,
+                        &full_substitutions,
+                    );
                     fused_b_insts.push(inst);
                 }
 
