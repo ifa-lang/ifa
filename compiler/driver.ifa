@@ -7970,6 +7970,201 @@ pub fn build_pe_import_table(
     );
 }
 
+pub struct PeExportDirectory {
+    export_flags: i64,
+    time_date_stamp: i64,
+    major_version: i64,
+    minor_version: i64,
+    name_rva: i64,
+    ordinal_base: i64,
+    number_of_functions: i64,
+    number_of_names: i64,
+    address_of_functions_rva: i64,
+    address_of_names_rva: i64,
+    address_of_name_ordinals_rva: i64
+}
+
+pub struct PeExportEntry {
+    symbol_name: String,
+    ordinal: i64,
+    function_rva: i64,
+    name_rva: i64,
+    is_forwarder: bool,
+    forwarder_name: String
+}
+
+pub struct PeExportTable {
+    dll_name: String,
+    directory: PeExportDirectory,
+    directory_rva: i64,
+    directory_bytes: i64,
+    eat_rva: i64,
+    eat_bytes: i64,
+    npt_rva: i64,
+    npt_bytes: i64,
+    ot_rva: i64,
+    ot_bytes: i64,
+    strings_rva: i64,
+    strings_bytes: i64,
+    total_bytes: i64,
+    exports: List<PeExportEntry>,
+    is_deterministic: bool
+}
+
+pub fn empty_pe_export_table() -> PeExportTable {
+    mut exports: List<PeExportEntry> = List::new();
+    let dir = PeExportDirectory(
+        export_flags: 0,
+        time_date_stamp: 0,
+        major_version: 0,
+        minor_version: 0,
+        name_rva: 0,
+        ordinal_base: 1,
+        number_of_functions: 0,
+        number_of_names: 0,
+        address_of_functions_rva: 0,
+        address_of_names_rva: 0,
+        address_of_name_ordinals_rva: 0
+    );
+    return PeExportTable(
+        dll_name: "",
+        directory: dir,
+        directory_rva: 0,
+        directory_bytes: 0,
+        eat_rva: 0,
+        eat_bytes: 0,
+        npt_rva: 0,
+        npt_bytes: 0,
+        ot_rva: 0,
+        ot_bytes: 0,
+        strings_rva: 0,
+        strings_bytes: 0,
+        total_bytes: 0,
+        exports: exports,
+        is_deterministic: true
+    );
+}
+
+pub fn build_pe_export_table(
+    dll_name: String,
+    symbols: List<NativeSymbolDescriptor>,
+    base_edata_rva: i64,
+    base_code_rva: i64
+) -> PeExportTable {
+    // 1. Filter exported function symbols in .text section
+    mut exp_names: List<String> = List::new();
+    mut i: i64 = 0;
+    while i < symbols.len() {
+        let sym = symbols[i];
+        if sym.is_exported && sym.section_name == ".text" {
+            exp_names.push(sym.name);
+        }
+        i = i + 1;
+    }
+
+    if exp_names.len() == 0 {
+        return empty_pe_export_table();
+    }
+
+    // 2. Lexicographical ordering of exported symbol names (mandated by PE spec for binary search)
+    exp_names = sort_strings_lexicographically(exp_names);
+    let num_funcs = exp_names.len();
+    let num_names = exp_names.len();
+
+    // 3. Layout .edata section:
+    //    - IMAGE_EXPORT_DIRECTORY: 40 bytes
+    //    - EAT: num_funcs * 4 bytes (DWORD function RVAs)
+    //    - NPT: num_names * 4 bytes (DWORD name pointer RVAs)
+    //    - OT:  num_names * 2 bytes (WORD ordinal indices)
+    //    - String Table: DLL name + null-terminated function names
+    let directory_rva = base_edata_rva;
+    let directory_bytes: i64 = 40;
+
+    let eat_rva = directory_rva + directory_bytes;
+    let eat_bytes = num_funcs * 4;
+
+    let npt_rva = eat_rva + eat_bytes;
+    let npt_bytes = num_names * 4;
+
+    let ot_rva = npt_rva + npt_bytes;
+    let ot_bytes = num_names * 2;
+
+    let strings_rva = ot_rva + ot_bytes;
+    let dll_name_rva = strings_rva;
+    mut cursor_str = dll_name_rva + string_len(dll_name) + 1;
+
+    mut entries: List<PeExportEntry> = List::new();
+    mut k: i64 = 0;
+    while k < num_names {
+        let name = exp_names[k];
+        mut sym_offset: i64 = 0;
+        mut s_idx: i64 = 0;
+        mut running_text_offset: i64 = 0;
+        while s_idx < symbols.len() {
+            let sym = symbols[s_idx];
+            if sym.section_name == ".text" {
+                if sym.name == name {
+                    sym_offset = running_text_offset;
+                    s_idx = symbols.len(); // break
+                } else {
+                    running_text_offset = running_text_offset + sym.size;
+                }
+            }
+            s_idx = s_idx + 1;
+        }
+
+        let fn_rva = base_code_rva + sym_offset;
+        let name_rva = cursor_str;
+        cursor_str = cursor_str + string_len(name) + 1;
+
+        let entry = PeExportEntry(
+            symbol_name: name,
+            ordinal: k + 1,
+            function_rva: fn_rva,
+            name_rva: name_rva,
+            is_forwarder: false,
+            forwarder_name: ""
+        );
+        entries.push(entry);
+        k = k + 1;
+    }
+
+    let strings_bytes = cursor_str - strings_rva;
+    let total_bytes = directory_bytes + eat_bytes + npt_bytes + ot_bytes + strings_bytes;
+
+    let dir = PeExportDirectory(
+        export_flags: 0,
+        time_date_stamp: 0,
+        major_version: 0,
+        minor_version: 0,
+        name_rva: dll_name_rva,
+        ordinal_base: 1,
+        number_of_functions: num_funcs,
+        number_of_names: num_names,
+        address_of_functions_rva: eat_rva,
+        address_of_names_rva: npt_rva,
+        address_of_name_ordinals_rva: ot_rva
+    );
+
+    return PeExportTable(
+        dll_name: dll_name,
+        directory: dir,
+        directory_rva: directory_rva,
+        directory_bytes: directory_bytes,
+        eat_rva: eat_rva,
+        eat_bytes: eat_bytes,
+        npt_rva: npt_rva,
+        npt_bytes: npt_bytes,
+        ot_rva: ot_rva,
+        ot_bytes: ot_bytes,
+        strings_rva: strings_rva,
+        strings_bytes: strings_bytes,
+        total_bytes: total_bytes,
+        exports: entries,
+        is_deterministic: true
+    );
+}
+
 pub struct PeCoffExecutableImage {
     dos_header: PeDosHeader,
     coff_header: CoffFileHeader,
@@ -7980,6 +8175,7 @@ pub struct PeCoffExecutableImage {
     symbol_table: CoffSymbolTable,
     relocation_table: PeBaseRelocationTable,
     import_table: PeImportTable,
+    export_table: PeExportTable,
     total_file_size: i64,
     entry_point_vaddr: i64,
     code_segment_size: i64,
@@ -8295,6 +8491,7 @@ pub fn build_autonomous_pe_coff_executable(
         symbol_table: sym_table,
         relocation_table: empty_pe_base_relocation_table(),
         import_table: empty_pe_import_table(),
+        export_table: empty_pe_export_table(),
         total_file_size: total_file_size,
         entry_point_vaddr: 5368709120 + base_code_rva,
         code_segment_size: text_raw_size,

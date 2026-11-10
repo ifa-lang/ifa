@@ -26,6 +26,24 @@ pub struct HttpResponse {
     body: String
 }
 
+pub struct Url {
+    scheme: String,
+    host: String,
+    port: i64,
+    path: String,
+    query: String
+}
+
+pub fn make_url(scheme: String, host: String, port: i64, path: String, query: String) -> Url {
+    return Url(
+        scheme: scheme,
+        host: host,
+        port: port,
+        path: path,
+        query: query
+    );
+}
+
 // Low-Level Syscall Wrappers
 pub fn net_tcp_listen(port: i64) -> i64 {
     return tcp_listen(port);
@@ -247,6 +265,257 @@ pub fn format_http_response(resp: HttpResponse) -> String {
     return res;
 }
 
+pub fn string_contains(s: String, sub: String) -> bool {
+    let s_len = string_len(s);
+    let sub_len = string_len(sub);
+    if sub_len == 0 {
+        return true;
+    }
+    if s_len < sub_len {
+        return false;
+    }
+    mut i: i64 = 0;
+    while i <= s_len - sub_len {
+        mut match_all = true;
+        mut j: i64 = 0;
+        while j < sub_len {
+            if string_char_at(s, i + j) != string_char_at(sub, j) {
+                match_all = false;
+                j = sub_len; // break
+            }
+            j = j + 1;
+        }
+        if match_all {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn parse_url(raw: String) -> Url {
+    let len = string_len(raw);
+    if len == 0 {
+        return Url(scheme: "http", host: "127.0.0.1", port: 80, path: "/", query: "");
+    }
+
+    mut scheme = "http";
+    mut cursor: i64 = 0;
+
+    // Check for scheme "://"
+    mut p: i64 = 0;
+    while p + 2 < len {
+        if string_char_at(raw, p) == 58 && string_char_at(raw, p + 1) == 47 && string_char_at(raw, p + 2) == 47 { // "://"
+            scheme = string_substr(raw, 0, p);
+            cursor = p + 3;
+            p = len; // break
+        }
+        p = p + 1;
+    }
+
+    // Host & port end at '/' or '?' or end of string
+    mut host_end = len;
+    mut path_start: i64 = -1;
+    mut q_start: i64 = -1;
+
+    mut i = cursor;
+    while i < len {
+        let c = string_char_at(raw, i);
+        if c == 47 { // '/'
+            if host_end == len {
+                host_end = i;
+                path_start = i;
+            }
+        } else if c == 63 { // '?'
+            if host_end == len {
+                host_end = i;
+            }
+            if q_start < 0 {
+                q_start = i;
+            }
+        }
+        i = i + 1;
+    }
+
+    let host_port = string_substr(raw, cursor, host_end - cursor);
+    mut host = host_port;
+    mut port: i64 = if scheme == "https" { 443 } else { 80 };
+
+    // Check if host_port has ':'
+    mut colon_idx: i64 = -1;
+    mut j: i64 = 0;
+    let hp_len = string_len(host_port);
+    while j < hp_len {
+        if string_char_at(host_port, j) == 58 { // ':'
+            colon_idx = j;
+            j = hp_len; // break
+        }
+        j = j + 1;
+    }
+
+    if colon_idx >= 0 {
+        host = string_substr(host_port, 0, colon_idx);
+        let port_str = string_substr(host_port, colon_idx + 1, hp_len - colon_idx - 1);
+        let parsed_port = string_to_int(port_str);
+        if parsed_port > 0 {
+            port = parsed_port;
+        }
+    }
+
+    mut path = "/";
+    mut query = "";
+
+    if path_start >= 0 {
+        if q_start >= 0 {
+            path = string_substr(raw, path_start, q_start - path_start);
+            query = string_substr(raw, q_start + 1, len - q_start - 1);
+        } else {
+            path = string_substr(raw, path_start, len - path_start);
+        }
+    } else if q_start >= 0 {
+        path = "/";
+        query = string_substr(raw, q_start + 1, len - q_start - 1);
+    }
+
+    return Url(
+        scheme: scheme,
+        host: host,
+        port: port,
+        path: path,
+        query: query
+    );
+}
+
+pub fn format_url(url: Url) -> String {
+    mut s = url.scheme + "://" + url.host;
+    if (url.scheme == "http" && url.port != 80) || (url.scheme == "https" && url.port != 443) {
+        s = s + ":" + int_to_string(url.port);
+    }
+    s = s + url.path;
+    if string_len(url.query) > 0 {
+        s = s + "?" + url.query;
+    }
+    return s;
+}
+
+pub fn format_http_request(req: HttpRequest, host: String) -> String {
+    let body_len = string_len(req.body);
+    let len_str = int_to_string(body_len);
+    mut out: String = req.method + " " + req.path + " " + req.version + "\r\n";
+    out = out + "Host: " + host + "\r\n";
+    if body_len > 0 {
+        out = out + "Content-Length: " + len_str + "\r\n";
+        out = out + "Content-Type: application/json\r\n";
+    }
+    out = out + "Connection: close\r\n\r\n";
+    if body_len > 0 {
+        out = out + req.body;
+    }
+    return out;
+}
+
+pub fn parse_http_response(raw: String) -> HttpResponse {
+    let len = string_len(raw);
+    if len == 0 {
+        return HttpResponse(status_code: 500, status_text: "Empty Response", content_type: "", body: "");
+    }
+
+    mut sp1: i64 = -1;
+    mut sp2: i64 = -1;
+    mut status_line_end: i64 = -1;
+    mut i: i64 = 0;
+
+    while i < len {
+        let c = string_char_at(raw, i);
+        if c == 32 { // ' '
+            if sp1 < 0 {
+                sp1 = i;
+            } else if sp2 < 0 {
+                sp2 = i;
+            }
+        } else if c == 10 { // '\n'
+            if status_line_end < 0 {
+                status_line_end = i;
+                i = len; // break
+            }
+        }
+        i = i + 1;
+    }
+
+    mut status_code: i64 = 200;
+    mut status_text = "OK";
+    if sp1 > 0 && sp2 > sp1 {
+        let code_str = string_substr(raw, sp1 + 1, sp2 - sp1 - 1);
+        status_code = string_to_int(code_str);
+        let mut text_end = status_line_end;
+        if text_end > 0 && string_char_at(raw, text_end - 1) == 13 { // '\r'
+            text_end = text_end - 1;
+        }
+        if text_end > sp2 {
+            status_text = string_substr(raw, sp2 + 1, text_end - sp2 - 1);
+        }
+    }
+
+    // Find double CRLF or LF LF for body start
+    mut body_start = len;
+    mut k: i64 = status_line_end;
+    while k + 3 < len {
+        if string_char_at(raw, k) == 13 && string_char_at(raw, k + 1) == 10 && string_char_at(raw, k + 2) == 13 && string_char_at(raw, k + 3) == 10 {
+            body_start = k + 4;
+            k = len; // break
+        } else if string_char_at(raw, k) == 10 && string_char_at(raw, k + 1) == 10 {
+            body_start = k + 2;
+            k = len; // break
+        }
+        k = k + 1;
+    }
+
+    mut body = "";
+    if body_start < len {
+        body = string_substr(raw, body_start, len - body_start);
+    }
+
+    mut content_type = "text/plain";
+    if string_contains(raw, "application/json") {
+        content_type = "application/json";
+    }
+
+    return HttpResponse(
+        status_code: status_code,
+        status_text: status_text,
+        content_type: content_type,
+        body: body
+    );
+}
+
+pub fn http_get(host: String, port: i64, path: String) -> HttpResponse {
+    mut stream = make_tcp_connect(host, port);
+    if !stream.is_open {
+        return HttpResponse(status_code: 503, status_text: "Service Unavailable", content_type: "text/plain", body: "Connection failed");
+    }
+
+    let req = HttpRequest(method: "GET", path: path, version: "HTTP/1.1", body: "");
+    let wire = format_http_request(req, host);
+    stream_write(stream, wire);
+    let resp_str = stream_read(stream, 65536);
+    stream_close(stream);
+    return parse_http_response(resp_str);
+}
+
+pub fn http_post_json(host: String, port: i64, path: String, json_body: String) -> HttpResponse {
+    mut stream = make_tcp_connect(host, port);
+    if !stream.is_open {
+        return HttpResponse(status_code: 503, status_text: "Service Unavailable", content_type: "text/plain", body: "Connection failed");
+    }
+
+    let req = HttpRequest(method: "POST", path: path, version: "HTTP/1.1", body: json_body);
+    let wire = format_http_request(req, host);
+    stream_write(stream, wire);
+    let resp_str = stream_read(stream, 65536);
+    stream_close(stream);
+    return parse_http_response(resp_str);
+}
+
 // === Unit Tests ===
 
 pub fn test_net_tcp_echo() -> bool {
@@ -356,17 +625,158 @@ pub fn test_net_nonblocking_fiber_transport() -> bool {
     return true;
 }
 
+pub fn test_net_url_parsing_and_formatting() -> bool {
+    let url_raw = "https://api.ifa-lang.org:8443/v1/packages?lang=ifa&arch=x86_64";
+    let u = parse_url(url_raw);
+
+    if u.scheme != "https" {
+        return false;
+    }
+    if u.host != "api.ifa-lang.org" {
+        return false;
+    }
+    if u.port != 8443 {
+        return false;
+    }
+    if u.path != "/v1/packages" {
+        return false;
+    }
+    if u.query != "lang=ifa&arch=x86_64" {
+        return false;
+    }
+
+    let formatted = format_url(u);
+    if formatted != url_raw {
+        return false;
+    }
+
+    // Default port and no query
+    let u_default = parse_url("http://localhost/health");
+    if u_default.scheme != "http" || u_default.host != "localhost" || u_default.port != 80 || u_default.path != "/health" || u_default.query != "" {
+        return false;
+    }
+    if format_url(u_default) != "http://localhost/health" {
+        return false;
+    }
+
+    return true;
+}
+
+pub fn test_net_http_client_and_response_parsing() -> bool {
+    let wire = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: close\r\n\r\n404 Not Found";
+    let resp = parse_http_response(wire);
+
+    if resp.status_code != 404 {
+        return false;
+    }
+    if resp.status_text != "Not Found" {
+        return false;
+    }
+    if resp.content_type != "text/plain" {
+        return false;
+    }
+    if resp.body != "404 Not Found" {
+        return false;
+    }
+
+    let req = HttpRequest(method: "POST", path: "/rpc/call", version: "HTTP/1.1", body: "{\"method\":\"ping\"}");
+    let wire_req = format_http_request(req, "127.0.0.1:8080");
+    if !string_contains(wire_req, "POST /rpc/call HTTP/1.1\r\n") {
+        return false;
+    }
+    if !string_contains(wire_req, "Host: 127.0.0.1:8080\r\n") {
+        return false;
+    }
+    if !string_contains(wire_req, "Content-Length: 17\r\n") {
+        return false;
+    }
+    if !string_contains(wire_req, "{\"method\":\"ping\"}") {
+        return false;
+    }
+
+    return true;
+}
+
+pub fn test_net_http_client_server_roundtrip() -> bool {
+    mut listener = make_tcp_listener(0);
+    if !listener.is_open || listener.port <= 0 {
+        return false;
+    }
+
+    mut client = make_tcp_connect("127.0.0.1", listener.port);
+    if !client.is_open {
+        listener_close(listener);
+        return false;
+    }
+
+    mut server = listener_accept(listener);
+    if !server.is_open {
+        stream_close(client);
+        listener_close(listener);
+        return false;
+    }
+
+    let req = HttpRequest(method: "GET", path: "/v1/metrics", version: "HTTP/1.1", body: "");
+    let wire_req = format_http_request(req, "localhost");
+    let sent = stream_write(client, wire_req);
+    if sent <= 0 {
+        stream_close(client);
+        stream_close(server);
+        listener_close(listener);
+        return false;
+    }
+
+    let raw_server_req = stream_read(server, 1024);
+    let parsed_req = parse_http_request(raw_server_req);
+    if parsed_req.method != "GET" || parsed_req.path != "/v1/metrics" {
+        stream_close(client);
+        stream_close(server);
+        listener_close(listener);
+        return false;
+    }
+
+    let server_resp = make_http_response(200, "OK", "application/json", "{\"active_fibers\":42}");
+    let wire_resp = format_http_response(server_resp);
+    stream_write(server, wire_resp);
+
+    let raw_client_resp = stream_read(client, 1024);
+    let parsed_resp = parse_http_response(raw_client_resp);
+    if parsed_resp.status_code != 200 || parsed_resp.status_text != "OK" {
+        stream_close(client);
+        stream_close(server);
+        listener_close(listener);
+        return false;
+    }
+    if parsed_resp.body != "{\"active_fibers\":42}" {
+        stream_close(client);
+        stream_close(server);
+        listener_close(listener);
+        return false;
+    }
+
+    stream_close(client);
+    stream_close(server);
+    listener_close(listener);
+    return true;
+}
+
 pub fn test_net_all() -> bool {
     return test_net_tcp_echo()
         && test_net_http_wire()
-        && test_net_nonblocking_fiber_transport();
+        && test_net_nonblocking_fiber_transport()
+        && test_net_url_parsing_and_formatting()
+        && test_net_http_client_and_response_parsing()
+        && test_net_http_client_server_roundtrip();
 }
 
 pub fn main() {
     let t1 = test_net_tcp_echo();
     let t2 = test_net_http_wire();
     let t3 = test_net_nonblocking_fiber_transport();
-    if t1 && t2 && t3 {
+    let t4 = test_net_url_parsing_and_formatting();
+    let t5 = test_net_http_client_and_response_parsing();
+    let t6 = test_net_http_client_server_roundtrip();
+    if t1 && t2 && t3 && t4 && t5 && t6 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");

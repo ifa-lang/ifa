@@ -1428,6 +1428,21 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_net_url_parsing_and_formatting ... ok"),
+        "Std net URL parsing test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_http_client_and_response_parsing ... ok"),
+        "Std net HTTP client test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_http_client_server_roundtrip ... ok"),
+        "Std net HTTP roundtrip test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_collections_ring_buffer ... ok"),
         "Std collections ring buffer test missing from output:\n{}",
         stdout
@@ -1503,8 +1518,8 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("99 passed; 0 failed"),
-        "Expected 99 passed std unit tests, got:\n{}",
+        stdout.contains("105 passed; 0 failed"),
+        "Expected 105 passed std unit tests, got:\n{}",
         stdout
     );
 }
