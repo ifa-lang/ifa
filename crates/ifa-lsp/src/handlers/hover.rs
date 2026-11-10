@@ -118,6 +118,22 @@ pub fn handle_hover(doc: &Document, position: Position) -> Option<Hover> {
             "**`TcpListener`** — Non-blocking TCP socket listener (`std/net`).\n\n\
              Binds to a network port and cooperatively accepts client connections.",
         ),
+        "WsServer" => Some(
+            "**`WsServer`** — Multi-client WebSocket RFC 6455 server (`std/net`).\n\n\
+             Multiplexes WebSocket client connections on top of non-blocking TCP sockets with automated HTTP Upgrade handshake and broadcast dispatch.",
+        ),
+        "WsClient" => Some(
+            "**`WsClient`** — WebSocket client (RFC 6455) (`std/net`).\n\n\
+             Handles client-side masking, handshake validation against `Sec-WebSocket-Accept`, and cooperative frame polling.",
+        ),
+        "WsSession" => Some(
+            "**`WsSession`** — Active WebSocket connection session (`std/net`).\n\n\
+             Maintains connection state, upgrade confirmation, and frame framing over a non-blocking stream.",
+        ),
+        "WsFrame" => Some(
+            "**`WsFrame`** — RFC 6455 WebSocket frame representation (`std/net`).\n\n\
+             Encapsulates opcode (Text, Binary, Ping, Pong, Close), masking keys, and payload data.",
+        ),
         "JsonValue" => Some(
             "**`JsonValue`** — Universal deterministic JSON AST node (`std/json`).\n\n\
              Supports RFC 8785 canonical serialization, RFC 6901 pointer resolution, and deep recursive merging.\n\n\

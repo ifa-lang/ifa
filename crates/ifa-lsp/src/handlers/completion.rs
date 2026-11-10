@@ -237,6 +237,65 @@ fn get_stdlib_completions_for_struct(name: &str) -> Option<Vec<CompletionItem>> 
             );
             Some(items)
         }
+        "WsFrame" => {
+            items.push(
+                CompletionItem::new("fin", CompletionItemKind::Field)
+                    .with_detail("fin: bool")
+                    .with_doc("Whether this is the final fragment of a WebSocket message"),
+            );
+            items.push(
+                CompletionItem::new("opcode", CompletionItemKind::Field)
+                    .with_detail("opcode: int")
+                    .with_doc("1: Text, 2: Binary, 8: Close, 9: Ping, 10: Pong"),
+            );
+            items.push(
+                CompletionItem::new("is_masked", CompletionItemKind::Field)
+                    .with_detail("is_masked: bool")
+                    .with_doc("RFC 6455 masking bit flag"),
+            );
+            items.push(
+                CompletionItem::new("mask_key", CompletionItemKind::Field)
+                    .with_detail("mask_key: int")
+                    .with_doc("32-bit masking key for masked payloads"),
+            );
+            items.push(
+                CompletionItem::new("payload", CompletionItemKind::Field)
+                    .with_detail("payload: String")
+                    .with_doc("Decoded WebSocket message payload"),
+            );
+            Some(items)
+        }
+        "WsClientSession" | "WsClient" => {
+            items.push(
+                CompletionItem::new("stream", CompletionItemKind::Field)
+                    .with_detail("stream: TcpStream")
+                    .with_doc("Underlying non-blocking TCP socket stream"),
+            );
+            items.push(
+                CompletionItem::new("is_upgraded", CompletionItemKind::Field)
+                    .with_detail("is_upgraded: bool")
+                    .with_doc("Whether RFC 6455 101 Switching Protocols handshake is confirmed"),
+            );
+            items.push(
+                CompletionItem::new("expected_accept", CompletionItemKind::Field)
+                    .with_detail("expected_accept: String")
+                    .with_doc("Expected Sec-WebSocket-Accept key response"),
+            );
+            Some(items)
+        }
+        "WsServer" => {
+            items.push(
+                CompletionItem::new("server", CompletionItemKind::Field)
+                    .with_detail("server: TcpServer")
+                    .with_doc("Underlying multi-connection non-blocking TCP server"),
+            );
+            items.push(
+                CompletionItem::new("upgraded_clients", CompletionItemKind::Field)
+                    .with_detail("upgraded_clients: List<bool>")
+                    .with_doc("Handshake upgrade status flags for all connected clients"),
+            );
+            Some(items)
+        }
         "JsonValue" => {
             items.push(
                 CompletionItem::new("kind", CompletionItemKind::Field)
@@ -652,6 +711,22 @@ pub fn handle_completion(doc: &Document, position: Position) -> CompletionList {
         ),
         ("TcpConnection", "Managed TCP client connection (`std/net`)"),
         ("UdpSocket", "UDP datagram network socket (`std/net`)"),
+        (
+            "WsServer",
+            "Multi-client WebSocket RFC 6455 server (`std/net`)",
+        ),
+        (
+            "WsClient",
+            "WebSocket RFC 6455 client with automatic masking (`std/net`)",
+        ),
+        (
+            "WsSession",
+            "Active WebSocket connection session (`std/net`)",
+        ),
+        (
+            "WsFrame",
+            "RFC 6455 WebSocket frame representation (`std/net`)",
+        ),
         (
             "HttpRequest",
             "Structured HTTP request representation (`std/net`)",

@@ -74,6 +74,17 @@ pub struct WsFrame {
     payload: String
 }
 
+pub struct WsClientSession {
+    stream: TcpStream,
+    is_upgraded: bool,
+    expected_accept: String
+}
+
+pub struct WsServer {
+    server: TcpServer,
+    upgraded_clients: List<bool>
+}
+
 pub fn make_url(scheme: String, host: String, port: i64, path: String, query: String) -> Url {
     return Url(
         scheme: scheme,
@@ -1788,6 +1799,173 @@ pub fn format_websocket_upgrade_response(accept_key: String) -> String {
     return res;
 }
 
+pub fn format_websocket_handshake_request(host: String, port: i64, path: String, key: String) -> String {
+    mut req: String = "GET " + path + " HTTP/1.1\r\n";
+    req = req + "Host: " + host + ":" + int_to_string(port) + "\r\n";
+    req = req + "Upgrade: websocket\r\n";
+    req = req + "Connection: Upgrade\r\n";
+    req = req + "Sec-WebSocket-Key: " + key + "\r\n";
+    req = req + "Sec-WebSocket-Version: 13\r\n\r\n";
+    return req;
+}
+
+pub fn websocket_is_handshake_request(raw_http: String) -> bool {
+    return string_contains(raw_http, "Upgrade: websocket")
+        && string_contains(raw_http, "Sec-WebSocket-Key:");
+}
+
+pub fn websocket_extract_key(raw_http: String) -> String {
+    let key_marker = "Sec-WebSocket-Key: ";
+    let m_len = string_len(key_marker);
+    let s_len = string_len(raw_http);
+    if s_len < m_len {
+        return "";
+    }
+    mut i: i64 = 0;
+    while i <= s_len - m_len {
+        mut match_all = true;
+        mut j: i64 = 0;
+        while j < m_len {
+            if string_char_at(raw_http, i + j) != string_char_at(key_marker, j) {
+                match_all = false;
+                j = m_len;
+            }
+            j = j + 1;
+        }
+        if match_all {
+            let start = i + m_len;
+            mut end = start;
+            while end < s_len && string_char_at(raw_http, end) != 13 && string_char_at(raw_http, end) != 10 {
+                end = end + 1;
+            }
+            return string_substr(raw_http, start, end - start);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub fn make_ws_server(port: i64, max_clients: i64) -> WsServer {
+    let tcp = make_tcp_server(port, max_clients);
+    mut upgraded: List<bool> = List::new();
+    return WsServer(server: tcp, upgraded_clients: upgraded);
+}
+
+pub fn ws_server_port(ws: WsServer) -> i64 {
+    return tcp_server_port(ws.server);
+}
+
+pub fn ws_server_client_count(ws: WsServer) -> i64 {
+    return tcp_server_client_count(ws.server);
+}
+
+pub fn ws_server_accept_client(inout ws: WsServer, accept_key: String) -> bool {
+    let accepted = tcp_server_accept_client(ws.server);
+    if !accepted {
+        return false;
+    }
+    let idx = ws.server.clients.len() - 1;
+    let raw_req = stream_read(ws.server.clients[idx], 1024);
+    if websocket_is_handshake_request(raw_req) {
+        let resp = format_websocket_upgrade_response(accept_key);
+        stream_write(ws.server.clients[idx], resp);
+        ws.upgraded_clients.push(true);
+        return true;
+    } else {
+        ws.upgraded_clients.push(false);
+        return false;
+    }
+}
+
+pub fn ws_server_broadcast_text(ws: WsServer, text: String) -> i64 {
+    let frame = make_ws_text_frame(text, false);
+    let wire = encode_ws_frame(frame);
+    mut delivered: i64 = 0;
+    let count = tcp_server_client_count(ws.server);
+    mut i: i64 = 0;
+    while i < count {
+        if i < ws.upgraded_clients.len() && ws.upgraded_clients[i] {
+            let sent = stream_write(ws.server.clients[i], wire);
+            if sent > 0 {
+                delivered = delivered + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return delivered;
+}
+
+pub fn ws_server_poll_messages(ws: WsServer) -> List<String> {
+    mut msgs: List<String> = List::new();
+    let count = tcp_server_client_count(ws.server);
+    mut i: i64 = 0;
+    while i < count {
+        if i < ws.upgraded_clients.len() && ws.upgraded_clients[i] {
+            let raw = stream_read(ws.server.clients[i], 2048);
+            if string_len(raw) > 0 {
+                let frame = decode_ws_frame(raw);
+                if frame.opcode == 1 {
+                    msgs.push(frame.payload);
+                } else if frame.opcode == 9 {
+                    let pong = make_ws_pong_frame(frame.payload);
+                    stream_write(ws.server.clients[i], encode_ws_frame(pong));
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return msgs;
+}
+
+pub fn ws_server_close(inout ws: WsServer) {
+    tcp_server_close(ws.server);
+}
+
+pub fn ws_client_connect(host: String, port: i64, path: String, key: String, expected_accept: String) -> WsClientSession {
+    mut stream = make_tcp_connect(host, port);
+    if !stream.is_open {
+        return WsClientSession(stream: stream, is_upgraded: false, expected_accept: expected_accept);
+    }
+    let req = format_websocket_handshake_request(host, port, path, key);
+    stream_write(stream, req);
+    return WsClientSession(stream: stream, is_upgraded: false, expected_accept: expected_accept);
+}
+
+pub fn ws_client_poll_handshake(inout client: WsClientSession) -> bool {
+    if client.is_upgraded {
+        return true;
+    }
+    let raw = stream_read(client.stream, 1024);
+    if string_contains(raw, "101 Switching Protocols") && string_contains(raw, client.expected_accept) {
+        client.is_upgraded = true;
+        return true;
+    }
+    return false;
+}
+
+pub fn ws_client_send_text(client: WsClientSession, text: String) -> bool {
+    let frame = make_ws_text_frame(text, true);
+    return stream_write(client.stream, encode_ws_frame(frame)) > 0;
+}
+
+pub fn ws_client_poll_text(client: WsClientSession) -> String {
+    let raw = stream_read(client.stream, 2048);
+    if string_len(raw) == 0 {
+        return "";
+    }
+    let frame = decode_ws_frame(raw);
+    if frame.opcode == 1 {
+        return frame.payload;
+    }
+    return "";
+}
+
+pub fn ws_client_close(inout client: WsClientSession) {
+    let close_f = make_ws_close_frame(1000, "Normal Closure");
+    stream_write(client.stream, encode_ws_frame(close_f));
+    stream_close(client.stream);
+}
+
 pub fn test_net_http_chunked_streaming() -> bool {
     // 1. Unitaire : encodage et décodage
     let c1 = encode_http_chunk("Alpha");
@@ -2047,6 +2225,92 @@ pub fn test_net_tcp_server_multiple_clients() -> bool {
     return true;
 }
 
+pub fn test_net_websocket_server_multiplexing() -> bool {
+    let test_key = "dGhlIHNhbXBsZSBub25jZQ==";
+    let expected_accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+
+    // 1. Helpers
+    let hs_req = format_websocket_handshake_request("127.0.0.1", 8080, "/ws", test_key);
+    if !websocket_is_handshake_request(hs_req) {
+        return false;
+    }
+    let extracted_k = websocket_extract_key(hs_req);
+    if extracted_k != test_key {
+        return false;
+    }
+
+    // 2. Server setup
+    mut ws_srv = make_ws_server(0, 4);
+    let port = ws_server_port(ws_srv);
+    if port <= 0 {
+        ws_server_close(ws_srv);
+        return false;
+    }
+
+    // Connect Client 1
+    mut c1 = ws_client_connect("127.0.0.1", port, "/ws", test_key, expected_accept);
+    let acc1 = ws_server_accept_client(ws_srv, expected_accept);
+    if !acc1 || ws_server_client_count(ws_srv) != 1 {
+        ws_client_close(c1);
+        ws_server_close(ws_srv);
+        return false;
+    }
+
+    // Connect Client 2
+    mut c2 = ws_client_connect("127.0.0.1", port, "/ws", test_key, expected_accept);
+    let acc2 = ws_server_accept_client(ws_srv, expected_accept);
+    if !acc2 || ws_server_client_count(ws_srv) != 2 {
+        ws_client_close(c1);
+        ws_client_close(c2);
+        ws_server_close(ws_srv);
+        return false;
+    }
+
+    // Poll handshake on clients
+    let h1 = ws_client_poll_handshake(c1);
+    let h2 = ws_client_poll_handshake(c2);
+    if !h1 || !h2 || !c1.is_upgraded || !c2.is_upgraded {
+        ws_client_close(c1);
+        ws_client_close(c2);
+        ws_server_close(ws_srv);
+        return false;
+    }
+
+    // Server broadcasts to all WebSocket clients
+    let delivered = ws_server_broadcast_text(ws_srv, "IFA_WS_BROADCAST_MSG");
+    if delivered != 2 {
+        ws_client_close(c1);
+        ws_client_close(c2);
+        ws_server_close(ws_srv);
+        return false;
+    }
+
+    // Clients receive broadcast
+    let r1 = ws_client_poll_text(c1);
+    let r2 = ws_client_poll_text(c2);
+    if r1 != "IFA_WS_BROADCAST_MSG" || r2 != "IFA_WS_BROADCAST_MSG" {
+        ws_client_close(c1);
+        ws_client_close(c2);
+        ws_server_close(ws_srv);
+        return false;
+    }
+
+    // Client 1 sends message to server
+    ws_client_send_text(c1, "PAYLOAD_FROM_WS_CLIENT_1");
+    let msgs = ws_server_poll_messages(ws_srv);
+    if msgs.len() != 1 || msgs[0] != "PAYLOAD_FROM_WS_CLIENT_1" {
+        ws_client_close(c1);
+        ws_client_close(c2);
+        ws_server_close(ws_srv);
+        return false;
+    }
+
+    ws_client_close(c1);
+    ws_client_close(c2);
+    ws_server_close(ws_srv);
+    return true;
+}
+
 pub fn test_net_all() -> bool {
     return test_net_tcp_echo()
         && test_net_http_wire()
@@ -2062,7 +2326,8 @@ pub fn test_net_all() -> bool {
         && test_net_http_patch_and_head()
         && test_net_http_chunked_streaming()
         && test_net_websocket_framing_and_roundtrip()
-        && test_net_tcp_server_multiple_clients();
+        && test_net_tcp_server_multiple_clients()
+        && test_net_websocket_server_multiplexing();
 }
 
 pub fn main() {
@@ -2081,7 +2346,8 @@ pub fn main() {
     let t13 = test_net_http_chunked_streaming();
     let t14 = test_net_websocket_framing_and_roundtrip();
     let t15 = test_net_tcp_server_multiple_clients();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 {
+    let t16 = test_net_websocket_server_multiplexing();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");

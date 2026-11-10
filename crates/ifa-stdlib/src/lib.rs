@@ -12,7 +12,10 @@ pub mod process;
 pub mod sync;
 
 pub use collections::{BinaryHeap, ByteBuffer, Deque, List, Map, Set, StringBuilder};
-pub use crypto::{blake3, blake3_hex, sha256, sha256_hex};
+pub use crypto::{
+    base64_decode, base64_encode, blake3, blake3_hex, sha1, sha1_hex, sha256, sha256_hex,
+    websocket_accept_key,
+};
 pub use csv::{decode as decode_csv, encode as encode_csv, CsvTable};
 pub use fmt::{
     format_binary, format_float, format_hex, format_octal, pad_center, pad_left, pad_right,
@@ -38,7 +41,8 @@ pub use json::{
     decode as decode_json, encode as encode_json, encode_pretty as encode_json_pretty, JsonValue,
 };
 pub use net::{
-    ConnectionInfo, TcpListener as NetTcpListener, TcpServer, TcpStream as NetTcpStream,
+    ConnectionInfo, TcpListener as NetTcpListener, TcpServer, TcpStream as NetTcpStream, WsClient,
+    WsFrame, WsOpcode, WsServer, WsSession,
 };
 pub use process::{
     find_best_assembler, find_best_linker, find_system_tool, invoke_assembler, invoke_linker,
