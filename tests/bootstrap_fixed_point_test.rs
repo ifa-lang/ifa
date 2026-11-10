@@ -2164,3 +2164,120 @@ fn test_direct_pe_coff_export_directory_and_tri_platform_compliance() {
         stdout
     );
 }
+
+#[test]
+fn test_industrial_dogfooding_http_service_and_data_processor_cli() {
+    let _lock = BOOTSTRAP_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let root = get_workspace_root();
+    let kori_bin = get_kori_binary();
+
+    // 1. Verify HTTP REST Microservice package unit tests
+    let http_manifest = root.join("examples").join("http_service").join("kori.toml");
+    let http_test_run = Command::new(&kori_bin)
+        .arg("test")
+        .arg("--manifest-path")
+        .arg(&http_manifest)
+        .output()
+        .expect("Run kori test on examples/http_service");
+
+    assert!(
+        http_test_run.status.success(),
+        "HTTP service package tests failed: {:?}\nstdout: {}\nstderr: {}",
+        http_test_run.status,
+        String::from_utf8_lossy(&http_test_run.stdout),
+        String::from_utf8_lossy(&http_test_run.stderr)
+    );
+    let http_test_stdout = String::from_utf8_lossy(&http_test_run.stdout);
+    assert!(
+        http_test_stdout.contains("test test_http_service_all ... ok"),
+        "HTTP service test_http_service_all missing from output:\n{}",
+        http_test_stdout
+    );
+    assert!(
+        http_test_stdout.contains("test test_service_post_and_get_orders ... ok"),
+        "HTTP service test_service_post_and_get_orders missing from output:\n{}",
+        http_test_stdout
+    );
+
+    // 2. Verify HTTP REST Microservice native JIT execution
+    let http_run = Command::new(&kori_bin)
+        .arg("run")
+        .arg("--manifest-path")
+        .arg(&http_manifest)
+        .output()
+        .expect("Run kori run on examples/http_service");
+
+    assert!(
+        http_run.status.success(),
+        "HTTP service package run failed: {:?}\nstdout: {}\nstderr: {}",
+        http_run.status,
+        String::from_utf8_lossy(&http_run.stdout),
+        String::from_utf8_lossy(&http_run.stderr)
+    );
+    let http_run_stdout = String::from_utf8_lossy(&http_run.stdout);
+    assert!(
+        http_run_stdout.contains("All HTTP microservice tests PASSED"),
+        "HTTP service run output missing success banner:\n{}",
+        http_run_stdout
+    );
+
+    // 3. Verify Autonomous Data Processor CLI package unit tests
+    let cli_manifest = root
+        .join("examples")
+        .join("data_processor_cli")
+        .join("kori.toml");
+    let cli_test_run = Command::new(&kori_bin)
+        .arg("test")
+        .arg("--manifest-path")
+        .arg(&cli_manifest)
+        .output()
+        .expect("Run kori test on examples/data_processor_cli");
+
+    assert!(
+        cli_test_run.status.success(),
+        "Data processor CLI package tests failed: {:?}\nstdout: {}\nstderr: {}",
+        cli_test_run.status,
+        String::from_utf8_lossy(&cli_test_run.stdout),
+        String::from_utf8_lossy(&cli_test_run.stderr)
+    );
+    let cli_test_stdout = String::from_utf8_lossy(&cli_test_run.stdout);
+    assert!(
+        cli_test_stdout.contains("test test_cli_all ... ok"),
+        "Data processor CLI test_cli_all missing from output:\n{}",
+        cli_test_stdout
+    );
+    assert!(
+        cli_test_stdout.contains("test test_cli_stats ... ok"),
+        "Data processor CLI test_cli_stats missing from output:\n{}",
+        cli_test_stdout
+    );
+    assert!(
+        cli_test_stdout.contains("test test_cli_filter_threshold ... ok"),
+        "Data processor CLI test_cli_filter_threshold missing from output:\n{}",
+        cli_test_stdout
+    );
+
+    // 4. Verify Autonomous Data Processor CLI native JIT execution
+    let cli_run = Command::new(&kori_bin)
+        .arg("run")
+        .arg("--manifest-path")
+        .arg(&cli_manifest)
+        .output()
+        .expect("Run kori run on examples/data_processor_cli");
+
+    assert!(
+        cli_run.status.success(),
+        "Data processor CLI package run failed: {:?}\nstdout: {}\nstderr: {}",
+        cli_run.status,
+        String::from_utf8_lossy(&cli_run.stdout),
+        String::from_utf8_lossy(&cli_run.stderr)
+    );
+    let cli_run_stdout = String::from_utf8_lossy(&cli_run.stdout);
+    assert!(
+        cli_run_stdout.contains("All CLI tests PASSED"),
+        "Data processor CLI run output missing success banner:\n{}",
+        cli_run_stdout
+    );
+}

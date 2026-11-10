@@ -2390,6 +2390,10 @@ impl<'a> LlvmIrEmitter<'a> {
                                 || callee == "String::substr"
                                 || callee == "substring"
                                 || callee == "ifa_rt_string_substr"
+                                || callee == "int_to_str"
+                                || callee == "int_to_string"
+                                || callee.ends_with("::int_to_str")
+                                || callee.ends_with("::int_to_string")
                                 || callee == "get_target_datalayout"
                                 || callee.ends_with("::get_target_datalayout")
                             {
@@ -3375,10 +3379,25 @@ impl<'a> LlvmIrEmitter<'a> {
                         BinaryOp::Shl => format!("shl {}", int_ty_str),
                         BinaryOp::Shr => format!("ashr {}", int_ty_str),
                     };
-                    out.push_str(&format!(
-                        "  %v{} = {} %v{}, %v{}\n",
-                        res_id, op_str, lhs.0, rhs.0
-                    ));
+                    if *op == BinaryOp::Add
+                        && (matches!(
+                            value_types.get(lhs),
+                            Some(ifa_fir::FirType::String) | Some(ifa_fir::FirType::Str)
+                        ) || matches!(
+                            value_types.get(rhs),
+                            Some(ifa_fir::FirType::String) | Some(ifa_fir::FirType::Str)
+                        ))
+                    {
+                        out.push_str(&format!(
+                            "  %v{} = call ptr @ifa_rt_string_concat(ptr %v{}, ptr %v{})\n",
+                            res_id, lhs.0, rhs.0
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  %v{} = {} %v{}, %v{}\n",
+                            res_id, op_str, lhs.0, rhs.0
+                        ));
+                    }
                 }
             }
             ValueExpr::Unary { op, val } => match op {

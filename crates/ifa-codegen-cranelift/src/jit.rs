@@ -1041,6 +1041,12 @@ impl JitEngine {
             })
             .collect();
 
+        let fn_return_types: HashMap<String, ifa_fir::FirType> = fir_module
+            .functions
+            .iter()
+            .map(|f| (INTERNER.resolve(&f.name).to_string(), f.ret_ty.clone()))
+            .collect();
+
         // 2. Translate and define each function
         for fir_func in &fir_module.functions {
             if fir_func.blocks.is_empty() {
@@ -1070,6 +1076,7 @@ impl JitEngine {
                         &struct_defs,
                         &coro_funcs,
                         &fn_param_types,
+                        &fn_return_types,
                     );
                     translator.translate_coroutine_resume(fir_func)?;
                 }
@@ -1103,6 +1110,7 @@ impl JitEngine {
                         &struct_defs,
                         &coro_funcs,
                         &fn_param_types,
+                        &fn_return_types,
                     );
                     translator.translate_coroutine_factory(fir_func, &resume_name)?;
                 }
@@ -1135,6 +1143,7 @@ impl JitEngine {
                         &struct_defs,
                         &coro_funcs,
                         &fn_param_types,
+                        &fn_return_types,
                     );
                     translator.translate(fir_func)?;
                 }

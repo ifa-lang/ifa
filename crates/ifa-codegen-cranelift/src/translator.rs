@@ -42,6 +42,7 @@ pub struct FunctionTranslator<'a, M: Module> {
     struct_defs: &'a HashMap<Symbol, Vec<(Symbol, FirType)>>,
     coro_funcs: &'a HashSet<Symbol>,
     fn_param_types: &'a HashMap<String, Vec<FirType>>,
+    fn_return_types: &'a HashMap<String, FirType>,
     block_map: HashMap<BlockId, ClBlock>,
     value_map: HashMap<ValueId, ClValue>,
     value_types: HashMap<ValueId, FirType>,
@@ -53,6 +54,7 @@ pub struct FunctionTranslator<'a, M: Module> {
 }
 
 impl<'a, M: Module> FunctionTranslator<'a, M> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         builder: FunctionBuilder<'a>,
         module: &'a mut M,
@@ -61,6 +63,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         struct_defs: &'a HashMap<Symbol, Vec<(Symbol, FirType)>>,
         coro_funcs: &'a HashSet<Symbol>,
         fn_param_types: &'a HashMap<String, Vec<FirType>>,
+        fn_return_types: &'a HashMap<String, FirType>,
     ) -> Self {
         Self {
             builder,
@@ -70,6 +73,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             struct_defs,
             coro_funcs,
             fn_param_types,
+            fn_return_types,
             block_map: HashMap::new(),
             value_map: HashMap::new(),
             value_types: HashMap::new(),
@@ -85,6 +89,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
     fn compute_value_types(
         func: &FirFunction,
         struct_defs: &HashMap<Symbol, Vec<(Symbol, FirType)>>,
+        fn_return_types: &HashMap<String, FirType>,
     ) -> HashMap<ValueId, FirType> {
         let mut value_types: HashMap<ValueId, FirType> = HashMap::new();
         for p in &func.params {
@@ -265,7 +270,9 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                         ValueExpr::CallDirect { name, .. }
                         | ValueExpr::BlockingCallDirect { name, .. } => {
                             let callee = INTERNER.resolve(name);
-                            if callee == "process::args_get"
+                            if let Some(ret_ty) = fn_return_types.get(&callee) {
+                                ret_ty.clone()
+                            } else if callee == "process::args_get"
                                 || callee == "env::args_get"
                                 || callee == "args_get"
                                 || callee == "ifa_rt_args_get"
@@ -276,6 +283,10 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                                 || callee == "String::substr"
                                 || callee == "substring"
                                 || callee == "ifa_rt_string_substr"
+                                || callee == "int_to_str"
+                                || callee == "int_to_string"
+                                || callee.ends_with("::int_to_str")
+                                || callee.ends_with("::int_to_string")
                                 || callee == "get_target_datalayout"
                                 || callee.ends_with("::get_target_datalayout")
                             {
@@ -303,7 +314,8 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
 
     /// Translate the entire FIR function into Cranelift IR.
     pub fn translate(mut self, fir_func: &FirFunction) -> Result<(), CodegenError> {
-        self.value_types = Self::compute_value_types(fir_func, self.struct_defs);
+        self.value_types =
+            Self::compute_value_types(fir_func, self.struct_defs, self.fn_return_types);
 
         // 1. Create a Cranelift block for each basic block in the FIR function
         for block in &fir_func.blocks {
@@ -394,7 +406,8 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         mut self,
         fir_func: &FirFunction,
     ) -> Result<(), CodegenError> {
-        self.value_types = Self::compute_value_types(fir_func, self.struct_defs);
+        self.value_types =
+            Self::compute_value_types(fir_func, self.struct_defs, self.fn_return_types);
 
         // 1. Entry block receiving the frame pointer
         let entry_cl_block = self.builder.create_block();
@@ -720,7 +733,8 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
         fir_func: &FirFunction,
         resume_fn_name: &str,
     ) -> Result<(), CodegenError> {
-        self.value_types = Self::compute_value_types(fir_func, self.struct_defs);
+        self.value_types =
+            Self::compute_value_types(fir_func, self.struct_defs, self.fn_return_types);
 
         let entry_cl_block = self.builder.create_block();
         self.builder
@@ -1007,7 +1021,29 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                         }
                     }
                     Some(match op {
-                        BinaryOp::Add => self.builder.ins().iadd(l, r),
+                        BinaryOp::Add => {
+                            let is_str = matches!(
+                                self.value_types.get(lhs),
+                                Some(FirType::String) | Some(FirType::Str)
+                            ) || matches!(
+                                self.value_types.get(rhs),
+                                Some(FirType::String) | Some(FirType::Str)
+                            );
+                            if is_str {
+                                if let Some(func_id) = self.func_ids.get("ifa_rt_string_concat") {
+                                    let local_func = self
+                                        .module
+                                        .declare_func_in_func(*func_id, self.builder.func);
+                                    let call = self.builder.ins().call(local_func, &[l, r]);
+                                    let results = self.builder.inst_results(call);
+                                    results.first().copied().unwrap_or(l)
+                                } else {
+                                    self.builder.ins().iadd(l, r)
+                                }
+                            } else {
+                                self.builder.ins().iadd(l, r)
+                            }
+                        }
                         BinaryOp::Sub => self.builder.ins().isub(l, r),
                         BinaryOp::Mul => self.builder.ins().imul(l, r),
                         BinaryOp::Div => self.builder.ins().sdiv(l, r),
@@ -1116,6 +1152,7 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     "string_len" | "String::len" => "ifa_rt_string_len",
                     "string_char_at" | "String::char_at" => "ifa_rt_string_char_at",
                     "string_substr" | "String::substr" | "substring" => "ifa_rt_string_substr",
+                    "int_to_str" | "int_to_string" => "ifa_rt_string_from_i64",
                     _ => fn_name.as_str(),
                 };
                 if let Some(res) = self.try_lower_simd_reduction(&fn_name, args) {
