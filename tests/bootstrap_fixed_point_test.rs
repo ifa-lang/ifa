@@ -846,8 +846,18 @@ fn test_modular_compiler_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("324 passed; 0 failed"),
-        "Expected 324 passed unit tests, got:\n{}",
+        stdout.contains("test test_sema_explicit_arena_declarations ... ok"),
+        "Modular sema explicit arena declarations test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sema_generic_struct_monomorphization ... ok"),
+        "Modular sema generic struct monomorphization test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("328 passed; 0 failed"),
+        "Expected 328 passed unit tests, got:\n{}",
         stdout
     );
 }
@@ -1212,8 +1222,38 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_collections_list ... ok"),
+        "Std collections list test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_collections_map ... ok"),
+        "Std collections map test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_collections_set ... ok"),
+        "Std collections set test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_collections_byte_buffer ... ok"),
+        "Std collections byte buffer test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_collections_string_builder ... ok"),
+        "Std collections string builder test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("55 passed; 0 failed"),
+        "Expected 55 passed std unit tests, got:\n{}",
         stdout
     );
 }

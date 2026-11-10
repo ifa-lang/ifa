@@ -2759,6 +2759,337 @@ pub fn test_sema_trait_impl_completeness_and_method_dispatch() -> bool {
     return unimpl_target == "";
 }
 
+// ---------------------------------------------------------------------------
+// Explicit Arena Declarations & Scoped Capacity Typing
+// ---------------------------------------------------------------------------
+
+pub struct AstArenaDecl {
+    name: String,
+    capacity: i64,
+    is_cow: bool,
+    page_size: i64
+}
+
+pub struct ArenaSymbolTable {
+    names: List<String>,
+    capacities: List<i64>,
+    is_cow: List<bool>,
+    page_sizes: List<i64>
+}
+
+pub fn make_arena_symbol_table() -> ArenaSymbolTable {
+    return ArenaSymbolTable(
+        names: List::new(),
+        capacities: List::new(),
+        is_cow: List::new(),
+        page_sizes: List::new()
+    );
+}
+
+pub fn register_arena_decl(inout table: ArenaSymbolTable, decl: AstArenaDecl) {
+    table.names.push(decl.name);
+    table.capacities.push(decl.capacity);
+    table.is_cow.push(decl.is_cow);
+    table.page_sizes.push(decl.page_size);
+}
+
+pub fn has_arena_decl(table: ArenaSymbolTable, name: String) -> bool {
+    mut i: i64 = 0;
+    while i < table.names.len() {
+        if table.names[i] == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn get_arena_decl_capacity(table: ArenaSymbolTable, name: String) -> i64 {
+    mut i: i64 = 0;
+    while i < table.names.len() {
+        if table.names[i] == name {
+            return table.capacities[i];
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub fn is_arena_decl_cow(table: ArenaSymbolTable, name: String) -> bool {
+    mut i: i64 = 0;
+    while i < table.names.len() {
+        if table.names[i] == name {
+            return table.is_cow[i];
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn validate_arena_declaration(decl: AstArenaDecl) -> bool {
+    if string_len(decl.name) == 0 {
+        return false;
+    }
+    if decl.capacity < 0 {
+        return false;
+    }
+    if decl.page_size > 0 && decl.page_size < 4096 {
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Generic Structs & Monomorphization Resolution
+// ---------------------------------------------------------------------------
+
+pub struct AstGenericStructDef {
+    is_pub: bool,
+    name: String,
+    generic_params: List<String>,
+    field_names: List<String>,
+    field_types: List<String>
+}
+
+pub struct GenericStructTable {
+    names: List<String>,
+    param_counts: List<i64>,
+    param_structs: List<String>,
+    param_names: List<String>,
+    field_counts: List<i64>,
+    field_structs: List<String>,
+    field_names: List<String>,
+    field_types: List<String>
+}
+
+pub fn make_generic_struct_table() -> GenericStructTable {
+    return GenericStructTable(
+        names: List::new(),
+        param_counts: List::new(),
+        param_structs: List::new(),
+        param_names: List::new(),
+        field_counts: List::new(),
+        field_structs: List::new(),
+        field_names: List::new(),
+        field_types: List::new()
+    );
+}
+
+pub fn register_generic_struct(inout table: GenericStructTable, def: AstGenericStructDef) {
+    table.names.push(def.name);
+    table.param_counts.push(def.generic_params.len());
+    mut i: i64 = 0;
+    while i < def.generic_params.len() {
+        table.param_structs.push(def.name);
+        table.param_names.push(def.generic_params[i]);
+        i = i + 1;
+    }
+    table.field_counts.push(def.field_names.len());
+    mut j: i64 = 0;
+    while j < def.field_names.len() {
+        table.field_structs.push(def.name);
+        table.field_names.push(def.field_names[j]);
+        table.field_types.push(def.field_types[j]);
+        j = j + 1;
+    }
+}
+
+pub fn has_generic_struct(table: GenericStructTable, name: String) -> bool {
+    mut i: i64 = 0;
+    while i < table.names.len() {
+        if table.names[i] == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn get_generic_struct_param_count(table: GenericStructTable, name: String) -> i64 {
+    mut i: i64 = 0;
+    while i < table.names.len() {
+        if table.names[i] == name {
+            return table.param_counts[i];
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub fn monomorphize_generic_struct(
+    table: GenericStructTable,
+    struct_name: String,
+    type_args: List<String>
+) -> String {
+    if !has_generic_struct(table, struct_name) {
+        return "";
+    }
+    let expected_params = get_generic_struct_param_count(table, struct_name);
+    if expected_params != type_args.len() {
+        return "";
+    }
+    mut mangled: String = struct_name;
+    mut i: i64 = 0;
+    while i < type_args.len() {
+        mangled = mangled + "__" + type_args[i];
+        i = i + 1;
+    }
+    return mangled;
+}
+
+pub fn resolve_generic_struct_field_type(
+    table: GenericStructTable,
+    struct_name: String,
+    type_args: List<String>,
+    field_name: String
+) -> String {
+    let mangled = monomorphize_generic_struct(table, struct_name, type_args);
+    if string_len(mangled) == 0 {
+        return "";
+    }
+    mut field_ty: String = "";
+    mut i: i64 = 0;
+    while i < table.field_structs.len() {
+        if table.field_structs[i] == struct_name && table.field_names[i] == field_name {
+            field_ty = table.field_types[i];
+            i = table.field_structs.len();
+        } else {
+            i = i + 1;
+        }
+    }
+    if string_len(field_ty) == 0 {
+        return "";
+    }
+    // Substitute generic parameter names with concrete type arguments
+    mut j: i64 = 0;
+    mut param_idx: i64 = 0;
+    while j < table.param_structs.len() {
+        if table.param_structs[j] == struct_name {
+            let p_name = table.param_names[j];
+            if p_name == field_ty && param_idx < type_args.len() {
+                return type_args[param_idx];
+            }
+            param_idx = param_idx + 1;
+        }
+        j = j + 1;
+    }
+    return field_ty;
+}
+
+pub fn test_sema_explicit_arena_declarations() -> bool {
+    mut table = make_arena_symbol_table();
+
+    let a1 = AstArenaDecl(
+        name: "ast_arena",
+        capacity: 1048576,
+        is_cow: false,
+        page_size: 65536
+    );
+    let a2 = AstArenaDecl(
+        name: "cow_scratch",
+        capacity: 2097152,
+        is_cow: true,
+        page_size: 4096
+    );
+    let a_invalid = AstArenaDecl(
+        name: "bad_arena",
+        capacity: -1,
+        is_cow: false,
+        page_size: 1024
+    );
+
+    let v1 = validate_arena_declaration(a1);
+    let v2 = validate_arena_declaration(a2);
+    let v_bad = validate_arena_declaration(a_invalid);
+
+    if !v1 || !v2 || v_bad {
+        return false;
+    }
+
+    register_arena_decl(inout table, a1);
+    register_arena_decl(inout table, a2);
+
+    let has_a1 = has_arena_decl(table, "ast_arena");
+    let has_a2 = has_arena_decl(table, "cow_scratch");
+    let has_a3 = has_arena_decl(table, "unknown_arena");
+
+    let cap_a1 = get_arena_decl_capacity(table, "ast_arena");
+    let cow_a2 = is_arena_decl_cow(table, "cow_scratch");
+    let cow_a1 = is_arena_decl_cow(table, "ast_arena");
+
+    return has_a1 && has_a2 && !has_a3
+        && cap_a1 == 1048576
+        && cow_a2
+        && !cow_a1;
+}
+
+pub fn test_sema_generic_struct_monomorphization() -> bool {
+    mut table = make_generic_struct_table();
+
+    // 1. Box<T> { value: T }
+    mut box_params: List<String> = List::new();
+    box_params.push("T");
+    mut box_fields: List<String> = List::new();
+    box_fields.push("value");
+    mut box_types: List<String> = List::new();
+    box_types.push("T");
+
+    let box_def = AstGenericStructDef(
+        is_pub: true,
+        name: "Box",
+        generic_params: box_params,
+        field_names: box_fields,
+        field_types: box_types
+    );
+    register_generic_struct(inout table, box_def);
+
+    // 2. Pair<K, V> { key: K, val: V }
+    mut pair_params: List<String> = List::new();
+    pair_params.push("K");
+    pair_params.push("V");
+    mut pair_fields: List<String> = List::new();
+    pair_fields.push("key");
+    pair_fields.push("val");
+    mut pair_types: List<String> = List::new();
+    pair_types.push("K");
+    pair_types.push("V");
+
+    let pair_def = AstGenericStructDef(
+        is_pub: true,
+        name: "Pair",
+        generic_params: pair_params,
+        field_names: pair_fields,
+        field_types: pair_types
+    );
+    register_generic_struct(inout table, pair_def);
+
+    // Monomorphization tests
+    mut box_args: List<String> = List::new();
+    box_args.push("String");
+    let box_mangled = monomorphize_generic_struct(table, "Box", box_args);
+    if box_mangled != "Box__String" {
+        return false;
+    }
+
+    let box_field_ty = resolve_generic_struct_field_type(table, "Box", box_args, "value");
+    if box_field_ty != "String" {
+        return false;
+    }
+
+    mut pair_args: List<String> = List::new();
+    pair_args.push("String");
+    pair_args.push("i64");
+    let pair_mangled = monomorphize_generic_struct(table, "Pair", pair_args);
+    if pair_mangled != "Pair__String__i64" {
+        return false;
+    }
+
+    let k_ty = resolve_generic_struct_field_type(table, "Pair", pair_args, "key");
+    let v_ty = resolve_generic_struct_field_type(table, "Pair", pair_args, "val");
+
+    return k_ty == "String" && v_ty == "i64";
+}
+
 pub fn main() {
     println("=== IFA Compiler Sema Module ===");
     let t1 = test_sema_eval();
@@ -2793,7 +3124,9 @@ pub fn main() {
     let t30 = test_sema_concurrent_task_path_exclusivity();
     let t31 = test_sema_polymorphic_where_clause_resolution();
     let t32 = test_sema_trait_impl_completeness_and_method_dispatch();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 {
+    let t33 = test_sema_explicit_arena_declarations();
+    let t34 = test_sema_generic_struct_monomorphization();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 && t33 && t34 {
         println("Sema validation tests: ALL PASSED");
     } else {
         println("Sema validation tests: FAILED");

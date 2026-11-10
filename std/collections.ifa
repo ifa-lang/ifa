@@ -1,0 +1,748 @@
+// Pure IFA Standard Library: Collections Subsystem (`std/collections.ifa`)
+// Deterministic data structures required for bit-for-bit reproducible compilation:
+// - List helpers: sorting, searching, reversing, and joining
+// - Map: deterministic ordered key-value dictionary (B-Tree-like sorted order)
+// - Set: deterministic unique sorted set
+// - ByteBuffer: high-throughput endian-aware binary builder
+// - StringBuilder: deterministic string synthesis with indentation management
+
+pub fn string_compare(s1: String, s2: String) -> i64 {
+    let len1 = string_len(s1);
+    let len2 = string_len(s2);
+    mut min_len: i64 = len1;
+    if len2 < min_len {
+        min_len = len2;
+    }
+    mut i: i64 = 0;
+    while i < min_len {
+        let c1 = string_char_at(s1, i);
+        let c2 = string_char_at(s2, i);
+        if c1 < c2 {
+            return -1;
+        }
+        if c1 > c2 {
+            return 1;
+        }
+        i = i + 1;
+    }
+    if len1 < len2 {
+        return -1;
+    }
+    if len1 > len2 {
+        return 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// 1. List Operations & Deterministic Algorithms
+// ---------------------------------------------------------------------------
+
+pub fn list_swap_strings(inout list: List<String>, i: i64, j: i64) {
+    if i != j {
+        let a = list[i];
+        let b = list[j];
+        list[i] = b;
+        list[j] = a;
+    }
+}
+
+pub fn list_swap_ints(inout list: List<i64>, i: i64, j: i64) {
+    if i != j {
+        let a = list[i];
+        let b = list[j];
+        list[i] = b;
+        list[j] = a;
+    }
+}
+
+pub fn list_sort_strings(inout list: List<String>) {
+    let len = list.len();
+    mut i: i64 = 0;
+    while i < len {
+        mut min_idx: i64 = i;
+        mut j: i64 = i + 1;
+        while j < len {
+            if string_compare(list[j], list[min_idx]) < 0 {
+                min_idx = j;
+            }
+            j = j + 1;
+        }
+        list_swap_strings(list, i, min_idx);
+        i = i + 1;
+    }
+}
+
+pub fn list_sort_ints(inout list: List<i64>) {
+    let len = list.len();
+    mut i: i64 = 0;
+    while i < len {
+        mut min_idx: i64 = i;
+        mut j: i64 = i + 1;
+        while j < len {
+            if list[j] < list[min_idx] {
+                min_idx = j;
+            }
+            j = j + 1;
+        }
+        list_swap_ints(list, i, min_idx);
+        i = i + 1;
+    }
+}
+
+pub fn list_contains_string(list: List<String>, target: String) -> bool {
+    mut i: i64 = 0;
+    while i < list.len() {
+        if list[i] == target {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn list_contains_int(list: List<i64>, target: i64) -> bool {
+    mut i: i64 = 0;
+    while i < list.len() {
+        if list[i] == target {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn list_join_strings(list: List<String>, sep: String) -> String {
+    mut res: String = "";
+    mut i: i64 = 0;
+    while i < list.len() {
+        if i > 0 {
+            res = res + sep;
+        }
+        res = res + list[i];
+        i = i + 1;
+    }
+    return res;
+}
+
+pub fn list_reverse_strings(inout list: List<String>) {
+    let len = list.len();
+    mut left: i64 = 0;
+    mut right: i64 = len - 1;
+    while left < right {
+        let tmp = list[left];
+        let v_r = list[right];
+        list[left] = v_r;
+        list[right] = tmp;
+        left = left + 1;
+        right = right - 1;
+    }
+}
+
+pub fn list_reverse_ints(inout list: List<i64>) {
+    let len = list.len();
+    mut left: i64 = 0;
+    mut right: i64 = len - 1;
+    while left < right {
+        let tmp = list[left];
+        let v_r = list[right];
+        list[left] = v_r;
+        list[right] = tmp;
+        left = left + 1;
+        right = right - 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Deterministic Ordered Map (String -> String)
+// ---------------------------------------------------------------------------
+
+pub struct StringMap {
+    keys: List<String>,
+    values: List<String>
+}
+
+pub fn map_new() -> StringMap {
+    return StringMap(
+        keys: List::new(),
+        values: List::new()
+    );
+}
+
+pub fn map_len(map: StringMap) -> i64 {
+    return map.keys.len();
+}
+
+pub fn map_is_empty(map: StringMap) -> bool {
+    return map.keys.len() == 0;
+}
+
+pub fn map_contains(map: StringMap, key: String) -> bool {
+    mut i: i64 = 0;
+    while i < map.keys.len() {
+        if map.keys[i] == key {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn map_get(map: StringMap, key: String) -> String {
+    mut i: i64 = 0;
+    while i < map.keys.len() {
+        if map.keys[i] == key {
+            return map.values[i];
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub fn map_insert(inout map: StringMap, key: String, val: String) -> bool {
+    mut i: i64 = 0;
+    while i < map.keys.len() {
+        let cmp = string_compare(map.keys[i], key);
+        if cmp == 0 {
+            map.values[i] = val;
+            return false;
+        }
+        i = i + 1;
+    }
+    map.keys.push(key);
+    map.values.push(val);
+    mut k: i64 = map.keys.len() - 1;
+    while k > 0 {
+        if string_compare(map.keys[k], map.keys[k - 1]) < 0 {
+            let tmp_k = map.keys[k];
+            let tmp_v = map.values[k];
+            map.keys[k] = map.keys[k - 1];
+            map.values[k] = map.values[k - 1];
+            map.keys[k - 1] = tmp_k;
+            map.values[k - 1] = tmp_v;
+            k = k - 1;
+        } else {
+            k = 0;
+        }
+    }
+    return true;
+}
+
+pub fn map_remove(inout map: StringMap, key: String) -> bool {
+    mut found_idx: i64 = -1;
+    mut i: i64 = 0;
+    while i < map.keys.len() {
+        if map.keys[i] == key {
+            found_idx = i;
+            i = map.keys.len();
+        } else {
+            i = i + 1;
+        }
+    }
+    if found_idx == -1 {
+        return false;
+    }
+    mut new_keys: List<String> = List::new();
+    mut new_vals: List<String> = List::new();
+    mut j: i64 = 0;
+    while j < map.keys.len() {
+        if j != found_idx {
+            new_keys.push(map.keys[j]);
+            new_vals.push(map.values[j]);
+        }
+        j = j + 1;
+    }
+    map.keys = new_keys;
+    map.values = new_vals;
+    return true;
+}
+
+pub fn map_keys(map: StringMap) -> List<String> {
+    return map.keys;
+}
+
+pub fn map_values(map: StringMap) -> List<String> {
+    return map.values;
+}
+
+// ---------------------------------------------------------------------------
+// 3. Deterministic Ordered Set (Unique elements)
+// ---------------------------------------------------------------------------
+
+pub struct StringSet {
+    items: List<String>
+}
+
+pub fn set_new() -> StringSet {
+    return StringSet(items: List::new());
+}
+
+pub fn set_len(set: StringSet) -> i64 {
+    return set.items.len();
+}
+
+pub fn set_is_empty(set: StringSet) -> bool {
+    return set.items.len() == 0;
+}
+
+pub fn set_contains(set: StringSet, item: String) -> bool {
+    mut i: i64 = 0;
+    while i < set.items.len() {
+        if set.items[i] == item {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn set_insert(inout set: StringSet, item: String) -> bool {
+    mut i: i64 = 0;
+    while i < set.items.len() {
+        let cmp = string_compare(set.items[i], item);
+        if cmp == 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    set.items.push(item);
+    mut k: i64 = set.items.len() - 1;
+    while k > 0 {
+        if string_compare(set.items[k], set.items[k - 1]) < 0 {
+            let tmp = set.items[k];
+            set.items[k] = set.items[k - 1];
+            set.items[k - 1] = tmp;
+            k = k - 1;
+        } else {
+            k = 0;
+        }
+    }
+    return true;
+}
+
+pub fn set_remove(inout set: StringSet, item: String) -> bool {
+    mut found_idx: i64 = -1;
+    mut i: i64 = 0;
+    while i < set.items.len() {
+        if set.items[i] == item {
+            found_idx = i;
+            i = set.items.len();
+        } else {
+            i = i + 1;
+        }
+    }
+    if found_idx == -1 {
+        return false;
+    }
+    mut new_items: List<String> = List::new();
+    mut j: i64 = 0;
+    while j < set.items.len() {
+        if j != found_idx {
+            new_items.push(set.items[j]);
+        }
+        j = j + 1;
+    }
+    set.items = new_items;
+    return true;
+}
+
+pub struct IntSet {
+    items: List<i64>
+}
+
+pub fn int_set_new() -> IntSet {
+    return IntSet(items: List::new());
+}
+
+pub fn int_set_len(set: IntSet) -> i64 {
+    return set.items.len();
+}
+
+pub fn int_set_is_empty(set: IntSet) -> bool {
+    return set.items.len() == 0;
+}
+
+pub fn int_set_contains(set: IntSet, item: i64) -> bool {
+    mut i: i64 = 0;
+    while i < set.items.len() {
+        if set.items[i] == item {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn int_set_insert(inout set: IntSet, item: i64) -> bool {
+    mut i: i64 = 0;
+    while i < set.items.len() {
+        if set.items[i] == item {
+            return false;
+        }
+        i = i + 1;
+    }
+    set.items.push(item);
+    mut k: i64 = set.items.len() - 1;
+    while k > 0 {
+        if set.items[k] < set.items[k - 1] {
+            let tmp = set.items[k];
+            set.items[k] = set.items[k - 1];
+            set.items[k - 1] = tmp;
+            k = k - 1;
+        } else {
+            k = 0;
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 4. ByteBuffer (Binary builder with endianness support)
+// ---------------------------------------------------------------------------
+
+pub struct ByteBuffer {
+    bytes: List<i64>
+}
+
+pub fn byte_buffer_new() -> ByteBuffer {
+    return ByteBuffer(bytes: List::new());
+}
+
+pub fn byte_buffer_len(buf: ByteBuffer) -> i64 {
+    return buf.bytes.len();
+}
+
+pub fn byte_buffer_is_empty(buf: ByteBuffer) -> bool {
+    return buf.bytes.len() == 0;
+}
+
+pub fn byte_buffer_clear(inout buf: ByteBuffer) {
+    mut empty: List<i64> = List::new();
+    buf.bytes = empty;
+}
+
+pub fn byte_buffer_write_u8(inout buf: ByteBuffer, val: i64) {
+    buf.bytes.push(val & 255);
+}
+
+pub fn byte_buffer_write_i8(inout buf: ByteBuffer, val: i64) {
+    buf.bytes.push(val & 255);
+}
+
+pub fn byte_buffer_write_u16_le(inout buf: ByteBuffer, val: i64) {
+    byte_buffer_write_u8(buf, val & 255);
+    byte_buffer_write_u8(buf, (val >> 8) & 255);
+}
+
+pub fn byte_buffer_write_u16_be(inout buf: ByteBuffer, val: i64) {
+    byte_buffer_write_u8(buf, (val >> 8) & 255);
+    byte_buffer_write_u8(buf, val & 255);
+}
+
+pub fn byte_buffer_write_u32_le(inout buf: ByteBuffer, val: i64) {
+    byte_buffer_write_u8(buf, val & 255);
+    byte_buffer_write_u8(buf, (val >> 8) & 255);
+    byte_buffer_write_u8(buf, (val >> 16) & 255);
+    byte_buffer_write_u8(buf, (val >> 24) & 255);
+}
+
+pub fn byte_buffer_write_u32_be(inout buf: ByteBuffer, val: i64) {
+    byte_buffer_write_u8(buf, (val >> 24) & 255);
+    byte_buffer_write_u8(buf, (val >> 16) & 255);
+    byte_buffer_write_u8(buf, (val >> 8) & 255);
+    byte_buffer_write_u8(buf, val & 255);
+}
+
+pub fn byte_buffer_write_u64_le(inout buf: ByteBuffer, val: i64) {
+    mut i: i64 = 0;
+    while i < 8 {
+        byte_buffer_write_u8(buf, (val >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+pub fn byte_buffer_write_u64_be(inout buf: ByteBuffer, val: i64) {
+    mut i: i64 = 7;
+    while i >= 0 {
+        byte_buffer_write_u8(buf, (val >> (i * 8)) & 255);
+        i = i - 1;
+    }
+}
+
+pub fn byte_buffer_write_str(inout buf: ByteBuffer, text: String) {
+    let len = string_len(text);
+    mut i: i64 = 0;
+    while i < len {
+        let c = string_char_at(text, i);
+        byte_buffer_write_u8(buf, c);
+        i = i + 1;
+    }
+}
+
+pub fn byte_buffer_read_u8(buf: ByteBuffer, offset: i64) -> i64 {
+    if offset >= 0 && offset < buf.bytes.len() {
+        return buf.bytes[offset];
+    }
+    return 0;
+}
+
+pub fn byte_buffer_read_u32_le(buf: ByteBuffer, offset: i64) -> i64 {
+    if offset + 4 <= buf.bytes.len() {
+        let b0 = buf.bytes[offset];
+        let b1 = buf.bytes[offset + 1];
+        let b2 = buf.bytes[offset + 2];
+        let b3 = buf.bytes[offset + 3];
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    }
+    return 0;
+}
+
+pub fn byte_buffer_read_u64_le(buf: ByteBuffer, offset: i64) -> i64 {
+    if offset + 8 <= buf.bytes.len() {
+        mut res: i64 = 0;
+        mut i: i64 = 0;
+        while i < 8 {
+            let b = buf.bytes[offset + i];
+            res = res | (b << (i * 8));
+            i = i + 1;
+        }
+        return res;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// 5. StringBuilder (Deterministic Code Formatting Buffer)
+// ---------------------------------------------------------------------------
+
+pub struct StringBuilder {
+    buffer: String,
+    indent_level: i64,
+    indent_unit: String
+}
+
+pub fn string_builder_new() -> StringBuilder {
+    return StringBuilder(
+        buffer: "",
+        indent_level: 0,
+        indent_unit: "    "
+    );
+}
+
+pub fn string_builder_with_indent(unit: String) -> StringBuilder {
+    return StringBuilder(
+        buffer: "",
+        indent_level: 0,
+        indent_unit: unit
+    );
+}
+
+pub fn string_builder_len(sb: StringBuilder) -> i64 {
+    return string_len(sb.buffer);
+}
+
+pub fn string_builder_append(inout sb: StringBuilder, text: String) {
+    sb.buffer = sb.buffer + text;
+}
+
+pub fn string_builder_append_line(inout sb: StringBuilder, line: String) {
+    mut i: i64 = 0;
+    while i < sb.indent_level {
+        sb.buffer = sb.buffer + sb.indent_unit;
+        i = i + 1;
+    }
+    sb.buffer = sb.buffer + line + "\n";
+}
+
+pub fn string_builder_indent(inout sb: StringBuilder) {
+    sb.indent_level = sb.indent_level + 1;
+}
+
+pub fn string_builder_dedent(inout sb: StringBuilder) {
+    if sb.indent_level > 0 {
+        sb.indent_level = sb.indent_level - 1;
+    }
+}
+
+pub fn string_builder_to_string(sb: StringBuilder) -> String {
+    return sb.buffer;
+}
+
+pub fn string_builder_clear(inout sb: StringBuilder) {
+    sb.buffer = "";
+    sb.indent_level = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Unit Tests for Standard Collections Subsystem
+// ---------------------------------------------------------------------------
+
+pub fn test_collections_list() -> bool {
+    mut str_list: List<String> = List::new();
+    str_list.push("omega");
+    str_list.push("alpha");
+    str_list.push("beta");
+    str_list.push("delta");
+
+    list_sort_strings(str_list);
+
+    let t1 = str_list[0] == "alpha"
+        && str_list[1] == "beta"
+        && str_list[2] == "delta"
+        && str_list[3] == "omega";
+    if !t1 {
+        println("FAILED t1");
+        return false;
+    }
+
+    let t2 = list_contains_string(str_list, "beta") && !list_contains_string(str_list, "gamma");
+    if !t2 {
+        println("FAILED t2");
+        return false;
+    }
+
+    let joined = list_join_strings(str_list, ", ");
+    let t3 = joined == "alpha, beta, delta, omega";
+    if !t3 {
+        println("FAILED t3");
+        return false;
+    }
+
+    mut int_list: List<i64> = List::new();
+    int_list.push(42);
+    int_list.push(7);
+    int_list.push(99);
+    int_list.push(1);
+
+    list_sort_ints(int_list);
+    let t4 = int_list[0] == 1 && int_list[1] == 7 && int_list[2] == 42 && int_list[3] == 99;
+    if !t4 {
+        println("FAILED t4");
+        return false;
+    }
+
+    list_reverse_ints(int_list);
+    let t5 = int_list[0] == 99 && int_list[3] == 1;
+    if !t5 {
+        println("FAILED t5");
+        return false;
+    }
+
+    return true;
+}
+
+pub fn test_collections_map() -> bool {
+    mut m = map_new();
+    let ins1 = map_insert(m, "gamma", "three");
+    let ins2 = map_insert(m, "alpha", "one");
+    let ins3 = map_insert(m, "beta", "two");
+
+    let t1 = ins1 && ins2 && ins3;
+    let t2 = map_len(m) == 3;
+    let t3 = map_get(m, "alpha") == "one"
+        && map_get(m, "beta") == "two"
+        && map_get(m, "gamma") == "three";
+
+    // Deterministic sorted key iteration: alpha, beta, gamma
+    let keys = map_keys(m);
+    let t4 = keys[0] == "alpha" && keys[1] == "beta" && keys[2] == "gamma";
+
+    // Value update
+    let ins_upd = map_insert(m, "beta", "updated_two");
+    let t5 = !ins_upd && map_get(m, "beta") == "updated_two" && map_len(m) == 3;
+
+    // Remove
+    let rem = map_remove(m, "alpha");
+    let t6 = rem && !map_contains(m, "alpha") && map_len(m) == 2;
+
+    return t1 && t2 && t3 && t4 && t5 && t6;
+}
+
+pub fn test_collections_set() -> bool {
+    mut set = set_new();
+    let i1 = set_insert(set, "gamma");
+    let i2 = set_insert(set, "alpha");
+    let i3 = set_insert(set, "beta");
+    let i4 = set_insert(set, "alpha"); // duplicate
+
+    let t1 = i1 && i2 && i3 && !i4;
+    let t2 = set_len(set) == 3;
+    let t3 = set_contains(set, "alpha") && set_contains(set, "beta") && !set_contains(set, "omega");
+    let t4 = set.items[0] == "alpha" && set.items[1] == "beta" && set.items[2] == "gamma";
+
+    let rem = set_remove(set, "beta");
+    let t5 = rem && !set_contains(set, "beta") && set_len(set) == 2;
+
+    mut iset = int_set_new();
+    int_set_insert(iset, 50);
+    int_set_insert(iset, 10);
+    int_set_insert(iset, 30);
+    int_set_insert(iset, 10); // duplicate
+
+    let t6 = int_set_len(iset) == 3
+        && iset.items[0] == 10
+        && iset.items[1] == 30
+        && iset.items[2] == 50;
+
+    return t1 && t2 && t3 && t4 && t5 && t6;
+}
+
+pub fn test_collections_byte_buffer() -> bool {
+    mut buf = byte_buffer_new();
+    byte_buffer_write_u8(buf, 65); // 'A'
+    byte_buffer_write_u16_le(buf, 4660); // 0x1234
+    byte_buffer_write_u32_le(buf, 305419896); // 0x12345678
+
+    let t1 = byte_buffer_len(buf) == 7;
+    let t2 = byte_buffer_read_u8(buf, 0) == 65;
+    let t3 = byte_buffer_read_u32_le(buf, 3) == 305419896;
+
+    mut buf_be = byte_buffer_new();
+    byte_buffer_write_u32_be(buf_be, 305419896); // 0x12, 0x34, 0x56, 0x78
+    let t4 = byte_buffer_read_u8(buf_be, 0) == 18
+        && byte_buffer_read_u8(buf_be, 1) == 52
+        && byte_buffer_read_u8(buf_be, 2) == 86
+        && byte_buffer_read_u8(buf_be, 3) == 120;
+
+    byte_buffer_write_str(buf_be, "IFA");
+    let t5 = byte_buffer_len(buf_be) == 7
+        && byte_buffer_read_u8(buf_be, 4) == 73  // 'I'
+        && byte_buffer_read_u8(buf_be, 5) == 70  // 'F'
+        && byte_buffer_read_u8(buf_be, 6) == 65; // 'A'
+
+    return t1 && t2 && t3 && t4 && t5;
+}
+
+pub fn test_collections_string_builder() -> bool {
+    mut sb = string_builder_new();
+    string_builder_append_line(sb, "; IFA LLVM IR Output");
+    string_builder_append_line(sb, "define i32 @main() {");
+    string_builder_indent(sb);
+    string_builder_append_line(sb, "ret i32 42");
+    string_builder_dedent(sb);
+    string_builder_append_line(sb, "}");
+
+    let out = string_builder_to_string(sb);
+    let expected = "; IFA LLVM IR Output\ndefine i32 @main() {\n    ret i32 42\n}\n";
+    let t1 = out == expected;
+    let t2 = string_builder_len(sb) == string_len(expected);
+
+    return t1 && t2;
+}
+
+pub fn test_collections_all() -> bool {
+    let t1 = test_collections_list();
+    let t2 = test_collections_map();
+    let t3 = test_collections_set();
+    let t4 = test_collections_byte_buffer();
+    let t5 = test_collections_string_builder();
+    return t1 && t2 && t3 && t4 && t5;
+}
+
+pub fn main() {
+    if test_collections_all() {
+        println("std/collections: ALL TESTS PASSED");
+    } else {
+        println("std/collections: TESTS FAILED");
+    }
+}

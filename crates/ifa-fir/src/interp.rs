@@ -1582,6 +1582,52 @@ impl<'a> FirInterpreter<'a> {
                             ))
                         }
                     }
+                    FirValue::FieldPointer { base_addr, path } => {
+                        let target = self
+                            .stack_memory
+                            .get_mut(base_addr)
+                            .ok_or(InterpError::InvalidPointer(*base_addr))?;
+                        let sub = navigate_value_mut(target, path)?;
+                        if let FirValue::Array(elements) = sub {
+                            if let Some(slot) = elements.get_mut(idx) {
+                                *slot = val_to_set;
+                                Ok(FirValue::Unit)
+                            } else {
+                                Err(InterpError::Panic(format!(
+                                    "Array index {} out of bounds",
+                                    idx
+                                )))
+                            }
+                        } else {
+                            Err(InterpError::TypeMismatch(
+                                "Referenced field target is not an array".into(),
+                            ))
+                        }
+                    }
+                    FirValue::HeapFieldPointer {
+                        slot,
+                        generation,
+                        path,
+                    } => {
+                        self.heap.check(*slot, *generation)?;
+                        let heap_target = self.heap.deref_mut(*slot)?;
+                        let sub = navigate_value_mut(heap_target, path)?;
+                        if let FirValue::Array(elements) = sub {
+                            if let Some(slot) = elements.get_mut(idx) {
+                                *slot = val_to_set;
+                                Ok(FirValue::Unit)
+                            } else {
+                                Err(InterpError::Panic(format!(
+                                    "Array index {} out of bounds",
+                                    idx
+                                )))
+                            }
+                        } else {
+                            Err(InterpError::TypeMismatch(
+                                "Referenced heap field target is not an array".into(),
+                            ))
+                        }
+                    }
                     _ => Err(InterpError::TypeMismatch(
                         "SetElement requires pointer or reference".into(),
                     )),
@@ -1874,6 +1920,36 @@ impl<'a> FirInterpreter<'a> {
                                 0
                             }
                         }
+                        FirValue::FieldPointer { base_addr, path } => {
+                            if let Some(target) = self.stack_memory.get(base_addr) {
+                                if let Ok(sub) = navigate_value(target, path) {
+                                    match sub {
+                                        FirValue::Array(elements) => elements.len() as i128,
+                                        FirValue::String(s) => s.len() as i128,
+                                        _ => 0,
+                                    }
+                                } else {
+                                    0
+                                }
+                            } else {
+                                0
+                            }
+                        }
+                        FirValue::HeapFieldPointer {
+                            slot,
+                            generation,
+                            path,
+                        } => self
+                            .heap
+                            .check(*slot, *generation)
+                            .ok()
+                            .and_then(|_| self.heap.deref(*slot).ok())
+                            .and_then(|heap_target| navigate_value(heap_target, path).ok())
+                            .map_or(0, |sub| match sub {
+                                FirValue::Array(elements) => elements.len() as i128,
+                                FirValue::String(s) => s.len() as i128,
+                                _ => 0,
+                            }),
                         _ => 0,
                     };
                     if s_idx < 0 || s_idx > e_idx || (len > 0 && e_idx > len) {
@@ -2788,6 +2864,36 @@ impl<'a> FirInterpreter<'a> {
                                 0
                             }
                         }
+                        FirValue::FieldPointer { base_addr, path } => {
+                            if let Some(target) = self.stack_memory.get(base_addr) {
+                                if let Ok(sub) = navigate_value(target, path) {
+                                    match sub {
+                                        FirValue::Array(elements) => elements.len() as i128,
+                                        FirValue::String(s) => s.len() as i128,
+                                        _ => 0,
+                                    }
+                                } else {
+                                    0
+                                }
+                            } else {
+                                0
+                            }
+                        }
+                        FirValue::HeapFieldPointer {
+                            slot,
+                            generation,
+                            path,
+                        } => self
+                            .heap
+                            .check(*slot, *generation)
+                            .ok()
+                            .and_then(|_| self.heap.deref(*slot).ok())
+                            .and_then(|heap_target| navigate_value(heap_target, path).ok())
+                            .map_or(0, |sub| match sub {
+                                FirValue::Array(elements) => elements.len() as i128,
+                                FirValue::String(s) => s.len() as i128,
+                                _ => 0,
+                            }),
                         _ => 0,
                     };
                     if len > 0 && (idx < 0 || idx >= len) {
@@ -2839,6 +2945,36 @@ impl<'a> FirInterpreter<'a> {
                                 0
                             }
                         }
+                        FirValue::FieldPointer { base_addr, path } => {
+                            if let Some(target) = self.stack_memory.get(base_addr) {
+                                if let Ok(sub) = navigate_value(target, path) {
+                                    match sub {
+                                        FirValue::Array(elements) => elements.len() as i128,
+                                        FirValue::String(s) => s.len() as i128,
+                                        _ => 0,
+                                    }
+                                } else {
+                                    0
+                                }
+                            } else {
+                                0
+                            }
+                        }
+                        FirValue::HeapFieldPointer {
+                            slot,
+                            generation,
+                            path,
+                        } => self
+                            .heap
+                            .check(*slot, *generation)
+                            .ok()
+                            .and_then(|_| self.heap.deref(*slot).ok())
+                            .and_then(|heap_target| navigate_value(heap_target, path).ok())
+                            .map_or(0, |sub| match sub {
+                                FirValue::Array(elements) => elements.len() as i128,
+                                FirValue::String(s) => s.len() as i128,
+                                _ => 0,
+                            }),
                         _ => 0,
                     };
                     if s_idx < 0 || s_idx > e_idx || (len > 0 && e_idx > len) {

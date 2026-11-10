@@ -1986,7 +1986,8 @@ pub fn check_call_exclusivity_interproc(
                 }
             }
 
-            // Now check exclusivity for each effective borrow
+            // Now check exclusivity for each effective borrow against existing argument borrows
+            let mut current_arg_borrows = Vec::new();
             for (eff_path, eff_kind) in effective_borrows {
                 if let Some(existing) = borrows.iter().find(|b| b.path.overlaps(&eff_path)) {
                     match (eff_kind, existing.kind) {
@@ -2166,13 +2167,14 @@ pub fn check_call_exclusivity_interproc(
                         (BorrowKind::PendingAssign, _) => {}
                     }
                 } else {
-                    borrows.push(BorrowRecord {
+                    current_arg_borrows.push(BorrowRecord {
                         path: eff_path,
                         kind: eff_kind,
                         span: arg.value.span,
                     });
                 }
             }
+            borrows.extend(current_arg_borrows);
         } else if is_inout || is_sink {
             // Passing a literal or complex non-lvalue expression to inout or sink
             let kw = if is_inout { "inout" } else { "sink" };

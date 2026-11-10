@@ -1696,7 +1696,7 @@ impl<'a> FunctionLoweringContext<'a> {
                                 .get(sym)
                                 .copied()
                                 .unwrap_or_else(|| self.lower_expr(receiver)),
-                            _ => self.lower_expr(receiver),
+                            _ => self.lower_lvalue_ptr(receiver, *span),
                         };
                         let idx_id = self.lower_expr(index);
                         self.emit(
@@ -3108,27 +3108,58 @@ impl<'a> FunctionLoweringContext<'a> {
                     return res;
                 }
 
-                let mut arg_vals = Vec::new();
-                for a in args {
-                    arg_vals.push(self.lower_expr(&a.value));
-                }
-
-                if let Some(fn_name) = direct_name {
-                    let target_fn_name = if let Some(fn_sym) =
-                        self.symbols.lookup_function(&fn_name).or_else(|| {
-                            if let ExprKind::Path(path) = &callee.kind {
-                                if path.len() >= 2 {
-                                    self.symbols.lookup_type_method(
+                let found_fn_sym = direct_name.and_then(|fn_name| {
+                    self.symbols.lookup_function(&fn_name).or_else(|| {
+                        if let ExprKind::Path(path) = &callee.kind {
+                            if path.len() >= 2 {
+                                self.symbols
+                                    .lookup_type_method(
                                         &path[path.len() - 2],
                                         &path[path.len() - 1],
                                     )
-                                } else {
-                                    None
-                                }
+                                    .or_else(|| {
+                                        self.symbols
+                                            .lookup_module(&path[0])
+                                            .and_then(|m| m.functions.get(&path[1]))
+                                    })
                             } else {
                                 None
                             }
-                        }) {
+                        } else {
+                            None
+                        }
+                    })
+                });
+
+                let mut arg_vals = Vec::new();
+                for (i, a) in args.iter().enumerate() {
+                    let is_inout = found_fn_sym
+                        .and_then(|f| f.params.get(i))
+                        .is_some_and(|p| p.mode == ifa_ast::ParamMode::InOut)
+                        || matches!(
+                            &a.value.kind,
+                            ExprKind::Unary {
+                                op: UnaryOp::InOut,
+                                ..
+                            }
+                        );
+                    let val = if is_inout {
+                        let inner = match &a.value.kind {
+                            ExprKind::Unary {
+                                op: UnaryOp::InOut,
+                                expr,
+                            } => expr.as_ref(),
+                            _ => &a.value,
+                        };
+                        self.lower_lvalue_ptr(inner, span)
+                    } else {
+                        self.lower_expr(&a.value)
+                    };
+                    arg_vals.push(val);
+                }
+
+                if let Some(fn_name) = direct_name {
+                    let target_fn_name = if let Some(fn_sym) = found_fn_sym {
                         if !fn_sym.generics.is_empty() {
                             if let Some(call_args) = self.symbols.call_instantiations.get(&span) {
                                 let concrete_args: Vec<_> = call_args
@@ -3317,6 +3348,10 @@ impl<'a> FunctionLoweringContext<'a> {
                     } else {
                         let target_fn_name =
                             self.resolve_method_call_target(receiver, *method, span);
+                        let target_fn_sym = self
+                            .symbols
+                            .lookup_function(&target_fn_name)
+                            .or_else(|| self.symbols.lookup_function(method));
                         let is_inout = self.is_method_receiver_inout(receiver, *method, span);
                         let rec_val = if is_inout {
                             self.lower_lvalue_ptr(receiver, span)
@@ -3324,8 +3359,31 @@ impl<'a> FunctionLoweringContext<'a> {
                             lhs
                         };
                         let mut arg_vals = vec![rec_val];
-                        for a in args {
-                            arg_vals.push(self.lower_expr(&a.value));
+                        for (i, a) in args.iter().enumerate() {
+                            let param_idx = i + 1;
+                            let is_arg_inout = target_fn_sym
+                                .and_then(|f| f.params.get(param_idx))
+                                .is_some_and(|p| p.mode == ifa_ast::ParamMode::InOut)
+                                || matches!(
+                                    &a.value.kind,
+                                    ExprKind::Unary {
+                                        op: UnaryOp::InOut,
+                                        ..
+                                    }
+                                );
+                            let val = if is_arg_inout {
+                                let inner = match &a.value.kind {
+                                    ExprKind::Unary {
+                                        op: UnaryOp::InOut,
+                                        expr,
+                                    } => expr.as_ref(),
+                                    _ => &a.value,
+                                };
+                                self.lower_lvalue_ptr(inner, span)
+                            } else {
+                                self.lower_expr(&a.value)
+                            };
+                            arg_vals.push(val);
                         }
 
                         let r = self.alloc_value();
@@ -3424,6 +3482,10 @@ impl<'a> FunctionLoweringContext<'a> {
                     res
                 } else {
                     let target_fn_name = self.resolve_method_call_target(receiver, *method, span);
+                    let target_fn_sym = self
+                        .symbols
+                        .lookup_function(&target_fn_name)
+                        .or_else(|| self.symbols.lookup_function(method));
                     let is_inout = self.is_method_receiver_inout(receiver, *method, span);
                     let rec_val = if is_inout {
                         self.lower_lvalue_ptr(receiver, span)
@@ -3431,8 +3493,31 @@ impl<'a> FunctionLoweringContext<'a> {
                         self.lower_expr(receiver)
                     };
                     let mut arg_vals = vec![rec_val];
-                    for a in args {
-                        arg_vals.push(self.lower_expr(&a.value));
+                    for (i, a) in args.iter().enumerate() {
+                        let param_idx = i + 1;
+                        let is_arg_inout = target_fn_sym
+                            .and_then(|f| f.params.get(param_idx))
+                            .is_some_and(|p| p.mode == ifa_ast::ParamMode::InOut)
+                            || matches!(
+                                &a.value.kind,
+                                ExprKind::Unary {
+                                    op: UnaryOp::InOut,
+                                    ..
+                                }
+                            );
+                        let val = if is_arg_inout {
+                            let inner = match &a.value.kind {
+                                ExprKind::Unary {
+                                    op: UnaryOp::InOut,
+                                    expr,
+                                } => expr.as_ref(),
+                                _ => &a.value,
+                            };
+                            self.lower_lvalue_ptr(inner, span)
+                        } else {
+                            self.lower_expr(&a.value)
+                        };
+                        arg_vals.push(val);
                     }
 
                     let is_target_blocking =
