@@ -1,5 +1,8 @@
 //! Deterministic Cryptographic primitives for IFA standard library.
 
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -266,6 +269,39 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Compare two byte slices in constant time to prevent side-channel timing attacks.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Encode bytes to URL-safe Base64 without padding according to RFC 4648 / RFC 7515 (JWS).
+pub fn base64url_encode(data: &[u8]) -> String {
+    let b64 = base64_encode(data);
+    b64.replace('+', "-")
+        .replace('/', "_")
+        .trim_end_matches('=')
+        .to_string()
+}
+
+/// Decode URL-safe Base64 string (with or without padding) according to RFC 4648 / RFC 7515 (JWS).
+pub fn base64url_decode(input: &str) -> Result<Vec<u8>, String> {
+    let mut s = input.trim().replace('-', "+").replace('_', "/");
+    match s.len() % 4 {
+        2 => s.push_str("=="),
+        3 => s.push('='),
+        0 => {}
+        _ => return Err("Invalid base64url length".to_string()),
+    }
+    base64_decode(&s)
+}
+
 /// Compute Sec-WebSocket-Accept key from client Sec-WebSocket-Key per RFC 6455 section 1.3.
 pub fn websocket_accept_key(client_key: &str) -> String {
     const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -455,6 +491,212 @@ pub fn pbkdf2_hmac_sha256_hex(
     to_hex(&derived)
 }
 
+/// JWT claims representing standard RFC 7519 registered claims and arbitrary custom fields.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct JwtClaims {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aud: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exp: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nbf: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iat: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
+    #[serde(flatten)]
+    pub custom: BTreeMap<String, serde_json::Value>,
+}
+
+impl JwtClaims {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_sub(mut self, sub: impl Into<String>) -> Self {
+        self.sub = Some(sub.into());
+        self
+    }
+
+    pub fn with_exp(mut self, exp: u64) -> Self {
+        self.exp = Some(exp);
+        self
+    }
+
+    pub fn with_nbf(mut self, nbf: u64) -> Self {
+        self.nbf = Some(nbf);
+        self
+    }
+
+    pub fn with_iat(mut self, iat: u64) -> Self {
+        self.iat = Some(iat);
+        self
+    }
+
+    pub fn with_iss(mut self, iss: impl Into<String>) -> Self {
+        self.iss = Some(iss.into());
+        self
+    }
+
+    pub fn with_aud(mut self, aud: impl Into<String>) -> Self {
+        self.aud = Some(aud.into());
+        self
+    }
+
+    pub fn with_jti(mut self, jti: impl Into<String>) -> Self {
+        self.jti = Some(jti.into());
+        self
+    }
+
+    pub fn with_custom(mut self, key: impl Into<String>, val: serde_json::Value) -> Self {
+        self.custom.insert(key.into(), val);
+        self
+    }
+
+    pub fn get_custom(&self, key: &str) -> Option<&serde_json::Value> {
+        self.custom.get(key)
+    }
+}
+
+/// JWT verification and generation errors (RFC 7519).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JwtError {
+    InvalidFormat,
+    InvalidHeader,
+    UnsupportedAlgorithm(String),
+    InvalidSignature,
+    Expired { expired_at: u64, current_time: u64 },
+    NotYetValid { not_before: u64, current_time: u64 },
+    SerializationError(String),
+}
+
+impl std::fmt::Display for JwtError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidFormat => {
+                write!(f, "Invalid JWT format (expected 3 parts separated by dots)")
+            }
+            Self::InvalidHeader => write!(f, "Invalid JWT header"),
+            Self::UnsupportedAlgorithm(alg) => write!(f, "Unsupported JWT algorithm: {}", alg),
+            Self::InvalidSignature => write!(f, "Invalid JWT HMAC signature"),
+            Self::Expired {
+                expired_at,
+                current_time,
+            } => {
+                write!(
+                    f,
+                    "JWT expired at {} (current time: {})",
+                    expired_at, current_time
+                )
+            }
+            Self::NotYetValid {
+                not_before,
+                current_time,
+            } => {
+                write!(
+                    f,
+                    "JWT not valid before {} (current time: {})",
+                    not_before, current_time
+                )
+            }
+            Self::SerializationError(msg) => write!(f, "JWT JSON serialization error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for JwtError {}
+
+/// JSON Web Token (JWT) HS256 engine according to RFC 7519 and RFC 7515.
+pub struct Jwt;
+
+impl Jwt {
+    /// Sign claims using HS256 (HMAC-SHA256) and secret key.
+    pub fn sign_hs256(secret: &[u8], claims: &JwtClaims) -> Result<String, JwtError> {
+        let header_json = r#"{"alg":"HS256","typ":"JWT"}"#;
+        let header_b64 = base64url_encode(header_json.as_bytes());
+
+        let claims_json = serde_json::to_string(claims)
+            .map_err(|e| JwtError::SerializationError(e.to_string()))?;
+        let claims_b64 = base64url_encode(claims_json.as_bytes());
+
+        let signing_input = format!("{}.{}", header_b64, claims_b64);
+        let sig = hmac_sha256(secret, signing_input.as_bytes());
+        let sig_b64 = base64url_encode(&sig);
+
+        Ok(format!("{}.{}", signing_input, sig_b64))
+    }
+
+    /// Verify HS256 token against secret key, checking expiration and validity time windows.
+    /// `leeway_secs` allows slight clock drift (e.g. 5 to 60 seconds, or 0).
+    pub fn verify_hs256(
+        secret: &[u8],
+        token: &str,
+        current_time_secs: u64,
+        leeway_secs: u64,
+    ) -> Result<JwtClaims, JwtError> {
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(JwtError::InvalidFormat);
+        }
+
+        let header_b64 = parts[0];
+        let claims_b64 = parts[1];
+        let sig_b64 = parts[2];
+
+        // 1. Verify header
+        let header_bytes = base64url_decode(header_b64).map_err(|_| JwtError::InvalidHeader)?;
+        let header_json: serde_json::Value =
+            serde_json::from_slice(&header_bytes).map_err(|_| JwtError::InvalidHeader)?;
+        let alg = header_json
+            .get("alg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if alg != "HS256" {
+            return Err(JwtError::UnsupportedAlgorithm(alg.to_string()));
+        }
+
+        // 2. Verify signature in constant time
+        let signing_input = format!("{}.{}", header_b64, claims_b64);
+        let expected_sig = hmac_sha256(secret, signing_input.as_bytes());
+        let expected_sig_b64 = base64url_encode(&expected_sig);
+
+        if !constant_time_eq(sig_b64.as_bytes(), expected_sig_b64.as_bytes()) {
+            return Err(JwtError::InvalidSignature);
+        }
+
+        // 3. Decode claims
+        let claims_bytes = base64url_decode(claims_b64).map_err(|_| JwtError::InvalidFormat)?;
+        let claims: JwtClaims = serde_json::from_slice(&claims_bytes)
+            .map_err(|e| JwtError::SerializationError(e.to_string()))?;
+
+        // 4. Validate exp (Expiration Time)
+        if let Some(exp) = claims.exp {
+            if current_time_secs > exp.saturating_add(leeway_secs) {
+                return Err(JwtError::Expired {
+                    expired_at: exp,
+                    current_time: current_time_secs,
+                });
+            }
+        }
+
+        // 5. Validate nbf (Not Before)
+        if let Some(nbf) = claims.nbf {
+            if current_time_secs.saturating_add(leeway_secs) < nbf {
+                return Err(JwtError::NotYetValid {
+                    not_before: nbf,
+                    current_time: current_time_secs,
+                });
+            }
+        }
+
+        Ok(claims)
+    }
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -557,6 +799,94 @@ mod tests {
         assert_eq!(
             pbkdf2_hmac_sha256_hex(password, salt, 2, 32),
             "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
+        );
+    }
+
+    #[test]
+    fn test_base64url_and_constant_time_eq() {
+        assert!(constant_time_eq(b"hello world", b"hello world"));
+        assert!(!constant_time_eq(b"hello world", b"hello word!"));
+        assert!(!constant_time_eq(b"short", b"longer string"));
+
+        let payload = b"{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+        let enc = base64url_encode(payload);
+        assert_eq!(enc, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9");
+        let dec = base64url_decode(&enc).unwrap();
+        assert_eq!(dec, payload);
+
+        // Test with bytes that produce + and / in standard base64
+        let binary_data = vec![251, 255, 254, 253]; // produces standard + and /
+        let url_enc = base64url_encode(&binary_data);
+        assert!(!url_enc.contains('+'));
+        assert!(!url_enc.contains('/'));
+        assert!(!url_enc.contains('='));
+        let dec_binary = base64url_decode(&url_enc).unwrap();
+        assert_eq!(dec_binary, binary_data);
+    }
+
+    #[test]
+    fn test_jwt_sign_and_verify() {
+        let secret = b"super-secret-key-for-ifa-jwt-auth";
+        let claims = JwtClaims::new()
+            .with_sub("user_123")
+            .with_iss("ifa-auth-service")
+            .with_iat(1000)
+            .with_nbf(1000)
+            .with_exp(2000)
+            .with_custom("role", serde_json::json!("admin"))
+            .with_custom("email", serde_json::json!("alice@ifa.dev"));
+
+        // Sign token
+        let token = Jwt::sign_hs256(secret, &claims).expect("Signing must succeed");
+        assert_eq!(token.split('.').count(), 3);
+
+        // Verify valid token at t = 1500
+        let verified =
+            Jwt::verify_hs256(secret, &token, 1500, 0).expect("Verification must succeed");
+        assert_eq!(verified.sub.as_deref(), Some("user_123"));
+        assert_eq!(verified.iss.as_deref(), Some("ifa-auth-service"));
+        assert_eq!(
+            verified.get_custom("role"),
+            Some(&serde_json::json!("admin"))
+        );
+        assert_eq!(
+            verified.get_custom("email"),
+            Some(&serde_json::json!("alice@ifa.dev"))
+        );
+
+        // Verification fails with invalid secret
+        let wrong_secret = b"wrong-secret-key";
+        let err_sig = Jwt::verify_hs256(wrong_secret, &token, 1500, 0).unwrap_err();
+        assert_eq!(err_sig, JwtError::InvalidSignature);
+
+        // Verification fails when expired (t = 2500)
+        let err_exp = Jwt::verify_hs256(secret, &token, 2500, 0).unwrap_err();
+        assert_eq!(
+            err_exp,
+            JwtError::Expired {
+                expired_at: 2000,
+                current_time: 2500
+            }
+        );
+
+        // Verification succeeds with leeway (exp 2000, t = 2050, leeway = 60)
+        let verified_leeway = Jwt::verify_hs256(secret, &token, 2050, 60);
+        assert!(verified_leeway.is_ok());
+
+        // Verification fails before not_before (t = 500)
+        let err_nbf = Jwt::verify_hs256(secret, &token, 500, 0).unwrap_err();
+        assert_eq!(
+            err_nbf,
+            JwtError::NotYetValid {
+                not_before: 1000,
+                current_time: 500
+            }
+        );
+
+        // Invalid format
+        assert_eq!(
+            Jwt::verify_hs256(secret, "invalid.token", 1500, 0).unwrap_err(),
+            JwtError::InvalidFormat
         );
     }
 }

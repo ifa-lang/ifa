@@ -13,9 +13,10 @@ pub mod sync;
 
 pub use collections::{BinaryHeap, ByteBuffer, Deque, List, Map, Set, StringBuilder};
 pub use crypto::{
-    base64_decode, base64_encode, blake3, blake3_hex, hmac_sha1, hmac_sha1_hex, hmac_sha256,
-    hmac_sha256_hex, hotp, pbkdf2_hmac_sha256, pbkdf2_hmac_sha256_hex, sha1, sha1_hex, sha256,
-    sha256_hex, totp, totp_verify, websocket_accept_key,
+    base64_decode, base64_encode, base64url_decode, base64url_encode, blake3, blake3_hex,
+    constant_time_eq, hmac_sha1, hmac_sha1_hex, hmac_sha256, hmac_sha256_hex, hotp,
+    pbkdf2_hmac_sha256, pbkdf2_hmac_sha256_hex, sha1, sha1_hex, sha256, sha256_hex, totp,
+    totp_verify, websocket_accept_key, Jwt, JwtClaims, JwtError,
 };
 pub use csv::{decode as decode_csv, encode as encode_csv, CsvTable};
 pub use fmt::{

@@ -1,3 +1,4 @@
+use crate::crypto::{constant_time_eq, Jwt, JwtClaims, JwtError};
 use crate::json::{self, JsonValue};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -408,6 +409,26 @@ impl HttpRequest {
         self
     }
 
+    /// Returns the raw query string part of the path (after '?'), if any.
+    pub fn query_string(&self) -> Option<&str> {
+        self.path.split_once('?').map(|(_, q)| q)
+    }
+
+    /// Extract query parameter by key from the request path query string.
+    pub fn query_param(&self, key: &str) -> Option<String> {
+        let qs = self.query_string()?;
+        for pair in qs.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == key {
+                    return Some(url_decode(v).unwrap_or_else(|_| v.to_string()));
+                }
+            } else if pair == key {
+                return Some(String::new());
+            }
+        }
+        None
+    }
+
     pub fn header(mut self, key: &str, val: &str) -> Self {
         self.headers.set(key, val);
         self
@@ -516,6 +537,10 @@ impl HttpResponse {
 
     pub fn bad_request() -> Self {
         Self::new(HttpStatus::BAD_REQUEST)
+    }
+
+    pub fn forbidden() -> Self {
+        Self::new(HttpStatus::FORBIDDEN)
     }
 
     pub fn not_found() -> Self {
@@ -992,6 +1017,32 @@ impl HttpRequest {
     /// Returns Some(token) if format is "Bearer <token>".
     pub fn bearer_token(&self) -> Option<String> {
         self.authorization().and_then(parse_bearer_token)
+    }
+
+    /// Verify Bearer token as an HS256 JWT (RFC 7519), returning validated claims.
+    pub fn verify_jwt_bearer(
+        &self,
+        secret: &[u8],
+        current_time_secs: u64,
+    ) -> Result<JwtClaims, JwtError> {
+        let token = self.bearer_token().ok_or(JwtError::InvalidFormat)?;
+        Jwt::verify_hs256(secret, &token, current_time_secs, 0)
+    }
+
+    /// Extract CSRF token from headers (X-CSRF-Token, X-XSRF-Token) or query parameter (_csrf).
+    pub fn csrf_token(&self) -> Option<String> {
+        self.headers
+            .get("x-csrf-token")
+            .or_else(|| self.headers.get("x-xsrf-token"))
+            .map(|s| s.to_string())
+            .or_else(|| self.query_param("_csrf").map(|s| s.to_string()))
+    }
+
+    /// Validate CSRF token against expected session token in constant time.
+    pub fn verify_csrf(&self, expected_token: &str) -> bool {
+        self.csrf_token()
+            .map(|t| constant_time_eq(t.as_bytes(), expected_token.as_bytes()))
+            .unwrap_or(false)
     }
 
     /// Check if this is a CORS preflight OPTIONS request.
@@ -5154,5 +5205,49 @@ mod tests {
         );
 
         server.stop();
+    }
+
+    #[test]
+    fn test_jwt_and_csrf_http_security() {
+        let secret = b"ifa-secure-jwt-secret-key-32b!";
+        let claims = JwtClaims::new()
+            .with_sub("user-99")
+            .with_exp(3000)
+            .with_custom("tenant", serde_json::json!("enterprise"));
+
+        let token = Jwt::sign_hs256(secret, &claims).unwrap();
+
+        // 1. JWT Bearer verification
+        let req = HttpRequest::new(HttpMethod::Get, "/api/profile?tab=security&_csrf=token_xyz")
+            .header("Authorization", &format!("Bearer {}", token));
+
+        assert_eq!(req.query_string(), Some("tab=security&_csrf=token_xyz"));
+        assert_eq!(req.query_param("tab"), Some("security".to_string()));
+        assert_eq!(req.query_param("_csrf"), Some("token_xyz".to_string()));
+        assert_eq!(req.bearer_token(), Some(token.clone()));
+
+        let verified_claims = req
+            .verify_jwt_bearer(secret, 2000)
+            .expect("Bearer verification failed");
+        assert_eq!(verified_claims.sub.as_deref(), Some("user-99"));
+        assert_eq!(
+            verified_claims.get_custom("tenant"),
+            Some(&serde_json::json!("enterprise"))
+        );
+
+        // 2. CSRF Token extraction & constant time verification
+        assert_eq!(req.csrf_token(), Some("token_xyz".to_string()));
+        assert!(req.verify_csrf("token_xyz"));
+        assert!(!req.verify_csrf("wrong_csrf_token"));
+
+        // CSRF from header takes precedence
+        let req_header_csrf = HttpRequest::new(HttpMethod::Post, "/api/transfer?_csrf=param_token")
+            .header("X-CSRF-Token", "header_token");
+        assert_eq!(
+            req_header_csrf.csrf_token(),
+            Some("header_token".to_string())
+        );
+        assert!(req_header_csrf.verify_csrf("header_token"));
+        assert!(!req_header_csrf.verify_csrf("param_token"));
     }
 }
