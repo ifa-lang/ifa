@@ -5177,6 +5177,200 @@ pub fn http_should_keep_alive(status_code: i64, headers: List<HttpHeader>) -> bo
     return false;
 }
 
+pub const CIRCUIT_STATE_CLOSED: i64 = 0;
+pub const CIRCUIT_STATE_OPEN: i64 = 1;
+pub const CIRCUIT_STATE_HALF_OPEN: i64 = 2;
+
+pub struct HttpCircuitBreaker {
+    pub state: i64,
+    pub failure_threshold: i64,
+    pub success_threshold: i64,
+    pub recovery_timeout_ms: i64,
+    pub consecutive_failures: i64,
+    pub consecutive_successes: i64,
+    pub last_state_change_ms: i64,
+    pub total_trips: i64,
+    pub total_requests: i64,
+    pub total_rejected: i64
+}
+
+pub fn make_http_circuit_breaker(failure_threshold: i64, success_threshold: i64, recovery_timeout_ms: i64) -> HttpCircuitBreaker {
+    return HttpCircuitBreaker(
+        state: CIRCUIT_STATE_CLOSED,
+        failure_threshold: failure_threshold,
+        success_threshold: success_threshold,
+        recovery_timeout_ms: recovery_timeout_ms,
+        consecutive_failures: 0,
+        consecutive_successes: 0,
+        last_state_change_ms: 0,
+        total_trips: 0,
+        total_requests: 0,
+        total_rejected: 0
+    );
+}
+
+pub fn circuit_breaker_allow_request(inout cb: HttpCircuitBreaker, now_ms: i64) -> bool {
+    if cb.state == CIRCUIT_STATE_CLOSED {
+        cb.total_requests = cb.total_requests + 1;
+        return true;
+    }
+    if cb.state == CIRCUIT_STATE_OPEN {
+        if now_ms - cb.last_state_change_ms >= cb.recovery_timeout_ms {
+            cb.state = CIRCUIT_STATE_HALF_OPEN;
+            cb.consecutive_successes = 0;
+            cb.last_state_change_ms = now_ms;
+            cb.total_requests = cb.total_requests + 1;
+            return true;
+        } else {
+            cb.total_rejected = cb.total_rejected + 1;
+            return false;
+        }
+    }
+    // Half-Open
+    cb.total_requests = cb.total_requests + 1;
+    return true;
+}
+
+pub fn circuit_breaker_record_success(inout cb: HttpCircuitBreaker, now_ms: i64) {
+    if cb.state == CIRCUIT_STATE_HALF_OPEN {
+        cb.consecutive_successes = cb.consecutive_successes + 1;
+        if cb.consecutive_successes >= cb.success_threshold {
+            cb.state = CIRCUIT_STATE_CLOSED;
+            cb.consecutive_failures = 0;
+            cb.consecutive_successes = 0;
+            cb.last_state_change_ms = now_ms;
+        }
+    } else if cb.state == CIRCUIT_STATE_CLOSED {
+        cb.consecutive_failures = 0;
+    }
+}
+
+pub fn circuit_breaker_record_failure(inout cb: HttpCircuitBreaker, now_ms: i64) {
+    if cb.state == CIRCUIT_STATE_CLOSED {
+        cb.consecutive_failures = cb.consecutive_failures + 1;
+        if cb.consecutive_failures >= cb.failure_threshold {
+            cb.state = CIRCUIT_STATE_OPEN;
+            cb.total_trips = cb.total_trips + 1;
+            cb.consecutive_failures = 0;
+            cb.consecutive_successes = 0;
+            cb.last_state_change_ms = now_ms;
+        }
+    } else if cb.state == CIRCUIT_STATE_HALF_OPEN {
+        cb.state = CIRCUIT_STATE_OPEN;
+        cb.total_trips = cb.total_trips + 1;
+        cb.consecutive_failures = 0;
+        cb.consecutive_successes = 0;
+        cb.last_state_change_ms = now_ms;
+    }
+}
+
+pub fn circuit_breaker_record_status(inout cb: HttpCircuitBreaker, status_code: i64, now_ms: i64) {
+    if status_code >= 500 && status_code <= 504 {
+        circuit_breaker_record_failure(inout cb, now_ms);
+    } else {
+        circuit_breaker_record_success(inout cb, now_ms);
+    }
+}
+
+pub fn circuit_breaker_reset(inout cb: HttpCircuitBreaker) {
+    cb.state = CIRCUIT_STATE_CLOSED;
+    cb.consecutive_failures = 0;
+    cb.consecutive_successes = 0;
+    cb.last_state_change_ms = 0;
+}
+
+pub fn test_net_http_circuit_breaker() -> bool {
+    mut cb = make_http_circuit_breaker(3, 2, 5000);
+    if cb.state != CIRCUIT_STATE_CLOSED
+        || cb.total_trips != 0
+        || cb.total_requests != 0
+        || cb.total_rejected != 0 {
+        return false;
+    }
+
+    // 1. Initial requests pass
+    if !circuit_breaker_allow_request(inout cb, 1000) {
+        return false;
+    }
+    circuit_breaker_record_status(inout cb, 200, 1010);
+    if cb.state != CIRCUIT_STATE_CLOSED || cb.consecutive_failures != 0 {
+        return false;
+    }
+
+    // 2. Failures below threshold
+    circuit_breaker_record_status(inout cb, 503, 1020);
+    circuit_breaker_record_status(inout cb, 502, 1030);
+    if cb.consecutive_failures != 2 || cb.state != CIRCUIT_STATE_CLOSED {
+        return false;
+    }
+
+    // 3. Third failure trips circuit to Open
+    circuit_breaker_record_status(inout cb, 500, 1040);
+    if cb.state != CIRCUIT_STATE_OPEN || cb.total_trips != 1 {
+        return false;
+    }
+
+    // 4. Fast-failing while Open before recovery timeout
+    if circuit_breaker_allow_request(inout cb, 2000) {
+        return false;
+    }
+    if cb.total_rejected != 1 {
+        return false;
+    }
+
+    // 5. Expiration of recovery timeout (1040 + 5000 = 6040 ms -> test at 6100 ms)
+    if !circuit_breaker_allow_request(inout cb, 6100) {
+        return false;
+    }
+    if cb.state != CIRCUIT_STATE_HALF_OPEN {
+        return false;
+    }
+
+    // 6. First probe success in Half-Open
+    circuit_breaker_record_status(inout cb, 200, 6110);
+    if cb.state != CIRCUIT_STATE_HALF_OPEN || cb.consecutive_successes != 1 {
+        return false;
+    }
+
+    // 7. Second probe success closes circuit (fully recovered)
+    circuit_breaker_record_status(inout cb, 200, 6120);
+    if cb.state != CIRCUIT_STATE_CLOSED
+        || cb.consecutive_successes != 0
+        || cb.consecutive_failures != 0 {
+        return false;
+    }
+
+    // 8. Re-trip and test half-open probe failure
+    circuit_breaker_record_failure(inout cb, 7000);
+    circuit_breaker_record_failure(inout cb, 7010);
+    circuit_breaker_record_failure(inout cb, 7020);
+    if cb.state != CIRCUIT_STATE_OPEN || cb.total_trips != 2 {
+        return false;
+    }
+
+    // Wait and transition to half-open
+    if !circuit_breaker_allow_request(inout cb, 13000) {
+        return false;
+    }
+    if cb.state != CIRCUIT_STATE_HALF_OPEN {
+        return false;
+    }
+
+    // Probe fails: re-trips immediately to open
+    circuit_breaker_record_failure(inout cb, 13010);
+    if cb.state != CIRCUIT_STATE_OPEN || cb.total_trips != 3 {
+        return false;
+    }
+
+    // 9. Reset
+    circuit_breaker_reset(inout cb);
+    if cb.state != CIRCUIT_STATE_CLOSED || cb.consecutive_failures != 0 {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn test_net_http_connection_pooling_and_keep_alive() -> bool {
     // 1. Initialize Connection Pool
     mut pool = make_http_connection_pool(2, 4, 10000);
@@ -5452,7 +5646,8 @@ pub fn test_net_all() -> bool {
     && test_net_websocket_frame_demux_and_fragmentation()
     && test_net_rate_limiting_and_mime_resolver()
     && test_net_http_reverse_proxy_gateway_and_load_balancer()
-    && test_net_http_connection_pooling_and_keep_alive();
+    && test_net_http_connection_pooling_and_keep_alive()
+    && test_net_http_circuit_breaker();
 }
 
 pub fn main() {
@@ -5486,7 +5681,8 @@ pub fn main() {
     let t28 = test_net_rate_limiting_and_mime_resolver();
     let t29 = test_net_http_reverse_proxy_gateway_and_load_balancer();
     let t30 = test_net_http_connection_pooling_and_keep_alive();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 {
+    let t31 = test_net_http_circuit_breaker();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");

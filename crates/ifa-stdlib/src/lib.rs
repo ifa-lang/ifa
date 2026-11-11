@@ -37,11 +37,11 @@ pub use http::{
     http_should_keep_alive, is_hop_by_hop_header, matches_if_match, matches_if_none_match,
     negotiate_content_type, parse_accept_header, parse_basic_auth, parse_bearer_token,
     parse_cookies, parse_form_urlencoded, parse_multipart, parse_sse_events, read_http_response,
-    url_decode, url_encode, AcceptItem, CorsConfig, HttpClient, HttpConnectionPool,
-    HttpConnectionPoolConfig, HttpHandler, HttpHeaders, HttpLoadBalancer, HttpMethod,
-    HttpProxyGateway, HttpRequest, HttpResponse, HttpRoute, HttpRouter, HttpServer, HttpStatus,
-    LoadBalancingStrategy, MultipartBuilder, MultipartPart, PooledConnection, RouteSegment,
-    SseEvent, UpstreamBackend,
+    url_decode, url_encode, AcceptItem, CircuitState, CorsConfig, HttpCircuitBreaker,
+    HttpCircuitBreakerConfig, HttpClient, HttpConnectionPool, HttpConnectionPoolConfig,
+    HttpHandler, HttpHeaders, HttpLoadBalancer, HttpMethod, HttpProxyGateway, HttpRequest,
+    HttpResponse, HttpRoute, HttpRouter, HttpServer, HttpStatus, LoadBalancingStrategy,
+    MultipartBuilder, MultipartPart, PooledConnection, RouteSegment, SseEvent, UpstreamBackend,
 };
 pub use io::{BufferedReader, BufferedWriter, MemoryStream};
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};

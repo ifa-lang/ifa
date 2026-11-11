@@ -1973,13 +1973,18 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_net_http_circuit_breaker ... ok"),
+        "Std net http circuit breaker test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("263 passed; 0 failed"),
-        "Expected 263 passed std unit tests, got:\n{}",
+        stdout.contains("265 passed; 0 failed"),
+        "Expected 265 passed std unit tests, got:\n{}",
         stdout
     );
 }

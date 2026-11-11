@@ -58,6 +58,14 @@ impl HttpStatus {
     pub const FORBIDDEN: HttpStatus = HttpStatus(403);
     pub const NOT_FOUND: HttpStatus = HttpStatus(404);
     pub const INTERNAL_SERVER_ERROR: HttpStatus = HttpStatus(500);
+    pub const BAD_GATEWAY: HttpStatus = HttpStatus(502);
+    pub const SERVICE_UNAVAILABLE: HttpStatus = HttpStatus(503);
+    pub const GATEWAY_TIMEOUT: HttpStatus = HttpStatus(504);
+
+    /// Numeric HTTP status code.
+    pub fn code(&self) -> u16 {
+        self.0
+    }
 
     pub fn reason_phrase(&self) -> &'static str {
         match self.0 {
@@ -70,6 +78,9 @@ impl HttpStatus {
             403 => "Forbidden",
             404 => "Not Found",
             500 => "Internal Server Error",
+            502 => "Bad Gateway",
+            503 => "Service Unavailable",
+            504 => "Gateway Timeout",
             _ => "Unknown",
         }
     }
@@ -2532,6 +2543,29 @@ impl HttpClient {
     ) -> io::Result<HttpResponse> {
         pool.send_request(req, host, port)
     }
+
+    /// Send request protected by a circuit breaker.
+    pub fn send_with_circuit_breaker(
+        &self,
+        breaker: &mut HttpCircuitBreaker,
+        req: &HttpRequest,
+        host: &str,
+        port: u16,
+    ) -> io::Result<HttpResponse> {
+        breaker.execute(|| self.send(req, host, port))
+    }
+
+    /// Send request utilizing connection pooling protected by a circuit breaker.
+    pub fn send_pooled_with_circuit_breaker(
+        &self,
+        breaker: &mut HttpCircuitBreaker,
+        pool: &mut HttpConnectionPool,
+        req: &HttpRequest,
+        host: &str,
+        port: u16,
+    ) -> io::Result<HttpResponse> {
+        breaker.execute(|| pool.send_request(req, host, port))
+    }
 }
 
 impl HttpProxyGateway {
@@ -2553,6 +2587,258 @@ impl HttpProxyGateway {
         );
         let upstream_resp = pool.send_request(&upstream_req, &backend.host, backend.port)?;
         Ok(self.prepare_client_response(upstream_resp))
+    }
+
+    /// Forward an incoming request protected by a circuit breaker.
+    pub fn forward_with_circuit_breaker(
+        &self,
+        breaker: &mut HttpCircuitBreaker,
+        pool: &mut HttpConnectionPool,
+        req: &HttpRequest,
+        client_ip: &str,
+        client_proto: &str,
+        backend: &UpstreamBackend,
+    ) -> io::Result<HttpResponse> {
+        breaker.execute(|| self.forward_pooled(pool, req, client_ip, client_proto, backend))
+    }
+}
+
+/// State of the HTTP Circuit Breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    /// Circuit is closed; normal operation, all requests forwarded.
+    Closed,
+    /// Circuit is open; upstream is failing, fast-failing requests.
+    Open,
+    /// Circuit is half-open; probe requests allowed to test upstream recovery.
+    HalfOpen,
+}
+
+/// Configuration options for the HTTP Circuit Breaker.
+#[derive(Debug, Clone)]
+pub struct HttpCircuitBreakerConfig {
+    /// Number of consecutive failures before tripping the circuit from Closed to Open.
+    pub failure_threshold: usize,
+    /// Number of consecutive successes in HalfOpen state before closing the circuit.
+    pub success_threshold: usize,
+    /// Duration in milliseconds the circuit remains Open before transitioning to HalfOpen.
+    pub recovery_timeout_ms: u64,
+    /// Upstream HTTP status codes treated as failures (e.g. 500, 502, 503, 504).
+    pub failure_status_codes: Vec<u16>,
+}
+
+impl Default for HttpCircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            success_threshold: 2,
+            recovery_timeout_ms: 10_000,
+            failure_status_codes: vec![500, 502, 503, 504],
+        }
+    }
+}
+
+/// HTTP Circuit Breaker implementing the standard resilience pattern for downstream calls.
+#[derive(Debug)]
+pub struct HttpCircuitBreaker {
+    config: HttpCircuitBreakerConfig,
+    state: CircuitState,
+    consecutive_failures: usize,
+    consecutive_successes: usize,
+    last_state_change: Instant,
+    last_failure: Option<Instant>,
+    total_trips: u64,
+    total_requests: u64,
+    total_rejected: u64,
+}
+
+impl Default for HttpCircuitBreaker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HttpCircuitBreaker {
+    /// Create a new circuit breaker with default configuration.
+    pub fn new() -> Self {
+        Self::with_config(HttpCircuitBreakerConfig::default())
+    }
+
+    /// Create a new circuit breaker with custom configuration.
+    pub fn with_config(config: HttpCircuitBreakerConfig) -> Self {
+        Self {
+            config,
+            state: CircuitState::Closed,
+            consecutive_failures: 0,
+            consecutive_successes: 0,
+            last_state_change: Instant::now(),
+            last_failure: None,
+            total_trips: 0,
+            total_requests: 0,
+            total_rejected: 0,
+        }
+    }
+
+    /// Current circuit state.
+    pub fn state(&self) -> CircuitState {
+        self.state
+    }
+
+    /// True if circuit is closed (healthy).
+    pub fn is_closed(&self) -> bool {
+        self.state == CircuitState::Closed
+    }
+
+    /// True if circuit is open (tripped).
+    pub fn is_open(&self) -> bool {
+        self.state == CircuitState::Open
+    }
+
+    /// True if circuit is half-open (probing).
+    pub fn is_half_open(&self) -> bool {
+        self.state == CircuitState::HalfOpen
+    }
+
+    /// Total number of times the circuit tripped from Closed/HalfOpen to Open.
+    pub fn total_trips(&self) -> u64 {
+        self.total_trips
+    }
+
+    /// Total requests allowed through.
+    pub fn total_requests(&self) -> u64 {
+        self.total_requests
+    }
+
+    /// Total requests rejected while open.
+    pub fn total_rejected(&self) -> u64 {
+        self.total_rejected
+    }
+
+    /// Consecutive failures count.
+    pub fn consecutive_failures(&self) -> usize {
+        self.consecutive_failures
+    }
+
+    /// Consecutive successes count.
+    pub fn consecutive_successes(&self) -> usize {
+        self.consecutive_successes
+    }
+
+    /// Determine if an outgoing request is allowed.
+    pub fn allow_request(&mut self) -> bool {
+        match self.state {
+            CircuitState::Closed => {
+                self.total_requests += 1;
+                true
+            }
+            CircuitState::Open => {
+                if self.last_state_change.elapsed()
+                    >= Duration::from_millis(self.config.recovery_timeout_ms)
+                {
+                    self.state = CircuitState::HalfOpen;
+                    self.consecutive_successes = 0;
+                    self.last_state_change = Instant::now();
+                    self.total_requests += 1;
+                    true
+                } else {
+                    self.total_rejected += 1;
+                    false
+                }
+            }
+            CircuitState::HalfOpen => {
+                self.total_requests += 1;
+                true
+            }
+        }
+    }
+
+    /// Record a successful request outcome.
+    pub fn record_success(&mut self) {
+        match self.state {
+            CircuitState::HalfOpen => {
+                self.consecutive_successes += 1;
+                if self.consecutive_successes >= self.config.success_threshold {
+                    self.state = CircuitState::Closed;
+                    self.consecutive_failures = 0;
+                    self.consecutive_successes = 0;
+                    self.last_state_change = Instant::now();
+                }
+            }
+            CircuitState::Closed => {
+                self.consecutive_failures = 0;
+            }
+            CircuitState::Open => {}
+        }
+    }
+
+    /// Record a failure outcome (network error or server 5xx error).
+    pub fn record_failure(&mut self) {
+        self.last_failure = Some(Instant::now());
+        match self.state {
+            CircuitState::Closed => {
+                self.consecutive_failures += 1;
+                if self.consecutive_failures >= self.config.failure_threshold {
+                    self.state = CircuitState::Open;
+                    self.total_trips += 1;
+                    self.consecutive_failures = 0;
+                    self.consecutive_successes = 0;
+                    self.last_state_change = Instant::now();
+                }
+            }
+            CircuitState::HalfOpen => {
+                self.state = CircuitState::Open;
+                self.total_trips += 1;
+                self.consecutive_failures = 0;
+                self.consecutive_successes = 0;
+                self.last_state_change = Instant::now();
+            }
+            CircuitState::Open => {}
+        }
+    }
+
+    /// Record response, classifying status code according to failure_status_codes.
+    pub fn record_response(&mut self, resp: &HttpResponse) {
+        if self
+            .config
+            .failure_status_codes
+            .contains(&resp.status.code())
+        {
+            self.record_failure();
+        } else {
+            self.record_success();
+        }
+    }
+
+    /// Execute a request closure within the protection of this circuit breaker.
+    pub fn execute<F>(&mut self, f: F) -> io::Result<HttpResponse>
+    where
+        F: FnOnce() -> io::Result<HttpResponse>,
+    {
+        if !self.allow_request() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "HTTP circuit breaker is OPEN",
+            ));
+        }
+        match f() {
+            Ok(resp) => {
+                self.record_response(&resp);
+                Ok(resp)
+            }
+            Err(err) => {
+                self.record_failure();
+                Err(err)
+            }
+        }
+    }
+
+    /// Reset circuit breaker to default Closed state with zeroed counters.
+    pub fn reset(&mut self) {
+        self.state = CircuitState::Closed;
+        self.consecutive_failures = 0;
+        self.consecutive_successes = 0;
+        self.last_state_change = Instant::now();
+        self.last_failure = None;
     }
 }
 
@@ -3258,6 +3544,152 @@ mod tests {
         pool.clear();
         assert_eq!(pool.total_idle(), 0);
         assert_eq!(pool.total_active(), 0);
+
+        server.stop();
+    }
+
+    #[test]
+    fn test_http_circuit_breaker_lifecycle() {
+        let config = HttpCircuitBreakerConfig {
+            failure_threshold: 3,
+            success_threshold: 2,
+            recovery_timeout_ms: 50,
+            failure_status_codes: vec![500, 502, 503],
+        };
+
+        let mut cb = HttpCircuitBreaker::with_config(config);
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.is_closed());
+        assert!(!cb.is_open());
+        assert!(!cb.is_half_open());
+        assert_eq!(cb.total_trips(), 0);
+
+        // 1. Initial success in Closed state
+        assert!(cb.allow_request());
+        cb.record_success();
+        assert_eq!(cb.consecutive_failures(), 0);
+        assert_eq!(cb.state(), CircuitState::Closed);
+
+        // 2. Consecutive failures below threshold
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.consecutive_failures(), 2);
+        assert_eq!(cb.state(), CircuitState::Closed);
+
+        // 3. 3rd failure trips the circuit open
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert!(cb.is_open());
+        assert_eq!(cb.total_trips(), 1);
+
+        // 4. Immediate calls rejected (Fast fail)
+        assert!(!cb.allow_request());
+        assert_eq!(cb.total_rejected(), 1);
+
+        // Execute helper returns Err
+        let exec_res = cb.execute(|| Ok(HttpResponse::ok().text("test")));
+        assert!(exec_res.is_err());
+        assert_eq!(cb.total_rejected(), 2);
+
+        // 5. Wait for recovery timeout to transition to HalfOpen
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(cb.allow_request()); // Transitions to HalfOpen
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        assert!(cb.is_half_open());
+
+        // 6. First probe success
+        cb.record_success();
+        assert_eq!(cb.consecutive_successes(), 1);
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // 7. Second probe success restores Closed state
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.is_closed());
+        assert_eq!(cb.consecutive_successes(), 0);
+        assert_eq!(cb.consecutive_failures(), 0);
+
+        // 8. Test half-open probe failure trips back to open
+        cb.record_failure();
+        cb.record_failure();
+        cb.record_failure(); // trips to open
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert_eq!(cb.total_trips(), 2);
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(cb.allow_request()); // Transitions to HalfOpen
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // Failure during HalfOpen re-trips immediately
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert_eq!(cb.total_trips(), 3);
+
+        // 9. Reset
+        cb.reset();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert_eq!(cb.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn test_http_circuit_breaker_client_server_integration() {
+        let mut server = HttpServer::new(0);
+        server.get("/api/healthy", |_req| {
+            HttpResponse::ok().text("healthy service")
+        });
+        server.get("/api/failing", |_req| {
+            HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE).text("service unavailable")
+        });
+
+        let bound = server.listen_background().expect("Server listen failed");
+        let port = bound.port();
+
+        let client = HttpClient::new();
+        let config = HttpCircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: 1,
+            recovery_timeout_ms: 50,
+            failure_status_codes: vec![500, 502, 503],
+        };
+        let mut breaker = HttpCircuitBreaker::with_config(config);
+
+        // Healthy requests pass
+        let req_ok = HttpRequest::new(HttpMethod::Get, "/api/healthy");
+        let resp_ok = client
+            .send_with_circuit_breaker(&mut breaker, &req_ok, "127.0.0.1", port)
+            .expect("Healthy request failed");
+        assert_eq!(resp_ok.status, HttpStatus::OK);
+        assert!(breaker.is_closed());
+
+        // Failing requests record failure and trip breaker
+        let req_fail = HttpRequest::new(HttpMethod::Get, "/api/failing");
+        let resp1 = client
+            .send_with_circuit_breaker(&mut breaker, &req_fail, "127.0.0.1", port)
+            .expect("First 503 received");
+        assert_eq!(resp1.status, HttpStatus::SERVICE_UNAVAILABLE);
+        assert_eq!(breaker.consecutive_failures(), 1);
+
+        let resp2 = client
+            .send_with_circuit_breaker(&mut breaker, &req_fail, "127.0.0.1", port)
+            .expect("Second 503 received");
+        assert_eq!(resp2.status, HttpStatus::SERVICE_UNAVAILABLE);
+        assert!(breaker.is_open());
+        assert_eq!(breaker.total_trips(), 1);
+
+        // Immediate subsequent request fails fast
+        let fast_fail = client.send_with_circuit_breaker(&mut breaker, &req_ok, "127.0.0.1", port);
+        assert!(fast_fail.is_err());
+        assert_eq!(breaker.total_rejected(), 1);
+
+        // Wait for recovery timeout
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Half-open trial request recovers circuit
+        let probe = client
+            .send_with_circuit_breaker(&mut breaker, &req_ok, "127.0.0.1", port)
+            .expect("Probe request succeeded");
+        assert_eq!(probe.status, HttpStatus::OK);
+        assert!(breaker.is_closed());
 
         server.stop();
     }
