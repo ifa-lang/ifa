@@ -37,7 +37,9 @@ pub struct UdpSocket {
 pub struct HttpRoute {
     method: String,
     path: String,
-    handler_id: i64
+    handler_id: i64,
+    auth_required: bool,
+    csrf_required: bool
 }
 
 pub struct HttpRouter {
@@ -1197,10 +1199,33 @@ pub fn router_extract_param(pattern: String, path: String, param_name: String) -
 }
 
 pub fn router_add_route(inout router: HttpRouter, method: String, path: String, handler_id: i64) {
-    router.routes.push(HttpRoute(method: method, path: path, handler_id: handler_id));
+    router.routes.push(HttpRoute(
+        method: method,
+        path: path,
+        handler_id: handler_id,
+        auth_required: false,
+        csrf_required: false
+    ));
 }
 
-pub fn router_match_route(router: HttpRouter, method: String, path: String) -> i64 {
+pub fn router_add_protected_route(
+    inout router: HttpRouter,
+    method: String,
+    path: String,
+    handler_id: i64,
+    auth_required: bool,
+    csrf_required: bool
+) {
+    router.routes.push(HttpRoute(
+        method: method,
+        path: path,
+        handler_id: handler_id,
+        auth_required: auth_required,
+        csrf_required: csrf_required
+    ));
+}
+
+pub fn router_match_route_index(router: HttpRouter, method: String, path: String) -> i64 {
     mut i: i64 = 0;
     let n = router.routes.len();
     mut dynamic_match: i64 = -1;
@@ -1208,15 +1233,37 @@ pub fn router_match_route(router: HttpRouter, method: String, path: String) -> i
         let r = router.routes[i];
         if r.method == method {
             if r.path == path {
-                return r.handler_id;
+                return i;
             }
             if dynamic_match < 0 && route_pattern_matches(r.path, path) {
-                dynamic_match = r.handler_id;
+                dynamic_match = i;
             }
         }
         i = i + 1;
     }
     return dynamic_match;
+}
+
+pub fn router_match_route(router: HttpRouter, method: String, path: String) -> i64 {
+    let idx = router_match_route_index(router, method, path);
+    if idx >= 0 {
+        return router.routes[idx].handler_id;
+    }
+    return -1;
+}
+
+pub fn router_route_requires_auth(router: HttpRouter, index: i64) -> bool {
+    if index >= 0 && index < router.routes.len() {
+        return router.routes[index].auth_required;
+    }
+    return false;
+}
+
+pub fn router_route_requires_csrf(router: HttpRouter, index: i64) -> bool {
+    if index >= 0 && index < router.routes.len() {
+        return router.routes[index].csrf_required;
+    }
+    return false;
 }
 
 // === Unit Tests ===
@@ -1615,13 +1662,23 @@ pub fn test_net_http_router_and_query_params() -> bool {
     router_add_route(inout router, "POST", "/api/v1/orders", 102);
     router_add_route(inout router, "GET", "/api/v1/orders", 103);
     router_add_route(inout router, "DELETE", "/api/v1/orders", 104);
+    router_add_protected_route(inout router, "POST", "/api/v1/checkout", 105, true, true);
 
     if router_match_route(router, "GET", "/api/v1/health") != 101 { return false; }
     if router_match_route(router, "POST", "/api/v1/orders") != 102 { return false; }
     if router_match_route(router, "GET", "/api/v1/orders") != 103 { return false; }
     if router_match_route(router, "DELETE", "/api/v1/orders") != 104 { return false; }
+    if router_match_route(router, "POST", "/api/v1/checkout") != 105 { return false; }
     if router_match_route(router, "PUT", "/api/v1/orders") != -1 { return false; }
     if router_match_route(router, "GET", "/api/v1/unknown") != -1 { return false; }
+
+    let idx_pub = router_match_route_index(router, "GET", "/api/v1/health");
+    let idx_prot = router_match_route_index(router, "POST", "/api/v1/checkout");
+    if idx_pub < 0 || idx_prot < 0 { return false; }
+    if router_route_requires_auth(router, idx_pub) { return false; }
+    if router_route_requires_csrf(router, idx_pub) { return false; }
+    if !router_route_requires_auth(router, idx_prot) { return false; }
+    if !router_route_requires_csrf(router, idx_prot) { return false; }
 
     let q = "search=colorless&limit=50&active=true";
     let p_search = url_get_query_param(q, "search");

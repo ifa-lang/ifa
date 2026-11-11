@@ -385,6 +385,7 @@ pub struct HttpRequest {
     pub headers: HttpHeaders,
     pub body: Vec<u8>,
     pub path_params: BTreeMap<String, String>,
+    pub context: BTreeMap<String, String>,
 }
 
 impl HttpRequest {
@@ -395,6 +396,7 @@ impl HttpRequest {
             headers: HttpHeaders::new(),
             body: Vec::new(),
             path_params: BTreeMap::new(),
+            context: BTreeMap::new(),
         }
     }
 
@@ -407,6 +409,22 @@ impl HttpRequest {
     pub fn with_param(mut self, name: impl Into<String>, val: impl Into<String>) -> Self {
         self.path_params.insert(name.into(), val.into());
         self
+    }
+
+    /// Retrieve contextual attribute set by middlewares (e.g. auth_sub, claims, etc.).
+    pub fn context(&self, name: &str) -> Option<&str> {
+        self.context.get(name).map(|s| s.as_str())
+    }
+
+    /// Set a contextual attribute fluently.
+    pub fn with_context(mut self, name: impl Into<String>, val: impl Into<String>) -> Self {
+        self.context.insert(name.into(), val.into());
+        self
+    }
+
+    /// Insert or update a contextual attribute.
+    pub fn set_context(&mut self, name: impl Into<String>, val: impl Into<String>) {
+        self.context.insert(name.into(), val.into());
     }
 
     /// Returns the raw query string part of the path (after '?'), if any.
@@ -882,6 +900,7 @@ impl HttpRequest {
                 headers,
                 body,
                 path_params: BTreeMap::new(),
+                context: BTreeMap::new(),
             },
             total_size,
         ))
@@ -1171,24 +1190,41 @@ pub enum RouteSegment {
     Wildcard(String),
 }
 
-/// Registered route with HTTP method, URI pattern, parsed segments and execution handler.
+/// HTTP Middleware function that intercepts a request before handler execution.
+/// Returning `Some(HttpResponse)` short-circuits the request pipeline immediately (e.g. 401 Unauthorized or 403 Forbidden).
+/// Returning `None` allows execution to proceed to the next middleware or route handler.
+pub type HttpMiddleware = Arc<dyn Fn(&mut HttpRequest) -> Option<HttpResponse> + Send + Sync>;
+
+/// Registered route with HTTP method, URI pattern, parsed segments, route-specific middlewares, and execution handler.
 #[derive(Clone)]
 pub struct HttpRoute {
     pub method: HttpMethod,
     pub pattern: String,
     pub segments: Vec<RouteSegment>,
+    pub middlewares: Vec<HttpMiddleware>,
     pub handler: HttpHandler,
 }
 
-/// High-performance URI router supporting dynamic path parameters (:param) and wildcards (*wildcard).
+/// High-performance URI router supporting dynamic path parameters (:param) and wildcards (*wildcard),
+/// along with global and per-route middleware pipelines.
 #[derive(Clone, Default)]
 pub struct HttpRouter {
     pub routes: Vec<HttpRoute>,
+    pub global_middlewares: Vec<HttpMiddleware>,
 }
 
 impl HttpRouter {
     pub fn new() -> Self {
-        Self { routes: Vec::new() }
+        Self {
+            routes: Vec::new(),
+            global_middlewares: Vec::new(),
+        }
+    }
+
+    /// Register a global middleware executed before every route handler.
+    pub fn use_middleware(&mut self, middleware: HttpMiddleware) -> &mut Self {
+        self.global_middlewares.push(middleware);
+        self
     }
 
     /// Parse a URI pattern into an ordered list of route segments.
@@ -1221,12 +1257,24 @@ impl HttpRouter {
         pattern: impl Into<String>,
         handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
     ) -> &mut Self {
+        self.add_with_middlewares(method, pattern, Vec::new(), handler)
+    }
+
+    /// Register a route handler with an HTTP method, URI pattern, and specific middlewares.
+    pub fn add_with_middlewares(
+        &mut self,
+        method: HttpMethod,
+        pattern: impl Into<String>,
+        middlewares: Vec<HttpMiddleware>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
         let pat_str = pattern.into();
         let segments = Self::parse_pattern(&pat_str);
         self.routes.push(HttpRoute {
             method,
             pattern: pat_str,
             segments,
+            middlewares,
             handler: Arc::new(handler),
         });
         self
@@ -1241,6 +1289,16 @@ impl HttpRouter {
         self.add(HttpMethod::Get, pattern, handler)
     }
 
+    /// Register a GET route handler with specific middlewares.
+    pub fn get_with_middlewares(
+        &mut self,
+        pattern: impl Into<String>,
+        middlewares: Vec<HttpMiddleware>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.add_with_middlewares(HttpMethod::Get, pattern, middlewares, handler)
+    }
+
     /// Register a POST route handler.
     pub fn post(
         &mut self,
@@ -1248,6 +1306,16 @@ impl HttpRouter {
         handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
     ) -> &mut Self {
         self.add(HttpMethod::Post, pattern, handler)
+    }
+
+    /// Register a POST route handler with specific middlewares.
+    pub fn post_with_middlewares(
+        &mut self,
+        pattern: impl Into<String>,
+        middlewares: Vec<HttpMiddleware>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.add_with_middlewares(HttpMethod::Post, pattern, middlewares, handler)
     }
 
     /// Register a PUT route handler.
@@ -1259,6 +1327,16 @@ impl HttpRouter {
         self.add(HttpMethod::Put, pattern, handler)
     }
 
+    /// Register a PUT route handler with specific middlewares.
+    pub fn put_with_middlewares(
+        &mut self,
+        pattern: impl Into<String>,
+        middlewares: Vec<HttpMiddleware>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.add_with_middlewares(HttpMethod::Put, pattern, middlewares, handler)
+    }
+
     /// Register a DELETE route handler.
     pub fn delete(
         &mut self,
@@ -1266,6 +1344,16 @@ impl HttpRouter {
         handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
     ) -> &mut Self {
         self.add(HttpMethod::Delete, pattern, handler)
+    }
+
+    /// Register a DELETE route handler with specific middlewares.
+    pub fn delete_with_middlewares(
+        &mut self,
+        pattern: impl Into<String>,
+        middlewares: Vec<HttpMiddleware>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.add_with_middlewares(HttpMethod::Delete, pattern, middlewares, handler)
     }
 
     /// Register a PATCH route handler.
@@ -1345,6 +1433,112 @@ impl HttpRouter {
         }
         None
     }
+
+    /// Dispatch an incoming HTTP request through global middlewares, match route,
+    /// execute route-specific middlewares, and invoke the matched handler.
+    pub fn dispatch(&self, req: &mut HttpRequest) -> HttpResponse {
+        for mw in &self.global_middlewares {
+            if let Some(resp) = mw(req) {
+                return resp;
+            }
+        }
+
+        if let Some((route, params)) = self.match_route(&req.method, &req.path) {
+            req.path_params = params;
+            for mw in &route.middlewares {
+                if let Some(resp) = mw(req) {
+                    return resp;
+                }
+            }
+            (route.handler)(req)
+        } else {
+            HttpResponse::not_found().text("Route not found")
+        }
+    }
+}
+
+/// Create an authentication middleware validating RFC 7519 JWT Bearer tokens with HMAC-SHA256.
+/// On success, populates `auth_sub` and `auth_claims` in `req.context`.
+/// On failure or missing token, returns 401 Unauthorized JSON error response.
+pub fn jwt_auth_middleware(secret: impl Into<Vec<u8>>) -> HttpMiddleware {
+    let secret = secret.into();
+    Arc::new(move |req: &mut HttpRequest| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        match req.verify_jwt_bearer(&secret, now) {
+            Ok(claims) => {
+                if let Some(sub) = &claims.sub {
+                    req.context.insert("auth_sub".to_string(), sub.clone());
+                }
+                if let Ok(claims_json) = serde_json::to_string(&claims) {
+                    req.context.insert("auth_claims".to_string(), claims_json);
+                }
+                None
+            }
+            Err(err) => {
+                let body = format!(r#"{{"error":"unauthorized","reason":"{}"}}"#, err);
+                Some(
+                    HttpResponse::new(HttpStatus::UNAUTHORIZED)
+                        .header("WWW-Authenticate", "Bearer")
+                        .header("Content-Type", "application/json")
+                        .text(body),
+                )
+            }
+        }
+    })
+}
+
+/// Create a CSRF protection middleware requiring a valid CSRF token on mutating requests (POST, PUT, DELETE, PATCH).
+/// Verifies that the header token matches the session/cookie token in constant time.
+/// On mismatch or missing token, returns 403 Forbidden JSON error response.
+pub fn csrf_protection_middleware(
+    cookie_name: impl Into<String>,
+    _header_name: impl Into<String>,
+) -> HttpMiddleware {
+    let cookie_name = cookie_name.into();
+    Arc::new(move |req: &mut HttpRequest| match req.method {
+        HttpMethod::Get | HttpMethod::Head | HttpMethod::Options => None,
+        _ => {
+            let cookies = req.cookies();
+            let expected = cookies.get(&cookie_name);
+            if let Some(expected_val) = expected {
+                if req.verify_csrf(expected_val) {
+                    return None;
+                }
+            }
+            let body = r#"{"error":"forbidden","reason":"invalid_or_missing_csrf_token"}"#;
+            Some(
+                HttpResponse::forbidden()
+                    .header("Content-Type", "application/json")
+                    .text(body),
+            )
+        }
+    })
+}
+
+/// Create a CORS middleware responding to preflight OPTIONS requests with CORS headers.
+pub fn cors_middleware(
+    allowed_origin: impl Into<String>,
+    allowed_methods: impl Into<String>,
+    allowed_headers: impl Into<String>,
+) -> HttpMiddleware {
+    let origin = allowed_origin.into();
+    let methods = allowed_methods.into();
+    let headers = allowed_headers.into();
+    Arc::new(move |req: &mut HttpRequest| {
+        if req.method == HttpMethod::Options {
+            let mut resp = HttpResponse::ok();
+            resp.headers.set("Access-Control-Allow-Origin", &origin);
+            resp.headers.set("Access-Control-Allow-Methods", &methods);
+            resp.headers.set("Access-Control-Allow-Headers", &headers);
+            resp.headers.set("Access-Control-Max-Age", "86400");
+            Some(resp)
+        } else {
+            None
+        }
+    })
 }
 
 /// High-performance, non-blocking HTTP server driven by IFA colorless fibers.
@@ -1372,6 +1566,14 @@ impl HttpServer {
         self
     }
 
+    /// Register a global middleware that executes before every route handler.
+    pub fn use_middleware(&mut self, middleware: HttpMiddleware) -> &mut Self {
+        let router =
+            Arc::get_mut(&mut self.router).expect("Cannot register middleware while listening");
+        router.use_middleware(middleware);
+        self
+    }
+
     /// Register a route handler for an HTTP method and path pattern.
     pub fn route(
         &mut self,
@@ -1384,6 +1586,19 @@ impl HttpServer {
         self
     }
 
+    /// Register a route handler with specific middlewares.
+    pub fn route_with_middlewares(
+        &mut self,
+        method: HttpMethod,
+        path: impl Into<String>,
+        middlewares: Vec<HttpMiddleware>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        let router = Arc::get_mut(&mut self.router).expect("Cannot register route while listening");
+        router.add_with_middlewares(method, path, middlewares, handler);
+        self
+    }
+
     /// Register a GET route handler.
     pub fn get(
         &mut self,
@@ -1391,6 +1606,16 @@ impl HttpServer {
         handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
     ) -> &mut Self {
         self.route(HttpMethod::Get, path, handler)
+    }
+
+    /// Register a GET route handler with specific middlewares.
+    pub fn get_with_middlewares(
+        &mut self,
+        path: impl Into<String>,
+        middlewares: Vec<HttpMiddleware>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.route_with_middlewares(HttpMethod::Get, path, middlewares, handler)
     }
 
     /// Register a POST route handler.
@@ -1402,6 +1627,16 @@ impl HttpServer {
         self.route(HttpMethod::Post, path, handler)
     }
 
+    /// Register a POST route handler with specific middlewares.
+    pub fn post_with_middlewares(
+        &mut self,
+        path: impl Into<String>,
+        middlewares: Vec<HttpMiddleware>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.route_with_middlewares(HttpMethod::Post, path, middlewares, handler)
+    }
+
     /// Register a PUT route handler.
     pub fn put(
         &mut self,
@@ -1411,6 +1646,16 @@ impl HttpServer {
         self.route(HttpMethod::Put, path, handler)
     }
 
+    /// Register a PUT route handler with specific middlewares.
+    pub fn put_with_middlewares(
+        &mut self,
+        path: impl Into<String>,
+        middlewares: Vec<HttpMiddleware>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.route_with_middlewares(HttpMethod::Put, path, middlewares, handler)
+    }
+
     /// Register a DELETE route handler.
     pub fn delete(
         &mut self,
@@ -1418,6 +1663,16 @@ impl HttpServer {
         handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
     ) -> &mut Self {
         self.route(HttpMethod::Delete, path, handler)
+    }
+
+    /// Register a DELETE route handler with specific middlewares.
+    pub fn delete_with_middlewares(
+        &mut self,
+        path: impl Into<String>,
+        middlewares: Vec<HttpMiddleware>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.route_with_middlewares(HttpMethod::Delete, path, middlewares, handler)
     }
 
     /// Register a PATCH route handler.
@@ -1480,16 +1735,7 @@ impl HttpServer {
                                             Ok((mut req, consumed)) => {
                                                 let keep_alive =
                                                     http_should_keep_alive(200, &req.headers);
-                                                let mut res = if let Some((route, params)) =
-                                                    router_worker
-                                                        .match_route(&req.method, &req.path)
-                                                {
-                                                    req.path_params = params;
-                                                    (route.handler)(&req)
-                                                } else {
-                                                    HttpResponse::not_found()
-                                                        .text("Route not found")
-                                                };
+                                                let mut res = router_worker.dispatch(&mut req);
 
                                                 if let Some(threshold) = auto_compress {
                                                     res = res.compress_if_accepted(&req, threshold);
@@ -5249,5 +5495,129 @@ mod tests {
         );
         assert!(req_header_csrf.verify_csrf("header_token"));
         assert!(!req_header_csrf.verify_csrf("param_token"));
+    }
+
+    #[test]
+    fn test_http_router_middlewares_jwt_and_csrf() {
+        let jwt_secret = b"ifa-production-secret-key-32b!!";
+        let claims = JwtClaims::new()
+            .with_sub("member-42")
+            .with_exp(4_000_000_000);
+        let valid_token = Jwt::sign_hs256(jwt_secret, &claims).unwrap();
+
+        // 1. Configure router with global middleware and protected routes
+        let mut router = HttpRouter::new();
+
+        // Global middleware: attach custom security header and inspect maintenance flag
+        router.use_middleware(Arc::new(|req: &mut HttpRequest| {
+            if req.headers.get("x-maintenance").is_some() {
+                Some(
+                    HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
+                        .text("System undergoing maintenance"),
+                )
+            } else {
+                req.headers.set("X-IFA-Filter", "active");
+                None
+            }
+        }));
+
+        // Public route
+        router.get("/api/v1/public", |_req| {
+            HttpResponse::ok().text("public data")
+        });
+
+        // JWT-protected route
+        let auth_mw = jwt_auth_middleware(jwt_secret.to_vec());
+        router.get_with_middlewares("/api/v1/account", vec![auth_mw.clone()], |req| {
+            let sub = req.context("auth_sub").unwrap_or("anonymous");
+            HttpResponse::ok().text(format!("Welcome {}", sub))
+        });
+
+        // Mutating route requiring BOTH JWT auth and CSRF protection
+        let csrf_mw = csrf_protection_middleware("csrf_cookie", "X-CSRF-Token");
+        router.post_with_middlewares("/api/v1/settings", vec![auth_mw, csrf_mw], |req| {
+            let sub = req.context("auth_sub").unwrap_or("anonymous");
+            HttpResponse::ok().text(format!("Settings updated for {}", sub))
+        });
+
+        // --- Dispatch Unit Tests ---
+
+        // A. Maintenance short-circuit
+        let mut req_maint =
+            HttpRequest::new(HttpMethod::Get, "/api/v1/public").header("X-Maintenance", "1");
+        let resp_maint = router.dispatch(&mut req_maint);
+        assert_eq!(resp_maint.status, HttpStatus::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp_maint.body_str().unwrap(),
+            "System undergoing maintenance"
+        );
+
+        // B. Public route succeeds
+        let mut req_pub = HttpRequest::new(HttpMethod::Get, "/api/v1/public");
+        let resp_pub = router.dispatch(&mut req_pub);
+        assert_eq!(resp_pub.status, HttpStatus::OK);
+        assert_eq!(resp_pub.body_str().unwrap(), "public data");
+
+        // C. Protected route without token -> 401 Unauthorized
+        let mut req_unauth = HttpRequest::new(HttpMethod::Get, "/api/v1/account");
+        let resp_unauth = router.dispatch(&mut req_unauth);
+        assert_eq!(resp_unauth.status, HttpStatus::UNAUTHORIZED);
+        assert!(resp_unauth.body_str().unwrap().contains("unauthorized"));
+
+        // D. Protected route with valid token -> 200 OK + context populated
+        let mut req_auth = HttpRequest::new(HttpMethod::Get, "/api/v1/account")
+            .header("Authorization", &format!("Bearer {}", valid_token));
+        let resp_auth = router.dispatch(&mut req_auth);
+        assert_eq!(resp_auth.status, HttpStatus::OK);
+        assert_eq!(resp_auth.body_str().unwrap(), "Welcome member-42");
+        assert_eq!(req_auth.context("auth_sub"), Some("member-42"));
+
+        // E. Mutating POST without CSRF token -> 403 Forbidden
+        let mut req_post_no_csrf = HttpRequest::new(HttpMethod::Post, "/api/v1/settings")
+            .header("Authorization", &format!("Bearer {}", valid_token));
+        let resp_post_no_csrf = router.dispatch(&mut req_post_no_csrf);
+        assert_eq!(resp_post_no_csrf.status, HttpStatus::FORBIDDEN);
+        assert!(resp_post_no_csrf
+            .body_str()
+            .unwrap()
+            .contains("invalid_or_missing_csrf_token"));
+
+        // F. Mutating POST with valid CSRF cookie and header -> 200 OK
+        let mut req_post_valid = HttpRequest::new(HttpMethod::Post, "/api/v1/settings")
+            .header("Authorization", &format!("Bearer {}", valid_token))
+            .header("Cookie", "csrf_cookie=sec_token_9999")
+            .header("X-CSRF-Token", "sec_token_9999");
+        let resp_post_valid = router.dispatch(&mut req_post_valid);
+        assert_eq!(resp_post_valid.status, HttpStatus::OK);
+        assert_eq!(
+            resp_post_valid.body_str().unwrap(),
+            "Settings updated for member-42"
+        );
+
+        // --- HttpServer Fiber Integration Test ---
+        let mut server = HttpServer::new(0);
+        let srv_auth_mw = jwt_auth_middleware(jwt_secret.to_vec());
+        server.get_with_middlewares("/api/protected", vec![srv_auth_mw], |req| {
+            let sub = req.context("auth_sub").unwrap_or("anon");
+            HttpResponse::ok().text(format!("Fiber member: {}", sub))
+        });
+
+        let bound = server.listen_background().expect("Server bind failed");
+        let port = bound.port();
+        let client = HttpClient::new();
+
+        // Server rejects missing token
+        let req_net_unauth = HttpRequest::new(HttpMethod::Get, "/api/protected");
+        let resp_net_unauth = client.send(&req_net_unauth, "127.0.0.1", port).unwrap();
+        assert_eq!(resp_net_unauth.status, HttpStatus::UNAUTHORIZED);
+
+        // Server accepts valid token over TCP socket
+        let req_net_auth = HttpRequest::new(HttpMethod::Get, "/api/protected")
+            .header("Authorization", &format!("Bearer {}", valid_token));
+        let resp_net_auth = client.send(&req_net_auth, "127.0.0.1", port).unwrap();
+        assert_eq!(resp_net_auth.status, HttpStatus::OK);
+        assert_eq!(resp_net_auth.body_str().unwrap(), "Fiber member: member-42");
+
+        server.stop();
     }
 }

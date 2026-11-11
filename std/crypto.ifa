@@ -1565,6 +1565,93 @@ pub fn test_crypto_pbkdf2_vectors() -> bool {
     return true;
 }
 
+// === RFC 7519 / RFC 7515 Pure IFA JSON Web Token (JWT) HS256 ===
+
+pub fn jwt_hs256_sign(header_json: String, payload_json: String, secret: String) -> String {
+    let hdr_b64 = base64url_encode_str(header_json);
+    let pay_b64 = base64url_encode_str(payload_json);
+    let signing_input = hdr_b64 + "." + pay_b64;
+
+    mut key_bytes: List<i64> = List::new();
+    let sec_len = string_len(secret);
+    mut i: i64 = 0;
+    while i < sec_len {
+        key_bytes.push(string_char_at(secret, i));
+        i = i + 1;
+    }
+
+    mut data_bytes: List<i64> = List::new();
+    let data_len = string_len(signing_input);
+    mut j: i64 = 0;
+    while j < data_len {
+        data_bytes.push(string_char_at(signing_input, j));
+        j = j + 1;
+    }
+
+    let sig_bytes = hmac_sha256_bytes(key_bytes, data_bytes);
+    let sig_b64 = base64url_encode_bytes(sig_bytes);
+    return signing_input + "." + sig_b64;
+}
+
+pub fn jwt_hs256_verify(token: String, secret: String) -> bool {
+    let t_len = string_len(token);
+    mut dot1: i64 = -1;
+    mut dot2: i64 = -1;
+    mut i: i64 = 0;
+    while i < t_len {
+        if string_char_at(token, i) == 46 {
+            if dot1 < 0 {
+                dot1 = i;
+            } else if dot2 < 0 {
+                dot2 = i;
+            }
+        }
+        i = i + 1;
+    }
+
+    if dot1 <= 0 || dot2 <= dot1 || dot2 >= t_len - 1 {
+        return false;
+    }
+
+    let signing_input = string_substr(token, 0, dot2);
+    let sig_part = string_substr(token, dot2 + 1, t_len - dot2 - 1);
+
+    mut key_bytes: List<i64> = List::new();
+    let sec_len = string_len(secret);
+    mut k: i64 = 0;
+    while k < sec_len {
+        key_bytes.push(string_char_at(secret, k));
+        k = k + 1;
+    }
+
+    mut data_bytes: List<i64> = List::new();
+    let data_len = string_len(signing_input);
+    mut m: i64 = 0;
+    while m < data_len {
+        data_bytes.push(string_char_at(signing_input, m));
+        m = m + 1;
+    }
+
+    let expected_sig_bytes = hmac_sha256_bytes(key_bytes, data_bytes);
+    let expected_sig_b64 = base64url_encode_bytes(expected_sig_bytes);
+
+    return constant_time_eq(expected_sig_b64, sig_part);
+}
+
+pub fn test_crypto_jwt_hs256() -> bool {
+    let hdr = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    let payload = "{\"sub\":\"ifa-admin-1\",\"role\":\"root\"}";
+    let secret = "ifa-very-secure-system-secret-key-32b!";
+
+    let token = jwt_hs256_sign(hdr, payload, secret);
+
+    let ok = jwt_hs256_verify(token, secret);
+    let wrong_secret = jwt_hs256_verify(token, "wrong-secret");
+    let tampered = jwt_hs256_verify(token + "x", secret);
+
+    return ok && !wrong_secret && !tampered;
+}
+
 pub fn test_crypto_all() -> bool {
     return test_crypto_fnv1a()
         && test_crypto_murmur3()
@@ -1580,7 +1667,8 @@ pub fn test_crypto_all() -> bool {
         && test_crypto_base64_and_websocket_key()
         && test_crypto_hmac_sha1_vectors()
         && test_crypto_hotp_totp_vectors()
-        && test_crypto_pbkdf2_vectors();
+        && test_crypto_pbkdf2_vectors()
+        && test_crypto_jwt_hs256();
 }
 
 pub fn main() {
@@ -1599,7 +1687,8 @@ pub fn main() {
     let t13 = test_crypto_hmac_sha1_vectors();
     let t14 = test_crypto_hotp_totp_vectors();
     let t15 = test_crypto_pbkdf2_vectors();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 {
+    let t16 = test_crypto_jwt_hs256();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 {
         println("std/crypto: ALL TESTS PASSED");
     } else {
         println("std/crypto: TESTS FAILED");
