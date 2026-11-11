@@ -10,10 +10,109 @@ use std::process::{Command as StdCommand, ExitStatus as StdExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+mod sys {
+    extern "C" {
+        pub fn kill(pid: i32, sig: i32) -> i32;
+        pub fn getpgid(pid: i32) -> i32;
+    }
+}
+
+/// Standard POSIX process signals for graceful process management and interruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Signal {
+    /// SIGHUP (1): Hangup detected on controlling terminal or death of controlling process.
+    Hangup,
+    /// SIGINT (2): Interrupt from keyboard (Ctrl+C).
+    Interrupt,
+    /// SIGQUIT (3): Quit from keyboard.
+    Quit,
+    /// SIGKILL (9): Kill signal (unblockable termination).
+    Kill,
+    /// SIGUSR1 (10): User-defined signal 1.
+    User1,
+    /// SIGUSR2 (12): User-defined signal 2.
+    User2,
+    /// SIGPIPE (13): Broken pipe: write to pipe with no readers.
+    Pipe,
+    /// SIGALRM (14): Timer signal from alarm.
+    Alarm,
+    /// SIGTERM (15): Termination signal (graceful termination request).
+    Terminate,
+    /// SIGCONT (18): Continue execution if stopped.
+    Continue,
+    /// SIGSTOP (19): Stop process execution.
+    Stop,
+    /// SIGTSTP (20): Terminal stop signal.
+    TerminalStop,
+    /// Custom signal number.
+    Custom(i32),
+}
+
+impl Signal {
+    /// Return the numerical signal number according to standard POSIX conventions.
+    pub const fn as_raw(&self) -> i32 {
+        match self {
+            Signal::Hangup => 1,
+            Signal::Interrupt => 2,
+            Signal::Quit => 3,
+            Signal::Kill => 9,
+            Signal::User1 => 10,
+            Signal::User2 => 12,
+            Signal::Pipe => 13,
+            Signal::Alarm => 14,
+            Signal::Terminate => 15,
+            Signal::Continue => 18,
+            Signal::Stop => 19,
+            Signal::TerminalStop => 20,
+            Signal::Custom(sig) => *sig,
+        }
+    }
+
+    /// Construct a Signal from its raw POSIX signal number.
+    pub const fn from_raw(sig: i32) -> Self {
+        match sig {
+            1 => Signal::Hangup,
+            2 => Signal::Interrupt,
+            3 => Signal::Quit,
+            9 => Signal::Kill,
+            10 => Signal::User1,
+            12 => Signal::User2,
+            13 => Signal::Pipe,
+            14 => Signal::Alarm,
+            15 => Signal::Terminate,
+            18 => Signal::Continue,
+            19 => Signal::Stop,
+            20 => Signal::TerminalStop,
+            other => Signal::Custom(other),
+        }
+    }
+
+    /// Return the canonical name of the signal (e.g. "SIGTERM", "SIGINT").
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Signal::Hangup => "SIGHUP",
+            Signal::Interrupt => "SIGINT",
+            Signal::Quit => "SIGQUIT",
+            Signal::Kill => "SIGKILL",
+            Signal::User1 => "SIGUSR1",
+            Signal::User2 => "SIGUSR2",
+            Signal::Pipe => "SIGPIPE",
+            Signal::Alarm => "SIGALRM",
+            Signal::Terminate => "SIGTERM",
+            Signal::Continue => "SIGCONT",
+            Signal::Stop => "SIGSTOP",
+            Signal::TerminalStop => "SIGTSTP",
+            Signal::Custom(_) => "SIGCUSTOM",
+        }
+    }
+}
+
 /// Exit status of a completed process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitStatus {
     code: Option<i32>,
+    signal: Option<i32>,
     success: bool,
 }
 
@@ -22,7 +121,17 @@ impl ExitStatus {
     pub fn from_code(code: i32) -> Self {
         Self {
             code: Some(code),
+            signal: None,
             success: code == 0,
+        }
+    }
+
+    /// Create a new ExitStatus representing termination by signal.
+    pub fn from_signal(signal: i32) -> Self {
+        Self {
+            code: None,
+            signal: Some(signal),
+            success: false,
         }
     }
 
@@ -35,13 +144,31 @@ impl ExitStatus {
     pub fn code(&self) -> Option<i32> {
         self.code
     }
+
+    /// The signal that terminated the process, if terminated by signal.
+    pub fn signal(&self) -> Option<i32> {
+        self.signal
+    }
 }
 
 impl From<StdExitStatus> for ExitStatus {
     fn from(status: StdExitStatus) -> Self {
-        Self {
-            code: status.code(),
-            success: status.success(),
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            Self {
+                code: status.code(),
+                signal: status.signal(),
+                success: status.success(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                code: status.code(),
+                signal: None,
+                success: status.success(),
+            }
         }
     }
 }
@@ -85,6 +212,7 @@ pub struct Command {
     stdin_data: Option<Vec<u8>>,
     timeout: Option<Duration>,
     redirect_stderr_to_stdout: bool,
+    process_group: Option<i32>,
 }
 
 impl Command {
@@ -99,6 +227,7 @@ impl Command {
             stdin_data: None,
             timeout: None,
             redirect_stderr_to_stdout: false,
+            process_group: None,
         }
     }
 
@@ -190,9 +319,33 @@ impl Command {
         self
     }
 
-    /// Spawn the process as a background child process.
-    pub fn spawn(&self) -> io::Result<ChildProcess> {
-        let mut std_cmd = StdCommand::new(&self.program);
+    /// Configure command to execute in its own new process group (`setpgid(0, 0)`).
+    /// This isolates child and all subprocesses spawned by it from the caller's process group.
+    pub fn new_process_group(&mut self) -> &mut Self {
+        self.process_group = Some(0);
+        self
+    }
+
+    /// Configure command to execute in its own new process group (by-value builder).
+    pub fn with_new_process_group(mut self) -> Self {
+        self.process_group = Some(0);
+        self
+    }
+
+    /// Set an explicit process group ID for the command.
+    pub fn process_group(&mut self, pgid: i32) -> &mut Self {
+        self.process_group = Some(pgid);
+        self
+    }
+
+    /// Set an explicit process group ID for the command (by-value builder).
+    pub fn with_process_group(mut self, pgid: i32) -> Self {
+        self.process_group = Some(pgid);
+        self
+    }
+
+    /// Internal helper to configure a std::process::Command with environment, working dir, arguments and process group.
+    fn configure_std_command(&self, std_cmd: &mut StdCommand) {
         if self.clear_env {
             std_cmd.env_clear();
         }
@@ -203,6 +356,20 @@ impl Command {
             std_cmd.current_dir(cwd);
         }
         std_cmd.args(&self.args);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            if let Some(pgid) = self.process_group {
+                std_cmd.process_group(pgid);
+            }
+        }
+    }
+
+    /// Spawn the process as a background child process.
+    pub fn spawn(&self) -> io::Result<ChildProcess> {
+        let mut std_cmd = StdCommand::new(&self.program);
+        self.configure_std_command(&mut std_cmd);
 
         if self.stdin_data.is_some() {
             std_cmd.stdin(Stdio::piped());
@@ -226,16 +393,7 @@ impl Command {
     /// Execute command synchronously with an enforced timeout.
     pub fn output_with_timeout(&self, timeout: Duration) -> io::Result<ProcessOutput> {
         let mut std_cmd = StdCommand::new(&self.program);
-        if self.clear_env {
-            std_cmd.env_clear();
-        }
-        for (k, v) in &self.envs {
-            std_cmd.env(k, v);
-        }
-        if let Some(ref cwd) = self.current_dir {
-            std_cmd.current_dir(cwd);
-        }
-        std_cmd.args(&self.args);
+        self.configure_std_command(&mut std_cmd);
 
         std_cmd.stdin(if self.stdin_data.is_some() {
             Stdio::piped()
@@ -295,6 +453,14 @@ impl Command {
                 }
                 None => {
                     if start.elapsed() >= timeout {
+                        #[cfg(unix)]
+                        {
+                            let pid = child.id() as i32;
+                            let pgid = unsafe { sys::getpgid(pid) };
+                            if pgid > 0 && self.process_group.is_some() {
+                                let _ = unsafe { sys::kill(-pgid, 9) };
+                            }
+                        }
                         let _ = child.kill();
                         let _ = child.wait();
                         let _ = stdout_thread.join();
@@ -321,17 +487,7 @@ impl Command {
         }
 
         let mut std_cmd = StdCommand::new(&self.program);
-        if self.clear_env {
-            std_cmd.env_clear();
-        }
-        // Insert env vars in deterministic BTreeMap iteration order
-        for (k, v) in &self.envs {
-            std_cmd.env(k, v);
-        }
-        if let Some(ref cwd) = self.current_dir {
-            std_cmd.current_dir(cwd);
-        }
-        std_cmd.args(&self.args);
+        self.configure_std_command(&mut std_cmd);
 
         let out = if let Some(ref input) = self.stdin_data {
             std_cmd.stdin(Stdio::piped());
@@ -373,16 +529,7 @@ impl Command {
     /// Execute command synchronously and return exit status.
     pub fn status(&self) -> io::Result<ExitStatus> {
         let mut std_cmd = StdCommand::new(&self.program);
-        if self.clear_env {
-            std_cmd.env_clear();
-        }
-        for (k, v) in &self.envs {
-            std_cmd.env(k, v);
-        }
-        if let Some(ref cwd) = self.current_dir {
-            std_cmd.current_dir(cwd);
-        }
-        std_cmd.args(&self.args);
+        self.configure_std_command(&mut std_cmd);
 
         if let Some(ref input) = self.stdin_data {
             std_cmd.stdin(Stdio::piped());
@@ -409,6 +556,83 @@ impl ChildProcess {
     /// Return the OS process identifier (PID).
     pub fn id(&self) -> u32 {
         self.inner.id()
+    }
+
+    /// Return the process group ID (PGID) of the running child process.
+    pub fn process_group_id(&self) -> io::Result<i32> {
+        #[cfg(unix)]
+        {
+            let pgid = unsafe { sys::getpgid(self.inner.id() as i32) };
+            if pgid < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(pgid)
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(self.inner.id() as i32)
+        }
+    }
+
+    /// Send a POSIX signal to the child process.
+    pub fn send_signal(&mut self, signal: Signal) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let res = unsafe { sys::kill(self.inner.id() as i32, signal.as_raw()) };
+            if res != 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match signal {
+                Signal::Kill | Signal::Terminate => self.kill(),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "Signal {:?} is not supported on non-POSIX platforms",
+                        signal
+                    ),
+                )),
+            }
+        }
+    }
+
+    /// Send a signal to the entire process group of the child process (`kill(-pgid, sig)`).
+    /// This signals or interrupts the child and all background subprocesses spawned by it.
+    pub fn send_group_signal(&mut self, signal: Signal) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let pgid = self.process_group_id()?;
+            let res = unsafe { sys::kill(-pgid, signal.as_raw()) };
+            if res != 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.send_signal(signal)
+        }
+    }
+
+    /// Send SIGTERM to request graceful process termination.
+    pub fn terminate(&mut self) -> io::Result<()> {
+        self.send_signal(Signal::Terminate)
+    }
+
+    /// Send SIGINT to request interruption (equivalent to Ctrl+C).
+    pub fn interrupt(&mut self) -> io::Result<()> {
+        self.send_signal(Signal::Interrupt)
+    }
+
+    /// Send SIGHUP to indicate hangup of controlling terminal.
+    pub fn hangup(&mut self) -> io::Result<()> {
+        self.send_signal(Signal::Hangup)
     }
 
     /// Kill the running child process.
@@ -453,6 +677,7 @@ impl ChildProcess {
 pub struct Pipeline {
     commands: Vec<Command>,
     stdin_data: Option<Vec<u8>>,
+    process_group: bool,
 }
 
 /// Alias for `Pipeline`.
@@ -470,7 +695,14 @@ impl Pipeline {
         Self {
             commands: Vec::new(),
             stdin_data: None,
+            process_group: false,
         }
+    }
+
+    /// Configure the entire pipeline to execute inside an isolated process group.
+    pub fn new_process_group(mut self) -> Self {
+        self.process_group = true;
+        self
     }
 
     /// Append a command to the pipeline.
@@ -530,19 +762,23 @@ impl Pipeline {
 
         let mut children: Vec<std::process::Child> = Vec::with_capacity(num_commands);
         let mut prev_stdout: Option<std::process::ChildStdout> = None;
+        let mut pipeline_pgid: Option<i32> = None;
 
         for (i, cmd) in self.commands.iter().enumerate() {
             let mut std_cmd = StdCommand::new(&cmd.program);
-            if cmd.clear_env {
-                std_cmd.env_clear();
+            cmd.configure_std_command(&mut std_cmd);
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                if self.process_group {
+                    if let Some(pgid) = pipeline_pgid {
+                        std_cmd.process_group(pgid);
+                    } else {
+                        std_cmd.process_group(0);
+                    }
+                }
             }
-            for (k, v) in &cmd.envs {
-                std_cmd.env(k, v);
-            }
-            if let Some(ref cwd) = cmd.current_dir {
-                std_cmd.current_dir(cwd);
-            }
-            std_cmd.args(&cmd.args);
 
             // Configure stdin
             if i == 0 {
@@ -562,6 +798,10 @@ impl Pipeline {
             std_cmd.stderr(Stdio::piped());
 
             let mut child = std_cmd.spawn()?;
+
+            if i == 0 && self.process_group {
+                pipeline_pgid = Some(child.id() as i32);
+            }
 
             // Feed input to first child if provided
             if i == 0 {
@@ -859,5 +1099,73 @@ mod tests {
         let out = p.output().expect("execute pipeline with stdin");
         assert!(out.success());
         assert_eq!(out.stdout_string().trim(), "MATCH_TARGET");
+    }
+
+    #[test]
+    fn test_signal_definitions_and_conversions() {
+        assert_eq!(Signal::Terminate.as_raw(), 15);
+        assert_eq!(Signal::Interrupt.as_raw(), 2);
+        assert_eq!(Signal::Hangup.as_raw(), 1);
+        assert_eq!(Signal::Kill.as_raw(), 9);
+        assert_eq!(Signal::from_raw(15), Signal::Terminate);
+        assert_eq!(Signal::from_raw(2), Signal::Interrupt);
+        assert_eq!(Signal::from_raw(1), Signal::Hangup);
+        assert_eq!(Signal::Terminate.name(), "SIGTERM");
+        assert_eq!(Signal::Interrupt.name(), "SIGINT");
+        assert_eq!(Signal::Kill.name(), "SIGKILL");
+    }
+
+    #[test]
+    fn test_child_signal_termination() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("10");
+        let mut child = cmd.spawn().expect("spawn sleep process");
+
+        // Request graceful termination
+        child.terminate().expect("send SIGTERM");
+        let status = child.wait().expect("wait for child termination");
+        assert!(!status.success());
+        #[cfg(unix)]
+        {
+            assert_eq!(status.signal(), Some(15));
+        }
+    }
+
+    #[test]
+    fn test_child_process_group_isolation() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("10");
+        cmd.new_process_group();
+        let mut child = cmd.spawn().expect("spawn process in new process group");
+
+        let pid = child.id() as i32;
+        let pgid = child.process_group_id().expect("retrieve process group id");
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                pid, pgid,
+                "Process group ID should match child PID when isolated"
+            );
+        }
+
+        // Clean up using group signal
+        child
+            .send_group_signal(Signal::Kill)
+            .expect("send group kill signal");
+        let status = child.wait().expect("wait for child termination");
+        assert!(!status.success());
+    }
+
+    #[test]
+    fn test_pipeline_with_process_group() {
+        let p = Pipeline::new()
+            .new_process_group()
+            .stdin_str("isolation\npipeline\ntest\n")
+            .pipe(Command::new("grep").arg("pipe"))
+            .pipe(Command::new("tr").args(["a-z", "A-Z"]));
+
+        let out = p.output().expect("execute pipeline in process group");
+        assert!(out.success());
+        assert_eq!(out.stdout_string().trim(), "PIPELINE");
     }
 }

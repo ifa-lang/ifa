@@ -68,7 +68,7 @@ pub use net::{
 pub use process::{
     find_best_assembler, find_best_linker, find_system_tool, invoke_assembler, invoke_linker,
     run as process_run, ChildProcess, Command as ProcessCommand, CommandPipeline,
-    ExitStatus as ProcessExitStatus, Pipeline, ProcessOutput,
+    ExitStatus as ProcessExitStatus, Pipeline, ProcessOutput, Signal, Signal as ProcessSignal,
 };
 pub use simd_parser::{
     find_byte_vectorized, find_crlf_vectorized, parse_http_request_fast, parse_http_response_fast,
