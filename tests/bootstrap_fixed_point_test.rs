@@ -1993,8 +1993,8 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("269 passed; 0 failed"),
-        "Expected 269 passed std unit tests, got:\n{}",
+        stdout.contains("271 passed; 0 failed"),
+        "Expected 271 passed std unit tests, got:\n{}",
         stdout
     );
 }

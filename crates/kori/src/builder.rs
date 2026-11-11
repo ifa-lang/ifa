@@ -512,27 +512,65 @@ impl BuildOrchestrator {
         }
         let parts: Vec<String> = module_path.iter().map(|s| INTERNER.resolve(s)).collect();
 
-        // 1. Check direct file: base_dir/part1/.../partN.ifa
-        let mut file_path = base_dir.to_path_buf();
-        for (i, part) in parts.iter().enumerate() {
-            if i == parts.len() - 1 {
-                file_path.push(format!("{}.ifa", part));
-            } else {
-                file_path.push(part);
+        // Check candidate directories:
+        // 1. base_dir (e.g. src/ or tests/)
+        // 2. base_dir sibling src/ (e.g. tests/../src -> src/)
+        // 3. base_dir child src/ (e.g. project_root/src)
+        // 4. Current working directory "src"
+        let mut candidate_dirs: Vec<PathBuf> = vec![base_dir.to_path_buf()];
+        if let Some(parent) = base_dir.parent() {
+            let sibling_src = parent.join("src");
+            if sibling_src != base_dir && sibling_src.is_dir() {
+                candidate_dirs.push(sibling_src);
             }
         }
-        if file_path.is_file() {
-            return Some(file_path);
+        let child_src = base_dir.join("src");
+        if child_src.is_dir() && !candidate_dirs.contains(&child_src) {
+            candidate_dirs.push(child_src);
+        }
+        let cwd_src = PathBuf::from("src");
+        if cwd_src.is_dir() && !candidate_dirs.contains(&cwd_src) {
+            candidate_dirs.push(cwd_src);
         }
 
-        // 2. Check directory module: base_dir/part1/.../partN/mod.ifa
-        let mut dir_path = base_dir.to_path_buf();
-        for part in &parts {
-            dir_path.push(part);
-        }
-        dir_path.push("mod.ifa");
-        if dir_path.is_file() {
-            return Some(dir_path);
+        let check_in_dir = |dir: &Path, slice: &[String]| -> Option<PathBuf> {
+            if slice.is_empty() {
+                return None;
+            }
+            // 1. Direct file: dir/part1/.../partN.ifa
+            let mut file_path = dir.to_path_buf();
+            for (i, part) in slice.iter().enumerate() {
+                if i == slice.len() - 1 {
+                    file_path.push(format!("{}.ifa", part));
+                } else {
+                    file_path.push(part);
+                }
+            }
+            if file_path.is_file() {
+                return Some(file_path);
+            }
+
+            // 2. Directory module: dir/part1/.../partN/mod.ifa
+            let mut dir_path = dir.to_path_buf();
+            for part in slice {
+                dir_path.push(part);
+            }
+            dir_path.push("mod.ifa");
+            if dir_path.is_file() {
+                return Some(dir_path);
+            }
+            None
+        };
+
+        for dir in &candidate_dirs {
+            if let Some(found) = check_in_dir(dir, &parts) {
+                return Some(found);
+            }
+            if parts.len() > 1 {
+                if let Some(found) = check_in_dir(dir, &parts[1..]) {
+                    return Some(found);
+                }
+            }
         }
 
         None
