@@ -1523,6 +1523,31 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_crypto_sha1_vectors ... ok"),
+        "Std crypto SHA-1 vectors test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_crypto_base64_and_websocket_key ... ok"),
+        "Std crypto Base64 & WebSocket key test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_crypto_hmac_sha1_vectors ... ok"),
+        "Std crypto HMAC-SHA1 vectors test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_crypto_hotp_totp_vectors ... ok"),
+        "Std crypto HOTP & TOTP vectors test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_crypto_pbkdf2_vectors ... ok"),
+        "Std crypto PBKDF2 vectors test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_net_tcp_echo ... ok"),
         "Std net tcp echo test missing from output:\n{}",
         stdout
@@ -1803,8 +1828,8 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("193 passed; 0 failed"),
-        "Expected 193 passed std unit tests, got:\n{}",
+        stdout.contains("199 passed; 0 failed"),
+        "Expected 199 passed std unit tests, got:\n{}",
         stdout
     );
 }

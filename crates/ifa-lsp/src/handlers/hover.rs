@@ -161,6 +161,38 @@ pub fn handle_hover(doc: &Document, position: Position) -> Option<Hover> {
             "**`AtomicInt`** — 64-bit atomic integer (`std/sync`).\n\n\
              Provides wait-free atomics including Compare-And-Swap (CAS), fetch-add, and sequential consistency.",
         ),
+        "hmac_sha256" => Some(
+            "**`hmac_sha256(key: String, message: String) -> String`** — HMAC-SHA-256 (RFC 2104).\n\n\
+             Computes the keyed-hash message authentication code using SHA-256.",
+        ),
+        "hmac_sha1" => Some(
+            "**`hmac_sha1(key: String, message: String) -> String`** — HMAC-SHA-1 (RFC 2104).\n\n\
+             Computes the keyed-hash message authentication code using SHA-1.",
+        ),
+        "hotp" => Some(
+            "**`hotp(key: String, counter: i64, digits: i64) -> String`** — HMAC-Based One-Time Password (RFC 4226).\n\n\
+             Generates an event-based OTP token with dynamic truncation.",
+        ),
+        "totp" => Some(
+            "**`totp(key: String, time_seconds: i64, step_seconds: i64, digits: i64) -> String`** — Time-Based One-Time Password (RFC 6238).\n\n\
+             Generates a time-synchronized 2FA / MFA authentication token.",
+        ),
+        "totp_verify" => Some(
+            "**`totp_verify(key: String, code: String, time_seconds: i64, step_seconds: i64, window_steps: i64) -> bool`** — TOTP Verification.\n\n\
+             Validates a user-provided 2FA token against the current time with allowable clock drift steps.",
+        ),
+        "pbkdf2_hmac_sha256" => Some(
+            "**`pbkdf2_hmac_sha256(password: String, salt: String, iterations: i64, key_len: i64) -> List<i64>`** — PBKDF2 Key Derivation (RFC 2898 / RFC 8018).\n\n\
+             Derives cryptographically strong keys using iterated HMAC-SHA-256 pseudo-random function.",
+        ),
+        "sha256" | "sha256_hex" => Some(
+            "**`sha256_hex(input: String) -> String`** — NIST FIPS 180-4 SHA-256.\n\n\
+             Computes standard 256-bit cryptographic digest as hexadecimal string.",
+        ),
+        "blake3" | "blake3_hex" => Some(
+            "**`blake3_hex(s: String) -> String`** — BLAKE3 Cryptographic Hash.\n\n\
+             High-performance tree hashing algorithm with official specification compliance.",
+        ),
         _ => None,
     };
 

@@ -286,6 +286,175 @@ pub fn blake3_hex(data: &[u8]) -> String {
     to_hex(&digest)
 }
 
+/// Compute HMAC-SHA-256 message authentication code (RFC 2104).
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        let digest = sha256(key);
+        k[..32].copy_from_slice(&digest);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+
+    let mut i_pad = [0u8; 64];
+    let mut o_pad = [0u8; 64];
+    for i in 0..64 {
+        i_pad[i] = k[i] ^ 0x36;
+        o_pad[i] = k[i] ^ 0x5c;
+    }
+
+    let mut inner = Vec::with_capacity(64 + message.len());
+    inner.extend_from_slice(&i_pad);
+    inner.extend_from_slice(message);
+    let inner_hash = sha256(&inner);
+
+    let mut outer = Vec::with_capacity(64 + 32);
+    outer.extend_from_slice(&o_pad);
+    outer.extend_from_slice(&inner_hash);
+    sha256(&outer)
+}
+
+/// Compute HMAC-SHA-256 and return as lowercase hex string.
+pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    let digest = hmac_sha256(key, message);
+    to_hex(&digest)
+}
+
+/// Compute HMAC-SHA-1 message authentication code (RFC 2104).
+pub fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        let digest = sha1(key);
+        k[..20].copy_from_slice(&digest);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+
+    let mut i_pad = [0u8; 64];
+    let mut o_pad = [0u8; 64];
+    for i in 0..64 {
+        i_pad[i] = k[i] ^ 0x36;
+        o_pad[i] = k[i] ^ 0x5c;
+    }
+
+    let mut inner = Vec::with_capacity(64 + message.len());
+    inner.extend_from_slice(&i_pad);
+    inner.extend_from_slice(message);
+    let inner_hash = sha1(&inner);
+
+    let mut outer = Vec::with_capacity(64 + 20);
+    outer.extend_from_slice(&o_pad);
+    outer.extend_from_slice(&inner_hash);
+    sha1(&outer)
+}
+
+/// Compute HMAC-SHA-1 and return as lowercase hex string.
+pub fn hmac_sha1_hex(key: &[u8], message: &[u8]) -> String {
+    let digest = hmac_sha1(key, message);
+    to_hex(&digest)
+}
+
+/// Generate HMAC-Based One-Time Password (HOTP) per RFC 4226.
+pub fn hotp(key: &[u8], counter: u64, digits: u32) -> String {
+    let counter_bytes = counter.to_be_bytes();
+    let hash = hmac_sha1(key, &counter_bytes);
+    let offset = (hash[19] & 0x0f) as usize;
+    let binary = ((u32::from(hash[offset] & 0x7f)) << 24)
+        | ((u32::from(hash[offset + 1])) << 16)
+        | ((u32::from(hash[offset + 2])) << 8)
+        | (u32::from(hash[offset + 3]));
+
+    let modulo = 10u32.pow(digits.min(10));
+    let token = binary % modulo;
+    format!("{:0width$}", token, width = digits as usize)
+}
+
+/// Generate Time-Based One-Time Password (TOTP) per RFC 6238.
+pub fn totp(key: &[u8], time_seconds: u64, step_seconds: u64, digits: u32) -> String {
+    let step = if step_seconds == 0 { 30 } else { step_seconds };
+    let counter = time_seconds / step;
+    hotp(key, counter, digits)
+}
+
+/// Verify a TOTP token against a timestamp with an allowed window of time steps.
+pub fn totp_verify(
+    key: &[u8],
+    code: &str,
+    time_seconds: u64,
+    step_seconds: u64,
+    window_steps: i64,
+) -> bool {
+    let step = if step_seconds == 0 { 30 } else { step_seconds };
+    let current_counter = (time_seconds / step) as i64;
+    let clean_code = code.trim();
+    let digits = clean_code.len() as u32;
+    if digits == 0 {
+        return false;
+    }
+
+    let win = window_steps.abs();
+    for offset in -win..=win {
+        let counter = current_counter + offset;
+        if counter >= 0 {
+            let expected = hotp(key, counter as u64, digits);
+            if expected == clean_code {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Compute PBKDF2-HMAC-SHA256 key derivation (RFC 2898 / RFC 8018).
+pub fn pbkdf2_hmac_sha256(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    key_len: usize,
+) -> Vec<u8> {
+    let mut derived = Vec::with_capacity(key_len);
+    let mut block_index: u32 = 1;
+
+    while derived.len() < key_len {
+        // U_1 = PRF(password, salt || INT_32_BE(block_index))
+        let mut msg = Vec::with_capacity(salt.len() + 4);
+        msg.extend_from_slice(salt);
+        msg.extend_from_slice(&block_index.to_be_bytes());
+
+        let mut u = hmac_sha256(password, &msg);
+        let mut t = u;
+
+        for _ in 1..iterations {
+            u = hmac_sha256(password, &u);
+            for i in 0..32 {
+                t[i] ^= u[i];
+            }
+        }
+
+        let needed = key_len - derived.len();
+        if needed < 32 {
+            derived.extend_from_slice(&t[..needed]);
+        } else {
+            derived.extend_from_slice(&t);
+        }
+
+        block_index += 1;
+    }
+
+    derived
+}
+
+/// Compute PBKDF2-HMAC-SHA256 and return lowercase hex string.
+pub fn pbkdf2_hmac_sha256_hex(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    key_len: usize,
+) -> String {
+    let derived = pbkdf2_hmac_sha256(password, salt, iterations, key_len);
+    to_hex(&derived)
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -333,5 +502,61 @@ mod tests {
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let accept = websocket_accept_key(key);
         assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    #[test]
+    fn test_hmac_sha1_and_sha256_rfc2202_rfc4231() {
+        // RFC 2202 test case 1: Key = 20 bytes of 0x0b, Data = "Hi There"
+        let key_20 = [0x0bu8; 20];
+        assert_eq!(
+            hmac_sha1_hex(&key_20, b"Hi There"),
+            "b617318655057264e28bc0b6fb378c8ef146be00"
+        );
+
+        // RFC 4231 test case 1: Key = 20 bytes of 0x0b, Data = "Hi There"
+        assert_eq!(
+            hmac_sha256_hex(&key_20, b"Hi There"),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
+    #[test]
+    fn test_rfc4226_hotp_and_rfc6238_totp_vectors() {
+        // RFC 4226 Appendix D official test secret
+        let secret = b"12345678901234567890";
+        assert_eq!(hotp(secret, 0, 6), "755224");
+        assert_eq!(hotp(secret, 1, 6), "287082");
+        assert_eq!(hotp(secret, 2, 6), "359152");
+        assert_eq!(hotp(secret, 3, 6), "969429");
+        assert_eq!(hotp(secret, 4, 6), "338314");
+        assert_eq!(hotp(secret, 5, 6), "254676");
+        assert_eq!(hotp(secret, 6, 6), "287922");
+        assert_eq!(hotp(secret, 7, 6), "162583");
+        assert_eq!(hotp(secret, 8, 6), "399871");
+        assert_eq!(hotp(secret, 9, 6), "520489");
+
+        // TOTP verification at T=59 (counter 1)
+        assert_eq!(totp(secret, 59, 30, 6), "287082");
+        assert!(totp_verify(secret, "287082", 59, 30, 1));
+        assert!(totp_verify(secret, "287082", 60, 30, 1)); // counter 2, window +/- 1 matches counter 1
+        assert!(!totp_verify(secret, "000000", 59, 30, 1));
+    }
+
+    #[test]
+    fn test_rfc6070_pbkdf2_hmac_sha256() {
+        let password = b"password";
+        let salt = b"salt";
+
+        // c = 1, dkLen = 32
+        assert_eq!(
+            pbkdf2_hmac_sha256_hex(password, salt, 1, 32),
+            "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+        );
+
+        // c = 2, dkLen = 32
+        assert_eq!(
+            pbkdf2_hmac_sha256_hex(password, salt, 2, 32),
+            "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
+        );
     }
 }

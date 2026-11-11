@@ -13,8 +13,9 @@ pub mod sync;
 
 pub use collections::{BinaryHeap, ByteBuffer, Deque, List, Map, Set, StringBuilder};
 pub use crypto::{
-    base64_decode, base64_encode, blake3, blake3_hex, sha1, sha1_hex, sha256, sha256_hex,
-    websocket_accept_key,
+    base64_decode, base64_encode, blake3, blake3_hex, hmac_sha1, hmac_sha1_hex, hmac_sha256,
+    hmac_sha256_hex, hotp, pbkdf2_hmac_sha256, pbkdf2_hmac_sha256_hex, sha1, sha1_hex, sha256,
+    sha256_hex, totp, totp_verify, websocket_accept_key,
 };
 pub use csv::{decode as decode_csv, encode as encode_csv, CsvTable};
 pub use fmt::{
@@ -127,6 +128,20 @@ mod tests {
         assert_eq!(
             blake3_hex(&vec![b'A'; 2000]),
             "fc6985444b763593734965947a328514e93ef2bae12db668a6d64147c5dcdde3"
+        );
+    }
+
+    #[test]
+    fn test_crypto_primitives_suite() {
+        let key = b"12345678901234567890";
+        assert_eq!(hotp(key, 0, 6), "755224");
+        assert_eq!(totp(key, 59, 30, 6), "287082");
+        assert!(totp_verify(key, "287082", 59, 30, 1));
+
+        let derived = pbkdf2_hmac_sha256_hex(b"password", b"salt", 1, 32);
+        assert_eq!(
+            derived,
+            "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
         );
     }
 

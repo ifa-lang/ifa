@@ -1126,6 +1126,356 @@ pub fn test_crypto_base64_and_websocket_key() -> bool {
     return true;
 }
 
+// === HMAC, HOTP, TOTP, PBKDF2 EXTENSIONS ===
+
+pub fn hmac_sha256_bytes(key: List<i64>, data: List<i64>) -> List<i64> {
+    mut k_bytes: List<i64> = List::new();
+    let k_len = key.len();
+    if k_len > 64 {
+        k_bytes = sha256_bytes(key);
+    } else {
+        mut i: i64 = 0;
+        while i < k_len {
+            k_bytes.push(key[i]);
+            i = i + 1;
+        }
+    }
+    while k_bytes.len() < 64 {
+        k_bytes.push(0);
+    }
+
+    mut i_key_pad: List<i64> = List::new();
+    mut o_key_pad: List<i64> = List::new();
+    mut i: i64 = 0;
+    while i < 64 {
+        i_key_pad.push(k_bytes[i] ^ 54);
+        o_key_pad.push(k_bytes[i] ^ 92);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < data.len() {
+        i_key_pad.push(data[i]);
+        i = i + 1;
+    }
+    let inner_hash = sha256_bytes(i_key_pad);
+
+    i = 0;
+    while i < inner_hash.len() {
+        o_key_pad.push(inner_hash[i]);
+        i = i + 1;
+    }
+    return sha256_bytes(o_key_pad);
+}
+
+pub fn hmac_sha1_bytes(key: List<i64>, data: List<i64>) -> List<i64> {
+    mut k_bytes: List<i64> = List::new();
+    let k_len = key.len();
+    if k_len > 64 {
+        k_bytes = sha1_bytes(key);
+    } else {
+        mut i: i64 = 0;
+        while i < k_len {
+            k_bytes.push(key[i]);
+            i = i + 1;
+        }
+    }
+    while k_bytes.len() < 64 {
+        k_bytes.push(0);
+    }
+
+    mut i_key_pad: List<i64> = List::new();
+    mut o_key_pad: List<i64> = List::new();
+    mut i: i64 = 0;
+    while i < 64 {
+        i_key_pad.push(k_bytes[i] ^ 54);
+        o_key_pad.push(k_bytes[i] ^ 92);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < data.len() {
+        i_key_pad.push(data[i]);
+        i = i + 1;
+    }
+    let inner_hash = sha1_bytes(i_key_pad);
+
+    i = 0;
+    while i < inner_hash.len() {
+        o_key_pad.push(inner_hash[i]);
+        i = i + 1;
+    }
+    return sha1_bytes(o_key_pad);
+}
+
+pub fn hmac_sha1(key: String, message: String) -> String {
+    mut k: List<i64> = List::new();
+    let k_len = string_len(key);
+    mut i: i64 = 0;
+    while i < k_len {
+        k.push(string_char_at(key, i));
+        i = i + 1;
+    }
+
+    mut d: List<i64> = List::new();
+    let d_len = string_len(message);
+    i = 0;
+    while i < d_len {
+        d.push(string_char_at(message, i));
+        i = i + 1;
+    }
+
+    let h = hmac_sha1_bytes(k, d);
+    return bytes_to_hex(h);
+}
+
+pub fn crypto_int_to_string(n: i64) -> String {
+    if n == 0 {
+        return "0";
+    }
+    mut val = if n < 0 { 0 - n } else { n };
+    mut s: String = "";
+    while val > 0 {
+        let digit = val % 10;
+        if digit == 0 { s = "0" + s; }
+        else if digit == 1 { s = "1" + s; }
+        else if digit == 2 { s = "2" + s; }
+        else if digit == 3 { s = "3" + s; }
+        else if digit == 4 { s = "4" + s; }
+        else if digit == 5 { s = "5" + s; }
+        else if digit == 6 { s = "6" + s; }
+        else if digit == 7 { s = "7" + s; }
+        else if digit == 8 { s = "8" + s; }
+        else if digit == 9 { s = "9" + s; }
+        val = val / 10;
+    }
+    if n < 0 {
+        s = "-" + s;
+    }
+    return s;
+}
+
+pub fn hotp_bytes(key: List<i64>, counter: i64, digits: i64) -> String {
+    mut counter_bytes: List<i64> = List::new();
+    mut i: i64 = 7;
+    while i >= 0 {
+        let b = (counter >> (i * 8)) & 255;
+        counter_bytes.push(b);
+        i = i - 1;
+    }
+
+    let hash = hmac_sha1_bytes(key, counter_bytes);
+    let offset = hash[19] & 15;
+    let b0 = hash[offset] & 127;
+    let b1 = hash[offset + 1] & 255;
+    let b2 = hash[offset + 2] & 255;
+    let b3 = hash[offset + 3] & 255;
+    let binary = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+
+    mut modulo: i64 = 1;
+    mut d: i64 = 0;
+    while d < digits {
+        modulo = modulo * 10;
+        d = d + 1;
+    }
+    let token_val = binary % modulo;
+
+    let s = crypto_int_to_string(token_val);
+    let s_len = string_len(s);
+    mut padded = "";
+    mut p: i64 = s_len;
+    while p < digits {
+        padded = padded + "0";
+        p = p + 1;
+    }
+    return padded + s;
+}
+
+pub fn hotp(key: String, counter: i64, digits: i64) -> String {
+    mut k: List<i64> = List::new();
+    let k_len = string_len(key);
+    mut i: i64 = 0;
+    while i < k_len {
+        k.push(string_char_at(key, i));
+        i = i + 1;
+    }
+    return hotp_bytes(k, counter, digits);
+}
+
+pub fn totp(key: String, time_seconds: i64, step_seconds: i64, digits: i64) -> String {
+    mut step: i64 = step_seconds;
+    if step <= 0 {
+        step = 30;
+    }
+    let counter = time_seconds / step;
+    return hotp(key, counter, digits);
+}
+
+pub fn totp_verify(key: String, code: String, time_seconds: i64, step_seconds: i64, window_steps: i64) -> bool {
+    mut step: i64 = step_seconds;
+    if step <= 0 {
+        step = 30;
+    }
+    let current_counter = time_seconds / step;
+    let digits = string_len(code);
+    if digits == 0 {
+        return false;
+    }
+
+    mut win: i64 = window_steps;
+    if win < 0 {
+        win = 0 - win;
+    }
+    mut offset: i64 = 0 - win;
+    while offset <= win {
+        let counter = current_counter + offset;
+        if counter >= 0 {
+            let expected = hotp(key, counter, digits);
+            if expected == code {
+                return true;
+            }
+        }
+        offset = offset + 1;
+    }
+    return false;
+}
+
+pub fn pbkdf2_hmac_sha256(password: String, salt: String, iterations: i64, key_len: i64) -> List<i64> {
+    mut pwd_bytes: List<i64> = List::new();
+    let pwd_len = string_len(password);
+    mut i: i64 = 0;
+    while i < pwd_len {
+        pwd_bytes.push(string_char_at(password, i));
+        i = i + 1;
+    }
+
+    mut salt_bytes: List<i64> = List::new();
+    let s_len = string_len(salt);
+    i = 0;
+    while i < s_len {
+        salt_bytes.push(string_char_at(salt, i));
+        i = i + 1;
+    }
+
+    mut derived: List<i64> = List::new();
+    mut block_index: i64 = 1;
+
+    while derived.len() < key_len {
+        mut msg: List<i64> = List::new();
+        i = 0;
+        while i < salt_bytes.len() {
+            msg.push(salt_bytes[i]);
+            i = i + 1;
+        }
+        msg.push((block_index >> 24) & 255);
+        msg.push((block_index >> 16) & 255);
+        msg.push((block_index >> 8) & 255);
+        msg.push(block_index & 255);
+
+        mut u = hmac_sha256_bytes(pwd_bytes, msg);
+        mut t: List<i64> = List::new();
+        i = 0;
+        while i < u.len() {
+            t.push(u[i]);
+            i = i + 1;
+        }
+
+        mut iter: i64 = 1;
+        while iter < iterations {
+            u = hmac_sha256_bytes(pwd_bytes, u);
+            i = 0;
+            while i < 32 {
+                t[i] = t[i] ^ u[i];
+                i = i + 1;
+            }
+            iter = iter + 1;
+        }
+
+        let needed = key_len - derived.len();
+        mut take: i64 = 32;
+        if needed < 32 {
+            take = needed;
+        }
+        i = 0;
+        while i < take {
+            derived.push(t[i]);
+            i = i + 1;
+        }
+
+        block_index = block_index + 1;
+    }
+
+    return derived;
+}
+
+pub fn pbkdf2_hmac_sha256_hex(password: String, salt: String, iterations: i64, key_len: i64) -> String {
+    let derived = pbkdf2_hmac_sha256(password, salt, iterations, key_len);
+    return bytes_to_hex(derived);
+}
+
+pub fn test_crypto_hmac_sha1_vectors() -> bool {
+    // RFC 2202 Test Case 2
+    let res2 = hmac_sha1("Jefe", "what do ya want for nothing?");
+    if res2 != "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79" {
+        return false;
+    }
+
+    // RFC 2202 Test Case 1: Key = 20 bytes of 0x0b, Data = "Hi There"
+    mut key: List<i64> = List::new();
+    mut i: i64 = 0;
+    while i < 20 {
+        key.push(11);
+        i = i + 1;
+    }
+    mut data: List<i64> = List::new();
+    let msg = "Hi There";
+    i = 0;
+    while i < string_len(msg) {
+        data.push(string_char_at(msg, i));
+        i = i + 1;
+    }
+    let res1_bytes = hmac_sha1_bytes(key, data);
+    let res1 = bytes_to_hex(res1_bytes);
+    if res1 != "b617318655057264e28bc0b6fb378c8ef146be00" {
+        return false;
+    }
+
+    return true;
+}
+
+pub fn test_crypto_hotp_totp_vectors() -> bool {
+    let secret = "12345678901234567890";
+    if hotp(secret, 0, 6) != "755224" { return false; }
+    if hotp(secret, 1, 6) != "287082" { return false; }
+    if hotp(secret, 2, 6) != "359152" { return false; }
+    if hotp(secret, 3, 6) != "969429" { return false; }
+    if hotp(secret, 4, 6) != "338314" { return false; }
+    if hotp(secret, 5, 6) != "254676" { return false; }
+    if hotp(secret, 6, 6) != "287922" { return false; }
+    if hotp(secret, 7, 6) != "162583" { return false; }
+    if hotp(secret, 8, 6) != "399871" { return false; }
+    if hotp(secret, 9, 6) != "520489" { return false; }
+
+    if totp(secret, 59, 30, 6) != "287082" { return false; }
+    if !totp_verify(secret, "287082", 59, 30, 1) { return false; }
+    if !totp_verify(secret, "287082", 60, 30, 1) { return false; }
+    if totp_verify(secret, "000000", 59, 30, 1) { return false; }
+
+    return true;
+}
+
+pub fn test_crypto_pbkdf2_vectors() -> bool {
+    let c1 = pbkdf2_hmac_sha256_hex("password", "salt", 1, 32);
+    if c1 != "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b" {
+        return false;
+    }
+    let c2 = pbkdf2_hmac_sha256_hex("password", "salt", 2, 32);
+    if c2 != "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43" {
+        return false;
+    }
+    return true;
+}
+
 pub fn test_crypto_all() -> bool {
     return test_crypto_fnv1a()
         && test_crypto_murmur3()
@@ -1138,7 +1488,10 @@ pub fn test_crypto_all() -> bool {
         && test_crypto_blake3_ifa()
         && test_crypto_blake3_tree()
         && test_crypto_sha1_vectors()
-        && test_crypto_base64_and_websocket_key();
+        && test_crypto_base64_and_websocket_key()
+        && test_crypto_hmac_sha1_vectors()
+        && test_crypto_hotp_totp_vectors()
+        && test_crypto_pbkdf2_vectors();
 }
 
 pub fn main() {
@@ -1154,7 +1507,10 @@ pub fn main() {
     let t10 = test_crypto_blake3_tree();
     let t11 = test_crypto_sha1_vectors();
     let t12 = test_crypto_base64_and_websocket_key();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 {
+    let t13 = test_crypto_hmac_sha1_vectors();
+    let t14 = test_crypto_hotp_totp_vectors();
+    let t15 = test_crypto_pbkdf2_vectors();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 {
         println("std/crypto: ALL TESTS PASSED");
     } else {
         println("std/crypto: TESTS FAILED");
