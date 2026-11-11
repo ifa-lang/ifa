@@ -2805,9 +2805,9 @@ impl<'a> FirInterpreter<'a> {
                         match listener.accept() {
                             Ok((stream, _)) => {
                                 let _ = stream
-                                    .set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                                    .set_read_timeout(Some(std::time::Duration::from_millis(50)));
                                 let _ = stream
-                                    .set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                                    .set_write_timeout(Some(std::time::Duration::from_millis(500)));
                                 let stream_id = self.next_socket_id;
                                 self.next_socket_id += 1;
                                 self.tcp_streams.insert(stream_id, stream);
@@ -2840,9 +2840,9 @@ impl<'a> FirInterpreter<'a> {
                     match std::net::TcpStream::connect(&target) {
                         Ok(stream) => {
                             let _ =
-                                stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-                            let _ =
-                                stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                                stream.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+                            let _ = stream
+                                .set_write_timeout(Some(std::time::Duration::from_millis(500)));
                             let stream_id = self.next_socket_id;
                             self.next_socket_id += 1;
                             self.tcp_streams.insert(stream_id, stream);

@@ -1953,13 +1953,18 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_net_websocket_frame_demux_and_fragmentation ... ok"),
+        "Std net websocket frame demux and fragmentation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("255 passed; 0 failed"),
-        "Expected 255 passed std unit tests, got:\n{}",
+        stdout.contains("257 passed; 0 failed"),
+        "Expected 257 passed std unit tests, got:\n{}",
         stdout
     );
 }

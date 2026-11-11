@@ -7,6 +7,9 @@ use std::net::{
 };
 use std::time::Duration;
 
+use ifa_runtime::fiber::GLOBAL_SCHEDULER;
+use ifa_runtime::reactor::AsyncTcpStream;
+
 /// Managed non-blocking TCP Stream.
 pub struct TcpStream {
     inner: StdTcpStream,
@@ -409,6 +412,39 @@ impl WsFrame {
         }
     }
 
+    pub fn continuation(
+        payload: Vec<u8>,
+        fin: bool,
+        is_masked: bool,
+        mask_key: Option<[u8; 4]>,
+    ) -> Self {
+        Self {
+            fin,
+            opcode: WsOpcode::Continuation,
+            is_masked,
+            mask_key,
+            payload,
+        }
+    }
+
+    /// Extract close status code from payload if this is a Close frame.
+    pub fn close_code(&self) -> Option<u16> {
+        if self.opcode == WsOpcode::Close && self.payload.len() >= 2 {
+            Some(u16::from_be_bytes([self.payload[0], self.payload[1]]))
+        } else {
+            None
+        }
+    }
+
+    /// Extract close reason string from payload if this is a Close frame.
+    pub fn close_reason(&self) -> Option<&str> {
+        if self.opcode == WsOpcode::Close && self.payload.len() > 2 {
+            std::str::from_utf8(&self.payload[2..]).ok()
+        } else {
+            None
+        }
+    }
+
     /// Encode frame to wire bytes.
     pub fn encode(&self) -> Vec<u8> {
         let mut wire = Vec::new();
@@ -514,12 +550,173 @@ impl WsFrame {
     }
 }
 
+/// High-level WebSocket message demultiplexed and reassembled from RFC 6455 data/control frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WsMessage {
+    /// Complete UTF-8 text message.
+    Text(String),
+    /// Complete arbitrary binary payload message.
+    Binary(Vec<u8>),
+    /// Ping control frame containing heartbeat payload.
+    Ping(Vec<u8>),
+    /// Pong control frame answering a ping or unsolicited.
+    Pong(Vec<u8>),
+    /// Close control frame with optional status code and reason string.
+    Close(Option<u16>, String),
+}
+
+impl WsMessage {
+    pub fn text(s: impl Into<String>) -> Self {
+        Self::Text(s.into())
+    }
+
+    pub fn binary(data: impl Into<Vec<u8>>) -> Self {
+        Self::Binary(data.into())
+    }
+
+    pub fn ping(payload: impl Into<Vec<u8>>) -> Self {
+        Self::Ping(payload.into())
+    }
+
+    pub fn pong(payload: impl Into<Vec<u8>>) -> Self {
+        Self::Pong(payload.into())
+    }
+
+    pub fn close(code: Option<u16>, reason: impl Into<String>) -> Self {
+        Self::Close(code, reason.into())
+    }
+
+    pub fn to_frame(&self, is_masked: bool, mask_key: Option<[u8; 4]>) -> WsFrame {
+        match self {
+            Self::Text(t) => WsFrame::text(t, is_masked, mask_key),
+            Self::Binary(b) => WsFrame::binary(b.clone(), is_masked, mask_key),
+            Self::Ping(p) => WsFrame::ping(p.clone(), is_masked, mask_key),
+            Self::Pong(p) => WsFrame::pong(p.clone(), is_masked, mask_key),
+            Self::Close(code, reason) => {
+                WsFrame::close(code.unwrap_or(1000), reason, is_masked, mask_key)
+            }
+        }
+    }
+}
+
+/// Streaming RFC 6455 frame demultiplexer and fragmented message reassembler.
+#[derive(Debug, Default, Clone)]
+pub struct WsDemux {
+    pub buffer: Vec<u8>,
+    fragment_opcode: Option<WsOpcode>,
+    fragment_payload: Vec<u8>,
+}
+
+impl WsDemux {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append incoming TCP wire bytes to demux buffer.
+    pub fn push_bytes(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    /// Current unconsumed wire bytes in buffer.
+    pub fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Drain and decode next complete raw frame from buffer, if available.
+    pub fn poll_frame(&mut self) -> Option<WsFrame> {
+        if let Some((frame, consumed)) = WsFrame::decode(&self.buffer) {
+            self.buffer.drain(..consumed);
+            Some(frame)
+        } else {
+            None
+        }
+    }
+
+    /// Decode all currently complete raw frames from buffer.
+    pub fn poll_all_frames(&mut self) -> Vec<WsFrame> {
+        let mut frames = Vec::new();
+        while let Some(frame) = self.poll_frame() {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    /// Demultiplex and reassemble the next complete `WsMessage`.
+    /// Control frames (Ping, Pong, Close) are emitted immediately even if interleaved
+    /// between fragmented data frames per RFC 6455 §5.4.
+    pub fn poll_message(&mut self) -> io::Result<Option<WsMessage>> {
+        while let Some(frame) = self.poll_frame() {
+            match frame.opcode {
+                WsOpcode::Ping => {
+                    return Ok(Some(WsMessage::Ping(frame.payload)));
+                }
+                WsOpcode::Pong => {
+                    return Ok(Some(WsMessage::Pong(frame.payload)));
+                }
+                WsOpcode::Close => {
+                    let code = frame.close_code();
+                    let reason = frame.close_reason().unwrap_or("").to_string();
+                    return Ok(Some(WsMessage::Close(code, reason)));
+                }
+                WsOpcode::Text | WsOpcode::Binary => {
+                    if frame.fin {
+                        if frame.opcode == WsOpcode::Text {
+                            let text = String::from_utf8(frame.payload).map_err(|e| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("Invalid UTF-8 in WebSocket text frame: {}", e),
+                                )
+                            })?;
+                            return Ok(Some(WsMessage::Text(text)));
+                        } else {
+                            return Ok(Some(WsMessage::Binary(frame.payload)));
+                        }
+                    } else {
+                        // First fragment of a fragmented message
+                        self.fragment_opcode = Some(frame.opcode);
+                        self.fragment_payload = frame.payload;
+                    }
+                }
+                WsOpcode::Continuation => {
+                    if let Some(initial_op) = self.fragment_opcode {
+                        self.fragment_payload.extend_from_slice(&frame.payload);
+                        if frame.fin {
+                            self.fragment_opcode = None;
+                            let full_payload = std::mem::take(&mut self.fragment_payload);
+                            if initial_op == WsOpcode::Text {
+                                let text = String::from_utf8(full_payload).map_err(|e| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!(
+                                            "Invalid UTF-8 in fragmented WebSocket text message: {}",
+                                            e
+                                        ),
+                                    )
+                                })?;
+                                return Ok(Some(WsMessage::Text(text)));
+                            } else {
+                                return Ok(Some(WsMessage::Binary(full_payload)));
+                            }
+                        }
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Received unexpected WebSocket continuation frame without initial fragment",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// Active WebSocket session on top of a non-blocking TCP Stream.
 pub struct WsSession {
     pub id: usize,
     pub stream: TcpStream,
     pub is_upgraded: bool,
-    buffer: Vec<u8>,
+    demux: WsDemux,
 }
 
 impl WsSession {
@@ -528,7 +725,7 @@ impl WsSession {
             id,
             stream,
             is_upgraded: false,
-            buffer: Vec::new(),
+            demux: WsDemux::new(),
         }
     }
 
@@ -541,14 +738,14 @@ impl WsSession {
         let mut chunk = [0u8; 1024];
         match self.stream.read(&mut chunk) {
             Ok(n) if n > 0 => {
-                self.buffer.extend_from_slice(&chunk[..n]);
+                self.demux.push_bytes(&chunk[..n]);
             }
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(e),
         }
 
-        let text = String::from_utf8_lossy(&self.buffer);
+        let text = String::from_utf8_lossy(&self.demux.buffer);
         if let Some(header_end) = text.find("\r\n\r\n") {
             let header_part = &text[..header_end];
             let mut key: Option<String> = None;
@@ -568,8 +765,8 @@ impl WsSession {
                 );
                 self.stream.write_all(response.as_bytes())?;
                 self.is_upgraded = true;
-                // keep any trailing frame bytes
-                self.buffer = self.buffer[header_end + 4..].to_vec();
+                // keep any trailing frame bytes in demux buffer
+                self.demux.buffer.drain(..header_end + 4);
                 return Ok(true);
             }
         }
@@ -584,16 +781,95 @@ impl WsSession {
         Ok(())
     }
 
-    /// Poll incoming WebSocket text messages, responding automatically to ping and handling close frames.
-    pub fn poll_text_messages(&mut self) -> io::Result<Vec<String>> {
+    /// Send binary data to this session (unmasked from server per RFC 6455).
+    pub fn send_binary(&mut self, data: &[u8]) -> io::Result<()> {
+        let frame = WsFrame::binary(data.to_vec(), false, None);
+        self.stream.write_all(&frame.encode())?;
+        Ok(())
+    }
+
+    /// Send a Ping frame to this session.
+    pub fn send_ping(&mut self, payload: &[u8]) -> io::Result<()> {
+        let frame = WsFrame::ping(payload.to_vec(), false, None);
+        self.stream.write_all(&frame.encode())?;
+        Ok(())
+    }
+
+    /// Send a Pong frame to this session.
+    pub fn send_pong(&mut self, payload: &[u8]) -> io::Result<()> {
+        let frame = WsFrame::pong(payload.to_vec(), false, None);
+        self.stream.write_all(&frame.encode())?;
+        Ok(())
+    }
+
+    /// Send a Close frame to this session.
+    pub fn send_close(&mut self, code: u16, reason: &str) -> io::Result<()> {
+        let frame = WsFrame::close(code, reason, false, None);
+        let _ = self.stream.write_all(&frame.encode());
+        self.stream.close();
+        Ok(())
+    }
+
+    /// Send a fragmented text message.
+    pub fn send_fragmented_text(&mut self, chunks: &[&str]) -> io::Result<()> {
+        if chunks.is_empty() {
+            return self.send_text("");
+        }
+        for (i, chunk) in chunks.iter().enumerate() {
+            let is_first = i == 0;
+            let is_last = i == chunks.len() - 1;
+            let opcode = if is_first {
+                WsOpcode::Text
+            } else {
+                WsOpcode::Continuation
+            };
+            let frame = WsFrame {
+                fin: is_last,
+                opcode,
+                is_masked: false,
+                mask_key: None,
+                payload: chunk.as_bytes().to_vec(),
+            };
+            self.stream.write_all(&frame.encode())?;
+        }
+        Ok(())
+    }
+
+    /// Send a fragmented binary message.
+    pub fn send_fragmented_binary(&mut self, chunks: &[&[u8]]) -> io::Result<()> {
+        if chunks.is_empty() {
+            return self.send_binary(&[]);
+        }
+        for (i, chunk) in chunks.iter().enumerate() {
+            let is_first = i == 0;
+            let is_last = i == chunks.len() - 1;
+            let opcode = if is_first {
+                WsOpcode::Binary
+            } else {
+                WsOpcode::Continuation
+            };
+            let frame = WsFrame {
+                fin: is_last,
+                opcode,
+                is_masked: false,
+                mask_key: None,
+                payload: chunk.to_vec(),
+            };
+            self.stream.write_all(&frame.encode())?;
+        }
+        Ok(())
+    }
+
+    /// Poll incoming WebSocket messages (Text, Binary, Ping, Pong, Close) with automatic ping/pong handling.
+    pub fn poll_messages(&mut self) -> io::Result<Vec<WsMessage>> {
         if !self.is_upgraded {
             return Ok(Vec::new());
         }
 
-        let mut chunk = [0u8; 2048];
+        let mut chunk = [0u8; 4096];
         match self.stream.read(&mut chunk) {
             Ok(n) if n > 0 => {
-                self.buffer.extend_from_slice(&chunk[..n]);
+                self.demux.push_bytes(&chunk[..n]);
             }
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -601,27 +877,36 @@ impl WsSession {
         }
 
         let mut messages = Vec::new();
-        while let Some((frame, consumed)) = WsFrame::decode(&self.buffer) {
-            self.buffer.drain(..consumed);
-            match frame.opcode {
-                WsOpcode::Text => {
-                    if let Ok(msg) = String::from_utf8(frame.payload) {
-                        messages.push(msg);
-                    }
-                }
-                WsOpcode::Ping => {
-                    let pong = WsFrame::pong(frame.payload, false, None);
+        while let Some(msg) = self.demux.poll_message()? {
+            match &msg {
+                WsMessage::Ping(payload) => {
+                    let pong = WsFrame::pong(payload.clone(), false, None);
                     let _ = self.stream.write_all(&pong.encode());
                 }
-                WsOpcode::Close => {
+                WsMessage::Close(code, reason) => {
+                    let reply = WsFrame::close(code.unwrap_or(1000), reason, false, None);
+                    let _ = self.stream.write_all(&reply.encode());
                     self.stream.close();
+                    messages.push(msg);
                     break;
                 }
-                _ => {}
+                _ => messages.push(msg),
             }
         }
 
         Ok(messages)
+    }
+
+    /// Poll incoming WebSocket text messages, responding automatically to ping and handling close frames.
+    pub fn poll_text_messages(&mut self) -> io::Result<Vec<String>> {
+        let msgs = self.poll_messages()?;
+        let mut text_msgs = Vec::new();
+        for m in msgs {
+            if let WsMessage::Text(t) = m {
+                text_msgs.push(t);
+            }
+        }
+        Ok(text_msgs)
     }
 
     /// Close session.
@@ -706,10 +991,41 @@ impl WsServer {
         delivered
     }
 
+    /// Broadcast binary data to all upgraded sessions.
+    pub fn broadcast_binary(&mut self, data: &[u8]) -> usize {
+        let mut delivered = 0;
+        let mut dead = Vec::new();
+        for (id, session) in self.sessions.iter_mut() {
+            if session.is_upgraded {
+                if session.send_binary(data).is_ok() {
+                    delivered += 1;
+                } else {
+                    dead.push(*id);
+                }
+            }
+        }
+        for id in dead {
+            self.sessions.remove(&id);
+        }
+        delivered
+    }
+
     /// Send text to a specific session id.
     pub fn send_to(&mut self, session_id: usize, text: &str) -> io::Result<()> {
         if let Some(session) = self.sessions.get_mut(&session_id) {
             session.send_text(text)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "WebSocket session not found",
+            ))
+        }
+    }
+
+    /// Send binary data to a specific session id.
+    pub fn send_binary_to(&mut self, session_id: usize, data: &[u8]) -> io::Result<()> {
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.send_binary(data)
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -736,6 +1052,26 @@ impl WsServer {
             self.sessions.remove(&id);
         }
         all_msgs
+    }
+
+    /// Poll all incoming events (Text, Binary, Close) across all active sessions.
+    pub fn poll_all_events(&mut self) -> Vec<(usize, WsMessage)> {
+        let mut all_events = Vec::new();
+        let mut dead = Vec::new();
+        for (id, session) in self.sessions.iter_mut() {
+            match session.poll_messages() {
+                Ok(msgs) => {
+                    for m in msgs {
+                        all_events.push((*id, m));
+                    }
+                }
+                Err(_) => dead.push(*id),
+            }
+        }
+        for id in dead {
+            self.sessions.remove(&id);
+        }
+        all_events
     }
 
     /// Disconnect a session.
@@ -824,6 +1160,27 @@ impl WsClient {
         Ok(())
     }
 
+    /// Send binary data (masked per RFC 6455 requirement for clients).
+    pub fn send_binary(&mut self, data: &[u8]) -> io::Result<()> {
+        let frame = WsFrame::binary(data.to_vec(), true, Some([0x12, 0x34, 0x56, 0x78]));
+        self.stream.write_all(&frame.encode())?;
+        Ok(())
+    }
+
+    /// Send Ping control frame (masked per RFC 6455 requirement for clients).
+    pub fn send_ping(&mut self, payload: &[u8]) -> io::Result<()> {
+        let frame = WsFrame::ping(payload.to_vec(), true, Some([0x12, 0x34, 0x56, 0x78]));
+        self.stream.write_all(&frame.encode())?;
+        Ok(())
+    }
+
+    /// Send Pong control frame (masked per RFC 6455 requirement for clients).
+    pub fn send_pong(&mut self, payload: &[u8]) -> io::Result<()> {
+        let frame = WsFrame::pong(payload.to_vec(), true, Some([0x12, 0x34, 0x56, 0x78]));
+        self.stream.write_all(&frame.encode())?;
+        Ok(())
+    }
+
     /// Poll incoming text message from server.
     pub fn poll_text_message(&mut self) -> io::Result<Option<String>> {
         let mut chunk = [0u8; 1024];
@@ -843,11 +1200,272 @@ impl WsClient {
         Ok(None)
     }
 
+    /// Poll incoming WebSocket message (Text, Binary, Ping, Pong, Close) from server.
+    pub fn poll_ws_message(&mut self) -> io::Result<Option<WsMessage>> {
+        let mut chunk = [0u8; 2048];
+        if let Ok(n) = self.stream.read(&mut chunk) {
+            if n > 0 {
+                self.buffer.extend_from_slice(&chunk[..n]);
+            }
+        }
+
+        if let Some((frame, consumed)) = WsFrame::decode(&self.buffer) {
+            self.buffer.drain(..consumed);
+            match frame.opcode {
+                WsOpcode::Text => {
+                    let text = String::from_utf8(frame.payload).map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Invalid UTF-8 in WebSocket text frame: {}", e),
+                        )
+                    })?;
+                    return Ok(Some(WsMessage::Text(text)));
+                }
+                WsOpcode::Binary => return Ok(Some(WsMessage::Binary(frame.payload))),
+                WsOpcode::Ping => return Ok(Some(WsMessage::Ping(frame.payload))),
+                WsOpcode::Pong => return Ok(Some(WsMessage::Pong(frame.payload))),
+                WsOpcode::Close => {
+                    let code = frame.close_code();
+                    let reason = frame.close_reason().unwrap_or("").to_string();
+                    return Ok(Some(WsMessage::Close(code, reason)));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Close client connection.
     pub fn close(&mut self) {
         let frame = WsFrame::close(1000, "Normal Closure", true, Some([0xAA, 0xBB, 0xCC, 0xDD]));
         let _ = self.stream.write_all(&frame.encode());
         self.stream.close();
+    }
+}
+
+/// Asynchronous WebSocket connection running over an `AsyncTcpStream` in colorless fibers.
+pub struct AsyncWsConnection {
+    pub stream: AsyncTcpStream,
+    demux: WsDemux,
+    is_client: bool,
+    is_closed: bool,
+}
+
+impl AsyncWsConnection {
+    /// Create a new async WebSocket connection wrapping an async TCP stream.
+    pub fn new(stream: AsyncTcpStream, is_client: bool) -> Self {
+        Self {
+            stream,
+            demux: WsDemux::new(),
+            is_client,
+            is_closed: false,
+        }
+    }
+
+    /// Whether this connection has been closed.
+    pub fn is_closed(&self) -> bool {
+        self.is_closed
+    }
+
+    /// Send a complete RFC 6455 WebSocket frame over the async TCP stream.
+    pub fn send_frame(&mut self, frame: &WsFrame) -> io::Result<()> {
+        if self.is_closed {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "WebSocket connection is closed",
+            ));
+        }
+        let wire = frame.encode();
+        self.stream.write_all(&wire)
+    }
+
+    /// Send a UTF-8 text message.
+    pub fn send_text(&mut self, text: &str) -> io::Result<()> {
+        let frame = if self.is_client {
+            WsFrame::text(text, true, Some([0x12, 0x34, 0x56, 0x78]))
+        } else {
+            WsFrame::text(text, false, None)
+        };
+        self.send_frame(&frame)
+    }
+
+    /// Send arbitrary binary payload.
+    pub fn send_binary(&mut self, data: &[u8]) -> io::Result<()> {
+        let frame = if self.is_client {
+            WsFrame::binary(data.to_vec(), true, Some([0x12, 0x34, 0x56, 0x78]))
+        } else {
+            WsFrame::binary(data.to_vec(), false, None)
+        };
+        self.send_frame(&frame)
+    }
+
+    /// Send a Ping control frame.
+    pub fn send_ping(&mut self, payload: &[u8]) -> io::Result<()> {
+        let frame = if self.is_client {
+            WsFrame::ping(payload.to_vec(), true, Some([0x12, 0x34, 0x56, 0x78]))
+        } else {
+            WsFrame::ping(payload.to_vec(), false, None)
+        };
+        self.send_frame(&frame)
+    }
+
+    /// Send a Pong control frame.
+    pub fn send_pong(&mut self, payload: &[u8]) -> io::Result<()> {
+        let frame = if self.is_client {
+            WsFrame::pong(payload.to_vec(), true, Some([0x12, 0x34, 0x56, 0x78]))
+        } else {
+            WsFrame::pong(payload.to_vec(), false, None)
+        };
+        self.send_frame(&frame)
+    }
+
+    /// Send a Close control frame and mark connection closed.
+    pub fn send_close(&mut self, code: u16, reason: &str) -> io::Result<()> {
+        let frame = if self.is_client {
+            WsFrame::close(code, reason, true, Some([0x12, 0x34, 0x56, 0x78]))
+        } else {
+            WsFrame::close(code, reason, false, None)
+        };
+        let res = self.send_frame(&frame);
+        self.is_closed = true;
+        res
+    }
+
+    /// Send a high-level `WsMessage`.
+    pub fn send_message(&mut self, msg: &WsMessage) -> io::Result<()> {
+        let mask = if self.is_client {
+            Some([0x12, 0x34, 0x56, 0x78])
+        } else {
+            None
+        };
+        let frame = msg.to_frame(self.is_client, mask);
+        self.send_frame(&frame)
+    }
+
+    /// Send a fragmented text message across multiple continuation frames.
+    pub fn send_fragmented_text(&mut self, chunks: &[&str]) -> io::Result<()> {
+        if chunks.is_empty() {
+            return self.send_text("");
+        }
+        for (i, chunk) in chunks.iter().enumerate() {
+            let is_first = i == 0;
+            let is_last = i == chunks.len() - 1;
+            let opcode = if is_first {
+                WsOpcode::Text
+            } else {
+                WsOpcode::Continuation
+            };
+            let mask_key = if self.is_client {
+                Some([0x12, 0x34, 0x56, 0x78])
+            } else {
+                None
+            };
+            let frame = WsFrame {
+                fin: is_last,
+                opcode,
+                is_masked: self.is_client,
+                mask_key,
+                payload: chunk.as_bytes().to_vec(),
+            };
+            self.send_frame(&frame)?;
+        }
+        Ok(())
+    }
+
+    /// Send a fragmented binary message across multiple continuation frames.
+    pub fn send_fragmented_binary(&mut self, chunks: &[&[u8]]) -> io::Result<()> {
+        if chunks.is_empty() {
+            return self.send_binary(&[]);
+        }
+        for (i, chunk) in chunks.iter().enumerate() {
+            let is_first = i == 0;
+            let is_last = i == chunks.len() - 1;
+            let opcode = if is_first {
+                WsOpcode::Binary
+            } else {
+                WsOpcode::Continuation
+            };
+            let mask_key = if self.is_client {
+                Some([0x12, 0x34, 0x56, 0x78])
+            } else {
+                None
+            };
+            let frame = WsFrame {
+                fin: is_last,
+                opcode,
+                is_masked: self.is_client,
+                mask_key,
+                payload: chunk.to_vec(),
+            };
+            self.send_frame(&frame)?;
+        }
+        Ok(())
+    }
+
+    /// Non-blocking check for incoming messages from the async TCP stream.
+    /// Handles Ping frames automatically by replying with a Pong.
+    pub fn try_recv_message(&mut self) -> io::Result<Option<WsMessage>> {
+        let mut buf = [0u8; 4096];
+        let mut eof = false;
+        match self.stream.try_read(&mut buf) {
+            Ok(Some(n)) if n > 0 => {
+                self.demux.push_bytes(&buf[..n]);
+            }
+            Ok(Some(0)) => {
+                eof = true;
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+
+        while let Some(msg) = self.demux.poll_message()? {
+            match &msg {
+                WsMessage::Ping(payload) => {
+                    let _ = self.send_pong(payload);
+                }
+                WsMessage::Close(code, reason) => {
+                    if !self.is_closed {
+                        let _ = self.send_close(code.unwrap_or(1000), reason);
+                    }
+                    return Ok(Some(msg));
+                }
+                _ => return Ok(Some(msg)),
+            }
+        }
+
+        if eof {
+            self.is_closed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "WebSocket connection closed by peer",
+            ));
+        }
+
+        Ok(None)
+    }
+
+    /// Receive the next `WsMessage` asynchronously, yielding the colorless fiber cooperatively.
+    pub fn recv_message(&mut self) -> io::Result<WsMessage> {
+        let mut spins = 0;
+        loop {
+            if let Some(msg) = self.try_recv_message()? {
+                return Ok(msg);
+            }
+            if self.is_closed {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "WebSocket connection closed",
+                ));
+            }
+            spins += 1;
+            if spins < 16 {
+                std::hint::spin_loop();
+            } else {
+                GLOBAL_SCHEDULER.yield_now();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }
 
@@ -988,5 +1606,259 @@ mod tests {
         client1.close();
         client2.close();
         server.stop();
+    }
+
+    #[test]
+    fn test_websocket_binary_and_control_frames() {
+        // Binary unmasked
+        let bin_payload = vec![0x00, 0xFF, 0x42, 0x13, 0x37];
+        let bin_frame = WsFrame::binary(bin_payload.clone(), false, None);
+        let wire = bin_frame.encode();
+        let (dec, consumed) = WsFrame::decode(&wire).expect("decode binary");
+        assert_eq!(consumed, wire.len());
+        assert_eq!(dec.opcode, WsOpcode::Binary);
+        assert_eq!(dec.payload, bin_payload);
+
+        // Binary masked
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        let masked_bin = WsFrame::binary(bin_payload.clone(), true, Some(mask));
+        let masked_wire = masked_bin.encode();
+        let (dec_m, consumed_m) = WsFrame::decode(&masked_wire).expect("decode masked binary");
+        assert_eq!(consumed_m, masked_wire.len());
+        assert_eq!(dec_m.opcode, WsOpcode::Binary);
+        assert!(dec_m.is_masked);
+        assert_eq!(dec_m.payload, bin_payload);
+
+        // Ping / Pong
+        let ping = WsFrame::ping(b"heartbeat-seq-1".to_vec(), false, None);
+        let ping_wire = ping.encode();
+        let (dec_ping, _) = WsFrame::decode(&ping_wire).expect("decode ping");
+        assert_eq!(dec_ping.opcode, WsOpcode::Ping);
+        assert_eq!(dec_ping.payload, b"heartbeat-seq-1");
+
+        let pong = WsFrame::pong(b"heartbeat-seq-1".to_vec(), false, None);
+        let pong_wire = pong.encode();
+        let (dec_pong, _) = WsFrame::decode(&pong_wire).expect("decode pong");
+        assert_eq!(dec_pong.opcode, WsOpcode::Pong);
+        assert_eq!(dec_pong.payload, b"heartbeat-seq-1");
+
+        // Close frame code and reason extraction
+        let close = WsFrame::close(1001, "Going Away", false, None);
+        let close_wire = close.encode();
+        let (dec_close, _) = WsFrame::decode(&close_wire).expect("decode close");
+        assert_eq!(dec_close.opcode, WsOpcode::Close);
+        assert_eq!(dec_close.close_code(), Some(1001));
+        assert_eq!(dec_close.close_reason(), Some("Going Away"));
+    }
+
+    #[test]
+    fn test_websocket_extended_payload_lengths() {
+        // Medium payload: 126..=65535 bytes (16-bit extended length)
+        let medium_payload = vec![0xAA; 1000];
+        let medium_frame = WsFrame::binary(medium_payload.clone(), false, None);
+        let wire = medium_frame.encode();
+        assert_eq!(wire[1] & 0x7F, 126);
+        let (dec, consumed) = WsFrame::decode(&wire).expect("decode medium");
+        assert_eq!(consumed, wire.len());
+        assert_eq!(dec.payload.len(), 1000);
+        assert_eq!(dec.payload, medium_payload);
+
+        // Masked medium payload
+        let masked_medium =
+            WsFrame::binary(medium_payload.clone(), true, Some([0x12, 0x34, 0x56, 0x78]));
+        let masked_wire = masked_medium.encode();
+        let (dec_m, consumed_m) = WsFrame::decode(&masked_wire).expect("decode masked medium");
+        assert_eq!(consumed_m, masked_wire.len());
+        assert_eq!(dec_m.payload, medium_payload);
+
+        // Large payload: 70000 bytes (>65535 bytes, 64-bit extended length)
+        let large_payload = vec![0x55; 70000];
+        let large_frame = WsFrame::binary(large_payload.clone(), false, None);
+        let large_wire = large_frame.encode();
+        assert_eq!(large_wire[1] & 0x7F, 127);
+        let (dec_l, consumed_l) = WsFrame::decode(&large_wire).expect("decode large");
+        assert_eq!(consumed_l, large_wire.len());
+        assert_eq!(dec_l.payload.len(), 70000);
+        assert_eq!(dec_l.payload, large_payload);
+    }
+
+    #[test]
+    fn test_websocket_demux_and_fragmentation_reassembly() {
+        let mut demux = WsDemux::new();
+
+        // 1. Unfragmented text message
+        let f1 = WsFrame::text("Hello IFA Demux", false, None);
+        demux.push_bytes(&f1.encode());
+        let msg1 = demux.poll_message().expect("poll").expect("some msg");
+        assert_eq!(msg1, WsMessage::Text("Hello IFA Demux".to_string()));
+
+        // 2. Fragmented text message: 3 chunks (Text -> Continuation -> Continuation)
+        let frag1 = WsFrame {
+            fin: false,
+            opcode: WsOpcode::Text,
+            is_masked: false,
+            mask_key: None,
+            payload: b"Part 1 - ".to_vec(),
+        };
+        let frag2 = WsFrame {
+            fin: false,
+            opcode: WsOpcode::Continuation,
+            is_masked: false,
+            mask_key: None,
+            payload: b"Part 2 - ".to_vec(),
+        };
+        let frag3 = WsFrame {
+            fin: true,
+            opcode: WsOpcode::Continuation,
+            is_masked: false,
+            mask_key: None,
+            payload: b"Part 3 Complete".to_vec(),
+        };
+
+        // Push fragments in byte streams
+        demux.push_bytes(&frag1.encode());
+        assert_eq!(demux.poll_message().expect("poll"), None); // incomplete
+
+        demux.push_bytes(&frag2.encode());
+        assert_eq!(demux.poll_message().expect("poll"), None); // incomplete
+
+        demux.push_bytes(&frag3.encode());
+        let reassembled = demux.poll_message().expect("poll").expect("reassembled");
+        assert_eq!(
+            reassembled,
+            WsMessage::Text("Part 1 - Part 2 - Part 3 Complete".to_string())
+        );
+
+        // 3. Fragmented binary message
+        let b1 = WsFrame {
+            fin: false,
+            opcode: WsOpcode::Binary,
+            is_masked: false,
+            mask_key: None,
+            payload: vec![1, 2, 3],
+        };
+        let b2 = WsFrame {
+            fin: true,
+            opcode: WsOpcode::Continuation,
+            is_masked: false,
+            mask_key: None,
+            payload: vec![4, 5, 6],
+        };
+        demux.push_bytes(&b1.encode());
+        demux.push_bytes(&b2.encode());
+        let reassembled_bin = demux
+            .poll_message()
+            .expect("poll bin")
+            .expect("reassembled bin");
+        assert_eq!(reassembled_bin, WsMessage::Binary(vec![1, 2, 3, 4, 5, 6]));
+    }
+
+    #[test]
+    fn test_websocket_interleaved_control_frames() {
+        let mut demux = WsDemux::new();
+
+        // Start a fragmented message
+        let frag1 = WsFrame {
+            fin: false,
+            opcode: WsOpcode::Text,
+            is_masked: false,
+            mask_key: None,
+            payload: b"Segment A - ".to_vec(),
+        };
+        demux.push_bytes(&frag1.encode());
+
+        // Interleave a Ping control frame
+        let ping = WsFrame::ping(b"interleaved-heartbeat".to_vec(), false, None);
+        demux.push_bytes(&ping.encode());
+
+        // Ping must be demultiplexed immediately!
+        let msg_ping = demux.poll_message().expect("poll ping").expect("got ping");
+        assert_eq!(msg_ping, WsMessage::Ping(b"interleaved-heartbeat".to_vec()));
+
+        // Now push final continuation fragment
+        let frag2 = WsFrame {
+            fin: true,
+            opcode: WsOpcode::Continuation,
+            is_masked: false,
+            mask_key: None,
+            payload: b"Segment B".to_vec(),
+        };
+        demux.push_bytes(&frag2.encode());
+
+        // Fragment reassembly continues seamlessly
+        let msg_text = demux.poll_message().expect("poll text").expect("got text");
+        assert_eq!(
+            msg_text,
+            WsMessage::Text("Segment A - Segment B".to_string())
+        );
+    }
+
+    #[test]
+    fn test_async_ws_connection_colorless_fibers() {
+        use ifa_runtime::reactor::AsyncTcpListener;
+
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        // Spawn client fiber
+        GLOBAL_SCHEDULER.spawn(move || {
+            let stream = AsyncTcpStream::connect(addr).expect("connect async client");
+            let mut client = AsyncWsConnection::new(stream, true);
+
+            // Client sends text message
+            client
+                .send_text("FIBER_WS_CLIENT_PING")
+                .expect("client send");
+
+            // Client receives server reply
+            let reply = client.recv_message().expect("client recv");
+            assert_eq!(reply, WsMessage::Text("FIBER_WS_SERVER_PONG".to_string()));
+
+            // Client sends fragmented binary
+            client
+                .send_fragmented_binary(&[&[0x01, 0x02], &[0x03, 0x04, 0x05]])
+                .expect("client send frag bin");
+
+            // Client sends close
+            client
+                .send_close(1000, "Clean shutdown")
+                .expect("client close");
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        // Server accepts connection
+        let mut server_conn = loop {
+            if let Ok(Some((stream, _))) = listener.try_accept() {
+                break AsyncWsConnection::new(stream, false);
+            }
+            GLOBAL_SCHEDULER.yield_now();
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        // Server receives client text message
+        let msg1 = server_conn.recv_message().expect("server recv text");
+        assert_eq!(msg1, WsMessage::Text("FIBER_WS_CLIENT_PING".to_string()));
+
+        // Server replies
+        server_conn
+            .send_text("FIBER_WS_SERVER_PONG")
+            .expect("server send");
+
+        // Server receives reassembled binary message
+        let bin_msg = server_conn.recv_message().expect("server recv bin");
+        assert_eq!(
+            bin_msg,
+            WsMessage::Binary(vec![0x01, 0x02, 0x03, 0x04, 0x05])
+        );
+
+        // Server receives close
+        let close_msg = server_conn.recv_message().expect("server recv close");
+        match close_msg {
+            WsMessage::Close(code, reason) => {
+                assert_eq!(code, Some(1000));
+                assert_eq!(reason, "Clean shutdown");
+            }
+            other => panic!("Expected close message, got {:?}", other),
+        }
     }
 }

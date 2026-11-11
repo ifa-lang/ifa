@@ -74,6 +74,12 @@ pub struct WsFrame {
     payload: String
 }
 
+pub struct WsDecodeResult {
+    frame: WsFrame,
+    consumed: i64,
+    has_frame: bool
+}
+
 pub struct WsClientSession {
     stream: TcpStream,
     is_upgraded: bool,
@@ -1817,6 +1823,30 @@ pub fn make_ws_close_frame(code: i64, reason: String) -> WsFrame {
     return make_ws_frame(true, 8, false, 0, payload);
 }
 
+pub fn make_ws_binary_frame(payload: String, masked: bool) -> WsFrame {
+    return make_ws_frame(true, 2, masked, if masked { 305419896 } else { 0 }, payload);
+}
+
+pub fn make_ws_continuation_frame(payload: String, fin: bool, masked: bool) -> WsFrame {
+    return make_ws_frame(fin, 0, masked, if masked { 305419896 } else { 0 }, payload);
+}
+
+pub fn ws_close_code(frame: WsFrame) -> i64 {
+    if frame.opcode != 8 || string_len(frame.payload) < 2 {
+        return 0;
+    }
+    let b0 = string_char_at(frame.payload, 0);
+    let b1 = string_char_at(frame.payload, 1);
+    return (b0 << 8) | b1;
+}
+
+pub fn ws_close_reason(frame: WsFrame) -> String {
+    if frame.opcode != 8 || string_len(frame.payload) <= 2 {
+        return "";
+    }
+    return string_substr(frame.payload, 2, string_len(frame.payload) - 2);
+}
+
 pub fn encode_ws_frame(frame: WsFrame) -> String {
     let payload_len = string_len(frame.payload);
     mut b0: i64 = frame.opcode & 15;
@@ -1872,10 +1902,11 @@ pub fn encode_ws_frame(frame: WsFrame) -> String {
     return header + frame.payload;
 }
 
-pub fn decode_ws_frame(raw: String) -> WsFrame {
+pub fn ws_decode_frame_stream(raw: String) -> WsDecodeResult {
     let total_len = string_len(raw);
+    let empty_frame = WsFrame(fin: false, opcode: 0, is_masked: false, mask_key: 0, payload: "");
     if total_len < 2 {
-        return WsFrame(fin: false, opcode: 0, is_masked: false, mask_key: 0, payload: "");
+        return WsDecodeResult(frame: empty_frame, consumed: 0, has_frame: false);
     }
 
     let b0 = string_char_at(raw, 0);
@@ -1890,7 +1921,7 @@ pub fn decode_ws_frame(raw: String) -> WsFrame {
     mut payload_len: i64 = raw_len;
     if raw_len == 126 {
         if total_len < 4 {
-            return WsFrame(fin: false, opcode: 0, is_masked: false, mask_key: 0, payload: "");
+            return WsDecodeResult(frame: empty_frame, consumed: 0, has_frame: false);
         }
         let l0 = string_char_at(raw, 2);
         let l1 = string_char_at(raw, 3);
@@ -1898,7 +1929,7 @@ pub fn decode_ws_frame(raw: String) -> WsFrame {
         cursor = 4;
     } else if raw_len == 127 {
         if total_len < 10 {
-            return WsFrame(fin: false, opcode: 0, is_masked: false, mask_key: 0, payload: "");
+            return WsDecodeResult(frame: empty_frame, consumed: 0, has_frame: false);
         }
         mut p_len: i64 = 0;
         mut k: i64 = 0;
@@ -1919,7 +1950,7 @@ pub fn decode_ws_frame(raw: String) -> WsFrame {
 
     if is_masked {
         if total_len < cursor + 4 {
-            return WsFrame(fin: false, opcode: 0, is_masked: false, mask_key: 0, payload: "");
+            return WsDecodeResult(frame: empty_frame, consumed: 0, has_frame: false);
         }
         m0 = string_char_at(raw, cursor);
         m1 = string_char_at(raw, cursor + 1);
@@ -1929,15 +1960,14 @@ pub fn decode_ws_frame(raw: String) -> WsFrame {
         cursor = cursor + 4;
     }
 
-    mut payload: String = "";
-    mut actual_bytes = total_len - cursor;
-    if actual_bytes > payload_len {
-        actual_bytes = payload_len;
+    if total_len < cursor + payload_len {
+        return WsDecodeResult(frame: empty_frame, consumed: 0, has_frame: false);
     }
 
+    mut payload: String = "";
     if is_masked {
         mut i: i64 = 0;
-        while i < actual_bytes {
+        while i < payload_len {
             let c = string_char_at(raw, cursor + i);
             let rem_i = i % 4;
             let mb = if rem_i == 0 { m0 }
@@ -1948,18 +1978,81 @@ pub fn decode_ws_frame(raw: String) -> WsFrame {
             i = i + 1;
         }
     } else {
-        if actual_bytes > 0 {
-            payload = string_substr(raw, cursor, actual_bytes);
+        if payload_len > 0 {
+            payload = string_substr(raw, cursor, payload_len);
         }
     }
 
-    return WsFrame(
+    let frame = WsFrame(
         fin: fin,
         opcode: opcode,
         is_masked: is_masked,
         mask_key: mask_key,
         payload: payload
     );
+    return WsDecodeResult(frame: frame, consumed: cursor + payload_len, has_frame: true);
+}
+
+pub fn decode_ws_frame(raw: String) -> WsFrame {
+    let res = ws_decode_frame_stream(raw);
+    return res.frame;
+}
+
+pub fn ws_demux_frames(raw: String) -> List<WsFrame> {
+    mut list: List<WsFrame> = List::new();
+    mut remainder: String = raw;
+    while string_len(remainder) > 0 {
+        let dec = ws_decode_frame_stream(remainder);
+        if !dec.has_frame || dec.consumed <= 0 {
+            return list;
+        }
+        list.push(dec.frame);
+        remainder = string_substr(remainder, dec.consumed, string_len(remainder) - dec.consumed);
+    }
+    return list;
+}
+
+pub fn ws_reassemble_messages(frames: List<WsFrame>) -> List<WsFrame> {
+    mut res: List<WsFrame> = List::new();
+    let count = frames.len();
+    mut in_fragment = false;
+    mut frag_opcode: i64 = 0;
+    mut frag_payload: String = "";
+
+    mut i: i64 = 0;
+    while i < count {
+        let f = frames[i];
+        if f.opcode == 9 || f.opcode == 10 || f.opcode == 8 {
+            // Control frames (Ping, Pong, Close) pass through immediately
+            res.push(f);
+        } else if f.opcode == 1 || f.opcode == 2 {
+            if f.fin {
+                res.push(f);
+            } else {
+                in_fragment = true;
+                frag_opcode = f.opcode;
+                frag_payload = f.payload;
+            }
+        } else if f.opcode == 0 {
+            // Continuation frame
+            if in_fragment {
+                frag_payload = frag_payload + f.payload;
+                if f.fin {
+                    res.push(WsFrame(
+                        fin: true,
+                        opcode: frag_opcode,
+                        is_masked: false,
+                        mask_key: 0,
+                        payload: frag_payload
+                    ));
+                    in_fragment = false;
+                    frag_payload = "";
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return res;
 }
 
 pub fn format_websocket_upgrade_response(accept_key: String) -> String {
@@ -2066,6 +2159,24 @@ pub fn ws_server_broadcast_text(ws: WsServer, text: String) -> i64 {
     return delivered;
 }
 
+pub fn ws_server_broadcast_binary(ws: WsServer, data: String) -> i64 {
+    let frame = make_ws_binary_frame(data, false);
+    let wire = encode_ws_frame(frame);
+    mut delivered: i64 = 0;
+    let count = tcp_server_client_count(ws.server);
+    mut i: i64 = 0;
+    while i < count {
+        if i < ws.upgraded_clients.len() && ws.upgraded_clients[i] {
+            let sent = stream_write(ws.server.clients[i], wire);
+            if sent > 0 {
+                delivered = delivered + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return delivered;
+}
+
 pub fn ws_server_poll_messages(ws: WsServer) -> List<String> {
     mut msgs: List<String> = List::new();
     let count = tcp_server_client_count(ws.server);
@@ -2119,6 +2230,16 @@ pub fn ws_client_send_text(client: WsClientSession, text: String) -> bool {
     return stream_write(client.stream, encode_ws_frame(frame)) > 0;
 }
 
+pub fn ws_client_send_binary(client: WsClientSession, data: String) -> bool {
+    let frame = make_ws_binary_frame(data, true);
+    return stream_write(client.stream, encode_ws_frame(frame)) > 0;
+}
+
+pub fn ws_client_send_ping(client: WsClientSession, payload: String) -> bool {
+    let frame = make_ws_frame(true, 9, true, 305419896, payload);
+    return stream_write(client.stream, encode_ws_frame(frame)) > 0;
+}
+
 pub fn ws_client_poll_text(client: WsClientSession) -> String {
     let raw = stream_read(client.stream, 2048);
     if string_len(raw) == 0 {
@@ -2126,6 +2247,18 @@ pub fn ws_client_poll_text(client: WsClientSession) -> String {
     }
     let frame = decode_ws_frame(raw);
     if frame.opcode == 1 {
+        return frame.payload;
+    }
+    return "";
+}
+
+pub fn ws_client_poll_binary(client: WsClientSession) -> String {
+    let raw = stream_read(client.stream, 2048);
+    if string_len(raw) == 0 {
+        return "";
+    }
+    let frame = decode_ws_frame(raw);
+    if frame.opcode == 2 {
         return frame.payload;
     }
     return "";
@@ -2466,10 +2599,11 @@ pub fn test_net_websocket_server_multiplexing() -> bool {
         return false;
     }
 
-    // Client 1 sends message to server
+    // Client 1 and Client 2 send messages to server
     ws_client_send_text(c1, "PAYLOAD_FROM_WS_CLIENT_1");
+    ws_client_send_text(c2, "PAYLOAD_FROM_WS_CLIENT_2");
     let msgs = ws_server_poll_messages(ws_srv);
-    if msgs.len() != 1 || msgs[0] != "PAYLOAD_FROM_WS_CLIENT_1" {
+    if msgs.len() != 2 || msgs[0] != "PAYLOAD_FROM_WS_CLIENT_1" || msgs[1] != "PAYLOAD_FROM_WS_CLIENT_2" {
         ws_client_close(c1);
         ws_client_close(c2);
         ws_server_close(ws_srv);
@@ -2479,6 +2613,110 @@ pub fn test_net_websocket_server_multiplexing() -> bool {
     ws_client_close(c1);
     ws_client_close(c2);
     ws_server_close(ws_srv);
+    return true;
+}
+
+pub fn test_net_websocket_frame_demux_and_fragmentation() -> bool {
+    // 1. Binary Frame encoding & decoding
+    let bin_frame = make_ws_binary_frame("BINARY_PAYLOAD_DATA", false);
+    let bin_wire = encode_ws_frame(bin_frame);
+    let bin_dec = decode_ws_frame(bin_wire);
+    if !bin_dec.fin || bin_dec.opcode != 2 || bin_dec.is_masked || bin_dec.payload != "BINARY_PAYLOAD_DATA" {
+        return false;
+    }
+
+    // 2. Close frame with code and reason extraction
+    let close_f = make_ws_close_frame(1001, "Server shutdown");
+    let close_wire = encode_ws_frame(close_f);
+    let close_dec = decode_ws_frame(close_wire);
+    if !close_dec.fin || close_dec.opcode != 8 || ws_close_code(close_dec) != 1001 || ws_close_reason(close_dec) != "Server shutdown" {
+        return false;
+    }
+
+    // 3. Multi-frame streaming demultiplexer
+    let f1 = make_ws_text_frame("STREAM_MSG_1", false);
+    let f2 = make_ws_ping_frame("STREAM_PING");
+    let f3 = make_ws_binary_frame("STREAM_BIN_3", false);
+    let stream_wire = encode_ws_frame(f1) + encode_ws_frame(f2) + encode_ws_frame(f3);
+
+    let demuxed = ws_demux_frames(stream_wire);
+    if demuxed.len() != 3 {
+        return false;
+    }
+    if demuxed[0].opcode != 1 || demuxed[0].payload != "STREAM_MSG_1" {
+        return false;
+    }
+    if demuxed[1].opcode != 9 || demuxed[1].payload != "STREAM_PING" {
+        return false;
+    }
+    if demuxed[2].opcode != 2 || demuxed[2].payload != "STREAM_BIN_3" {
+        return false;
+    }
+
+    // 4. Fragmented message reassembly with interleaved Ping
+    mut frags: List<WsFrame> = List::new();
+    frags.push(make_ws_frame(false, 1, false, 0, "ChunkA-"));
+    frags.push(make_ws_ping_frame("HEARTBEAT"));
+    frags.push(make_ws_continuation_frame("ChunkB-", false, false));
+    frags.push(make_ws_continuation_frame("ChunkC", true, false));
+
+    let reassembled = ws_reassemble_messages(frags);
+    if reassembled.len() != 2 {
+        return false;
+    }
+    if reassembled[0].opcode != 9 || reassembled[0].payload != "HEARTBEAT" {
+        return false;
+    }
+    if reassembled[1].opcode != 1 || !reassembled[1].fin || reassembled[1].payload != "ChunkA-ChunkB-ChunkC" {
+        return false;
+    }
+
+    // 5. Intégration sur socket TCP non-bloquant : client/serveur binaire et ping/pong
+    mut listener = make_tcp_listener(0);
+    if !listener.is_open || listener.port <= 0 {
+        return false;
+    }
+    mut client = make_tcp_connect("127.0.0.1", listener.port);
+    if !client.is_open {
+        listener_close(listener);
+        return false;
+    }
+    mut server = listener_accept(listener);
+    if !server.is_open {
+        stream_close(client);
+        listener_close(listener);
+        return false;
+    }
+
+    // Client sends masked binary frame over TCP
+    let client_bin = make_ws_binary_frame("TCP_BIN_MSG", true);
+    stream_write(client, encode_ws_frame(client_bin));
+
+    let raw_server = stream_read(server, 1024);
+    let s_dec = decode_ws_frame(raw_server);
+    if s_dec.opcode != 2 || !s_dec.is_masked || s_dec.payload != "TCP_BIN_MSG" {
+        stream_close(client);
+        stream_close(server);
+        listener_close(listener);
+        return false;
+    }
+
+    // Server sends close frame to client
+    let s_close = make_ws_close_frame(1000, "Clean TCP Close");
+    stream_write(server, encode_ws_frame(s_close));
+
+    let raw_client = stream_read(client, 1024);
+    let c_dec = decode_ws_frame(raw_client);
+    if c_dec.opcode != 8 || ws_close_code(c_dec) != 1000 || ws_close_reason(c_dec) != "Clean TCP Close" {
+        stream_close(client);
+        stream_close(server);
+        listener_close(listener);
+        return false;
+    }
+
+    stream_close(client);
+    stream_close(server);
+    listener_close(listener);
     return true;
 }
 
@@ -4264,7 +4502,8 @@ pub fn test_net_all() -> bool {
     && test_net_multipart_form_data()
     && test_net_http_sse_streaming_and_content_negotiation()
     && test_net_http_auth_cors_and_etag()
-    && test_net_http_router_dynamic_params_and_websocket_handshake();
+    && test_net_http_router_dynamic_params_and_websocket_handshake()
+    && test_net_websocket_frame_demux_and_fragmentation();
 }
 
 pub fn main() {
@@ -4294,7 +4533,8 @@ pub fn main() {
     let t24 = test_net_http_sse_streaming_and_content_negotiation();
     let t25 = test_net_http_auth_cors_and_etag();
     let t26 = test_net_http_router_dynamic_params_and_websocket_handshake();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 {
+    let t27 = test_net_websocket_frame_demux_and_fragmentation();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");
