@@ -552,6 +552,11 @@ impl LoopOptPass {
                     continue;
                 }
 
+                // Loop fusion requires canonical single-block body loops (exactly header + body)
+                if loop_a.blocks.len() != 2 || loop_b.blocks.len() != 2 {
+                    continue;
+                }
+
                 let info_a = match Self::extract_induction_info(
                     func,
                     loop_a.header,
@@ -690,6 +695,18 @@ impl LoopOptPass {
                     Some(b) => b.clone(),
                     None => continue,
                 };
+
+                let body_a_is_canonical = matches!(
+                    &body_a_block.terminator,
+                    Some(Terminator::Branch { target, args }) if *target == loop_a.header && args.is_empty()
+                );
+                let body_b_is_canonical = matches!(
+                    &body_b_block.terminator,
+                    Some(Terminator::Branch { target, args }) if *target == loop_b.header && args.is_empty()
+                );
+                if !body_a_is_canonical || !body_b_is_canonical {
+                    continue;
+                }
 
                 // Loops must not dynamically resize arrays via ArrayPush
                 if body_a_block

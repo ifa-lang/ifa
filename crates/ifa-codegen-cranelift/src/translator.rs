@@ -1777,14 +1777,28 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             ValueExpr::ArrayInit(elements) => {
                 let count = elements.len().max(1);
                 let byte_size = (count * 8) as u32;
-                // Maximum stack slot alignment supported by Cranelift stack frames is 16 bytes (ARM Neon / SSE)
-                let align_shift = if byte_size >= 16 { 4 } else { 3 };
-                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    byte_size,
-                    align_shift,
-                ));
-                let base_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+                let base_addr = if let Some(func_id) = self.func_ids.get("ifa_rt_gen_alloc") {
+                    let size_val = self.builder.ins().iconst(self.ptr_type, byte_size as i64);
+                    let align_val = self.builder.ins().iconst(self.ptr_type, 8);
+                    let arena_val = self.builder.ins().iconst(types::I32, 0);
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    let call = self
+                        .builder
+                        .ins()
+                        .call(local_func, &[size_val, align_val, arena_val]);
+                    self.builder.inst_results(call)[0]
+                } else {
+                    // Maximum stack slot alignment supported by Cranelift stack frames is 16 bytes (ARM Neon / SSE)
+                    let align_shift = if byte_size >= 16 { 4 } else { 3 };
+                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        byte_size,
+                        align_shift,
+                    ));
+                    self.builder.ins().stack_addr(self.ptr_type, slot, 0)
+                };
                 for (idx, elem_id) in elements.iter().enumerate() {
                     let elem_val = self.value_map[elem_id];
                     let offset = (idx * 8) as i32;
@@ -1807,12 +1821,26 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     (fields.len().max(1) * 8) as u32
                 };
 
-                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    total_size,
-                    3,
-                ));
-                let base_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+                let base_addr = if let Some(func_id) = self.func_ids.get("ifa_rt_gen_alloc") {
+                    let size_val = self.builder.ins().iconst(self.ptr_type, total_size as i64);
+                    let align_val = self.builder.ins().iconst(self.ptr_type, 8);
+                    let arena_val = self.builder.ins().iconst(types::I32, 0);
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    let call = self
+                        .builder
+                        .ins()
+                        .call(local_func, &[size_val, align_val, arena_val]);
+                    self.builder.inst_results(call)[0]
+                } else {
+                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        total_size,
+                        3,
+                    ));
+                    self.builder.ins().stack_addr(self.ptr_type, slot, 0)
+                };
 
                 let mut current_offset = 0i32;
                 for (idx, field_id) in fields.iter().enumerate() {
@@ -1870,12 +1898,26 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
             ValueExpr::TupleInit(fields) => {
                 let count = fields.len().max(1);
                 let byte_size = (count * 8) as u32;
-                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    byte_size,
-                    3,
-                ));
-                let base_addr = self.builder.ins().stack_addr(self.ptr_type, slot, 0);
+                let base_addr = if let Some(func_id) = self.func_ids.get("ifa_rt_gen_alloc") {
+                    let size_val = self.builder.ins().iconst(self.ptr_type, byte_size as i64);
+                    let align_val = self.builder.ins().iconst(self.ptr_type, 8);
+                    let arena_val = self.builder.ins().iconst(types::I32, 0);
+                    let local_func = self
+                        .module
+                        .declare_func_in_func(*func_id, self.builder.func);
+                    let call = self
+                        .builder
+                        .ins()
+                        .call(local_func, &[size_val, align_val, arena_val]);
+                    self.builder.inst_results(call)[0]
+                } else {
+                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        byte_size,
+                        3,
+                    ));
+                    self.builder.ins().stack_addr(self.ptr_type, slot, 0)
+                };
                 for (idx, field_id) in fields.iter().enumerate() {
                     let field_val = self.value_map[field_id];
                     let offset = (idx * 8) as i32;

@@ -1977,4 +1977,69 @@ mod tests {
         assert_eq!(lookup_mime_type("png"), "image/png");
         assert_eq!(lookup_mime_type("unknown_ext"), "application/octet-stream");
     }
+
+    #[test]
+    fn test_websocket_concurrent_burst_and_streaming() {
+        let mut server = WsServer::bind("127.0.0.1:0", 16).expect("bind ws server");
+        let port = server.port().expect("port");
+
+        let client_count = 6;
+        let mut clients: Vec<WsClient> = (0..client_count)
+            .map(|i| {
+                WsClient::connect("127.0.0.1", port, &format!("/stream?client_id={}", i))
+                    .expect("connect client")
+            })
+            .collect();
+
+        // Give sockets a brief window to complete TCP accept
+        std::thread::sleep(Duration::from_millis(50));
+
+        let upgraded = server.accept_and_upgrade().expect("accept and upgrade");
+        assert_eq!(upgraded, client_count);
+        assert_eq!(server.session_count(), client_count);
+
+        std::thread::sleep(Duration::from_millis(50));
+        for client in &mut clients {
+            assert!(client.poll_handshake().expect("client handshake"));
+            assert!(client.is_upgraded());
+        }
+
+        // Concurrent multi-client broadcast burst from server
+        for seq in 0..10 {
+            let broadcast_msg = format!("BURST_EVENT_SEQ_{}", seq);
+            let delivered = server.broadcast_text(&broadcast_msg);
+            assert_eq!(delivered, client_count);
+        }
+
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Each client verifies delivery of burst messages
+        for client in &mut clients {
+            let mut received = Vec::new();
+            while let Ok(Some(msg)) = client.poll_text_message() {
+                received.push(msg);
+            }
+            assert_eq!(received.len(), 10);
+            assert_eq!(received[0], "BURST_EVENT_SEQ_0");
+            assert_eq!(received[9], "BURST_EVENT_SEQ_9");
+        }
+
+        // Concurrent response from all clients to server
+        for (idx, client) in clients.iter_mut().enumerate() {
+            client
+                .send_text(&format!("CLIENT_{}_ACK", idx))
+                .expect("send ack");
+        }
+
+        std::thread::sleep(Duration::from_millis(60));
+
+        let acks = server.poll_all_messages();
+        assert_eq!(acks.len(), client_count);
+
+        // Teardown cleanly
+        for mut client in clients {
+            client.close();
+        }
+        server.stop();
+    }
 }
