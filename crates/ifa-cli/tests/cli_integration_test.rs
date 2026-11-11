@@ -641,6 +641,23 @@ pub fn main() -> i64 {
         String::from_utf8_lossy(&check_output.stderr)
     );
 
+    // 1.25. Test `ifa fir` (emits merged FIR module with submodules)
+    let fir_output = Command::new(&ifa_bin)
+        .arg("fir")
+        .arg(&main_file)
+        .output()
+        .expect("Failed to execute `ifa fir`");
+    assert!(
+        fir_output.status.success(),
+        "ifa fir failed: {}",
+        String::from_utf8_lossy(&fir_output.stderr)
+    );
+    let fir_text = String::from_utf8_lossy(&fir_output.stdout);
+    assert!(
+        fir_text.contains("calculate"),
+        "FIR module must contain lowered submodule functions"
+    );
+
     // 1.5. Test `ifa run` (FIR interpreter)
     let interp_output = Command::new(&ifa_bin)
         .arg("run")

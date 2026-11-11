@@ -356,3 +356,69 @@ pub fn main() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_multi_module_submodule_semantic_error_reporting() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kori_submod_err_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(temp_dir.join("src/calc")).unwrap();
+
+    let manifest = r#"
+[package]
+name = "submod-err-app"
+version = "0.1.0"
+edition = "2026"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
+license = "MIT"
+description = "Submodule semantic error propagation test"
+
+[targets]
+bin = [
+    { name = "err_runner", path = "src/main.ifa" }
+]
+
+[profiles.dev]
+backend = "cranelift"
+opt_level = 0
+debug_assertions = true
+lto = "none"
+strip_symbols = false
+gen_checks = true
+"#;
+    fs::write(temp_dir.join("kori.toml"), manifest).unwrap();
+
+    // Submodule contains a semantic type mismatch
+    let bad_math_src = r#"
+pub fn broken_add(a: i64, b: i64) -> i64 {
+    return "invalid_string_type";
+}
+"#;
+    fs::write(temp_dir.join("src/calc/bad_math.ifa"), bad_math_src).unwrap();
+
+    let main_src = r#"
+import calc::bad_math;
+
+pub fn main() {
+    let x = bad_math::broken_add(1, 2);
+}
+"#;
+    fs::write(temp_dir.join("src/main.ifa"), main_src).unwrap();
+
+    let orchestrator =
+        BuildOrchestrator::new(temp_dir.clone()).expect("Failed to initialize orchestrator");
+    let result = orchestrator.build(false, None, true);
+
+    assert!(
+        result.is_err(),
+        "Build must fail when submodule contains semantic errors"
+    );
+    let err_str = format!("{:?}", result.err().unwrap());
+    assert!(
+        err_str.contains("E0002") || err_str.contains("Type mismatch") || err_str.contains("type"),
+        "Error diagnostic must report type mismatch in submodule: {}",
+        err_str
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

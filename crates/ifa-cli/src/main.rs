@@ -4,7 +4,6 @@ use ifa_comptime::ComptimeVM;
 use ifa_fir::{compile_to_fir, format_module, FirInterpreter};
 use ifa_lexer::tokenize;
 use ifa_parser::parse;
-use ifa_sema::analyze;
 use ifa_span::{sym, SourceMap, Span, INTERNER};
 use kori::builder::BuildOrchestrator;
 use kori::manifest::{DependencySpec, DetailedDependency, Manifest};
@@ -581,7 +580,9 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            let analysis = analyze(&source_map, &prog);
+            let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
+            let (analysis, _) =
+                BuildOrchestrator::analyze_with_local_modules(&mut source_map, base_dir, &prog);
             if !analysis.diagnostics.is_empty() {
                 for diag in &analysis.diagnostics {
                     eprint!("{}", diag.render_to_string(&source_map));
@@ -648,7 +649,9 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            let analysis = analyze(&source_map, &prog);
+            let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
+            let (analysis, sub_firs) =
+                BuildOrchestrator::analyze_with_local_modules(&mut source_map, base_dir, &prog);
             if !analysis.diagnostics.is_empty() {
                 for diag in &analysis.diagnostics {
                     eprint!("{}", diag.render_to_string(&source_map));
@@ -660,7 +663,10 @@ fn main() -> ExitCode {
             }
 
             match compile_to_fir(&prog, &analysis.symbols, !no_cow, !no_gen_opt) {
-                Ok(fir_module) => {
+                Ok(mut fir_module) => {
+                    for sub_fir in sub_firs {
+                        fir_module.merge(sub_fir);
+                    }
                     let formatted = format_module(&fir_module);
                     print!("{}", formatted);
                     ExitCode::SUCCESS
