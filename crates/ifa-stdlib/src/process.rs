@@ -518,6 +518,15 @@ impl Command {
         })
     }
 
+    /// Execute command synchronously and return both output and consumed resource metrics (`ResourceUsage`).
+    pub fn output_with_rusage(&self) -> io::Result<(ProcessOutput, crate::sys::ResourceUsage)> {
+        let before = crate::sys::get_children_resource_usage().unwrap_or_default();
+        let out = self.output()?;
+        let after = crate::sys::get_children_resource_usage().unwrap_or_default();
+        let rusage = after.diff(&before);
+        Ok((out, rusage))
+    }
+
     /// Execute command synchronously and write stdout directly to a writer stream.
     pub fn output_to_writer<W: Write>(&self, writer: &mut W) -> io::Result<ExitStatus> {
         let out = self.output()?;
@@ -556,6 +565,11 @@ impl ChildProcess {
     /// Return the OS process identifier (PID).
     pub fn id(&self) -> u32 {
         self.inner.id()
+    }
+
+    /// Query current resident memory and virtual size statistics for this child process.
+    pub fn memory_info(&self) -> io::Result<crate::sys::ProcessMemoryInfo> {
+        crate::sys::get_process_memory_info(self.inner.id())
     }
 
     /// Return the process group ID (PGID) of the running child process.
@@ -1167,5 +1181,32 @@ mod tests {
         let out = p.output().expect("execute pipeline in process group");
         assert!(out.success());
         assert_eq!(out.stdout_string().trim(), "PIPELINE");
+    }
+
+    #[test]
+    fn test_command_output_with_rusage() {
+        let (out, rusage) = Command::new("echo")
+            .arg("hello rusage")
+            .output_with_rusage()
+            .expect("execute with rusage");
+        assert!(out.success());
+        assert_eq!(out.stdout_string().trim(), "hello rusage");
+        assert!(rusage.total_cpu_time() >= Duration::ZERO);
+    }
+
+    #[test]
+    fn test_child_process_memory_info() {
+        let mut child = Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .expect("spawn sleep process");
+        if let Ok(mem) = child.memory_info() {
+            assert!(
+                mem.resident_bytes > 0,
+                "child resident memory should be > 0"
+            );
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

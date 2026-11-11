@@ -12,6 +12,7 @@ pub mod net;
 pub mod process;
 pub mod simd_parser;
 pub mod sync;
+pub mod sys;
 
 pub use collections::{BinaryHeap, ByteBuffer, Deque, List, Map, Set, StringBuilder};
 pub use crypto::{
@@ -76,6 +77,11 @@ pub use simd_parser::{
 };
 pub use sync::{
     bounded, channel, AtomicFlag, AtomicInt, Receiver, RingBuffer, Select, Sender, WaitGroup,
+};
+pub use sys::{
+    cpu_count, get_children_resource_usage, get_current_process_memory_info, get_host_memory_info,
+    get_process_memory_info, get_resource_usage, get_self_resource_usage, get_system_load,
+    HostMemoryInfo, ProcessMemoryInfo, ResourceScope, ResourceUsage, SystemLoad,
 };
 
 #[cfg(test)]
