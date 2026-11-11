@@ -57,6 +57,19 @@ pub struct TargetsConfig {
 pub struct BinTarget {
     pub name: String,
     pub path: PathBuf,
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+impl BinTarget {
+    /// Check whether this binary target targets WebAssembly.
+    pub fn is_wasm(&self) -> bool {
+        self.target
+            .as_deref()
+            .map(|t| t.contains("wasm"))
+            .unwrap_or(false)
+            || self.name.ends_with(".wasm")
+    }
 }
 
 /// Library target supporting multiple output formats.
@@ -66,6 +79,23 @@ pub struct LibTarget {
     pub path: PathBuf,
     #[serde(default = "default_crate_types")]
     pub crate_types: Vec<CrateType>,
+}
+
+impl LibTarget {
+    /// Check whether this library produces a WebAssembly module.
+    pub fn has_wasm(&self) -> bool {
+        self.crate_types.contains(&CrateType::Wasm)
+    }
+
+    /// Check whether this library produces native binaries or archives (.so, .a, .ifalib).
+    pub fn has_native(&self) -> bool {
+        self.crate_types.iter().any(|ct| {
+            matches!(
+                ct,
+                CrateType::IfaLib | CrateType::Cdylib | CrateType::Staticlib
+            )
+        })
+    }
 }
 
 fn default_crate_types() -> Vec<CrateType> {
@@ -300,6 +330,7 @@ impl Manifest {
                 self.targets.bin.push(BinTarget {
                     name: self.package.name.clone(),
                     path: PathBuf::from("src/main.ifa"),
+                    target: None,
                 });
             }
 

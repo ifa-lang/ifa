@@ -494,3 +494,152 @@ pub fn create_user(id: i64) -> i64 {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_joint_multi_architecture_native_bin_and_wasm_lib() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kori_joint_multiarch_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(temp_dir.join("src")).unwrap();
+
+    let manifest = r#"
+[package]
+name = "joint-multiarch-app"
+version = "0.1.0"
+edition = "2026"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
+license = "MIT"
+description = "Joint multi-architecture compilation test"
+
+[targets]
+bin = [
+    { name = "native_server", path = "src/main.ifa" }
+]
+
+[targets.lib]
+name = "wasm_core"
+path = "src/lib.ifa"
+crate_types = ["wasm", "cdylib"]
+
+[profiles.dev]
+backend = "llvm"
+opt_level = 0
+"#;
+    fs::write(temp_dir.join("kori.toml"), manifest).unwrap();
+
+    let main_src = r#"
+pub fn main() {
+    let status = 100 + 20;
+}
+"#;
+    fs::write(temp_dir.join("src/main.ifa"), main_src).unwrap();
+
+    let lib_src = r#"
+pub fn compute_factor(x: i64) -> i64 {
+    return x * 3;
+}
+"#;
+    fs::write(temp_dir.join("src/lib.ifa"), lib_src).unwrap();
+
+    let orchestrator =
+        BuildOrchestrator::new(temp_dir.clone()).expect("Failed to initialize orchestrator");
+
+    // 1. Joint compilation (both native executable and wasm library compiled concurrently)
+    let joint_report = orchestrator
+        .build(false, None, true)
+        .expect("Joint multi-architecture build must succeed");
+
+    let exe = joint_report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::Executable);
+    assert!(
+        exe.is_some(),
+        "Joint build must produce native executable target"
+    );
+    assert!(exe.unwrap().path.exists());
+
+    let wasm = joint_report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::WebAssemblyModule);
+    assert!(
+        wasm.is_some(),
+        "Joint build must produce WebAssembly library module"
+    );
+    assert!(wasm.unwrap().path.exists());
+    let wasm_bytes = fs::read(&wasm.unwrap().path).unwrap();
+    assert!(
+        wasm_bytes.starts_with(b"\0asm"),
+        "WASM module must contain standard WebAssembly magic binary prefix"
+    );
+
+    let bundle = joint_report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::WebAssemblyBundle);
+    assert!(
+        bundle.is_some(),
+        "Joint build must produce WebAssembly TypeScript bundle"
+    );
+    assert!(bundle.unwrap().path.join("package.json").exists());
+    assert!(bundle.unwrap().path.join("index.d.ts").exists());
+    let dts = fs::read_to_string(bundle.unwrap().path.join("index.d.ts")).unwrap();
+    assert!(
+        dts.contains("compute_factor"),
+        "TypeScript declarations must export function signatures from FIR: {}",
+        dts
+    );
+
+    let cdylib = joint_report
+        .artifacts
+        .iter()
+        .find(|a| a.kind == kori::ArtifactKind::SharedLibrary);
+    assert!(
+        cdylib.is_some(),
+        "Joint build must produce shared library target"
+    );
+    assert!(cdylib.unwrap().path.exists());
+
+    // 2. Targeted compilation: wasm only filter
+    let wasm_report = orchestrator
+        .build_with_target(false, None, Some("wasm32-wasi"), true)
+        .expect("Targeted WASM build must succeed");
+
+    assert!(
+        wasm_report
+            .artifacts
+            .iter()
+            .any(|a| a.kind == kori::ArtifactKind::WebAssemblyModule),
+        "WASM filtered build must produce wasm module"
+    );
+    assert!(
+        !wasm_report
+            .artifacts
+            .iter()
+            .any(|a| a.kind == kori::ArtifactKind::Executable),
+        "WASM filtered build must not produce native binary executable"
+    );
+
+    // 3. Targeted compilation: native only filter
+    let native_report = orchestrator
+        .build_with_target(false, None, Some("native"), true)
+        .expect("Targeted native build must succeed");
+
+    assert!(
+        native_report
+            .artifacts
+            .iter()
+            .any(|a| a.kind == kori::ArtifactKind::Executable),
+        "Native filtered build must produce native executable"
+    );
+    assert!(
+        !native_report
+            .artifacts
+            .iter()
+            .any(|a| a.kind == kori::ArtifactKind::WebAssemblyModule),
+        "Native filtered build must not produce wasm module"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

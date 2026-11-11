@@ -41,6 +41,9 @@ enum Commands {
         /// Select compilation backend (cranelift or llvm)
         #[arg(long)]
         backend: Option<String>,
+        /// Target architecture or filter (e.g. wasm32-wasi, native, all)
+        #[arg(short, long)]
+        target: Option<String>,
         /// Force rebuilding all artifacts ignoring cache
         #[arg(short, long)]
         force: bool,
@@ -168,11 +171,12 @@ fn main() -> ExitCode {
         Commands::Build {
             release,
             backend,
+            target,
             force,
             manifest_path,
         } => {
             let target_dir = resolve_project_dir(manifest_path, &current_dir);
-            handle_build(&target_dir, release, backend, force)
+            handle_build(&target_dir, release, backend, target, force)
         }
         Commands::Run {
             release,
@@ -258,6 +262,7 @@ fn handle_new(name: &str, lib: bool) -> ExitCode {
                 bin: vec![BinTarget {
                     name: name.to_string(),
                     path: PathBuf::from("src/main.ifa"),
+                    target: None,
                 }],
                 lib: None,
             }
@@ -309,6 +314,7 @@ fn handle_build(
     current_dir: &Path,
     release: bool,
     backend_str: Option<String>,
+    target_str: Option<String>,
     force: bool,
 ) -> ExitCode {
     let orchestrator = match BuildOrchestrator::new(current_dir.to_path_buf()) {
@@ -332,7 +338,7 @@ fn handle_build(
         None => None,
     };
 
-    match orchestrator.build(release, backend_override, force) {
+    match orchestrator.build_with_target(release, backend_override, target_str.as_deref(), force) {
         Ok(report) => {
             println!(
                 "Finished {} build in {:.2?}",

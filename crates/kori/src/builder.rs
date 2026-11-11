@@ -65,6 +65,13 @@ pub struct BuildOrchestrator {
     manifest: Manifest,
 }
 
+struct BuildContext<'a> {
+    profile: &'a ProfileConfig,
+    out_dir: &'a Path,
+    target_filter: Option<&'a str>,
+    force: bool,
+}
+
 impl BuildOrchestrator {
     /// Create a build orchestrator rooted at the specified project directory.
     pub fn new(root_dir: PathBuf) -> Result<Self, KoriError> {
@@ -85,6 +92,17 @@ impl BuildOrchestrator {
         &self,
         release: bool,
         backend_override: Option<BackendKind>,
+        force: bool,
+    ) -> Result<BuildReport, KoriError> {
+        self.build_with_target(release, backend_override, None, force)
+    }
+
+    /// Build package targets under the specified profile, with optional target architecture filtering.
+    pub fn build_with_target(
+        &self,
+        release: bool,
+        backend_override: Option<BackendKind>,
+        target_filter: Option<&str>,
         force: bool,
     ) -> Result<BuildReport, KoriError> {
         let start_time = Instant::now();
@@ -124,7 +142,8 @@ impl BuildOrchestrator {
 
         // 3. Compile resolved packages in topological order
         for pkg in &build_order {
-            let pkg_artifacts = self.compile_package(pkg, &profile, &out_dir, &mut cache, force)?;
+            let pkg_artifacts =
+                self.compile_package(pkg, &profile, &out_dir, &mut cache, target_filter, force)?;
             all_artifacts.extend(pkg_artifacts);
         }
 
@@ -213,6 +232,7 @@ impl BuildOrchestrator {
         profile: &ProfileConfig,
         out_dir: &Path,
         cache: &mut BuildCache,
+        target_filter: Option<&str>,
         force: bool,
     ) -> Result<Vec<BuiltArtifact>, KoriError> {
         let mut manifest = pkg.manifest.clone();
@@ -220,15 +240,37 @@ impl BuildOrchestrator {
 
         let mut artifacts = Vec::new();
 
+        let is_wasm_only = target_filter.map(|t| t.contains("wasm")).unwrap_or(false);
+        let is_native_only = target_filter
+            .map(|t| t == "native" || t == "host")
+            .unwrap_or(false);
+
+        let ctx = BuildContext {
+            profile,
+            out_dir,
+            target_filter,
+            force,
+        };
+
         // Build binary targets
         for bin in &manifest.targets.bin {
-            let art = self.build_bin_target(pkg, bin, profile, out_dir, cache, force)?;
+            let bin_is_wasm = bin.is_wasm();
+            if is_wasm_only && !bin_is_wasm {
+                let has_wasm_lib = manifest.targets.lib.as_ref().is_some_and(|l| l.has_wasm());
+                if has_wasm_lib {
+                    continue;
+                }
+            } else if is_native_only && bin_is_wasm {
+                continue;
+            }
+
+            let art = self.build_bin_target(pkg, bin, &ctx, cache)?;
             artifacts.push(art);
         }
 
         // Build library targets
         if let Some(lib) = &manifest.targets.lib {
-            let lib_arts = self.build_lib_target(pkg, lib, profile, out_dir, cache, force)?;
+            let lib_arts = self.build_lib_target(pkg, lib, &ctx, cache)?;
             artifacts.extend(lib_arts);
         }
 
@@ -239,22 +281,40 @@ impl BuildOrchestrator {
         &self,
         pkg: &ResolvedPackage,
         bin: &BinTarget,
-        profile: &ProfileConfig,
-        out_dir: &Path,
+        ctx: &BuildContext<'_>,
         cache: &mut BuildCache,
-        force: bool,
     ) -> Result<BuiltArtifact, KoriError> {
-        let target_key = format!("{}:bin:{}", pkg.name, bin.name);
-        let output_bin = out_dir.join(&bin.name);
+        let is_wasm = bin.is_wasm()
+            || ctx
+                .target_filter
+                .map(|t| t.contains("wasm"))
+                .unwrap_or(false);
+
+        let bin_stem = bin.name.strip_suffix(".wasm").unwrap_or(&bin.name);
+        let output_bin = if is_wasm {
+            ctx.out_dir.join(format!("{}.wasm", bin_stem))
+        } else {
+            ctx.out_dir.join(&bin.name)
+        };
+        let target_arch = if is_wasm { "wasm32-wasi" } else { "native" };
+        let target_key = format!("{}:bin:{}:{}", pkg.name, bin.name, target_arch);
         let expected_outputs = [&output_bin as &Path];
 
-        let fingerprint = cache.compute_target_fingerprint(pkg, profile, &[]);
+        let fingerprint = cache.compute_target_fingerprint(pkg, ctx.profile, &[]);
 
-        if !force && cache.is_up_to_date(&target_key, &fingerprint, &expected_outputs) {
+        if !ctx.force && cache.is_up_to_date(&target_key, &fingerprint, &expected_outputs) {
             return Ok(BuiltArtifact {
-                name: bin.name.clone(),
+                name: output_bin
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
                 path: output_bin,
-                kind: ArtifactKind::Executable,
+                kind: if is_wasm {
+                    ArtifactKind::WebAssemblyModule
+                } else {
+                    ArtifactKind::Executable
+                },
                 cached: true,
             });
         }
@@ -263,21 +323,47 @@ impl BuildOrchestrator {
         let src_path = pkg.root_dir.join(&bin.path);
         let fir_module = self.compile_source_to_fir(&src_path, &pkg.name, cache)?;
 
-        let obj_path = out_dir.join(format!("{}.o", bin.name));
+        if is_wasm {
+            let mut llvm_comp = LlvmCompiler::new(LlvmTargetConfig::wasm32_wasi());
+            llvm_comp
+                .opt_level(ctx.profile.opt_level)
+                .lto(&ctx.profile.lto)
+                .strip_symbols(ctx.profile.strip_symbols);
+            llvm_comp
+                .compile_to_wasm(&fir_module, &output_bin)
+                .map_err(|e| {
+                    KoriError::Codegen(format!("LLVM compile WebAssembly binary failed: {}", e))
+                })?;
 
-        match profile.backend {
+            cache.record_success(&target_key, fingerprint, vec![output_bin.clone()])?;
+
+            return Ok(BuiltArtifact {
+                name: output_bin
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                path: output_bin,
+                kind: ArtifactKind::WebAssemblyModule,
+                cached: false,
+            });
+        }
+
+        let obj_path = ctx.out_dir.join(format!("{}.o", bin.name));
+
+        match ctx.profile.backend {
             BackendKind::Llvm => {
                 let mut llvm_comp = LlvmCompiler::new(LlvmTargetConfig::host());
                 llvm_comp
-                    .opt_level(profile.opt_level)
-                    .lto(&profile.lto)
-                    .strip_symbols(profile.strip_symbols);
+                    .opt_level(ctx.profile.opt_level)
+                    .lto(&ctx.profile.lto)
+                    .strip_symbols(ctx.profile.strip_symbols);
                 llvm_comp
                     .compile_to_object(&fir_module, &obj_path)
                     .map_err(|e| {
                         KoriError::Codegen(format!("LLVM compile to object failed: {}", e))
                     })?;
-                LlvmCompiler::link_executable_with_lto(&obj_path, &output_bin, &profile.lto)
+                LlvmCompiler::link_executable_with_lto(&obj_path, &output_bin, &ctx.profile.lto)
                     .map_err(|e| {
                         KoriError::Codegen(format!("Failed to link binary `{}`: {}", bin.name, e))
                     })?;
@@ -313,24 +399,43 @@ impl BuildOrchestrator {
         &self,
         pkg: &ResolvedPackage,
         lib: &LibTarget,
-        profile: &ProfileConfig,
-        out_dir: &Path,
+        ctx: &BuildContext<'_>,
         cache: &mut BuildCache,
-        force: bool,
     ) -> Result<Vec<BuiltArtifact>, KoriError> {
         let mut artifacts = Vec::new();
         let src_path = pkg.root_dir.join(&lib.path);
         let fir_module = self.compile_source_to_fir(&src_path, &pkg.name, cache)?;
 
-        for crate_type in &lib.crate_types {
+        let is_wasm_only = ctx
+            .target_filter
+            .map(|t| t.contains("wasm"))
+            .unwrap_or(false);
+        let is_native_only = ctx
+            .target_filter
+            .map(|t| t == "native" || t == "host")
+            .unwrap_or(false);
+
+        let crate_types_to_build: Vec<CrateType> = if is_wasm_only {
+            vec![CrateType::Wasm]
+        } else if is_native_only {
+            lib.crate_types
+                .iter()
+                .copied()
+                .filter(|ct| *ct != CrateType::Wasm)
+                .collect()
+        } else {
+            lib.crate_types.clone()
+        };
+
+        for crate_type in &crate_types_to_build {
             match crate_type {
                 CrateType::Cdylib => {
                     let so_filename = format!("lib{}.so", lib.name);
-                    let so_path = out_dir.join(&so_filename);
+                    let so_path = ctx.out_dir.join(&so_filename);
                     let target_key = format!("{}:cdylib:{}", pkg.name, lib.name);
-                    let fingerprint = cache.compute_target_fingerprint(pkg, profile, &[]);
+                    let fingerprint = cache.compute_target_fingerprint(pkg, ctx.profile, &[]);
 
-                    if !force && cache.is_up_to_date(&target_key, &fingerprint, &[&so_path]) {
+                    if !ctx.force && cache.is_up_to_date(&target_key, &fingerprint, &[&so_path]) {
                         artifacts.push(BuiltArtifact {
                             name: lib.name.clone(),
                             path: so_path.clone(),
@@ -338,15 +443,15 @@ impl BuildOrchestrator {
                             cached: true,
                         });
                     } else {
-                        let obj_path = out_dir.join(format!("{}_cdylib.o", lib.name));
+                        let obj_path = ctx.out_dir.join(format!("{}_cdylib.o", lib.name));
 
-                        match profile.backend {
+                        match ctx.profile.backend {
                             BackendKind::Llvm => {
                                 let mut llvm_comp = LlvmCompiler::new(LlvmTargetConfig::host());
                                 llvm_comp
-                                    .opt_level(profile.opt_level)
-                                    .lto(&profile.lto)
-                                    .strip_symbols(profile.strip_symbols);
+                                    .opt_level(ctx.profile.opt_level)
+                                    .lto(&ctx.profile.lto)
+                                    .strip_symbols(ctx.profile.strip_symbols);
                                 llvm_comp
                                     .compile_to_object(&fir_module, &obj_path)
                                     .map_err(|e| {
@@ -393,7 +498,7 @@ impl BuildOrchestrator {
                     let exported_fns = FfiBridgeGenerator::extract_exported_functions(&fir_module);
 
                     let ffi_artifacts =
-                        ffi_gen.emit_bindings(&exported_fns, out_dir, &so_filename)?;
+                        ffi_gen.emit_bindings(&exported_fns, ctx.out_dir, &so_filename)?;
 
                     artifacts.push(BuiltArtifact {
                         name: format!("{}.h", pkg.name),
@@ -429,11 +534,11 @@ impl BuildOrchestrator {
                 }
                 CrateType::Staticlib => {
                     let a_filename = format!("lib{}.a", lib.name);
-                    let a_path = out_dir.join(&a_filename);
+                    let a_path = ctx.out_dir.join(&a_filename);
                     let target_key = format!("{}:staticlib:{}", pkg.name, lib.name);
-                    let fingerprint = cache.compute_target_fingerprint(pkg, profile, &[]);
+                    let fingerprint = cache.compute_target_fingerprint(pkg, ctx.profile, &[]);
 
-                    if !force && cache.is_up_to_date(&target_key, &fingerprint, &[&a_path]) {
+                    if !ctx.force && cache.is_up_to_date(&target_key, &fingerprint, &[&a_path]) {
                         artifacts.push(BuiltArtifact {
                             name: lib.name.clone(),
                             path: a_path.clone(),
@@ -441,15 +546,15 @@ impl BuildOrchestrator {
                             cached: true,
                         });
                     } else {
-                        let obj_path = out_dir.join(format!("{}_static.o", lib.name));
+                        let obj_path = ctx.out_dir.join(format!("{}_static.o", lib.name));
 
-                        match profile.backend {
+                        match ctx.profile.backend {
                             BackendKind::Llvm => {
                                 let mut llvm_comp = LlvmCompiler::new(LlvmTargetConfig::host());
                                 llvm_comp
-                                    .opt_level(profile.opt_level)
-                                    .lto(&profile.lto)
-                                    .strip_symbols(profile.strip_symbols);
+                                    .opt_level(ctx.profile.opt_level)
+                                    .lto(&ctx.profile.lto)
+                                    .strip_symbols(ctx.profile.strip_symbols);
                                 llvm_comp
                                     .compile_to_object(&fir_module, &obj_path)
                                     .map_err(|e| {
@@ -492,23 +597,32 @@ impl BuildOrchestrator {
                 }
                 CrateType::Wasm => {
                     let wasm_filename = format!("{}.wasm", lib.name);
-                    let wasm_path = out_dir.join(&wasm_filename);
+                    let wasm_path = ctx.out_dir.join(&wasm_filename);
                     let target_key = format!("{}:wasm:{}", pkg.name, lib.name);
-                    let fingerprint = cache.compute_target_fingerprint(pkg, profile, &[]);
+                    let fingerprint = cache.compute_target_fingerprint(pkg, ctx.profile, &[]);
+                    let bundle_dir = ctx.out_dir.join(format!("{}_wasm_bundle", lib.name));
 
-                    if !force && cache.is_up_to_date(&target_key, &fingerprint, &[&wasm_path]) {
+                    if !ctx.force && cache.is_up_to_date(&target_key, &fingerprint, &[&wasm_path]) {
                         artifacts.push(BuiltArtifact {
                             name: lib.name.clone(),
                             path: wasm_path.clone(),
                             kind: ArtifactKind::WebAssemblyModule,
                             cached: true,
                         });
+                        if bundle_dir.exists() {
+                            artifacts.push(BuiltArtifact {
+                                name: format!("{}_wasm_bundle", lib.name),
+                                path: bundle_dir,
+                                kind: ArtifactKind::WebAssemblyBundle,
+                                cached: true,
+                            });
+                        }
                     } else {
                         let mut llvm_comp = LlvmCompiler::new(LlvmTargetConfig::wasm32_wasi());
                         llvm_comp
-                            .opt_level(profile.opt_level)
-                            .lto(&profile.lto)
-                            .strip_symbols(profile.strip_symbols);
+                            .opt_level(ctx.profile.opt_level)
+                            .lto(&ctx.profile.lto)
+                            .strip_symbols(ctx.profile.strip_symbols);
                         llvm_comp
                             .compile_to_wasm(&fir_module, &wasm_path)
                             .map_err(|e| {
@@ -529,8 +643,11 @@ impl BuildOrchestrator {
 
                         // Bundle WebAssembly package with TypeScript and JavaScript glue
                         if let Ok(wasm_bytes) = fs::read(&wasm_path) {
-                            let bundle_dir = out_dir.join(format!("{}_wasm_bundle", lib.name));
-                            let bundler = ifa_wasm::WasmBundler::new(&lib.name, wasm_bytes);
+                            let bundler = ifa_wasm::WasmBundler::from_fir_module(
+                                &lib.name,
+                                wasm_bytes,
+                                &fir_module,
+                            );
                             if bundler.bundle(&bundle_dir).is_ok() {
                                 artifacts.push(BuiltArtifact {
                                     name: format!("{}_wasm_bundle", lib.name),
@@ -544,11 +661,12 @@ impl BuildOrchestrator {
                 }
                 CrateType::IfaLib => {
                     let ifalib_filename = format!("{}.ifalib", lib.name);
-                    let ifalib_path = out_dir.join(&ifalib_filename);
+                    let ifalib_path = ctx.out_dir.join(&ifalib_filename);
                     let target_key = format!("{}:ifalib:{}", pkg.name, lib.name);
-                    let fingerprint = cache.compute_target_fingerprint(pkg, profile, &[]);
+                    let fingerprint = cache.compute_target_fingerprint(pkg, ctx.profile, &[]);
 
-                    if !force && cache.is_up_to_date(&target_key, &fingerprint, &[&ifalib_path]) {
+                    if !ctx.force && cache.is_up_to_date(&target_key, &fingerprint, &[&ifalib_path])
+                    {
                         artifacts.push(BuiltArtifact {
                             name: lib.name.clone(),
                             path: ifalib_path,

@@ -981,28 +981,35 @@ fn main() -> ExitCode {
 
             if let Some(dir) = manifest_dir {
                 match BuildOrchestrator::new(dir) {
-                    Ok(orchestrator) => match orchestrator.build(release, None, false) {
-                        Ok(report) => {
-                            println!(
-                                "Finished {} build in {:.2?}",
-                                if release { "release" } else { "dev" },
-                                report.duration
-                            );
-                            for art in report.artifacts {
+                    Ok(orchestrator) => {
+                        match orchestrator.build_with_target(
+                            release,
+                            None,
+                            target.as_deref(),
+                            false,
+                        ) {
+                            Ok(report) => {
                                 println!(
-                                    "  {} {:?} => {}",
-                                    if art.cached { "[cached]" } else { "[built]" },
-                                    art.kind,
-                                    art.path.display()
+                                    "Finished {} build in {:.2?}",
+                                    if release { "release" } else { "dev" },
+                                    report.duration
                                 );
+                                for art in report.artifacts {
+                                    println!(
+                                        "  {} {:?} => {}",
+                                        if art.cached { "[cached]" } else { "[built]" },
+                                        art.kind,
+                                        art.path.display()
+                                    );
+                                }
+                                return ExitCode::SUCCESS;
                             }
-                            return ExitCode::SUCCESS;
+                            Err(e) => {
+                                eprintln!("error: build failed: {}", e);
+                                return ExitCode::FAILURE;
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("error: build failed: {}", e);
-                            return ExitCode::FAILURE;
-                        }
-                    },
+                    }
                     Err(e) => {
                         eprintln!("error: failed to load package: {}", e);
                         return ExitCode::FAILURE;
