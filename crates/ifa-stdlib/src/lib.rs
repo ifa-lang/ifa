@@ -40,8 +40,9 @@ pub use http::{
     url_decode, url_encode, AcceptItem, CircuitState, CorsConfig, HttpCircuitBreaker,
     HttpCircuitBreakerConfig, HttpClient, HttpConnectionPool, HttpConnectionPoolConfig,
     HttpHandler, HttpHeaders, HttpLoadBalancer, HttpMethod, HttpProxyGateway, HttpRequest,
-    HttpResponse, HttpRoute, HttpRouter, HttpServer, HttpStatus, LoadBalancingStrategy,
-    MultipartBuilder, MultipartPart, PooledConnection, RouteSegment, SseEvent, UpstreamBackend,
+    HttpResponse, HttpRetryPolicy, HttpRetryReport, HttpRoute, HttpRouter, HttpServer, HttpStatus,
+    LoadBalancingStrategy, MultipartBuilder, MultipartPart, PooledConnection, RouteSegment,
+    SseEvent, UpstreamBackend,
 };
 pub use io::{BufferedReader, BufferedWriter, MemoryStream};
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};

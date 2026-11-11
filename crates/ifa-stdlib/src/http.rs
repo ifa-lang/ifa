@@ -2566,6 +2566,254 @@ impl HttpClient {
     ) -> io::Result<HttpResponse> {
         breaker.execute(|| pool.send_request(req, host, port))
     }
+
+    /// Send request governed by a retry policy with exponential backoff and jitter.
+    pub fn send_with_retry(
+        &self,
+        policy: &HttpRetryPolicy,
+        req: &HttpRequest,
+        host: &str,
+        port: u16,
+    ) -> (io::Result<HttpResponse>, HttpRetryReport) {
+        policy.execute(&req.method, |_attempt| self.send(req, host, port))
+    }
+
+    /// Send request utilizing connection pooling governed by a retry policy.
+    pub fn send_pooled_with_retry(
+        &self,
+        policy: &HttpRetryPolicy,
+        pool: &mut HttpConnectionPool,
+        req: &HttpRequest,
+        host: &str,
+        port: u16,
+    ) -> (io::Result<HttpResponse>, HttpRetryReport) {
+        policy.execute(&req.method, |_attempt| pool.send_request(req, host, port))
+    }
+
+    /// Fully resilient request execution: retry policy wrapping a circuit breaker and connection pool.
+    pub fn send_resilient(
+        &self,
+        policy: &HttpRetryPolicy,
+        breaker: &mut HttpCircuitBreaker,
+        pool: &mut HttpConnectionPool,
+        req: &HttpRequest,
+        host: &str,
+        port: u16,
+    ) -> (io::Result<HttpResponse>, HttpRetryReport) {
+        policy.execute(&req.method, |_attempt| {
+            breaker.execute(|| pool.send_request(req, host, port))
+        })
+    }
+}
+
+/// Configuration and policy engine for automatic HTTP request retries with exponential backoff and jitter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpRetryPolicy {
+    /// Maximum number of retry attempts (default: 3).
+    pub max_retries: usize,
+    /// Base delay in milliseconds before the first retry (default: 50ms).
+    pub initial_delay_ms: u64,
+    /// Maximum backoff ceiling in milliseconds (default: 2000ms).
+    pub max_delay_ms: u64,
+    /// Exponential multiplication factor applied between successive attempts (default: 2.0).
+    pub backoff_factor: f64,
+    /// Jitter variance ratio [0.0..=0.5] applied to avoid synchronized retries / thundering herds (default: 0.1).
+    pub jitter_ratio: f64,
+    /// HTTP status codes considered transient and eligible for retry (default: 408, 429, 500, 502, 503, 504).
+    pub retryable_status_codes: Vec<u16>,
+    /// HTTP methods considered safe/idempotent to retry (default: GET, HEAD, PUT, DELETE, OPTIONS, TRACE).
+    pub retryable_methods: Vec<HttpMethod>,
+    /// Whether to retry when an I/O network connection error occurs (default: true).
+    pub retry_on_network_error: bool,
+}
+
+/// Execution telemetry and statistics for an HTTP operation processed with retry policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpRetryReport {
+    /// Total number of attempts executed (1 initial attempt + number of retries).
+    pub attempts: usize,
+    /// Total number of retries performed (attempts - 1).
+    pub retries: usize,
+    /// Whether the request ultimately succeeded.
+    pub succeeded: bool,
+    /// Final HTTP status code obtained, if available.
+    pub last_status: Option<u16>,
+    /// Total cumulative backoff delay waited in milliseconds.
+    pub total_backoff_ms: u64,
+}
+
+impl Default for HttpRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_delay_ms: 50,
+            max_delay_ms: 2000,
+            backoff_factor: 2.0,
+            jitter_ratio: 0.1,
+            retryable_status_codes: vec![408, 429, 500, 502, 503, 504],
+            retryable_methods: vec![
+                HttpMethod::Get,
+                HttpMethod::Head,
+                HttpMethod::Put,
+                HttpMethod::Delete,
+                HttpMethod::Options,
+            ],
+            retry_on_network_error: true,
+        }
+    }
+}
+
+impl HttpRetryPolicy {
+    /// Create a new retry policy with standard default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set maximum retry count.
+    pub fn with_max_retries(mut self, max: usize) -> Self {
+        self.max_retries = max;
+        self
+    }
+
+    /// Set initial backoff delay in milliseconds.
+    pub fn with_initial_delay_ms(mut self, delay: u64) -> Self {
+        self.initial_delay_ms = delay;
+        self
+    }
+
+    /// Set maximum ceiling delay in milliseconds.
+    pub fn with_max_delay_ms(mut self, max: u64) -> Self {
+        self.max_delay_ms = max;
+        self
+    }
+
+    /// Set exponential backoff multiplication factor.
+    pub fn with_backoff_factor(mut self, factor: f64) -> Self {
+        self.backoff_factor = factor;
+        self
+    }
+
+    /// Set jitter variance ratio [0.0..=0.5].
+    pub fn with_jitter_ratio(mut self, jitter: f64) -> Self {
+        self.jitter_ratio = jitter;
+        self
+    }
+
+    /// Set list of HTTP status codes eligible for retry.
+    pub fn with_retryable_statuses(mut self, statuses: Vec<u16>) -> Self {
+        self.retryable_status_codes = statuses;
+        self
+    }
+
+    /// Set list of HTTP methods permitted to be retried.
+    pub fn with_retryable_methods(mut self, methods: Vec<HttpMethod>) -> Self {
+        self.retryable_methods = methods;
+        self
+    }
+
+    /// Enable or disable retrying on I/O network errors.
+    pub fn with_retry_on_network_error(mut self, enable: bool) -> Self {
+        self.retry_on_network_error = enable;
+        self
+    }
+
+    /// Check if a given HTTP status code is retryable under this policy.
+    pub fn is_status_retryable(&self, status: u16) -> bool {
+        self.retryable_status_codes.contains(&status)
+    }
+
+    /// Check if a given HTTP method is idempotent/safe to retry under this policy.
+    pub fn is_method_retryable(&self, method: &HttpMethod) -> bool {
+        self.retryable_methods.contains(method)
+    }
+
+    /// Calculate backoff delay in milliseconds for the given attempt count (1-based).
+    pub fn calculate_delay_ms(&self, attempt: usize) -> u64 {
+        if attempt <= 1 {
+            return self.initial_delay_ms.min(self.max_delay_ms);
+        }
+        let exp = (attempt - 1) as i32;
+        let base_delay = (self.initial_delay_ms as f64) * self.backoff_factor.powi(exp);
+        let capped = base_delay.min(self.max_delay_ms as f64);
+        let jitter_amount = capped * self.jitter_ratio.clamp(0.0, 0.5);
+        // Deterministic salt based on attempt for reproducible jitter
+        let salt = (((attempt as u64) * 1103515245 + 12345) % 100) as f64 / 100.0;
+        let jitter_offset = (salt - 0.5) * 2.0 * jitter_amount;
+        (capped + jitter_offset).clamp(1.0, self.max_delay_ms as f64) as u64
+    }
+
+    /// Execute an HTTP operation with automatic retries, backoff, and telemetry reporting.
+    pub fn execute<F>(
+        &self,
+        method: &HttpMethod,
+        mut op: F,
+    ) -> (io::Result<HttpResponse>, HttpRetryReport)
+    where
+        F: FnMut(usize) -> io::Result<HttpResponse>,
+    {
+        let mut attempts = 0;
+        let mut total_backoff_ms = 0;
+        let max_attempts = self.max_retries + 1;
+
+        for attempt in 1..=max_attempts {
+            attempts = attempt;
+            match op(attempt) {
+                Ok(resp) => {
+                    let status = resp.status.0;
+                    let should_retry = attempt < max_attempts
+                        && self.is_method_retryable(method)
+                        && self.is_status_retryable(status);
+
+                    if should_retry {
+                        let delay = self.calculate_delay_ms(attempt);
+                        std::thread::sleep(Duration::from_millis(delay));
+                        total_backoff_ms += delay;
+                        continue;
+                    }
+
+                    let succeeded = status < 400 || !self.is_status_retryable(status);
+                    let report = HttpRetryReport {
+                        attempts,
+                        retries: attempts.saturating_sub(1),
+                        succeeded,
+                        last_status: Some(status),
+                        total_backoff_ms,
+                    };
+                    return (Ok(resp), report);
+                }
+                Err(err) => {
+                    let should_retry = attempt < max_attempts
+                        && self.retry_on_network_error
+                        && self.is_method_retryable(method);
+
+                    if should_retry {
+                        let delay = self.calculate_delay_ms(attempt);
+                        std::thread::sleep(Duration::from_millis(delay));
+                        total_backoff_ms += delay;
+                        continue;
+                    }
+
+                    let report = HttpRetryReport {
+                        attempts,
+                        retries: attempts.saturating_sub(1),
+                        succeeded: false,
+                        last_status: None,
+                        total_backoff_ms,
+                    };
+                    return (Err(err), report);
+                }
+            }
+        }
+
+        let report = HttpRetryReport {
+            attempts,
+            retries: attempts.saturating_sub(1),
+            succeeded: false,
+            last_status: None,
+            total_backoff_ms,
+        };
+        (Err(io::Error::other("Retries exhausted")), report)
+    }
 }
 
 impl HttpProxyGateway {
@@ -3690,6 +3938,114 @@ mod tests {
             .expect("Probe request succeeded");
         assert_eq!(probe.status, HttpStatus::OK);
         assert!(breaker.is_closed());
+
+        server.stop();
+    }
+
+    #[test]
+    fn test_http_retry_policy_delay_calculation() {
+        let policy = HttpRetryPolicy::new()
+            .with_max_retries(4)
+            .with_initial_delay_ms(10)
+            .with_max_delay_ms(100)
+            .with_backoff_factor(2.0)
+            .with_jitter_ratio(0.0);
+
+        assert_eq!(policy.calculate_delay_ms(1), 10);
+        assert_eq!(policy.calculate_delay_ms(2), 20);
+        assert_eq!(policy.calculate_delay_ms(3), 40);
+        assert_eq!(policy.calculate_delay_ms(4), 80);
+        assert_eq!(policy.calculate_delay_ms(5), 100);
+
+        assert!(policy.is_status_retryable(503));
+        assert!(policy.is_status_retryable(429));
+        assert!(!policy.is_status_retryable(200));
+        assert!(!policy.is_status_retryable(404));
+
+        assert!(policy.is_method_retryable(&HttpMethod::Get));
+        assert!(policy.is_method_retryable(&HttpMethod::Put));
+        assert!(!policy.is_method_retryable(&HttpMethod::Post));
+    }
+
+    #[test]
+    fn test_http_retry_policy_execute_success_after_retries() {
+        let policy = HttpRetryPolicy::new()
+            .with_max_retries(3)
+            .with_initial_delay_ms(2)
+            .with_jitter_ratio(0.0);
+
+        let mut attempts_seen = 0;
+        let (res, report) = policy.execute(&HttpMethod::Get, |attempt| {
+            attempts_seen = attempt;
+            if attempt < 3 {
+                Ok(HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE).text("transient error"))
+            } else {
+                Ok(HttpResponse::ok().text("recovered"))
+            }
+        });
+
+        let resp = res.expect("Should succeed on attempt 3");
+        assert_eq!(resp.status, HttpStatus::OK);
+        assert_eq!(resp.body_str().unwrap(), "recovered");
+        assert_eq!(attempts_seen, 3);
+        assert_eq!(report.attempts, 3);
+        assert_eq!(report.retries, 2);
+        assert!(report.succeeded);
+        assert_eq!(report.last_status, Some(200));
+    }
+
+    #[test]
+    fn test_http_retry_policy_non_idempotent_no_retry() {
+        let policy = HttpRetryPolicy::new()
+            .with_max_retries(3)
+            .with_initial_delay_ms(2);
+
+        let mut attempts_seen = 0;
+        let (res, report) = policy.execute(&HttpMethod::Post, |attempt| {
+            attempts_seen = attempt;
+            Ok(HttpResponse::new(HttpStatus::INTERNAL_SERVER_ERROR).text("failure"))
+        });
+
+        let resp = res.expect("Should return response without retry");
+        assert_eq!(resp.status, HttpStatus::INTERNAL_SERVER_ERROR);
+        assert_eq!(attempts_seen, 1);
+        assert_eq!(report.attempts, 1);
+        assert_eq!(report.retries, 0);
+    }
+
+    #[test]
+    fn test_http_client_send_with_retry_integration() {
+        let mut server = HttpServer::new(0);
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c_clone = Arc::clone(&counter);
+
+        server.get("/api/flaky", move |_req| {
+            let n = c_clone.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE).text("unavailable")
+            } else {
+                HttpResponse::ok().text("service restored")
+            }
+        });
+
+        let bound = server.listen_background().expect("Server listen failed");
+        let port = bound.port();
+
+        let client = HttpClient::new();
+        let policy = HttpRetryPolicy::new()
+            .with_max_retries(3)
+            .with_initial_delay_ms(5)
+            .with_jitter_ratio(0.0);
+
+        let req = HttpRequest::new(HttpMethod::Get, "/api/flaky");
+        let (res, report) = client.send_with_retry(&policy, &req, "127.0.0.1", port);
+
+        let resp = res.expect("Flaky endpoint should succeed on attempt 3");
+        assert_eq!(resp.status, HttpStatus::OK);
+        assert_eq!(resp.body_str().unwrap(), "service restored");
+        assert_eq!(report.attempts, 3);
+        assert_eq!(report.retries, 2);
+        assert!(report.succeeded);
 
         server.stop();
     }

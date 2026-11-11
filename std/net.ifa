@@ -159,6 +159,24 @@ pub struct HttpConnectionPool {
     total_reused: i64
 }
 
+pub struct HttpRetryPolicy {
+    max_retries: i64,
+    initial_delay_ms: i64,
+    max_delay_ms: i64,
+    backoff_factor: i64,
+    retry_on_5xx: bool,
+    retry_on_429: bool,
+    retry_on_network_error: bool
+}
+
+pub struct HttpRetryReport {
+    attempts: i64,
+    retries: i64,
+    succeeded: bool,
+    last_status: i64,
+    total_backoff_ms: i64
+}
+
 pub fn make_http_header(name: String, value: String) -> HttpHeader {
     return HttpHeader(name: name, value: value);
 }
@@ -5371,6 +5389,119 @@ pub fn test_net_http_circuit_breaker() -> bool {
     return true;
 }
 
+pub fn make_http_retry_policy(max_retries: i64, initial_delay_ms: i64, max_delay_ms: i64, backoff_factor: i64) -> HttpRetryPolicy {
+    return HttpRetryPolicy(
+        max_retries: max_retries,
+        initial_delay_ms: initial_delay_ms,
+        max_delay_ms: max_delay_ms,
+        backoff_factor: backoff_factor,
+        retry_on_5xx: true,
+        retry_on_429: true,
+        retry_on_network_error: true
+    );
+}
+
+pub fn http_retry_policy_default() -> HttpRetryPolicy {
+    return make_http_retry_policy(3, 50, 2000, 2);
+}
+
+pub fn http_retry_is_status_retryable(policy: HttpRetryPolicy, status_code: i64) -> bool {
+    if policy.retry_on_429 && status_code == 429 {
+        return true;
+    }
+    if status_code == 408 {
+        return true;
+    }
+    if policy.retry_on_5xx && (status_code == 500 || status_code == 502 || status_code == 503 || status_code == 504) {
+        return true;
+    }
+    return false;
+}
+
+pub fn http_retry_is_method_idempotent(method: String) -> bool {
+    return method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE" || method == "OPTIONS";
+}
+
+pub fn http_retry_calculate_delay_ms(policy: HttpRetryPolicy, attempt: i64) -> i64 {
+    if attempt <= 1 {
+        return policy.initial_delay_ms;
+    }
+    mut delay: i64 = policy.initial_delay_ms;
+    mut i: i64 = 1;
+    while i < attempt {
+        delay = delay * policy.backoff_factor;
+        if delay >= policy.max_delay_ms {
+            return policy.max_delay_ms;
+        }
+        i = i + 1;
+    }
+    return delay;
+}
+
+pub fn test_net_http_retry_policy() -> bool {
+    let policy = make_http_retry_policy(4, 10, 100, 2);
+
+    // 1. Backoff progression
+    if http_retry_calculate_delay_ms(policy, 1) != 10 {
+        return false;
+    }
+    if http_retry_calculate_delay_ms(policy, 2) != 20 {
+        return false;
+    }
+    if http_retry_calculate_delay_ms(policy, 3) != 40 {
+        return false;
+    }
+    if http_retry_calculate_delay_ms(policy, 4) != 80 {
+        return false;
+    }
+    if http_retry_calculate_delay_ms(policy, 5) != 100 {
+        return false;
+    }
+
+    // 2. Status filtering
+    if !http_retry_is_status_retryable(policy, 503)
+        || !http_retry_is_status_retryable(policy, 502)
+        || !http_retry_is_status_retryable(policy, 500)
+        || !http_retry_is_status_retryable(policy, 504)
+        || !http_retry_is_status_retryable(policy, 429)
+        || !http_retry_is_status_retryable(policy, 408) {
+        return false;
+    }
+    if http_retry_is_status_retryable(policy, 200)
+        || http_retry_is_status_retryable(policy, 404)
+        || http_retry_is_status_retryable(policy, 400)
+        || http_retry_is_status_retryable(policy, 401) {
+        return false;
+    }
+
+    // 3. Method idempotency
+    if !http_retry_is_method_idempotent("GET")
+        || !http_retry_is_method_idempotent("HEAD")
+        || !http_retry_is_method_idempotent("PUT")
+        || !http_retry_is_method_idempotent("DELETE")
+        || !http_retry_is_method_idempotent("OPTIONS") {
+        return false;
+    }
+    if http_retry_is_method_idempotent("POST")
+        || http_retry_is_method_idempotent("PATCH") {
+        return false;
+    }
+
+    // 4. Report creation
+    let report = HttpRetryReport(
+        attempts: 3,
+        retries: 2,
+        succeeded: true,
+        last_status: 200,
+        total_backoff_ms: 30
+    );
+    if report.attempts != 3 || report.retries != 2 || !report.succeeded || report.last_status != 200 || report.total_backoff_ms != 30 {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn test_net_http_connection_pooling_and_keep_alive() -> bool {
     // 1. Initialize Connection Pool
     mut pool = make_http_connection_pool(2, 4, 10000);
@@ -5647,7 +5778,8 @@ pub fn test_net_all() -> bool {
     && test_net_rate_limiting_and_mime_resolver()
     && test_net_http_reverse_proxy_gateway_and_load_balancer()
     && test_net_http_connection_pooling_and_keep_alive()
-    && test_net_http_circuit_breaker();
+    && test_net_http_circuit_breaker()
+    && test_net_http_retry_policy();
 }
 
 pub fn main() {
@@ -5682,7 +5814,8 @@ pub fn main() {
     let t29 = test_net_http_reverse_proxy_gateway_and_load_balancer();
     let t30 = test_net_http_connection_pooling_and_keep_alive();
     let t31 = test_net_http_circuit_breaker();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 {
+    let t32 = test_net_http_retry_policy();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");
