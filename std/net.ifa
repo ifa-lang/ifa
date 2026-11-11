@@ -3652,6 +3652,359 @@ pub fn test_net_http_sse_streaming_and_content_negotiation() -> bool {
     return accepts_json && accepts_sse && !rejects_xml;
 }
 
+pub fn get_net_b64_char(idx: i64) -> String {
+    let chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if idx >= 0 && idx < 64 {
+        return string_substr(chars, idx, 1);
+    }
+    return "=";
+}
+
+pub fn get_net_b64_val(c: i64) -> i64 {
+    if c >= 65 && c <= 90 { return c - 65; }
+    if c >= 97 && c <= 122 { return c - 97 + 26; }
+    if c >= 48 && c <= 57 { return c - 48 + 52; }
+    if c == 43 { return 62; }
+    if c == 47 { return 63; }
+    return -1;
+}
+
+pub fn net_base64_encode(input: String) -> String {
+    mut out: String = "";
+    let len = string_len(input);
+    mut i: i64 = 0;
+    while i + 3 <= len {
+        let b0 = string_char_at(input, i) & 255;
+        let b1 = string_char_at(input, i + 1) & 255;
+        let b2 = string_char_at(input, i + 2) & 255;
+
+        out = out + get_net_b64_char(b0 >> 2);
+        out = out + get_net_b64_char(((b0 & 3) << 4) | (b1 >> 4));
+        out = out + get_net_b64_char(((b1 & 15) << 2) | (b2 >> 6));
+        out = out + get_net_b64_char(b2 & 63);
+
+        i = i + 3;
+    }
+
+    let rem = len - i;
+    if rem == 1 {
+        let b0 = string_char_at(input, i) & 255;
+        out = out + get_net_b64_char(b0 >> 2);
+        out = out + get_net_b64_char((b0 & 3) << 4);
+        out = out + "==";
+    } else if rem == 2 {
+        let b0 = string_char_at(input, i) & 255;
+        let b1 = string_char_at(input, i + 1) & 255;
+        out = out + get_net_b64_char(b0 >> 2);
+        out = out + get_net_b64_char(((b0 & 3) << 4) | (b1 >> 4));
+        out = out + get_net_b64_char((b1 & 15) << 2);
+        out = out + "=";
+    }
+
+    return out;
+}
+
+pub fn net_base64_decode(input: String) -> String {
+    let len = string_len(input);
+    mut clean: List<i64> = List::new();
+    mut i: i64 = 0;
+    while i < len {
+        let c = string_char_at(input, i);
+        if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 43 || c == 47 || c == 61 {
+            clean.push(c);
+        }
+        i = i + 1;
+    }
+
+    let c_len = clean.len();
+    mut out: String = "";
+    mut idx: i64 = 0;
+    while idx + 4 <= c_len {
+        let c0 = clean[idx];
+        let c1 = clean[idx + 1];
+        let c2 = clean[idx + 2];
+        let c3 = clean[idx + 3];
+
+        let v0 = get_net_b64_val(c0);
+        let v1 = get_net_b64_val(c1);
+
+        if c2 == 61 {
+            let b0 = ((v0 << 2) | (v1 >> 4)) & 255;
+            out = out + string_from_char(b0);
+            return out;
+        }
+
+        let v2 = get_net_b64_val(c2);
+        let b0 = ((v0 << 2) | (v1 >> 4)) & 255;
+        out = out + string_from_char(b0);
+
+        if c3 == 61 {
+            let b1 = ((v1 & 15) << 4) | (v2 >> 2);
+            out = out + string_from_char(b1);
+            return out;
+        }
+
+        let v3 = get_net_b64_val(c3);
+        let b1 = ((v1 & 15) << 4) | (v2 >> 2);
+        let b2 = ((v2 & 3) << 6) | v3;
+        out = out + string_from_char(b1);
+        out = out + string_from_char(b2);
+
+        idx = idx + 4;
+    }
+    return out;
+}
+
+pub fn http_encode_basic_auth(username: String, password: String) -> String {
+    let creds = username + ":" + password;
+    return "Basic " + net_base64_encode(creds);
+}
+
+pub fn http_parse_basic_auth(auth_header: String) -> String {
+    let len = string_len(auth_header);
+    if len < 6 {
+        return "";
+    }
+    let pfx = string_substr(auth_header, 0, 6);
+    if (pfx != "Basic ") && (pfx != "basic ") && (pfx != "BASIC ") {
+        return "";
+    }
+    mut b64_part = string_substr(auth_header, 6, len - 6);
+    while string_len(b64_part) > 0 && string_char_at(b64_part, 0) == 32 {
+        b64_part = string_substr(b64_part, 1, string_len(b64_part) - 1);
+    }
+    while string_len(b64_part) > 0 && string_char_at(b64_part, string_len(b64_part) - 1) == 32 {
+        b64_part = string_substr(b64_part, 0, string_len(b64_part) - 1);
+    }
+    return net_base64_decode(b64_part);
+}
+
+pub fn http_parse_bearer_token(auth_header: String) -> String {
+    let len = string_len(auth_header);
+    if len < 7 {
+        return "";
+    }
+    let pfx = string_substr(auth_header, 0, 7);
+    if (pfx != "Bearer ") && (pfx != "bearer ") && (pfx != "BEARER ") {
+        return "";
+    }
+    mut tok = string_substr(auth_header, 7, len - 7);
+    while string_len(tok) > 0 && string_char_at(tok, 0) == 32 {
+        tok = string_substr(tok, 1, string_len(tok) - 1);
+    }
+    while string_len(tok) > 0 && string_char_at(tok, string_len(tok) - 1) == 32 {
+        tok = string_substr(tok, 0, string_len(tok) - 1);
+    }
+    return tok;
+}
+
+pub fn http_is_cors_preflight(method: String, origin: String, req_method: String) -> bool {
+    return (method == "OPTIONS") && (string_len(origin) > 0) && (string_len(req_method) > 0);
+}
+
+pub fn http_format_cors_headers(origin: String, methods: String, headers: String, max_age: i64) -> String {
+    mut res: String = "Access-Control-Allow-Origin: " + origin + "\r\n";
+    if string_len(methods) > 0 {
+        res = res + "Access-Control-Allow-Methods: " + methods + "\r\n";
+    }
+    if string_len(headers) > 0 {
+        res = res + "Access-Control-Allow-Headers: " + headers + "\r\n";
+    }
+    if max_age > 0 {
+        res = res + "Access-Control-Max-Age: " + int_to_string(max_age) + "\r\n";
+    }
+    return res;
+}
+
+pub fn http_cors_preflight_response(origin: String, methods: String, headers: String, max_age: i64) -> String {
+    return "HTTP/1.1 204 No Content\r\n"
+        + http_format_cors_headers(origin, methods, headers, max_age)
+        + "Content-Length: 0\r\n\r\n";
+}
+
+pub fn http_compute_etag(body: String, weak: bool) -> String {
+    let crc = net_crc32_string(body);
+    let len = string_len(body);
+    let tag = "\"" + int_to_hex_string(crc) + "-" + int_to_string(len) + "\"";
+    if weak {
+        return "W/" + tag;
+    }
+    return tag;
+}
+
+pub fn http_strip_etag(raw_tag: String) -> String {
+    mut t = raw_tag;
+    while string_len(t) > 0 && string_char_at(t, 0) == 32 {
+        t = string_substr(t, 1, string_len(t) - 1);
+    }
+    while string_len(t) > 0 && string_char_at(t, string_len(t) - 1) == 32 {
+        t = string_substr(t, 0, string_len(t) - 1);
+    }
+    if string_len(t) >= 2 && string_substr(t, 0, 2) == "W/" {
+        t = string_substr(t, 2, string_len(t) - 2);
+    }
+    if string_len(t) >= 2 && string_char_at(t, 0) == 34 && string_char_at(t, string_len(t) - 1) == 34 {
+        t = string_substr(t, 1, string_len(t) - 2);
+    }
+    return t;
+}
+
+pub fn http_matches_if_none_match(current_etag: String, header_val: String) -> bool {
+    let h_len = string_len(header_val);
+    if h_len == 0 {
+        return false;
+    }
+    if string_contains(header_val, "*") {
+        return true;
+    }
+    let target = http_strip_etag(current_etag);
+
+    mut start: i64 = 0;
+    mut i: i64 = 0;
+    while i <= h_len {
+        let is_end = (i == h_len) || (string_char_at(header_val, i) == 44); // ','
+        if is_end {
+            let part = string_substr(header_val, start, i - start);
+            let cleaned = http_strip_etag(part);
+            if cleaned == target {
+                return true;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn http_matches_if_match(current_etag: String, header_val: String) -> bool {
+    let h_len = string_len(header_val);
+    if h_len == 0 {
+        return true;
+    }
+    if string_len(current_etag) >= 2 && string_substr(current_etag, 0, 2) == "W/" {
+        return false;
+    }
+    if string_contains(header_val, "*") {
+        return true;
+    }
+
+    mut target = current_etag;
+    while string_len(target) > 0 && string_char_at(target, 0) == 32 {
+        target = string_substr(target, 1, string_len(target) - 1);
+    }
+    while string_len(target) > 0 && string_char_at(target, string_len(target) - 1) == 32 {
+        target = string_substr(target, 0, string_len(target) - 1);
+    }
+    if string_len(target) >= 2 && string_char_at(target, 0) == 34 && string_char_at(target, string_len(target) - 1) == 34 {
+        target = string_substr(target, 1, string_len(target) - 2);
+    }
+
+    mut start: i64 = 0;
+    mut i: i64 = 0;
+    while i <= h_len {
+        let is_end = (i == h_len) || (string_char_at(header_val, i) == 44); // ','
+        if is_end {
+            mut part = string_substr(header_val, start, i - start);
+            while string_len(part) > 0 && string_char_at(part, 0) == 32 {
+                part = string_substr(part, 1, string_len(part) - 1);
+            }
+            while string_len(part) > 0 && string_char_at(part, string_len(part) - 1) == 32 {
+                part = string_substr(part, 0, string_len(part) - 1);
+            }
+            if !(string_len(part) >= 2 && string_substr(part, 0, 2) == "W/") {
+                if string_len(part) >= 2 && string_char_at(part, 0) == 34 && string_char_at(part, string_len(part) - 1) == 34 {
+                    part = string_substr(part, 1, string_len(part) - 2);
+                }
+                if part == target {
+                    return true;
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn http_response_304_not_modified(etag: String) -> String {
+    return "HTTP/1.1 304 Not Modified\r\nETag: " + etag + "\r\nConnection: keep-alive\r\n\r\n";
+}
+
+pub fn test_net_http_auth_cors_and_etag() -> bool {
+    let b_auth = http_encode_basic_auth("aladdin", "open sesame");
+    if b_auth != "Basic YWxhZGRpbjpvcGVuIHNlc2FtZQ==" {
+        return false;
+    }
+    let parsed_creds = http_parse_basic_auth(b_auth);
+    if parsed_creds != "aladdin:open sesame" {
+        return false;
+    }
+    let invalid_basic = http_parse_basic_auth("Bearer 12345");
+    if invalid_basic != "" {
+        return false;
+    }
+
+    let b_hdr = "Bearer sec_live_tok_991823746";
+    let tok = http_parse_bearer_token(b_hdr);
+    if tok != "sec_live_tok_991823746" {
+        return false;
+    }
+    let invalid_bearer = http_parse_bearer_token("Basic YWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+    if invalid_bearer != "" {
+        return false;
+    }
+
+    let is_preflight = http_is_cors_preflight("OPTIONS", "https://ifa-lang.org", "POST");
+    let is_not_preflight = http_is_cors_preflight("GET", "https://ifa-lang.org", "");
+    if !is_preflight || is_not_preflight {
+        return false;
+    }
+
+    let cors_resp = http_cors_preflight_response("https://ifa-lang.org", "GET, POST, OPTIONS", "Content-Type, Authorization", 7200);
+    if !string_contains(cors_resp, "HTTP/1.1 204 No Content")
+        || !string_contains(cors_resp, "Access-Control-Allow-Origin: https://ifa-lang.org")
+        || !string_contains(cors_resp, "Access-Control-Max-Age: 7200") {
+        return false;
+    }
+
+    let content = "IFA High-Performance Fiber Engine";
+    let strong_etag = http_compute_etag(content, false);
+    let weak_etag = http_compute_etag(content, true);
+
+    if !string_contains(strong_etag, "\"") || string_contains(strong_etag, "W/") {
+        return false;
+    }
+    if !string_contains(weak_etag, "W/\"") {
+        return false;
+    }
+
+    let match_exact = http_matches_if_none_match(strong_etag, strong_etag);
+    let match_weak = http_matches_if_none_match(strong_etag, weak_etag);
+    let match_wildcard = http_matches_if_none_match(strong_etag, "*");
+    let match_list = http_matches_if_none_match(strong_etag, "\"random-tag\", " + strong_etag);
+    let no_match = http_matches_if_none_match(strong_etag, "\"tag-diff-999\"");
+
+    if !match_exact || !match_weak || !match_wildcard || !match_list || no_match {
+        return false;
+    }
+
+    let if_match_exact = http_matches_if_match(strong_etag, strong_etag);
+    let if_match_weak_candidate = http_matches_if_match(weak_etag, strong_etag);
+    let if_match_weak_header = http_matches_if_match(strong_etag, weak_etag);
+    let if_match_wildcard = http_matches_if_match(strong_etag, "*");
+
+    if !if_match_exact || if_match_weak_candidate || if_match_weak_header || !if_match_wildcard {
+        return false;
+    }
+
+    let resp_304 = http_response_304_not_modified(strong_etag);
+    if !string_contains(resp_304, "304 Not Modified") || !string_contains(resp_304, strong_etag) {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn test_net_all() -> bool {
     return test_net_tcp_echo()
     && test_net_http_wire()
@@ -3676,7 +4029,8 @@ pub fn test_net_all() -> bool {
     && test_net_url_percent_encoding_roundtrip()
     && test_net_http_cookies_and_session()
     && test_net_multipart_form_data()
-    && test_net_http_sse_streaming_and_content_negotiation();
+    && test_net_http_sse_streaming_and_content_negotiation()
+    && test_net_http_auth_cors_and_etag();
 }
 
 pub fn main() {
@@ -3704,7 +4058,8 @@ pub fn main() {
     let t22 = test_net_http_cookies_and_session();
     let t23 = test_net_multipart_form_data();
     let t24 = test_net_http_sse_streaming_and_content_negotiation();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 {
+    let t25 = test_net_http_auth_cors_and_etag();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");

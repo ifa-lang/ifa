@@ -52,6 +52,7 @@ impl HttpStatus {
     pub const OK: HttpStatus = HttpStatus(200);
     pub const CREATED: HttpStatus = HttpStatus(201);
     pub const NO_CONTENT: HttpStatus = HttpStatus(204);
+    pub const NOT_MODIFIED: HttpStatus = HttpStatus(304);
     pub const BAD_REQUEST: HttpStatus = HttpStatus(400);
     pub const UNAUTHORIZED: HttpStatus = HttpStatus(401);
     pub const FORBIDDEN: HttpStatus = HttpStatus(403);
@@ -63,6 +64,7 @@ impl HttpStatus {
             200 => "OK",
             201 => "Created",
             204 => "No Content",
+            304 => "Not Modified",
             400 => "Bad Request",
             401 => "Unauthorized",
             403 => "Forbidden",
@@ -166,6 +168,25 @@ impl HttpResponse {
         Self::new(HttpStatus::CREATED)
     }
 
+    pub fn no_content() -> Self {
+        Self::new(HttpStatus::NO_CONTENT)
+    }
+
+    pub fn not_modified(etag_str: Option<&str>) -> Self {
+        let mut resp = Self::new(HttpStatus::NOT_MODIFIED);
+        if let Some(etag) = etag_str {
+            resp.headers.set("ETag", etag);
+        }
+        resp
+    }
+
+    pub fn unauthorized(realm: &str) -> Self {
+        let challenge = format!("Basic realm=\"{}\"", realm);
+        Self::new(HttpStatus::UNAUTHORIZED)
+            .header("WWW-Authenticate", &challenge)
+            .text("401 Unauthorized\n")
+    }
+
     pub fn bad_request() -> Self {
         Self::new(HttpStatus::BAD_REQUEST)
     }
@@ -176,6 +197,11 @@ impl HttpResponse {
 
     pub fn server_error() -> Self {
         Self::new(HttpStatus::INTERNAL_SERVER_ERROR)
+    }
+
+    pub fn etag(mut self, etag_str: &str) -> Self {
+        self.headers.set("ETag", etag_str);
+        self
     }
 
     pub fn header(mut self, key: &str, val: &str) -> Self {
@@ -507,6 +533,48 @@ impl HttpRequest {
         self.content_type()
             .map(|c| c.to_ascii_lowercase().contains("multipart/form-data"))
             .unwrap_or(false)
+    }
+
+    /// Returns the Authorization header value if present.
+    pub fn authorization(&self) -> Option<&str> {
+        self.headers.get("authorization")
+    }
+
+    /// Parse HTTP Basic Authentication credentials (RFC 7617).
+    /// Returns Some((username, password)) if format is "Basic <base64>" and valid.
+    pub fn basic_auth(&self) -> Option<(String, String)> {
+        self.authorization().and_then(parse_basic_auth)
+    }
+
+    /// Parse HTTP Bearer token from Authorization header (RFC 6750).
+    /// Returns Some(token) if format is "Bearer <token>".
+    pub fn bearer_token(&self) -> Option<String> {
+        self.authorization().and_then(parse_bearer_token)
+    }
+
+    /// Check if this is a CORS preflight OPTIONS request.
+    pub fn is_cors_preflight(&self) -> bool {
+        self.method == HttpMethod::Options
+            && self.headers.get("origin").is_some()
+            && self.headers.get("access-control-request-method").is_some()
+    }
+
+    /// Evaluate If-None-Match header against the given ETag (RFC 7232).
+    /// Returns true if client version is fresh and server should reply 304 Not Modified.
+    pub fn if_none_match(&self, current_etag: &str) -> bool {
+        self.headers
+            .get("if-none-match")
+            .map(|val| matches_if_none_match(current_etag, val))
+            .unwrap_or(false)
+    }
+
+    /// Evaluate If-Match header against the given ETag (RFC 7232).
+    /// Returns true if operation is permitted (matches or header absent).
+    pub fn if_match(&self, current_etag: &str) -> bool {
+        self.headers
+            .get("if-match")
+            .map(|val| matches_if_match(current_etag, val))
+            .unwrap_or(true)
     }
 }
 
@@ -1263,6 +1331,209 @@ pub fn negotiate_content_type(accept_header: &str, available: &[&str]) -> Option
     None
 }
 
+// ============================================================================
+// HTTP Authentication Helpers (RFC 7617, RFC 6750)
+// ============================================================================
+
+/// Encode Basic Authentication header value from username and password.
+/// Format: "Basic <base64(username:password)>"
+pub fn encode_basic_auth(username: &str, password: &str) -> String {
+    let creds = format!("{}:{}", username, password);
+    let encoded = crate::crypto::base64_encode(creds.as_bytes());
+    format!("Basic {}", encoded)
+}
+
+/// Parse Basic Authentication header value.
+/// Accepts "Basic <base64>" (case-insensitive scheme) and returns Some((user, password)).
+pub fn parse_basic_auth(header_val: &str) -> Option<(String, String)> {
+    let trimmed = header_val.trim();
+    if trimmed.len() < 6 {
+        return None;
+    }
+    let (scheme, rest) = trimmed.split_at(6);
+    if !scheme.eq_ignore_ascii_case("basic ") {
+        return None;
+    }
+    let decoded_bytes = crate::crypto::base64_decode(rest.trim()).ok()?;
+    let decoded_str = String::from_utf8(decoded_bytes).ok()?;
+    let (user, pass) = decoded_str.split_once(':')?;
+    Some((user.to_string(), pass.to_string()))
+}
+
+/// Parse Bearer token from Authorization header value (RFC 6750).
+/// Accepts "Bearer <token>" (case-insensitive scheme) and returns Some(token).
+pub fn parse_bearer_token(header_val: &str) -> Option<String> {
+    let trimmed = header_val.trim();
+    if trimmed.len() < 7 {
+        return None;
+    }
+    let (scheme, rest) = trimmed.split_at(7);
+    if !scheme.eq_ignore_ascii_case("bearer ") {
+        return None;
+    }
+    let token = rest.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+// ============================================================================
+// HTTP CORS (Cross-Origin Resource Sharing) Configuration & Preflight
+// ============================================================================
+
+/// Cross-Origin Resource Sharing (CORS) policy configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorsConfig {
+    pub allow_origin: String,
+    pub allow_methods: String,
+    pub allow_headers: String,
+    pub max_age_secs: Option<u32>,
+    pub allow_credentials: bool,
+    pub expose_headers: Option<String>,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            allow_origin: "*".to_string(),
+            allow_methods: "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD".to_string(),
+            allow_headers: "Content-Type, Authorization, X-Requested-With, Accept".to_string(),
+            max_age_secs: Some(86400),
+            allow_credentials: false,
+            expose_headers: None,
+        }
+    }
+}
+
+impl CorsConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn allow_origin(mut self, origin: impl Into<String>) -> Self {
+        self.allow_origin = origin.into();
+        self
+    }
+
+    pub fn allow_methods(mut self, methods: impl Into<String>) -> Self {
+        self.allow_methods = methods.into();
+        self
+    }
+
+    pub fn allow_headers(mut self, headers: impl Into<String>) -> Self {
+        self.allow_headers = headers.into();
+        self
+    }
+
+    pub fn max_age(mut self, secs: u32) -> Self {
+        self.max_age_secs = Some(secs);
+        self
+    }
+
+    pub fn credentials(mut self, allow: bool) -> Self {
+        self.allow_credentials = allow;
+        self
+    }
+
+    pub fn expose_headers(mut self, headers: impl Into<String>) -> Self {
+        self.expose_headers = Some(headers.into());
+        self
+    }
+
+    /// Apply standard CORS response headers to an HttpResponse.
+    pub fn apply(&self, mut resp: HttpResponse) -> HttpResponse {
+        resp = resp.header("Access-Control-Allow-Origin", &self.allow_origin);
+        if self.allow_credentials {
+            resp = resp.header("Access-Control-Allow-Credentials", "true");
+        }
+        if let Some(expose) = &self.expose_headers {
+            resp = resp.header("Access-Control-Expose-Headers", expose);
+        }
+        resp
+    }
+
+    /// Create a 204 No Content preflight response with full Access-Control headers.
+    pub fn preflight_response(&self) -> HttpResponse {
+        let mut resp = HttpResponse::no_content()
+            .header("Access-Control-Allow-Origin", &self.allow_origin)
+            .header("Access-Control-Allow-Methods", &self.allow_methods)
+            .header("Access-Control-Allow-Headers", &self.allow_headers);
+        if let Some(max_age) = self.max_age_secs {
+            resp = resp.header("Access-Control-Max-Age", &max_age.to_string());
+        }
+        if self.allow_credentials {
+            resp = resp.header("Access-Control-Allow-Credentials", "true");
+        }
+        resp
+    }
+}
+
+// ============================================================================
+// HTTP ETag & Conditional Requests (RFC 7232)
+// ============================================================================
+
+/// Compute an HTTP ETag string from arbitrary byte content.
+/// Strong ETag: "\"<16-char-sha256-hex>\""
+/// Weak ETag: "W/\"<16-char-sha256-hex>\""
+pub fn compute_etag(content: &[u8], weak: bool) -> String {
+    let full_hex = crate::crypto::sha256_hex(content);
+    let tag = &full_hex[..16];
+    if weak {
+        format!("W/\"{}\"", tag)
+    } else {
+        format!("\"{}\"", tag)
+    }
+}
+
+/// Matches an entity tag against an If-None-Match header value (RFC 7232 section 3.2).
+/// Supports wildcard '*', weak comparisons, and comma-separated lists.
+pub fn matches_if_none_match(etag: &str, header_val: &str) -> bool {
+    let target = etag.trim();
+    let target_clean = target
+        .strip_prefix("W/")
+        .unwrap_or(target)
+        .trim_matches('"');
+
+    for part in header_val.split(',') {
+        let p = part.trim();
+        if p == "*" {
+            return true;
+        }
+        let p_clean = p.strip_prefix("W/").unwrap_or(p).trim_matches('"');
+        if p_clean == target_clean {
+            return true;
+        }
+    }
+    false
+}
+
+/// Matches an entity tag against an If-Match header value (RFC 7232 section 3.1).
+/// Requires strong comparison (neither candidate nor header item can be weak).
+pub fn matches_if_match(etag: &str, header_val: &str) -> bool {
+    let target = etag.trim();
+    if target.starts_with("W/") {
+        return false;
+    }
+    let target_clean = target.trim_matches('"');
+
+    for part in header_val.split(',') {
+        let p = part.trim();
+        if p == "*" {
+            return true;
+        }
+        if p.starts_with("W/") {
+            continue; // Weak ETags not permitted in strong comparison
+        }
+        let p_clean = p.trim_matches('"');
+        if p_clean == target_clean {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1475,5 +1746,160 @@ mod tests {
             HttpRequest::new(HttpMethod::Get, "/events").header("Accept", "text/event-stream");
         assert!(sse_req.is_sse());
         assert!(sse_req.accepts("text/event-stream"));
+    }
+
+    #[test]
+    fn test_http_auth_cors_and_etag() {
+        // 1. Basic Auth encoding and decoding
+        let basic_header = encode_basic_auth("aladdin", "open sesame");
+        assert_eq!(basic_header, "Basic YWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+        let parsed_creds = parse_basic_auth(&basic_header);
+        assert_eq!(
+            parsed_creds,
+            Some(("aladdin".to_string(), "open sesame".to_string()))
+        );
+
+        // Case-insensitive scheme and whitespace tolerance
+        let mixed_case = "   bAsIc   YWxhZGRpbjpvcGVuIHNlc2FtZQ==  ";
+        assert_eq!(
+            parse_basic_auth(mixed_case),
+            Some(("aladdin".to_string(), "open sesame".to_string()))
+        );
+        assert_eq!(parse_basic_auth("Bearer some-token"), None);
+        assert_eq!(parse_basic_auth("Basic !!!invalid-b64"), None);
+
+        // 2. Bearer Token
+        let bearer_hdr = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.t-IDcSemACt8x4iTMCda8Yhe3iZaWbvV5XKSTbuAn0M";
+        assert_eq!(
+            parse_bearer_token(bearer_hdr),
+            Some("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.t-IDcSemACt8x4iTMCda8Yhe3iZaWbvV5XKSTbuAn0M".to_string())
+        );
+        assert_eq!(
+            parse_bearer_token("bearer  my_api_key_12345 "),
+            Some("my_api_key_12345".to_string())
+        );
+        assert_eq!(
+            parse_bearer_token("Basic YWxhZGRpbjpvcGVuIHNlc2FtZQ=="),
+            None
+        );
+
+        // 3. HttpRequest auth helpers
+        let req_with_auth =
+            HttpRequest::new(HttpMethod::Get, "/api/secure").header("Authorization", &basic_header);
+        assert_eq!(
+            req_with_auth.basic_auth(),
+            Some(("aladdin".to_string(), "open sesame".to_string()))
+        );
+        assert_eq!(req_with_auth.bearer_token(), None);
+
+        let req_with_bearer = HttpRequest::new(HttpMethod::Get, "/api/token-gated")
+            .header("Authorization", "Bearer tok_live_abcdef123456");
+        assert_eq!(
+            req_with_bearer.bearer_token(),
+            Some("tok_live_abcdef123456".to_string())
+        );
+
+        // 4. HttpResponse unauthorized
+        let unauth = HttpResponse::unauthorized("IFA Secure API");
+        assert_eq!(unauth.status, HttpStatus::UNAUTHORIZED);
+        assert_eq!(
+            unauth.headers.get("www-authenticate"),
+            Some("Basic realm=\"IFA Secure API\"")
+        );
+
+        // 5. CORS Config & Preflight
+        let cors = CorsConfig::new()
+            .allow_origin("https://ifa-lang.org")
+            .allow_methods("GET, POST, OPTIONS")
+            .allow_headers("Content-Type, Authorization, X-Request-ID")
+            .max_age(3600)
+            .credentials(true)
+            .expose_headers("X-RateLimit-Remaining");
+
+        let preflight_resp = cors.preflight_response();
+        assert_eq!(preflight_resp.status, HttpStatus::NO_CONTENT);
+        assert_eq!(
+            preflight_resp.headers.get("access-control-allow-origin"),
+            Some("https://ifa-lang.org")
+        );
+        assert_eq!(
+            preflight_resp.headers.get("access-control-allow-methods"),
+            Some("GET, POST, OPTIONS")
+        );
+        assert_eq!(
+            preflight_resp.headers.get("access-control-allow-headers"),
+            Some("Content-Type, Authorization, X-Request-ID")
+        );
+        assert_eq!(
+            preflight_resp.headers.get("access-control-max-age"),
+            Some("3600")
+        );
+        assert_eq!(
+            preflight_resp
+                .headers
+                .get("access-control-allow-credentials"),
+            Some("true")
+        );
+
+        let standard_resp = HttpResponse::ok().text("cors payload");
+        let applied_resp = cors.apply(standard_resp);
+        assert_eq!(
+            applied_resp.headers.get("access-control-allow-origin"),
+            Some("https://ifa-lang.org")
+        );
+        assert_eq!(
+            applied_resp.headers.get("access-control-expose-headers"),
+            Some("X-RateLimit-Remaining")
+        );
+
+        // HttpRequest CORS preflight check
+        let preflight_req = HttpRequest::new(HttpMethod::Options, "/api/data")
+            .header("Origin", "https://ifa-lang.org")
+            .header("Access-Control-Request-Method", "POST");
+        assert!(preflight_req.is_cors_preflight());
+
+        let non_preflight =
+            HttpRequest::new(HttpMethod::Get, "/api/data").header("Origin", "https://ifa-lang.org");
+        assert!(!non_preflight.is_cors_preflight());
+
+        // 6. ETag & Conditional Requests (RFC 7232)
+        let body = b"System deterministic bytecode artifact";
+        let strong_etag = compute_etag(body, false);
+        let weak_etag = compute_etag(body, true);
+
+        assert!(strong_etag.starts_with('"') && strong_etag.ends_with('"'));
+        assert!(weak_etag.starts_with("W/\"") && weak_etag.ends_with('"'));
+
+        // If-None-Match matching
+        assert!(matches_if_none_match(&strong_etag, &strong_etag));
+        assert!(matches_if_none_match(&strong_etag, &weak_etag)); // Weak match allowed for If-None-Match
+        assert!(matches_if_none_match(&weak_etag, &strong_etag));
+        assert!(matches_if_none_match(&strong_etag, "*"));
+        assert!(matches_if_none_match(
+            &strong_etag,
+            &format!("\"other-tag\", {}", strong_etag)
+        ));
+        assert!(!matches_if_none_match(&strong_etag, "\"mismatched-tag\""));
+
+        // If-Match matching (strong comparison)
+        assert!(matches_if_match(&strong_etag, &strong_etag));
+        assert!(!matches_if_match(&weak_etag, &strong_etag)); // Weak candidate disallowed
+        assert!(!matches_if_match(&strong_etag, &weak_etag)); // Weak header item disallowed
+        assert!(matches_if_match(&strong_etag, "*"));
+        assert!(matches_if_match(
+            &strong_etag,
+            &format!("\"tag1\", {}", strong_etag)
+        ));
+        assert!(!matches_if_match(&strong_etag, "\"tag1\", \"tag2\""));
+
+        // HttpRequest conditional request helpers
+        let cond_req =
+            HttpRequest::new(HttpMethod::Get, "/resource").header("If-None-Match", &strong_etag);
+        assert!(cond_req.if_none_match(&strong_etag));
+        assert!(!cond_req.if_none_match("\"outdated-tag\""));
+
+        let not_mod = HttpResponse::not_modified(Some(&strong_etag));
+        assert_eq!(not_mod.status, HttpStatus::NOT_MODIFIED);
+        assert_eq!(not_mod.headers.get("etag"), Some(strong_etag.as_str()));
     }
 }
