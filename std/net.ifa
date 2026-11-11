@@ -120,6 +120,25 @@ pub struct TokenBucket {
     last_refill: i64
 }
 
+pub struct UpstreamBackend {
+    host: String,
+    port: i64,
+    weight: i64,
+    is_healthy: bool,
+    active_conns: i64
+}
+
+pub struct HttpLoadBalancer {
+    backends: List<UpstreamBackend>,
+    current_idx: i64
+}
+
+pub struct HttpProxyGateway {
+    via_name: String,
+    strip_prefix: String,
+    preserve_host: bool
+}
+
 pub fn make_http_header(name: String, value: String) -> HttpHeader {
     return HttpHeader(name: name, value: value);
 }
@@ -4713,6 +4732,343 @@ pub fn test_net_rate_limiting_and_mime_resolver() -> bool {
     return true;
 }
 
+pub fn make_upstream_backend(host: String, port: i64, weight: i64) -> UpstreamBackend {
+    return UpstreamBackend(
+        host: host,
+        port: port,
+        weight: weight,
+        is_healthy: true,
+        active_conns: 0
+    );
+}
+
+pub fn make_http_load_balancer(backends: List<UpstreamBackend>) -> HttpLoadBalancer {
+    return HttpLoadBalancer(
+        backends: backends,
+        current_idx: 0
+    );
+}
+
+pub fn load_balancer_count(lb: HttpLoadBalancer) -> i64 {
+    return lb.backends.len();
+}
+
+pub fn load_balancer_healthy_count(lb: HttpLoadBalancer) -> i64 {
+    mut count: i64 = 0;
+    mut i: i64 = 0;
+    while i < lb.backends.len() {
+        if lb.backends[i].is_healthy {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+pub fn load_balancer_set_healthy(inout lb: HttpLoadBalancer, host: String, port: i64, healthy: bool) {
+    mut updated: List<UpstreamBackend> = List::new();
+    mut i: i64 = 0;
+    while i < lb.backends.len() {
+        let b = lb.backends[i];
+        if b.host == host && b.port == port {
+            updated.push(UpstreamBackend(
+                host: b.host,
+                port: b.port,
+                weight: b.weight,
+                is_healthy: healthy,
+                active_conns: b.active_conns
+            ));
+        } else {
+            updated.push(b);
+        }
+        i = i + 1;
+    }
+    lb.backends = updated;
+}
+
+pub fn load_balancer_next(inout lb: HttpLoadBalancer) -> UpstreamBackend {
+    let total = lb.backends.len();
+    if total == 0 {
+        return UpstreamBackend(host: "", port: 0, weight: 0, is_healthy: false, active_conns: 0);
+    }
+    mut cur: i64 = lb.current_idx;
+    mut attempts: i64 = 0;
+    while attempts < total {
+        let idx = cur % total;
+        cur = (cur + 1) % total;
+        if lb.backends[idx].is_healthy {
+            lb.current_idx = cur;
+            return lb.backends[idx];
+        }
+        attempts = attempts + 1;
+    }
+    lb.current_idx = cur;
+    return lb.backends[0];
+}
+
+pub fn string_to_lower(input: String) -> String {
+    let len = string_len(input);
+    mut out = "";
+    mut i: i64 = 0;
+    while i < len {
+        let c = string_char_at(input, i);
+        if c >= 65 && c <= 90 {
+            out = out + string_from_char(c + 32);
+        } else {
+            out = out + string_from_char(c);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn http_is_hop_by_hop_header(name: String) -> bool {
+    let lower = string_to_lower(name);
+    return lower == "connection"
+        || lower == "keep-alive"
+        || lower == "proxy-authenticate"
+        || lower == "proxy-authorization"
+        || lower == "te"
+        || lower == "trailer"
+        || lower == "trailers"
+        || lower == "transfer-encoding"
+        || lower == "upgrade";
+}
+
+pub fn make_http_proxy_gateway(via_name: String, strip_prefix: String, preserve_host: bool) -> HttpProxyGateway {
+    return HttpProxyGateway(
+        via_name: via_name,
+        strip_prefix: strip_prefix,
+        preserve_host: preserve_host
+    );
+}
+
+pub fn http_proxy_rewrite_path(gateway: HttpProxyGateway, incoming_path: String) -> String {
+    let prefix_len = string_len(gateway.strip_prefix);
+    if prefix_len == 0 {
+        return incoming_path;
+    }
+    if string_len(incoming_path) >= prefix_len {
+        let sub = string_substr(incoming_path, 0, prefix_len);
+        if sub == gateway.strip_prefix {
+            let remainder = string_substr(incoming_path, prefix_len, string_len(incoming_path) - prefix_len);
+            if string_len(remainder) == 0 {
+                return "/";
+            }
+            if string_char_at(remainder, 0) != 47 {
+                return "/" + remainder;
+            }
+            return remainder;
+        }
+    }
+    return incoming_path;
+}
+
+pub fn http_proxy_format_forwarded_headers(client_ip: String, proto: String, host: String, prefix: String, via: String) -> String {
+    mut out: String = "";
+    if string_len(client_ip) > 0 {
+        out = out + "X-Forwarded-For: " + client_ip + "\r\n";
+    }
+    if string_len(proto) > 0 {
+        out = out + "X-Forwarded-Proto: " + proto + "\r\n";
+    }
+    if string_len(host) > 0 {
+        out = out + "X-Forwarded-Host: " + host + "\r\n";
+    }
+    if string_len(prefix) > 0 {
+        out = out + "X-Forwarded-Prefix: " + prefix + "\r\n";
+    }
+    if string_len(via) > 0 {
+        out = out + "Via: " + via + "\r\n";
+    }
+    return out;
+}
+
+pub fn http_proxy_build_upstream_request(
+    gateway: HttpProxyGateway,
+    req: HttpRequest,
+    headers: List<HttpHeader>,
+    client_ip: String,
+    client_proto: String,
+    original_host: String,
+    upstream_host: String,
+    upstream_port: i64
+) -> String {
+    let rewritten_path = http_proxy_rewrite_path(gateway, req.path);
+    mut host_header_val = upstream_host;
+    if upstream_port != 80 && upstream_port != 443 {
+        host_header_val = upstream_host + ":" + int_to_string(upstream_port);
+    }
+    if gateway.preserve_host && string_len(original_host) > 0 {
+        host_header_val = original_host;
+    }
+
+    mut out: String = req.method + " " + rewritten_path + " " + req.version + "\r\n";
+    out = out + "Host: " + host_header_val + "\r\n";
+
+    mut i: i64 = 0;
+    while i < headers.len() {
+        let h = headers[i];
+        let lower = string_to_lower(h.name);
+        if lower != "host" && !http_is_hop_by_hop_header(h.name) {
+            out = out + h.name + ": " + h.value + "\r\n";
+        }
+        i = i + 1;
+    }
+
+    out = out + http_proxy_format_forwarded_headers(client_ip, client_proto, original_host, gateway.strip_prefix, gateway.via_name);
+
+    let body_len = string_len(req.body);
+    if body_len > 0 {
+        out = out + "Content-Length: " + int_to_string(body_len) + "\r\n";
+    }
+    out = out + "Connection: close\r\n\r\n";
+    if body_len > 0 {
+        out = out + req.body;
+    }
+    return out;
+}
+
+pub fn http_proxy_sanitize_response(gateway: HttpProxyGateway, resp: HttpResponse) -> HttpResponse {
+    return HttpResponse(
+        status_code: resp.status_code,
+        status_text: resp.status_text,
+        content_type: resp.content_type,
+        body: resp.body
+    );
+}
+
+pub fn test_net_http_reverse_proxy_gateway_and_load_balancer() -> bool {
+    // 1. Hop-by-hop headers
+    if !http_is_hop_by_hop_header("Connection")
+        || !http_is_hop_by_hop_header("keep-alive")
+        || !http_is_hop_by_hop_header("Upgrade")
+        || !http_is_hop_by_hop_header("Transfer-Encoding")
+        || !http_is_hop_by_hop_header("Proxy-Authorization") {
+        return false;
+    }
+    if http_is_hop_by_hop_header("Content-Type")
+        || http_is_hop_by_hop_header("Authorization")
+        || http_is_hop_by_hop_header("X-Custom-Header") {
+        return false;
+    }
+
+    // 2. Load Balancer Round Robin & Health Tracking
+    mut backends: List<UpstreamBackend> = List::new();
+    backends.push(make_upstream_backend("10.0.0.1", 8080, 1));
+    backends.push(make_upstream_backend("10.0.0.2", 8080, 1));
+    backends.push(make_upstream_backend("10.0.0.3", 8080, 1));
+
+    mut lb = make_http_load_balancer(backends);
+    if load_balancer_count(lb) != 3 || load_balancer_healthy_count(lb) != 3 {
+        return false;
+    }
+
+    let b1 = load_balancer_next(inout lb);
+    if b1.host != "10.0.0.1" { return false; }
+    let b2 = load_balancer_next(inout lb);
+    if b2.host != "10.0.0.2" { return false; }
+    let b3 = load_balancer_next(inout lb);
+    if b3.host != "10.0.0.3" { return false; }
+    let b4 = load_balancer_next(inout lb);
+    if b4.host != "10.0.0.1" { return false; }
+
+    // Mark 10.0.0.2 unhealthy
+    load_balancer_set_healthy(inout lb, "10.0.0.2", 8080, false);
+    if load_balancer_healthy_count(lb) != 2 { return false; }
+
+    // Cycling should skip 10.0.0.2
+    let b5 = load_balancer_next(inout lb);
+    if b5.host != "10.0.0.3" { return false; }
+    let b6 = load_balancer_next(inout lb);
+    if b6.host != "10.0.0.1" { return false; }
+    let b7 = load_balancer_next(inout lb);
+    if b7.host != "10.0.0.3" { return false; }
+
+    // 3. Reverse Proxy Gateway Request Construction & Path Rewriting
+    let gateway = make_http_proxy_gateway("1.1 ifa-gateway", "/api/v1", false);
+    if http_proxy_rewrite_path(gateway, "/api/v1/orders/create") != "/orders/create" {
+        return false;
+    }
+    if http_proxy_rewrite_path(gateway, "/api/v1") != "/" {
+        return false;
+    }
+    if http_proxy_rewrite_path(gateway, "/other/path") != "/other/path" {
+        return false;
+    }
+
+    mut client_headers: List<HttpHeader> = List::new();
+    client_headers.push(make_http_header("User-Agent", "IFA-Client/1.0"));
+    client_headers.push(make_http_header("Connection", "keep-alive"));
+    client_headers.push(make_http_header("Upgrade", "websocket"));
+    client_headers.push(make_http_header("Authorization", "Bearer sec_tok_42"));
+
+    let req = HttpRequest(
+        method: "POST",
+        path: "/api/v1/orders/create",
+        version: "HTTP/1.1",
+        body: "{\"order_id\":\"ORD-101\"}"
+    );
+
+    let upstream_req_wire = http_proxy_build_upstream_request(
+        gateway,
+        req,
+        client_headers,
+        "192.168.1.100",
+        "https",
+        "api.example.com",
+        "backend.internal",
+        8080
+    );
+
+    // Verify rewritten line
+    if !string_contains(upstream_req_wire, "POST /orders/create HTTP/1.1") {
+        return false;
+    }
+    // Verify host header
+    if !string_contains(upstream_req_wire, "Host: backend.internal:8080") {
+        return false;
+    }
+    // Verify hop-by-hop headers stripped
+    if string_contains(upstream_req_wire, "Upgrade: websocket") {
+        return false;
+    }
+    // Verify standard headers preserved
+    if !string_contains(upstream_req_wire, "Authorization: Bearer sec_tok_42") {
+        return false;
+    }
+    if !string_contains(upstream_req_wire, "User-Agent: IFA-Client/1.0") {
+        return false;
+    }
+    // Verify gateway headers injected
+    if !string_contains(upstream_req_wire, "X-Forwarded-For: 192.168.1.100")
+        || !string_contains(upstream_req_wire, "X-Forwarded-Proto: https")
+        || !string_contains(upstream_req_wire, "X-Forwarded-Host: api.example.com")
+        || !string_contains(upstream_req_wire, "X-Forwarded-Prefix: /api/v1")
+        || !string_contains(upstream_req_wire, "Via: 1.1 ifa-gateway") {
+        return false;
+    }
+    // Verify body & Content-Length
+    if !string_contains(upstream_req_wire, "Content-Length: 22")
+        || !string_contains(upstream_req_wire, "{\"order_id\":\"ORD-101\"}") {
+        return false;
+    }
+
+    // 4. Response sanitization
+    let resp = HttpResponse(
+        status_code: 200,
+        status_text: "OK",
+        content_type: "application/json",
+        body: "{\"status\":\"created\"}"
+    );
+    let sanitized = http_proxy_sanitize_response(gateway, resp);
+    if sanitized.status_code != 200 || sanitized.body != "{\"status\":\"created\"}" {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn test_net_all() -> bool {
     return test_net_tcp_echo()
     && test_net_http_wire()
@@ -4741,7 +5097,8 @@ pub fn test_net_all() -> bool {
     && test_net_http_auth_cors_and_etag()
     && test_net_http_router_dynamic_params_and_websocket_handshake()
     && test_net_websocket_frame_demux_and_fragmentation()
-    && test_net_rate_limiting_and_mime_resolver();
+    && test_net_rate_limiting_and_mime_resolver()
+    && test_net_http_reverse_proxy_gateway_and_load_balancer();
 }
 
 pub fn main() {
@@ -4773,7 +5130,8 @@ pub fn main() {
     let t26 = test_net_http_router_dynamic_params_and_websocket_handshake();
     let t27 = test_net_websocket_frame_demux_and_fragmentation();
     let t28 = test_net_rate_limiting_and_mime_resolver();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 {
+    let t29 = test_net_http_reverse_proxy_gateway_and_load_balancer();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");

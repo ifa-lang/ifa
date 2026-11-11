@@ -1882,6 +1882,274 @@ pub fn matches_if_match(etag: &str, header_val: &str) -> bool {
     false
 }
 
+/// Hop-by-hop headers that MUST be removed by an HTTP proxy according to RFC 7230 §6.1.
+pub const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Checks if a header name is an RFC 7230 hop-by-hop header.
+pub fn is_hop_by_hop_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    HOP_BY_HOP_HEADERS.iter().any(|&h| h == lower)
+}
+
+/// Upstream backend target in an HTTP reverse proxy / gateway cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamBackend {
+    pub host: String,
+    pub port: u16,
+    pub weight: u32,
+    pub healthy: bool,
+    pub active_conns: usize,
+}
+
+impl UpstreamBackend {
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            weight: 1,
+            healthy: true,
+            active_conns: 0,
+        }
+    }
+
+    pub fn with_weight(mut self, weight: u32) -> Self {
+        self.weight = weight.max(1);
+        self
+    }
+}
+
+/// Load balancing strategy across upstream backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadBalancingStrategy {
+    RoundRobin,
+    Random,
+    LeastConnections,
+}
+
+/// Reverse proxy load balancer managing upstream backends with health tracking.
+#[derive(Debug, Clone)]
+pub struct HttpLoadBalancer {
+    backends: Vec<UpstreamBackend>,
+    strategy: LoadBalancingStrategy,
+    rr_index: usize,
+}
+
+impl HttpLoadBalancer {
+    pub fn new(backends: Vec<UpstreamBackend>, strategy: LoadBalancingStrategy) -> Self {
+        Self {
+            backends,
+            strategy,
+            rr_index: 0,
+        }
+    }
+
+    pub fn backends(&self) -> &[UpstreamBackend] {
+        &self.backends
+    }
+
+    pub fn healthy_count(&self) -> usize {
+        self.backends.iter().filter(|b| b.healthy).count()
+    }
+
+    pub fn mark_healthy(&mut self, host: &str, port: u16, healthy: bool) {
+        for b in &mut self.backends {
+            if b.host == host && b.port == port {
+                b.healthy = healthy;
+            }
+        }
+    }
+
+    pub fn next_backend(&mut self) -> Option<&UpstreamBackend> {
+        if self.backends.is_empty() {
+            return None;
+        }
+
+        match self.strategy {
+            LoadBalancingStrategy::RoundRobin => {
+                let total = self.backends.len();
+                for _ in 0..total {
+                    let idx = self.rr_index % total;
+                    self.rr_index = (self.rr_index + 1) % total;
+                    if self.backends[idx].healthy {
+                        return Some(&self.backends[idx]);
+                    }
+                }
+                Some(&self.backends[0])
+            }
+            LoadBalancingStrategy::LeastConnections => self
+                .backends
+                .iter()
+                .filter(|b| b.healthy)
+                .min_by_key(|b| b.active_conns)
+                .or_else(|| self.backends.first()),
+            LoadBalancingStrategy::Random => {
+                let healthy: Vec<&UpstreamBackend> =
+                    self.backends.iter().filter(|b| b.healthy).collect();
+                if let Some(b) = healthy.first() {
+                    Some(*b)
+                } else {
+                    self.backends.first()
+                }
+            }
+        }
+    }
+}
+
+/// HTTP Reverse Proxy Gateway configuration and request/response processor.
+#[derive(Debug, Clone)]
+pub struct HttpProxyGateway {
+    pub via_name: String,
+    pub strip_prefix: Option<String>,
+    pub preserve_host: bool,
+}
+
+impl Default for HttpProxyGateway {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HttpProxyGateway {
+    pub fn new() -> Self {
+        Self {
+            via_name: "1.1 ifa-gateway".to_string(),
+            strip_prefix: None,
+            preserve_host: false,
+        }
+    }
+
+    pub fn strip_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.strip_prefix = Some(prefix.into());
+        self
+    }
+
+    pub fn preserve_host(mut self, preserve: bool) -> Self {
+        self.preserve_host = preserve;
+        self
+    }
+
+    pub fn rewrite_path<'a>(&'a self, incoming_path: &'a str) -> &'a str {
+        if let Some(prefix) = &self.strip_prefix {
+            if incoming_path.starts_with(prefix) {
+                let remainder = &incoming_path[prefix.len()..];
+                if remainder.is_empty() {
+                    return "/";
+                }
+                if !remainder.starts_with('/') {
+                    return remainder;
+                }
+                return remainder;
+            }
+        }
+        incoming_path
+    }
+
+    pub fn prepare_upstream_request(
+        &self,
+        req: &HttpRequest,
+        client_ip: &str,
+        client_proto: &str,
+        upstream_host: &str,
+        upstream_port: u16,
+    ) -> HttpRequest {
+        let rewritten_path = self.rewrite_path(&req.path);
+        let mut upstream_req = HttpRequest::new(req.method, rewritten_path);
+
+        // Copy non-hop-by-hop headers
+        for (k, v) in req.headers.iter() {
+            if !is_hop_by_hop_header(k) && k != "host" {
+                upstream_req.headers.set(k.as_str(), v.as_str());
+            }
+        }
+
+        // Host header
+        let host_val = if self.preserve_host {
+            req.headers
+                .get("host")
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if upstream_port == 80 || upstream_port == 443 {
+                        upstream_host.to_string()
+                    } else {
+                        format!("{}:{}", upstream_host, upstream_port)
+                    }
+                })
+        } else if upstream_port == 80 || upstream_port == 443 {
+            upstream_host.to_string()
+        } else {
+            format!("{}:{}", upstream_host, upstream_port)
+        };
+        upstream_req.headers.set("Host", host_val);
+
+        // X-Forwarded-For: append if already present
+        let x_forwarded_for = match req.headers.get("x-forwarded-for") {
+            Some(existing) => format!("{}, {}", existing, client_ip),
+            None => client_ip.to_string(),
+        };
+        upstream_req.headers.set("X-Forwarded-For", x_forwarded_for);
+
+        // X-Forwarded-Proto
+        upstream_req.headers.set("X-Forwarded-Proto", client_proto);
+
+        // X-Forwarded-Host
+        if let Some(orig_host) = req.headers.get("host") {
+            upstream_req.headers.set("X-Forwarded-Host", orig_host);
+        }
+
+        // X-Forwarded-Prefix
+        if let Some(prefix) = &self.strip_prefix {
+            upstream_req
+                .headers
+                .set("X-Forwarded-Prefix", prefix.as_str());
+        }
+
+        // Via header
+        let via_val = match req.headers.get("via") {
+            Some(existing) => format!("{}, {}", existing, self.via_name),
+            None => self.via_name.clone(),
+        };
+        upstream_req.headers.set("Via", via_val);
+
+        // Body & Content-Length
+        if !req.body.is_empty() {
+            upstream_req = upstream_req.body(req.body.clone());
+        }
+
+        upstream_req
+    }
+
+    pub fn prepare_client_response(&self, upstream_resp: HttpResponse) -> HttpResponse {
+        let mut client_resp = HttpResponse::new(upstream_resp.status);
+
+        // Filter hop-by-hop headers
+        for (k, v) in upstream_resp.headers.iter() {
+            if !is_hop_by_hop_header(k) {
+                client_resp.headers.set(k.as_str(), v.as_str());
+            }
+        }
+
+        // Append Via header
+        let via_val = match upstream_resp.headers.get("via") {
+            Some(existing) => format!("{}, {}", existing, self.via_name),
+            None => self.via_name.clone(),
+        };
+        client_resp.headers.set("Via", via_val);
+
+        client_resp.body = upstream_resp.body;
+        client_resp
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2387,5 +2655,125 @@ mod tests {
             .header("Sec-WebSocket-Version", "13");
         assert!(!missing_key.is_websocket_upgrade());
         assert!(missing_key.websocket_upgrade_response(None).is_none());
+    }
+
+    #[test]
+    fn test_http_reverse_proxy_gateway_and_load_balancer() {
+        // 1. Hop-by-hop headers
+        assert!(is_hop_by_hop_header("Connection"));
+        assert!(is_hop_by_hop_header("keep-alive"));
+        assert!(is_hop_by_hop_header("Upgrade"));
+        assert!(is_hop_by_hop_header("Transfer-Encoding"));
+        assert!(is_hop_by_hop_header("Proxy-Authorization"));
+        assert!(!is_hop_by_hop_header("Content-Type"));
+        assert!(!is_hop_by_hop_header("Authorization"));
+        assert!(!is_hop_by_hop_header("X-Custom-Header"));
+
+        // 2. Load Balancer Round Robin & Health Tracking
+        let backends = vec![
+            UpstreamBackend::new("10.0.0.1", 8080),
+            UpstreamBackend::new("10.0.0.2", 8080),
+            UpstreamBackend::new("10.0.0.3", 8080),
+        ];
+        let mut lb = HttpLoadBalancer::new(backends, LoadBalancingStrategy::RoundRobin);
+        assert_eq!(lb.healthy_count(), 3);
+
+        let b1 = lb.next_backend().unwrap();
+        assert_eq!(b1.host, "10.0.0.1");
+        let b2 = lb.next_backend().unwrap();
+        assert_eq!(b2.host, "10.0.0.2");
+        let b3 = lb.next_backend().unwrap();
+        assert_eq!(b3.host, "10.0.0.3");
+        let b4 = lb.next_backend().unwrap();
+        assert_eq!(b4.host, "10.0.0.1");
+
+        // Mark 10.0.0.2 as unhealthy
+        lb.mark_healthy("10.0.0.2", 8080, false);
+        assert_eq!(lb.healthy_count(), 2);
+
+        // Next should cycle 10.0.0.3 -> 10.0.0.1 (skipping 10.0.0.2)
+        let b5 = lb.next_backend().unwrap();
+        assert_eq!(b5.host, "10.0.0.3");
+        let b6 = lb.next_backend().unwrap();
+        assert_eq!(b6.host, "10.0.0.1");
+        let b7 = lb.next_backend().unwrap();
+        assert_eq!(b7.host, "10.0.0.3");
+
+        // 3. Reverse Proxy Gateway Request Preparation
+        let gateway = HttpProxyGateway::new()
+            .strip_prefix("/api/v1")
+            .preserve_host(false);
+
+        let incoming_req = HttpRequest::new(HttpMethod::Post, "/api/v1/orders/create")
+            .header("Host", "api.example.com")
+            .header("User-Agent", "IFA-Client/1.0")
+            .header("Connection", "keep-alive")
+            .header("Upgrade", "websocket")
+            .header("Authorization", "Bearer sec_tok_42")
+            .body(b"{\"order_id\":\"ORD-101\"}".to_vec());
+
+        let upstream_req = gateway.prepare_upstream_request(
+            &incoming_req,
+            "192.168.1.100",
+            "https",
+            "backend.internal",
+            8080,
+        );
+
+        // Verify path rewritten
+        assert_eq!(upstream_req.path, "/orders/create");
+        // Verify host updated to upstream
+        assert_eq!(
+            upstream_req.headers.get("host"),
+            Some("backend.internal:8080")
+        );
+        // Verify hop-by-hop headers stripped
+        assert!(!upstream_req.headers.has("connection"));
+        assert!(!upstream_req.headers.has("upgrade"));
+        // Verify standard headers preserved
+        assert_eq!(
+            upstream_req.headers.get("authorization"),
+            Some("Bearer sec_tok_42")
+        );
+        assert_eq!(
+            upstream_req.headers.get("user-agent"),
+            Some("IFA-Client/1.0")
+        );
+        // Verify gateway forwarding headers
+        assert_eq!(
+            upstream_req.headers.get("x-forwarded-for"),
+            Some("192.168.1.100")
+        );
+        assert_eq!(upstream_req.headers.get("x-forwarded-proto"), Some("https"));
+        assert_eq!(
+            upstream_req.headers.get("x-forwarded-host"),
+            Some("api.example.com")
+        );
+        assert_eq!(
+            upstream_req.headers.get("x-forwarded-prefix"),
+            Some("/api/v1")
+        );
+        assert_eq!(upstream_req.headers.get("via"), Some("1.1 ifa-gateway"));
+        assert_eq!(upstream_req.body, b"{\"order_id\":\"ORD-101\"}");
+
+        // 4. Reverse Proxy Gateway Response Sanitization
+        let upstream_resp = HttpResponse::ok()
+            .text("{\"status\":\"created\"}")
+            .header("Content-Type", "application/json")
+            .header("Connection", "close")
+            .header("Keep-Alive", "timeout=5")
+            .header("X-Server-Id", "node-3");
+
+        let client_resp = gateway.prepare_client_response(upstream_resp);
+        assert_eq!(client_resp.status, HttpStatus::OK);
+        assert_eq!(
+            client_resp.headers.get("content-type"),
+            Some("application/json")
+        );
+        assert_eq!(client_resp.headers.get("x-server-id"), Some("node-3"));
+        assert!(!client_resp.headers.has("connection"));
+        assert!(!client_resp.headers.has("keep-alive"));
+        assert_eq!(client_resp.headers.get("via"), Some("1.1 ifa-gateway"));
+        assert_eq!(client_resp.body_str().unwrap(), "{\"status\":\"created\"}");
     }
 }

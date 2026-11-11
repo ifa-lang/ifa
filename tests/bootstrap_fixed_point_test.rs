@@ -1963,13 +1963,18 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_net_http_reverse_proxy_gateway_and_load_balancer ... ok"),
+        "Std net http reverse proxy gateway and load balancer test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("259 passed; 0 failed"),
-        "Expected 259 passed std unit tests, got:\n{}",
+        stdout.contains("261 passed; 0 failed"),
+        "Expected 261 passed std unit tests, got:\n{}",
         stdout
     );
 }
