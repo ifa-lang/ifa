@@ -11,6 +11,7 @@ import json;
 import sync;
 import fmt;
 import csv;
+import io;
 
 pub fn test_std_all() -> bool {
     let t_crypto = crypto::test_crypto_all();
@@ -58,6 +59,8 @@ pub fn test_std_all() -> bool {
 
     let t_csv = csv::test_csv_all();
 
+    let t_io = io::test_io_all();
+
     return t_crypto
         && t_fs
         && t_process
@@ -67,7 +70,8 @@ pub fn test_std_all() -> bool {
         && t_json
         && t_sync
         && t_fmt
-        && t_csv;
+        && t_csv
+        && t_io;
 }
 
 pub fn main() {

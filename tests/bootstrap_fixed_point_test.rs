@@ -1873,13 +1873,43 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_io_string_reader_lines ... ok"),
+        "Std io string reader lines test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_io_string_reader_seek_and_peek ... ok"),
+        "Std io string reader seek and peek test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_io_string_writer_accumulation ... ok"),
+        "Std io string writer accumulation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_io_buffered_reader_and_writer ... ok"),
+        "Std io buffered reader and writer test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_io_byte_stream_endianness ... ok"),
+        "Std io byte stream endianness test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_io_all ... ok"),
+        "Std io all test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("219 passed; 0 failed"),
-        "Expected 219 passed std unit tests, got:\n{}",
+        stdout.contains("235 passed; 0 failed"),
+        "Expected 235 passed std unit tests, got:\n{}",
         stdout
     );
 }
@@ -2591,6 +2621,16 @@ fn test_industrial_dogfooding_http_service_and_data_processor_cli() {
     assert!(
         cli_test_stdout.contains("test test_cli_filter_threshold ... ok"),
         "Data processor CLI test_cli_filter_threshold missing from output:\n{}",
+        cli_test_stdout
+    );
+    assert!(
+        cli_test_stdout.contains("test test_cli_csv2json ... ok"),
+        "Data processor CLI test_cli_csv2json missing from output:\n{}",
+        cli_test_stdout
+    );
+    assert!(
+        cli_test_stdout.contains("test test_cli_stream_transform ... ok"),
+        "Data processor CLI test_cli_stream_transform missing from output:\n{}",
         cli_test_stdout
     );
 

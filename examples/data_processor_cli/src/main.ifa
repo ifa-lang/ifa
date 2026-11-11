@@ -62,6 +62,27 @@ pub fn int_to_string(mut n: i64) -> String {
     return digits;
 }
 
+pub fn parse_int_str(s: String) -> i64 {
+    let len = string_len(s);
+    if len == 0 { return 0; }
+    mut res: i64 = 0;
+    mut i: i64 = 0;
+    mut is_neg = false;
+    if string_char_at(s, 0) == 45 { // '-'
+        is_neg = true;
+        i = 1;
+    }
+    while i < len {
+        let c = string_char_at(s, i);
+        if c >= 48 && c <= 57 {
+            res = res * 10 + (c - 48);
+        }
+        i = i + 1;
+    }
+    if is_neg { return 0 - res; }
+    return res;
+}
+
 pub fn make_cli_response(exit_code: i64, status: String, payload: String, diagnostic: String) -> CliResponse {
     return CliResponse(
         exit_code: exit_code,
@@ -234,6 +255,223 @@ pub fn handle_validate(payload: String) -> CliResponse {
     return make_cli_response(5, "ERR_PARSE_FAILED", "", "Malformed JSON token stream");
 }
 
+pub fn handle_csv2json(payload: String) -> CliResponse {
+    let len = string_len(payload);
+    if len == 0 {
+        return make_cli_response(4, "ERR_EMPTY_PAYLOAD", "", "Cannot convert empty CSV to JSON");
+    }
+
+    mut json = "[";
+    mut start: i64 = 0;
+    mut is_header = true;
+    mut count: i64 = 0;
+    mut i: i64 = 0;
+
+    while i < len {
+        let c = string_char_at(payload, i);
+        if c == 10 || (c == 13 && i + 1 < len && string_char_at(payload, i + 1) == 10) {
+            let line_len = i - start;
+            if line_len > 0 {
+                let line = string_substr(payload, start, line_len);
+                if is_header {
+                    is_header = false;
+                } else {
+                    mut f_idx: i64 = 0;
+                    mut f_start: i64 = 0;
+                    mut col: i64 = 0;
+                    mut id_val: i64 = 0;
+                    mut src_val = "";
+                    mut metric_val: i64 = 0;
+                    mut valid_val = false;
+
+                    while f_idx < line_len {
+                        let fc = string_char_at(line, f_idx);
+                        if fc == 44 { // ','
+                            let chunk = string_substr(line, f_start, f_idx - f_start);
+                            if col == 0 { id_val = parse_int_str(chunk); }
+                            else if col == 1 { src_val = chunk; }
+                            else if col == 2 { metric_val = parse_int_str(chunk); }
+                            col = col + 1;
+                            f_start = f_idx + 1;
+                        }
+                        f_idx = f_idx + 1;
+                    }
+                    if f_start <= line_len {
+                        let chunk = string_substr(line, f_start, line_len - f_start);
+                        if col == 3 {
+                            if chunk == "true" || chunk == "1" { valid_val = true; }
+                        }
+                    }
+                    if count > 0 {
+                        json = json + ",";
+                    }
+                    json = json + format_data_item_json(id_val, src_val, metric_val, valid_val);
+                    count = count + 1;
+                }
+            }
+            if c == 13 {
+                i = i + 1;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+
+    if start < len && !is_header {
+        let line = string_substr(payload, start, len - start);
+        let line_len = string_len(line);
+        mut f_idx: i64 = 0;
+        mut f_start: i64 = 0;
+        mut col: i64 = 0;
+        mut id_val: i64 = 0;
+        mut src_val = "";
+        mut metric_val: i64 = 0;
+        mut valid_val = false;
+
+        while f_idx < line_len {
+            let fc = string_char_at(line, f_idx);
+            if fc == 44 {
+                let chunk = string_substr(line, f_start, f_idx - f_start);
+                if col == 0 { id_val = parse_int_str(chunk); }
+                else if col == 1 { src_val = chunk; }
+                else if col == 2 { metric_val = parse_int_str(chunk); }
+                col = col + 1;
+                f_start = f_idx + 1;
+            }
+            f_idx = f_idx + 1;
+        }
+        if f_start <= line_len {
+            let chunk = string_substr(line, f_start, line_len - f_start);
+            if col == 3 {
+                if chunk == "true" || chunk == "1" { valid_val = true; }
+            }
+        }
+        if count > 0 {
+            json = json + ",";
+        }
+        json = json + format_data_item_json(id_val, src_val, metric_val, valid_val);
+        count = count + 1;
+    }
+
+    json = json + "]";
+    return make_cli_response(0, "SUCCESS", json, "NONE");
+}
+
+pub fn handle_stream_transform(threshold: i64, payload: String) -> CliResponse {
+    let len = string_len(payload);
+    if len == 0 {
+        return make_cli_response(4, "ERR_EMPTY_PAYLOAD", "", "Cannot transform empty dataset");
+    }
+
+    mut items_json = "[";
+    mut matched_count: i64 = 0;
+    mut start: i64 = 0;
+    mut is_header = true;
+    mut i: i64 = 0;
+
+    while i < len {
+        let c = string_char_at(payload, i);
+        if c == 10 || (c == 13 && i + 1 < len && string_char_at(payload, i + 1) == 10) {
+            let line_len = i - start;
+            if line_len > 0 {
+                let line = string_substr(payload, start, line_len);
+                if is_header {
+                    is_header = false;
+                } else {
+                    mut f_idx: i64 = 0;
+                    mut f_start: i64 = 0;
+                    mut col: i64 = 0;
+                    mut id_val: i64 = 0;
+                    mut src_val = "";
+                    mut metric_val: i64 = 0;
+                    mut valid_val = false;
+
+                    while f_idx < line_len {
+                        let fc = string_char_at(line, f_idx);
+                        if fc == 44 {
+                            let chunk = string_substr(line, f_start, f_idx - f_start);
+                            if col == 0 { id_val = parse_int_str(chunk); }
+                            else if col == 1 { src_val = chunk; }
+                            else if col == 2 { metric_val = parse_int_str(chunk); }
+                            col = col + 1;
+                            f_start = f_idx + 1;
+                        }
+                        f_idx = f_idx + 1;
+                    }
+                    if f_start <= line_len {
+                        let chunk = string_substr(line, f_start, line_len - f_start);
+                        if col == 3 {
+                            if chunk == "true" || chunk == "1" { valid_val = true; }
+                        }
+                    }
+                    if valid_val && metric_val >= threshold {
+                        if matched_count > 0 {
+                            items_json = items_json + ",";
+                        }
+                        items_json = items_json + format_data_item_json(id_val, src_val, metric_val, valid_val);
+                        matched_count = matched_count + 1;
+                    }
+                }
+            }
+            if c == 13 {
+                i = i + 1;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+
+    if start < len && !is_header {
+        let line = string_substr(payload, start, len - start);
+        let line_len = string_len(line);
+        mut f_idx: i64 = 0;
+        mut f_start: i64 = 0;
+        mut col: i64 = 0;
+        mut id_val: i64 = 0;
+        mut src_val = "";
+        mut metric_val: i64 = 0;
+        mut valid_val = false;
+
+        while f_idx < line_len {
+            let fc = string_char_at(line, f_idx);
+            if fc == 44 {
+                let chunk = string_substr(line, f_start, f_idx - f_start);
+                if col == 0 { id_val = parse_int_str(chunk); }
+                else if col == 1 { src_val = chunk; }
+                else if col == 2 { metric_val = parse_int_str(chunk); }
+                col = col + 1;
+                f_start = f_idx + 1;
+            }
+            f_idx = f_idx + 1;
+        }
+        if f_start <= line_len {
+            let chunk = string_substr(line, f_start, line_len - f_start);
+            if col == 3 {
+                if chunk == "true" || chunk == "1" { valid_val = true; }
+            }
+        }
+        if valid_val && metric_val >= threshold {
+            if matched_count > 0 {
+                items_json = items_json + ",";
+            }
+            items_json = items_json + format_data_item_json(id_val, src_val, metric_val, valid_val);
+            matched_count = matched_count + 1;
+        }
+    }
+
+    items_json = items_json + "]";
+
+    mut json = "{\"threshold\":";
+    json = json + int_to_string(threshold);
+    json = json + ",\"matched_count\":";
+    json = json + int_to_string(matched_count);
+    json = json + ",\"items\":";
+    json = json + items_json;
+    json = json + "}";
+
+    return make_cli_response(0, "SUCCESS", json, "NONE");
+}
+
 pub fn dispatch_cli(cmd: CliCommand) -> CliResponse {
     if cmd.name == "help" || cmd.name == "--help" || cmd.name == "-h" {
         return handle_help();
@@ -252,6 +490,12 @@ pub fn dispatch_cli(cmd: CliCommand) -> CliResponse {
     }
     if cmd.name == "validate" {
         return handle_validate(cmd.raw_payload);
+    }
+    if cmd.name == "csv2json" {
+        return handle_csv2json(cmd.raw_payload);
+    }
+    if cmd.name == "transform" {
+        return handle_stream_transform(cmd.threshold, cmd.raw_payload);
     }
 
     return make_cli_response(1, "ERR_UNKNOWN_COMMAND", "", "Unknown command requested");
@@ -343,6 +587,28 @@ pub fn test_cli_validate() -> bool {
     return res.exit_code == 0 && res.status == "SUCCESS";
 }
 
+pub fn test_cli_csv2json() -> bool {
+    let csv_data = "id,source,metric_value,is_valid\n201,sensor-x,300,true\n202,sensor-y,550,false\n";
+    let cmd = CliCommand(name: "csv2json", threshold: 0, algo: "", raw_payload: csv_data);
+    let res = dispatch_cli(cmd);
+    if res.exit_code != 0 || res.status != "SUCCESS" {
+        return false;
+    }
+    let expected = "[{\"id\":201,\"source\":\"sensor-x\",\"metric_value\":300,\"is_valid\":true},{\"id\":202,\"source\":\"sensor-y\",\"metric_value\":550,\"is_valid\":false}]";
+    return res.payload == expected;
+}
+
+pub fn test_cli_stream_transform() -> bool {
+    let csv_data = "id,source,metric_value,is_valid\n301,node-a,750,true\n302,node-b,420,true\n303,node-c,890,false\n304,node-d,910,true\n";
+    let cmd = CliCommand(name: "transform", threshold: 700, algo: "", raw_payload: csv_data);
+    let res = dispatch_cli(cmd);
+    if res.exit_code != 0 || res.status != "SUCCESS" {
+        return false;
+    }
+    let expected = "{\"threshold\":700,\"matched_count\":2,\"items\":[{\"id\":301,\"source\":\"node-a\",\"metric_value\":750,\"is_valid\":true},{\"id\":304,\"source\":\"node-d\",\"metric_value\":910,\"is_valid\":true}]}";
+    return res.payload == expected;
+}
+
 pub fn test_cli_all() -> bool {
     let t1 = test_cli_help();
     let t2 = test_cli_unknown_command();
@@ -355,7 +621,9 @@ pub fn test_cli_all() -> bool {
     let t9 = test_cli_digest_sha256();
     let t10 = test_cli_digest_unsupported();
     let t11 = test_cli_validate();
-    return t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11;
+    let t12 = test_cli_csv2json();
+    let t13 = test_cli_stream_transform();
+    return t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13;
 }
 
 pub fn main() {
@@ -386,7 +654,18 @@ pub fn main() {
     let res_digest = dispatch_cli(cmd_digest);
     println(res_digest.payload);
 
-    // 6. Test suite validation
+    // 6. CSV to JSON Ingestion Pipeline
+    let sample_csv = "id,source,metric_value,is_valid\n101,edge-hub,620,true\n102,lora-gw,310,true\n";
+    let cmd_csv2json = CliCommand(name: "csv2json", threshold: 0, algo: "", raw_payload: sample_csv);
+    let res_csv2json = dispatch_cli(cmd_csv2json);
+    println(res_csv2json.payload);
+
+    // 7. Stream Transformation & Threshold Filtering
+    let cmd_transform = CliCommand(name: "transform", threshold: 500, algo: "", raw_payload: sample_csv);
+    let res_transform = dispatch_cli(cmd_transform);
+    println(res_transform.payload);
+
+    // 8. Test suite validation
     let all_ok = test_cli_all();
     if all_ok {
         println("All CLI tests PASSED");

@@ -7,5 +7,5 @@ version = 1
 name = "ifa-data-processor-cli"
 version = "0.1.0"
 source = "root"
-checksum = "a5e81682b4d243318dc64cb64042c9970a3d76d7f712d6f046ceb6900fad89e0"
+checksum = "ea14c0a8738dbe97ea7ce64bf3e614cc4a967241e007c6a5c0b3d25f0f6e2800"
 dependencies = []

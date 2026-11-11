@@ -237,6 +237,42 @@ pub fn handle_hover(doc: &Document, position: Position) -> Option<Hover> {
             "**`csv_table_get_value(table: CsvTable, row_idx: i64, col_name: String) -> String`** — Column Lookup (`std/csv`).\n\n\
              Retrieves cell string value by 0-based row index and header column name.",
         ),
+        "StringReader" => Some(
+            "**`StringReader`** — Sequential In-Memory Text Stream Reader (`std/io`).\n\n\
+             Provides character-by-character and line-by-line streaming with cursor position, line, and column tracking.",
+        ),
+        "StringWriter" => Some(
+            "**`StringWriter`** — In-Memory Text Accumulator (`std/io`).\n\n\
+             Accumulates text and lines in memory with metrics on written lines and deterministic buffer extraction.",
+        ),
+        "BufferedReader" => Some(
+            "**`BufferedReader`** — Chunk & Line Buffered Text Stream (`std/io`).\n\n\
+             Enables batch reading of text input via sliding buffer chunks and line iterators.",
+        ),
+        "BufferedWriter" => Some(
+            "**`BufferedWriter`** — Batch-Buffered Text Stream (`std/io`).\n\n\
+             Batches string writes in memory before flushing to target text storage, reducing reallocations.",
+        ),
+        "ByteStream" => Some(
+            "**`ByteStream`** — Binary Stream Buffer (`std/io`).\n\n\
+             Provides sequential reading and writing of multi-byte integers (16-bit, 32-bit, 64-bit) with big-endian and little-endian support.",
+        ),
+        "string_reader_read_line" => Some(
+            "**`string_reader_read_line(inout reader: StringReader) -> String`** — Line Reader (`std/io`).\n\n\
+             Consumes and returns the next line from the stream up to `\\n` or `\\r\\n` while updating line and column counters.",
+        ),
+        "buffered_reader_read_line" => Some(
+            "**`buffered_reader_read_line(inout reader: BufferedReader) -> String`** — Buffered Line Reader (`std/io`).\n\n\
+             Reads next line from the buffered input stream.",
+        ),
+        "byte_stream_write_u32_be" => Some(
+            "**`byte_stream_write_u32_be(inout stream: ByteStream, val: i64)`** — Big-Endian 32-bit Writer (`std/io`).\n\n\
+             Appends a 32-bit integer in network byte order (big-endian) to the binary stream.",
+        ),
+        "byte_stream_read_u32_be" => Some(
+            "**`byte_stream_read_u32_be(inout stream: ByteStream) -> i64`** — Big-Endian 32-bit Reader (`std/io`).\n\n\
+             Reads a 32-bit integer in big-endian order from the binary stream.",
+        ),
         _ => None,
     };
 

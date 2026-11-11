@@ -1,0 +1,686 @@
+// Pure IFA Standard Library: Buffered and In-Memory Stream I/O Subsystem (`std/io.ifa`)
+// High-performance streaming abstractions, line-oriented readers, chunked writers, and binary byte streams.
+
+pub struct StringReader {
+    src: String,
+    pos: i64,
+    line: i64,
+    col: i64
+}
+
+pub struct StringWriter {
+    buffer: String,
+    lines_written: i64
+}
+
+pub struct BufferedReader {
+    source: String,
+    cursor: i64,
+    buffer_size: i64,
+    total_len: i64
+}
+
+pub struct BufferedWriter {
+    chunks: List<String>,
+    max_batch: i64,
+    target_string: String
+}
+
+pub struct ByteStream {
+    bytes: List<i64>,
+    pos: i64
+}
+
+// ---------------------------------------------------------------------------
+// 1. StringReader: Cursor-tracked sequential character and line reader
+// ---------------------------------------------------------------------------
+
+pub fn string_reader_new(src: String) -> StringReader {
+    return StringReader(
+        src: src,
+        pos: 0,
+        line: 1,
+        col: 1
+    );
+}
+
+pub fn string_reader_is_eof(reader: StringReader) -> bool {
+    let len = string_len(reader.src);
+    return reader.pos >= len;
+}
+
+pub fn string_reader_remaining(reader: StringReader) -> i64 {
+    let len = string_len(reader.src);
+    if reader.pos >= len {
+        return 0;
+    }
+    return len - reader.pos;
+}
+
+pub fn string_reader_peek(reader: StringReader) -> i64 {
+    let len = string_len(reader.src);
+    if reader.pos >= len {
+        return -1;
+    }
+    return string_char_at(reader.src, reader.pos);
+}
+
+pub fn string_reader_read_char(inout reader: StringReader) -> i64 {
+    let len = string_len(reader.src);
+    if reader.pos >= len {
+        return -1;
+    }
+    let ch = string_char_at(reader.src, reader.pos);
+    reader.pos = reader.pos + 1;
+    if ch == 10 { // '\n'
+        reader.line = reader.line + 1;
+        reader.col = 1;
+    } else {
+        reader.col = reader.col + 1;
+    }
+    return ch;
+}
+
+pub fn string_reader_read_line(inout reader: StringReader) -> String {
+    let len = string_len(reader.src);
+    if reader.pos >= len {
+        return "";
+    }
+
+    mut start = reader.pos;
+    mut end = start;
+    mut found_newline = false;
+
+    while reader.pos < len && !found_newline {
+        let ch = string_char_at(reader.src, reader.pos);
+        if ch == 10 { // '\n'
+            end = reader.pos;
+            reader.pos = reader.pos + 1;
+            reader.line = reader.line + 1;
+            reader.col = 1;
+            found_newline = true;
+        } else if ch == 13 { // '\r'
+            end = reader.pos;
+            reader.pos = reader.pos + 1;
+            if reader.pos < len && string_char_at(reader.src, reader.pos) == 10 {
+                reader.pos = reader.pos + 1;
+            }
+            reader.line = reader.line + 1;
+            reader.col = 1;
+            found_newline = true;
+        } else {
+            reader.pos = reader.pos + 1;
+            reader.col = reader.col + 1;
+        }
+    }
+
+    if !found_newline {
+        end = reader.pos;
+    }
+
+    let line_len = end - start;
+    if line_len <= 0 {
+        return "";
+    }
+    return string_substr(reader.src, start, line_len);
+}
+
+pub fn string_reader_read_exact(inout reader: StringReader, count: i64) -> String {
+    if count <= 0 {
+        return "";
+    }
+    let len = string_len(reader.src);
+    if reader.pos >= len {
+        return "";
+    }
+
+    mut actual_count = count;
+    if reader.pos + actual_count > len {
+        actual_count = len - reader.pos;
+    }
+
+    let start = reader.pos;
+    mut i: i64 = 0;
+    while i < actual_count {
+        let ch = string_char_at(reader.src, reader.pos);
+        if ch == 10 {
+            reader.line = reader.line + 1;
+            reader.col = 1;
+        } else {
+            reader.col = reader.col + 1;
+        }
+        reader.pos = reader.pos + 1;
+        i = i + 1;
+    }
+
+    return string_substr(reader.src, start, actual_count);
+}
+
+pub fn string_reader_read_until(inout reader: StringReader, delimiter: i64) -> String {
+    let len = string_len(reader.src);
+    if reader.pos >= len {
+        return "";
+    }
+
+    let start = reader.pos;
+    while reader.pos < len {
+        let ch = string_char_at(reader.src, reader.pos);
+        if ch == delimiter {
+            let res_len = reader.pos - start;
+            reader.pos = reader.pos + 1; // Consume delimiter
+            reader.col = reader.col + 1;
+            if res_len <= 0 {
+                return "";
+            }
+            return string_substr(reader.src, start, res_len);
+        }
+        if ch == 10 {
+            reader.line = reader.line + 1;
+            reader.col = 1;
+        } else {
+            reader.col = reader.col + 1;
+        }
+        reader.pos = reader.pos + 1;
+    }
+
+    let remaining_len = reader.pos - start;
+    if remaining_len <= 0 {
+        return "";
+    }
+    return string_substr(reader.src, start, remaining_len);
+}
+
+pub fn string_reader_skip_whitespace(inout reader: StringReader) {
+    let len = string_len(reader.src);
+    while reader.pos < len {
+        let ch = string_char_at(reader.src, reader.pos);
+        if ch == 32 || ch == 9 || ch == 10 || ch == 13 {
+            if ch == 10 {
+                reader.line = reader.line + 1;
+                reader.col = 1;
+            } else {
+                reader.col = reader.col + 1;
+            }
+            reader.pos = reader.pos + 1;
+        } else {
+            return;
+        }
+    }
+}
+
+pub fn string_reader_seek(inout reader: StringReader, new_pos: i64) {
+    let len = string_len(reader.src);
+    if new_pos < 0 {
+        reader.pos = 0;
+    } else if new_pos > len {
+        reader.pos = len;
+    } else {
+        reader.pos = new_pos;
+    }
+}
+
+pub fn string_reader_rewind(inout reader: StringReader) {
+    reader.pos = 0;
+    reader.line = 1;
+    reader.col = 1;
+}
+
+// ---------------------------------------------------------------------------
+// 2. StringWriter: Memory text accumulator
+// ---------------------------------------------------------------------------
+
+pub fn string_writer_new() -> StringWriter {
+    return StringWriter(
+        buffer: "",
+        lines_written: 0
+    );
+}
+
+pub fn string_writer_write(inout writer: StringWriter, text: String) {
+    writer.buffer = writer.buffer + text;
+}
+
+pub fn string_writer_write_line(inout writer: StringWriter, line: String) {
+    writer.buffer = writer.buffer + line + "\n";
+    writer.lines_written = writer.lines_written + 1;
+}
+
+pub fn string_writer_write_char(inout writer: StringWriter, ch: i64) {
+    // Write single ASCII character by code
+    let s = if ch == 10 { "\n" }
+        else if ch == 32 { " " }
+        else if ch == 44 { "," }
+        else if ch == 58 { ":" }
+        else if ch == 59 { ";" }
+        else if ch == 123 { "{" }
+        else if ch == 125 { "}" }
+        else if ch == 91 { "[" }
+        else if ch == 93 { "]" }
+        else if ch >= 48 && ch <= 57 {
+            let offset = ch - 48;
+            if offset == 0 { "0" } else if offset == 1 { "1" } else if offset == 2 { "2" }
+            else if offset == 3 { "3" } else if offset == 4 { "4" } else if offset == 5 { "5" }
+            else if offset == 6 { "6" } else if offset == 7 { "7" } else if offset == 8 { "8" }
+            else { "9" }
+        }
+        else { "_" };
+    writer.buffer = writer.buffer + s;
+}
+
+pub fn string_writer_len(writer: StringWriter) -> i64 {
+    return string_len(writer.buffer);
+}
+
+pub fn string_writer_to_string(writer: StringWriter) -> String {
+    return writer.buffer;
+}
+
+pub fn string_writer_clear(inout writer: StringWriter) {
+    writer.buffer = "";
+    writer.lines_written = 0;
+}
+
+// ---------------------------------------------------------------------------
+// 3. BufferedReader: Chunk-buffered text scanner
+// ---------------------------------------------------------------------------
+
+pub fn buffered_reader_new(src: String, buffer_size: i64) -> BufferedReader {
+    mut effective_size: i64 = buffer_size;
+    if effective_size <= 0 {
+        effective_size = 64;
+    }
+    let total = string_len(src);
+    return BufferedReader(
+        source: src,
+        cursor: 0,
+        buffer_size: effective_size,
+        total_len: total
+    );
+}
+
+pub fn buffered_reader_has_next(reader: BufferedReader) -> bool {
+    return reader.cursor < reader.total_len;
+}
+
+pub fn buffered_reader_read_line(inout reader: BufferedReader) -> String {
+    if reader.cursor >= reader.total_len {
+        return "";
+    }
+
+    let start = reader.cursor;
+    mut end = start;
+    mut found = false;
+
+    while reader.cursor < reader.total_len && !found {
+        let ch = string_char_at(reader.source, reader.cursor);
+        if ch == 10 { // '\n'
+            end = reader.cursor;
+            reader.cursor = reader.cursor + 1;
+            found = true;
+        } else if ch == 13 { // '\r'
+            end = reader.cursor;
+            reader.cursor = reader.cursor + 1;
+            if reader.cursor < reader.total_len && string_char_at(reader.source, reader.cursor) == 10 {
+                reader.cursor = reader.cursor + 1;
+            }
+            found = true;
+        } else {
+            reader.cursor = reader.cursor + 1;
+        }
+    }
+
+    if !found {
+        end = reader.cursor;
+    }
+
+    let line_len = end - start;
+    if line_len <= 0 {
+        return "";
+    }
+    return string_substr(reader.source, start, line_len);
+}
+
+pub fn buffered_reader_read_chunk(inout reader: BufferedReader) -> String {
+    if reader.cursor >= reader.total_len {
+        return "";
+    }
+
+    mut chunk_len = reader.buffer_size;
+    if reader.cursor + chunk_len > reader.total_len {
+        chunk_len = reader.total_len - reader.cursor;
+    }
+
+    let start = reader.cursor;
+    reader.cursor = reader.cursor + chunk_len;
+    return string_substr(reader.source, start, chunk_len);
+}
+
+pub fn buffered_reader_read_all_lines(inout reader: BufferedReader) -> List<String> {
+    mut lines: List<String> = List::new();
+    while buffered_reader_has_next(reader) {
+        let line = buffered_reader_read_line(inout reader);
+        lines.push(line);
+    }
+    return lines;
+}
+
+// ---------------------------------------------------------------------------
+// 4. BufferedWriter: Batched string chunk aggregator
+// ---------------------------------------------------------------------------
+
+pub fn buffered_writer_new(max_batch: i64) -> BufferedWriter {
+    mut effective_batch: i64 = max_batch;
+    if effective_batch <= 0 {
+        effective_batch = 16;
+    }
+    return BufferedWriter(
+        chunks: List::new(),
+        max_batch: effective_batch,
+        target_string: ""
+    );
+}
+
+pub fn buffered_writer_flush(inout writer: BufferedWriter) {
+    let count = writer.chunks.len();
+    if count == 0 {
+        return;
+    }
+    mut acc = writer.target_string;
+    mut i: i64 = 0;
+    while i < count {
+        acc = acc + writer.chunks[i];
+        i = i + 1;
+    }
+    writer.target_string = acc;
+    mut empty: List<String> = List::new();
+    writer.chunks = empty;
+}
+
+pub fn buffered_writer_write(inout writer: BufferedWriter, chunk: String) {
+    writer.chunks.push(chunk);
+    if writer.chunks.len() >= writer.max_batch {
+        buffered_writer_flush(inout writer);
+    }
+}
+
+pub fn buffered_writer_write_line(inout writer: BufferedWriter, line: String) {
+    buffered_writer_write(inout writer, line + "\n");
+}
+
+pub fn buffered_writer_to_string(inout writer: BufferedWriter) -> String {
+    buffered_writer_flush(inout writer);
+    return writer.target_string;
+}
+
+pub fn buffered_writer_is_empty(writer: BufferedWriter) -> bool {
+    return writer.chunks.len() == 0 && string_len(writer.target_string) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// 5. ByteStream: Binary streaming buffer with cursor & endianness support
+// ---------------------------------------------------------------------------
+
+pub fn byte_stream_new() -> ByteStream {
+    return ByteStream(
+        bytes: List::new(),
+        pos: 0
+    );
+}
+
+pub fn byte_stream_from_bytes(bytes: List<i64>) -> ByteStream {
+    return ByteStream(
+        bytes: bytes,
+        pos: 0
+    );
+}
+
+pub fn byte_stream_len(stream: ByteStream) -> i64 {
+    return stream.bytes.len();
+}
+
+pub fn byte_stream_pos(stream: ByteStream) -> i64 {
+    return stream.pos;
+}
+
+pub fn byte_stream_is_eof(stream: ByteStream) -> bool {
+    return stream.pos >= stream.bytes.len();
+}
+
+pub fn byte_stream_seek(inout stream: ByteStream, pos: i64) {
+    if pos < 0 {
+        stream.pos = 0;
+    } else if pos > stream.bytes.len() {
+        stream.pos = stream.bytes.len();
+    } else {
+        stream.pos = pos;
+    }
+}
+
+pub fn byte_stream_rewind(inout stream: ByteStream) {
+    stream.pos = 0;
+}
+
+pub fn byte_stream_write_u8(inout stream: ByteStream, val: i64) {
+    stream.bytes.push(val & 255);
+}
+
+pub fn byte_stream_write_u16_be(inout stream: ByteStream, val: i64) {
+    byte_stream_write_u8(inout stream, (val >> 8) & 255);
+    byte_stream_write_u8(inout stream, val & 255);
+}
+
+pub fn byte_stream_write_u16_le(inout stream: ByteStream, val: i64) {
+    byte_stream_write_u8(inout stream, val & 255);
+    byte_stream_write_u8(inout stream, (val >> 8) & 255);
+}
+
+pub fn byte_stream_write_u32_be(inout stream: ByteStream, val: i64) {
+    byte_stream_write_u8(inout stream, (val >> 24) & 255);
+    byte_stream_write_u8(inout stream, (val >> 16) & 255);
+    byte_stream_write_u8(inout stream, (val >> 8) & 255);
+    byte_stream_write_u8(inout stream, val & 255);
+}
+
+pub fn byte_stream_write_u32_le(inout stream: ByteStream, val: i64) {
+    byte_stream_write_u8(inout stream, val & 255);
+    byte_stream_write_u8(inout stream, (val >> 8) & 255);
+    byte_stream_write_u8(inout stream, (val >> 16) & 255);
+    byte_stream_write_u8(inout stream, (val >> 24) & 255);
+}
+
+pub fn byte_stream_write_u64_be(inout stream: ByteStream, val: i64) {
+    mut i: i64 = 7;
+    while i >= 0 {
+        byte_stream_write_u8(inout stream, (val >> (i * 8)) & 255);
+        i = i - 1;
+    }
+}
+
+pub fn byte_stream_write_u64_le(inout stream: ByteStream, val: i64) {
+    mut i: i64 = 0;
+    while i < 8 {
+        byte_stream_write_u8(inout stream, (val >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+pub fn byte_stream_read_u8(inout stream: ByteStream) -> i64 {
+    if stream.pos >= stream.bytes.len() {
+        return 0;
+    }
+    let b = stream.bytes[stream.pos];
+    stream.pos = stream.pos + 1;
+    return b;
+}
+
+pub fn byte_stream_read_u16_be(inout stream: ByteStream) -> i64 {
+    let b0 = byte_stream_read_u8(inout stream);
+    let b1 = byte_stream_read_u8(inout stream);
+    return (b0 << 8) | b1;
+}
+
+pub fn byte_stream_read_u16_le(inout stream: ByteStream) -> i64 {
+    let b0 = byte_stream_read_u8(inout stream);
+    let b1 = byte_stream_read_u8(inout stream);
+    return b0 | (b1 << 8);
+}
+
+pub fn byte_stream_read_u32_be(inout stream: ByteStream) -> i64 {
+    let b0 = byte_stream_read_u8(inout stream);
+    let b1 = byte_stream_read_u8(inout stream);
+    let b2 = byte_stream_read_u8(inout stream);
+    let b3 = byte_stream_read_u8(inout stream);
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+pub fn byte_stream_read_u32_le(inout stream: ByteStream) -> i64 {
+    let b0 = byte_stream_read_u8(inout stream);
+    let b1 = byte_stream_read_u8(inout stream);
+    let b2 = byte_stream_read_u8(inout stream);
+    let b3 = byte_stream_read_u8(inout stream);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+pub fn byte_stream_read_u64_be(inout stream: ByteStream) -> i64 {
+    mut res: i64 = 0;
+    mut i: i64 = 0;
+    while i < 8 {
+        let b = byte_stream_read_u8(inout stream);
+        res = (res << 8) | b;
+        i = i + 1;
+    }
+    return res;
+}
+
+pub fn byte_stream_read_u64_le(inout stream: ByteStream) -> i64 {
+    mut res: i64 = 0;
+    mut i: i64 = 0;
+    while i < 8 {
+        let b = byte_stream_read_u8(inout stream);
+        res = res | (b << (i * 8));
+        i = i + 1;
+    }
+    return res;
+}
+
+pub fn byte_stream_to_bytes(stream: ByteStream) -> List<i64> {
+    return stream.bytes;
+}
+
+// ---------------------------------------------------------------------------
+// 6. Unit Tests for std/io Subsystem
+// ---------------------------------------------------------------------------
+
+pub fn test_io_string_reader_lines() -> bool {
+    let content = "line1:alpha\nline2:beta\r\nline3:gamma";
+    mut reader = string_reader_new(content);
+
+    let l1 = string_reader_read_line(inout reader);
+    let l2 = string_reader_read_line(inout reader);
+    let l3 = string_reader_read_line(inout reader);
+    let is_eof = string_reader_is_eof(reader);
+
+    return l1 == "line1:alpha" && l2 == "line2:beta" && l3 == "line3:gamma" && is_eof;
+}
+
+pub fn test_io_string_reader_seek_and_peek() -> bool {
+    let content = "IFA SYSTEM";
+    mut reader = string_reader_new(content);
+
+    let peek_first = string_reader_peek(reader); // 'I' = 73
+    let c1 = string_reader_read_char(inout reader);
+    let c2 = string_reader_read_char(inout reader); // 'F' = 70
+    let c3 = string_reader_read_char(inout reader); // 'A' = 65
+
+    string_reader_seek(inout reader, 4);
+    let remaining = string_reader_remaining(reader);
+    let exact = string_reader_read_exact(inout reader, 6);
+
+    string_reader_rewind(inout reader);
+    let rewound_peek = string_reader_peek(reader);
+
+    return peek_first == 73
+        && c1 == 73
+        && c2 == 70
+        && c3 == 65
+        && remaining == 6
+        && exact == "SYSTEM"
+        && rewound_peek == 73;
+}
+
+pub fn test_io_string_writer_accumulation() -> bool {
+    mut writer = string_writer_new();
+    string_writer_write(inout writer, "HEADER:");
+    string_writer_write_line(inout writer, "OK");
+    string_writer_write_line(inout writer, "STATUS:200");
+
+    let count = writer.lines_written;
+    let s = string_writer_to_string(writer);
+
+    return count == 2 && s == "HEADER:OK\nSTATUS:200\n";
+}
+
+pub fn test_io_buffered_reader() -> bool {
+    let src = "alpha\nbeta\ngamma\ndelta\n";
+    mut buf_reader = buffered_reader_new(src, 8);
+    let lines = buffered_reader_read_all_lines(inout buf_reader);
+    return lines.len() == 4 && lines[0] == "alpha" && lines[3] == "delta";
+}
+
+pub fn test_io_buffered_writer() -> bool {
+    mut buf_writer = buffered_writer_new(3);
+    buffered_writer_write(inout buf_writer, "col1,");
+    buffered_writer_write(inout buf_writer, "col2,");
+    buffered_writer_write(inout buf_writer, "col3\n");
+    buffered_writer_write(inout buf_writer, "val1,val2,val3\n");
+
+    let out = buffered_writer_to_string(inout buf_writer);
+    return out == "col1,col2,col3\nval1,val2,val3\n";
+}
+
+pub fn test_io_buffered_reader_and_writer() -> bool {
+    return test_io_buffered_reader() && test_io_buffered_writer();
+}
+
+pub fn test_io_byte_stream_endianness() -> bool {
+    mut stream = byte_stream_new();
+    byte_stream_write_u8(inout stream, 42);
+    byte_stream_write_u16_be(inout stream, 4660); // 0x1234
+    byte_stream_write_u16_le(inout stream, 4660);
+    byte_stream_write_u32_be(inout stream, 305419896); // 0x12345678
+    byte_stream_write_u32_le(inout stream, 305419896);
+
+    let total_len = byte_stream_len(stream);
+    byte_stream_rewind(inout stream);
+
+    let v_u8 = byte_stream_read_u8(inout stream);
+    let v_u16_be = byte_stream_read_u16_be(inout stream);
+    let v_u16_le = byte_stream_read_u16_le(inout stream);
+    let v_u32_be = byte_stream_read_u32_be(inout stream);
+    let v_u32_le = byte_stream_read_u32_le(inout stream);
+    let is_eof = byte_stream_is_eof(stream);
+
+    return total_len == 13
+        && v_u8 == 42
+        && v_u16_be == 4660
+        && v_u16_le == 4660
+        && v_u32_be == 305419896
+        && v_u32_le == 305419896
+        && is_eof;
+}
+
+pub fn test_io_all() -> bool {
+    return test_io_string_reader_lines()
+        && test_io_string_reader_seek_and_peek()
+        && test_io_string_writer_accumulation()
+        && test_io_buffered_reader_and_writer()
+        && test_io_byte_stream_endianness();
+}
+
+pub fn main() {
+    if test_io_all() {
+        println("std/io: ALL TESTS PASSED");
+    } else {
+        println("std/io: TESTS FAILED");
+    }
+}
