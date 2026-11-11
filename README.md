@@ -1,6 +1,6 @@
 # **IFA Programming Language**
 
-[License: MIT/Apache 2.0](#licence) | [Version](https://github.com/ifa-lang/ifa/releases) | [Quickstart & Tour of IFA](docs/TOUR_OF_IFA.md)
+[License: MIT/Apache 2.0](#licence) | [Release Notes v0.1.0](docs/RELEASE_NOTES_v0.1.0.md) | [Changelog](CHANGELOG.md) | [Quickstart & Tour of IFA](docs/TOUR_OF_IFA.md)
 
 ---
 
@@ -141,7 +141,12 @@ Le compilateur IFA est structuré en un workspace modulaire en Rust :
 | `ifa-fir` | Représentation intermédiaire SSA (FIR), passes d'optimisation CoW et références générationnelles. |
 | `ifa-runtime` | Bibliothèque d'exécution standard et déterministe (allocateur générationnel, ordonnanceur de fibres M:N, conteneurs CoW, flux I/O, ABI C). |
 | `ifa-codegen-cranelift` | Backend de génération de code machine natif AOT (`.o`, ELF) et JIT haute performance via Cranelift. |
-| `ifa-cli` | Binaire CLI unifié (`ifa`) proposant les commandes `check`, `lex`, `parse`, `comptime`, `fir`, `run` et `build`. |
+| `ifa-codegen-llvm` | Backend AOT alternatif et pont d'optimisation vectorielle via LLVM. |
+| `ifa-wasm` | Compilateur et runtime d'exécution WebAssembly (Wasm/WASI). |
+| `ifa-lsp` | Serveur de langage compatible LSP 3.17 pour éditeurs et IDE (VS Code, Neovim, etc.). |
+| `ifa-stdlib` | Implémentation Rust et ponts d'interopérabilité pour la bibliothèque standard pure IFA (`std/`). |
+| `kori` | Gestionnaire de paquets déterministe, orchestrateur de compilation et résolveur SemVer. |
+| `ifa-cli` | Binaire CLI unifié (`ifa`) proposant les commandes `check`, `lex`, `parse`, `comptime`, `fir`, `run`, `build`, `fmt`, `lint`, `test`, `doc` et `new`. |
 
 ---
 
