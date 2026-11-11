@@ -1938,13 +1938,18 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_net_http_sse_streaming_and_content_negotiation ... ok"),
+        "Std net http sse streaming and content negotiation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("249 passed; 0 failed"),
-        "Expected 249 passed std unit tests, got:\n{}",
+        stdout.contains("251 passed; 0 failed"),
+        "Expected 251 passed std unit tests, got:\n{}",
         stdout
     );
 }

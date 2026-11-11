@@ -3420,6 +3420,238 @@ pub fn test_net_multipart_form_data() -> bool {
     return u == "prudence" && desc == "IFA Systems Programming" && doc == "Deterministic compilation fixed point OK" && missing == "";
 }
 
+pub fn sse_format_event(event_type: String, data: String, id: String, retry_ms: i64) -> String {
+    mut res: String = "";
+    if string_len(id) > 0 {
+        res = res + "id: " + id + "\n";
+    }
+    if string_len(event_type) > 0 {
+        res = res + "event: " + event_type + "\n";
+    }
+    if retry_ms > 0 {
+        res = res + "retry: " + int_to_string(retry_ms) + "\n";
+    }
+
+    let d_len = string_len(data);
+    if d_len == 0 {
+        res = res + "data:\n";
+    } else {
+        mut line_start: i64 = 0;
+        mut i: i64 = 0;
+        while i <= d_len {
+            let is_end = (i == d_len) || (string_char_at(data, i) == 10); // '\n'
+            if is_end {
+                mut line_len = i - line_start;
+                if line_len > 0 && string_char_at(data, line_start + line_len - 1) == 13 { // '\r'
+                    line_len = line_len - 1;
+                }
+                res = res + "data: " + string_substr(data, line_start, line_len) + "\n";
+                line_start = i + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    res = res + "\n";
+    return res;
+}
+
+pub fn sse_extract_field(raw_block: String, field_name: String) -> String {
+    let b_len = string_len(raw_block);
+    let prefix = field_name + ": ";
+    let p_len = string_len(prefix);
+    mut i: i64 = 0;
+    while i + p_len <= b_len {
+        let is_line_start = (i == 0) || (string_char_at(raw_block, i - 1) == 10);
+        if is_line_start {
+            mut match_prefix = true;
+            mut j: i64 = 0;
+            while j < p_len {
+                if string_char_at(raw_block, i + j) != string_char_at(prefix, j) {
+                    match_prefix = false;
+                    j = p_len;
+                }
+                j = j + 1;
+            }
+            if match_prefix {
+                let val_start = i + p_len;
+                mut val_end = val_start;
+                while val_end < b_len && string_char_at(raw_block, val_end) != 10 && string_char_at(raw_block, val_end) != 13 {
+                    val_end = val_end + 1;
+                }
+                return string_substr(raw_block, val_start, val_end - val_start);
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub fn sse_parse_event_data(raw_block: String) -> String {
+    let b_len = string_len(raw_block);
+    let prefix = "data: ";
+    let p_len = string_len(prefix);
+    mut res: String = "";
+    mut i: i64 = 0;
+    while i + p_len <= b_len {
+        let is_line_start = (i == 0) || (string_char_at(raw_block, i - 1) == 10);
+        if is_line_start {
+            mut match_prefix = true;
+            mut j: i64 = 0;
+            while j < p_len {
+                if string_char_at(raw_block, i + j) != string_char_at(prefix, j) {
+                    match_prefix = false;
+                    j = p_len;
+                }
+                j = j + 1;
+            }
+            if match_prefix {
+                let val_start = i + p_len;
+                mut val_end = val_start;
+                while val_end < b_len && string_char_at(raw_block, val_end) != 10 && string_char_at(raw_block, val_end) != 13 {
+                    val_end = val_end + 1;
+                }
+                let line = string_substr(raw_block, val_start, val_end - val_start);
+                if string_len(res) > 0 {
+                    res = res + "\n" + line;
+                } else {
+                    res = line;
+                }
+                i = val_end;
+            }
+        }
+        i = i + 1;
+    }
+    return res;
+}
+
+pub fn sse_parse_event_name(raw_block: String) -> String {
+    return sse_extract_field(raw_block, "event");
+}
+
+pub fn sse_parse_event_id(raw_block: String) -> String {
+    return sse_extract_field(raw_block, "id");
+}
+
+pub fn http_response_sse_header() -> String {
+    return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+}
+
+pub fn string_find_char(s: String, ch: i64) -> i64 {
+    let len = string_len(s);
+    mut i: i64 = 0;
+    while i < len {
+        if string_char_at(s, i) == ch {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn http_accepts_mime(accept_header: String, target_mime: String) -> bool {
+    let h_len = string_len(accept_header);
+    if h_len == 0 {
+        return true;
+    }
+    if string_contains(accept_header, "*/*") {
+        return true;
+    }
+    if string_contains(accept_header, target_mime) {
+        return true;
+    }
+
+    let slash_idx = string_find_char(target_mime, 47); // '/'
+    if slash_idx > 0 {
+        let prefix = string_substr(target_mime, 0, slash_idx + 1) + "*";
+        if string_contains(accept_header, prefix) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+pub fn http_negotiate_content_type(accept_header: String, available_csv: String) -> String {
+    let a_len = string_len(available_csv);
+    if a_len == 0 {
+        return "";
+    }
+    if string_len(accept_header) == 0 || string_contains(accept_header, "*/*") {
+        let comma = string_find_char(available_csv, 44); // ','
+        if comma >= 0 {
+            return string_substr(available_csv, 0, comma);
+        }
+        return available_csv;
+    }
+
+    mut start: i64 = 0;
+    mut i: i64 = 0;
+    while i <= a_len {
+        let is_end = (i == a_len) || (string_char_at(available_csv, i) == 44); // ','
+        if is_end {
+            let item = string_substr(available_csv, start, i - start);
+            if http_accepts_mime(accept_header, item) {
+                return item;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+
+    return "";
+}
+
+pub fn test_net_http_sse_streaming_and_content_negotiation() -> bool {
+    let ev1 = sse_format_event("status_update", "Fiber reactor healthy and running", "evt-101", 3000);
+    let ev_name1 = sse_parse_event_name(ev1);
+    let ev_id1 = sse_parse_event_id(ev1);
+    let ev_data1 = sse_parse_event_data(ev1);
+
+    if ev_name1 != "status_update" || ev_id1 != "evt-101" || ev_data1 != "Fiber reactor healthy and running" {
+        return false;
+    }
+
+    let multiline_data = "chunk_alpha\nchunk_beta\nchunk_gamma";
+    let ev2 = sse_format_event("data_feed", multiline_data, "", 0);
+    let ev_data2 = sse_parse_event_data(ev2);
+    if ev_data2 != multiline_data {
+        return false;
+    }
+
+    let sse_header = http_response_sse_header();
+    if !string_contains(sse_header, "text/event-stream") || !string_contains(sse_header, "no-cache") {
+        return false;
+    }
+
+    let available = "application/json,text/html,text/plain";
+    let chosen_json = http_negotiate_content_type("application/json", available);
+    if chosen_json != "application/json" {
+        return false;
+    }
+
+    let chosen_wildcard = http_negotiate_content_type("*/*", available);
+    if chosen_wildcard != "application/json" {
+        return false;
+    }
+
+    let chosen_text = http_negotiate_content_type("text/*", available);
+    if chosen_text != "text/html" {
+        return false;
+    }
+
+    let chosen_none = http_negotiate_content_type("image/png", available);
+    if chosen_none != "" {
+        return false;
+    }
+
+    let accepts_json = http_accepts_mime("application/json, text/plain", "application/json");
+    let accepts_sse = http_accepts_mime("text/event-stream", "text/event-stream");
+    let rejects_xml = http_accepts_mime("application/json", "application/xml");
+
+    return accepts_json && accepts_sse && !rejects_xml;
+}
+
 pub fn test_net_all() -> bool {
     return test_net_tcp_echo()
     && test_net_http_wire()
@@ -3443,7 +3675,8 @@ pub fn test_net_all() -> bool {
     && test_net_http_secure_client_token_negotiation()
     && test_net_url_percent_encoding_roundtrip()
     && test_net_http_cookies_and_session()
-    && test_net_multipart_form_data();
+    && test_net_multipart_form_data()
+    && test_net_http_sse_streaming_and_content_negotiation();
 }
 
 pub fn main() {
@@ -3470,7 +3703,8 @@ pub fn main() {
     let t21 = test_net_url_percent_encoding_roundtrip();
     let t22 = test_net_http_cookies_and_session();
     let t23 = test_net_multipart_form_data();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 {
+    let t24 = test_net_http_sse_streaming_and_content_negotiation();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");

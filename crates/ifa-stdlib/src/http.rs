@@ -249,6 +249,34 @@ impl HttpResponse {
         self
     }
 
+    /// Create an HTTP Response initialized for Server-Sent Events (SSE).
+    pub fn sse() -> Self {
+        Self::new(HttpStatus::OK)
+            .header("Content-Type", "text/event-stream")
+            .header("Cache-Control", "no-cache")
+            .header("Connection", "keep-alive")
+    }
+
+    /// Append a Server-Sent Event (SSE) to response body.
+    pub fn sse_event(mut self, event: &SseEvent) -> Self {
+        let wire = event.to_wire_bytes();
+        self.body.extend_from_slice(&wire);
+        self.headers
+            .set("Content-Length", self.body.len().to_string());
+        self
+    }
+
+    /// Append multiple Server-Sent Events (SSE) to response body.
+    pub fn sse_events(mut self, events: &[SseEvent]) -> Self {
+        for ev in events {
+            let wire = ev.to_wire_bytes();
+            self.body.extend_from_slice(&wire);
+        }
+        self.headers
+            .set("Content-Length", self.body.len().to_string());
+        self
+    }
+
     /// Parse HTTP Response from raw wire bytes.
     pub fn parse_from_wire(raw: &[u8]) -> Result<(Self, usize), String> {
         let header_end = raw
@@ -400,6 +428,85 @@ impl HttpRequest {
     /// Parse multipart form-data body (RFC 7578 / RFC 2046).
     pub fn multipart(&self, boundary: &str) -> Result<Vec<MultipartPart>, String> {
         parse_multipart(&self.body, boundary)
+    }
+
+    /// Check if the request accepts a specific MIME type.
+    pub fn accepts(&self, mime: &str) -> bool {
+        if let Some(accept_hdr) = self.headers.get("accept") {
+            let items = parse_accept_header(accept_hdr);
+            if items.is_empty() {
+                return true;
+            }
+            let target = mime.to_ascii_lowercase();
+            let target_type = target.split('/').next().unwrap_or("");
+
+            for item in &items {
+                if item.quality <= 0.0 {
+                    if item.media_type == "*/*"
+                        || item.media_type == target
+                        || item.media_type == format!("{}/*", target_type)
+                    {
+                        return false;
+                    }
+                } else if item.media_type == "*/*"
+                    || item.media_type == target
+                    || item.media_type == format!("{}/*", target_type)
+                {
+                    return true;
+                }
+            }
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Negotiate Content-Type from available choices based on Accept header.
+    pub fn negotiate_content_type(&self, available: &[&str]) -> Option<String> {
+        if let Some(accept_hdr) = self.headers.get("accept") {
+            negotiate_content_type(accept_hdr, available)
+        } else if !available.is_empty() {
+            Some(available[0].to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Content-Type header of the request, if present.
+    pub fn content_type(&self) -> Option<&str> {
+        self.headers.get("content-type")
+    }
+
+    /// Check if Content-Type is JSON.
+    pub fn is_json(&self) -> bool {
+        self.content_type()
+            .map(|c| c.to_ascii_lowercase().contains("application/json"))
+            .unwrap_or(false)
+    }
+
+    /// Check if Accept header indicates Server-Sent Events.
+    pub fn is_sse(&self) -> bool {
+        self.headers
+            .get("accept")
+            .map(|a| a.to_ascii_lowercase().contains("text/event-stream"))
+            .unwrap_or(false)
+    }
+
+    /// Check if Content-Type is application/x-www-form-urlencoded.
+    pub fn is_form_urlencoded(&self) -> bool {
+        self.content_type()
+            .map(|c| {
+                c.to_ascii_lowercase()
+                    .contains("application/x-www-form-urlencoded")
+            })
+            .unwrap_or(false)
+    }
+
+    /// Check if Content-Type is multipart/form-data.
+    pub fn is_multipart(&self) -> bool {
+        self.content_type()
+            .map(|c| c.to_ascii_lowercase().contains("multipart/form-data"))
+            .unwrap_or(false)
     }
 }
 
@@ -897,6 +1004,265 @@ pub fn parse_multipart(body: &[u8], boundary: &str) -> Result<Vec<MultipartPart>
     Ok(parts)
 }
 
+// -------------------------------------------------------------
+// SERVER-SENT EVENTS (SSE) & CONTENT NEGOTIATION
+// -------------------------------------------------------------
+
+/// Server-Sent Event (SSE) structure according to W3C / WHATWG EventSource specification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseEvent {
+    pub id: Option<String>,
+    pub event: Option<String>,
+    pub data: String,
+    pub retry: Option<u64>,
+    pub comment: Option<String>,
+}
+
+impl SseEvent {
+    /// Create a new SSE event with data.
+    pub fn new(data: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            event: None,
+            data: data.into(),
+            retry: None,
+            comment: None,
+        }
+    }
+
+    /// Set event type name.
+    pub fn with_event(mut self, event: impl Into<String>) -> Self {
+        self.event = Some(event.into());
+        self
+    }
+
+    /// Set event identifier.
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// Set reconnection retry time in milliseconds.
+    pub fn with_retry(mut self, retry_ms: u64) -> Self {
+        self.retry = Some(retry_ms);
+        self
+    }
+
+    /// Set optional comment / ping line.
+    pub fn with_comment(mut self, comment: impl Into<String>) -> Self {
+        self.comment = Some(comment.into());
+        self
+    }
+
+    /// Serialize event into W3C EventSource wire format terminated by double newline "\n\n".
+    pub fn to_wire_string(&self) -> String {
+        let mut out = String::new();
+        if let Some(ref comment) = self.comment {
+            out.push_str(": ");
+            out.push_str(comment);
+            out.push('\n');
+        }
+        if let Some(ref id) = self.id {
+            out.push_str("id: ");
+            out.push_str(id);
+            out.push('\n');
+        }
+        if let Some(ref event) = self.event {
+            out.push_str("event: ");
+            out.push_str(event);
+            out.push('\n');
+        }
+        if let Some(retry) = self.retry {
+            out.push_str("retry: ");
+            out.push_str(&retry.to_string());
+            out.push('\n');
+        }
+
+        if self.data.is_empty() {
+            out.push_str("data:\n");
+        } else {
+            for line in self.data.split('\n') {
+                let clean_line = line.strip_suffix('\r').unwrap_or(line);
+                out.push_str("data: ");
+                out.push_str(clean_line);
+                out.push('\n');
+            }
+        }
+
+        out.push('\n');
+        out
+    }
+
+    /// Serialize event into wire bytes.
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        self.to_wire_string().into_bytes()
+    }
+}
+
+/// Parse a stream of Server-Sent Events from wire text.
+pub fn parse_sse_events(input: &str) -> Vec<SseEvent> {
+    let mut events = Vec::new();
+    let mut current_id = None;
+    let mut current_event = None;
+    let mut current_data_lines = Vec::new();
+    let mut current_retry = None;
+    let mut current_comment = None;
+    let mut has_fields = false;
+
+    for line in input.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+
+        if line.is_empty() {
+            if has_fields {
+                events.push(SseEvent {
+                    id: current_id.take(),
+                    event: current_event.take(),
+                    data: current_data_lines.join("\n"),
+                    retry: current_retry.take(),
+                    comment: current_comment.take(),
+                });
+                current_data_lines.clear();
+                has_fields = false;
+            }
+            continue;
+        }
+
+        if let Some(comment) = line.strip_prefix(':') {
+            has_fields = true;
+            let c = comment.strip_prefix(' ').unwrap_or(comment);
+            current_comment = Some(c.to_string());
+        } else if let Some(data) = line.strip_prefix("data:") {
+            has_fields = true;
+            let val = data.strip_prefix(' ').unwrap_or(data);
+            current_data_lines.push(val.to_string());
+        } else if let Some(event) = line.strip_prefix("event:") {
+            has_fields = true;
+            let val = event.strip_prefix(' ').unwrap_or(event);
+            current_event = Some(val.to_string());
+        } else if let Some(id) = line.strip_prefix("id:") {
+            has_fields = true;
+            let val = id.strip_prefix(' ').unwrap_or(id);
+            current_id = Some(val.to_string());
+        } else if let Some(retry) = line.strip_prefix("retry:") {
+            has_fields = true;
+            let val = retry.trim();
+            if let Ok(ms) = val.parse::<u64>() {
+                current_retry = Some(ms);
+            }
+        }
+    }
+
+    if has_fields {
+        events.push(SseEvent {
+            id: current_id,
+            event: current_event,
+            data: current_data_lines.join("\n"),
+            retry: current_retry,
+            comment: current_comment,
+        });
+    }
+
+    events
+}
+
+/// Representation of an item in the HTTP `Accept` header with quality score and specificity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcceptItem {
+    pub media_type: String,
+    pub quality: f32,
+    pub specificity: u8,
+}
+
+/// Parse HTTP `Accept` header into sorted list of `AcceptItem`s (highest precedence first).
+pub fn parse_accept_header(header: &str) -> Vec<AcceptItem> {
+    let mut items = Vec::new();
+
+    for part in header.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut subparts = trimmed.split(';');
+        let media_type = subparts.next().unwrap_or("").trim().to_ascii_lowercase();
+        if media_type.is_empty() {
+            continue;
+        }
+
+        let mut quality = 1.0f32;
+        for param in subparts {
+            let p = param.trim();
+            if let Some(q_val) = p.strip_prefix("q=") {
+                if let Ok(q) = q_val.trim().parse::<f32>() {
+                    quality = q.clamp(0.0, 1.0);
+                }
+            }
+        }
+
+        let specificity = if media_type == "*/*" {
+            1
+        } else if media_type.ends_with("/*") {
+            2
+        } else {
+            3
+        };
+
+        items.push(AcceptItem {
+            media_type,
+            quality,
+            specificity,
+        });
+    }
+
+    items.sort_by(|a, b| {
+        b.quality
+            .partial_cmp(&a.quality)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.specificity.cmp(&a.specificity))
+    });
+
+    items
+}
+
+/// Negotiate the most suitable Content-Type from a client's Accept header and available MIME types.
+pub fn negotiate_content_type(accept_header: &str, available: &[&str]) -> Option<String> {
+    if available.is_empty() {
+        return None;
+    }
+
+    let accept_items = parse_accept_header(accept_header);
+    if accept_items.is_empty() {
+        return Some(available[0].to_string());
+    }
+
+    for item in &accept_items {
+        if item.quality <= 0.0 {
+            continue;
+        }
+
+        if item.media_type == "*/*" {
+            return Some(available[0].to_string());
+        }
+
+        if let Some(prefix) = item.media_type.strip_suffix("/*") {
+            let type_prefix = format!("{}/", prefix);
+            for avail in available {
+                if avail.to_ascii_lowercase().starts_with(&type_prefix) {
+                    return Some((*avail).to_string());
+                }
+            }
+        } else {
+            for avail in available {
+                if avail.eq_ignore_ascii_case(&item.media_type) {
+                    return Some((*avail).to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1021,5 +1387,93 @@ mod tests {
         assert_eq!(parts[2].filename.as_deref(), Some("report.txt"));
         assert_eq!(parts[2].content_type.as_deref(), Some("text/plain"));
         assert_eq!(parts[2].data, b"Deterministic compilation fixed point OK");
+    }
+
+    #[test]
+    fn test_sse_event_formatting_and_parsing() {
+        let ev1 = SseEvent::new("Hello IFA Fiber Stream")
+            .with_event("greeting")
+            .with_id("msg-001")
+            .with_retry(5000)
+            .with_comment("heartbeat ping");
+
+        let wire1 = ev1.to_wire_string();
+        assert!(wire1.starts_with(": heartbeat ping\n"));
+        assert!(wire1.contains("id: msg-001\n"));
+        assert!(wire1.contains("event: greeting\n"));
+        assert!(wire1.contains("retry: 5000\n"));
+        assert!(wire1.contains("data: Hello IFA Fiber Stream\n"));
+        assert!(wire1.ends_with("\n\n"));
+
+        let ev2 = SseEvent::new("line1\nline2\nline3").with_event("multiline");
+        let wire2 = ev2.to_wire_string();
+        assert!(wire2.contains("data: line1\ndata: line2\ndata: line3\n\n"));
+
+        // Parse stream containing multiple events
+        let full_stream = format!("{}{}", wire1, wire2);
+        let parsed = parse_sse_events(&full_stream);
+        assert_eq!(parsed.len(), 2);
+
+        assert_eq!(parsed[0].id.as_deref(), Some("msg-001"));
+        assert_eq!(parsed[0].event.as_deref(), Some("greeting"));
+        assert_eq!(parsed[0].retry, Some(5000));
+        assert_eq!(parsed[0].comment.as_deref(), Some("heartbeat ping"));
+        assert_eq!(parsed[0].data, "Hello IFA Fiber Stream");
+
+        assert_eq!(parsed[1].id, None);
+        assert_eq!(parsed[1].event.as_deref(), Some("multiline"));
+        assert_eq!(parsed[1].data, "line1\nline2\nline3");
+
+        // Test HttpResponse SSE builder
+        let resp = HttpResponse::sse().sse_event(&ev1).sse_event(&ev2);
+        assert_eq!(resp.headers.get("content-type"), Some("text/event-stream"));
+        assert_eq!(resp.headers.get("cache-control"), Some("no-cache"));
+        assert_eq!(resp.headers.get("connection"), Some("keep-alive"));
+        assert_eq!(resp.body, full_stream.as_bytes());
+    }
+
+    #[test]
+    fn test_content_negotiation() {
+        let available = ["application/json", "text/html", "text/plain"];
+
+        // Client accepts JSON
+        let chosen = negotiate_content_type("application/json", &available);
+        assert_eq!(chosen.as_deref(), Some("application/json"));
+
+        // Client prefers HTML over JSON
+        let chosen2 = negotiate_content_type("application/json;q=0.8, text/html;q=1.0", &available);
+        assert_eq!(chosen2.as_deref(), Some("text/html"));
+
+        // Client prefers wildcard text/*
+        let chosen3 = negotiate_content_type("text/*;q=0.9, image/webp", &available);
+        assert_eq!(chosen3.as_deref(), Some("text/html"));
+
+        // Client accepts anything */*
+        let chosen4 = negotiate_content_type("*/*;q=0.1", &available);
+        assert_eq!(chosen4.as_deref(), Some("application/json"));
+
+        // Client accepts only unsupported type
+        let chosen5 = negotiate_content_type("image/png, audio/mpeg", &available);
+        assert_eq!(chosen5, None);
+
+        // Test HttpRequest methods
+        let req = HttpRequest::new(HttpMethod::Get, "/api/resource")
+            .header("Accept", "text/html, application/json;q=0.9, */*;q=0.8")
+            .header("Content-Type", "application/json; charset=utf-8");
+
+        assert!(req.accepts("text/html"));
+        assert!(req.accepts("application/json"));
+        assert!(req.accepts("application/xml")); // Matches */*;q=0.8
+        assert!(req.is_json());
+        assert!(!req.is_sse());
+        assert_eq!(
+            req.negotiate_content_type(&available).as_deref(),
+            Some("text/html")
+        );
+
+        let sse_req =
+            HttpRequest::new(HttpMethod::Get, "/events").header("Accept", "text/event-stream");
+        assert!(sse_req.is_sse());
+        assert!(sse_req.accepts("text/event-stream"));
     }
 }

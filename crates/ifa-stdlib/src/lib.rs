@@ -33,9 +33,10 @@ pub use fs::{
     FileMetadata,
 };
 pub use http::{
-    format_form_urlencoded, format_set_cookie, parse_cookies, parse_form_urlencoded,
-    parse_multipart, url_decode, url_encode, HttpClient, HttpHandler, HttpHeaders, HttpMethod,
-    HttpRequest, HttpResponse, HttpServer, HttpStatus, MultipartBuilder, MultipartPart,
+    format_form_urlencoded, format_set_cookie, negotiate_content_type, parse_accept_header,
+    parse_cookies, parse_form_urlencoded, parse_multipart, parse_sse_events, url_decode,
+    url_encode, AcceptItem, HttpClient, HttpHandler, HttpHeaders, HttpMethod, HttpRequest,
+    HttpResponse, HttpServer, HttpStatus, MultipartBuilder, MultipartPart, SseEvent,
 };
 pub use io::{BufferedReader, BufferedWriter, MemoryStream};
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};
