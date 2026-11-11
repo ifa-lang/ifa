@@ -723,6 +723,7 @@ use ifa_runtime::GLOBAL_SCHEDULER;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub type HttpHandler = Arc<dyn Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static>;
 
@@ -1019,26 +1020,72 @@ impl HttpServer {
                 if let Ok(Some((mut stream, _))) = listener.try_accept() {
                     let router_worker = Arc::clone(&router);
                     GLOBAL_SCHEDULER.spawn(move || {
-                        let mut buf = vec![0u8; 8192];
-                        if let Ok(n) = stream.read(&mut buf) {
-                            if n > 0 {
-                                let res = match HttpRequest::parse_from_wire(&buf[..n]) {
-                                    Ok((mut req, _)) => {
-                                        if let Some((route, params)) =
-                                            router_worker.match_route(&req.method, &req.path)
-                                        {
-                                            req.path_params = params;
-                                            (route.handler)(&req)
-                                        } else {
-                                            HttpResponse::not_found().text("Route not found")
+                        let mut buf = vec![0u8; 16384];
+                        let mut total_read = 0;
+                        let mut spins = 0;
+                        let mut last_activity = Instant::now();
+
+                        loop {
+                            match stream.try_read(&mut buf[total_read..]) {
+                                Ok(Some(0)) => break,
+                                Ok(Some(n)) => {
+                                    total_read += n;
+                                    spins = 0;
+                                    last_activity = Instant::now();
+
+                                    while total_read > 0 {
+                                        match HttpRequest::parse_from_wire(&buf[..total_read]) {
+                                            Ok((mut req, consumed)) => {
+                                                let keep_alive =
+                                                    http_should_keep_alive(200, &req.headers);
+                                                let mut res = if let Some((route, params)) =
+                                                    router_worker
+                                                        .match_route(&req.method, &req.path)
+                                                {
+                                                    req.path_params = params;
+                                                    (route.handler)(&req)
+                                                } else {
+                                                    HttpResponse::not_found()
+                                                        .text("Route not found")
+                                                };
+
+                                                if keep_alive {
+                                                    res.headers.set("Connection", "keep-alive");
+                                                } else {
+                                                    res.headers.set("Connection", "close");
+                                                }
+
+                                                let wire = res.to_wire_bytes();
+                                                if stream.write_all(&wire).is_err() {
+                                                    return;
+                                                }
+
+                                                buf.copy_within(consumed..total_read, 0);
+                                                total_read -= consumed;
+
+                                                if !keep_alive {
+                                                    return;
+                                                }
+                                            }
+                                            Err(_) => {
+                                                // Incomplete request body or headers, await more bytes
+                                                break;
+                                            }
                                         }
                                     }
-                                    Err(err) => HttpResponse::bad_request()
-                                        .text(format!("Invalid HTTP request: {}", err)),
-                                };
-
-                                let wire = res.to_wire_bytes();
-                                let _ = stream.write_all(&wire);
+                                }
+                                Ok(None) | Err(_) => {
+                                    spins += 1;
+                                    if spins < 32 {
+                                        std::hint::spin_loop();
+                                    } else {
+                                        if last_activity.elapsed() > Duration::from_secs(30) {
+                                            break;
+                                        }
+                                        GLOBAL_SCHEDULER.yield_now();
+                                        std::thread::sleep(Duration::from_millis(1));
+                                    }
+                                }
                             }
                         }
                     });
@@ -1058,6 +1105,83 @@ impl HttpServer {
     }
 }
 
+/// Read an HTTP response from an async TCP stream over colorless fibers.
+pub fn read_http_response(stream: &mut AsyncTcpStream) -> io::Result<HttpResponse> {
+    let mut buf = vec![0u8; 16384];
+    let mut total_read = 0;
+    let mut spins = 0;
+    let start = Instant::now();
+
+    loop {
+        match stream.try_read(&mut buf[total_read..]) {
+            Ok(Some(0)) => {
+                // Connection closed by peer
+                if total_read > 0 {
+                    if let Ok((resp, _)) = HttpResponse::parse_from_wire(&buf[..total_read]) {
+                        return Ok(resp);
+                    }
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Connection closed by server",
+                ));
+            }
+            Ok(Some(n)) => {
+                total_read += n;
+                if let Ok((resp, _)) = HttpResponse::parse_from_wire(&buf[..total_read]) {
+                    return Ok(resp);
+                }
+                if total_read == buf.len() {
+                    buf.resize(buf.len() * 2, 0);
+                }
+                spins = 0;
+            }
+            Ok(None) | Err(_) => {
+                spins += 1;
+                if spins < 32 {
+                    std::hint::spin_loop();
+                } else {
+                    if start.elapsed() > Duration::from_secs(15) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "HTTP response timed out waiting for data",
+                        ));
+                    }
+                    GLOBAL_SCHEDULER.yield_now();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+}
+
+/// Determine whether an HTTP request or response permits socket reuse under RFC 7230 Keep-Alive rules.
+pub fn http_should_keep_alive(status_code: u16, headers: &HttpHeaders) -> bool {
+    if let Some(conn) = headers.get("connection") {
+        let val = conn.to_ascii_lowercase();
+        if val.contains("close") {
+            return false;
+        }
+        if val.contains("keep-alive") {
+            return true;
+        }
+    }
+    // 204 No Content or 304 Not Modified have no message body
+    if status_code == 204 || status_code == 304 {
+        return true;
+    }
+    // Must have deterministic framing (Content-Length or chunked Transfer-Encoding)
+    if headers.has("content-length") {
+        return true;
+    }
+    if let Some(te) = headers.get("transfer-encoding") {
+        if te.to_ascii_lowercase().contains("chunked") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Asynchronous non-blocking HTTP client running over colorless fibers.
 pub struct HttpClient;
 
@@ -1071,42 +1195,7 @@ impl HttpClient {
         let mut stream = AsyncTcpStream::connect(format!("{}:{}", host, port))?;
         let wire = req.to_wire_bytes();
         stream.write_all(&wire)?;
-
-        let mut buf = vec![0u8; 16384];
-        let mut total_read = 0;
-        let mut spins = 0;
-
-        loop {
-            match stream.try_read(&mut buf[total_read..]) {
-                Ok(Some(0)) => {
-                    // Connection closed by peer
-                    if total_read > 0 {
-                        if let Ok((resp, _)) = HttpResponse::parse_from_wire(&buf[..total_read]) {
-                            return Ok(resp);
-                        }
-                    }
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "Connection closed by server",
-                    ));
-                }
-                Ok(Some(n)) => {
-                    total_read += n;
-                    if let Ok((resp, _)) = HttpResponse::parse_from_wire(&buf[..total_read]) {
-                        return Ok(resp);
-                    }
-                }
-                Ok(None) | Err(_) => {
-                    spins += 1;
-                    if spins < 32 {
-                        std::hint::spin_loop();
-                    } else {
-                        GLOBAL_SCHEDULER.yield_now();
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                }
-            }
-        }
+        read_http_response(&mut stream)
     }
 
     /// Execute a non-blocking GET request.
@@ -2150,6 +2239,323 @@ impl HttpProxyGateway {
     }
 }
 
+// -------------------------------------------------------------
+// HTTP CONNECTION POOLING (KEEP-ALIVE & SOCKET REUSE)
+// -------------------------------------------------------------
+
+/// Configuration options for the HTTP Keep-Alive connection pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpConnectionPoolConfig {
+    /// Maximum idle connections preserved per host:port endpoint.
+    pub max_idle_per_host: usize,
+    /// Maximum total connections (active + idle) across all hosts.
+    pub max_total_conns: usize,
+    /// Idle connection lifetime in milliseconds before automatic expiration.
+    pub idle_timeout_ms: u64,
+}
+
+impl Default for HttpConnectionPoolConfig {
+    fn default() -> Self {
+        Self {
+            max_idle_per_host: 8,
+            max_total_conns: 64,
+            idle_timeout_ms: 15_000,
+        }
+    }
+}
+
+impl HttpConnectionPoolConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn max_idle_per_host(mut self, max: usize) -> Self {
+        self.max_idle_per_host = max.max(1);
+        self
+    }
+
+    pub fn max_total_conns(mut self, max: usize) -> Self {
+        self.max_total_conns = max.max(1);
+        self
+    }
+
+    pub fn idle_timeout_ms(mut self, ms: u64) -> Self {
+        self.idle_timeout_ms = ms;
+        self
+    }
+}
+
+/// A pooled socket wrapper tracking connection lifecycle and utilization.
+pub struct PooledConnection {
+    pub stream: AsyncTcpStream,
+    pub host: String,
+    pub port: u16,
+    pub created_at: Instant,
+    pub last_used_at: Instant,
+    pub use_count: usize,
+}
+
+impl PooledConnection {
+    pub fn new(stream: AsyncTcpStream, host: impl Into<String>, port: u16) -> Self {
+        let now = Instant::now();
+        Self {
+            stream,
+            host: host.into(),
+            port,
+            created_at: now,
+            last_used_at: now,
+            use_count: 0,
+        }
+    }
+
+    /// Check if idle duration exceeds given timeout.
+    pub fn is_idle_expired(&self, timeout: Duration) -> bool {
+        self.last_used_at.elapsed() >= timeout
+    }
+
+    /// Check if underlying TCP socket is open and healthy.
+    pub fn is_healthy(&mut self) -> bool {
+        let mut buf = [0u8; 1];
+        match self.stream.try_read(&mut buf) {
+            Ok(Some(0)) => false, // EOF / closed by remote peer
+            Ok(Some(_)) => false, // Unexpected unconsumed byte
+            Ok(None) => true,     // Open and waiting (WouldBlock)
+            Err(_) => false,      // Socket error
+        }
+    }
+}
+
+/// HTTP Keep-Alive connection pool managing reusable TCP connections per host.
+pub struct HttpConnectionPool {
+    config: HttpConnectionPoolConfig,
+    idle_conns: BTreeMap<(String, u16), Vec<PooledConnection>>,
+    active_counts: BTreeMap<(String, u16), usize>,
+    total_acquired: usize,
+    total_reused: usize,
+}
+
+impl Default for HttpConnectionPool {
+    fn default() -> Self {
+        Self::new(HttpConnectionPoolConfig::default())
+    }
+}
+
+impl HttpConnectionPool {
+    pub fn new(config: HttpConnectionPoolConfig) -> Self {
+        Self {
+            config,
+            idle_conns: BTreeMap::new(),
+            active_counts: BTreeMap::new(),
+            total_acquired: 0,
+            total_reused: 0,
+        }
+    }
+
+    pub fn config(&self) -> &HttpConnectionPoolConfig {
+        &self.config
+    }
+
+    pub fn idle_count(&self, host: &str, port: u16) -> usize {
+        self.idle_conns
+            .get(&(host.to_string(), port))
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
+    pub fn active_count(&self, host: &str, port: u16) -> usize {
+        self.active_counts
+            .get(&(host.to_string(), port))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn total_idle(&self) -> usize {
+        self.idle_conns.values().map(|v| v.len()).sum()
+    }
+
+    pub fn total_active(&self) -> usize {
+        self.active_counts.values().sum()
+    }
+
+    pub fn total_acquired(&self) -> usize {
+        self.total_acquired
+    }
+
+    pub fn total_reused(&self) -> usize {
+        self.total_reused
+    }
+
+    /// Prune expired and closed idle connections. Returns number of purged sockets.
+    pub fn prune_idle(&mut self) -> usize {
+        let timeout = Duration::from_millis(self.config.idle_timeout_ms);
+        let mut purged = 0;
+        for list in self.idle_conns.values_mut() {
+            let before = list.len();
+            list.retain_mut(|conn| !conn.is_idle_expired(timeout) && conn.is_healthy());
+            purged += before - list.len();
+        }
+        purged
+    }
+
+    /// Clear and close all idle sockets in the pool.
+    pub fn clear(&mut self) {
+        self.idle_conns.clear();
+        self.active_counts.clear();
+    }
+
+    /// Acquire a reusable connection from the pool, or establish a new TCP stream.
+    pub fn acquire(&mut self, host: &str, port: u16) -> io::Result<PooledConnection> {
+        let timeout = Duration::from_millis(self.config.idle_timeout_ms);
+        let key = (host.to_string(), port);
+
+        // Check idle pool for a live, unexpired socket
+        if let Some(list) = self.idle_conns.get_mut(&key) {
+            while let Some(mut conn) = list.pop() {
+                if !conn.is_idle_expired(timeout) && conn.is_healthy() {
+                    conn.use_count += 1;
+                    conn.last_used_at = Instant::now();
+                    self.total_reused += 1;
+                    self.total_acquired += 1;
+                    *self.active_counts.entry(key).or_insert(0) += 1;
+                    return Ok(conn);
+                }
+            }
+        }
+
+        // Establish new connection
+        let stream = AsyncTcpStream::connect(format!("{}:{}", host, port))?;
+        let mut conn = PooledConnection::new(stream, host, port);
+        conn.use_count = 1;
+        self.total_acquired += 1;
+        *self.active_counts.entry(key).or_insert(0) += 1;
+        Ok(conn)
+    }
+
+    /// Release an acquired connection back to the pool, or drop it if Keep-Alive is disabled or expired.
+    pub fn release(&mut self, mut conn: PooledConnection, can_reuse: bool) {
+        let key = (conn.host.clone(), conn.port);
+        if let Some(count) = self.active_counts.get_mut(&key) {
+            if *count > 0 {
+                *count -= 1;
+            }
+        }
+
+        let timeout = Duration::from_millis(self.config.idle_timeout_ms);
+        let total_idle = self.total_idle();
+        if can_reuse && !conn.is_idle_expired(timeout) && total_idle < self.config.max_total_conns {
+            let host_idle = self.idle_conns.entry(key).or_default();
+            if host_idle.len() < self.config.max_idle_per_host {
+                conn.last_used_at = Instant::now();
+                host_idle.push(conn);
+            }
+        }
+        // Connection dropped and closed automatically
+    }
+
+    /// Send an HTTP request reusing pooled connections and handling transparent Keep-Alive retry.
+    pub fn send_request(
+        &mut self,
+        req: &HttpRequest,
+        host: &str,
+        port: u16,
+    ) -> io::Result<HttpResponse> {
+        let mut req_wire = req.clone();
+        if !req_wire.headers.has("connection") {
+            req_wire.headers.set("Connection", "keep-alive");
+        }
+        if !req_wire.headers.has("host") {
+            if port == 80 || port == 443 {
+                req_wire.headers.set("Host", host);
+            } else {
+                req_wire.headers.set("Host", format!("{}:{}", host, port));
+            }
+        }
+
+        let wire = req_wire.to_wire_bytes();
+        let mut conn = self.acquire(host, port)?;
+
+        let write_res = conn.stream.write_all(&wire);
+        let was_reused = conn.use_count > 1;
+
+        let (conn, resp_res) = if write_res.is_err() && was_reused {
+            self.release(conn, false);
+            let mut fresh_conn = self.acquire(host, port)?;
+            let fresh_write = fresh_conn.stream.write_all(&wire);
+            if let Err(e) = fresh_write {
+                self.release(fresh_conn, false);
+                return Err(e);
+            }
+            let resp = read_http_response(&mut fresh_conn.stream);
+            (fresh_conn, resp)
+        } else if let Err(e) = write_res {
+            self.release(conn, false);
+            return Err(e);
+        } else {
+            let resp = read_http_response(&mut conn.stream);
+            if resp.is_err() && was_reused {
+                self.release(conn, false);
+                let mut fresh_conn = self.acquire(host, port)?;
+                let fresh_write = fresh_conn.stream.write_all(&wire);
+                if let Err(e) = fresh_write {
+                    self.release(fresh_conn, false);
+                    return Err(e);
+                }
+                let fresh_resp = read_http_response(&mut fresh_conn.stream);
+                (fresh_conn, fresh_resp)
+            } else {
+                (conn, resp)
+            }
+        };
+
+        match resp_res {
+            Ok(resp) => {
+                let can_reuse = http_should_keep_alive(resp.status.0, &resp.headers);
+                self.release(conn, can_reuse);
+                Ok(resp)
+            }
+            Err(e) => {
+                self.release(conn, false);
+                Err(e)
+            }
+        }
+    }
+}
+
+impl HttpClient {
+    /// Send request utilizing an external connection pool.
+    pub fn send_pooled(
+        &self,
+        pool: &mut HttpConnectionPool,
+        req: &HttpRequest,
+        host: &str,
+        port: u16,
+    ) -> io::Result<HttpResponse> {
+        pool.send_request(req, host, port)
+    }
+}
+
+impl HttpProxyGateway {
+    /// Forward an incoming request to an upstream backend reusing a connection pool.
+    pub fn forward_pooled(
+        &self,
+        pool: &mut HttpConnectionPool,
+        req: &HttpRequest,
+        client_ip: &str,
+        client_proto: &str,
+        backend: &UpstreamBackend,
+    ) -> io::Result<HttpResponse> {
+        let upstream_req = self.prepare_upstream_request(
+            req,
+            client_ip,
+            client_proto,
+            &backend.host,
+            backend.port,
+        );
+        let upstream_resp = pool.send_request(&upstream_req, &backend.host, backend.port)?;
+        Ok(self.prepare_client_response(upstream_resp))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2775,5 +3181,84 @@ mod tests {
         assert!(!client_resp.headers.has("keep-alive"));
         assert_eq!(client_resp.headers.get("via"), Some("1.1 ifa-gateway"));
         assert_eq!(client_resp.body_str().unwrap(), "{\"status\":\"created\"}");
+    }
+
+    #[test]
+    fn test_http_connection_pool_keep_alive_and_socket_reuse() {
+        // 1. Config validation
+        let config = HttpConnectionPoolConfig::new()
+            .max_idle_per_host(4)
+            .max_total_conns(16)
+            .idle_timeout_ms(5000);
+        assert_eq!(config.max_idle_per_host, 4);
+        assert_eq!(config.max_total_conns, 16);
+        assert_eq!(config.idle_timeout_ms, 5000);
+
+        // 2. Start HTTP server supporting Keep-Alive
+        let mut server = HttpServer::new(0);
+        server.get("/api/ping", |_req| {
+            HttpResponse::ok()
+                .text("pong")
+                .header("Content-Type", "text/plain")
+        });
+        server.get("/api/data", |_req| {
+            HttpResponse::ok()
+                .text("{\"ok\":true}")
+                .header("Content-Type", "application/json")
+        });
+
+        let bound_addr = server.listen_background().expect("Server listen failed");
+        let port = bound_addr.port();
+
+        // 3. Connection pool execution
+        let mut pool = HttpConnectionPool::new(config);
+        assert_eq!(pool.total_idle(), 0);
+        assert_eq!(pool.total_active(), 0);
+        assert_eq!(pool.total_acquired(), 0);
+        assert_eq!(pool.total_reused(), 0);
+
+        let req1 = HttpRequest::new(HttpMethod::Get, "/api/ping");
+        let resp1 = pool
+            .send_request(&req1, "127.0.0.1", port)
+            .expect("First pooled request failed");
+        assert_eq!(resp1.status, HttpStatus::OK);
+        assert_eq!(resp1.body_str().unwrap(), "pong");
+        assert_eq!(pool.total_acquired(), 1);
+        assert_eq!(pool.total_reused(), 0);
+        assert_eq!(pool.total_idle(), 1);
+        assert_eq!(pool.idle_count("127.0.0.1", port), 1);
+        assert_eq!(pool.total_active(), 0);
+
+        // 4. Second request on same host:port should reuse the idle socket
+        let req2 = HttpRequest::new(HttpMethod::Get, "/api/data");
+        let resp2 = pool
+            .send_request(&req2, "127.0.0.1", port)
+            .expect("Second pooled request failed");
+        assert_eq!(resp2.status, HttpStatus::OK);
+        assert_eq!(resp2.body_str().unwrap(), "{\"ok\":true}");
+        assert_eq!(pool.total_acquired(), 2);
+        assert_eq!(pool.total_reused(), 1);
+        assert_eq!(pool.total_idle(), 1);
+
+        // 5. Third request via HttpClient::send_pooled
+        let client = HttpClient::new();
+        let resp3 = client
+            .send_pooled(&mut pool, &req1, "127.0.0.1", port)
+            .expect("Third pooled request failed");
+        assert_eq!(resp3.status, HttpStatus::OK);
+        assert_eq!(resp3.body_str().unwrap(), "pong");
+        assert_eq!(pool.total_acquired(), 3);
+        assert_eq!(pool.total_reused(), 2);
+
+        // 6. Test prune_idle & clear
+        let pruned = pool.prune_idle();
+        assert_eq!(pruned, 0); // Not expired yet
+        assert_eq!(pool.total_idle(), 1);
+
+        pool.clear();
+        assert_eq!(pool.total_idle(), 0);
+        assert_eq!(pool.total_active(), 0);
+
+        server.stop();
     }
 }

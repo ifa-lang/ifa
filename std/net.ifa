@@ -139,6 +139,26 @@ pub struct HttpProxyGateway {
     preserve_host: bool
 }
 
+pub struct HttpPooledConnection {
+    id: i64,
+    host: String,
+    port: i64,
+    created_at: i64,
+    last_used_at: i64,
+    use_count: i64,
+    is_active: bool
+}
+
+pub struct HttpConnectionPool {
+    max_idle_per_host: i64,
+    max_total_conns: i64,
+    idle_timeout_ms: i64,
+    connections: List<HttpPooledConnection>,
+    next_conn_id: i64,
+    total_acquired: i64,
+    total_reused: i64
+}
+
 pub fn make_http_header(name: String, value: String) -> HttpHeader {
     return HttpHeader(name: name, value: value);
 }
@@ -4938,6 +4958,339 @@ pub fn http_proxy_sanitize_response(gateway: HttpProxyGateway, resp: HttpRespons
     );
 }
 
+pub fn make_http_pooled_connection(id: i64, host: String, port: i64, created_at: i64) -> HttpPooledConnection {
+    return HttpPooledConnection(
+        id: id,
+        host: host,
+        port: port,
+        created_at: created_at,
+        last_used_at: created_at,
+        use_count: 1,
+        is_active: true
+    );
+}
+
+pub fn make_http_connection_pool(max_idle_per_host: i64, max_total_conns: i64, idle_timeout_ms: i64) -> HttpConnectionPool {
+    return HttpConnectionPool(
+        max_idle_per_host: max_idle_per_host,
+        max_total_conns: max_total_conns,
+        idle_timeout_ms: idle_timeout_ms,
+        connections: List::new(),
+        next_conn_id: 1,
+        total_acquired: 0,
+        total_reused: 0
+    );
+}
+
+pub fn connection_pool_idle_count(pool: HttpConnectionPool, host: String, port: i64) -> i64 {
+    mut count: i64 = 0;
+    mut i: i64 = 0;
+    while i < pool.connections.len() {
+        let c = pool.connections[i];
+        if c.host == host && c.port == port && !c.is_active {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+pub fn connection_pool_active_count(pool: HttpConnectionPool, host: String, port: i64) -> i64 {
+    mut count: i64 = 0;
+    mut i: i64 = 0;
+    while i < pool.connections.len() {
+        let c = pool.connections[i];
+        if c.host == host && c.port == port && c.is_active {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+pub fn connection_pool_total_idle(pool: HttpConnectionPool) -> i64 {
+    mut count: i64 = 0;
+    mut i: i64 = 0;
+    while i < pool.connections.len() {
+        if !pool.connections[i].is_active {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+pub fn connection_pool_total_active(pool: HttpConnectionPool) -> i64 {
+    mut count: i64 = 0;
+    mut i: i64 = 0;
+    while i < pool.connections.len() {
+        if pool.connections[i].is_active {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+pub fn connection_pool_prune_expired(inout pool: HttpConnectionPool, now_ms: i64) -> i64 {
+    mut kept: List<HttpPooledConnection> = List::new();
+    mut purged: i64 = 0;
+    mut i: i64 = 0;
+    while i < pool.connections.len() {
+        let c = pool.connections[i];
+        if !c.is_active && (now_ms - c.last_used_at >= pool.idle_timeout_ms) {
+            purged = purged + 1;
+        } else {
+            kept.push(c);
+        }
+        i = i + 1;
+    }
+    pool.connections = kept;
+    return purged;
+}
+
+pub fn connection_pool_acquire(inout pool: HttpConnectionPool, host: String, port: i64, now_ms: i64) -> HttpPooledConnection {
+    mut target_idx: i64 = -1;
+    mut i: i64 = 0;
+    while i < pool.connections.len() {
+        let c = pool.connections[i];
+        if c.host == host && c.port == port && !c.is_active {
+            if now_ms - c.last_used_at < pool.idle_timeout_ms {
+                target_idx = i;
+                i = pool.connections.len();
+            }
+        }
+        i = i + 1;
+    }
+
+    if target_idx >= 0 {
+        mut updated: List<HttpPooledConnection> = List::new();
+        mut reused_conn = pool.connections[target_idx];
+        reused_conn.is_active = true;
+        reused_conn.last_used_at = now_ms;
+        reused_conn.use_count = reused_conn.use_count + 1;
+
+        mut j: i64 = 0;
+        while j < pool.connections.len() {
+            if j == target_idx {
+                updated.push(reused_conn);
+            } else {
+                updated.push(pool.connections[j]);
+            }
+            j = j + 1;
+        }
+        pool.connections = updated;
+        pool.total_acquired = pool.total_acquired + 1;
+        pool.total_reused = pool.total_reused + 1;
+        return reused_conn;
+    }
+
+    let conn_id = pool.next_conn_id;
+    pool.next_conn_id = pool.next_conn_id + 1;
+    let new_conn = HttpPooledConnection(
+        id: conn_id,
+        host: host,
+        port: port,
+        created_at: now_ms,
+        last_used_at: now_ms,
+        use_count: 1,
+        is_active: true
+    );
+
+    pool.connections.push(new_conn);
+    pool.total_acquired = pool.total_acquired + 1;
+    return new_conn;
+}
+
+pub fn connection_pool_release(inout pool: HttpConnectionPool, conn: HttpPooledConnection, can_reuse: bool, now_ms: i64) {
+    mut updated: List<HttpPooledConnection> = List::new();
+    let cur_idle_count = connection_pool_idle_count(pool, conn.host, conn.port);
+    let cur_total_idle = connection_pool_total_idle(pool);
+
+    let should_keep = can_reuse
+        && (now_ms - conn.last_used_at < pool.idle_timeout_ms)
+        && (cur_idle_count < pool.max_idle_per_host)
+        && (cur_total_idle < pool.max_total_conns);
+
+    mut i: i64 = 0;
+    while i < pool.connections.len() {
+        let c = pool.connections[i];
+        if c.id == conn.id {
+            if should_keep {
+                mut idle_conn = c;
+                idle_conn.is_active = false;
+                idle_conn.last_used_at = now_ms;
+                updated.push(idle_conn);
+            }
+        } else {
+            updated.push(c);
+        }
+        i = i + 1;
+    }
+    pool.connections = updated;
+}
+
+pub fn connection_pool_clear(inout pool: HttpConnectionPool) {
+    pool.connections = List::new();
+}
+
+pub fn http_should_keep_alive(status_code: i64, headers: List<HttpHeader>) -> bool {
+    mut i: i64 = 0;
+    mut has_close: bool = false;
+    mut has_keep_alive: bool = false;
+    mut has_content_length: bool = false;
+    mut has_chunked: bool = false;
+
+    while i < headers.len() {
+        let h = headers[i];
+        let name_lower = string_to_lower(h.name);
+        let val_lower = string_to_lower(h.value);
+        if name_lower == "connection" {
+            if string_contains(val_lower, "close") {
+                has_close = true;
+            }
+            if string_contains(val_lower, "keep-alive") {
+                has_keep_alive = true;
+            }
+        }
+        if name_lower == "content-length" {
+            has_content_length = true;
+        }
+        if name_lower == "transfer-encoding" && string_contains(val_lower, "chunked") {
+            has_chunked = true;
+        }
+        i = i + 1;
+    }
+
+    if has_close {
+        return false;
+    }
+    if has_keep_alive {
+        return true;
+    }
+    if status_code == 204 || status_code == 304 {
+        return true;
+    }
+    if has_content_length || has_chunked {
+        return true;
+    }
+    return false;
+}
+
+pub fn test_net_http_connection_pooling_and_keep_alive() -> bool {
+    // 1. Initialize Connection Pool
+    mut pool = make_http_connection_pool(2, 4, 10000);
+    if connection_pool_total_idle(pool) != 0
+        || connection_pool_total_active(pool) != 0
+        || pool.total_acquired != 0
+        || pool.total_reused != 0 {
+        return false;
+    }
+
+    // 2. First acquisition
+    let c1 = connection_pool_acquire(pool, "api.internal", 8080, 1000);
+    if c1.id != 1 || c1.use_count != 1 || !c1.is_active {
+        return false;
+    }
+    if pool.total_acquired != 1 || pool.total_reused != 0 {
+        return false;
+    }
+    if connection_pool_active_count(pool, "api.internal", 8080) != 1
+        || connection_pool_idle_count(pool, "api.internal", 8080) != 0 {
+        return false;
+    }
+
+    // 3. Release c1 with keep-alive
+    connection_pool_release(pool, c1, true, 1050);
+    if connection_pool_active_count(pool, "api.internal", 8080) != 0
+        || connection_pool_idle_count(pool, "api.internal", 8080) != 1 {
+        return false;
+    }
+
+    // 4. Second acquisition: should reuse c1
+    let c2 = connection_pool_acquire(pool, "api.internal", 8080, 1100);
+    if c2.id != 1 || c2.use_count != 2 || !c2.is_active {
+        return false;
+    }
+    if pool.total_acquired != 2 || pool.total_reused != 1 {
+        return false;
+    }
+    if connection_pool_idle_count(pool, "api.internal", 8080) != 0 {
+        return false;
+    }
+
+    // 5. Concurrent acquisition for same host: establishes new connection c3
+    let c3 = connection_pool_acquire(pool, "api.internal", 8080, 1150);
+    if c3.id != 2 || c3.use_count != 1 || !c3.is_active {
+        return false;
+    }
+    if connection_pool_active_count(pool, "api.internal", 8080) != 2 {
+        return false;
+    }
+
+    // 6. Release both connections
+    connection_pool_release(pool, c2, true, 1200);
+    connection_pool_release(pool, c3, true, 1210);
+    if connection_pool_idle_count(pool, "api.internal", 8080) != 2
+        || connection_pool_total_idle(pool) != 2 {
+        return false;
+    }
+
+    // 7. Acquire connection for another endpoint
+    let c4 = connection_pool_acquire(pool, "db.internal", 5432, 1250);
+    if c4.id != 3 || c4.use_count != 1 {
+        return false;
+    }
+    connection_pool_release(pool, c4, true, 1260);
+    if connection_pool_total_idle(pool) != 3 {
+        return false;
+    }
+
+    // 8. Test idle timeout expiration: at t = 13000 ms, (13000 - 1200 = 11800 ms > 10000 ms)
+    let purged = connection_pool_prune_expired(pool, 13000);
+    if purged != 3 || connection_pool_total_idle(pool) != 0 {
+        return false;
+    }
+
+    // 9. RFC 7230 Keep-Alive determination rules
+    mut headers_close: List<HttpHeader> = List::new();
+    headers_close.push(make_http_header("Connection", "close"));
+    headers_close.push(make_http_header("Content-Length", "50"));
+    if http_should_keep_alive(200, headers_close) {
+        return false;
+    }
+
+    mut headers_keep: List<HttpHeader> = List::new();
+    headers_keep.push(make_http_header("Connection", "keep-alive"));
+    if !http_should_keep_alive(200, headers_keep) {
+        return false;
+    }
+
+    mut headers_chunked: List<HttpHeader> = List::new();
+    headers_chunked.push(make_http_header("Transfer-Encoding", "chunked"));
+    if !http_should_keep_alive(200, headers_chunked) {
+        return false;
+    }
+
+    mut headers_204: List<HttpHeader> = List::new();
+    if !http_should_keep_alive(204, headers_204) {
+        return false;
+    }
+
+    mut headers_none: List<HttpHeader> = List::new();
+    if http_should_keep_alive(200, headers_none) {
+        return false;
+    }
+
+    // 10. Clear pool
+    connection_pool_clear(pool);
+    if pool.connections.len() != 0 {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn test_net_http_reverse_proxy_gateway_and_load_balancer() -> bool {
     // 1. Hop-by-hop headers
     if !http_is_hop_by_hop_header("Connection")
@@ -5098,7 +5451,8 @@ pub fn test_net_all() -> bool {
     && test_net_http_router_dynamic_params_and_websocket_handshake()
     && test_net_websocket_frame_demux_and_fragmentation()
     && test_net_rate_limiting_and_mime_resolver()
-    && test_net_http_reverse_proxy_gateway_and_load_balancer();
+    && test_net_http_reverse_proxy_gateway_and_load_balancer()
+    && test_net_http_connection_pooling_and_keep_alive();
 }
 
 pub fn main() {
@@ -5131,7 +5485,8 @@ pub fn main() {
     let t27 = test_net_websocket_frame_demux_and_fragmentation();
     let t28 = test_net_rate_limiting_and_mime_resolver();
     let t29 = test_net_http_reverse_proxy_gateway_and_load_balancer();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 {
+    let t30 = test_net_http_connection_pooling_and_keep_alive();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");

@@ -1968,13 +1968,18 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_net_http_connection_pooling_and_keep_alive ... ok"),
+        "Std net http connection pooling and keep alive test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("261 passed; 0 failed"),
-        "Expected 261 passed std unit tests, got:\n{}",
+        stdout.contains("263 passed; 0 failed"),
+        "Expected 263 passed std unit tests, got:\n{}",
         stdout
     );
 }
