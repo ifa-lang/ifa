@@ -586,6 +586,7 @@ impl BuildOrchestrator {
         let mut symbols = SymbolTable::new();
         let mut sub_firs = Vec::new();
         let mut loaded_modules = std::collections::HashSet::new();
+        let mut extra_diagnostics = Vec::new();
 
         // Multi-pass resolution: retry unresolved modules if earlier modules had forward dependencies
         let mut resolved_any = true;
@@ -606,10 +607,14 @@ impl BuildOrchestrator {
                             let sub_fid = source_map.add_file(sub_path.to_string_lossy(), &sub_src);
                             let sub_toks = tokenize(sub_fid, &sub_src);
                             let (sub_prog, sub_diags) = parse(sub_fid, sub_toks);
-                            if sub_diags.is_empty() {
+                            if !sub_diags.is_empty() {
+                                extra_diagnostics.extend(sub_diags);
+                            } else {
                                 let sub_res =
                                     analyze_with_symbols(source_map, &sub_prog, symbols.clone());
-                                if !sub_res.has_errors() {
+                                if sub_res.has_errors() {
+                                    extra_diagnostics.extend(sub_res.diagnostics);
+                                } else {
                                     if let Ok(sub_fir) =
                                         compile_to_fir(&sub_prog, &sub_res.symbols, true, true)
                                     {
@@ -658,7 +663,8 @@ impl BuildOrchestrator {
             }
         }
 
-        let analysis = analyze_with_symbols(source_map, prog, symbols);
+        let mut analysis = analyze_with_symbols(source_map, prog, symbols);
+        analysis.diagnostics.extend(extra_diagnostics);
         (analysis, sub_firs)
     }
 
