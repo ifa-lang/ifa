@@ -544,7 +544,9 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            let analysis = analyze(&source_map, &prog);
+            let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
+            let (analysis, _) =
+                BuildOrchestrator::analyze_with_local_modules(&mut source_map, base_dir, &prog);
             for diag in &analysis.diagnostics {
                 eprint!("{}", diag.render_to_string(&source_map));
             }
@@ -761,7 +763,9 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            let analysis = analyze(&source_map, &prog);
+            let base_dir = target_file.parent().unwrap_or_else(|| Path::new("."));
+            let (analysis, sub_firs) =
+                BuildOrchestrator::analyze_with_local_modules(&mut source_map, base_dir, &prog);
             if !analysis.diagnostics.is_empty() {
                 for diag in &analysis.diagnostics {
                     eprint!("{}", diag.render_to_string(&source_map));
@@ -772,7 +776,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            let fir_module = match compile_to_fir(&prog, &analysis.symbols, true, true) {
+            let mut fir_module = match compile_to_fir(&prog, &analysis.symbols, true, true) {
                 Ok(m) => m,
                 Err(errors) => {
                     for err in errors {
@@ -781,6 +785,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+
+            for sub_fir in sub_firs {
+                fir_module.merge(sub_fir);
+            }
 
             if native {
                 match JitEngine::new() {
@@ -903,7 +911,9 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            let analysis = analyze(&source_map, &prog);
+            let base_dir = target_file.parent().unwrap_or_else(|| Path::new("."));
+            let (analysis, sub_firs) =
+                BuildOrchestrator::analyze_with_local_modules(&mut source_map, base_dir, &prog);
             if !analysis.diagnostics.is_empty() {
                 for diag in &analysis.diagnostics {
                     eprint!("{}", diag.render_to_string(&source_map));
@@ -914,7 +924,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            let fir_module = match compile_to_fir(&prog, &analysis.symbols, true, true) {
+            let mut fir_module = match compile_to_fir(&prog, &analysis.symbols, true, true) {
                 Ok(m) => m,
                 Err(errors) => {
                     for err in errors {
@@ -923,6 +933,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+
+            for sub_fir in sub_firs {
+                fir_module.merge(sub_fir);
+            }
 
             let default_stem = target_file
                 .file_stem()

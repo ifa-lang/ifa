@@ -604,3 +604,98 @@ world host {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_cli_run_and_build_with_local_submodule() {
+    let temp_dir = std::env::temp_dir().join(format!("ifa_cli_submod_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(temp_dir.join("helpers")).unwrap();
+
+    let submod_code = r#"pub fn calculate(a: i64, b: i64) -> i64 {
+    return a * b + 42;
+}
+"#;
+    fs::write(temp_dir.join("helpers").join("math.ifa"), submod_code).unwrap();
+
+    let main_code = r#"import helpers::math;
+
+pub fn main() -> i64 {
+    let res: i64 = math::calculate(10, 5);
+    return res;
+}
+"#;
+    let main_file = temp_dir.join("main.ifa");
+    fs::write(&main_file, main_code).unwrap();
+
+    let ifa_bin = get_ifa_binary();
+
+    // 1. Test `ifa check`
+    let check_output = Command::new(&ifa_bin)
+        .arg("check")
+        .arg(&main_file)
+        .output()
+        .expect("Failed to execute `ifa check`");
+    assert!(
+        check_output.status.success(),
+        "ifa check failed: {}",
+        String::from_utf8_lossy(&check_output.stderr)
+    );
+
+    // 1.5. Test `ifa run` (FIR interpreter)
+    let interp_output = Command::new(&ifa_bin)
+        .arg("run")
+        .arg(&main_file)
+        .output()
+        .expect("Failed to execute `ifa run`");
+    eprintln!(
+        "interp_output stdout: '{}', stderr: '{}'",
+        String::from_utf8_lossy(&interp_output.stdout),
+        String::from_utf8_lossy(&interp_output.stderr)
+    );
+    let run_output = Command::new(&ifa_bin)
+        .arg("run")
+        .arg("--native")
+        .arg(&main_file)
+        .output()
+        .expect("Failed to execute `ifa run`");
+    eprintln!(
+        "run_output stdout: '{}', stderr: '{}'",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert!(
+        run_output.status.success(),
+        "ifa run failed: {}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    // 3. Test `ifa build` (AOT)
+    let out_bin = temp_dir.join("main_bin");
+    let build_output = Command::new(&ifa_bin)
+        .arg("build")
+        .arg(&main_file)
+        .arg("-o")
+        .arg(&out_bin)
+        .output()
+        .expect("Failed to execute `ifa build`");
+    assert!(
+        build_output.status.success(),
+        "ifa build failed: {}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    assert!(out_bin.exists());
+
+    // 4. Verify running the generated standalone binary
+    let exec_output = Command::new(&out_bin)
+        .output()
+        .expect("Failed to execute generated binary");
+    eprintln!(
+        "exec_output code: {:?}, stdout: '{}', stderr: '{}'",
+        exec_output.status.code(),
+        String::from_utf8_lossy(&exec_output.stdout),
+        String::from_utf8_lossy(&exec_output.stderr)
+    );
+    assert_eq!(exec_output.status.code(), Some(92));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

@@ -8,7 +8,7 @@ use crate::resolver::{DependencyResolver, ResolvedPackage};
 use ifa_ast::Item;
 use ifa_codegen_cranelift::AotCompiler;
 use ifa_codegen_llvm::{LlvmCompiler, LlvmTargetConfig};
-use ifa_fir::{compile_to_fir_with_opts, CacheLayoutPass, SroaPass};
+use ifa_fir::{compile_to_fir, compile_to_fir_with_opts, CacheLayoutPass, SroaPass};
 use ifa_lexer::tokenize;
 use ifa_parser::parse;
 use ifa_sema::{analyze, analyze_with_symbols, symbol_table::ModuleSymbol, SymbolTable};
@@ -574,6 +574,92 @@ impl BuildOrchestrator {
         }
 
         None
+    }
+
+    /// Analyzes an IFA AST program, automatically resolving imported local submodules
+    /// located relative to `base_dir` and lowering them to FIR modules.
+    pub fn analyze_with_local_modules(
+        source_map: &mut SourceMap,
+        base_dir: &Path,
+        prog: &ifa_ast::Program,
+    ) -> (ifa_sema::AnalysisResult, Vec<ifa_fir::FirModule>) {
+        let mut symbols = SymbolTable::new();
+        let mut sub_firs = Vec::new();
+        let mut loaded_modules = std::collections::HashSet::new();
+
+        // Multi-pass resolution: retry unresolved modules if earlier modules had forward dependencies
+        let mut resolved_any = true;
+        let mut attempts = 0;
+        while resolved_any && attempts < 4 {
+            resolved_any = false;
+            attempts += 1;
+
+            for item in &prog.items {
+                if let Item::Import(im) = item {
+                    let local_alias = im.alias.unwrap_or_else(|| *im.path.last().unwrap());
+                    if loaded_modules.contains(&local_alias) {
+                        continue;
+                    }
+
+                    if let Some(sub_path) = Self::resolve_module_file(base_dir, &im.path) {
+                        if let Ok(sub_src) = fs::read_to_string(&sub_path) {
+                            let sub_fid = source_map.add_file(sub_path.to_string_lossy(), &sub_src);
+                            let sub_toks = tokenize(sub_fid, &sub_src);
+                            let (sub_prog, sub_diags) = parse(sub_fid, sub_toks);
+                            if sub_diags.is_empty() {
+                                let sub_res =
+                                    analyze_with_symbols(source_map, &sub_prog, symbols.clone());
+                                if !sub_res.has_errors() {
+                                    if let Ok(sub_fir) =
+                                        compile_to_fir(&sub_prog, &sub_res.symbols, true, true)
+                                    {
+                                        sub_firs.push(sub_fir);
+                                    }
+                                    let path_str = im
+                                        .path
+                                        .iter()
+                                        .map(|s| INTERNER.resolve(s))
+                                        .collect::<Vec<_>>()
+                                        .join("::");
+                                    let path_sym = INTERNER.intern(&path_str);
+                                    let mut mod_sym =
+                                        symbols.modules.remove(&local_alias).unwrap_or_else(|| {
+                                            ModuleSymbol::new(
+                                                local_alias,
+                                                im.path.clone(),
+                                                true,
+                                                im.span,
+                                            )
+                                        });
+                                    for f in sub_res.symbols.functions.values() {
+                                        mod_sym.add_function(f.clone());
+                                    }
+                                    for s in sub_res.symbols.structs.values() {
+                                        mod_sym.add_struct(s.clone());
+                                    }
+                                    for e in sub_res.symbols.enums.values() {
+                                        mod_sym.add_enum(e.clone());
+                                    }
+                                    for c in sub_res.symbols.consts.values() {
+                                        mod_sym.add_const(c.clone());
+                                    }
+                                    symbols.modules.insert(local_alias, mod_sym.clone());
+                                    symbols.modules.insert(path_sym, mod_sym.clone());
+                                    if let Some(last) = im.path.last() {
+                                        symbols.modules.insert(*last, mod_sym);
+                                    }
+                                    loaded_modules.insert(local_alias);
+                                    resolved_any = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let analysis = analyze_with_symbols(source_map, prog, symbols);
+        (analysis, sub_firs)
     }
 
     fn compile_source_to_fir(

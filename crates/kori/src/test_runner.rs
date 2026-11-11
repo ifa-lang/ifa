@@ -9,7 +9,6 @@ use ifa_codegen_cranelift::JitEngine;
 use ifa_fir::{compile_to_fir, FirInterpreter, FirModule, FirType, FirValue};
 use ifa_lexer::tokenize;
 use ifa_parser::parse;
-use ifa_sema::{analyze, analyze_with_symbols, ModuleSymbol, SymbolTable};
 use ifa_span::{SourceMap, INTERNER};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -294,9 +293,6 @@ impl TestRunner {
             });
         }
 
-        let mut symbols = SymbolTable::new();
-        let mut sub_firs = Vec::new();
-
         // Determine base directory for module resolution
         let base_dir = if let Some(parent) = file.parent() {
             if parent.join("kori.toml").exists() {
@@ -314,58 +310,8 @@ impl TestRunner {
             PathBuf::from(".")
         };
 
-        for item in &prog.items {
-            if let ifa_ast::Item::Import(im) = item {
-                if let Some(sub_path) = BuildOrchestrator::resolve_module_file(&base_dir, &im.path)
-                {
-                    if let Ok(sub_src) = fs::read_to_string(&sub_path) {
-                        let sub_fid = source_map.add_file(sub_path.to_string_lossy(), &sub_src);
-                        let sub_toks = tokenize(sub_fid, &sub_src);
-                        let (sub_prog, sub_diags) = parse(sub_fid, sub_toks);
-                        if sub_diags.is_empty() {
-                            let sub_res = analyze(&source_map, &sub_prog);
-                            if !sub_res.has_errors() {
-                                if let Ok(sub_fir) =
-                                    compile_to_fir(&sub_prog, &sub_res.symbols, true, true)
-                                {
-                                    sub_firs.push(sub_fir);
-                                }
-                                let local_alias =
-                                    im.alias.unwrap_or_else(|| *im.path.last().unwrap());
-                                let path_str = im
-                                    .path
-                                    .iter()
-                                    .map(|s| INTERNER.resolve(s))
-                                    .collect::<Vec<_>>()
-                                    .join("::");
-                                let path_sym = INTERNER.intern(&path_str);
-                                let mut mod_sym =
-                                    ModuleSymbol::new(local_alias, im.path.clone(), true, im.span);
-                                for f in sub_res.symbols.functions.values() {
-                                    mod_sym.add_function(f.clone());
-                                }
-                                for s in sub_res.symbols.structs.values() {
-                                    mod_sym.add_struct(s.clone());
-                                }
-                                for e in sub_res.symbols.enums.values() {
-                                    mod_sym.add_enum(e.clone());
-                                }
-                                for c in sub_res.symbols.consts.values() {
-                                    mod_sym.add_const(c.clone());
-                                }
-                                symbols.modules.insert(local_alias, mod_sym.clone());
-                                symbols.modules.insert(path_sym, mod_sym.clone());
-                                if let Some(last) = im.path.last() {
-                                    symbols.modules.insert(*last, mod_sym);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let analysis = analyze_with_symbols(&source_map, &prog, symbols);
+        let (analysis, sub_firs) =
+            BuildOrchestrator::analyze_with_local_modules(&mut source_map, &base_dir, &prog);
         if analysis.has_errors() {
             let mut err_msg = String::new();
             for d in analysis.diagnostics {
