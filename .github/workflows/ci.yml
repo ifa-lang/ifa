@@ -31,11 +31,13 @@ jobs:
       - name: Clippy Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Install LLVM Tools and WebAssembly Runtime
+        continue-on-error: true
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -q lld clang
-          curl https://wasmtime.dev/install.sh -sSf | bash
-          echo "$HOME/.wasmtime/bin" >> $GITHUB_PATH
+          which clang && which lld || {
+            sudo apt-get update -qq || true
+            sudo apt-get install -y -q lld clang || true
+          }
+          (curl -fsSL https://wasmtime.dev/install.sh | bash && echo "$HOME/.wasmtime/bin" >> $GITHUB_PATH) || true
       - name: Run Tests
         timeout-minutes: 10
         run: cargo test --workspace -q
