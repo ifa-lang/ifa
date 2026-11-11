@@ -1923,13 +1923,28 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_net_url_percent_encoding_roundtrip ... ok"),
+        "Std net url percent encoding roundtrip test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_http_cookies_and_session ... ok"),
+        "Std net http cookies and session test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_multipart_form_data ... ok"),
+        "Std net multipart form data test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("243 passed; 0 failed"),
-        "Expected 243 passed std unit tests, got:\n{}",
+        stdout.contains("249 passed; 0 failed"),
+        "Expected 249 passed std unit tests, got:\n{}",
         stdout
     );
 }

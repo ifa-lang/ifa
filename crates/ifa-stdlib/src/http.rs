@@ -224,6 +224,31 @@ impl HttpResponse {
         std::str::from_utf8(&self.body)
     }
 
+    /// Add a Set-Cookie header (RFC 6265).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_cookie(
+        mut self,
+        name: &str,
+        value: &str,
+        path: Option<&str>,
+        max_age_secs: Option<u64>,
+        secure: bool,
+        http_only: bool,
+        same_site: Option<&str>,
+    ) -> Self {
+        let cookie_str = format_set_cookie(
+            name,
+            value,
+            path,
+            max_age_secs,
+            secure,
+            http_only,
+            same_site,
+        );
+        self.headers.set("Set-Cookie", cookie_str);
+        self
+    }
+
     /// Parse HTTP Response from raw wire bytes.
     pub fn parse_from_wire(raw: &[u8]) -> Result<(Self, usize), String> {
         let header_end = raw
@@ -339,6 +364,42 @@ impl HttpRequest {
             },
             total_size,
         ))
+    }
+
+    /// Parse Cookies from request header (RFC 6265).
+    pub fn cookies(&self) -> HashMap<String, String> {
+        if let Some(cookie_hdr) = self.headers.get("cookie") {
+            parse_cookies(cookie_hdr)
+        } else {
+            HashMap::new()
+        }
+    }
+
+    /// Retrieve a specific cookie by name.
+    pub fn cookie(&self, name: &str) -> Option<String> {
+        self.cookies().get(name).cloned()
+    }
+
+    /// Parse form-urlencoded body into key-value map.
+    pub fn form_urlencoded(&self) -> Result<HashMap<String, String>, String> {
+        let s = self.body_str().map_err(|e| format!("UTF-8 error: {}", e))?;
+        Ok(parse_form_urlencoded(s))
+    }
+
+    /// Set form-urlencoded body and appropriate Content-Type header.
+    pub fn form_urlencoded_body(mut self, pairs: &[(&str, &str)]) -> Self {
+        let encoded = format_form_urlencoded(pairs);
+        self.headers
+            .set("Content-Type", "application/x-www-form-urlencoded");
+        self.headers
+            .set("Content-Length", encoded.len().to_string());
+        self.body = encoded.into_bytes();
+        self
+    }
+
+    /// Parse multipart form-data body (RFC 7578 / RFC 2046).
+    pub fn multipart(&self, boundary: &str) -> Result<Vec<MultipartPart>, String> {
+        parse_multipart(&self.body, boundary)
     }
 }
 
@@ -554,5 +615,411 @@ impl HttpClient {
 impl Default for HttpClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// -------------------------------------------------------------
+// RFC 3986 URL ENCODING, FORM URLENCODED, COOKIES & MULTIPART
+// -------------------------------------------------------------
+
+/// Percent-encode a string according to RFC 3986 (unreserved: [A-Za-z0-9-_.~]).
+pub fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{:02X}", b));
+            }
+        }
+    }
+    out
+}
+
+/// Percent-decode an RFC 3986 string. Converts '+' to space ' ' for form compatibility.
+pub fn url_decode(s: &str) -> Result<String, String> {
+    let mut bytes = Vec::with_capacity(s.len());
+    let raw = s.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' {
+            if i + 2 >= raw.len() {
+                return Err("Incomplete percent-encoded sequence".to_string());
+            }
+            let hex_str = std::str::from_utf8(&raw[i + 1..=i + 2])
+                .map_err(|_| "Invalid UTF-8 in percent escape".to_string())?;
+            let val = u8::from_str_radix(hex_str, 16)
+                .map_err(|_| format!("Invalid hex sequence: %{}", hex_str))?;
+            bytes.push(val);
+            i += 3;
+        } else if raw[i] == b'+' {
+            bytes.push(b' ');
+            i += 1;
+        } else {
+            bytes.push(raw[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(bytes).map_err(|e| format!("Invalid UTF-8 after decoding: {}", e))
+}
+
+/// Parse `application/x-www-form-urlencoded` query or body into key-value map.
+pub fn parse_form_urlencoded(s: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if s.is_empty() {
+        return map;
+    }
+    for pair in s.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = pair.split_once('=') {
+            let key = url_decode(k).unwrap_or_else(|_| k.to_string());
+            let val = url_decode(v).unwrap_or_else(|_| v.to_string());
+            map.insert(key, val);
+        } else {
+            let key = url_decode(pair).unwrap_or_else(|_| pair.to_string());
+            map.insert(key, String::new());
+        }
+    }
+    map
+}
+
+/// Format key-value pairs into `application/x-www-form-urlencoded` string.
+pub fn format_form_urlencoded(pairs: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    for (idx, (k, v)) in pairs.iter().enumerate() {
+        if idx > 0 {
+            out.push('&');
+        }
+        out.push_str(&url_encode(k));
+        out.push('=');
+        out.push_str(&url_encode(v));
+    }
+    out
+}
+
+/// Parse HTTP `Cookie` header into key-value map (RFC 6265).
+pub fn parse_cookies(header: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for part in header.split(';') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once('=') {
+            map.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    map
+}
+
+/// Format `Set-Cookie` header value (RFC 6265).
+pub fn format_set_cookie(
+    name: &str,
+    value: &str,
+    path: Option<&str>,
+    max_age_secs: Option<u64>,
+    secure: bool,
+    http_only: bool,
+    same_site: Option<&str>,
+) -> String {
+    let mut out = format!("{}={}", name, value);
+    if let Some(p) = path {
+        out.push_str(&format!("; Path={}", p));
+    }
+    if let Some(secs) = max_age_secs {
+        out.push_str(&format!("; Max-Age={}", secs));
+    }
+    if let Some(ss) = same_site {
+        out.push_str(&format!("; SameSite={}", ss));
+    }
+    if secure {
+        out.push_str("; Secure");
+    }
+    if http_only {
+        out.push_str("; HttpOnly");
+    }
+    out
+}
+
+/// Multipart part representation (RFC 7578 / RFC 2046).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartPart {
+    pub name: String,
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+    pub data: Vec<u8>,
+}
+
+/// Fluent builder for constructing `multipart/form-data` payloads.
+#[derive(Debug, Clone)]
+pub struct MultipartBuilder {
+    boundary: String,
+    body: Vec<u8>,
+}
+
+impl MultipartBuilder {
+    pub fn new(boundary: impl Into<String>) -> Self {
+        Self {
+            boundary: boundary.into(),
+            body: Vec::new(),
+        }
+    }
+
+    pub fn boundary(&self) -> &str {
+        &self.boundary
+    }
+
+    pub fn content_type(&self) -> String {
+        format!("multipart/form-data; boundary={}", self.boundary)
+    }
+
+    pub fn add_field(mut self, name: &str, value: &str) -> Self {
+        let header = format!(
+            "--{}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n",
+            self.boundary, name
+        );
+        self.body.extend_from_slice(header.as_bytes());
+        self.body.extend_from_slice(value.as_bytes());
+        self.body.extend_from_slice(b"\r\n");
+        self
+    }
+
+    pub fn add_file(mut self, name: &str, filename: &str, content_type: &str, data: &[u8]) -> Self {
+        let header = format!(
+            "--{}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n",
+            self.boundary, name, filename, content_type
+        );
+        self.body.extend_from_slice(header.as_bytes());
+        self.body.extend_from_slice(data);
+        self.body.extend_from_slice(b"\r\n");
+        self
+    }
+
+    pub fn finish(mut self) -> Vec<u8> {
+        let footer = format!("--{}--\r\n", self.boundary);
+        self.body.extend_from_slice(footer.as_bytes());
+        self.body
+    }
+}
+
+/// Parse multipart payload into individual `MultipartPart` items.
+pub fn parse_multipart(body: &[u8], boundary: &str) -> Result<Vec<MultipartPart>, String> {
+    let delim = format!("--{}", boundary);
+    let delim_bytes = delim.as_bytes();
+    let mut parts = Vec::new();
+
+    let mut start_idx = 0;
+    while let Some(pos) = body[start_idx..]
+        .windows(delim_bytes.len())
+        .position(|w| w == delim_bytes)
+    {
+        let part_start = start_idx + pos + delim_bytes.len();
+        if part_start + 2 <= body.len() && &body[part_start..part_start + 2] == b"--" {
+            // End boundary
+            break;
+        }
+        // Skip \r\n after boundary
+        let search_start =
+            if part_start + 2 <= body.len() && &body[part_start..part_start + 2] == b"\r\n" {
+                part_start + 2
+            } else {
+                part_start
+            };
+
+        // Next boundary or end
+        let part_end = if let Some(next_pos) = body[search_start..]
+            .windows(delim_bytes.len())
+            .position(|w| w == delim_bytes)
+        {
+            let end = search_start + next_pos;
+            if end >= 2 && &body[end - 2..end] == b"\r\n" {
+                end - 2
+            } else {
+                end
+            }
+        } else {
+            body.len()
+        };
+
+        let raw_part = &body[search_start..part_end];
+        if let Some(header_sep) = raw_part.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header_str = std::str::from_utf8(&raw_part[..header_sep])
+                .map_err(|e| format!("Header UTF-8 error: {}", e))?;
+            let part_data = &raw_part[header_sep + 4..];
+
+            let mut name = String::new();
+            let mut filename = None;
+            let mut content_type = None;
+
+            for line in header_str.split("\r\n") {
+                if let Some((k, v)) = line.split_once(':') {
+                    let k_lower = k.trim().to_ascii_lowercase();
+                    let v_trim = v.trim();
+                    if k_lower == "content-disposition" {
+                        for disp_part in v_trim.split(';') {
+                            let dp = disp_part.trim();
+                            if let Some(unquoted) = dp
+                                .strip_prefix("name=\"")
+                                .and_then(|s| s.strip_suffix('\"'))
+                            {
+                                name = unquoted.to_string();
+                            } else if let Some(unquoted) = dp
+                                .strip_prefix("filename=\"")
+                                .and_then(|s| s.strip_suffix('\"'))
+                            {
+                                filename = Some(unquoted.to_string());
+                            }
+                        }
+                    } else if k_lower == "content-type" {
+                        content_type = Some(v_trim.to_string());
+                    }
+                }
+            }
+
+            if !name.is_empty() {
+                parts.push(MultipartPart {
+                    name,
+                    filename,
+                    content_type,
+                    data: part_data.to_vec(),
+                });
+            }
+        }
+
+        start_idx = part_end;
+    }
+
+    Ok(parts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_url_encode_decode_roundtrip() {
+        let input = "Hello World! & IFA = 100%?";
+        let encoded = url_encode(input);
+        assert_eq!(encoded, "Hello%20World%21%20%26%20IFA%20%3D%20100%25%3F");
+        let decoded = url_decode(&encoded).expect("decode");
+        assert_eq!(decoded, input);
+
+        // Form '+' decoding
+        let with_plus = "IFA+Systems+Programming";
+        assert_eq!(url_decode(with_plus).unwrap(), "IFA Systems Programming");
+    }
+
+    #[test]
+    fn test_form_urlencoded() {
+        let params = [
+            ("user", "Dieudonné Assogba"),
+            ("email", "jprud67@gmail.com"),
+            ("status", "active & verified"),
+        ];
+        let encoded = format_form_urlencoded(&params);
+        let parsed = parse_form_urlencoded(&encoded);
+
+        assert_eq!(
+            parsed.get("user").map(|s| s.as_str()),
+            Some("Dieudonné Assogba")
+        );
+        assert_eq!(
+            parsed.get("email").map(|s| s.as_str()),
+            Some("jprud67@gmail.com")
+        );
+        assert_eq!(
+            parsed.get("status").map(|s| s.as_str()),
+            Some("active & verified")
+        );
+
+        // HttpRequest integration
+        let req = HttpRequest::new(HttpMethod::Post, "/api/v1/login").form_urlencoded_body(&params);
+        assert_eq!(
+            req.headers.get("content-type"),
+            Some("application/x-www-form-urlencoded")
+        );
+        let parsed_req_form = req.form_urlencoded().expect("parse req form");
+        assert_eq!(
+            parsed_req_form.get("user").map(|s| s.as_str()),
+            Some("Dieudonné Assogba")
+        );
+    }
+
+    #[test]
+    fn test_http_cookies() {
+        let cookie_header = "sessionId=ifa_sec_token_9876; user_role=admin; theme=dark";
+        let cookies = parse_cookies(cookie_header);
+        assert_eq!(
+            cookies.get("sessionId").map(|s| s.as_str()),
+            Some("ifa_sec_token_9876")
+        );
+        assert_eq!(cookies.get("user_role").map(|s| s.as_str()), Some("admin"));
+        assert_eq!(cookies.get("theme").map(|s| s.as_str()), Some("dark"));
+        assert_eq!(cookies.get("missing"), None);
+
+        let formatted = format_set_cookie(
+            "sessionId",
+            "ifa_sec_token_9876",
+            Some("/api"),
+            Some(7200),
+            true,
+            true,
+            Some("Strict"),
+        );
+        assert_eq!(
+            formatted,
+            "sessionId=ifa_sec_token_9876; Path=/api; Max-Age=7200; SameSite=Strict; Secure; HttpOnly"
+        );
+
+        let resp = HttpResponse::ok().set_cookie(
+            "sessionId",
+            "ifa_sec_token_9876",
+            Some("/api"),
+            Some(7200),
+            true,
+            true,
+            Some("Strict"),
+        );
+        assert_eq!(resp.headers.get("set-cookie"), Some(formatted.as_str()));
+    }
+
+    #[test]
+    fn test_multipart_form_data() {
+        let builder = MultipartBuilder::new("ifaBoundary4242")
+            .add_field("username", "prudence")
+            .add_field("description", "IFA Systems Programming")
+            .add_file(
+                "document",
+                "report.txt",
+                "text/plain",
+                b"Deterministic compilation fixed point OK",
+            );
+
+        assert_eq!(
+            builder.content_type(),
+            "multipart/form-data; boundary=ifaBoundary4242"
+        );
+
+        let wire_body = builder.finish();
+        let parts = parse_multipart(&wire_body, "ifaBoundary4242").expect("parse multipart");
+        assert_eq!(parts.len(), 3);
+
+        assert_eq!(parts[0].name, "username");
+        assert_eq!(parts[0].filename, None);
+        assert_eq!(parts[0].content_type, None);
+        assert_eq!(parts[0].data, b"prudence");
+
+        assert_eq!(parts[1].name, "description");
+        assert_eq!(parts[1].data, b"IFA Systems Programming");
+
+        assert_eq!(parts[2].name, "document");
+        assert_eq!(parts[2].filename.as_deref(), Some("report.txt"));
+        assert_eq!(parts[2].content_type.as_deref(), Some("text/plain"));
+        assert_eq!(parts[2].data, b"Deterministic compilation fixed point OK");
     }
 }

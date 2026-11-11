@@ -3076,6 +3076,350 @@ pub fn test_net_http_secure_client_token_negotiation() -> bool {
     return true;
 }
 
+pub fn hex_nibble_to_char(nibble: i64) -> String {
+    if nibble == 0 { return "0"; }
+    else if nibble == 1 { return "1"; }
+    else if nibble == 2 { return "2"; }
+    else if nibble == 3 { return "3"; }
+    else if nibble == 4 { return "4"; }
+    else if nibble == 5 { return "5"; }
+    else if nibble == 6 { return "6"; }
+    else if nibble == 7 { return "7"; }
+    else if nibble == 8 { return "8"; }
+    else if nibble == 9 { return "9"; }
+    else if nibble == 10 { return "A"; }
+    else if nibble == 11 { return "B"; }
+    else if nibble == 12 { return "C"; }
+    else if nibble == 13 { return "D"; }
+    else if nibble == 14 { return "E"; }
+    else if nibble == 15 { return "F"; }
+    return "0";
+}
+
+pub fn hex_char_to_nibble(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { // '0'..'9'
+        return c - 48;
+    } else if c >= 65 && c <= 70 { // 'A'..'F'
+        return c - 65 + 10;
+    } else if c >= 97 && c <= 102 { // 'a'..'f'
+        return c - 97 + 10;
+    }
+    return -1;
+}
+
+pub fn is_url_unreserved(c: i64) -> bool {
+    if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) {
+        return true;
+    }
+    if c == 45 || c == 95 || c == 46 || c == 126 { // '-', '_', '.', '~'
+        return true;
+    }
+    return false;
+}
+
+pub fn url_encode(raw: String) -> String {
+    let len = string_len(raw);
+    mut res: String = "";
+    mut i: i64 = 0;
+    while i < len {
+        let c = string_char_at(raw, i);
+        if is_url_unreserved(c) {
+            res = res + string_substr(raw, i, 1);
+        } else {
+            let high = (c / 16) % 16;
+            let low = c % 16;
+            res = res + "%" + hex_nibble_to_char(high) + hex_nibble_to_char(low);
+        }
+        i = i + 1;
+    }
+    return res;
+}
+
+pub fn url_decode(raw: String) -> String {
+    let len = string_len(raw);
+    mut res: String = "";
+    mut i: i64 = 0;
+    while i < len {
+        let c = string_char_at(raw, i);
+        if c == 37 && i + 2 < len { // '%'
+            let h1 = hex_char_to_nibble(string_char_at(raw, i + 1));
+            let h2 = hex_char_to_nibble(string_char_at(raw, i + 2));
+            if h1 >= 0 && h2 >= 0 {
+                let code = h1 * 16 + h2;
+                res = res + string_from_char(code);
+                i = i + 2;
+            } else {
+                res = res + string_substr(raw, i, 1);
+            }
+        } else if c == 43 { // '+' -> ' '
+            res = res + " ";
+        } else {
+            res = res + string_substr(raw, i, 1);
+        }
+        i = i + 1;
+    }
+    return res;
+}
+
+pub fn form_urlencoded_set(existing: String, key: String, value: String) -> String {
+    let enc_k = url_encode(key);
+    let enc_v = url_encode(value);
+    let pair = enc_k + "=" + enc_v;
+    if string_len(existing) == 0 {
+        return pair;
+    }
+    return existing + "&" + pair;
+}
+
+pub fn form_urlencoded_get(body: String, key: String) -> String {
+    let b_len = string_len(body);
+    let k_len = string_len(key);
+    if b_len == 0 || k_len == 0 {
+        return "";
+    }
+    let target_key = url_encode(key);
+
+    mut i: i64 = 0;
+    while i < b_len {
+        let pair_start = i;
+        mut pair_end = b_len;
+        mut eq_idx: i64 = -1;
+        mut j = i;
+        while j < b_len {
+            let c = string_char_at(body, j);
+            if c == 61 && eq_idx < 0 { // '='
+                eq_idx = j;
+            } else if c == 38 { // '&'
+                pair_end = j;
+                j = b_len;
+            }
+            j = j + 1;
+        }
+
+        if eq_idx > pair_start {
+            let k_found = string_substr(body, pair_start, eq_idx - pair_start);
+            if k_found == target_key || url_decode(k_found) == key {
+                let v_enc = string_substr(body, eq_idx + 1, pair_end - eq_idx - 1);
+                return url_decode(v_enc);
+            }
+        }
+        i = pair_end + 1;
+    }
+    return "";
+}
+
+pub fn http_cookie_get(cookie_header: String, name: String) -> String {
+    let h_len = string_len(cookie_header);
+    let n_len = string_len(name);
+    if h_len == 0 || n_len == 0 {
+        return "";
+    }
+
+    mut i: i64 = 0;
+    while i < h_len {
+        while i < h_len && (string_char_at(cookie_header, i) == 32 || string_char_at(cookie_header, i) == 9) {
+            i = i + 1;
+        }
+        let pair_start = i;
+        mut pair_end = h_len;
+        mut eq_idx: i64 = -1;
+        mut j = i;
+        while j < h_len {
+            let c = string_char_at(cookie_header, j);
+            if c == 61 && eq_idx < 0 { // '='
+                eq_idx = j;
+            } else if c == 59 { // ';'
+                pair_end = j;
+                j = h_len;
+            }
+            j = j + 1;
+        }
+
+        if eq_idx > pair_start {
+            let k_found = string_substr(cookie_header, pair_start, eq_idx - pair_start);
+            if k_found == name {
+                return string_substr(cookie_header, eq_idx + 1, pair_end - eq_idx - 1);
+            }
+        }
+        i = pair_end + 1;
+    }
+    return "";
+}
+
+pub fn http_format_set_cookie(name: String, value: String, path: String, max_age_secs: i64, secure: bool, http_only: bool, same_site: String) -> String {
+    mut res: String = name + "=" + value;
+    if string_len(path) > 0 {
+        res = res + "; Path=" + path;
+    }
+    if max_age_secs >= 0 {
+        res = res + "; Max-Age=" + int_to_string(max_age_secs);
+    }
+    if string_len(same_site) > 0 {
+        res = res + "; SameSite=" + same_site;
+    }
+    if secure {
+        res = res + "; Secure";
+    }
+    if http_only {
+        res = res + "; HttpOnly";
+    }
+    return res;
+}
+
+pub fn make_multipart_boundary(seed: i64) -> String {
+    return "---------------------------ifaBoundary" + int_to_string(seed);
+}
+
+pub fn format_multipart_field(boundary: String, name: String, value: String) -> String {
+    mut res: String = "--" + boundary + "\r\n";
+    res = res + "Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n";
+    res = res + value + "\r\n";
+    return res;
+}
+
+pub fn format_multipart_file(boundary: String, name: String, filename: String, content_type: String, content: String) -> String {
+    mut res: String = "--" + boundary + "\r\n";
+    res = res + "Content-Disposition: form-data; name=\"" + name + "\"; filename=\"" + filename + "\"\r\n";
+    res = res + "Content-Type: " + content_type + "\r\n\r\n";
+    res = res + content + "\r\n";
+    return res;
+}
+
+pub fn format_multipart_end(boundary: String) -> String {
+    return "--" + boundary + "--\r\n";
+}
+
+pub fn parse_multipart_field(body: String, boundary: String, field_name: String) -> String {
+    let b_len = string_len(body);
+    let marker = "name=\"" + field_name + "\"";
+    let m_len = string_len(marker);
+    if b_len == 0 || m_len == 0 {
+        return "";
+    }
+
+    mut match_pos: i64 = -1;
+    mut i: i64 = 0;
+    while i + m_len <= b_len {
+        mut found = true;
+        mut k: i64 = 0;
+        while k < m_len {
+            if string_char_at(body, i + k) != string_char_at(marker, k) {
+                found = false;
+                k = m_len;
+            }
+            k = k + 1;
+        }
+        if found {
+            match_pos = i;
+            i = b_len; // break
+        }
+        i = i + 1;
+    }
+
+    if match_pos < 0 {
+        return "";
+    }
+
+    mut val_start: i64 = -1;
+    mut j = match_pos + m_len;
+    while j + 3 < b_len {
+        if string_char_at(body, j) == 13 && string_char_at(body, j + 1) == 10 && string_char_at(body, j + 2) == 13 && string_char_at(body, j + 3) == 10 {
+            val_start = j + 4;
+            j = b_len; // break
+        }
+        j = j + 1;
+    }
+
+    if val_start < 0 {
+        return "";
+    }
+
+    let delim = "\r\n--" + boundary;
+    let d_len = string_len(delim);
+    mut val_end: i64 = -1;
+    mut p = val_start;
+    while p + d_len <= b_len {
+        mut d_match = true;
+        mut q: i64 = 0;
+        while q < d_len {
+            if string_char_at(body, p + q) != string_char_at(delim, q) {
+                d_match = false;
+                q = d_len;
+            }
+            q = q + 1;
+        }
+        if d_match {
+            val_end = p;
+            p = b_len; // break
+        }
+        p = p + 1;
+    }
+
+    if val_end >= val_start {
+        return string_substr(body, val_start, val_end - val_start);
+    }
+    return "";
+}
+
+pub fn test_net_url_percent_encoding_roundtrip() -> bool {
+    let input = "Hello World! & IFA = 100%?";
+    let encoded = url_encode(input);
+    if encoded != "Hello%20World%21%20%26%20IFA%20%3D%20100%25%3F" {
+        return false;
+    }
+    let decoded = url_decode(encoded);
+    if decoded != input {
+        return false;
+    }
+
+    let with_plus = "IFA+Systems+Programming";
+    if url_decode(with_plus) != "IFA Systems Programming" {
+        return false;
+    }
+
+    mut form = form_urlencoded_set("", "user", "Dieudonné Assogba");
+    form = form_urlencoded_set(form, "email", "jprud67@gmail.com");
+    form = form_urlencoded_set(form, "status", "active & verified");
+
+    let u = form_urlencoded_get(form, "user");
+    let e = form_urlencoded_get(form, "email");
+    let s = form_urlencoded_get(form, "status");
+    let missing = form_urlencoded_get(form, "unknown");
+
+    return u == "Dieudonné Assogba" && e == "jprud67@gmail.com" && s == "active & verified" && missing == "";
+}
+
+pub fn test_net_http_cookies_and_session() -> bool {
+    let cookie_hdr = "sessionId=ifa_sec_token_9876; user_role=admin; theme=dark";
+    let sid = http_cookie_get(cookie_hdr, "sessionId");
+    let role = http_cookie_get(cookie_hdr, "user_role");
+    let theme = http_cookie_get(cookie_hdr, "theme");
+    let missing = http_cookie_get(cookie_hdr, "unknown");
+
+    if sid != "ifa_sec_token_9876" || role != "admin" || theme != "dark" || missing != "" {
+        return false;
+    }
+
+    let set_cookie = http_format_set_cookie("sessionId", "ifa_sec_token_9876", "/api", 7200, true, true, "Strict");
+    let expected = "sessionId=ifa_sec_token_9876; Path=/api; Max-Age=7200; SameSite=Strict; Secure; HttpOnly";
+    return set_cookie == expected;
+}
+
+pub fn test_net_multipart_form_data() -> bool {
+    let boundary = make_multipart_boundary(4242);
+    mut body = format_multipart_field(boundary, "username", "prudence");
+    body = body + format_multipart_field(boundary, "description", "IFA Systems Programming");
+    body = body + format_multipart_file(boundary, "document", "report.txt", "text/plain", "Deterministic compilation fixed point OK");
+    body = body + format_multipart_end(boundary);
+
+    let u = parse_multipart_field(body, boundary, "username");
+    let desc = parse_multipart_field(body, boundary, "description");
+    let doc = parse_multipart_field(body, boundary, "document");
+    let missing = parse_multipart_field(body, boundary, "nonexistent");
+
+    return u == "prudence" && desc == "IFA Systems Programming" && doc == "Deterministic compilation fixed point OK" && missing == "";
+}
+
 pub fn test_net_all() -> bool {
     return test_net_tcp_echo()
     && test_net_http_wire()
@@ -3096,7 +3440,10 @@ pub fn test_net_all() -> bool {
     && test_net_crc32_and_adler32()
     && test_net_deflate_compression_roundtrip()
     && test_net_gzip_compression_roundtrip()
-    && test_net_http_secure_client_token_negotiation();
+    && test_net_http_secure_client_token_negotiation()
+    && test_net_url_percent_encoding_roundtrip()
+    && test_net_http_cookies_and_session()
+    && test_net_multipart_form_data();
 }
 
 pub fn main() {
@@ -3120,7 +3467,10 @@ pub fn main() {
     let t18 = test_net_deflate_compression_roundtrip();
     let t19 = test_net_gzip_compression_roundtrip();
     let t20 = test_net_http_secure_client_token_negotiation();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 {
+    let t21 = test_net_url_percent_encoding_roundtrip();
+    let t22 = test_net_http_cookies_and_session();
+    let t23 = test_net_multipart_form_data();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");
