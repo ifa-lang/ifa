@@ -85,6 +85,66 @@ pub struct WsServer {
     upgraded_clients: List<bool>
 }
 
+pub struct HttpHeader {
+    name: String,
+    value: String
+}
+
+pub struct HttpClientConfig {
+    bearer_token: String,
+    api_key_header: String,
+    api_key_value: String,
+    content_type: String,
+    accept_encoding: String,
+    user_agent: String
+}
+
+pub struct TokenNegotiationResponse {
+    access_token: String,
+    token_type: String,
+    expires_in: i64,
+    refresh_token: String,
+    is_valid: bool
+}
+
+pub fn make_http_header(name: String, value: String) -> HttpHeader {
+    return HttpHeader(name: name, value: value);
+}
+
+pub fn make_http_client_config() -> HttpClientConfig {
+    return HttpClientConfig(
+        bearer_token: "",
+        api_key_header: "",
+        api_key_value: "",
+        content_type: "application/json",
+        accept_encoding: "gzip, deflate",
+        user_agent: "IFA-HttpClient/0.1.0"
+    );
+}
+
+pub fn http_client_with_bearer(token: String) -> HttpClientConfig {
+    mut cfg = make_http_client_config();
+    cfg.bearer_token = token;
+    return cfg;
+}
+
+pub fn http_client_with_api_key(header_name: String, key_value: String) -> HttpClientConfig {
+    mut cfg = make_http_client_config();
+    cfg.api_key_header = header_name;
+    cfg.api_key_value = key_value;
+    return cfg;
+}
+
+pub fn make_token_response(access_token: String, token_type: String, expires_in: i64, refresh_token: String, is_valid: bool) -> TokenNegotiationResponse {
+    return TokenNegotiationResponse(
+        access_token: access_token,
+        token_type: token_type,
+        expires_in: expires_in,
+        refresh_token: refresh_token,
+        is_valid: is_valid
+    );
+}
+
 pub fn make_url(scheme: String, host: String, port: i64, path: String, query: String) -> Url {
     return Url(
         scheme: scheme,
@@ -1688,9 +1748,9 @@ pub fn encode_ws_frame(frame: WsFrame) -> String {
             let c = string_char_at(frame.payload, i);
             let rem_i = i % 4;
             let mask_byte = if rem_i == 0 { m0 }
-                else if rem_i == 1 { m1 }
-                else if rem_i == 2 { m2 }
-                else { m3 };
+            else if rem_i == 1 { m1 }
+            else if rem_i == 2 { m2 }
+            else { m3 };
             let xor_val = c ^ mask_byte;
             masked_payload = masked_payload + string_from_char(xor_val);
             i = i + 1;
@@ -1770,9 +1830,9 @@ pub fn decode_ws_frame(raw: String) -> WsFrame {
             let c = string_char_at(raw, cursor + i);
             let rem_i = i % 4;
             let mb = if rem_i == 0 { m0 }
-                else if rem_i == 1 { m1 }
-                else if rem_i == 2 { m2 }
-                else { m3 };
+            else if rem_i == 1 { m1 }
+            else if rem_i == 2 { m2 }
+            else { m3 };
             payload = payload + string_from_char(c ^ mb);
             i = i + 1;
         }
@@ -1811,7 +1871,7 @@ pub fn format_websocket_handshake_request(host: String, port: i64, path: String,
 
 pub fn websocket_is_handshake_request(raw_http: String) -> bool {
     return string_contains(raw_http, "Upgrade: websocket")
-        && string_contains(raw_http, "Sec-WebSocket-Key:");
+    && string_contains(raw_http, "Sec-WebSocket-Key:");
 }
 
 pub fn websocket_extract_key(raw_http: String) -> String {
@@ -2311,23 +2371,732 @@ pub fn test_net_websocket_server_multiplexing() -> bool {
     return true;
 }
 
+// ===========================================================================
+// Native Stream Compression Subsystem (RFC 1951 Deflate, RFC 1952 Gzip, Zlib)
+// ===========================================================================
+
+pub fn net_crc32(bytes: List<i64>) -> i64 {
+    mut crc: i64 = 4294967295; // 0xFFFFFFFF
+    let len = bytes.len();
+    mut i: i64 = 0;
+    while i < len {
+        let b = bytes[i] & 255;
+        crc = crc ^ b;
+        mut j: i64 = 0;
+        while j < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 3988292384; // 0xEDB88320
+            } else {
+                crc = crc >> 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return (crc ^ 4294967295) & 4294967295;
+}
+
+pub fn net_crc32_string(text: String) -> i64 {
+    let bytes = net_string_to_bytes(text);
+    return net_crc32(bytes);
+}
+
+pub fn net_adler32(bytes: List<i64>) -> i64 {
+    mut s1: i64 = 1;
+    mut s2: i64 = 0;
+    let len = bytes.len();
+    mut i: i64 = 0;
+    while i < len {
+        let b = bytes[i] & 255;
+        s1 = (s1 + b) % 65521;
+        s2 = (s2 + s1) % 65521;
+        i = i + 1;
+    }
+    return ((s2 << 16) | s1) & 4294967295;
+}
+
+pub fn net_adler32_string(text: String) -> i64 {
+    let bytes = net_string_to_bytes(text);
+    return net_adler32(bytes);
+}
+
+pub fn net_string_to_bytes(s: String) -> List<i64> {
+    let len = string_len(s);
+    mut bytes: List<i64> = List::new();
+    mut i: i64 = 0;
+    while i < len {
+        bytes.push(string_char_at(s, i));
+        i = i + 1;
+    }
+    return bytes;
+}
+
+pub fn net_bytes_to_string(bytes: List<i64>) -> String {
+    let chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    let len = bytes.len();
+    mut out = "";
+    mut i: i64 = 0;
+    while i < len {
+        let b = bytes[i] & 255;
+        if b == 10 {
+            out = out + "\n";
+        } else if b == 13 {
+            out = out + "\r";
+        } else if b == 9 {
+            out = out + "\t";
+        } else if b >= 32 && b <= 126 {
+            out = out + string_substr(chars, b - 32, 1);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn deflate_compress_bytes(data: List<i64>) -> List<i64> {
+    mut out: List<i64> = List::new();
+    let total_len = data.len();
+    if total_len == 0 {
+        out.push(1); // BFINAL=1, BTYPE=00
+        out.push(0);
+        out.push(0);
+        out.push(255);
+        out.push(255);
+        return out;
+    }
+
+    mut pos: i64 = 0;
+    while pos < total_len {
+        mut chunk_len = total_len - pos;
+        if chunk_len > 32768 {
+            chunk_len = 32768;
+        }
+        let is_final = if pos + chunk_len >= total_len { 1 } else { 0 };
+        out.push(is_final);
+        out.push(chunk_len & 255);
+        out.push((chunk_len >> 8) & 255);
+        let nlen = 65535 - chunk_len;
+        out.push(nlen & 255);
+        out.push((nlen >> 8) & 255);
+
+        mut k: i64 = 0;
+        while k < chunk_len {
+            out.push(data[pos + k] & 255);
+            k = k + 1;
+        }
+        pos = pos + chunk_len;
+    }
+    return out;
+}
+
+pub fn deflate_decompress_bytes(compressed: List<i64>) -> List<i64> {
+    mut out: List<i64> = List::new();
+    let comp_len = compressed.len();
+    mut pos: i64 = 0;
+
+    while pos < comp_len {
+        let header = compressed[pos];
+        pos = pos + 1;
+        let is_final = header & 1;
+        let btype = (header >> 1) & 3;
+
+        if btype == 0 {
+            if pos + 4 > comp_len {
+                return out;
+            }
+            let len_lo = compressed[pos];
+            let len_hi = compressed[pos + 1];
+            pos = pos + 2;
+            let block_len = len_lo | (len_hi << 8);
+
+            let nlen_lo = compressed[pos];
+            let nlen_hi = compressed[pos + 1];
+            pos = pos + 2;
+            let nlen = nlen_lo | (nlen_hi << 8);
+
+            if (block_len ^ nlen) != 65535 {
+                return out;
+            }
+
+            mut k: i64 = 0;
+            while k < block_len && pos < comp_len {
+                out.push(compressed[pos]);
+                pos = pos + 1;
+                k = k + 1;
+            }
+
+            if is_final == 1 {
+                return out;
+            }
+        } else {
+            return out;
+        }
+    }
+
+    return out;
+}
+
+pub fn deflate_compress_string(text: String) -> List<i64> {
+    let bytes = net_string_to_bytes(text);
+    return deflate_compress_bytes(bytes);
+}
+
+pub fn deflate_decompress_string(compressed: List<i64>) -> String {
+    let bytes = deflate_decompress_bytes(compressed);
+    return net_bytes_to_string(bytes);
+}
+
+pub fn gzip_compress_bytes(data: List<i64>) -> List<i64> {
+    mut out: List<i64> = List::new();
+    // 10-byte Gzip Header (RFC 1952)
+    out.push(31); // 0x1F ID1
+    out.push(139); // 0x8B ID2
+    out.push(8); // CM = 8 (Deflate)
+    out.push(0); // FLG = 0
+    out.push(0); // MTIME
+    out.push(0);
+    out.push(0);
+    out.push(0);
+    out.push(0); // XFL = 0
+    out.push(255); // OS = 255
+
+    // Deflate payload
+    let deflated = deflate_compress_bytes(data);
+    let def_len = deflated.len();
+    mut i: i64 = 0;
+    while i < def_len {
+        out.push(deflated[i]);
+        i = i + 1;
+    }
+
+    // 8-byte Trailer: CRC32 (4 bytes LE) + ISIZE (4 bytes LE)
+    let crc = net_crc32(data);
+    out.push(crc & 255);
+    out.push((crc >> 8) & 255);
+    out.push((crc >> 16) & 255);
+    out.push((crc >> 24) & 255);
+
+    let isize = data.len() & 4294967295;
+    out.push(isize & 255);
+    out.push((isize >> 8) & 255);
+    out.push((isize >> 16) & 255);
+    out.push((isize >> 24) & 255);
+
+    return out;
+}
+
+pub fn gzip_decompress_bytes(gz: List<i64>) -> List<i64> {
+    let gz_len = gz.len();
+    if gz_len < 18 {
+        return List::new();
+    }
+    if gz[0] != 31 || gz[1] != 139 || gz[2] != 8 {
+        return List::new();
+    }
+
+    let flg = gz[3];
+    mut pos: i64 = 10;
+
+    if (flg & 4) != 0 && pos + 2 <= gz_len {
+        let xlen = gz[pos] | (gz[pos + 1] << 8);
+        pos = pos + 2 + xlen;
+    }
+    if (flg & 8) != 0 {
+        while pos < gz_len && gz[pos] != 0 {
+            pos = pos + 1;
+        }
+        pos = pos + 1;
+    }
+    if (flg & 16) != 0 {
+        while pos < gz_len && gz[pos] != 0 {
+            pos = pos + 1;
+        }
+        pos = pos + 1;
+    }
+    if (flg & 2) != 0 {
+        pos = pos + 2;
+    }
+
+    if pos >= gz_len - 8 {
+        return List::new();
+    }
+
+    let payload_end = gz_len - 8;
+    mut deflated_slice: List<i64> = List::new();
+    mut i = pos;
+    while i < payload_end {
+        deflated_slice.push(gz[i]);
+        i = i + 1;
+    }
+
+    let decompressed = deflate_decompress_bytes(deflated_slice);
+
+    let expected_crc = (gz[gz_len - 8] & 255)
+    | ((gz[gz_len - 7] & 255) << 8)
+    | ((gz[gz_len - 6] & 255) << 16)
+    | ((gz[gz_len - 5] & 255) << 24);
+    let actual_crc = net_crc32(decompressed);
+    if expected_crc != actual_crc {
+        return List::new();
+    }
+
+    let expected_isize = (gz[gz_len - 4] & 255)
+    | ((gz[gz_len - 3] & 255) << 8)
+    | ((gz[gz_len - 2] & 255) << 16)
+    | ((gz[gz_len - 1] & 255) << 24);
+    let actual_isize = decompressed.len() & 4294967295;
+    if expected_isize != actual_isize {
+        return List::new();
+    }
+
+    return decompressed;
+}
+
+pub fn gzip_compress_string(text: String) -> List<i64> {
+    let bytes = net_string_to_bytes(text);
+    return gzip_compress_bytes(bytes);
+}
+
+pub fn gzip_decompress_string(gz: List<i64>) -> String {
+    let bytes = gzip_decompress_bytes(gz);
+    return net_bytes_to_string(bytes);
+}
+
+pub fn zlib_compress_bytes(data: List<i64>) -> List<i64> {
+    mut out: List<i64> = List::new();
+    out.push(120); // 0x78
+    out.push(1); // 0x01
+
+    let deflated = deflate_compress_bytes(data);
+    let def_len = deflated.len();
+    mut i: i64 = 0;
+    while i < def_len {
+        out.push(deflated[i]);
+        i = i + 1;
+    }
+
+    let adler = net_adler32(data);
+    out.push((adler >> 24) & 255);
+    out.push((adler >> 16) & 255);
+    out.push((adler >> 8) & 255);
+    out.push(adler & 255);
+
+    return out;
+}
+
+pub fn zlib_decompress_bytes(z: List<i64>) -> List<i64> {
+    let z_len = z.len();
+    if z_len < 6 {
+        return List::new();
+    }
+    let cmf = z[0];
+    let flg = z[1];
+    if (cmf * 256 + flg) % 31 != 0 {
+        return List::new();
+    }
+
+    let payload_end = z_len - 4;
+    mut deflated_slice: List<i64> = List::new();
+    mut i: i64 = 2;
+    while i < payload_end {
+        deflated_slice.push(z[i]);
+        i = i + 1;
+    }
+
+    let decompressed = deflate_decompress_bytes(deflated_slice);
+    let expected_adler = ((z[z_len - 4] & 255) << 24)
+    | ((z[z_len - 3] & 255) << 16)
+    | ((z[z_len - 2] & 255) << 8)
+    | (z[z_len - 1] & 255);
+    let actual_adler = net_adler32(decompressed);
+    if expected_adler != actual_adler {
+        return List::new();
+    }
+
+    return decompressed;
+}
+
+pub fn zlib_compress_string(text: String) -> List<i64> {
+    let bytes = net_string_to_bytes(text);
+    return zlib_compress_bytes(bytes);
+}
+
+pub fn zlib_decompress_string(z: List<i64>) -> String {
+    let bytes = zlib_decompress_bytes(z);
+    return net_bytes_to_string(bytes);
+}
+
+// ===========================================================================
+// Secure HTTP Client & Token Negotiation Subsystem
+// ===========================================================================
+
+pub fn format_http_request_with_headers(req: HttpRequest, host: String, headers: List<HttpHeader>) -> String {
+    let body_len = string_len(req.body);
+    let len_str = int_to_string(body_len);
+    mut out: String = req.method + " " + req.path + " " + req.version + "\r\n";
+    out = out + "Host: " + host + "\r\n";
+    let h_len = headers.len();
+    mut i: i64 = 0;
+    while i < h_len {
+        let hdr = headers[i];
+        out = out + hdr.name + ": " + hdr.value + "\r\n";
+        i = i + 1;
+    }
+    if body_len > 0 {
+        out = out + "Content-Length: " + len_str + "\r\n";
+    }
+    out = out + "Connection: close\r\n\r\n";
+    if body_len > 0 {
+        out = out + req.body;
+    }
+    return out;
+}
+
+pub fn format_http_request_secure(req: HttpRequest, host: String, config: HttpClientConfig) -> String {
+    let body_len = string_len(req.body);
+    let len_str = int_to_string(body_len);
+    mut out: String = req.method + " " + req.path + " " + req.version + "\r\n";
+    out = out + "Host: " + host + "\r\n";
+    if string_len(config.user_agent) > 0 {
+        out = out + "User-Agent: " + config.user_agent + "\r\n";
+    }
+    if string_len(config.accept_encoding) > 0 {
+        out = out + "Accept-Encoding: " + config.accept_encoding + "\r\n";
+    }
+    if string_len(config.bearer_token) > 0 {
+        out = out + "Authorization: Bearer " + config.bearer_token + "\r\n";
+    }
+    if string_len(config.api_key_header) > 0 && string_len(config.api_key_value) > 0 {
+        out = out + config.api_key_header + ": " + config.api_key_value + "\r\n";
+    }
+    if body_len > 0 {
+        out = out + "Content-Length: " + len_str + "\r\n";
+        out = out + "Content-Type: " + config.content_type + "\r\n";
+    }
+    out = out + "Connection: close\r\n\r\n";
+    if body_len > 0 {
+        out = out + req.body;
+    }
+    return out;
+}
+
+pub fn http_execute_request(host: String, port: i64, req: HttpRequest, config: HttpClientConfig) -> HttpResponse {
+    mut stream = make_tcp_connect(host, port);
+    if !stream.is_open {
+        return HttpResponse(status_code: 503, status_text: "Service Unavailable", content_type: "text/plain", body: "Connection failed");
+    }
+
+    let wire = format_http_request_secure(req, host, config);
+    stream_write(stream, wire);
+    let resp_str = stream_read(stream, 65536);
+    stream_close(stream);
+    return parse_http_response(resp_str);
+}
+
+pub fn http_get_secure(host: String, port: i64, path: String, config: HttpClientConfig) -> HttpResponse {
+    let req = HttpRequest(method: "GET", path: path, version: "HTTP/1.1", body: "");
+    return http_execute_request(host, port, req, config);
+}
+
+pub fn http_post_secure(host: String, port: i64, path: String, body: String, config: HttpClientConfig) -> HttpResponse {
+    let req = HttpRequest(method: "POST", path: path, version: "HTTP/1.1", body: body);
+    return http_execute_request(host, port, req, config);
+}
+
+pub fn http_put_secure(host: String, port: i64, path: String, body: String, config: HttpClientConfig) -> HttpResponse {
+    let req = HttpRequest(method: "PUT", path: path, version: "HTTP/1.1", body: body);
+    return http_execute_request(host, port, req, config);
+}
+
+pub fn http_delete_secure(host: String, port: i64, path: String, config: HttpClientConfig) -> HttpResponse {
+    let req = HttpRequest(method: "DELETE", path: path, version: "HTTP/1.1", body: "");
+    return http_execute_request(host, port, req, config);
+}
+
+pub fn json_extract_string_field(json_str: String, field_name: String) -> String {
+    let key = "\"" + field_name + "\"";
+    let k_len = string_len(key);
+    let total_len = string_len(json_str);
+    mut i: i64 = 0;
+    while i <= total_len - k_len {
+        mut matches = true;
+        mut k: i64 = 0;
+        while k < k_len {
+            if string_char_at(json_str, i + k) != string_char_at(key, k) {
+                matches = false;
+                k = k_len;
+            }
+            k = k + 1;
+        }
+
+        if matches {
+            mut pos = i + k_len;
+            while pos < total_len && string_char_at(json_str, pos) != 58 { // ':'
+                pos = pos + 1;
+            }
+            pos = pos + 1;
+            while pos < total_len && (string_char_at(json_str, pos) == 32 || string_char_at(json_str, pos) == 9) {
+                pos = pos + 1;
+            }
+            if pos < total_len && string_char_at(json_str, pos) == 34 { // '"'
+                pos = pos + 1;
+                let start_val = pos;
+                while pos < total_len && string_char_at(json_str, pos) != 34 {
+                    pos = pos + 1;
+                }
+                return string_substr(json_str, start_val, pos - start_val);
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub fn json_extract_int_field(json_str: String, field_name: String) -> i64 {
+    let key = "\"" + field_name + "\"";
+    let k_len = string_len(key);
+    let total_len = string_len(json_str);
+    mut i: i64 = 0;
+    while i <= total_len - k_len {
+        mut matches = true;
+        mut k: i64 = 0;
+        while k < k_len {
+            if string_char_at(json_str, i + k) != string_char_at(key, k) {
+                matches = false;
+                k = k_len;
+            }
+            k = k + 1;
+        }
+
+        if matches {
+            mut pos = i + k_len;
+            while pos < total_len && string_char_at(json_str, pos) != 58 { // ':'
+                pos = pos + 1;
+            }
+            pos = pos + 1;
+            while pos < total_len && (string_char_at(json_str, pos) == 32 || string_char_at(json_str, pos) == 9) {
+                pos = pos + 1;
+            }
+            let start_val = pos;
+            while pos < total_len && string_char_at(json_str, pos) >= 48 && string_char_at(json_str, pos) <= 57 {
+                pos = pos + 1;
+            }
+            let val_str = string_substr(json_str, start_val, pos - start_val);
+            return string_to_int(val_str);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub fn parse_token_response(json_payload: String) -> TokenNegotiationResponse {
+    let token = json_extract_string_field(json_payload, "access_token");
+    let t_type = json_extract_string_field(json_payload, "token_type");
+    let exp = json_extract_int_field(json_payload, "expires_in");
+    let refresh = json_extract_string_field(json_payload, "refresh_token");
+    let is_valid = string_len(token) > 0;
+    return TokenNegotiationResponse(
+        access_token: token,
+        token_type: if string_len(t_type) > 0 { t_type } else { "Bearer" },
+        expires_in: if exp > 0 { exp } else { 3600 },
+        refresh_token: refresh,
+        is_valid: is_valid
+    );
+}
+
+pub fn http_negotiate_token(host: String, port: i64, auth_path: String, client_id: String, client_secret: String) -> TokenNegotiationResponse {
+    let payload = "{\"client_id\":\"" + client_id + "\",\"client_secret\":\"" + client_secret + "\",\"grant_type\":\"client_credentials\"}";
+    let cfg = make_http_client_config();
+    let resp = http_post_secure(host, port, auth_path, payload, cfg);
+    if resp.status_code != 200 {
+        return make_token_response("", "", 0, "", false);
+    }
+    return parse_token_response(resp.body);
+}
+
+pub fn http_refresh_token(host: String, port: i64, refresh_path: String, refresh_token: String) -> TokenNegotiationResponse {
+    let payload = "{\"refresh_token\":\"" + refresh_token + "\",\"grant_type\":\"refresh_token\"}";
+    let cfg = make_http_client_config();
+    let resp = http_post_secure(host, port, refresh_path, payload, cfg);
+    if resp.status_code != 200 {
+        return make_token_response("", "", 0, "", false);
+    }
+    return parse_token_response(resp.body);
+}
+
+pub fn http_authenticate_and_request(host: String, port: i64, auth_path: String, resource_path: String, client_id: String, client_secret: String) -> HttpResponse {
+    let tok_resp = http_negotiate_token(host, port, auth_path, client_id, client_secret);
+    if !tok_resp.is_valid {
+        return HttpResponse(status_code: 401, status_text: "Unauthorized", content_type: "application/json", body: "{\"error\":\"Token negotiation failed\"}");
+    }
+    let client_cfg = http_client_with_bearer(tok_resp.access_token);
+    return http_get_secure(host, port, resource_path, client_cfg);
+}
+
+// ===========================================================================
+// Tests for Compression and Secure HTTP Client
+// ===========================================================================
+
+pub fn test_net_crc32_and_adler32() -> bool {
+    let crc = net_crc32_string("123456789");
+    if crc != 3421780262 {
+        return false;
+    }
+
+    let adler = net_adler32_string("Wikipedia");
+    if adler != 300286872 {
+        return false;
+    }
+
+    return true;
+}
+
+pub fn test_net_deflate_compression_roundtrip() -> bool {
+    let original = "IFA Pure Language Native RFC 1951 Deflate Stream Engine";
+    let compressed = deflate_compress_string(original);
+    if compressed.len() <= 5 {
+        return false;
+    }
+    if (compressed[0] & 1) != 1 {
+        return false;
+    }
+    let restored = deflate_decompress_string(compressed);
+    return restored == original;
+}
+
+pub fn test_net_gzip_compression_roundtrip() -> bool {
+    let original = "IFA RFC 1952 Gzip Native Compression Header, Deflate and Trailer";
+    let gz = gzip_compress_string(original);
+    if gz.len() < 18 {
+        return false;
+    }
+    if gz[0] != 31 || gz[1] != 139 || gz[2] != 8 {
+        return false;
+    }
+    let restored = gzip_decompress_string(gz);
+    return restored == original;
+}
+
+pub fn test_net_http_secure_client_token_negotiation() -> bool {
+    mut listener = make_tcp_listener(0);
+    if !listener.is_open || listener.port <= 0 {
+        return false;
+    }
+
+    // Step 1: Client negotiates token with auth server
+    mut client = make_tcp_connect("127.0.0.1", listener.port);
+    if !client.is_open {
+        listener_close(listener);
+        return false;
+    }
+
+    mut server = listener_accept(listener);
+    if !server.is_open {
+        stream_close(client);
+        listener_close(listener);
+        return false;
+    }
+
+    let auth_body = "{\"client_id\":\"ifa-app\",\"client_secret\":\"ifa-secret-77\"}";
+    let client_cfg = make_http_client_config();
+    let auth_req = HttpRequest(method: "POST", path: "/oauth/token", version: "HTTP/1.1", body: auth_body);
+    let wire_auth_req = format_http_request_secure(auth_req, "127.0.0.1", client_cfg);
+    stream_write(client, wire_auth_req);
+
+    let raw_auth_req = stream_read(server, 1024);
+    let parsed_auth_req = parse_http_request(raw_auth_req);
+    if parsed_auth_req.method != "POST" || parsed_auth_req.path != "/oauth/token" {
+        stream_close(client);
+        stream_close(server);
+        listener_close(listener);
+        return false;
+    }
+
+    let token_json = "{\"access_token\":\"ifa_bearer_sec_9911\",\"token_type\":\"Bearer\",\"expires_in\":3600,\"refresh_token\":\"ifa_ref_5522\"}";
+    let auth_resp = make_http_response(200, "OK", "application/json", token_json);
+    let wire_auth_resp = format_http_response(auth_resp);
+    stream_write(server, wire_auth_resp);
+
+    let raw_auth_resp = stream_read(client, 1024);
+    let parsed_auth_resp = parse_http_response(raw_auth_resp);
+    let tok = parse_token_response(parsed_auth_resp.body);
+    if !tok.is_valid || tok.access_token != "ifa_bearer_sec_9911" || tok.expires_in != 3600 || tok.refresh_token != "ifa_ref_5522" {
+        stream_close(client);
+        stream_close(server);
+        listener_close(listener);
+        return false;
+    }
+
+    stream_close(client);
+    stream_close(server);
+
+    // Step 2: Client performs authenticated API request using negotiated Bearer token
+    mut client2 = make_tcp_connect("127.0.0.1", listener.port);
+    if !client2.is_open {
+        listener_close(listener);
+        return false;
+    }
+
+    mut server2 = listener_accept(listener);
+    if !server2.is_open {
+        stream_close(client2);
+        listener_close(listener);
+        return false;
+    }
+
+    let auth_cfg = http_client_with_bearer(tok.access_token);
+    let api_req = HttpRequest(method: "GET", path: "/api/v1/protected-data", version: "HTTP/1.1", body: "");
+    let wire_api_req = format_http_request_secure(api_req, "127.0.0.1", auth_cfg);
+    stream_write(client2, wire_api_req);
+
+    let raw_api_req = stream_read(server2, 1024);
+    let auth_header = http_get_header(raw_api_req, "Authorization");
+    if auth_header != "Bearer ifa_bearer_sec_9911" {
+        stream_close(client2);
+        stream_close(server2);
+        listener_close(listener);
+        return false;
+    }
+
+    let api_resp = make_http_response(200, "OK", "application/json", "{\"status\":\"authorized\",\"identity\":\"ifa-app\"}");
+    let wire_api_resp = format_http_response(api_resp);
+    stream_write(server2, wire_api_resp);
+
+    let raw_api_resp = stream_read(client2, 1024);
+    let parsed_api_resp = parse_http_response(raw_api_resp);
+    if parsed_api_resp.status_code != 200 || !string_contains(parsed_api_resp.body, "authorized") {
+        stream_close(client2);
+        stream_close(server2);
+        listener_close(listener);
+        return false;
+    }
+
+    stream_close(client2);
+    stream_close(server2);
+    listener_close(listener);
+    return true;
+}
+
 pub fn test_net_all() -> bool {
     return test_net_tcp_echo()
-        && test_net_http_wire()
-        && test_net_nonblocking_fiber_transport()
-        && test_net_url_parsing_and_formatting()
-        && test_net_http_client_and_response_parsing()
-        && test_net_http_client_server_roundtrip()
-        && test_net_http_status_helpers()
-        && test_net_http_put_and_delete()
-        && test_net_udp_roundtrip()
-        && test_net_http_router_and_query_params()
-        && test_net_http_headers_and_status_categories()
-        && test_net_http_patch_and_head()
-        && test_net_http_chunked_streaming()
-        && test_net_websocket_framing_and_roundtrip()
-        && test_net_tcp_server_multiple_clients()
-        && test_net_websocket_server_multiplexing();
+    && test_net_http_wire()
+    && test_net_nonblocking_fiber_transport()
+    && test_net_url_parsing_and_formatting()
+    && test_net_http_client_and_response_parsing()
+    && test_net_http_client_server_roundtrip()
+    && test_net_http_status_helpers()
+    && test_net_http_put_and_delete()
+    && test_net_udp_roundtrip()
+    && test_net_http_router_and_query_params()
+    && test_net_http_headers_and_status_categories()
+    && test_net_http_patch_and_head()
+    && test_net_http_chunked_streaming()
+    && test_net_websocket_framing_and_roundtrip()
+    && test_net_tcp_server_multiple_clients()
+    && test_net_websocket_server_multiplexing()
+    && test_net_crc32_and_adler32()
+    && test_net_deflate_compression_roundtrip()
+    && test_net_gzip_compression_roundtrip()
+    && test_net_http_secure_client_token_negotiation();
 }
 
 pub fn main() {
@@ -2347,7 +3116,11 @@ pub fn main() {
     let t14 = test_net_websocket_framing_and_roundtrip();
     let t15 = test_net_tcp_server_multiple_clients();
     let t16 = test_net_websocket_server_multiplexing();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 {
+    let t17 = test_net_crc32_and_adler32();
+    let t18 = test_net_deflate_compression_roundtrip();
+    let t19 = test_net_gzip_compression_roundtrip();
+    let t20 = test_net_http_secure_client_token_negotiation();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");

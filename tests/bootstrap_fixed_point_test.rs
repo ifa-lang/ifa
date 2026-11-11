@@ -1903,13 +1903,33 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_net_crc32_and_adler32 ... ok"),
+        "Std net crc32 and adler32 test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_deflate_compression_roundtrip ... ok"),
+        "Std net deflate compression roundtrip test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_gzip_compression_roundtrip ... ok"),
+        "Std net gzip compression roundtrip test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_net_http_secure_client_token_negotiation ... ok"),
+        "Std net http secure client token negotiation test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("235 passed; 0 failed"),
-        "Expected 235 passed std unit tests, got:\n{}",
+        stdout.contains("243 passed; 0 failed"),
+        "Expected 243 passed std unit tests, got:\n{}",
         stdout
     );
 }

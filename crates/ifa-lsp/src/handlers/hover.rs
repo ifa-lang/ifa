@@ -273,6 +273,46 @@ pub fn handle_hover(doc: &Document, position: Position) -> Option<Hover> {
             "**`byte_stream_read_u32_be(inout stream: ByteStream) -> i64`** — Big-Endian 32-bit Reader (`std/io`).\n\n\
              Reads a 32-bit integer in big-endian order from the binary stream.",
         ),
+        "HttpClientConfig" => Some(
+            "**`HttpClientConfig`** — Secure HTTP Client Configuration (`std/net`).\n\n\
+             Manages Bearer tokens, custom headers, compression preferences, and User-Agent headers.",
+        ),
+        "HttpHeader" => Some(
+            "**`HttpHeader`** — Key-Value HTTP Header (`std/net`).\n\n\
+             Represents a single header name-value pair.",
+        ),
+        "TokenNegotiationResponse" => Some(
+            "**`TokenNegotiationResponse`** — OAuth2 / Token Negotiation Result (`std/net`).\n\n\
+             Contains access token, token type, expiry duration, and refresh token.",
+        ),
+        "http_negotiate_token" => Some(
+            "**`http_negotiate_token(host: String, port: i64, auth_path: String, client_id: String, client_secret: String) -> TokenNegotiationResponse`** — OAuth2 Token Negotiation (`std/net`).\n\n\
+             Negotiates an access token with an authentication endpoint using client credentials.",
+        ),
+        "http_get_secure" => Some(
+            "**`http_get_secure(host: String, port: i64, path: String, config: HttpClientConfig) -> HttpResponse`** — Authenticated HTTP GET (`std/net`).\n\n\
+             Performs an authenticated GET request using the provided client configuration.",
+        ),
+        "http_post_secure" => Some(
+            "**`http_post_secure(host: String, port: i64, path: String, body: String, config: HttpClientConfig) -> HttpResponse`** — Authenticated HTTP POST (`std/net`).\n\n\
+             Performs an authenticated POST request with payload and configuration.",
+        ),
+        "gzip_compress_string" => Some(
+            "**`gzip_compress_string(text: String) -> List<i64>`** — RFC 1952 Gzip Compression (`std/net`).\n\n\
+             Compresses a UTF-8/ASCII text string into a compliant RFC 1952 Gzip stream.",
+        ),
+        "gzip_decompress_string" => Some(
+            "**`gzip_decompress_string(gz: List<i64>) -> String`** — RFC 1952 Gzip Decompression (`std/net`).\n\n\
+             Decompresses an RFC 1952 Gzip byte stream into its original text representation.",
+        ),
+        "deflate_compress_string" => Some(
+            "**`deflate_compress_string(text: String) -> List<i64>`** — RFC 1951 Deflate Compression (`std/net`).\n\n\
+             Compresses a text string into a compliant RFC 1951 raw Deflate stream.",
+        ),
+        "deflate_decompress_string" => Some(
+            "**`deflate_decompress_string(compressed: List<i64>) -> String`** — RFC 1951 Deflate Decompression (`std/net`).\n\n\
+             Decompresses an RFC 1951 Deflate byte stream into its original text representation.",
+        ),
         _ => None,
     };
 
