@@ -1,5 +1,6 @@
 use crate::json::{self, JsonValue};
 use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Standard HTTP Methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,18 +91,41 @@ impl HttpStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HttpHeaders {
     headers: HashMap<String, String>,
+    multi_headers: HashMap<String, Vec<String>>,
+    raw_entries: Vec<(String, String)>,
 }
 
 impl HttpHeaders {
     pub fn new() -> Self {
         Self {
             headers: HashMap::new(),
+            multi_headers: HashMap::new(),
+            raw_entries: Vec::new(),
         }
     }
 
     pub fn set(&mut self, key: impl Into<String>, value: impl Into<String>) {
         let k = key.into();
-        self.headers.insert(k.to_ascii_lowercase(), value.into());
+        let k_lower = k.to_ascii_lowercase();
+        let val = value.into();
+        self.raw_entries
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(&k_lower));
+        self.raw_entries.push((k, val.clone()));
+        self.multi_headers
+            .insert(k_lower.clone(), vec![val.clone()]);
+        self.headers.insert(k_lower, val);
+    }
+
+    pub fn append(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let k = key.into();
+        let k_lower = k.to_ascii_lowercase();
+        let val = value.into();
+        self.headers.insert(k_lower.clone(), val.clone());
+        self.multi_headers
+            .entry(k_lower)
+            .or_default()
+            .push(val.clone());
+        self.raw_entries.push((k, val));
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -110,16 +134,27 @@ impl HttpHeaders {
             .map(|s| s.as_str())
     }
 
+    pub fn get_all(&self, key: &str) -> Vec<&str> {
+        self.multi_headers
+            .get(&key.to_ascii_lowercase())
+            .map(|vec| vec.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_default()
+    }
+
     pub fn has(&self, key: &str) -> bool {
         self.headers.contains_key(&key.to_ascii_lowercase())
     }
 
     pub fn remove(&mut self, key: &str) -> Option<String> {
-        self.headers.remove(&key.to_ascii_lowercase())
+        let k_lower = key.to_ascii_lowercase();
+        self.raw_entries
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(&k_lower));
+        self.multi_headers.remove(&k_lower);
+        self.headers.remove(&k_lower)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
-        self.headers.iter()
+        self.raw_entries.iter().map(|(k, v)| (k, v))
     }
 }
 
@@ -563,8 +598,24 @@ impl HttpResponse {
             http_only,
             same_site,
         );
-        self.headers.set("Set-Cookie", cookie_str);
+        self.headers.append("Set-Cookie", cookie_str);
         self
+    }
+
+    /// Add a structured Cookie object as a Set-Cookie header.
+    pub fn set_cookie_obj(mut self, cookie: &Cookie) -> Self {
+        let cookie_str = cookie.to_set_cookie_header();
+        self.headers.append("Set-Cookie", cookie_str);
+        self
+    }
+
+    /// Extract all Set-Cookie headers as parsed Cookie instances.
+    pub fn cookies(&self) -> Vec<Cookie> {
+        self.headers
+            .get_all("set-cookie")
+            .into_iter()
+            .filter_map(Cookie::parse_set_cookie)
+            .collect()
     }
 
     /// Create an HTTP Response initialized for Server-Sent Events (SSE).
@@ -713,7 +764,7 @@ impl HttpResponse {
         let mut headers = HttpHeaders::new();
         for line in lines {
             if let Some((k, v)) = line.split_once(':') {
-                headers.set(k.trim(), v.trim());
+                headers.append(k.trim(), v.trim());
             }
         }
 
@@ -783,7 +834,7 @@ impl HttpRequest {
         let mut headers = HttpHeaders::new();
         for line in lines {
             if let Some((k, v)) = line.split_once(':') {
-                headers.set(k.trim(), v.trim());
+                headers.append(k.trim(), v.trim());
             }
         }
 
@@ -1055,7 +1106,6 @@ use ifa_runtime::GLOBAL_SCHEDULER;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 pub type HttpHandler = Arc<dyn Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static>;
 
@@ -1567,6 +1617,20 @@ impl HttpClient {
             .json(payload);
         self.send(&req, host, port)
     }
+
+    /// Send an HTTP request managing cookies through the provided CookieJar.
+    pub fn send_with_cookie_jar(
+        &self,
+        req: &mut HttpRequest,
+        host: &str,
+        port: u16,
+        cookie_jar: &mut CookieJar,
+    ) -> io::Result<HttpResponse> {
+        cookie_jar.apply_to_request(req);
+        let resp = self.send(req, host, port)?;
+        cookie_jar.store_from_response(&resp);
+        Ok(resp)
+    }
 }
 
 impl Default for HttpClient {
@@ -1701,6 +1765,432 @@ pub fn format_set_cookie(
         out.push_str("; HttpOnly");
     }
     out
+}
+
+/// RFC 6265bis SameSite attribute policy for HTTP cookies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameSite {
+    Strict,
+    Lax,
+    None,
+}
+
+impl SameSite {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SameSite::Strict => "Strict",
+            SameSite::Lax => "Lax",
+            SameSite::None => "None",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        if s.eq_ignore_ascii_case("strict") {
+            Some(SameSite::Strict)
+        } else if s.eq_ignore_ascii_case("lax") {
+            Some(SameSite::Lax)
+        } else if s.eq_ignore_ascii_case("none") {
+            Some(SameSite::None)
+        } else {
+            None
+        }
+    }
+}
+
+/// Structured HTTP Cookie complying with RFC 6265 and RFC 6265bis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cookie {
+    pub name: String,
+    pub value: String,
+    pub path: Option<String>,
+    pub domain: Option<String>,
+    pub max_age_secs: Option<u64>,
+    pub secure: bool,
+    pub http_only: bool,
+    pub same_site: Option<SameSite>,
+    pub created_at: Instant,
+}
+
+impl Cookie {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            path: None,
+            domain: None,
+            max_age_secs: None,
+            secure: false,
+            http_only: false,
+            same_site: None,
+            created_at: Instant::now(),
+        }
+    }
+
+    pub fn path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    pub fn domain(mut self, domain: impl Into<String>) -> Self {
+        self.domain = Some(domain.into());
+        self
+    }
+
+    pub fn max_age(mut self, secs: u64) -> Self {
+        self.max_age_secs = Some(secs);
+        self
+    }
+
+    pub fn secure(mut self, secure: bool) -> Self {
+        self.secure = secure;
+        self
+    }
+
+    pub fn http_only(mut self, http_only: bool) -> Self {
+        self.http_only = http_only;
+        self
+    }
+
+    pub fn same_site(mut self, same_site: SameSite) -> Self {
+        self.same_site = Some(same_site);
+        self
+    }
+
+    /// Check if this cookie is expired relative to a reference instant.
+    pub fn is_expired_at(&self, now: Instant) -> bool {
+        if let Some(max_age) = self.max_age_secs {
+            if max_age == 0 {
+                return true;
+            }
+            let elapsed = now.saturating_duration_since(self.created_at);
+            elapsed >= Duration::from_secs(max_age)
+        } else {
+            false
+        }
+    }
+
+    /// Check if this cookie has expired as of right now.
+    pub fn is_expired(&self) -> bool {
+        self.is_expired_at(Instant::now())
+    }
+
+    /// Format as an RFC 6265 Set-Cookie header value.
+    pub fn to_set_cookie_header(&self) -> String {
+        format_set_cookie(
+            &self.name,
+            &self.value,
+            self.path.as_deref(),
+            self.max_age_secs,
+            self.secure,
+            self.http_only,
+            self.same_site.map(|ss| ss.as_str()),
+        )
+    }
+
+    /// Format as a single key-value pair for Cookie request headers.
+    pub fn to_cookie_pair(&self) -> String {
+        format!("{}={}", self.name, self.value)
+    }
+
+    /// Parse a raw Set-Cookie header string into a structured Cookie.
+    pub fn parse_set_cookie(header: &str) -> Option<Self> {
+        let mut parts = header.split(';');
+        let first = parts.next()?.trim();
+        let (name, value) = first.split_once('=')?;
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() {
+            return None;
+        }
+
+        let mut cookie = Cookie::new(name, value);
+
+        for part in parts {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some((attr_name, attr_val)) = trimmed.split_once('=') {
+                let attr_name = attr_name.trim();
+                let attr_val = attr_val.trim();
+                if attr_name.eq_ignore_ascii_case("path") {
+                    cookie.path = Some(attr_val.to_string());
+                } else if attr_name.eq_ignore_ascii_case("domain") {
+                    cookie.domain = Some(attr_val.to_string());
+                } else if attr_name.eq_ignore_ascii_case("max-age") {
+                    if let Ok(secs) = attr_val.parse::<u64>() {
+                        cookie.max_age_secs = Some(secs);
+                    }
+                } else if attr_name.eq_ignore_ascii_case("samesite") {
+                    cookie.same_site = SameSite::parse(attr_val);
+                }
+            } else if trimmed.eq_ignore_ascii_case("secure") {
+                cookie.secure = true;
+            } else if trimmed.eq_ignore_ascii_case("httponly") {
+                cookie.http_only = true;
+            }
+        }
+
+        Some(cookie)
+    }
+}
+
+/// RFC 6265 client cookie jar managing automatic persistence, expiration, and header formatting.
+#[derive(Debug, Clone, Default)]
+pub struct CookieJar {
+    cookies: HashMap<String, Cookie>,
+}
+
+impl CookieJar {
+    pub fn new() -> Self {
+        Self {
+            cookies: HashMap::new(),
+        }
+    }
+
+    /// Store or update a cookie in the jar.
+    pub fn add(&mut self, mut cookie: Cookie) {
+        cookie.created_at = Instant::now();
+        self.cookies.insert(cookie.name.clone(), cookie);
+    }
+
+    /// Retrieve an unexpired cookie by name.
+    pub fn get(&self, name: &str) -> Option<&Cookie> {
+        if let Some(cookie) = self.cookies.get(name) {
+            if cookie.is_expired() {
+                None
+            } else {
+                Some(cookie)
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Retrieve an unexpired cookie value by name.
+    pub fn get_value(&self, name: &str) -> Option<&str> {
+        self.get(name).map(|c| c.value.as_str())
+    }
+
+    /// Check if an unexpired cookie with the given name exists.
+    pub fn contains(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    /// Remove a cookie by name.
+    pub fn remove(&mut self, name: &str) -> Option<Cookie> {
+        self.cookies.remove(name)
+    }
+
+    /// Remove all cookies.
+    pub fn clear(&mut self) {
+        self.cookies.clear();
+    }
+
+    /// Count of currently valid (non-expired) cookies.
+    pub fn len(&self) -> usize {
+        self.cookies.values().filter(|c| !c.is_expired()).count()
+    }
+
+    /// Returns true if no valid cookies exist.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Purge expired cookies and return the number of purged cookies.
+    pub fn purge_expired(&mut self) -> usize {
+        let initial_len = self.cookies.len();
+        self.cookies.retain(|_, c| !c.is_expired());
+        initial_len - self.cookies.len()
+    }
+
+    /// Parse and store a Set-Cookie header. If Max-Age=0, removes the cookie.
+    pub fn store_set_cookie(&mut self, set_cookie_str: &str) -> bool {
+        if let Some(cookie) = Cookie::parse_set_cookie(set_cookie_str) {
+            if cookie.max_age_secs == Some(0) {
+                self.remove(&cookie.name);
+            } else {
+                self.add(cookie);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Extract and store all Set-Cookie headers from an HTTP response.
+    pub fn store_from_response(&mut self, response: &HttpResponse) -> usize {
+        let set_cookie_headers = response.headers.get_all("set-cookie");
+        let mut count = 0;
+        for sc in set_cookie_headers {
+            if self.store_set_cookie(sc) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Build a Cookie header string (e.g. "foo=bar; baz=qux") in deterministic order.
+    pub fn to_cookie_header(&self) -> Option<String> {
+        let mut valid: Vec<&Cookie> = self.cookies.values().filter(|c| !c.is_expired()).collect();
+        if valid.is_empty() {
+            return None;
+        }
+        valid.sort_by(|a, b| a.name.cmp(&b.name));
+        let s = valid
+            .iter()
+            .map(|c| c.to_cookie_pair())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(s)
+    }
+
+    /// Apply valid cookies to an HTTP request's headers.
+    pub fn apply_to_request(&self, request: &mut HttpRequest) {
+        if let Some(header_val) = self.to_cookie_header() {
+            request.headers.set("Cookie", header_val);
+        }
+    }
+}
+
+/// In-memory server-side HTTP session with expiration and key-value attributes.
+#[derive(Debug, Clone)]
+pub struct HttpSession {
+    pub id: String,
+    pub created_at: Instant,
+    pub last_accessed_at: Instant,
+    pub ttl: Duration,
+    data: HashMap<String, String>,
+}
+
+impl HttpSession {
+    pub fn new(id: impl Into<String>, ttl: Duration) -> Self {
+        let now = Instant::now();
+        Self {
+            id: id.into(),
+            created_at: now,
+            last_accessed_at: now,
+            ttl,
+            data: HashMap::new(),
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.data.get(key).map(|s| s.as_str())
+    }
+
+    pub fn set(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.data.insert(key.into(), value.into());
+        self.last_accessed_at = Instant::now();
+    }
+
+    pub fn remove(&mut self, key: &str) -> Option<String> {
+        self.last_accessed_at = Instant::now();
+        self.data.remove(key)
+    }
+
+    pub fn is_expired_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_accessed_at) >= self.ttl
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.is_expired_at(Instant::now())
+    }
+
+    pub fn touch(&mut self) {
+        self.last_accessed_at = Instant::now();
+    }
+}
+
+/// Server-side session store managing active sessions, generation, and TTL eviction.
+#[derive(Debug)]
+pub struct SessionStore {
+    sessions: HashMap<String, HttpSession>,
+    default_ttl: Duration,
+    counter: u64,
+}
+
+impl SessionStore {
+    pub fn new(default_ttl: Duration) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            default_ttl,
+            counter: 0,
+        }
+    }
+
+    fn generate_session_id(&mut self) -> String {
+        self.counter += 1;
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mix = (ts ^ (self.counter as u128).wrapping_mul(0x517cc1b727220a95)) as u64;
+        format!("ifa_sess_{:016x}_{:08x}", mix, self.counter)
+    }
+
+    pub fn create_session(&mut self) -> String {
+        self.create_session_with_ttl(self.default_ttl)
+    }
+
+    pub fn create_session_with_ttl(&mut self, ttl: Duration) -> String {
+        let sid = self.generate_session_id();
+        let session = HttpSession::new(sid.clone(), ttl);
+        self.sessions.insert(sid.clone(), session);
+        sid
+    }
+
+    pub fn get_session(&mut self, id: &str) -> Option<&HttpSession> {
+        let is_exp = self
+            .sessions
+            .get(id)
+            .map(|s| s.is_expired())
+            .unwrap_or(true);
+        if is_exp {
+            self.sessions.remove(id);
+            None
+        } else {
+            if let Some(s) = self.sessions.get_mut(id) {
+                s.touch();
+            }
+            self.sessions.get(id)
+        }
+    }
+
+    pub fn get_session_mut(&mut self, id: &str) -> Option<&mut HttpSession> {
+        let is_exp = self
+            .sessions
+            .get(id)
+            .map(|s| s.is_expired())
+            .unwrap_or(true);
+        if is_exp {
+            self.sessions.remove(id);
+            None
+        } else {
+            let session = self.sessions.get_mut(id)?;
+            session.touch();
+            Some(session)
+        }
+    }
+
+    pub fn remove_session(&mut self, id: &str) -> Option<HttpSession> {
+        self.sessions.remove(id)
+    }
+
+    pub fn purge_expired(&mut self) -> usize {
+        let now = Instant::now();
+        let initial_len = self.sessions.len();
+        self.sessions.retain(|_, s| !s.is_expired_at(now));
+        initial_len - self.sessions.len()
+    }
+
+    pub fn active_sessions_count(&self) -> usize {
+        let now = Instant::now();
+        self.sessions
+            .values()
+            .filter(|s| !s.is_expired_at(now))
+            .count()
+    }
 }
 
 /// Multipart part representation (RFC 7578 / RFC 2046).
@@ -3513,6 +4003,146 @@ mod tests {
             Some("Strict"),
         );
         assert_eq!(resp.headers.get("set-cookie"), Some(formatted.as_str()));
+    }
+
+    #[test]
+    fn test_cookie_struct_and_samesite_rfc6265() {
+        let c = Cookie::new("jwt_auth", "token_val_12345")
+            .path("/auth")
+            .domain("ifa-lang.org")
+            .max_age(3600)
+            .secure(true)
+            .http_only(true)
+            .same_site(SameSite::Strict);
+
+        assert_eq!(c.name, "jwt_auth");
+        assert_eq!(c.value, "token_val_12345");
+        assert_eq!(c.path.as_deref(), Some("/auth"));
+        assert_eq!(c.domain.as_deref(), Some("ifa-lang.org"));
+        assert_eq!(c.max_age_secs, Some(3600));
+        assert!(c.secure);
+        assert!(c.http_only);
+        assert_eq!(c.same_site, Some(SameSite::Strict));
+
+        let set_cookie_hdr = c.to_set_cookie_header();
+        assert!(set_cookie_hdr.contains("jwt_auth=token_val_12345"));
+        assert!(set_cookie_hdr.contains("Path=/auth"));
+        assert!(set_cookie_hdr.contains("Max-Age=3600"));
+        assert!(set_cookie_hdr.contains("SameSite=Strict"));
+        assert!(set_cookie_hdr.contains("Secure"));
+        assert!(set_cookie_hdr.contains("HttpOnly"));
+
+        let parsed = Cookie::parse_set_cookie(&set_cookie_hdr).expect("Parsed Set-Cookie");
+        assert_eq!(parsed.name, "jwt_auth");
+        assert_eq!(parsed.value, "token_val_12345");
+        assert_eq!(parsed.path.as_deref(), Some("/auth"));
+        assert_eq!(parsed.max_age_secs, Some(3600));
+        assert!(parsed.secure);
+        assert!(parsed.http_only);
+        assert_eq!(parsed.same_site, Some(SameSite::Strict));
+
+        // Expiration check relative to future instant
+        let future_expired = c.created_at + Duration::from_secs(3601);
+        let future_valid = c.created_at + Duration::from_secs(3599);
+        assert!(c.is_expired_at(future_expired));
+        assert!(!c.is_expired_at(future_valid));
+    }
+
+    #[test]
+    fn test_cookie_jar_lifecycle_and_max_age_expiration() {
+        let mut jar = CookieJar::new();
+        assert!(jar.is_empty());
+
+        let c1 = Cookie::new("session", "sess_abc").max_age(100);
+        let c2 = Cookie::new("theme", "dracula");
+        let c3 = Cookie::new("temp", "remove_soon").max_age(0);
+
+        jar.add(c1);
+        jar.add(c2);
+        assert_eq!(jar.len(), 2);
+        assert_eq!(jar.get_value("session"), Some("sess_abc"));
+        assert_eq!(jar.get_value("theme"), Some("dracula"));
+
+        // Max-Age=0 removal
+        jar.store_set_cookie(&c3.to_set_cookie_header());
+        assert!(!jar.contains("temp"));
+
+        // Format to header
+        let hdr = jar.to_cookie_header().expect("Cookie header present");
+        assert!(hdr.contains("session=sess_abc"));
+        assert!(hdr.contains("theme=dracula"));
+
+        // Apply to request
+        let mut req = HttpRequest::new(HttpMethod::Get, "/api/dashboard");
+        jar.apply_to_request(&mut req);
+        assert_eq!(req.headers.get("cookie"), Some(hdr.as_str()));
+
+        // Manual removal
+        jar.remove("session");
+        assert_eq!(jar.len(), 1);
+        assert!(!jar.contains("session"));
+    }
+
+    #[test]
+    fn test_http_response_multiple_set_cookie_headers() {
+        let c1 = Cookie::new("sid", "123").path("/").http_only(true);
+        let c2 = Cookie::new("pref", "dark").path("/");
+        let c3 = Cookie::new("lang", "fr").path("/");
+
+        let resp = HttpResponse::ok()
+            .set_cookie_obj(&c1)
+            .set_cookie_obj(&c2)
+            .set_cookie_obj(&c3);
+
+        let parsed_cookies = resp.cookies();
+        assert_eq!(parsed_cookies.len(), 3);
+        assert_eq!(parsed_cookies[0].name, "sid");
+        assert_eq!(parsed_cookies[0].value, "123");
+        assert!(parsed_cookies[0].http_only);
+        assert_eq!(parsed_cookies[1].name, "pref");
+        assert_eq!(parsed_cookies[1].value, "dark");
+        assert_eq!(parsed_cookies[2].name, "lang");
+        assert_eq!(parsed_cookies[2].value, "fr");
+
+        let mut jar = CookieJar::new();
+        let stored = jar.store_from_response(&resp);
+        assert_eq!(stored, 3);
+        assert_eq!(jar.len(), 3);
+        assert_eq!(jar.get_value("sid"), Some("123"));
+        assert_eq!(jar.get_value("pref"), Some("dark"));
+        assert_eq!(jar.get_value("lang"), Some("fr"));
+    }
+
+    #[test]
+    fn test_http_session_and_session_store() {
+        let mut store = SessionStore::new(Duration::from_secs(60));
+        assert_eq!(store.active_sessions_count(), 0);
+
+        let sid = store.create_session();
+        assert!(sid.starts_with("ifa_sess_"));
+        assert_eq!(store.active_sessions_count(), 1);
+
+        {
+            let sess = store.get_session_mut(&sid).expect("Session found");
+            sess.set("user_id", "42");
+            sess.set("username", "prudence");
+            assert_eq!(sess.get("user_id"), Some("42"));
+            assert_eq!(sess.get("username"), Some("prudence"));
+        }
+
+        {
+            let sess = store.get_session(&sid).expect("Session found read-only");
+            assert_eq!(sess.get("user_id"), Some("42"));
+        }
+
+        // Test custom short TTL expiration
+        let short_sid = store.create_session_with_ttl(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(store.get_session(&short_sid).is_none());
+
+        // Invalidation
+        store.remove_session(&sid);
+        assert_eq!(store.active_sessions_count(), 0);
     }
 
     #[test]
