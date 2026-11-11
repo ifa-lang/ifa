@@ -1469,6 +1469,88 @@ impl AsyncWsConnection {
     }
 }
 
+/// Token Bucket Rate Limiter for network request throttling and DoS mitigation.
+#[derive(Debug, Clone)]
+pub struct TokenBucket {
+    capacity: u64,
+    tokens: u64,
+    refill_rate_per_sec: u64,
+    last_refill_timestamp: u64,
+}
+
+impl TokenBucket {
+    /// Create a new TokenBucket with maximum burst capacity and refill rate in tokens per second.
+    pub fn new(capacity: u64, refill_rate_per_sec: u64, now_sec: u64) -> Self {
+        Self {
+            capacity,
+            tokens: capacity,
+            refill_rate_per_sec,
+            last_refill_timestamp: now_sec,
+        }
+    }
+
+    /// Refill tokens based on elapsed seconds since last refill.
+    pub fn refill(&mut self, now_sec: u64) {
+        if now_sec > self.last_refill_timestamp {
+            let elapsed = now_sec - self.last_refill_timestamp;
+            let added = elapsed.saturating_mul(self.refill_rate_per_sec);
+            self.tokens = (self.tokens + added).min(self.capacity);
+            self.last_refill_timestamp = now_sec;
+        }
+    }
+
+    /// Try to consume `count` tokens. Returns true if permitted, false if rate limited.
+    pub fn try_consume(&mut self, count: u64, now_sec: u64) -> bool {
+        self.refill(now_sec);
+        if self.tokens >= count {
+            self.tokens -= count;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get current remaining available tokens.
+    pub fn remaining(&self) -> u64 {
+        self.tokens
+    }
+
+    /// Compute seconds until at least full capacity is reached or reset.
+    pub fn seconds_until_reset(&self) -> u64 {
+        if self.tokens >= self.capacity || self.refill_rate_per_sec == 0 {
+            0
+        } else {
+            let needed = self.capacity - self.tokens;
+            needed.div_ceil(self.refill_rate_per_sec)
+        }
+    }
+}
+
+/// MIME content type resolver for HTTP static file serving.
+pub fn lookup_mime_type(extension: &str) -> &'static str {
+    match extension.to_ascii_lowercase().as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "application/javascript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "txt" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "webp" => "image/webp",
+        "wasm" => "application/wasm",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "tar" => "application/x-tar",
+        "gz" => "application/gzip",
+        _ => "application/octet-stream",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1860,5 +1942,39 @@ mod tests {
             }
             other => panic!("Expected close message, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_token_bucket_rate_limiting() {
+        let mut tb = TokenBucket::new(10, 2, 1000);
+        assert_eq!(tb.remaining(), 10);
+
+        // Consume 6 tokens
+        assert!(tb.try_consume(6, 1000));
+        assert_eq!(tb.remaining(), 4);
+
+        // Consume 4 tokens
+        assert!(tb.try_consume(4, 1000));
+        assert_eq!(tb.remaining(), 0);
+
+        // Consume 1 token fails (throttled)
+        assert!(!tb.try_consume(1, 1000));
+
+        // Advance 3 seconds -> refills 6 tokens
+        assert!(tb.try_consume(5, 1003));
+        assert_eq!(tb.remaining(), 1);
+
+        // Reset seconds calculation
+        assert_eq!(tb.seconds_until_reset(), 5);
+    }
+
+    #[test]
+    fn test_mime_type_lookup() {
+        assert_eq!(lookup_mime_type("html"), "text/html; charset=utf-8");
+        assert_eq!(lookup_mime_type("json"), "application/json");
+        assert_eq!(lookup_mime_type("css"), "text/css; charset=utf-8");
+        assert_eq!(lookup_mime_type("wasm"), "application/wasm");
+        assert_eq!(lookup_mime_type("png"), "image/png");
+        assert_eq!(lookup_mime_type("unknown_ext"), "application/octet-stream");
     }
 }

@@ -113,6 +113,13 @@ pub struct TokenNegotiationResponse {
     is_valid: bool
 }
 
+pub struct TokenBucket {
+    capacity: i64,
+    tokens: i64,
+    refill_rate: i64,
+    last_refill: i64
+}
+
 pub fn make_http_header(name: String, value: String) -> HttpHeader {
     return HttpHeader(name: name, value: value);
 }
@@ -4476,6 +4483,236 @@ pub fn test_net_http_router_dynamic_params_and_websocket_handshake() -> bool {
     return true;
 }
 
+pub fn make_token_bucket(capacity: i64, refill_rate: i64, now_sec: i64) -> TokenBucket {
+    return TokenBucket(
+        capacity: capacity,
+        tokens: capacity,
+        refill_rate: refill_rate,
+        last_refill: now_sec
+    );
+}
+
+pub fn token_bucket_refill(inout tb: TokenBucket, now_sec: i64) {
+    if now_sec > tb.last_refill {
+        let elapsed = now_sec - tb.last_refill;
+        let added = elapsed * tb.refill_rate;
+        tb.tokens = tb.tokens + added;
+        if tb.tokens > tb.capacity {
+            tb.tokens = tb.capacity;
+        }
+        tb.last_refill = now_sec;
+    }
+}
+
+pub fn token_bucket_try_consume(inout tb: TokenBucket, count: i64, now_sec: i64) -> bool {
+    token_bucket_refill(inout tb, now_sec);
+    if tb.tokens >= count {
+        tb.tokens = tb.tokens - count;
+        return true;
+    }
+    return false;
+}
+
+pub fn token_bucket_remaining(tb: TokenBucket) -> i64 {
+    return tb.tokens;
+}
+
+pub fn token_bucket_seconds_until_reset(tb: TokenBucket) -> i64 {
+    if tb.tokens >= tb.capacity || tb.refill_rate <= 0 {
+        return 0;
+    }
+    let needed = tb.capacity - tb.tokens;
+    return (needed + tb.refill_rate - 1) / tb.refill_rate;
+}
+
+pub fn format_rate_limit_headers(limit: i64, remaining: i64, reset_sec: i64) -> String {
+    mut h = "X-RateLimit-Limit: ";
+    h = h + int_to_string(limit);
+    h = h + "\r\nX-RateLimit-Remaining: ";
+    h = h + int_to_string(remaining);
+    h = h + "\r\nX-RateLimit-Reset: ";
+    h = h + int_to_string(reset_sec);
+    h = h + "\r\n";
+    return h;
+}
+
+pub fn make_rate_limited_response(retry_after_sec: i64, limit: i64, reset_sec: i64) -> HttpResponse {
+    let body = "{\"error\":\"Too Many Requests\",\"retry_after\":" + int_to_string(retry_after_sec) + "}";
+    return HttpResponse(
+        status_code: 429,
+        status_text: "Too Many Requests",
+        content_type: "application/json",
+        body: body
+    );
+}
+
+pub fn net_mime_type_lookup(extension: String) -> String {
+    let ext = extension;
+    if ext == "html" || ext == "htm" {
+        return "text/html; charset=utf-8";
+    }
+    if ext == "css" {
+        return "text/css; charset=utf-8";
+    }
+    if ext == "js" || ext == "mjs" {
+        return "application/javascript";
+    }
+    if ext == "json" {
+        return "application/json";
+    }
+    if ext == "xml" {
+        return "application/xml";
+    }
+    if ext == "txt" {
+        return "text/plain; charset=utf-8";
+    }
+    if ext == "csv" {
+        return "text/csv; charset=utf-8";
+    }
+    if ext == "png" {
+        return "image/png";
+    }
+    if ext == "jpg" || ext == "jpeg" {
+        return "image/jpeg";
+    }
+    if ext == "gif" {
+        return "image/gif";
+    }
+    if ext == "svg" {
+        return "image/svg+xml";
+    }
+    if ext == "ico" {
+        return "image/x-icon";
+    }
+    if ext == "webp" {
+        return "image/webp";
+    }
+    if ext == "wasm" {
+        return "application/wasm";
+    }
+    if ext == "pdf" {
+        return "application/pdf";
+    }
+    if ext == "zip" {
+        return "application/zip";
+    }
+    return "application/octet-stream";
+}
+
+pub fn http_serve_static_content(content: String, extension: String, etag: String, if_none_match: String) -> HttpResponse {
+    let mime = net_mime_type_lookup(extension);
+    if if_none_match != "" && http_matches_if_none_match(etag, if_none_match) {
+        return HttpResponse(
+            status_code: 304,
+            status_text: "Not Modified",
+            content_type: mime,
+            body: ""
+        );
+    }
+    return HttpResponse(
+        status_code: 200,
+        status_text: "OK",
+        content_type: mime,
+        body: content
+    );
+}
+
+pub fn test_net_rate_limiting_and_mime_resolver() -> bool {
+    // 1. Token Bucket Burst and Throttling
+    mut tb = make_token_bucket(10, 2, 1000);
+    if token_bucket_remaining(tb) != 10 {
+        return false;
+    }
+    // Consume 6 tokens
+    if !token_bucket_try_consume(inout tb, 6, 1000) {
+        return false;
+    }
+    if token_bucket_remaining(tb) != 4 {
+        return false;
+    }
+    // Consume remaining 4 tokens
+    if !token_bucket_try_consume(inout tb, 4, 1000) {
+        return false;
+    }
+    if token_bucket_remaining(tb) != 0 {
+        return false;
+    }
+    // Next attempt must fail (rate limited)
+    if token_bucket_try_consume(inout tb, 1, 1000) {
+        return false;
+    }
+
+    // Refill after 3 seconds (+6 tokens at 2 tokens/sec)
+    if !token_bucket_try_consume(inout tb, 5, 1003) {
+        return false;
+    }
+    if token_bucket_remaining(tb) != 1 {
+        return false;
+    }
+
+    // Reset calculation: capacity 10 - remaining 1 = 9 needed => ceil(9 / 2) = 5 sec
+    let reset_sec = token_bucket_seconds_until_reset(tb);
+    if reset_sec != 5 {
+        return false;
+    }
+
+    // Rate limit headers
+    let rl_headers = format_rate_limit_headers(10, 1, reset_sec);
+    if !string_contains(rl_headers, "X-RateLimit-Limit: 10")
+        || !string_contains(rl_headers, "X-RateLimit-Remaining: 1")
+        || !string_contains(rl_headers, "X-RateLimit-Reset: 5") {
+        return false;
+    }
+
+    // 429 Too Many Requests response
+    let resp_429 = make_rate_limited_response(5, 10, reset_sec);
+    if resp_429.status_code != 429
+        || resp_429.status_text != "Too Many Requests"
+        || resp_429.content_type != "application/json"
+        || !string_contains(resp_429.body, "retry_after") {
+        return false;
+    }
+
+    // 2. MIME Type Lookup
+    if net_mime_type_lookup("html") != "text/html; charset=utf-8" {
+        return false;
+    }
+    if net_mime_type_lookup("json") != "application/json" {
+        return false;
+    }
+    if net_mime_type_lookup("wasm") != "application/wasm" {
+        return false;
+    }
+    if net_mime_type_lookup("png") != "image/png" {
+        return false;
+    }
+    if net_mime_type_lookup("unknown_ext") != "application/octet-stream" {
+        return false;
+    }
+
+    // 3. Static File & ETag Conditional Serving
+    let asset_html = "<!DOCTYPE html><html><body><h1>IFA Web</h1></body></html>";
+    let asset_etag = http_compute_etag(asset_html, false);
+
+    // Initial 200 OK
+    let resp_init = http_serve_static_content(asset_html, "html", asset_etag, "");
+    if resp_init.status_code != 200
+        || resp_init.content_type != "text/html; charset=utf-8"
+        || resp_init.body != asset_html {
+        return false;
+    }
+
+    // Conditional 304 Not Modified
+    let resp_cached = http_serve_static_content(asset_html, "html", asset_etag, asset_etag);
+    if resp_cached.status_code != 304
+        || resp_cached.status_text != "Not Modified"
+        || string_len(resp_cached.body) != 0 {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn test_net_all() -> bool {
     return test_net_tcp_echo()
     && test_net_http_wire()
@@ -4503,7 +4740,8 @@ pub fn test_net_all() -> bool {
     && test_net_http_sse_streaming_and_content_negotiation()
     && test_net_http_auth_cors_and_etag()
     && test_net_http_router_dynamic_params_and_websocket_handshake()
-    && test_net_websocket_frame_demux_and_fragmentation();
+    && test_net_websocket_frame_demux_and_fragmentation()
+    && test_net_rate_limiting_and_mime_resolver();
 }
 
 pub fn main() {
@@ -4534,7 +4772,8 @@ pub fn main() {
     let t25 = test_net_http_auth_cors_and_etag();
     let t26 = test_net_http_router_dynamic_params_and_websocket_handshake();
     let t27 = test_net_websocket_frame_demux_and_fragmentation();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 {
+    let t28 = test_net_rate_limiting_and_mime_resolver();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");
