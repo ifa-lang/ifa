@@ -871,6 +871,12 @@ char* ifa_rt_args_get(int64_t index) {
     }
     return copy;
 }
+
+uint64_t ifa_rt_sys_max_rss(void) { return 0; }
+uint64_t ifa_rt_sys_cpu_time_ns(void) { return 0; }
+int64_t ifa_rt_sys_cpu_count(void) { return 1; }
+uint64_t ifa_rt_sys_memory_resident(void) { return 0; }
+uint64_t ifa_rt_sys_memory_virtual(void) { return 0; }
 "#;
 
 /// Ahead-of-Time (AOT) compiler producing native object files (.o) and linked ELF binaries.
@@ -1606,6 +1612,58 @@ impl AotCompiler {
         self.func_ids
             .insert("fs::create_dir_all".into(), fs_mkdir_id);
         self.func_ids.insert("create_dir_all".into(), fs_mkdir_id);
+
+        // Register system resource intrinsics
+        let mut sys_res_sig = cranelift_codegen::ir::Signature::new(call_conv);
+        sys_res_sig
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I64,
+            ));
+        let sys_names: [(&str, &[&str]); 5] = [
+            (
+                "ifa_rt_sys_max_rss",
+                &["sys::max_rss", "max_rss", "sys::resources::max_rss"],
+            ),
+            (
+                "ifa_rt_sys_cpu_time_ns",
+                &[
+                    "sys::cpu_time_ns",
+                    "cpu_time_ns",
+                    "sys::resources::cpu_time_ns",
+                ],
+            ),
+            (
+                "ifa_rt_sys_cpu_count",
+                &["sys::cpu_count", "cpu_count", "sys::resources::cpu_count"],
+            ),
+            (
+                "ifa_rt_sys_memory_resident",
+                &[
+                    "sys::memory_resident",
+                    "memory_resident",
+                    "sys::resources::memory_resident",
+                ],
+            ),
+            (
+                "ifa_rt_sys_memory_virtual",
+                &[
+                    "sys::memory_virtual",
+                    "memory_virtual",
+                    "sys::resources::memory_virtual",
+                ],
+            ),
+        ];
+        for (raw_name, aliases) in sys_names {
+            let func_id = self
+                .module
+                .declare_function(raw_name, Linkage::Import, &sys_res_sig)
+                .map_err(|e| CodegenError::Module(e.to_string()))?;
+            self.func_ids.insert(raw_name.into(), func_id);
+            for alias in aliases {
+                self.func_ids.insert((*alias).into(), func_id);
+            }
+        }
 
         // Register stackless coroutine intrinsics
         let mut coro_create_sig = cranelift_codegen::ir::Signature::new(call_conv);

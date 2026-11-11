@@ -2632,3 +2632,21 @@ fn test_runtime_fs_and_process_primitives() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_ifa_rt_sys_resource_primitives() {
+    let cpu_count = ifa_rt_sys_cpu_count();
+    assert!(cpu_count >= 1);
+
+    let max_rss = ifa_rt_sys_max_rss();
+    assert!(max_rss > 0);
+
+    let mem_resident = ifa_rt_sys_memory_resident();
+    assert!(mem_resident > 0);
+
+    let mem_virtual = ifa_rt_sys_memory_virtual();
+    assert!(mem_virtual >= mem_resident);
+
+    let cpu_time_ns = ifa_rt_sys_cpu_time_ns();
+    assert!(cpu_time_ns > 0);
+}

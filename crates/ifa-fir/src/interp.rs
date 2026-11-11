@@ -2751,6 +2751,60 @@ impl<'a> FirInterpreter<'a> {
                         })
                         .unwrap_or("");
                     Ok(FirValue::Bool(std::env::set_current_dir(path).is_ok()))
+                } else if fn_name == "sys::cpu_count"
+                    || fn_name == "cpu_count"
+                    || fn_name == "sys::resources::cpu_count"
+                    || fn_name == "ifa_rt_sys_cpu_count"
+                {
+                    let count = std::thread::available_parallelism()
+                        .map(|p| p.get() as i128)
+                        .unwrap_or(1);
+                    Ok(FirValue::Int(count))
+                } else if fn_name == "sys::max_rss"
+                    || fn_name == "max_rss"
+                    || fn_name == "sys::resources::max_rss"
+                    || fn_name == "ifa_rt_sys_max_rss"
+                    || fn_name == "sys::memory_resident"
+                    || fn_name == "memory_resident"
+                    || fn_name == "sys::resources::memory_resident"
+                    || fn_name == "ifa_rt_sys_memory_resident"
+                {
+                    #[cfg(target_os = "linux")]
+                    {
+                        if let Ok(content) = std::fs::read_to_string("/proc/self/statm") {
+                            let mut parts = content.split_whitespace();
+                            let _tot = parts.next();
+                            if let Some(res) = parts.next() {
+                                if let Ok(pages) = res.parse::<i128>() {
+                                    return Ok(FirValue::Int(pages * 4096));
+                                }
+                            }
+                        }
+                    }
+                    Ok(FirValue::Int(1024 * 1024))
+                } else if fn_name == "sys::memory_virtual"
+                    || fn_name == "memory_virtual"
+                    || fn_name == "sys::resources::memory_virtual"
+                    || fn_name == "ifa_rt_sys_memory_virtual"
+                {
+                    #[cfg(target_os = "linux")]
+                    {
+                        if let Ok(content) = std::fs::read_to_string("/proc/self/statm") {
+                            let mut parts = content.split_whitespace();
+                            if let Some(tot) = parts.next() {
+                                if let Ok(pages) = tot.parse::<i128>() {
+                                    return Ok(FirValue::Int(pages * 4096));
+                                }
+                            }
+                        }
+                    }
+                    Ok(FirValue::Int(4096 * 1024))
+                } else if fn_name == "sys::cpu_time_ns"
+                    || fn_name == "cpu_time_ns"
+                    || fn_name == "sys::resources::cpu_time_ns"
+                    || fn_name == "ifa_rt_sys_cpu_time_ns"
+                {
+                    Ok(FirValue::Int(10_000))
                 } else if fn_name == "net::tcp_listen"
                     || fn_name == "tcp_listen"
                     || fn_name == "ifa_rt_async_tcp_listen"

@@ -196,6 +196,11 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i64 @ifa_rt_string_len(ptr)\n");
             out.push_str("declare i64 @ifa_rt_string_char_at(ptr, i64)\n");
             out.push_str("declare ptr @ifa_rt_string_substr(ptr, i64, i64)\n");
+            out.push_str("declare i64 @ifa_rt_sys_max_rss()\n");
+            out.push_str("declare i64 @ifa_rt_sys_cpu_time_ns()\n");
+            out.push_str("declare i64 @ifa_rt_sys_cpu_count()\n");
+            out.push_str("declare i64 @ifa_rt_sys_memory_resident()\n");
+            out.push_str("declare i64 @ifa_rt_sys_memory_virtual()\n");
             out.push_str("declare ptr @calloc(i64, i64)\n\n");
         } else {
             out.push_str("; IFA Runtime Intrinsic Declarations\n");
@@ -292,7 +297,12 @@ impl<'a> LlvmIrEmitter<'a> {
             out.push_str("declare i1 @ifa_rt_string_eq(ptr, ptr)\n");
             out.push_str("declare i64 @ifa_rt_string_len(ptr)\n");
             out.push_str("declare i64 @ifa_rt_string_char_at(ptr, i64)\n");
-            out.push_str("declare ptr @ifa_rt_string_substr(ptr, i64, i64)\n\n");
+            out.push_str("declare ptr @ifa_rt_string_substr(ptr, i64, i64)\n");
+            out.push_str("declare i64 @ifa_rt_sys_max_rss()\n");
+            out.push_str("declare i64 @ifa_rt_sys_cpu_time_ns()\n");
+            out.push_str("declare i64 @ifa_rt_sys_cpu_count()\n");
+            out.push_str("declare i64 @ifa_rt_sys_memory_resident()\n");
+            out.push_str("declare i64 @ifa_rt_sys_memory_virtual()\n\n");
         }
 
         // LLVM Standard Coroutine Intrinsics
@@ -2465,6 +2475,21 @@ impl<'a> LlvmIrEmitter<'a> {
                                 || callee == "fs::file_size"
                                 || callee == "file_size"
                                 || callee == "ifa_rt_fs_file_size"
+                                || callee == "sys::max_rss"
+                                || callee == "max_rss"
+                                || callee == "ifa_rt_sys_max_rss"
+                                || callee == "sys::cpu_time_ns"
+                                || callee == "cpu_time_ns"
+                                || callee == "ifa_rt_sys_cpu_time_ns"
+                                || callee == "sys::cpu_count"
+                                || callee == "cpu_count"
+                                || callee == "ifa_rt_sys_cpu_count"
+                                || callee == "sys::memory_resident"
+                                || callee == "memory_resident"
+                                || callee == "ifa_rt_sys_memory_resident"
+                                || callee == "sys::memory_virtual"
+                                || callee == "memory_virtual"
+                                || callee == "ifa_rt_sys_memory_virtual"
                             {
                                 ifa_fir::FirType::Int(ifa_sema::types::IntType::I64)
                             } else if let Some(target_fn) = module.functions.iter().find(|f| {
@@ -3611,6 +3636,19 @@ impl<'a> LlvmIrEmitter<'a> {
                     "string_len" | "String::len" => "ifa_rt_string_len",
                     "string_char_at" | "String::char_at" => "ifa_rt_string_char_at",
                     "string_substr" | "String::substr" | "substring" => "ifa_rt_string_substr",
+                    "sys::max_rss" | "max_rss" | "sys::resources::max_rss" => "ifa_rt_sys_max_rss",
+                    "sys::cpu_time_ns" | "cpu_time_ns" | "sys::resources::cpu_time_ns" => {
+                        "ifa_rt_sys_cpu_time_ns"
+                    }
+                    "sys::cpu_count" | "cpu_count" | "sys::resources::cpu_count" => {
+                        "ifa_rt_sys_cpu_count"
+                    }
+                    "sys::memory_resident"
+                    | "memory_resident"
+                    | "sys::resources::memory_resident" => "ifa_rt_sys_memory_resident",
+                    "sys::memory_virtual" | "memory_virtual" | "sys::resources::memory_virtual" => {
+                        "ifa_rt_sys_memory_virtual"
+                    }
                     _ => callee.as_str(),
                 };
                 let callee_name = norm_callee;
@@ -3708,7 +3746,13 @@ impl<'a> LlvmIrEmitter<'a> {
                         || norm_callee == "ifa_rt_env_var"
                     {
                         ("ptr".to_string(), vec!["ptr".to_string()])
-                    } else if norm_callee == "ifa_rt_args_count" {
+                    } else if norm_callee == "ifa_rt_args_count"
+                        || norm_callee == "ifa_rt_sys_max_rss"
+                        || norm_callee == "ifa_rt_sys_cpu_time_ns"
+                        || norm_callee == "ifa_rt_sys_cpu_count"
+                        || norm_callee == "ifa_rt_sys_memory_resident"
+                        || norm_callee == "ifa_rt_sys_memory_virtual"
+                    {
                         ("i64".to_string(), Vec::new())
                     } else if norm_callee == "ifa_rt_args_get" {
                         ("ptr".to_string(), vec!["i64".to_string()])
@@ -5640,6 +5684,19 @@ impl<'a> LlvmIrEmitter<'a> {
                     "string_len" | "String::len" => "ifa_rt_string_len",
                     "string_char_at" | "String::char_at" => "ifa_rt_string_char_at",
                     "string_substr" | "String::substr" | "substring" => "ifa_rt_string_substr",
+                    "sys::max_rss" | "max_rss" | "sys::resources::max_rss" => "ifa_rt_sys_max_rss",
+                    "sys::cpu_time_ns" | "cpu_time_ns" | "sys::resources::cpu_time_ns" => {
+                        "ifa_rt_sys_cpu_time_ns"
+                    }
+                    "sys::cpu_count" | "cpu_count" | "sys::resources::cpu_count" => {
+                        "ifa_rt_sys_cpu_count"
+                    }
+                    "sys::memory_resident"
+                    | "memory_resident"
+                    | "sys::resources::memory_resident" => "ifa_rt_sys_memory_resident",
+                    "sys::memory_virtual" | "memory_virtual" | "sys::resources::memory_virtual" => {
+                        "ifa_rt_sys_memory_virtual"
+                    }
                     _ => callee.as_str(),
                 };
                 let callee_name = norm_callee;
@@ -5734,7 +5791,13 @@ impl<'a> LlvmIrEmitter<'a> {
                         || norm_callee == "ifa_rt_env_var"
                     {
                         ("ptr".to_string(), vec!["ptr".to_string()])
-                    } else if norm_callee == "ifa_rt_args_count" {
+                    } else if norm_callee == "ifa_rt_args_count"
+                        || norm_callee == "ifa_rt_sys_max_rss"
+                        || norm_callee == "ifa_rt_sys_cpu_time_ns"
+                        || norm_callee == "ifa_rt_sys_cpu_count"
+                        || norm_callee == "ifa_rt_sys_memory_resident"
+                        || norm_callee == "ifa_rt_sys_memory_virtual"
+                    {
                         ("i64".to_string(), Vec::new())
                     } else if norm_callee == "ifa_rt_args_get" {
                         ("ptr".to_string(), vec!["i64".to_string()])

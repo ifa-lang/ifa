@@ -654,6 +654,13 @@ int32_t ifa_rt_channel_recv_int(ifa_channel_handle_t* chan, int64_t* out_val);
 int32_t ifa_rt_channel_try_send_int(ifa_channel_handle_t* chan, int64_t val);
 int32_t ifa_rt_channel_try_recv_int(ifa_channel_handle_t* chan, int64_t* out_val);
 
+/* --- System Resource and Telemetry Primitives --- */
+uint64_t ifa_rt_sys_max_rss(void);
+uint64_t ifa_rt_sys_cpu_time_ns(void);
+int64_t ifa_rt_sys_cpu_count(void);
+uint64_t ifa_rt_sys_memory_resident(void);
+uint64_t ifa_rt_sys_memory_virtual(void);
+
 #ifdef __cplusplus
 }
 #endif

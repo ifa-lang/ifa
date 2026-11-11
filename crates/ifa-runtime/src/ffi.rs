@@ -5267,3 +5267,99 @@ pub extern "C" fn ifa_rt_channel_try_recv_int(
     }
     res
 }
+
+// ============================================================================
+// System Resource and Memory Telemetry Primitives
+// ============================================================================
+
+/// Return the maximum resident set size (max RSS) of the calling process in bytes.
+#[no_mangle]
+pub extern "C" fn ifa_rt_sys_max_rss() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+        if rc == 0 {
+            #[cfg(target_os = "macos")]
+            return usage.ru_maxrss as u64;
+            #[cfg(not(target_os = "macos"))]
+            return (usage.ru_maxrss as u64).saturating_mul(1024);
+        }
+    }
+    0
+}
+
+/// Return total CPU execution time (user + system) consumed by the calling process in nanoseconds.
+#[no_mangle]
+pub extern "C" fn ifa_rt_sys_cpu_time_ns() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+        if rc == 0 {
+            let user_ns = (usage.ru_utime.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add((usage.ru_utime.tv_usec as u64).saturating_mul(1_000));
+            let sys_ns = (usage.ru_stime.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add((usage.ru_stime.tv_usec as u64).saturating_mul(1_000));
+            return user_ns.saturating_add(sys_ns);
+        }
+    }
+    0
+}
+
+/// Return the number of available logical CPU cores.
+#[no_mangle]
+pub extern "C" fn ifa_rt_sys_cpu_count() -> i64 {
+    std::thread::available_parallelism()
+        .map(|p| p.get() as i64)
+        .unwrap_or(1)
+}
+
+/// Return the current resident set size (RSS) of the calling process in bytes.
+#[no_mangle]
+pub extern "C" fn ifa_rt_sys_memory_resident() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/self/statm") {
+            let mut parts = content.split_whitespace();
+            let _total_pages = parts.next();
+            if let Some(resident_pages_str) = parts.next() {
+                if let Ok(pages) = resident_pages_str.parse::<u64>() {
+                    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                    let page_size = if page_size > 0 {
+                        page_size as u64
+                    } else {
+                        4096
+                    };
+                    return pages.saturating_mul(page_size);
+                }
+            }
+        }
+    }
+    ifa_rt_sys_max_rss()
+}
+
+/// Return the current virtual memory size of the calling process in bytes.
+#[no_mangle]
+pub extern "C" fn ifa_rt_sys_memory_virtual() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/self/statm") {
+            let mut parts = content.split_whitespace();
+            if let Some(total_pages_str) = parts.next() {
+                if let Ok(pages) = total_pages_str.parse::<u64>() {
+                    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                    let page_size = if page_size > 0 {
+                        page_size as u64
+                    } else {
+                        4096
+                    };
+                    return pages.saturating_mul(page_size);
+                }
+            }
+        }
+    }
+    0
+}

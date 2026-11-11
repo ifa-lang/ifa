@@ -496,6 +496,28 @@ impl JitEngine {
             ifa_simd_arena_slice_count_if_gt_i64 as *const u8,
         );
 
+        // System resource audit & telemetry intrinsics
+        builder.symbol(
+            "ifa_rt_sys_max_rss",
+            ifa_runtime::ffi::ifa_rt_sys_max_rss as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_sys_cpu_time_ns",
+            ifa_runtime::ffi::ifa_rt_sys_cpu_time_ns as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_sys_cpu_count",
+            ifa_runtime::ffi::ifa_rt_sys_cpu_count as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_sys_memory_resident",
+            ifa_runtime::ffi::ifa_rt_sys_memory_resident as *const u8,
+        );
+        builder.symbol(
+            "ifa_rt_sys_memory_virtual",
+            ifa_runtime::ffi::ifa_rt_sys_memory_virtual as *const u8,
+        );
+
         let module = JITModule::new(builder);
 
         Ok(Self {
@@ -1099,6 +1121,54 @@ impl JitEngine {
             .insert("ifa_rt_fs_rename".into(), fs_rename_id);
         self.func_ids.insert("fs::rename".into(), fs_rename_id);
         self.func_ids.insert("rename".into(), fs_rename_id);
+
+        // Register system resource intrinsics
+        let mut sys_res_sig = Signature::new(call_conv);
+        sys_res_sig.returns.push(AbiParam::new(types::I64));
+        let sys_names: [(&str, &[&str]); 5] = [
+            (
+                "ifa_rt_sys_max_rss",
+                &["sys::max_rss", "max_rss", "sys::resources::max_rss"],
+            ),
+            (
+                "ifa_rt_sys_cpu_time_ns",
+                &[
+                    "sys::cpu_time_ns",
+                    "cpu_time_ns",
+                    "sys::resources::cpu_time_ns",
+                ],
+            ),
+            (
+                "ifa_rt_sys_cpu_count",
+                &["sys::cpu_count", "cpu_count", "sys::resources::cpu_count"],
+            ),
+            (
+                "ifa_rt_sys_memory_resident",
+                &[
+                    "sys::memory_resident",
+                    "memory_resident",
+                    "sys::resources::memory_resident",
+                ],
+            ),
+            (
+                "ifa_rt_sys_memory_virtual",
+                &[
+                    "sys::memory_virtual",
+                    "memory_virtual",
+                    "sys::resources::memory_virtual",
+                ],
+            ),
+        ];
+        for (raw_name, aliases) in sys_names {
+            let func_id = self
+                .module
+                .declare_function(raw_name, Linkage::Import, &sys_res_sig)
+                .map_err(|e| CodegenError::Module(e.to_string()))?;
+            self.func_ids.insert(raw_name.into(), func_id);
+            for alias in aliases {
+                self.func_ids.insert((*alias).into(), func_id);
+            }
+        }
 
         // Register stackless coroutine intrinsics
         let mut coro_create_sig = Signature::new(call_conv);
