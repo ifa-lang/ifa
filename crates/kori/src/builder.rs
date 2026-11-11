@@ -50,6 +50,14 @@ pub struct BuildReport {
     pub duration: std::time::Duration,
 }
 
+/// Static analysis and semantic check execution report.
+#[derive(Debug, Clone)]
+pub struct CheckReport {
+    pub package: String,
+    pub targets_checked: usize,
+    pub duration: std::time::Duration,
+}
+
 /// Multi-target build orchestrator coordinating parsing, FIR lowering, codegen, and FFI bridging.
 pub struct BuildOrchestrator {
     root_dir: PathBuf,
@@ -123,6 +131,78 @@ impl BuildOrchestrator {
         Ok(BuildReport {
             packages_resolved: build_order.len(),
             artifacts: all_artifacts,
+            duration: start_time.elapsed(),
+        })
+    }
+
+    /// Check syntax and semantics for all package targets and imported local modules without code generation.
+    pub fn check(&self) -> Result<CheckReport, KoriError> {
+        let start_time = Instant::now();
+        let mut manifest = self.manifest.clone();
+        manifest.resolve_targets(&self.root_dir);
+
+        let mut targets_checked = 0;
+        let mut all_errors = Vec::new();
+
+        let mut target_paths = Vec::new();
+        for bin in &manifest.targets.bin {
+            target_paths.push((format!("bin:{}", bin.name), self.root_dir.join(&bin.path)));
+        }
+        if let Some(lib) = &manifest.targets.lib {
+            target_paths.push((format!("lib:{}", lib.name), self.root_dir.join(&lib.path)));
+        }
+
+        for (target_name, src_path) in target_paths {
+            targets_checked += 1;
+            let src = fs::read_to_string(&src_path).map_err(|e| KoriError::CompilationError {
+                package: self.manifest.package.name.clone(),
+                message: format!(
+                    "Failed to read target `{}` at `{}`: {}",
+                    target_name,
+                    src_path.display(),
+                    e
+                ),
+            })?;
+
+            let mut source_map = SourceMap::new();
+            let fid = source_map.add_file(src_path.to_string_lossy(), &src);
+            let tokens = tokenize(fid, &src);
+            let (prog, parse_diags) = parse(fid, tokens);
+
+            let mut target_has_errors = false;
+            let mut diag_msg = String::new();
+            for diag in &parse_diags {
+                diag_msg.push_str(&diag.render_to_string(&source_map));
+                target_has_errors = true;
+            }
+
+            if !target_has_errors {
+                let base_dir = src_path.parent().unwrap_or_else(|| Path::new("."));
+                let (analysis, _) =
+                    Self::analyze_with_local_modules(&mut source_map, base_dir, &prog);
+                for diag in &analysis.diagnostics {
+                    diag_msg.push_str(&diag.render_to_string(&source_map));
+                }
+                if analysis.has_errors() {
+                    target_has_errors = true;
+                }
+            }
+
+            if target_has_errors {
+                all_errors.push(format!("In target `{}`:\n{}", target_name, diag_msg));
+            }
+        }
+
+        if !all_errors.is_empty() {
+            return Err(KoriError::CompilationError {
+                package: self.manifest.package.name.clone(),
+                message: all_errors.join("\n"),
+            });
+        }
+
+        Ok(CheckReport {
+            package: self.manifest.package.name.clone(),
+            targets_checked,
             duration: start_time.elapsed(),
         })
     }

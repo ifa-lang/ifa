@@ -422,3 +422,73 @@ pub fn main() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_multi_module_orchestrator_check() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kori_check_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(temp_dir.join("src/domain")).unwrap();
+
+    let manifest = r#"
+[package]
+name = "check-demo-app"
+version = "0.1.0"
+edition = "2026"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
+license = "MIT"
+description = "Fast semantic check test"
+
+[targets]
+bin = [
+    { name = "check_runner", path = "src/main.ifa" }
+]
+"#;
+    fs::write(temp_dir.join("kori.toml"), manifest).unwrap();
+
+    let domain_src = r#"
+pub struct User {
+    id: i64,
+    active: bool,
+}
+
+pub fn create_user(id: i64) -> User {
+    return User(id: id, active: true);
+}
+"#;
+    fs::write(temp_dir.join("src/domain/user.ifa"), domain_src).unwrap();
+
+    let main_src = r#"
+import domain::user;
+
+pub fn main() {
+    let u = user::create_user(42);
+}
+"#;
+    fs::write(temp_dir.join("src/main.ifa"), main_src).unwrap();
+
+    let orchestrator =
+        BuildOrchestrator::new(temp_dir.clone()).expect("Failed to initialize orchestrator");
+    let report = orchestrator.check().expect("Semantic check must succeed");
+    assert_eq!(report.package, "check-demo-app");
+    assert_eq!(report.targets_checked, 1);
+
+    // Now introduce an error in user.ifa and ensure check() catches it
+    let bad_domain_src = r#"
+pub fn create_user(id: i64) -> i64 {
+    return "invalid_type";
+}
+"#;
+    fs::write(temp_dir.join("src/domain/user.ifa"), bad_domain_src).unwrap();
+
+    let bad_check = orchestrator.check();
+    assert!(bad_check.is_err(), "Check must fail when submodule has errors");
+    let err_msg = format!("{:?}", bad_check.err().unwrap());
+    assert!(
+        err_msg.contains("Type mismatch") || err_msg.contains("E0002") || err_msg.contains("type"),
+        "Diagnostic must report type error: {}",
+        err_msg
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

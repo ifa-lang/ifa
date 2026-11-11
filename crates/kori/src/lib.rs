@@ -12,7 +12,7 @@ pub mod packager;
 pub mod resolver;
 pub mod test_runner;
 
-pub use builder::{ArtifactKind, BuildOrchestrator, BuildReport, BuiltArtifact};
+pub use builder::{ArtifactKind, BuildOrchestrator, BuildReport, BuiltArtifact, CheckReport};
 pub use cache::BuildCache;
 pub use error::KoriError;
 pub use ffi_gen::{ExportedFunction, ExportedParam, FfiArtifacts, FfiBridgeGenerator};

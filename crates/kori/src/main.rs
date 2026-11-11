@@ -92,6 +92,12 @@ enum Commands {
     Tree,
     /// Resolve and pin dependencies into deterministic kori.lock
     Lock,
+    /// Check syntax and semantics for the current package and its modules without code generation
+    Check {
+        /// Path to kori.toml manifest file or project directory
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+    },
     /// Canonically format IFA source files in the project or a specific file
     Fmt {
         /// Optional path to source file (.ifa) or directory (defaults to current project)
@@ -189,6 +195,10 @@ fn main() -> ExitCode {
         Commands::Remove { name } => handle_remove(&current_dir, &name),
         Commands::Tree => handle_tree(&current_dir),
         Commands::Lock => handle_lock(&current_dir),
+        Commands::Check { manifest_path } => {
+            let target_dir = resolve_project_dir(manifest_path, &current_dir);
+            handle_check(&target_dir)
+        }
         Commands::Fmt { path, check } => handle_fmt(&current_dir, path, check),
         Commands::Package {
             out_dir,
@@ -535,6 +545,30 @@ fn handle_lock(current_dir: &Path) -> ExitCode {
         }
         Err(e) => {
             eprintln!("error: failed to resolve dependencies: {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn handle_check(current_dir: &Path) -> ExitCode {
+    let orchestrator = match BuildOrchestrator::new(current_dir.to_path_buf()) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("error: failed to load package: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match orchestrator.check() {
+        Ok(report) => {
+            println!(
+                "Checked package `{}` ({} target(s)) in {:.2?}: syntax and semantics valid with zero errors.",
+                report.package, report.targets_checked, report.duration
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: check failed:\n{}", e);
             ExitCode::FAILURE
         }
     }

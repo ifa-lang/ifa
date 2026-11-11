@@ -40,10 +40,10 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
-    /// Run static analysis and linting checks on an IFA program
+    /// Run static analysis and linting checks on an IFA program or package
     Lint {
-        /// Source file path (.ifa)
-        file: PathBuf,
+        /// Source file path (.ifa) or project directory (defaults to current directory)
+        path: Option<PathBuf>,
     },
     /// Run unit and integration tests for an IFA program or package
     Test {
@@ -89,10 +89,10 @@ enum Commands {
         /// Source file path (.ifa)
         file: PathBuf,
     },
-    /// Check syntax, semantics and report diagnostics on a source file
+    /// Check syntax, semantics and report diagnostics on an IFA program or package
     Check {
-        /// Source file path (.ifa)
-        file: PathBuf,
+        /// Source file path (.ifa) or project directory (defaults to current directory)
+        path: Option<PathBuf>,
     },
     /// Execute compile-time (comptime) evaluation and inspect constants
     Comptime {
@@ -295,34 +295,101 @@ fn main() -> ExitCode {
             }
         }
 
-        Commands::Lint { file } => {
-            let src = match fs::read_to_string(&file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: impossible de lire le fichier {:?}: {}", file, e);
+        Commands::Lint { path } => {
+            let target_path = path.unwrap_or_else(|| PathBuf::from("."));
+
+            if target_path.is_file() {
+                let src = match fs::read_to_string(&target_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!(
+                            "error: impossible de lire le fichier {:?}: {}",
+                            target_path, e
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let fid = source_map.add_file(target_path.to_string_lossy(), &src);
+                let tokens = tokenize(fid, &src);
+                let (prog, parse_diags) = parse(fid, tokens);
+
+                for diag in &parse_diags {
+                    eprint!("{}", diag.render_to_string(&source_map));
+                }
+                if !parse_diags.is_empty() {
                     return ExitCode::FAILURE;
                 }
-            };
-            let fid = source_map.add_file(file.to_string_lossy(), &src);
-            let tokens = tokenize(fid, &src);
-            let (prog, parse_diags) = parse(fid, tokens);
 
-            for diag in &parse_diags {
-                eprint!("{}", diag.render_to_string(&source_map));
-            }
-            if !parse_diags.is_empty() {
-                return ExitCode::FAILURE;
-            }
-
-            let warnings = lint_program(&prog, &source_map);
-            if warnings.is_empty() {
-                println!("Lint passed: zero style warnings for {:?}", file);
-                ExitCode::SUCCESS
-            } else {
-                for w in &warnings {
-                    println!("{}", w);
+                let warnings = lint_program(&prog, &source_map);
+                if warnings.is_empty() {
+                    println!("Lint passed: zero style warnings for {:?}", target_path);
+                    ExitCode::SUCCESS
+                } else {
+                    for w in &warnings {
+                        println!("{}", w);
+                    }
+                    ExitCode::SUCCESS
                 }
-                ExitCode::SUCCESS
+            } else if target_path.is_dir() {
+                let mut ifa_files = Vec::new();
+                collect_ifa_files_recursive(&target_path, &mut ifa_files);
+                ifa_files.sort();
+
+                if ifa_files.is_empty() {
+                    println!("No .ifa files found in {:?}", target_path);
+                    return ExitCode::SUCCESS;
+                }
+
+                let mut total_warnings = Vec::new();
+                let mut has_parse_errors = false;
+
+                for file in &ifa_files {
+                    let src = match fs::read_to_string(file) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("error: impossible de lire le fichier {:?}: {}", file, e);
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    let fid = source_map.add_file(file.to_string_lossy(), &src);
+                    let tokens = tokenize(fid, &src);
+                    let (prog, parse_diags) = parse(fid, tokens);
+
+                    for diag in &parse_diags {
+                        eprint!("{}", diag.render_to_string(&source_map));
+                        has_parse_errors = true;
+                    }
+                    if !parse_diags.is_empty() {
+                        continue;
+                    }
+
+                    let warnings = lint_program(&prog, &source_map);
+                    let display_path = file.strip_prefix(&target_path).unwrap_or(file);
+                    for w in warnings {
+                        total_warnings.push(format!("{}: {}", display_path.display(), w));
+                    }
+                }
+
+                if has_parse_errors {
+                    return ExitCode::FAILURE;
+                }
+
+                if total_warnings.is_empty() {
+                    println!(
+                        "Lint passed: zero style warnings across {} file(s) in {:?}",
+                        ifa_files.len(),
+                        target_path
+                    );
+                    ExitCode::SUCCESS
+                } else {
+                    for w in &total_warnings {
+                        println!("{}", w);
+                    }
+                    ExitCode::SUCCESS
+                }
+            } else {
+                eprintln!("error: target path {:?} does not exist", target_path);
+                ExitCode::FAILURE
             }
         }
 
@@ -521,15 +588,70 @@ fn main() -> ExitCode {
             }
         }
 
-        Commands::Check { file } => {
-            let src = match fs::read_to_string(&file) {
+        Commands::Check { path } => {
+            let target_path = path.unwrap_or_else(|| PathBuf::from("."));
+
+            // Check if target is a project directory with kori.toml
+            let manifest_dir = if target_path.is_dir() && target_path.join("kori.toml").exists() {
+                Some(target_path.clone())
+            } else if target_path.file_name().and_then(|s| s.to_str()) == Some("kori.toml") {
+                target_path.parent().map(|p| p.to_path_buf())
+            } else if target_path == Path::new(".") && Path::new("kori.toml").exists() {
+                Some(PathBuf::from("."))
+            } else {
+                None
+            };
+
+            if let Some(dir) = manifest_dir {
+                match BuildOrchestrator::new(dir) {
+                    Ok(orchestrator) => match orchestrator.check() {
+                        Ok(report) => {
+                            println!(
+                                "Checked package `{}` ({} target(s)) in {:.2?}: syntax and semantics valid with zero errors.",
+                                report.package, report.targets_checked, report.duration
+                            );
+                            return ExitCode::SUCCESS;
+                        }
+                        Err(e) => {
+                            eprintln!("error: check failed:\n{}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("error: failed to load package: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+
+            // Fallback for directory without kori.toml: check src/main.ifa or main.ifa if present
+            let file_to_check = if target_path.is_dir() {
+                if target_path.join("src").join("main.ifa").exists() {
+                    target_path.join("src").join("main.ifa")
+                } else if target_path.join("main.ifa").exists() {
+                    target_path.join("main.ifa")
+                } else {
+                    eprintln!(
+                        "error: no `.ifa` entry point or kori.toml found in {:?}",
+                        target_path
+                    );
+                    return ExitCode::FAILURE;
+                }
+            } else {
+                target_path
+            };
+
+            let src = match fs::read_to_string(&file_to_check) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("error: impossible de lire le fichier {:?}: {}", file, e);
+                    eprintln!(
+                        "error: impossible de lire le fichier {:?}: {}",
+                        file_to_check, e
+                    );
                     return ExitCode::FAILURE;
                 }
             };
-            let fid = source_map.add_file(file.to_string_lossy(), &src);
+            let fid = source_map.add_file(file_to_check.to_string_lossy(), &src);
             let tokens = tokenize(fid, &src);
             let (prog, parse_diags) = parse(fid, tokens);
 
@@ -543,7 +665,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
+            let base_dir = file_to_check.parent().unwrap_or_else(|| Path::new("."));
             let (analysis, _) =
                 BuildOrchestrator::analyze_with_local_modules(&mut source_map, base_dir, &prog);
             for diag in &analysis.diagnostics {
@@ -555,7 +677,7 @@ fn main() -> ExitCode {
             } else {
                 println!(
                     "Analyse sémantique réussie pour {:?}. Aucune erreur détectée.",
-                    file
+                    file_to_check
                 );
                 ExitCode::SUCCESS
             }
@@ -1418,5 +1540,21 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         },
+    }
+}
+
+fn collect_ifa_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if !name.starts_with('.') && name != "target" {
+                    collect_ifa_files_recursive(&p, out);
+                }
+            } else if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("ifa") {
+                out.push(p);
+            }
+        }
     }
 }
