@@ -34,7 +34,9 @@ pub use fs::{
     remove_dir_all as fs_remove_dir_all, remove_file as fs_remove_file, rename as fs_rename,
     walk_dir as fs_walk_dir, walk_dir_files as fs_walk_dir_files,
     walk_dir_matching as fs_walk_dir_matching, write as fs_write, write_string as fs_write_string,
-    FileMetadata,
+    current_fs, current_target_kind, normalize_path, reset_global_fs, set_global_fs,
+    with_target_fs, FileMetadata, FileSystem, PosixFs, TargetKind, VirtualFs, WasiFs,
+    WasiFsBuilder, WasiPreopen, WasiRights,
 };
 pub use http::{
     compute_etag, cors_middleware, csrf_protection_middleware, encode_basic_auth,
@@ -74,6 +76,9 @@ pub use sync::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::path::Path;
+    use std::sync::Arc;
 
     #[test]
     fn test_json_decode_and_encode() {
@@ -276,6 +281,149 @@ mod tests {
 
         fs_remove_dir_all(&temp_dir).unwrap();
         assert!(!fs_exists(&temp_dir));
+    }
+
+    #[test]
+    fn test_virtual_fs_in_memory_lifecycle() {
+        let vfs = Arc::new(VirtualFs::new());
+        assert_eq!(vfs.target_kind(), TargetKind::Virtual);
+
+        with_target_fs(vfs.clone(), || {
+            assert_eq!(current_target_kind(), TargetKind::Virtual);
+
+            // Directory creation
+            fs_create_dir_all("/var/log/ifa").unwrap();
+            assert!(fs_is_dir("/var/log/ifa"));
+            assert!(fs_exists("/var/log"));
+
+            // File write and append
+            let log_file = "/var/log/ifa/app.log";
+            fs_write_string(log_file, "BOOT_OK\n").unwrap();
+            assert!(fs_exists(log_file));
+            assert!(fs_is_file(log_file));
+
+            fs_append(log_file, b"EVENT_STARTED\n").unwrap();
+            let content = fs_read_to_string(log_file).unwrap();
+            assert_eq!(content, "BOOT_OK\nEVENT_STARTED\n");
+
+            // Metadata and file size
+            let meta = fs_metadata(log_file).unwrap();
+            assert!(meta.is_file);
+            assert_eq!(meta.size, 22);
+
+            // Copy and rename
+            let backup_file = "/var/log/ifa/app.log.bak";
+            fs_copy(log_file, backup_file).unwrap();
+            assert!(fs_exists(backup_file));
+
+            let renamed_file = "/var/log/ifa/app.log.archive";
+            fs_rename(backup_file, renamed_file).unwrap();
+            assert!(!fs_exists(backup_file));
+            assert!(fs_exists(renamed_file));
+
+            // List and walk dir
+            let entries = fs_list_dir("/var/log/ifa").unwrap();
+            assert_eq!(entries.len(), 2);
+
+            let walked = fs_walk_dir("/var/log").unwrap();
+            assert!(walked.len() >= 3);
+
+            // Readonly protection
+            vfs.set_readonly(Path::new(renamed_file), true).unwrap();
+            let append_err = fs_append(renamed_file, b"ILLEGAL");
+            assert!(append_err.is_err());
+
+            // Cleanup
+            fs_remove_file(log_file).unwrap();
+            assert!(!fs_exists(log_file));
+            fs_remove_dir_all("/var").unwrap();
+            assert!(!fs_exists("/var/log/ifa"));
+        });
+    }
+
+    #[test]
+    fn test_wasi_sandboxed_capabilities_and_preopen() {
+        let temp_dir = std::env::temp_dir().join(format!("ifa_wasi_test_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let wasi = WasiFs::builder()
+            .preopen(
+                "/sandbox",
+                Some(temp_dir.clone()),
+                WasiRights::READ_WRITE,
+            )
+            .preopen(
+                "/read_only_data",
+                None,
+                WasiRights::READ_ONLY,
+            )
+            .build();
+
+        let wasi_arc = Arc::new(wasi);
+        assert_eq!(wasi_arc.target_kind(), TargetKind::Wasi);
+
+        with_target_fs(wasi_arc, || {
+            assert_eq!(current_target_kind(), TargetKind::Wasi);
+
+            // 1. Authorized read/write within preopened /sandbox
+            let guest_path = "/sandbox/greeting.txt";
+            fs_write_string(guest_path, "Hello from WASI sandbox!\n").unwrap();
+            assert!(fs_exists(guest_path));
+            assert!(fs_is_file(guest_path));
+
+            let content = fs_read_to_string(guest_path).unwrap();
+            assert_eq!(content, "Hello from WASI sandbox!\n");
+
+            // 2. Reject write on read-only mount
+            let ro_write_err = fs_write_string("/read_only_data/forbidden.txt", "Should fail");
+            assert!(ro_write_err.is_err());
+            assert_eq!(
+                ro_write_err.unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+
+            // 3. Reject access completely outside preopened mounts
+            let outside_err = fs_read_to_string("/etc/shadow");
+            assert!(outside_err.is_err());
+            assert_eq!(
+                outside_err.unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_wasi_path_traversal_prevention() {
+        let wasi = Arc::new(WasiFs::new_sandbox());
+        with_target_fs(wasi, || {
+            // Attempting path traversal escape out of /sandbox
+            // /sandbox/../../etc/passwd resolves internally to /etc/passwd which is not preopened
+            let escape_err = fs_write_string("/sandbox/../../etc/passwd", "malicious_root");
+            assert!(escape_err.is_err());
+            assert_eq!(
+                escape_err.unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        });
+    }
+
+    #[test]
+    fn test_multi_target_transparent_switching() {
+        // By default on Linux we run Posix
+        assert_eq!(current_target_kind(), TargetKind::Posix);
+
+        // Switch transparently to VirtualFs
+        let vfs = Arc::new(VirtualFs::new());
+        with_target_fs(vfs, || {
+            assert_eq!(current_target_kind(), TargetKind::Virtual);
+            fs_write_string("/demo.txt", "In-memory").unwrap();
+            assert_eq!(fs_read_to_string("/demo.txt").unwrap(), "In-memory");
+        });
+
+        // Outside scoped block, returns to default Posix
+        assert_eq!(current_target_kind(), TargetKind::Posix);
     }
 
     #[test]
