@@ -67,7 +67,8 @@ pub use net::{
 };
 pub use process::{
     find_best_assembler, find_best_linker, find_system_tool, invoke_assembler, invoke_linker,
-    run as process_run, Command as ProcessCommand, ExitStatus as ProcessExitStatus, ProcessOutput,
+    run as process_run, ChildProcess, Command as ProcessCommand, CommandPipeline,
+    ExitStatus as ProcessExitStatus, Pipeline, ProcessOutput,
 };
 pub use simd_parser::{
     find_byte_vectorized, find_crlf_vectorized, parse_http_request_fast, parse_http_response_fast,
@@ -790,6 +791,20 @@ mod tests {
         let echo_run = process_run("echo", ["test_run"]).expect("process_run echo");
         assert!(echo_run.success());
         assert_eq!(echo_run.stdout_string().trim(), "test_run");
+
+        // Test pipeline integration with stream
+        let mut mem_stream = MemoryStream::new();
+        let pipeline = Pipeline::new()
+            .stdin_str("pipeline row 1\npipeline row 2\n")
+            .pipe(ProcessCommand::new("grep").arg("row 2"));
+        let status = pipeline
+            .output_to_writer(&mut mem_stream)
+            .expect("execute pipeline to memory stream");
+        assert!(status.success());
+        assert_eq!(
+            String::from_utf8_lossy(mem_stream.as_bytes()).trim(),
+            "pipeline row 2"
+        );
     }
 
     #[test]

@@ -4,9 +4,11 @@
 //! and assemblers during bootstrap and self-hosting compilation stages.
 
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitStatus as StdExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Exit status of a completed process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +83,8 @@ pub struct Command {
     clear_env: bool,
     current_dir: Option<PathBuf>,
     stdin_data: Option<Vec<u8>>,
+    timeout: Option<Duration>,
+    redirect_stderr_to_stdout: bool,
 }
 
 impl Command {
@@ -93,6 +97,8 @@ impl Command {
             clear_env: false,
             current_dir: None,
             stdin_data: None,
+            timeout: None,
+            redirect_stderr_to_stdout: false,
         }
     }
 
@@ -108,14 +114,52 @@ impl Command {
         self
     }
 
+    /// Read entire content from a reader into standard input buffer.
+    pub fn stdin_reader<R: Read>(&mut self, reader: &mut R) -> io::Result<&mut Self> {
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf)?;
+        self.stdin_data = Some(buf);
+        Ok(self)
+    }
+
+    /// Set an execution timeout limit.
+    pub fn timeout(&mut self, duration: Duration) -> &mut Self {
+        self.timeout = Some(duration);
+        self
+    }
+
+    /// Redirect standard error (stderr) into standard output (stdout).
+    pub fn redirect_stderr(&mut self, redirect: bool) -> &mut Self {
+        self.redirect_stderr_to_stdout = redirect;
+        self
+    }
+
     /// Append an argument to the command.
     pub fn arg<S: AsRef<str>>(&mut self, arg: S) -> &mut Self {
         self.args.push(arg.as_ref().to_string());
         self
     }
 
+    /// Append an argument consuming self (by-value builder).
+    pub fn with_arg<S: AsRef<str>>(mut self, arg: S) -> Self {
+        self.args.push(arg.as_ref().to_string());
+        self
+    }
+
     /// Append multiple arguments to the command.
     pub fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for arg in args {
+            self.args.push(arg.as_ref().to_string());
+        }
+        self
+    }
+
+    /// Append multiple arguments consuming self (by-value builder).
+    pub fn with_args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -146,8 +190,136 @@ impl Command {
         self
     }
 
+    /// Spawn the process as a background child process.
+    pub fn spawn(&self) -> io::Result<ChildProcess> {
+        let mut std_cmd = StdCommand::new(&self.program);
+        if self.clear_env {
+            std_cmd.env_clear();
+        }
+        for (k, v) in &self.envs {
+            std_cmd.env(k, v);
+        }
+        if let Some(ref cwd) = self.current_dir {
+            std_cmd.current_dir(cwd);
+        }
+        std_cmd.args(&self.args);
+
+        if self.stdin_data.is_some() {
+            std_cmd.stdin(Stdio::piped());
+        } else {
+            std_cmd.stdin(Stdio::null());
+        }
+        std_cmd.stdout(Stdio::piped());
+        std_cmd.stderr(Stdio::piped());
+
+        let mut child = std_cmd.spawn()?;
+        if let Some(ref input) = self.stdin_data {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(input);
+                let _ = stdin.flush();
+            }
+        }
+
+        Ok(ChildProcess { inner: child })
+    }
+
+    /// Execute command synchronously with an enforced timeout.
+    pub fn output_with_timeout(&self, timeout: Duration) -> io::Result<ProcessOutput> {
+        let mut std_cmd = StdCommand::new(&self.program);
+        if self.clear_env {
+            std_cmd.env_clear();
+        }
+        for (k, v) in &self.envs {
+            std_cmd.env(k, v);
+        }
+        if let Some(ref cwd) = self.current_dir {
+            std_cmd.current_dir(cwd);
+        }
+        std_cmd.args(&self.args);
+
+        std_cmd.stdin(if self.stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        std_cmd.stdout(Stdio::piped());
+        std_cmd.stderr(Stdio::piped());
+
+        let mut child = std_cmd.spawn()?;
+
+        if let Some(ref input) = self.stdin_data {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(input);
+                let _ = stdin.flush();
+            }
+        }
+
+        let mut stdout_handle = child.stdout.take();
+        let mut stderr_handle = child.stderr.take();
+
+        let stdout_thread = thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut reader) = stdout_handle.take() {
+                let _ = reader.read_to_end(&mut buf);
+            }
+            buf
+        });
+
+        let stderr_thread = thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut reader) = stderr_handle.take() {
+                let _ = reader.read_to_end(&mut buf);
+            }
+            buf
+        });
+
+        let start = Instant::now();
+        let poll_interval = Duration::from_millis(5);
+
+        loop {
+            match child.try_wait()? {
+                Some(status) => {
+                    let mut stdout = stdout_thread.join().unwrap_or_default();
+                    let mut stderr = stderr_thread.join().unwrap_or_default();
+
+                    if self.redirect_stderr_to_stdout {
+                        stdout.extend_from_slice(&stderr);
+                        stderr.clear();
+                    }
+
+                    return Ok(ProcessOutput {
+                        status: status.into(),
+                        stdout,
+                        stderr,
+                    });
+                }
+                None => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = stdout_thread.join();
+                        let _ = stderr_thread.join();
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "Process '{}' exceeded execution timeout limit of {:?}",
+                                self.program.display(),
+                                timeout
+                            ),
+                        ));
+                    }
+                    thread::sleep(poll_interval);
+                }
+            }
+        }
+    }
+
     /// Execute command synchronously and capture stdout and stderr.
     pub fn output(&self) -> io::Result<ProcessOutput> {
+        if let Some(t) = self.timeout {
+            return self.output_with_timeout(t);
+        }
+
         let mut std_cmd = StdCommand::new(&self.program);
         if self.clear_env {
             std_cmd.env_clear();
@@ -161,7 +333,7 @@ impl Command {
         }
         std_cmd.args(&self.args);
 
-        if let Some(ref input) = self.stdin_data {
+        let out = if let Some(ref input) = self.stdin_data {
             std_cmd.stdin(Stdio::piped());
             std_cmd.stdout(Stdio::piped());
             std_cmd.stderr(Stdio::piped());
@@ -170,21 +342,32 @@ impl Command {
                 let _ = stdin.write_all(input);
                 let _ = stdin.flush();
             }
-            let out = child.wait_with_output()?;
-            Ok(ProcessOutput {
-                status: out.status.into(),
-                stdout: out.stdout,
-                stderr: out.stderr,
-            })
+            child.wait_with_output()?
         } else {
             std_cmd.stdin(Stdio::null());
-            let out = std_cmd.output()?;
-            Ok(ProcessOutput {
-                status: out.status.into(),
-                stdout: out.stdout,
-                stderr: out.stderr,
-            })
+            std_cmd.output()?
+        };
+
+        let mut stdout = out.stdout;
+        let mut stderr = out.stderr;
+        if self.redirect_stderr_to_stdout {
+            stdout.extend_from_slice(&stderr);
+            stderr.clear();
         }
+
+        Ok(ProcessOutput {
+            status: out.status.into(),
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Execute command synchronously and write stdout directly to a writer stream.
+    pub fn output_to_writer<W: Write>(&self, writer: &mut W) -> io::Result<ExitStatus> {
+        let out = self.output()?;
+        writer.write_all(&out.stdout)?;
+        writer.flush()?;
+        Ok(out.status)
     }
 
     /// Execute command synchronously and return exit status.
@@ -214,6 +397,233 @@ impl Command {
             let st = std_cmd.status()?;
             Ok(st.into())
         }
+    }
+}
+
+/// Running child process abstraction allowing inspection and interaction.
+pub struct ChildProcess {
+    inner: std::process::Child,
+}
+
+impl ChildProcess {
+    /// Return the OS process identifier (PID).
+    pub fn id(&self) -> u32 {
+        self.inner.id()
+    }
+
+    /// Kill the running child process.
+    pub fn kill(&mut self) -> io::Result<()> {
+        self.inner.kill()
+    }
+
+    /// Wait for process completion and return exit status.
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        let st = self.inner.wait()?;
+        Ok(st.into())
+    }
+
+    /// Check if child process has terminated without blocking.
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        let opt = self.inner.try_wait()?;
+        Ok(opt.map(ExitStatus::from))
+    }
+
+    /// Write all data to child stdin, flush and close it.
+    pub fn write_all_stdin(&mut self, data: &[u8]) -> io::Result<()> {
+        if let Some(mut stdin) = self.inner.stdin.take() {
+            stdin.write_all(data)?;
+            stdin.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Wait for process to finish and collect all output.
+    pub fn wait_with_output(self) -> io::Result<ProcessOutput> {
+        let out = self.inner.wait_with_output()?;
+        Ok(ProcessOutput {
+            status: out.status.into(),
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
+    }
+}
+
+/// A sequential pipeline of commands connected via standard I/O pipes (`cmd1 | cmd2 | ...`).
+#[derive(Debug, Clone, Default)]
+pub struct Pipeline {
+    commands: Vec<Command>,
+    stdin_data: Option<Vec<u8>>,
+}
+
+/// Alias for `Pipeline`.
+pub type CommandPipeline = Pipeline;
+
+impl From<&mut Command> for Command {
+    fn from(cmd: &mut Command) -> Self {
+        cmd.clone()
+    }
+}
+
+impl Pipeline {
+    /// Create a new empty pipeline.
+    pub fn new() -> Self {
+        Self {
+            commands: Vec::new(),
+            stdin_data: None,
+        }
+    }
+
+    /// Append a command to the pipeline.
+    pub fn pipe<C: Into<Command>>(mut self, cmd: C) -> Self {
+        self.commands.push(cmd.into());
+        self
+    }
+
+    /// Provide input bytes to feed into the first command in the pipeline.
+    pub fn stdin_bytes(mut self, bytes: &[u8]) -> Self {
+        self.stdin_data = Some(bytes.to_vec());
+        self
+    }
+
+    /// Provide input string to feed into the first command in the pipeline.
+    pub fn stdin_str<S: AsRef<str>>(mut self, s: S) -> Self {
+        self.stdin_data = Some(s.as_ref().as_bytes().to_vec());
+        self
+    }
+
+    /// Read entire content from a reader into standard input buffer of first command.
+    pub fn stdin_reader<R: Read>(mut self, reader: &mut R) -> io::Result<Self> {
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf)?;
+        self.stdin_data = Some(buf);
+        Ok(self)
+    }
+
+    /// Number of commands in the pipeline.
+    pub fn len(&self) -> usize {
+        self.commands.len()
+    }
+
+    /// Whether pipeline has no commands.
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
+    /// Execute the pipeline synchronously, feeding stdout of each stage into stdin of next stage.
+    pub fn output(mut self) -> io::Result<ProcessOutput> {
+        if self.commands.is_empty() {
+            return Ok(ProcessOutput {
+                status: ExitStatus::from_code(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        }
+
+        let num_commands = self.commands.len();
+        if num_commands == 1 {
+            let mut cmd = self.commands.pop().unwrap();
+            if self.stdin_data.is_some() && cmd.stdin_data.is_none() {
+                cmd.stdin_data = self.stdin_data;
+            }
+            return cmd.output();
+        }
+
+        let mut children: Vec<std::process::Child> = Vec::with_capacity(num_commands);
+        let mut prev_stdout: Option<std::process::ChildStdout> = None;
+
+        for (i, cmd) in self.commands.iter().enumerate() {
+            let mut std_cmd = StdCommand::new(&cmd.program);
+            if cmd.clear_env {
+                std_cmd.env_clear();
+            }
+            for (k, v) in &cmd.envs {
+                std_cmd.env(k, v);
+            }
+            if let Some(ref cwd) = cmd.current_dir {
+                std_cmd.current_dir(cwd);
+            }
+            std_cmd.args(&cmd.args);
+
+            // Configure stdin
+            if i == 0 {
+                if self.stdin_data.is_some() || cmd.stdin_data.is_some() {
+                    std_cmd.stdin(Stdio::piped());
+                } else {
+                    std_cmd.stdin(Stdio::null());
+                }
+            } else if let Some(stdout) = prev_stdout.take() {
+                std_cmd.stdin(Stdio::from(stdout));
+            } else {
+                std_cmd.stdin(Stdio::null());
+            }
+
+            // Configure stdout and stderr
+            std_cmd.stdout(Stdio::piped());
+            std_cmd.stderr(Stdio::piped());
+
+            let mut child = std_cmd.spawn()?;
+
+            // Feed input to first child if provided
+            if i == 0 {
+                let input_data = self.stdin_data.as_ref().or(cmd.stdin_data.as_ref());
+                if let Some(input) = input_data {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(input);
+                        let _ = stdin.flush();
+                    }
+                }
+            }
+
+            if i < self.commands.len() - 1 {
+                prev_stdout = child.stdout.take();
+            }
+            children.push(child);
+        }
+
+        // Wait for last child and read its output
+        let last_child = children.pop().expect("At least one child exists");
+        let last_output = last_child.wait_with_output()?;
+
+        // Wait for all upstream children and aggregate stderr if any failed
+        let mut aggregate_stderr = Vec::new();
+        let mut upstream_failed_status = None;
+
+        for mut child in children {
+            if let Some(mut err_reader) = child.stderr.take() {
+                let _ = err_reader.read_to_end(&mut aggregate_stderr);
+            }
+            let status = child.wait()?;
+            if !status.success() && upstream_failed_status.is_none() {
+                upstream_failed_status = Some(status);
+            }
+        }
+
+        let mut final_stderr = aggregate_stderr;
+        final_stderr.extend_from_slice(&last_output.stderr);
+
+        let final_status = if let Some(up_status) = upstream_failed_status {
+            if !last_output.status.success() {
+                last_output.status.into()
+            } else {
+                up_status.into()
+            }
+        } else {
+            last_output.status.into()
+        };
+
+        Ok(ProcessOutput {
+            status: final_status,
+            stdout: last_output.stdout,
+            stderr: final_stderr,
+        })
+    }
+
+    /// Execute the pipeline and write captured stdout directly to a writer stream.
+    pub fn output_to_writer<W: Write>(self, writer: &mut W) -> io::Result<ExitStatus> {
+        let out = self.output()?;
+        writer.write_all(&out.stdout)?;
+        writer.flush()?;
+        Ok(out.status)
     }
 }
 
@@ -374,5 +784,80 @@ mod tests {
             best_linker.is_some(),
             "At least one system linker (clang/gcc/ld) should be present"
         );
+    }
+
+    #[test]
+    fn test_child_process_lifecycle() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 0.05; exit 0"]);
+        let mut child = cmd.spawn().expect("spawn child process");
+        assert!(child.id() > 0, "Child should have valid non-zero PID");
+
+        // Wait with try_wait or wait
+        let status = child.wait().expect("wait for child completion");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn test_command_output_timeout() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 2"]);
+        let res = cmd.output_with_timeout(Duration::from_millis(100));
+        assert!(res.is_err(), "Sleep 2 should exceed 100ms timeout");
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn test_command_redirect_stderr() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo 'out message'; echo 'err message' >&2"]);
+        cmd.redirect_stderr(true);
+        let out = cmd.output().expect("execute command with stderr redirect");
+        assert!(out.success());
+        let full_output = out.stdout_string();
+        assert!(full_output.contains("out message"));
+        assert!(full_output.contains("err message"));
+        assert!(out.stderr.is_empty(), "Stderr should be merged into stdout");
+    }
+
+    #[test]
+    fn test_command_reader_writer_streams() {
+        use std::io::Cursor;
+        let mut input_cursor = Cursor::new(b"piped payload data from stream");
+        let mut cmd = Command::new("cat");
+        cmd.stdin_reader(&mut input_cursor)
+            .expect("read input from stream");
+
+        let mut output_buf = Vec::new();
+        let status = cmd
+            .output_to_writer(&mut output_buf)
+            .expect("write output to stream");
+        assert!(status.success());
+        assert_eq!(output_buf, b"piped payload data from stream");
+    }
+
+    #[test]
+    fn test_command_pipeline_multistage() {
+        let p = Pipeline::new()
+            .pipe(Command::new("sh").args(["-c", "printf 'alpha\\nbeta\\ngamma\\n'"]))
+            .pipe(Command::new("grep").arg("ta"))
+            .pipe(Command::new("tr").args(["a-z", "A-Z"]));
+
+        let out = p.output().expect("execute multi-stage pipeline");
+        assert!(out.success());
+        assert_eq!(out.stdout_string().trim(), "BETA");
+    }
+
+    #[test]
+    fn test_command_pipeline_with_custom_stdin() {
+        let p = Pipeline::new()
+            .stdin_str("line1\nmatch_target\nline3\n")
+            .pipe(Command::new("grep").arg("match"))
+            .pipe(Command::new("tr").args(["a-z", "A-Z"]));
+
+        let out = p.output().expect("execute pipeline with stdin");
+        assert!(out.success());
+        assert_eq!(out.stdout_string().trim(), "MATCH_TARGET");
     }
 }
