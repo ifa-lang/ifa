@@ -37,8 +37,8 @@ pub use http::{
     matches_if_none_match, negotiate_content_type, parse_accept_header, parse_basic_auth,
     parse_bearer_token, parse_cookies, parse_form_urlencoded, parse_multipart, parse_sse_events,
     url_decode, url_encode, AcceptItem, CorsConfig, HttpClient, HttpHandler, HttpHeaders,
-    HttpMethod, HttpRequest, HttpResponse, HttpServer, HttpStatus, MultipartBuilder, MultipartPart,
-    SseEvent,
+    HttpMethod, HttpRequest, HttpResponse, HttpRoute, HttpRouter, HttpServer, HttpStatus,
+    MultipartBuilder, MultipartPart, RouteSegment, SseEvent,
 };
 pub use io::{BufferedReader, BufferedWriter, MemoryStream};
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};

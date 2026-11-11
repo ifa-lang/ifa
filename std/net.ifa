@@ -984,9 +984,114 @@ pub fn url_get_query_param(query: String, key: String) -> String {
     return "";
 }
 
-// HTTP Router
+// HTTP Router & Dynamic URI Segment Matching
 pub fn make_http_router() -> HttpRouter {
     return HttpRouter(routes: List::new());
+}
+
+pub fn path_split_segments(path: String) -> List<String> {
+    mut segs: List<String> = List::new();
+    let p_len = string_len(path);
+    mut i: i64 = 0;
+    while i < p_len {
+        while i < p_len && string_char_at(path, i) == 47 {
+            i = i + 1;
+        }
+        if i >= p_len {
+            return segs;
+        }
+        let start = i;
+        while i < p_len && string_char_at(path, i) != 47 && string_char_at(path, i) != 63 {
+            i = i + 1;
+        }
+        let seg_len = i - start;
+        if seg_len > 0 {
+            let seg = string_substr(path, start, seg_len);
+            segs.push(seg);
+        }
+        if i < p_len && string_char_at(path, i) == 63 {
+            return segs;
+        }
+    }
+    return segs;
+}
+
+pub fn route_pattern_matches(pattern: String, path: String) -> bool {
+    if pattern == path {
+        return true;
+    }
+    let pat_segs = path_split_segments(pattern);
+    let req_segs = path_split_segments(path);
+
+    let pat_len = pat_segs.len();
+    let req_len = req_segs.len();
+
+    mut p_idx: i64 = 0;
+    mut r_idx: i64 = 0;
+
+    while p_idx < pat_len {
+        let p_seg = pat_segs[p_idx];
+        let p_s_len = string_len(p_seg);
+        if p_s_len > 0 && string_char_at(p_seg, 0) == 42 { // '*' wildcard
+            return true;
+        }
+        if r_idx >= req_len {
+            return false;
+        }
+        let r_seg = req_segs[r_idx];
+        if p_s_len > 0 && string_char_at(p_seg, 0) == 58 { // ':' dynamic param
+            p_idx = p_idx + 1;
+            r_idx = r_idx + 1;
+        } else {
+            if p_seg != r_seg {
+                return false;
+            }
+            p_idx = p_idx + 1;
+            r_idx = r_idx + 1;
+        }
+    }
+
+    return p_idx == pat_len && r_idx == req_len;
+}
+
+pub fn router_extract_param(pattern: String, path: String, param_name: String) -> String {
+    let pat_segs = path_split_segments(pattern);
+    let req_segs = path_split_segments(path);
+
+    let pat_len = pat_segs.len();
+    let req_len = req_segs.len();
+
+    mut p_idx: i64 = 0;
+    mut r_idx: i64 = 0;
+
+    let target_colon = ":" + param_name;
+    let target_star = "*" + param_name;
+
+    while p_idx < pat_len {
+        let p_seg = pat_segs[p_idx];
+        if p_seg == target_colon {
+            if r_idx < req_len {
+                return req_segs[r_idx];
+            }
+            return "";
+        }
+        if p_seg == target_star || p_seg == "*" {
+            mut rem: String = "";
+            mut k: i64 = r_idx;
+            while k < req_len {
+                if k > r_idx {
+                    rem = rem + "/";
+                }
+                rem = rem + req_segs[k];
+                k = k + 1;
+            }
+            return rem;
+        }
+        p_idx = p_idx + 1;
+        r_idx = r_idx + 1;
+    }
+
+    return "";
 }
 
 pub fn router_add_route(inout router: HttpRouter, method: String, path: String, handler_id: i64) {
@@ -996,14 +1101,20 @@ pub fn router_add_route(inout router: HttpRouter, method: String, path: String, 
 pub fn router_match_route(router: HttpRouter, method: String, path: String) -> i64 {
     mut i: i64 = 0;
     let n = router.routes.len();
+    mut dynamic_match: i64 = -1;
     while i < n {
         let r = router.routes[i];
-        if r.method == method && r.path == path {
-            return r.handler_id;
+        if r.method == method {
+            if r.path == path {
+                return r.handler_id;
+            }
+            if dynamic_match < 0 && route_pattern_matches(r.path, path) {
+                dynamic_match = r.handler_id;
+            }
         }
         i = i + 1;
     }
-    return -1;
+    return dynamic_match;
 }
 
 // === Unit Tests ===
@@ -4005,6 +4116,128 @@ pub fn test_net_http_auth_cors_and_etag() -> bool {
     return true;
 }
 
+pub fn http_is_websocket_upgrade(raw_req: String) -> bool {
+    let req_len = string_len(raw_req);
+    if req_len < 4 {
+        return false;
+    }
+    if string_substr(raw_req, 0, 4) != "GET " {
+        return false;
+    }
+
+    let up = http_get_header(raw_req, "Upgrade");
+    let conn = http_get_header(raw_req, "Connection");
+    let ver = http_get_header(raw_req, "Sec-WebSocket-Version");
+    let key = http_get_header(raw_req, "Sec-WebSocket-Key");
+
+    return string_contains(up, "websocket")
+        && (string_contains(conn, "Upgrade") || string_contains(conn, "upgrade"))
+        && string_len(key) > 0
+        && ver == "13";
+}
+
+pub fn http_websocket_key(raw_req: String) -> String {
+    return http_get_header(raw_req, "Sec-WebSocket-Key");
+}
+
+pub fn http_websocket_accept_response(accept_key: String) -> String {
+    mut res: String = "HTTP/1.1 101 Switching Protocols\r\n";
+    res = res + "Upgrade: websocket\r\n";
+    res = res + "Connection: Upgrade\r\n";
+    res = res + "Sec-WebSocket-Accept: " + accept_key + "\r\n";
+    res = res + "\r\n";
+    return res;
+}
+
+pub fn http_response_is_websocket_101(raw_resp: String) -> bool {
+    return string_contains(raw_resp, "101 Switching Protocols")
+        && string_contains(raw_resp, "Upgrade: websocket")
+        && string_contains(raw_resp, "Sec-WebSocket-Accept:");
+}
+
+pub fn test_net_http_router_dynamic_params_and_websocket_handshake() -> bool {
+    // 1. Dynamic router pattern matching
+    mut router = make_http_router();
+    router_add_route(inout router, "GET", "/api/v1/health", 100);
+    router_add_route(inout router, "GET", "/api/v1/users/:user_id/posts/:post_id", 200);
+    router_add_route(inout router, "POST", "/orders/:order_id/items", 300);
+    router_add_route(inout router, "GET", "/assets/*path", 400);
+
+    // Exact route
+    if router_match_route(router, "GET", "/api/v1/health") != 100 {
+        return false;
+    }
+
+    // Dynamic segments
+    let matched_user = router_match_route(router, "GET", "/api/v1/users/usr-99/posts/pst-42");
+    if matched_user != 200 {
+        return false;
+    }
+    let p_user = router_extract_param("/api/v1/users/:user_id/posts/:post_id", "/api/v1/users/usr-99/posts/pst-42", "user_id");
+    let p_post = router_extract_param("/api/v1/users/:user_id/posts/:post_id", "/api/v1/users/usr-99/posts/pst-42", "post_id");
+    if p_user != "usr-99" || p_post != "pst-42" {
+        return false;
+    }
+
+    // Dynamic POST route
+    let matched_order = router_match_route(router, "POST", "/orders/ORD-888/items");
+    if matched_order != 300 {
+        return false;
+    }
+    let p_order = router_extract_param("/orders/:order_id/items", "/orders/ORD-888/items", "order_id");
+    if p_order != "ORD-888" {
+        return false;
+    }
+
+    // Wildcard route
+    let matched_asset = router_match_route(router, "GET", "/assets/images/branding/logo.svg");
+    if matched_asset != 400 {
+        return false;
+    }
+    let p_path = router_extract_param("/assets/*path", "/assets/images/branding/logo.svg", "path");
+    if p_path != "images/branding/logo.svg" {
+        return false;
+    }
+
+    // Negative matches
+    if router_match_route(router, "PUT", "/api/v1/health") != -1 {
+        return false;
+    }
+    if router_match_route(router, "GET", "/api/v1/users/usr-99") != -1 {
+        return false;
+    }
+
+    // 2. RFC 6455 WebSocket Handshake
+    let client_key = "dGhlIHNhbXBsZSBub25jZQ==";
+    let expected_accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+    let raw_ws_req = "GET /chat HTTP/1.1\r\nHost: server.example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + client_key + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    if !http_is_websocket_upgrade(raw_ws_req) {
+        return false;
+    }
+    let extracted_k = http_websocket_key(raw_ws_req);
+    if extracted_k != client_key {
+        return false;
+    }
+
+    let ws_resp = http_websocket_accept_response(expected_accept);
+    if !http_response_is_websocket_101(ws_resp) {
+        return false;
+    }
+    if !string_contains(ws_resp, expected_accept) {
+        return false;
+    }
+
+    // Bad handshake requests
+    let bad_req_1 = "POST /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: abc\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    let bad_req_2 = "GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: abc\r\nSec-WebSocket-Version: 8\r\n\r\n";
+    if http_is_websocket_upgrade(bad_req_1) || http_is_websocket_upgrade(bad_req_2) {
+        return false;
+    }
+
+    return true;
+}
+
 pub fn test_net_all() -> bool {
     return test_net_tcp_echo()
     && test_net_http_wire()
@@ -4030,7 +4263,8 @@ pub fn test_net_all() -> bool {
     && test_net_http_cookies_and_session()
     && test_net_multipart_form_data()
     && test_net_http_sse_streaming_and_content_negotiation()
-    && test_net_http_auth_cors_and_etag();
+    && test_net_http_auth_cors_and_etag()
+    && test_net_http_router_dynamic_params_and_websocket_handshake();
 }
 
 pub fn main() {
@@ -4059,7 +4293,8 @@ pub fn main() {
     let t23 = test_net_multipart_form_data();
     let t24 = test_net_http_sse_streaming_and_content_negotiation();
     let t25 = test_net_http_auth_cors_and_etag();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 {
+    let t26 = test_net_http_router_dynamic_params_and_websocket_handshake();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");

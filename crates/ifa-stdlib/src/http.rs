@@ -1,5 +1,5 @@
 use crate::json::{self, JsonValue};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Standard HTTP Methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +99,10 @@ impl HttpHeaders {
             .map(|s| s.as_str())
     }
 
+    pub fn has(&self, key: &str) -> bool {
+        self.headers.contains_key(&key.to_ascii_lowercase())
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
         self.headers.iter()
     }
@@ -111,6 +115,7 @@ pub struct HttpRequest {
     pub path: String,
     pub headers: HttpHeaders,
     pub body: Vec<u8>,
+    pub path_params: BTreeMap<String, String>,
 }
 
 impl HttpRequest {
@@ -120,7 +125,19 @@ impl HttpRequest {
             path: path.into(),
             headers: HttpHeaders::new(),
             body: Vec::new(),
+            path_params: BTreeMap::new(),
         }
+    }
+
+    /// Retrieve dynamic path parameter matched by router (e.g. :id or *wildcard).
+    pub fn param(&self, name: &str) -> Option<&str> {
+        self.path_params.get(name).map(|s| s.as_str())
+    }
+
+    /// Set a path parameter manually.
+    pub fn with_param(mut self, name: impl Into<String>, val: impl Into<String>) -> Self {
+        self.path_params.insert(name.into(), val.into());
+        self
     }
 
     pub fn header(mut self, key: &str, val: &str) -> Self {
@@ -303,6 +320,47 @@ impl HttpResponse {
         self
     }
 
+    /// Create an HTTP 101 Switching Protocols response for RFC 6455 WebSocket upgrade.
+    pub fn websocket_upgrade(accept_key: &str) -> Self {
+        Self::new(HttpStatus(101))
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Accept", accept_key)
+    }
+
+    /// Check if this response is an RFC 6455 WebSocket switching protocols upgrade response.
+    pub fn is_websocket_upgrade(&self) -> bool {
+        self.status.0 == 101
+            && self
+                .headers
+                .get("upgrade")
+                .map(|u| u.eq_ignore_ascii_case("websocket"))
+                .unwrap_or(false)
+            && self
+                .headers
+                .get("connection")
+                .map(|c| {
+                    c.split(',')
+                        .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+                })
+                .unwrap_or(false)
+            && self.headers.has("sec-websocket-accept")
+    }
+
+    /// Retrieve the Sec-WebSocket-Accept header value if present.
+    pub fn websocket_accept_key(&self) -> Option<&str> {
+        self.headers.get("sec-websocket-accept")
+    }
+
+    /// Verify whether this response's Sec-WebSocket-Accept header matches client key per RFC 6455.
+    pub fn verify_websocket_accept(&self, client_key: &str) -> bool {
+        if !self.is_websocket_upgrade() {
+            return false;
+        }
+        let expected = crate::crypto::websocket_accept_key(client_key);
+        self.websocket_accept_key() == Some(expected.as_str())
+    }
+
     /// Parse HTTP Response from raw wire bytes.
     pub fn parse_from_wire(raw: &[u8]) -> Result<(Self, usize), String> {
         let header_end = raw
@@ -415,6 +473,7 @@ impl HttpRequest {
                 path: path.to_string(),
                 headers,
                 body,
+                path_params: BTreeMap::new(),
             },
             total_size,
         ))
@@ -576,6 +635,83 @@ impl HttpRequest {
             .map(|val| matches_if_match(current_etag, val))
             .unwrap_or(true)
     }
+
+    /// Check whether request is an RFC 6455 WebSocket handshake upgrade request.
+    pub fn is_websocket_upgrade(&self) -> bool {
+        let has_upgrade = self
+            .headers
+            .get("upgrade")
+            .map(|v| v.eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false);
+
+        let has_connection = self
+            .headers
+            .get("connection")
+            .map(|v| {
+                v.split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+            })
+            .unwrap_or(false);
+
+        let has_valid_version = self
+            .headers
+            .get("sec-websocket-version")
+            .map(|v| v.trim() == "13")
+            .unwrap_or(false);
+
+        let has_key = self
+            .headers
+            .get("sec-websocket-key")
+            .map(|k| !k.trim().is_empty())
+            .unwrap_or(false);
+
+        self.method == HttpMethod::Get
+            && has_upgrade
+            && has_connection
+            && has_valid_version
+            && has_key
+    }
+
+    /// Retrieve client Sec-WebSocket-Key header if present.
+    pub fn websocket_key(&self) -> Option<&str> {
+        self.headers.get("sec-websocket-key").map(|k| k.trim())
+    }
+
+    /// Retrieve client-requested Sec-WebSocket-Protocol header if present.
+    pub fn websocket_protocol(&self) -> Option<&str> {
+        self.headers.get("sec-websocket-protocol").map(|p| p.trim())
+    }
+
+    /// Create an RFC 6455 101 Switching Protocols response accepting this WebSocket handshake request.
+    pub fn websocket_upgrade_response(
+        &self,
+        selected_protocol: Option<&str>,
+    ) -> Option<HttpResponse> {
+        if !self.is_websocket_upgrade() {
+            return None;
+        }
+        let key = self.websocket_key()?;
+        let accept = crate::crypto::websocket_accept_key(key);
+        let mut resp = HttpResponse::websocket_upgrade(&accept);
+        if let Some(proto) = selected_protocol {
+            resp = resp.header("Sec-WebSocket-Protocol", proto);
+        }
+        Some(resp)
+    }
+
+    /// Construct a client RFC 6455 WebSocket handshake upgrade request.
+    pub fn websocket_handshake(
+        path: impl Into<String>,
+        host: impl AsRef<str>,
+        client_key: &str,
+    ) -> Self {
+        Self::new(HttpMethod::Get, path)
+            .header("Host", host.as_ref())
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Key", client_key)
+            .header("Sec-WebSocket-Version", "13")
+    }
 }
 
 // -------------------------------------------------------------
@@ -590,10 +726,197 @@ use std::sync::Arc;
 
 pub type HttpHandler = Arc<dyn Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static>;
 
+/// Route segment kind for dynamic URI routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteSegment {
+    /// Static exact path segment (e.g. "api", "v1", "users").
+    Exact(String),
+    /// Dynamic named path parameter (e.g. ":id", ":username") storing parameter key.
+    Param(String),
+    /// Catch-all wildcard matching remainder of URI (e.g. "*filepath", "*").
+    Wildcard(String),
+}
+
+/// Registered route with HTTP method, URI pattern, parsed segments and execution handler.
+#[derive(Clone)]
+pub struct HttpRoute {
+    pub method: HttpMethod,
+    pub pattern: String,
+    pub segments: Vec<RouteSegment>,
+    pub handler: HttpHandler,
+}
+
+/// High-performance URI router supporting dynamic path parameters (:param) and wildcards (*wildcard).
+#[derive(Clone, Default)]
+pub struct HttpRouter {
+    pub routes: Vec<HttpRoute>,
+}
+
+impl HttpRouter {
+    pub fn new() -> Self {
+        Self { routes: Vec::new() }
+    }
+
+    /// Parse a URI pattern into an ordered list of route segments.
+    pub fn parse_pattern(pattern: &str) -> Vec<RouteSegment> {
+        let clean = pattern.split_once('?').map(|(p, _)| p).unwrap_or(pattern);
+        clean
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|seg| {
+                if let Some(param) = seg.strip_prefix(':') {
+                    RouteSegment::Param(param.to_string())
+                } else if let Some(wildcard) = seg.strip_prefix('*') {
+                    let name = if wildcard.is_empty() {
+                        "wildcard"
+                    } else {
+                        wildcard
+                    };
+                    RouteSegment::Wildcard(name.to_string())
+                } else {
+                    RouteSegment::Exact(seg.to_string())
+                }
+            })
+            .collect()
+    }
+
+    /// Register a route handler with an HTTP method and URI pattern.
+    pub fn add(
+        &mut self,
+        method: HttpMethod,
+        pattern: impl Into<String>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        let pat_str = pattern.into();
+        let segments = Self::parse_pattern(&pat_str);
+        self.routes.push(HttpRoute {
+            method,
+            pattern: pat_str,
+            segments,
+            handler: Arc::new(handler),
+        });
+        self
+    }
+
+    /// Register a GET route handler.
+    pub fn get(
+        &mut self,
+        pattern: impl Into<String>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.add(HttpMethod::Get, pattern, handler)
+    }
+
+    /// Register a POST route handler.
+    pub fn post(
+        &mut self,
+        pattern: impl Into<String>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.add(HttpMethod::Post, pattern, handler)
+    }
+
+    /// Register a PUT route handler.
+    pub fn put(
+        &mut self,
+        pattern: impl Into<String>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.add(HttpMethod::Put, pattern, handler)
+    }
+
+    /// Register a DELETE route handler.
+    pub fn delete(
+        &mut self,
+        pattern: impl Into<String>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.add(HttpMethod::Delete, pattern, handler)
+    }
+
+    /// Register a PATCH route handler.
+    pub fn patch(
+        &mut self,
+        pattern: impl Into<String>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.add(HttpMethod::Patch, pattern, handler)
+    }
+
+    /// Register a HEAD route handler.
+    pub fn head(
+        &mut self,
+        pattern: impl Into<String>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.add(HttpMethod::Head, pattern, handler)
+    }
+
+    /// Register an OPTIONS route handler.
+    pub fn options(
+        &mut self,
+        pattern: impl Into<String>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.add(HttpMethod::Options, pattern, handler)
+    }
+
+    /// Match an incoming request against registered routes and extract dynamic path parameters.
+    pub fn match_route<'a>(
+        &'a self,
+        method: &HttpMethod,
+        path: &str,
+    ) -> Option<(&'a HttpRoute, BTreeMap<String, String>)> {
+        let clean_path = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+        let path_segs: Vec<&str> = clean_path.split('/').filter(|s| !s.is_empty()).collect();
+
+        for route in &self.routes {
+            if route.method != *method {
+                continue;
+            }
+
+            let mut params = BTreeMap::new();
+            let mut matches = true;
+            let mut req_idx = 0;
+
+            for seg in &route.segments {
+                match seg {
+                    RouteSegment::Exact(expected) => {
+                        if req_idx >= path_segs.len() || path_segs[req_idx] != expected {
+                            matches = false;
+                            break;
+                        }
+                        req_idx += 1;
+                    }
+                    RouteSegment::Param(param_name) => {
+                        if req_idx >= path_segs.len() {
+                            matches = false;
+                            break;
+                        }
+                        params.insert(param_name.clone(), path_segs[req_idx].to_string());
+                        req_idx += 1;
+                    }
+                    RouteSegment::Wildcard(wildcard_name) => {
+                        let remaining = path_segs[req_idx..].join("/");
+                        params.insert(wildcard_name.clone(), remaining);
+                        req_idx = path_segs.len();
+                        break;
+                    }
+                }
+            }
+
+            if matches && req_idx == path_segs.len() {
+                return Some((route, params));
+            }
+        }
+        None
+    }
+}
+
 /// High-performance, non-blocking HTTP server driven by IFA colorless fibers.
 pub struct HttpServer {
     port: u16,
-    routes: Arc<Vec<(HttpMethod, String, HttpHandler)>>,
+    router: Arc<HttpRouter>,
     is_running: Arc<AtomicBool>,
 }
 
@@ -602,7 +925,7 @@ impl HttpServer {
     pub fn new(port: u16) -> Self {
         Self {
             port,
-            routes: Arc::new(Vec::new()),
+            router: Arc::new(HttpRouter::new()),
             is_running: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -614,8 +937,8 @@ impl HttpServer {
         path: impl Into<String>,
         handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
     ) -> &mut Self {
-        let routes = Arc::get_mut(&mut self.routes).expect("Cannot register route while listening");
-        routes.push((method, path.into(), Arc::new(handler)));
+        let router = Arc::get_mut(&mut self.router).expect("Cannot register route while listening");
+        router.add(method, path, handler);
         self
     }
 
@@ -655,6 +978,33 @@ impl HttpServer {
         self.route(HttpMethod::Delete, path, handler)
     }
 
+    /// Register a PATCH route handler.
+    pub fn patch(
+        &mut self,
+        path: impl Into<String>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.route(HttpMethod::Patch, path, handler)
+    }
+
+    /// Register a HEAD route handler.
+    pub fn head(
+        &mut self,
+        path: impl Into<String>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.route(HttpMethod::Head, path, handler)
+    }
+
+    /// Register an OPTIONS route handler.
+    pub fn options(
+        &mut self,
+        path: impl Into<String>,
+        handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.route(HttpMethod::Options, path, handler)
+    }
+
     /// Start listening in a background colorless fiber and return bound address.
     pub fn listen_background(&self) -> io::Result<std::net::SocketAddr> {
         let listener = AsyncTcpListener::bind(format!("127.0.0.1:{}", self.port))?;
@@ -662,28 +1012,26 @@ impl HttpServer {
         self.is_running.store(true, Ordering::SeqCst);
 
         let running = Arc::clone(&self.is_running);
-        let routes = Arc::clone(&self.routes);
+        let router = Arc::clone(&self.router);
 
         GLOBAL_SCHEDULER.spawn(move || {
             while running.load(Ordering::Relaxed) {
                 if let Ok(Some((mut stream, _))) = listener.try_accept() {
-                    let routes_worker = Arc::clone(&routes);
+                    let router_worker = Arc::clone(&router);
                     GLOBAL_SCHEDULER.spawn(move || {
                         let mut buf = vec![0u8; 8192];
                         if let Ok(n) = stream.read(&mut buf) {
                             if n > 0 {
                                 let res = match HttpRequest::parse_from_wire(&buf[..n]) {
-                                    Ok((req, _)) => {
-                                        let mut matched = None;
-                                        for (m, p, h) in routes_worker.iter() {
-                                            if *m == req.method && p == &req.path {
-                                                matched = Some(h(&req));
-                                                break;
-                                            }
-                                        }
-                                        matched.unwrap_or_else(|| {
+                                    Ok((mut req, _)) => {
+                                        if let Some((route, params)) =
+                                            router_worker.match_route(&req.method, &req.path)
+                                        {
+                                            req.path_params = params;
+                                            (route.handler)(&req)
+                                        } else {
                                             HttpResponse::not_found().text("Route not found")
-                                        })
+                                        }
                                     }
                                     Err(err) => HttpResponse::bad_request()
                                         .text(format!("Invalid HTTP request: {}", err)),
@@ -1901,5 +2249,143 @@ mod tests {
         let not_mod = HttpResponse::not_modified(Some(&strong_etag));
         assert_eq!(not_mod.status, HttpStatus::NOT_MODIFIED);
         assert_eq!(not_mod.headers.get("etag"), Some(strong_etag.as_str()));
+    }
+
+    #[test]
+    fn test_dynamic_uri_router_and_path_params() {
+        let mut router = HttpRouter::new();
+        router.get("/api/v1/health", |_| HttpResponse::ok().text("healthy"));
+        router.get("/api/v1/users/:user_id/posts/:post_id", |req| {
+            let u = req.param("user_id").unwrap_or("missing");
+            let p = req.param("post_id").unwrap_or("missing");
+            HttpResponse::ok().text(format!("User {} Post {}", u, p))
+        });
+        router.post("/orders/:order_id/items", |req| {
+            let o = req.param("order_id").unwrap_or("missing");
+            HttpResponse::created().text(format!("Item added to order {}", o))
+        });
+        router.get("/assets/*filepath", |req| {
+            let f = req.param("filepath").unwrap_or("missing");
+            HttpResponse::ok().text(format!("Asset {}", f))
+        });
+
+        // 1. Match static
+        let (r1, p1) = router
+            .match_route(&HttpMethod::Get, "/api/v1/health")
+            .expect("Match static");
+        assert_eq!(r1.pattern, "/api/v1/health");
+        assert!(p1.is_empty());
+
+        // 2. Match dynamic parameters with query string ignored
+        let (r2, p2) = router
+            .match_route(
+                &HttpMethod::Get,
+                "/api/v1/users/usr-42/posts/pst-999?expand=all",
+            )
+            .expect("Match dynamic");
+        assert_eq!(r2.pattern, "/api/v1/users/:user_id/posts/:post_id");
+        assert_eq!(p2.get("user_id").map(|s| s.as_str()), Some("usr-42"));
+        assert_eq!(p2.get("post_id").map(|s| s.as_str()), Some("pst-999"));
+
+        // 3. Match POST with dynamic param
+        let (r3, p3) = router
+            .match_route(&HttpMethod::Post, "/orders/ORD-777/items")
+            .expect("Match POST dynamic");
+        assert_eq!(r3.pattern, "/orders/:order_id/items");
+        assert_eq!(p3.get("order_id").map(|s| s.as_str()), Some("ORD-777"));
+
+        // 4. Match wildcard
+        let (r4, p4) = router
+            .match_route(&HttpMethod::Get, "/assets/images/icons/logo.png")
+            .expect("Match wildcard");
+        assert_eq!(r4.pattern, "/assets/*filepath");
+        assert_eq!(
+            p4.get("filepath").map(|s| s.as_str()),
+            Some("images/icons/logo.png")
+        );
+
+        // 5. Mismatched methods or paths
+        assert!(router
+            .match_route(&HttpMethod::Put, "/api/v1/health")
+            .is_none());
+        assert!(router
+            .match_route(&HttpMethod::Get, "/api/v1/users/42")
+            .is_none());
+        assert!(router
+            .match_route(&HttpMethod::Get, "/orders/ORD-777/items")
+            .is_none());
+
+        // 6. Test integrated HttpServer with dynamic parameters
+        let mut server = HttpServer::new(0);
+        server.get("/api/v1/agents/:agent_id", |req| {
+            let id = req.param("agent_id").unwrap_or("anon");
+            HttpResponse::ok().text(format!("Agent: {}", id))
+        });
+
+        let bound_addr = server.listen_background().expect("Server listen failed");
+        let client = HttpClient::new();
+
+        let resp = client
+            .get("127.0.0.1", bound_addr.port(), "/api/v1/agents/AGT-4048")
+            .expect("Client GET failed");
+        assert_eq!(resp.status, HttpStatus::OK);
+        assert_eq!(resp.body_str().unwrap(), "Agent: AGT-4048");
+
+        server.stop();
+    }
+
+    #[test]
+    fn test_rfc6455_websocket_handshake() {
+        let client_key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let expected_accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+
+        // 1. Client handshake request construction
+        let req = HttpRequest::websocket_handshake("/chat/v1", "localhost:8080", client_key)
+            .header("Sec-WebSocket-Protocol", "chat.ifa, binary.ifa");
+
+        assert!(req.is_websocket_upgrade());
+        assert_eq!(req.websocket_key(), Some(client_key));
+        assert_eq!(req.websocket_protocol(), Some("chat.ifa, binary.ifa"));
+
+        // 2. Server upgrade response generation
+        let resp = req
+            .websocket_upgrade_response(Some("chat.ifa"))
+            .expect("Upgrade response should be generated");
+
+        assert_eq!(resp.status.0, 101);
+        assert_eq!(resp.headers.get("upgrade"), Some("websocket"));
+        assert_eq!(resp.headers.get("connection"), Some("Upgrade"));
+        assert_eq!(
+            resp.headers.get("sec-websocket-accept"),
+            Some(expected_accept)
+        );
+        assert_eq!(resp.headers.get("sec-websocket-protocol"), Some("chat.ifa"));
+
+        // 3. Client validation
+        assert!(resp.is_websocket_upgrade());
+        assert!(resp.verify_websocket_accept(client_key));
+        assert!(!resp.verify_websocket_accept("invalid_other_key=="));
+
+        // 4. Negative tests
+        let bad_method = HttpRequest::new(HttpMethod::Post, "/ws")
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Key", client_key)
+            .header("Sec-WebSocket-Version", "13");
+        assert!(!bad_method.is_websocket_upgrade());
+
+        let bad_ver = HttpRequest::new(HttpMethod::Get, "/ws")
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Key", client_key)
+            .header("Sec-WebSocket-Version", "8");
+        assert!(!bad_ver.is_websocket_upgrade());
+
+        let missing_key = HttpRequest::new(HttpMethod::Get, "/ws")
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Version", "13");
+        assert!(!missing_key.is_websocket_upgrade());
+        assert!(missing_key.websocket_upgrade_response(None).is_none());
     }
 }

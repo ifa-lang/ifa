@@ -1948,13 +1948,18 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_net_http_router_dynamic_params_and_websocket_handshake ... ok"),
+        "Std net http router dynamic params and websocket handshake test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("253 passed; 0 failed"),
-        "Expected 253 passed std unit tests, got:\n{}",
+        stdout.contains("255 passed; 0 failed"),
+        "Expected 255 passed std unit tests, got:\n{}",
         stdout
     );
 }
