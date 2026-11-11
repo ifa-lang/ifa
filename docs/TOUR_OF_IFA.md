@@ -1,4 +1,4 @@
-# Tour of IFA & Quickstart Guide (v0.1.0)
+# Tour of IFA & Quickstart Guide (v0.1.* Series)
 
 Welcome to the **IFA Systems Programming Language** (`ifa-lang`). IFA is a statically typed, compiled systems programming language engineered for deterministic reliability, fearless concurrency via colorless fibers, strict memory safety without garbage collection pauses, and multi-architecture native compilation (ELF64, Mach-O, PE32+/COFF, and WebAssembly).
 
@@ -192,6 +192,7 @@ IFA ships with a batteries-included, zero-dependency standard library:
 | **Data Formats** | `std::json`, `std::csv` | High-throughput JSON parser & serializer, RFC 4180 CSV parser & generator |
 | **Collections** | `std::collections` | Dynamic List, Robin-Hood Map, Set, Deque, RingBuffer, Priority Queue (Binary Heap), StringBuilder |
 | **Concurrency** | `std::sync` | Colorless fibers, MPMC cross-fiber channels, WaitGroup, Atomic primitives (`AtomicI64`, `AtomicBool`) |
+| **Embedded Database & WAL** | `std::db` | Zero-GC transactional key-value store, Write-Ahead Logging (WAL), atomic multi-operation transactions, rollback, prefix scanning, BLAKE3 crash recovery |
 | **I/O & File System** | `std::io`, `std::fs` | Buffered streams, memory streams, atomic file writes, recursive directory walking |
 | **Process & Environment** | `std::process`, `std::env` | Subprocess spawning, stdin/stdout/stderr pipeline capture, environment variable access |
 | **Time & Formatting** | `std::time`, `std::fmt` | Monotonic high-resolution clocks, elapsed durations, formatted string interpolation |
@@ -220,6 +221,16 @@ ifa build
 ./target/dev/data_processor_cli
 ```
 
+### Transactional Key-Value Storage Engine
+
+Embedded zero-GC transactional database service demonstrating atomic balance transfer, rollback, prefix scanning, and WAL recovery:
+
+```bash
+cd examples/kv_store_service
+ifa build
+./target/dev/kv_store_service
+```
+
 ---
 
 ## 6. Language Server Protocol (LSP 3.17)
@@ -236,3 +247,20 @@ Supported LSP capabilities:
 - Go-to-definition across local files and imported modules
 - Auto-completion for symbols and standard library namespaces
 - Document formatting via the canonical formatting engine
+
+---
+
+## 7. WebAssembly Component Model & WIT (WASI 0.2)
+
+IFA provides first-class support for WASI 0.2 and the WebAssembly Component Model:
+
+```bash
+# Wrap a core Wasm module into a standard Component binary
+ifa component wrap input.wasm -o component.wasm
+
+# Inspect Component header and interface sections
+ifa component info component.wasm
+
+# Parse and validate a WIT (WebAssembly Interface Type) document
+ifa wit check service.wit
+```

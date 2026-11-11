@@ -1988,13 +1988,48 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_db_basic_crud ... ok"),
+        "Std db basic crud test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_db_transaction_commit ... ok"),
+        "Std db transaction commit test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_db_transaction_rollback ... ok"),
+        "Std db transaction rollback test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_db_range_scan ... ok"),
+        "Std db range scan test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_db_wal_integrity ... ok"),
+        "Std db wal integrity test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_db_wal_recovery ... ok"),
+        "Std db wal recovery test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_db_all ... ok"),
+        "Std db all test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("271 passed; 0 failed"),
-        "Expected 271 passed std unit tests, got:\n{}",
+        stdout.contains("302 passed; 0 failed"),
+        "Expected 302 passed std unit tests, got:\n{}",
         stdout
     );
 }

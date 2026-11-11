@@ -12,6 +12,7 @@ import sync;
 import fmt;
 import csv;
 import io;
+import db;
 
 pub fn test_std_all() -> bool {
     let t_crypto = crypto::test_crypto_all();
@@ -61,6 +62,8 @@ pub fn test_std_all() -> bool {
 
     let t_io = io::test_io_all();
 
+    let t_db = db::test_db_all();
+
     return t_crypto
         && t_fs
         && t_process
@@ -71,7 +74,8 @@ pub fn test_std_all() -> bool {
         && t_sync
         && t_fmt
         && t_csv
-        && t_io;
+        && t_io
+        && t_db;
 }
 
 pub fn main() {

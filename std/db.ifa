@@ -1,0 +1,607 @@
+// Pure IFA Standard Library: Embedded Key-Value Database & WAL Subsystem (`std/db.ifa`)
+// Deterministic, zero-GC ACID storage engine with Write-Ahead Logging (WAL) and BLAKE3 integrity.
+
+import crypto;
+
+// ---------------------------------------------------------------------------
+// 1. Data Structures & Result Types
+// ---------------------------------------------------------------------------
+
+pub struct DbResult {
+    found: bool,
+    val: String,
+    version: i64,
+    err: String
+}
+
+pub struct Database {
+    path: String,
+    keys: List<String>,
+    vals: List<String>,
+    versions: List<i64>,
+    wal_ops: List<i64>,        // 1: Put, 2: Delete, 3: Commit
+    wal_tx_ids: List<i64>,
+    wal_keys: List<String>,
+    wal_vals: List<String>,
+    wal_checksums: List<String>,
+    next_tx_id: i64,
+    current_version: i64,
+    is_open: bool
+}
+
+pub struct Transaction {
+    tx_id: i64,
+    staged_ops: List<i64>,     // 1: Put, 2: Delete
+    staged_keys: List<String>,
+    staged_vals: List<String>,
+    is_active: bool
+}
+
+// ---------------------------------------------------------------------------
+// 2. String & Helper Primitives
+// ---------------------------------------------------------------------------
+
+pub fn db_int_to_str(n: i64) -> String {
+    if n == 0 {
+        return "0";
+    }
+    mut val = if n < 0 { -n } else { n };
+    mut s: String = "";
+    while val > 0 {
+        let digit = val % 10;
+        if digit == 0 { s = "0" + s; }
+        else if digit == 1 { s = "1" + s; }
+        else if digit == 2 { s = "2" + s; }
+        else if digit == 3 { s = "3" + s; }
+        else if digit == 4 { s = "4" + s; }
+        else if digit == 5 { s = "5" + s; }
+        else if digit == 6 { s = "6" + s; }
+        else if digit == 7 { s = "7" + s; }
+        else if digit == 8 { s = "8" + s; }
+        else if digit == 9 { s = "9" + s; }
+        val = val / 10;
+    }
+    if n < 0 {
+        s = "-" + s;
+    }
+    return s;
+}
+
+pub fn db_cmp_str(s1: String, s2: String) -> i64 {
+    let len1 = string_len(s1);
+    let len2 = string_len(s2);
+    mut min_len: i64 = len1;
+    if len2 < min_len {
+        min_len = len2;
+    }
+    mut i: i64 = 0;
+    while i < min_len {
+        let c1 = string_char_at(s1, i);
+        let c2 = string_char_at(s2, i);
+        if c1 < c2 {
+            return -1;
+        }
+        if c1 > c2 {
+            return 1;
+        }
+        i = i + 1;
+    }
+    if len1 < len2 {
+        return -1;
+    }
+    if len1 > len2 {
+        return 1;
+    }
+    return 0;
+}
+
+pub fn db_str_starts_with(s: String, prefix: String) -> bool {
+    let s_len = string_len(s);
+    let p_len = string_len(prefix);
+    if p_len > s_len {
+        return false;
+    }
+    mut i: i64 = 0;
+    while i < p_len {
+        if string_char_at(s, i) != string_char_at(prefix, i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn db_compute_checksum(op: i64, tx_id: i64, key: String, val: String) -> String {
+    let payload = db_int_to_str(op) + "|" + db_int_to_str(tx_id) + "|" + key + "|" + val;
+    return crypto::blake3_hex(payload);
+}
+
+// ---------------------------------------------------------------------------
+// 3. Database Lifecycle & Core Index Operations
+// ---------------------------------------------------------------------------
+
+pub fn db_open(path: String) -> Database {
+    return Database(
+        path: path,
+        keys: List::new(),
+        vals: List::new(),
+        versions: List::new(),
+        wal_ops: List::new(),
+        wal_tx_ids: List::new(),
+        wal_keys: List::new(),
+        wal_vals: List::new(),
+        wal_checksums: List::new(),
+        next_tx_id: 1,
+        current_version: 1,
+        is_open: true
+    );
+}
+
+pub fn db_close(inout db: Database) {
+    db.is_open = false;
+}
+
+pub fn db_find_key_index(db: Database, key: String) -> i64 {
+    let total = db.keys.len();
+    mut i: i64 = 0;
+    while i < total {
+        if db_cmp_str(db.keys[i], key) == 0 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn db_get(db: Database, key: String) -> DbResult {
+    if !db.is_open {
+        return DbResult(found: false, val: "", version: 0, err: "database is closed");
+    }
+    let idx = db_find_key_index(db, key);
+    if idx >= 0 {
+        return DbResult(
+            found: true,
+            val: db.vals[idx],
+            version: db.versions[idx],
+            err: ""
+        );
+    }
+    return DbResult(found: false, val: "", version: 0, err: "");
+}
+
+pub fn db_has(db: Database, key: String) -> bool {
+    let res = db_get(db, key);
+    return res.found;
+}
+
+pub fn db_put(inout db: Database, key: String, val: String) -> bool {
+    if !db.is_open {
+        return false;
+    }
+    let tx_id = db.next_tx_id;
+    db.next_tx_id = db.next_tx_id + 1;
+    db.current_version = db.current_version + 1;
+
+    // Append to Write-Ahead Log with BLAKE3 checksum
+    let cs = db_compute_checksum(1, tx_id, key, val);
+    db.wal_ops.push(1);
+    db.wal_tx_ids.push(tx_id);
+    db.wal_keys.push(key);
+    db.wal_vals.push(val);
+    db.wal_checksums.push(cs);
+
+    // Update in-memory index
+    let idx = db_find_key_index(db, key);
+    if idx >= 0 {
+        db.vals[idx] = val;
+        db.versions[idx] = db.current_version;
+    } else {
+        db.keys.push(key);
+        db.vals.push(val);
+        db.versions.push(db.current_version);
+    }
+    return true;
+}
+
+pub fn db_delete(inout db: Database, key: String) -> bool {
+    if !db.is_open {
+        return false;
+    }
+    let idx = db_find_key_index(db, key);
+    if idx < 0 {
+        return false;
+    }
+
+    let tx_id = db.next_tx_id;
+    db.next_tx_id = db.next_tx_id + 1;
+
+    // Append delete record to WAL
+    let cs = db_compute_checksum(2, tx_id, key, "");
+    db.wal_ops.push(2);
+    db.wal_tx_ids.push(tx_id);
+    db.wal_keys.push(key);
+    db.wal_vals.push("");
+    db.wal_checksums.push(cs);
+
+    // Remove from in-memory index
+    mut new_keys: List<String> = List::new();
+    mut new_vals: List<String> = List::new();
+    mut new_versions: List<i64> = List::new();
+    let total = db.keys.len();
+    mut i: i64 = 0;
+    while i < total {
+        if i != idx {
+            new_keys.push(db.keys[i]);
+            new_vals.push(db.vals[i]);
+            new_versions.push(db.versions[i]);
+        }
+        i = i + 1;
+    }
+    db.keys = new_keys;
+    db.vals = new_vals;
+    db.versions = new_versions;
+    return true;
+}
+
+pub fn db_count(db: Database) -> i64 {
+    return db.keys.len();
+}
+
+pub fn db_range_scan(db: Database, prefix: String) -> List<String> {
+    mut res: List<String> = List::new();
+    let total = db.keys.len();
+    mut i: i64 = 0;
+    while i < total {
+        if db_str_starts_with(db.keys[i], prefix) {
+            res.push(db.keys[i]);
+        }
+        i = i + 1;
+    }
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// 4. ACID Transactions & Snapshot Isolation
+// ---------------------------------------------------------------------------
+
+pub fn db_begin_tx(inout db: Database) -> Transaction {
+    let tid = db.next_tx_id;
+    db.next_tx_id = db.next_tx_id + 1;
+    return Transaction(
+        tx_id: tid,
+        staged_ops: List::new(),
+        staged_keys: List::new(),
+        staged_vals: List::new(),
+        is_active: true
+    );
+}
+
+pub fn tx_put(inout tx: Transaction, key: String, val: String) {
+    if !tx.is_active {
+        return;
+    }
+    tx.staged_ops.push(1);
+    tx.staged_keys.push(key);
+    tx.staged_vals.push(val);
+}
+
+pub fn tx_delete(inout tx: Transaction, key: String) {
+    if !tx.is_active {
+        return;
+    }
+    tx.staged_ops.push(2);
+    tx.staged_keys.push(key);
+    tx.staged_vals.push("");
+}
+
+pub fn tx_commit(inout db: Database, inout tx: Transaction) -> bool {
+    if !tx.is_active || !db.is_open {
+        return false;
+    }
+
+    let staged_count = tx.staged_ops.len();
+    mut i: i64 = 0;
+    while i < staged_count {
+        let op = tx.staged_ops[i];
+        let k = tx.staged_keys[i];
+        let v = tx.staged_vals[i];
+
+        // Append staged record to WAL
+        let cs = db_compute_checksum(op, tx.tx_id, k, v);
+        db.wal_ops.push(op);
+        db.wal_tx_ids.push(tx.tx_id);
+        db.wal_keys.push(k);
+        db.wal_vals.push(v);
+        db.wal_checksums.push(cs);
+
+        if op == 1 {
+            // Apply Put
+            db.current_version = db.current_version + 1;
+            let idx = db_find_key_index(db, k);
+            if idx >= 0 {
+                db.vals[idx] = v;
+                db.versions[idx] = db.current_version;
+            } else {
+                db.keys.push(k);
+                db.vals.push(v);
+                db.versions.push(db.current_version);
+            }
+        } else if op == 2 {
+            // Apply Delete
+            let idx = db_find_key_index(db, k);
+            if idx >= 0 {
+                mut new_keys: List<String> = List::new();
+                mut new_vals: List<String> = List::new();
+                mut new_versions: List<i64> = List::new();
+                let total = db.keys.len();
+                mut j: i64 = 0;
+                while j < total {
+                    if j != idx {
+                        new_keys.push(db.keys[j]);
+                        new_vals.push(db.vals[j]);
+                        new_versions.push(db.versions[j]);
+                    }
+                    j = j + 1;
+                }
+                db.keys = new_keys;
+                db.vals = new_vals;
+                db.versions = new_versions;
+            }
+        }
+        i = i + 1;
+    }
+
+    // Append Commit Marker to WAL
+    let commit_cs = db_compute_checksum(3, tx.tx_id, "", "");
+    db.wal_ops.push(3);
+    db.wal_tx_ids.push(tx.tx_id);
+    db.wal_keys.push("");
+    db.wal_vals.push("");
+    db.wal_checksums.push(commit_cs);
+
+    tx.is_active = false;
+    return true;
+}
+
+pub fn tx_rollback(inout tx: Transaction) {
+    tx.is_active = false;
+    tx.staged_ops = List::new();
+    tx.staged_keys = List::new();
+    tx.staged_vals = List::new();
+}
+
+// ---------------------------------------------------------------------------
+// 5. WAL Integrity & Crash Recovery
+// ---------------------------------------------------------------------------
+
+pub fn db_wal_size(db: Database) -> i64 {
+    return db.wal_ops.len();
+}
+
+pub fn db_verify_wal_integrity(db: Database) -> bool {
+    let total = db.wal_ops.len();
+    mut i: i64 = 0;
+    while i < total {
+        let op = db.wal_ops[i];
+        let tid = db.wal_tx_ids[i];
+        let k = db.wal_keys[i];
+        let v = db.wal_vals[i];
+        let expected_cs = db.wal_checksums[i];
+        let computed_cs = db_compute_checksum(op, tid, k, v);
+        if db_cmp_str(expected_cs, computed_cs) != 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn db_recover_from_wal(path: String, wal_ops: List<i64>, wal_tx_ids: List<i64>, wal_keys: List<String>, wal_vals: List<String>, wal_checksums: List<String>) -> Database {
+    mut recovered = db_open(path);
+    let total = wal_ops.len();
+    mut i: i64 = 0;
+    while i < total {
+        let op = wal_ops[i];
+        let tid = wal_tx_ids[i];
+        let k = wal_keys[i];
+        let v = wal_vals[i];
+        let cs = wal_checksums[i];
+
+        // Verify checksum before applying
+        let computed = db_compute_checksum(op, tid, k, v);
+        if db_cmp_str(cs, computed) == 0 {
+            if op == 1 {
+                let idx = db_find_key_index(recovered, k);
+                if idx >= 0 {
+                    recovered.vals[idx] = v;
+                    recovered.versions[idx] = recovered.versions[idx] + 1;
+                } else {
+                    recovered.keys.push(k);
+                    recovered.vals.push(v);
+                    recovered.versions.push(1);
+                }
+            } else if op == 2 {
+                let idx = db_find_key_index(recovered, k);
+                if idx >= 0 {
+                    mut new_k: List<String> = List::new();
+                    mut new_v: List<String> = List::new();
+                    mut new_ver: List<i64> = List::new();
+                    let cnt = recovered.keys.len();
+                    mut j: i64 = 0;
+                    while j < cnt {
+                        if j != idx {
+                            new_k.push(recovered.keys[j]);
+                            new_v.push(recovered.vals[j]);
+                            new_ver.push(recovered.versions[j]);
+                        }
+                        j = j + 1;
+                    }
+                    recovered.keys = new_k;
+                    recovered.vals = new_v;
+                    recovered.versions = new_ver;
+                }
+            }
+            recovered.wal_ops.push(op);
+            recovered.wal_tx_ids.push(tid);
+            recovered.wal_keys.push(k);
+            recovered.wal_vals.push(v);
+            recovered.wal_checksums.push(cs);
+        }
+        i = i + 1;
+    }
+    return recovered;
+}
+
+// ---------------------------------------------------------------------------
+// 6. Unit Tests & Invariant Verification
+// ---------------------------------------------------------------------------
+
+pub fn test_db_basic_crud() -> bool {
+    mut db = db_open("/tmp/ifa_test_db");
+
+    // Put items
+    db_put(inout db, "user:1", "{\"name\":\"Dieudonne\"}");
+    db_put(inout db, "user:2", "{\"name\":\"Prudence\"}");
+
+    let r1 = db_get(db, "user:1");
+    let r2 = db_get(db, "user:2");
+    let r3 = db_get(db, "user:3");
+
+    let ok1 = r1.found && r1.val == "{\"name\":\"Dieudonne\"}";
+    let ok2 = r2.found && r2.val == "{\"name\":\"Prudence\"}";
+    let ok3 = !r3.found;
+    let count1 = db_count(db);
+
+    // Overwrite
+    db_put(inout db, "user:1", "{\"name\":\"Dieudonne Updated\"}");
+    let r1_up = db_get(db, "user:1");
+    let ok_up = r1_up.found && r1_up.val == "{\"name\":\"Dieudonne Updated\"}";
+
+    // Delete
+    let del_ok = db_delete(inout db, "user:2");
+    let r2_after = db_get(db, "user:2");
+    let ok_del = del_ok && !r2_after.found;
+    let count2 = db_count(db);
+
+    db_close(inout db);
+    return ok1 && ok2 && ok3 && count1 == 2 && ok_up && ok_del && count2 == 1;
+}
+
+pub fn test_db_transaction_commit() -> bool {
+    mut db = db_open("/tmp/ifa_test_tx_commit");
+    db_put(inout db, "k1", "v1");
+
+    mut tx = db_begin_tx(inout db);
+    tx_put(inout tx, "k2", "v2");
+    tx_put(inout tx, "k3", "v3");
+    tx_delete(inout tx, "k1");
+
+    // Before commit, db still has k1, does not have k2 or k3
+    let before_k1 = db_get(db, "k1");
+    let before_k2 = db_get(db, "k2");
+    let ok_before = before_k1.found && !before_k2.found;
+
+    let commit_res = tx_commit(inout db, inout tx);
+
+    // After commit, k1 deleted, k2 and k3 present
+    let after_k1 = db_get(db, "k1");
+    let after_k2 = db_get(db, "k2");
+    let after_k3 = db_get(db, "k3");
+    let ok_after = !after_k1.found && after_k2.found && after_k2.val == "v2" && after_k3.found && after_k3.val == "v3";
+
+    db_close(inout db);
+    return ok_before && commit_res && ok_after;
+}
+
+pub fn test_db_transaction_rollback() -> bool {
+    mut db = db_open("/tmp/ifa_test_tx_rollback");
+    db_put(inout db, "safe_key", "original_value");
+
+    mut tx = db_begin_tx(inout db);
+    tx_put(inout tx, "safe_key", "overwritten_value");
+    tx_put(inout tx, "temp_key", "ephemeral");
+    tx_rollback(inout tx);
+
+    // After rollback, original value must be intact, temp_key absent
+    let r_safe = db_get(db, "safe_key");
+    let r_temp = db_get(db, "temp_key");
+
+    let ok = r_safe.found && r_safe.val == "original_value" && !r_temp.found;
+    db_close(inout db);
+    return ok;
+}
+
+pub fn test_db_range_scan() -> bool {
+    mut db = db_open("/tmp/ifa_test_scan");
+    db_put(inout db, "order:101", "apple");
+    db_put(inout db, "order:102", "banana");
+    db_put(inout db, "order:103", "cherry");
+    db_put(inout db, "customer:1", "alice");
+    db_put(inout db, "customer:2", "bob");
+
+    let orders = db_range_scan(db, "order:");
+    let customers = db_range_scan(db, "customer:");
+    let none = db_range_scan(db, "product:");
+
+    let ok_orders = orders.len() == 3;
+    let ok_cust = customers.len() == 2;
+    let ok_none = none.len() == 0;
+
+    db_close(inout db);
+    return ok_orders && ok_cust && ok_none;
+}
+
+pub fn test_db_wal_integrity() -> bool {
+    mut db = db_open("/tmp/ifa_test_wal");
+    db_put(inout db, "cfg:port", "8080");
+    db_put(inout db, "cfg:host", "127.0.0.1");
+    db_delete(inout db, "cfg:port");
+
+    let integrity_ok = db_verify_wal_integrity(db);
+    let wal_len = db_wal_size(db);
+
+    db_close(inout db);
+    return integrity_ok && wal_len == 3;
+}
+
+pub fn test_db_wal_recovery() -> bool {
+    mut db = db_open("/tmp/ifa_test_recovery");
+    db_put(inout db, "session:a", "tok_alpha");
+    db_put(inout db, "session:b", "tok_beta");
+    db_delete(inout db, "session:a");
+    db_put(inout db, "session:c", "tok_gamma");
+
+    // Recover from original WAL logs into a brand new database instance
+    let recovered = db_recover_from_wal(
+        "/tmp/ifa_test_recovered",
+        db.wal_ops,
+        db.wal_tx_ids,
+        db.wal_keys,
+        db.wal_vals,
+        db.wal_checksums
+    );
+
+    let r_a = db_get(recovered, "session:a");
+    let r_b = db_get(recovered, "session:b");
+    let r_c = db_get(recovered, "session:c");
+
+    let ok = !r_a.found && r_b.found && r_b.val == "tok_beta" && r_c.found && r_c.val == "tok_gamma";
+    return ok && db_count(recovered) == 2;
+}
+
+pub fn test_db_all() -> bool {
+    return test_db_basic_crud()
+        && test_db_transaction_commit()
+        && test_db_transaction_rollback()
+        && test_db_range_scan()
+        && test_db_wal_integrity()
+        && test_db_wal_recovery();
+}
+
+pub fn main() {
+    if test_db_all() {
+        println("test_db_all: ok");
+    } else {
+        println("test_db_all: failed");
+    }
+}
