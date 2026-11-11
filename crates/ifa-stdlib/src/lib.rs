@@ -28,15 +28,15 @@ pub use fmt::{
 };
 pub use fs::{
     append as fs_append, copy as fs_copy, create_dir as fs_create_dir,
-    create_dir_all as fs_create_dir_all, exists as fs_exists, file_size as fs_file_size,
-    is_dir as fs_is_dir, is_file as fs_is_file, list_dir as fs_list_dir, metadata as fs_metadata,
-    read as fs_read, read_to_string as fs_read_to_string, remove_dir as fs_remove_dir,
-    remove_dir_all as fs_remove_dir_all, remove_file as fs_remove_file, rename as fs_rename,
+    create_dir_all as fs_create_dir_all, current_fs, current_target_kind, exists as fs_exists,
+    file_size as fs_file_size, is_dir as fs_is_dir, is_file as fs_is_file, list_dir as fs_list_dir,
+    metadata as fs_metadata, normalize_path, read as fs_read, read_to_string as fs_read_to_string,
+    remove_dir as fs_remove_dir, remove_dir_all as fs_remove_dir_all,
+    remove_file as fs_remove_file, rename as fs_rename, reset_global_fs, set_global_fs,
     walk_dir as fs_walk_dir, walk_dir_files as fs_walk_dir_files,
-    walk_dir_matching as fs_walk_dir_matching, write as fs_write, write_string as fs_write_string,
-    current_fs, current_target_kind, normalize_path, reset_global_fs, set_global_fs,
-    with_target_fs, FileMetadata, FileSystem, PosixFs, TargetKind, VirtualFs, WasiFs,
-    WasiFsBuilder, WasiPreopen, WasiRights,
+    walk_dir_matching as fs_walk_dir_matching, with_target_fs, write as fs_write,
+    write_string as fs_write_string, FileMetadata, FileSystem, PosixFs, TargetKind, VirtualFs,
+    WasiFs, WasiFsBuilder, WasiPreopen, WasiRights,
 };
 pub use http::{
     compute_etag, cors_middleware, csrf_protection_middleware, encode_basic_auth,
@@ -347,16 +347,8 @@ mod tests {
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let wasi = WasiFs::builder()
-            .preopen(
-                "/sandbox",
-                Some(temp_dir.clone()),
-                WasiRights::READ_WRITE,
-            )
-            .preopen(
-                "/read_only_data",
-                None,
-                WasiRights::READ_ONLY,
-            )
+            .preopen("/sandbox", Some(temp_dir.clone()), WasiRights::READ_WRITE)
+            .preopen("/read_only_data", None, WasiRights::READ_ONLY)
             .build();
 
         let wasi_arc = Arc::new(wasi);

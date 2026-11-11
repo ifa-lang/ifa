@@ -459,9 +459,7 @@ impl FileSystem for VirtualFs {
                 data.extend_from_slice(contents);
                 Ok(())
             }
-            Some(VirtualNode::File {
-                readonly: true, ..
-            }) => Err(io::Error::new(
+            Some(VirtualNode::File { readonly: true, .. }) => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("File is read-only: {}", norm.display()),
             )),
@@ -944,7 +942,10 @@ impl FileSystem for WasiFs {
         if !rights.read {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("WASI capability error: read not permitted on {}", path.display()),
+                format!(
+                    "WASI capability error: read not permitted on {}",
+                    path.display()
+                ),
             ));
         }
         if let Some(host_path) = host_opt {
@@ -959,7 +960,10 @@ impl FileSystem for WasiFs {
         if !rights.write {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("WASI capability error: write not permitted on {}", path.display()),
+                format!(
+                    "WASI capability error: write not permitted on {}",
+                    path.display()
+                ),
             ));
         }
         if let Some(host_path) = host_opt {
@@ -974,7 +978,10 @@ impl FileSystem for WasiFs {
         if !rights.write {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("WASI capability error: write not permitted on {}", path.display()),
+                format!(
+                    "WASI capability error: write not permitted on {}",
+                    path.display()
+                ),
             ));
         }
         if let Some(host_path) = host_opt {
@@ -1041,7 +1048,10 @@ impl FileSystem for WasiFs {
         if !rights.create {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("WASI capability error: create not permitted on {}", path.display()),
+                format!(
+                    "WASI capability error: create not permitted on {}",
+                    path.display()
+                ),
             ));
         }
         if let Some(host_path) = host_opt {
@@ -1056,7 +1066,10 @@ impl FileSystem for WasiFs {
         if !rights.create {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("WASI capability error: create not permitted on {}", path.display()),
+                format!(
+                    "WASI capability error: create not permitted on {}",
+                    path.display()
+                ),
             ));
         }
         if let Some(host_path) = host_opt {
@@ -1071,7 +1084,10 @@ impl FileSystem for WasiFs {
         if !rights.delete {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("WASI capability error: delete not permitted on {}", path.display()),
+                format!(
+                    "WASI capability error: delete not permitted on {}",
+                    path.display()
+                ),
             ));
         }
         if let Some(host_path) = host_opt {
@@ -1086,7 +1102,10 @@ impl FileSystem for WasiFs {
         if !rights.delete {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("WASI capability error: delete not permitted on {}", path.display()),
+                format!(
+                    "WASI capability error: delete not permitted on {}",
+                    path.display()
+                ),
             ));
         }
         if let Some(host_path) = host_opt {
@@ -1101,7 +1120,10 @@ impl FileSystem for WasiFs {
         if !rights.delete {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("WASI capability error: delete not permitted on {}", path.display()),
+                format!(
+                    "WASI capability error: delete not permitted on {}",
+                    path.display()
+                ),
             ));
         }
         if let Some(host_path) = host_opt {
@@ -1182,7 +1204,10 @@ impl FileSystem for WasiFs {
         if !rights.list {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("WASI capability error: list not permitted on {}", path.display()),
+                format!(
+                    "WASI capability error: list not permitted on {}",
+                    path.display()
+                ),
             ));
         }
         if let Some(host_path) = host_opt {
@@ -1203,7 +1228,10 @@ impl FileSystem for WasiFs {
         if !rights.list {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("WASI capability error: list not permitted on {}", root.display()),
+                format!(
+                    "WASI capability error: list not permitted on {}",
+                    root.display()
+                ),
             ));
         }
         if let Some(host_path) = host_opt {
