@@ -9,6 +9,8 @@ import net;
 import time;
 import json;
 import sync;
+import fmt;
+import csv;
 
 pub fn test_std_all() -> bool {
     let t_crypto = crypto::test_crypto_all();
@@ -52,7 +54,20 @@ pub fn test_std_all() -> bool {
 
     let t_sync = sync::test_sync_all();
 
-    return t_crypto && t_fs && t_process && t_collections && t_net && t_time && t_json && t_sync;
+    let t_fmt = fmt::test_fmt_all();
+
+    let t_csv = csv::test_csv_all();
+
+    return t_crypto
+        && t_fs
+        && t_process
+        && t_collections
+        && t_net
+        && t_time
+        && t_json
+        && t_sync
+        && t_fmt
+        && t_csv;
 }
 
 pub fn main() {

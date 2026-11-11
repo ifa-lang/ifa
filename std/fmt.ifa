@@ -1,0 +1,266 @@
+// Pure IFA Standard Library: Text & Numeric Formatting Subsystem (`std/fmt.ifa`)
+// Deterministic representation of integers (hex, octal, binary), string padding, and tabular alignment.
+
+pub fn int_to_str(mut n: i64) -> String {
+    if n == 0 {
+        return "0";
+    }
+    mut is_neg = false;
+    if n < 0 {
+        is_neg = true;
+        n = 0 - n;
+    }
+    mut digits = "";
+    while n > 0 {
+        let rem = n % 10;
+        let d = if rem == 0 { "0" }
+            else if rem == 1 { "1" }
+            else if rem == 2 { "2" }
+            else if rem == 3 { "3" }
+            else if rem == 4 { "4" }
+            else if rem == 5 { "5" }
+            else if rem == 6 { "6" }
+            else if rem == 7 { "7" }
+            else if rem == 8 { "8" }
+            else { "9" };
+        digits = d + digits;
+        n = n / 10;
+    }
+    if is_neg {
+        return "-" + digits;
+    }
+    return digits;
+}
+
+pub fn repeat_str(s: String, count: i64) -> String {
+    if count <= 0 {
+        return "";
+    }
+    mut res = "";
+    mut i: i64 = 0;
+    while i < count {
+        res = res + s;
+        i = i + 1;
+    }
+    return res;
+}
+
+pub fn pad_left(s: String, width: i64, pad_char: String) -> String {
+    let len = string_len(s);
+    if len >= width {
+        return s;
+    }
+    let pad_len = width - len;
+    return s + repeat_str(pad_char, pad_len);
+}
+
+pub fn pad_right(s: String, width: i64, pad_char: String) -> String {
+    let len = string_len(s);
+    if len >= width {
+        return s;
+    }
+    let pad_len = width - len;
+    return repeat_str(pad_char, pad_len) + s;
+}
+
+pub fn pad_center(s: String, width: i64, pad_char: String) -> String {
+    let len = string_len(s);
+    if len >= width {
+        return s;
+    }
+    let total_pad = width - len;
+    let left_pad = total_pad / 2;
+    let right_pad = total_pad - left_pad;
+    return repeat_str(pad_char, left_pad) + s + repeat_str(pad_char, right_pad);
+}
+
+pub fn format_hex(mut val: i64, prefix: bool, uppercase: bool) -> String {
+    if val == 0 {
+        if prefix {
+            if uppercase {
+                return "0X0";
+            } else {
+                return "0x0";
+            }
+        }
+        return "0";
+    }
+
+    mut is_neg = false;
+    if val < 0 {
+        is_neg = true;
+        val = 0 - val;
+    }
+
+    mut hex_digits = "";
+    while val > 0 {
+        let rem = val % 16;
+        let c = if rem == 0 { "0" }
+            else if rem == 1 { "1" }
+            else if rem == 2 { "2" }
+            else if rem == 3 { "3" }
+            else if rem == 4 { "4" }
+            else if rem == 5 { "5" }
+            else if rem == 6 { "6" }
+            else if rem == 7 { "7" }
+            else if rem == 8 { "8" }
+            else if rem == 9 { "9" }
+            else if rem == 10 { if uppercase { "A" } else { "a" } }
+            else if rem == 11 { if uppercase { "B" } else { "b" } }
+            else if rem == 12 { if uppercase { "C" } else { "c" } }
+            else if rem == 13 { if uppercase { "D" } else { "d" } }
+            else if rem == 14 { if uppercase { "E" } else { "e" } }
+            else { if uppercase { "F" } else { "f" } };
+        hex_digits = c + hex_digits;
+        val = val / 16;
+    }
+
+    mut out = "";
+    if is_neg {
+        out = "-";
+    }
+    if prefix {
+        if uppercase {
+            out = out + "0X";
+        } else {
+            out = out + "0x";
+        }
+    }
+    return out + hex_digits;
+}
+
+pub fn format_octal(mut val: i64, prefix: bool) -> String {
+    if val == 0 {
+        if prefix {
+            return "0o0";
+        }
+        return "0";
+    }
+
+    mut is_neg = false;
+    if val < 0 {
+        is_neg = true;
+        val = 0 - val;
+    }
+
+    mut oct_digits = "";
+    while val > 0 {
+        let rem = val % 8;
+        let c = if rem == 0 { "0" }
+            else if rem == 1 { "1" }
+            else if rem == 2 { "2" }
+            else if rem == 3 { "3" }
+            else if rem == 4 { "4" }
+            else if rem == 5 { "5" }
+            else if rem == 6 { "6" }
+            else { "7" };
+        oct_digits = c + oct_digits;
+        val = val / 8;
+    }
+
+    mut out = "";
+    if is_neg {
+        out = "-";
+    }
+    if prefix {
+        out = out + "0o";
+    }
+    return out + oct_digits;
+}
+
+pub fn format_binary(mut val: i64, prefix: bool) -> String {
+    if val == 0 {
+        if prefix {
+            return "0b0";
+        }
+        return "0";
+    }
+
+    mut is_neg = false;
+    if val < 0 {
+        is_neg = true;
+        val = 0 - val;
+    }
+
+    mut bin_digits = "";
+    while val > 0 {
+        let rem = val % 2;
+        let c = if rem == 0 { "0" } else { "1" };
+        bin_digits = c + bin_digits;
+        val = val / 2;
+    }
+
+    mut out = "";
+    if is_neg {
+        out = "-";
+    }
+    if prefix {
+        out = out + "0b";
+    }
+    return out + bin_digits;
+}
+
+pub fn format_int_aligned(val: i64, width: i64, alignment: i64, pad_char: String) -> String {
+    let s = int_to_str(val);
+    if alignment == 0 {
+        return pad_left(s, width, pad_char);
+    } else if alignment == 1 {
+        return pad_right(s, width, pad_char);
+    } else {
+        return pad_center(s, width, pad_char);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit Tests for fmt subsystem
+// ---------------------------------------------------------------------------
+
+pub fn test_fmt_hex() -> bool {
+    let t1 = format_hex(255, true, false) == "0xff";
+    let t2 = format_hex(255, true, true) == "0XFF";
+    let t3 = format_hex(255, false, false) == "ff";
+    let t4 = format_hex(0, true, false) == "0x0";
+    let t5 = format_hex(4096, true, false) == "0x1000";
+    return t1 && t2 && t3 && t4 && t5;
+}
+
+pub fn test_fmt_octal() -> bool {
+    let t1 = format_octal(64, true) == "0o100";
+    let t2 = format_octal(64, false) == "100";
+    let t3 = format_octal(0, true) == "0o0";
+    let t4 = format_octal(8, false) == "10";
+    return t1 && t2 && t3 && t4;
+}
+
+pub fn test_fmt_binary() -> bool {
+    let t1 = format_binary(10, true) == "0b1010";
+    let t2 = format_binary(10, false) == "1010";
+    let t3 = format_binary(0, true) == "0b0";
+    let t4 = format_binary(255, false) == "11111111";
+    return t1 && t2 && t3 && t4;
+}
+
+pub fn test_fmt_padding_and_alignment() -> bool {
+    let t1 = pad_left("hello", 10, " ") == "hello     ";
+    let t2 = pad_right("hello", 10, "0") == "00000hello";
+    let t3 = pad_center("test", 10, "-") == "---test---";
+    let t4 = format_int_aligned(42, 6, 1, " ") == "    42";
+    let t5 = format_int_aligned(42, 6, 0, " ") == "42    ";
+    let t6 = format_int_aligned(42, 6, 2, " ") == "  42  ";
+    return t1 && t2 && t3 && t4 && t5 && t6;
+}
+
+pub fn test_fmt_all() -> bool {
+    return test_fmt_hex()
+        && test_fmt_octal()
+        && test_fmt_binary()
+        && test_fmt_padding_and_alignment();
+}
+
+pub fn main() {
+    if test_fmt_all() {
+        println("std/fmt: ALL TESTS PASSED");
+    } else {
+        println("std/fmt: TESTS FAILED");
+    }
+}

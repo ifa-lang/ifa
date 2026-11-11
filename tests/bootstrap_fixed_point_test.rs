@@ -1823,13 +1823,63 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_fmt_all ... ok"),
+        "Std fmt all test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_fmt_hex ... ok"),
+        "Std fmt hex test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_fmt_octal ... ok"),
+        "Std fmt octal test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_fmt_binary ... ok"),
+        "Std fmt binary test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_fmt_padding_and_alignment ... ok"),
+        "Std fmt padding and alignment test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_csv_all ... ok"),
+        "Std csv all test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_csv_rfc4180_quotes_and_commas ... ok"),
+        "Std csv RFC 4180 quotes test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_csv_table_access_by_header ... ok"),
+        "Std csv table access by header test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_csv_roundtrip_encode_decode ... ok"),
+        "Std csv roundtrip encode decode test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_csv_custom_delimiter_tsv ... ok"),
+        "Std csv custom delimiter TSV test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_std_all ... ok"),
         "Std all subsystem tests missing from output:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("199 passed; 0 failed"),
-        "Expected 199 passed std unit tests, got:\n{}",
+        stdout.contains("219 passed; 0 failed"),
+        "Expected 219 passed std unit tests, got:\n{}",
         stdout
     );
 }

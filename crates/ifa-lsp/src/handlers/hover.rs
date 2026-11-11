@@ -193,6 +193,50 @@ pub fn handle_hover(doc: &Document, position: Position) -> Option<Hover> {
             "**`blake3_hex(s: String) -> String`** — BLAKE3 Cryptographic Hash.\n\n\
              High-performance tree hashing algorithm with official specification compliance.",
         ),
+        "format_hex" => Some(
+            "**`format_hex(val: i64, prefix: bool, uppercase: bool) -> String`** — Hexadecimal Formatter (`std/fmt`).\n\n\
+             Converts an integer to hexadecimal format with optional prefix ('0x' / '0X') and letter case control.",
+        ),
+        "format_octal" => Some(
+            "**`format_octal(val: i64, prefix: bool) -> String`** — Octal Formatter (`std/fmt`).\n\n\
+             Converts an integer to octal format with optional '0o' prefix.",
+        ),
+        "format_binary" => Some(
+            "**`format_binary(val: i64, prefix: bool) -> String`** — Binary Formatter (`std/fmt`).\n\n\
+             Converts an integer to binary bitstring representation with optional '0b' prefix.",
+        ),
+        "pad_left" => Some(
+            "**`pad_left(s: String, width: i64, pad_char: String) -> String`** — Left Alignment (`std/fmt`).\n\n\
+             Aligns string to the left by appending padding characters on the right until reaching specified width.",
+        ),
+        "pad_right" => Some(
+            "**`pad_right(s: String, width: i64, pad_char: String) -> String`** — Right Alignment (`std/fmt`).\n\n\
+             Aligns string to the right by prepending padding characters on the left until reaching specified width.",
+        ),
+        "pad_center" => Some(
+            "**`pad_center(s: String, width: i64, pad_char: String) -> String`** — Center Alignment (`std/fmt`).\n\n\
+             Centers string by evenly distributing padding characters on both sides until reaching specified width.",
+        ),
+        "CsvTable" => Some(
+            "**`CsvTable`** — In-Memory Tabular Data Structure (`std/csv`).\n\n\
+             Represents structured tabular data with named headers and rows.",
+        ),
+        "CsvRow" => Some(
+            "**`CsvRow`** — Tabular Row Representation (`std/csv`).\n\n\
+             Represents an ordered list of string cell values in a CSV record.",
+        ),
+        "csv_decode" => Some(
+            "**`csv_decode(src: String, has_headers: bool, delimiter: String) -> CsvTable`** — RFC 4180 CSV Decoder (`std/csv`).\n\n\
+             Parses structured CSV or TSV source text with quote escaping and multi-line field support into a `CsvTable`.",
+        ),
+        "csv_encode" => Some(
+            "**`csv_encode(table: CsvTable, delimiter: String) -> String`** — RFC 4180 CSV Encoder (`std/csv`).\n\n\
+             Serializes a `CsvTable` into standard RFC 4180 compliant CSV format with automatic quote wrapping.",
+        ),
+        "csv_table_get_value" => Some(
+            "**`csv_table_get_value(table: CsvTable, row_idx: i64, col_name: String) -> String`** — Column Lookup (`std/csv`).\n\n\
+             Retrieves cell string value by 0-based row index and header column name.",
+        ),
         _ => None,
     };
 
