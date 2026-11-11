@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -78,6 +78,141 @@ pub struct FileMetadata {
     pub readonly: bool,
 }
 
+#[derive(Debug, Clone)]
+enum VirtualNode {
+    File { data: Vec<u8>, readonly: bool },
+    Dir,
+}
+
+type VirtualNodeMap = Arc<RwLock<BTreeMap<PathBuf, VirtualNode>>>;
+
+/// In-memory stream handle for virtual filesystem files.
+#[derive(Debug)]
+pub struct VirtualStreamHandle {
+    stream: crate::io::MemoryStream,
+    nodes: Option<(VirtualNodeMap, PathBuf)>,
+    writable: bool,
+}
+
+impl VirtualStreamHandle {
+    fn commit_to_fs(&self) -> io::Result<()> {
+        if let Some((ref nodes_lock, ref norm)) = self.nodes {
+            if self.writable {
+                let mut nodes = nodes_lock.write().unwrap();
+                if let Some(VirtualNode::File { readonly: true, .. }) = nodes.get(norm) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("Virtual file is read-only: {}", norm.display()),
+                    ));
+                }
+                nodes.insert(
+                    norm.clone(),
+                    VirtualNode::File {
+                        data: self.stream.as_bytes().to_vec(),
+                        readonly: false,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Read for VirtualStreamHandle {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(buf)
+    }
+}
+
+impl Write for VirtualStreamHandle {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.writable {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Stream is not open for writing",
+            ));
+        }
+        let written = self.stream.write(buf)?;
+        self.commit_to_fs()?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.commit_to_fs()
+    }
+}
+
+impl Seek for VirtualStreamHandle {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        Seek::seek(&mut self.stream, pos)
+    }
+}
+
+/// An open stream handle backed by host OS file or virtual sandboxed memory buffer.
+#[derive(Debug)]
+pub enum FileStream {
+    Posix(fs::File),
+    Virtual(VirtualStreamHandle),
+}
+
+impl Read for FileStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Posix(f) => f.read(buf),
+            Self::Virtual(v) => v.read(buf),
+        }
+    }
+}
+
+impl Write for FileStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Posix(f) => f.write(buf),
+            Self::Virtual(v) => v.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Posix(f) => f.flush(),
+            Self::Virtual(v) => v.flush(),
+        }
+    }
+}
+
+impl Seek for FileStream {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::Posix(f) => f.seek(pos),
+            Self::Virtual(v) => v.seek(pos),
+        }
+    }
+}
+
+impl FileStream {
+    /// Read entire stream into a String.
+    pub fn read_to_string(&mut self) -> io::Result<String> {
+        let mut s = String::new();
+        Read::read_to_string(self, &mut s)?;
+        Ok(s)
+    }
+
+    /// Read entire stream into a byte vector.
+    pub fn read_to_end(&mut self) -> io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        Read::read_to_end(self, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Flush buffers and synchronize data to underlying storage.
+    pub fn sync_all(&mut self) -> io::Result<()> {
+        match self {
+            Self::Posix(f) => f.sync_all(),
+            Self::Virtual(v) => v.commit_to_fs(),
+        }
+    }
+}
+
 /// Abstract filesystem trait supporting multiple targets (POSIX, WASI, Virtual).
 pub trait FileSystem: Send + Sync {
     /// Target execution environment kind.
@@ -139,6 +274,15 @@ pub trait FileSystem: Send + Sync {
 
     /// Recursively walk a directory tree in deterministic order.
     fn walk_dir(&self, root: &Path) -> io::Result<Vec<PathBuf>>;
+
+    /// Open a file for reading as a stream.
+    fn open_read(&self, path: &Path) -> io::Result<FileStream>;
+
+    /// Open or create a file for writing as a stream, truncating existing contents.
+    fn open_write(&self, path: &Path) -> io::Result<FileStream>;
+
+    /// Open or create a file for appending as a stream.
+    fn open_append(&self, path: &Path) -> io::Result<FileStream>;
 }
 
 /// Normalizes any path by resolving `.` and `..` components cleanly without OS syscalls.
@@ -311,6 +455,21 @@ impl FileSystem for PosixFs {
         results.sort();
         Ok(results)
     }
+
+    fn open_read(&self, path: &Path) -> io::Result<FileStream> {
+        let file = fs::File::open(path)?;
+        Ok(FileStream::Posix(file))
+    }
+
+    fn open_write(&self, path: &Path) -> io::Result<FileStream> {
+        let file = fs::File::create(path)?;
+        Ok(FileStream::Posix(file))
+    }
+
+    fn open_append(&self, path: &Path) -> io::Result<FileStream> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(FileStream::Posix(file))
+    }
 }
 
 fn walk_dir_internal(dir: &Path, acc: &mut Vec<PathBuf>) -> io::Result<()> {
@@ -337,16 +496,10 @@ fn walk_dir_internal(dir: &Path, acc: &mut Vec<PathBuf>) -> io::Result<()> {
 // Virtual In-Memory Driver
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-enum VirtualNode {
-    File { data: Vec<u8>, readonly: bool },
-    Dir,
-}
-
 /// In-memory deterministic virtual filesystem.
 #[derive(Debug)]
 pub struct VirtualFs {
-    nodes: RwLock<BTreeMap<PathBuf, VirtualNode>>,
+    nodes: VirtualNodeMap,
 }
 
 impl Default for VirtualFs {
@@ -360,7 +513,7 @@ impl VirtualFs {
         let mut map = BTreeMap::new();
         map.insert(PathBuf::from("/"), VirtualNode::Dir);
         Self {
-            nodes: RwLock::new(map),
+            nodes: Arc::new(RwLock::new(map)),
         }
     }
 
@@ -767,6 +920,117 @@ impl FileSystem for VirtualFs {
         }
         results.sort();
         Ok(results)
+    }
+
+    fn open_read(&self, path: &Path) -> io::Result<FileStream> {
+        let norm = normalize_virtual_path(path);
+        let nodes = self.nodes.read().unwrap();
+        match nodes.get(&norm) {
+            Some(VirtualNode::File { data, .. }) => {
+                let handle = VirtualStreamHandle {
+                    stream: crate::io::MemoryStream::from_bytes(data),
+                    nodes: None,
+                    writable: false,
+                };
+                Ok(FileStream::Virtual(handle))
+            }
+            Some(VirtualNode::Dir) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Is a directory: {}", path.display()),
+            )),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("File not found: {}", path.display()),
+            )),
+        }
+    }
+
+    fn open_write(&self, path: &Path) -> io::Result<FileStream> {
+        let norm = normalize_virtual_path(path);
+        let parent = norm.parent().unwrap_or_else(|| Path::new("/"));
+        {
+            let mut nodes = self.nodes.write().unwrap();
+            if !nodes.contains_key(parent) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Parent directory does not exist: {}", parent.display()),
+                ));
+            }
+            if let Some(VirtualNode::Dir) = nodes.get(&norm) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("Path is already a directory: {}", norm.display()),
+                ));
+            }
+            if let Some(VirtualNode::File { readonly: true, .. }) = nodes.get(&norm) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("File is read-only: {}", norm.display()),
+                ));
+            }
+            nodes.insert(
+                norm.clone(),
+                VirtualNode::File {
+                    data: Vec::new(),
+                    readonly: false,
+                },
+            );
+        }
+        let handle = VirtualStreamHandle {
+            stream: crate::io::MemoryStream::new(),
+            nodes: Some((Arc::clone(&self.nodes), norm)),
+            writable: true,
+        };
+        Ok(FileStream::Virtual(handle))
+    }
+
+    fn open_append(&self, path: &Path) -> io::Result<FileStream> {
+        let norm = normalize_virtual_path(path);
+        let parent = norm.parent().unwrap_or_else(|| Path::new("/"));
+        let existing = {
+            let mut nodes = self.nodes.write().unwrap();
+            if !nodes.contains_key(parent) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Parent directory does not exist: {}", parent.display()),
+                ));
+            }
+            if let Some(VirtualNode::Dir) = nodes.get(&norm) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("Path is already a directory: {}", norm.display()),
+                ));
+            }
+            if let Some(VirtualNode::File { readonly: true, .. }) = nodes.get(&norm) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("File is read-only: {}", norm.display()),
+                ));
+            }
+            match nodes.get(&norm) {
+                Some(VirtualNode::File { data, .. }) => data.clone(),
+                Some(VirtualNode::Dir) => unreachable!(),
+                None => {
+                    nodes.insert(
+                        norm.clone(),
+                        VirtualNode::File {
+                            data: Vec::new(),
+                            readonly: false,
+                        },
+                    );
+                    Vec::new()
+                }
+            }
+        };
+        let len = existing.len();
+        let mut stream = crate::io::MemoryStream::from_bytes(&existing);
+        stream.set_position(len);
+        let handle = VirtualStreamHandle {
+            stream,
+            nodes: Some((Arc::clone(&self.nodes), norm)),
+            writable: true,
+        };
+        Ok(FileStream::Virtual(handle))
     }
 }
 
@@ -1243,6 +1507,66 @@ impl FileSystem for WasiFs {
             self.virtual_fs.walk_dir(&norm)
         }
     }
+
+    fn open_read(&self, path: &Path) -> io::Result<FileStream> {
+        let (norm, rights, host_opt) = self.resolve_capability(path)?;
+        if !rights.read {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "WASI capability error: read not permitted on {}",
+                    path.display()
+                ),
+            ));
+        }
+        if let Some(host_path) = host_opt {
+            let file = fs::File::open(host_path)?;
+            Ok(FileStream::Posix(file))
+        } else {
+            self.virtual_fs.open_read(&norm)
+        }
+    }
+
+    fn open_write(&self, path: &Path) -> io::Result<FileStream> {
+        let (norm, rights, host_opt) = self.resolve_capability(path)?;
+        if !rights.write {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "WASI capability error: write not permitted on {}",
+                    path.display()
+                ),
+            ));
+        }
+        if let Some(host_path) = host_opt {
+            let file = fs::File::create(host_path)?;
+            Ok(FileStream::Posix(file))
+        } else {
+            self.virtual_fs.open_write(&norm)
+        }
+    }
+
+    fn open_append(&self, path: &Path) -> io::Result<FileStream> {
+        let (norm, rights, host_opt) = self.resolve_capability(path)?;
+        if !rights.write {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "WASI capability error: write not permitted on {}",
+                    path.display()
+                ),
+            ));
+        }
+        if let Some(host_path) = host_opt {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(host_path)?;
+            Ok(FileStream::Posix(file))
+        } else {
+            self.virtual_fs.open_append(&norm)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1323,6 +1647,21 @@ where
 // ---------------------------------------------------------------------------
 // Public Transparent Convenience API
 // ---------------------------------------------------------------------------
+
+/// Open a file for reading as a stream via the active target filesystem.
+pub fn open_read<P: AsRef<Path>>(path: P) -> io::Result<FileStream> {
+    current_fs().open_read(path.as_ref())
+}
+
+/// Open or create a file for writing as a stream via the active target filesystem.
+pub fn open_write<P: AsRef<Path>>(path: P) -> io::Result<FileStream> {
+    current_fs().open_write(path.as_ref())
+}
+
+/// Open or create a file for appending as a stream via the active target filesystem.
+pub fn open_append<P: AsRef<Path>>(path: P) -> io::Result<FileStream> {
+    current_fs().open_append(path.as_ref())
+}
 
 /// Read an entire file into a UTF-8 String via the active target filesystem.
 pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {

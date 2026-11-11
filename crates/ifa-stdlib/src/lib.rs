@@ -30,13 +30,14 @@ pub use fs::{
     append as fs_append, copy as fs_copy, create_dir as fs_create_dir,
     create_dir_all as fs_create_dir_all, current_fs, current_target_kind, exists as fs_exists,
     file_size as fs_file_size, is_dir as fs_is_dir, is_file as fs_is_file, list_dir as fs_list_dir,
-    metadata as fs_metadata, normalize_path, read as fs_read, read_to_string as fs_read_to_string,
-    remove_dir as fs_remove_dir, remove_dir_all as fs_remove_dir_all,
-    remove_file as fs_remove_file, rename as fs_rename, reset_global_fs, set_global_fs,
-    walk_dir as fs_walk_dir, walk_dir_files as fs_walk_dir_files,
+    metadata as fs_metadata, normalize_path, open_append as fs_open_append,
+    open_read as fs_open_read, open_write as fs_open_write, read as fs_read,
+    read_to_string as fs_read_to_string, remove_dir as fs_remove_dir,
+    remove_dir_all as fs_remove_dir_all, remove_file as fs_remove_file, rename as fs_rename,
+    reset_global_fs, set_global_fs, walk_dir as fs_walk_dir, walk_dir_files as fs_walk_dir_files,
     walk_dir_matching as fs_walk_dir_matching, with_target_fs, write as fs_write,
-    write_string as fs_write_string, FileMetadata, FileSystem, PosixFs, TargetKind, VirtualFs,
-    WasiFs, WasiFsBuilder, WasiPreopen, WasiRights,
+    write_string as fs_write_string, FileMetadata, FileStream, FileSystem, PosixFs, TargetKind,
+    VirtualFs, WasiFs, WasiFsBuilder, WasiPreopen, WasiRights,
 };
 pub use http::{
     compute_etag, cors_middleware, csrf_protection_middleware, encode_basic_auth,
@@ -51,7 +52,10 @@ pub use http::{
     HttpSession, HttpStatus, LoadBalancingStrategy, MultipartBuilder, MultipartPart,
     PooledConnection, RouteSegment, SameSite, SessionStore, SseEvent, UpstreamBackend,
 };
-pub use io::{BufferedReader, BufferedWriter, MemoryStream};
+pub use io::{
+    copy_stream, pipe_lines, read_to_end as io_read_to_end, read_to_string as io_read_to_string,
+    BufferedReader, BufferedWriter, MemoryStream,
+};
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};
 pub use json::{
     decode as decode_json, encode as encode_json, encode_pretty as encode_json_pretty, JsonValue,
@@ -420,15 +424,38 @@ mod tests {
 
     #[test]
     fn test_io_buffered_and_memory_stream() {
-        // Test memory stream
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        // Test memory stream inherent methods
         let mut mem = MemoryStream::new();
         assert!(mem.is_empty());
         mem.write_bytes(b"IFA Memory Stream Data");
         assert_eq!(mem.len(), 22);
 
-        mem.seek(4);
+        mem.set_position(4);
         let read_slice = mem.read_bytes(6);
         assert_eq!(read_slice, b"Memory");
+
+        mem.seek(SeekFrom::Start(4)).unwrap();
+        let read_slice2 = mem.read_bytes(6);
+        assert_eq!(read_slice2, b"Memory");
+
+        // Test std::io::Read, Write, Seek implementations on MemoryStream
+        let mut io_mem = MemoryStream::from_bytes(b"First line\nSecond line\nThird line\n");
+        let mut buf_reader = BufferedReader::new(&mut io_mem);
+        let first = buf_reader.read_line().unwrap().unwrap();
+        assert_eq!(first, "First line");
+
+        // Test std::io::Write & Seek on MemoryStream
+        let mut writable_mem = MemoryStream::new();
+        writable_mem.write_all(b"Stream Start: ").unwrap();
+        writable_mem.write_all(b"Payload Data").unwrap();
+        assert_eq!(writable_mem.as_bytes(), b"Stream Start: Payload Data");
+
+        writable_mem.seek(SeekFrom::Start(7)).unwrap();
+        let mut read_buf = [0u8; 5];
+        writable_mem.read_exact(&mut read_buf).unwrap();
+        assert_eq!(&read_buf, b"Start");
 
         // Test buffered reader
         let cursor = std::io::Cursor::new(b"line 1\nline 2\r\nline 3");
@@ -445,6 +472,136 @@ mod tests {
             writer.flush().unwrap();
         }
         assert_eq!(sink, b"Alpha\nBeta\n");
+
+        // Test pipe_lines and copy_stream
+        let input_stream = MemoryStream::from_bytes(b"Row 1\nRow 2\nRow 3\n");
+        let mut piped_reader = BufferedReader::new(input_stream);
+        let mut output_buf = Vec::new();
+        {
+            let mut piped_writer = BufferedWriter::new(&mut output_buf);
+            let count = pipe_lines(&mut piped_reader, &mut piped_writer).unwrap();
+            assert_eq!(count, 3);
+        }
+        assert_eq!(output_buf, b"Row 1\nRow 2\nRow 3\n");
+
+        let mut src = MemoryStream::from_bytes(b"Transfer Bytes");
+        let mut dst = MemoryStream::new();
+        let transferred = copy_stream(&mut src, &mut dst).unwrap();
+        assert_eq!(transferred, 14);
+        assert_eq!(dst.as_bytes(), b"Transfer Bytes");
+    }
+
+    #[test]
+    fn test_multitarget_streaming_and_capabilities() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        // 1. VirtualFs streaming
+        let vfs = VirtualFs::new();
+        {
+            let mut stream = vfs.open_write(std::path::Path::new("/stream.txt")).unwrap();
+            stream.write_all(b"Header\n").unwrap();
+            stream.write_all(b"Body line 1\n").unwrap();
+            stream.flush().unwrap();
+        }
+        // Verify immediate persistence in VirtualFs
+        assert_eq!(
+            vfs.read_to_string(std::path::Path::new("/stream.txt"))
+                .unwrap(),
+            "Header\nBody line 1\n"
+        );
+
+        // Append to stream
+        {
+            let mut append_stream = vfs
+                .open_append(std::path::Path::new("/stream.txt"))
+                .unwrap();
+            append_stream.write_all(b"Footer\n").unwrap();
+            append_stream.flush().unwrap();
+        }
+
+        // Read through FileStream with Seek
+        {
+            let mut read_stream = vfs.open_read(std::path::Path::new("/stream.txt")).unwrap();
+            let full_str = read_stream.read_to_string().unwrap();
+            assert_eq!(full_str, "Header\nBody line 1\nFooter\n");
+
+            // Seek back to start
+            read_stream.seek(SeekFrom::Start(0)).unwrap();
+            let mut initial_bytes = [0u8; 6];
+            read_stream.read_exact(&mut initial_bytes).unwrap();
+            assert_eq!(&initial_bytes, b"Header");
+        }
+
+        // 2. WASI capability enforcement on streams
+        let wasi = WasiFs::builder()
+            .preopen(
+                "/sandbox",
+                None,
+                WasiRights {
+                    read: true,
+                    write: true,
+                    create: true,
+                    delete: true,
+                    list: true,
+                    traverse: true,
+                },
+            )
+            .preopen(
+                "/etc/config",
+                None,
+                WasiRights {
+                    read: true,
+                    write: false,
+                    create: false,
+                    delete: false,
+                    list: true,
+                    traverse: true,
+                },
+            )
+            .build();
+
+        // Write to read-only preopen must be denied
+        let denied = wasi.open_write(std::path::Path::new("/etc/config/secret.key"));
+        assert!(denied.is_err());
+        assert_eq!(
+            denied.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        // Path outside preopened mounts must be denied
+        let jailbreak = wasi.open_read(std::path::Path::new("/root/.ssh/id_rsa"));
+        assert!(jailbreak.is_err());
+
+        // Write inside /sandbox must succeed
+        {
+            let mut writer = wasi
+                .open_write(std::path::Path::new("/sandbox/app.log"))
+                .unwrap();
+            writer.write_all(b"Service started at 12:00").unwrap();
+            writer.flush().unwrap();
+        }
+
+        // Read inside /sandbox must succeed
+        {
+            let mut reader = wasi
+                .open_read(std::path::Path::new("/sandbox/app.log"))
+                .unwrap();
+            let content = reader.read_to_string().unwrap();
+            assert_eq!(content, "Service started at 12:00");
+        }
+
+        // 3. Transparent scoped filesystem streaming
+        with_target_fs(std::sync::Arc::new(vfs), || {
+            let mut stream = fs_open_write("/transparent.txt").unwrap();
+            stream.write_all(b"Transparent Stream Content").unwrap();
+            stream.flush().unwrap();
+
+            let mut reader = fs_open_read("/transparent.txt").unwrap();
+            assert_eq!(
+                reader.read_to_string().unwrap(),
+                "Transparent Stream Content"
+            );
+        });
     }
 
     #[test]

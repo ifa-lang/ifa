@@ -1,6 +1,6 @@
 //! Stream I/O primitives and buffered reader/writer utilities (`std::io`).
 
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
 /// Print a message to standard output followed by a newline.
 pub fn println(msg: &str) {
@@ -137,13 +137,45 @@ impl MemoryStream {
         }
     }
 
+    /// Create an in-memory stream with preallocated capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(capacity),
+            position: 0,
+        }
+    }
+
+    /// Clear all data and reset position to 0.
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+        self.position = 0;
+    }
+
+    /// Truncate internal buffer to `size` bytes.
+    pub fn truncate(&mut self, size: usize) {
+        self.buffer.truncate(size);
+        if self.position > self.buffer.len() {
+            self.position = self.buffer.len();
+        }
+    }
+
+    /// Allocated capacity of internal buffer.
+    pub fn capacity(&self) -> usize {
+        self.buffer.capacity()
+    }
+
+    /// Reserve capacity for at least `additional` more bytes.
+    pub fn reserve(&mut self, additional: usize) {
+        self.buffer.reserve(additional);
+    }
+
     /// Current cursor position.
     pub fn position(&self) -> usize {
         self.position
     }
 
     /// Set cursor position.
-    pub fn seek(&mut self, pos: usize) {
+    pub fn set_position(&mut self, pos: usize) {
         self.position = pos.min(self.buffer.len());
     }
 
@@ -186,4 +218,96 @@ impl MemoryStream {
         self.buffer[self.position..self.position + bytes.len()].copy_from_slice(bytes);
         self.position += bytes.len();
     }
+}
+
+impl Read for MemoryStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.position >= self.buffer.len() {
+            return Ok(0);
+        }
+        let available = self.buffer.len() - self.position;
+        let amt = available.min(buf.len());
+        buf[..amt].copy_from_slice(&self.buffer[self.position..self.position + amt]);
+        self.position += amt;
+        Ok(amt)
+    }
+}
+
+impl Write for MemoryStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_bytes(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for MemoryStream {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(offset) => offset as i128,
+            SeekFrom::End(offset) => self.buffer.len() as i128 + offset as i128,
+            SeekFrom::Current(offset) => self.position as i128 + offset as i128,
+        };
+        if new_pos < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Seek before start of stream",
+            ));
+        }
+        self.position = (new_pos as usize).min(self.buffer.len());
+        Ok(self.position as u64)
+    }
+}
+
+impl BufRead for MemoryStream {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.position >= self.buffer.len() {
+            Ok(&[])
+        } else {
+            Ok(&self.buffer[self.position..])
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.position = (self.position + amt).min(self.buffer.len());
+    }
+}
+
+/// Copy all bytes from reader to writer using an efficient internal buffer.
+pub fn copy_stream<R: ?Sized + Read, W: ?Sized + Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> io::Result<u64> {
+    io::copy(reader, writer)
+}
+
+/// Read all bytes from a reader into a string.
+pub fn read_to_string<R: Read>(mut reader: R) -> io::Result<String> {
+    let mut s = String::new();
+    reader.read_to_string(&mut s)?;
+    Ok(s)
+}
+
+/// Read all bytes from a reader into a vector.
+pub fn read_to_end<R: Read>(mut reader: R) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Pipe lines from a buffered reader into a buffered writer.
+pub fn pipe_lines<R: Read, W: Write>(
+    reader: &mut BufferedReader<R>,
+    writer: &mut BufferedWriter<W>,
+) -> io::Result<usize> {
+    let mut count = 0;
+    while let Some(line) = reader.read_line()? {
+        writer.write_line(&line)?;
+        count += 1;
+    }
+    writer.flush()?;
+    Ok(count)
 }
