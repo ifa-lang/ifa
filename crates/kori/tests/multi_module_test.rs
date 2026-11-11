@@ -425,8 +425,7 @@ pub fn main() {
 
 #[test]
 fn test_multi_module_orchestrator_check() {
-    let temp_dir =
-        std::env::temp_dir().join(format!("kori_check_test_{}", std::process::id()));
+    let temp_dir = std::env::temp_dir().join(format!("kori_check_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(temp_dir.join("src/domain")).unwrap();
 
@@ -482,7 +481,10 @@ pub fn create_user(id: i64) -> i64 {
     fs::write(temp_dir.join("src/domain/user.ifa"), bad_domain_src).unwrap();
 
     let bad_check = orchestrator.check();
-    assert!(bad_check.is_err(), "Check must fail when submodule has errors");
+    assert!(
+        bad_check.is_err(),
+        "Check must fail when submodule has errors"
+    );
     let err_msg = format!("{:?}", bad_check.err().unwrap());
     assert!(
         err_msg.contains("Type mismatch") || err_msg.contains("E0002") || err_msg.contains("type"),
