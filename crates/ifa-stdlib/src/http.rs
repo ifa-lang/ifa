@@ -114,9 +114,231 @@ impl HttpHeaders {
         self.headers.contains_key(&key.to_ascii_lowercase())
     }
 
+    pub fn remove(&mut self, key: &str) -> Option<String> {
+        self.headers.remove(&key.to_ascii_lowercase())
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
         self.headers.iter()
     }
+}
+
+/// Standard HTTP Content-Encoding types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentEncoding {
+    Identity,
+    Gzip,
+    Deflate,
+    Other(String),
+}
+
+impl ContentEncoding {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ContentEncoding::Identity => "identity",
+            ContentEncoding::Gzip => "gzip",
+            ContentEncoding::Deflate => "deflate",
+            ContentEncoding::Other(s) => s.as_str(),
+        }
+    }
+
+    pub fn from_header(val: &str) -> Self {
+        let lower = val.to_ascii_lowercase();
+        if lower.contains("gzip") {
+            ContentEncoding::Gzip
+        } else if lower.contains("deflate") {
+            ContentEncoding::Deflate
+        } else if lower.contains("identity") || lower.trim().is_empty() {
+            ContentEncoding::Identity
+        } else {
+            ContentEncoding::Other(val.trim().to_string())
+        }
+    }
+}
+
+/// Compute standard IEEE 802.3 CRC32 checksum.
+pub fn http_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+/// Compress arbitrary byte payload into RFC 1951 Deflate non-compressed blocks (BTYPE 00).
+pub fn compress_deflate(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    if data.is_empty() {
+        out.push(1); // BFINAL=1, BTYPE=00
+        out.extend_from_slice(&[0, 0, 255, 255]);
+        return out;
+    }
+    let total_len = data.len();
+    let mut pos = 0;
+    while pos < total_len {
+        let mut chunk_len = total_len - pos;
+        if chunk_len > 32768 {
+            chunk_len = 32768;
+        }
+        let is_final: u8 = if pos + chunk_len >= total_len { 1 } else { 0 };
+        out.push(is_final);
+        out.push((chunk_len & 0xFF) as u8);
+        out.push(((chunk_len >> 8) & 0xFF) as u8);
+        let nlen = (65535 - chunk_len) as u16;
+        out.push((nlen & 0xFF) as u8);
+        out.push(((nlen >> 8) & 0xFF) as u8);
+        out.extend_from_slice(&data[pos..pos + chunk_len]);
+        pos += chunk_len;
+    }
+    out
+}
+
+/// Decompress an RFC 1951 Deflate byte stream containing uncompressed blocks.
+pub fn decompress_deflate(compressed: &[u8]) -> Result<Vec<u8>, String> {
+    if compressed.is_empty() {
+        return Err("Deflate stream is empty".to_string());
+    }
+    let mut out = Vec::new();
+    let comp_len = compressed.len();
+    let mut pos = 0;
+    let mut finished = false;
+    while pos < comp_len {
+        let header = compressed[pos];
+        pos += 1;
+        let is_final = header & 1;
+        let btype = (header >> 1) & 3;
+        if btype == 0 {
+            if pos + 4 > comp_len {
+                return Err("Incomplete uncompressed deflate block header".to_string());
+            }
+            let len = (compressed[pos] as u16) | ((compressed[pos + 1] as u16) << 8);
+            pos += 2;
+            let nlen = (compressed[pos] as u16) | ((compressed[pos + 1] as u16) << 8);
+            pos += 2;
+            if (len ^ nlen) != 0xFFFF {
+                return Err("Corrupted uncompressed block length integrity".to_string());
+            }
+            let block_len = len as usize;
+            if pos + block_len > comp_len {
+                return Err("Deflate block data truncated".to_string());
+            }
+            out.extend_from_slice(&compressed[pos..pos + block_len]);
+            pos += block_len;
+            if is_final == 1 {
+                finished = true;
+                break;
+            }
+        } else {
+            return Err(format!(
+                "Unsupported deflate compression block type: {}",
+                btype
+            ));
+        }
+    }
+    if !finished {
+        return Err("Deflate stream truncated: no final block encountered".to_string());
+    }
+    Ok(out)
+}
+
+/// Compress arbitrary byte payload into RFC 1952 Gzip format.
+pub fn compress_gzip(data: &[u8]) -> Vec<u8> {
+    // 10-byte Gzip Header (RFC 1952): ID1, ID2, CM, FLG, MTIME (4B), XFL, OS
+    let mut out = vec![0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 255];
+
+    // Deflate payload
+    let deflated = compress_deflate(data);
+    out.extend_from_slice(&deflated);
+
+    // 8-byte Trailer: CRC32 (4 bytes LE) + ISIZE (4 bytes LE)
+    let crc = http_crc32(data);
+    out.extend_from_slice(&crc.to_le_bytes());
+
+    let isize = (data.len() & 0xFFFF_FFFF) as u32;
+    out.extend_from_slice(&isize.to_le_bytes());
+
+    out
+}
+
+/// Decompress RFC 1952 Gzip byte payload, validating headers, CRC32 checksum and uncompressed size.
+pub fn decompress_gzip(gz: &[u8]) -> Result<Vec<u8>, String> {
+    let gz_len = gz.len();
+    if gz_len < 18 {
+        return Err("Gzip payload too short (minimum 18 bytes required)".to_string());
+    }
+    if gz[0] != 0x1F || gz[1] != 0x8B || gz[2] != 8 {
+        return Err("Invalid Gzip magic numbers or unsupported compression method".to_string());
+    }
+    let flg = gz[3];
+    let mut pos = 10;
+    // FEXTRA
+    if (flg & 4) != 0 {
+        if pos + 2 > gz_len {
+            return Err("Incomplete FEXTRA header in gzip".to_string());
+        }
+        let xlen = (gz[pos] as usize) | ((gz[pos + 1] as usize) << 8);
+        pos += 2 + xlen;
+    }
+    // FNAME
+    if (flg & 8) != 0 {
+        while pos < gz_len && gz[pos] != 0 {
+            pos += 1;
+        }
+        pos += 1;
+    }
+    // FCOMMENT
+    if (flg & 16) != 0 {
+        while pos < gz_len && gz[pos] != 0 {
+            pos += 1;
+        }
+        pos += 1;
+    }
+    // FHCRC
+    if (flg & 2) != 0 {
+        pos += 2;
+    }
+    if pos >= gz_len.saturating_sub(8) {
+        return Err("Truncated gzip payload: missing deflate stream and trailer".to_string());
+    }
+    let payload_end = gz_len - 8;
+    let decompressed = decompress_deflate(&gz[pos..payload_end])?;
+
+    let expected_crc = u32::from_le_bytes([
+        gz[gz_len - 8],
+        gz[gz_len - 7],
+        gz[gz_len - 6],
+        gz[gz_len - 5],
+    ]);
+    let actual_crc = http_crc32(&decompressed);
+    if expected_crc != actual_crc {
+        return Err(format!(
+            "Gzip CRC32 checksum mismatch: expected {:#010X}, computed {:#010X}",
+            expected_crc, actual_crc
+        ));
+    }
+
+    let expected_isize = u32::from_le_bytes([
+        gz[gz_len - 4],
+        gz[gz_len - 3],
+        gz[gz_len - 2],
+        gz[gz_len - 1],
+    ]);
+    let actual_isize = (decompressed.len() & 0xFFFF_FFFF) as u32;
+    if expected_isize != actual_isize {
+        return Err(format!(
+            "Gzip ISIZE mismatch: expected {}, got {}",
+            expected_isize, actual_isize
+        ));
+    }
+
+    Ok(decompressed)
 }
 
 /// Incoming or outgoing HTTP Request message.
@@ -168,6 +390,48 @@ impl HttpRequest {
         self.headers.set("Content-Length", s.len().to_string());
         self.body = s.into_bytes();
         self
+    }
+
+    /// Check whether the client accepts a specific content encoding (e.g. "gzip", "deflate").
+    pub fn accepts_encoding(&self, encoding: &str) -> bool {
+        if let Some(val) = self.headers.get("accept-encoding") {
+            let enc_lower = encoding.to_ascii_lowercase();
+            val.to_ascii_lowercase().split(',').any(|part| {
+                part.trim().split(';').next().map(|s| s.trim()) == Some(enc_lower.as_str())
+            })
+        } else {
+            false
+        }
+    }
+
+    /// Retrieve Content-Encoding of the request payload.
+    pub fn content_encoding(&self) -> ContentEncoding {
+        if let Some(val) = self.headers.get("content-encoding") {
+            ContentEncoding::from_header(val)
+        } else {
+            ContentEncoding::Identity
+        }
+    }
+
+    /// Compress request body using RFC 1952 Gzip and set Content-Encoding header.
+    pub fn gzip(mut self) -> Self {
+        self.body = compress_gzip(&self.body);
+        self.headers.set("Content-Encoding", "gzip");
+        self.headers
+            .set("Content-Length", self.body.len().to_string());
+        self
+    }
+
+    /// Decompress request body based on Content-Encoding header.
+    pub fn decompress_body(&self) -> Result<Vec<u8>, String> {
+        match self.content_encoding() {
+            ContentEncoding::Identity => Ok(self.body.clone()),
+            ContentEncoding::Gzip => decompress_gzip(&self.body),
+            ContentEncoding::Deflate => decompress_deflate(&self.body),
+            ContentEncoding::Other(enc) => {
+                Err(format!("Unsupported request Content-Encoding: {}", enc))
+            }
+        }
     }
 }
 
@@ -370,6 +634,63 @@ impl HttpResponse {
         }
         let expected = crate::crypto::websocket_accept_key(client_key);
         self.websocket_accept_key() == Some(expected.as_str())
+    }
+
+    /// Retrieve Content-Encoding of the response payload.
+    pub fn content_encoding(&self) -> ContentEncoding {
+        if let Some(val) = self.headers.get("content-encoding") {
+            ContentEncoding::from_header(val)
+        } else {
+            ContentEncoding::Identity
+        }
+    }
+
+    /// Compress response body using RFC 1952 Gzip and set Content-Encoding header.
+    pub fn gzip(mut self) -> Self {
+        self.body = compress_gzip(&self.body);
+        self.headers.set("Content-Encoding", "gzip");
+        self.headers
+            .set("Content-Length", self.body.len().to_string());
+        self
+    }
+
+    /// Compress response body using RFC 1951 Deflate and set Content-Encoding header.
+    pub fn deflate(mut self) -> Self {
+        self.body = compress_deflate(&self.body);
+        self.headers.set("Content-Encoding", "deflate");
+        self.headers
+            .set("Content-Length", self.body.len().to_string());
+        self
+    }
+
+    /// Decompress response body according to Content-Encoding header.
+    pub fn decompress_body(&self) -> Result<Vec<u8>, String> {
+        match self.content_encoding() {
+            ContentEncoding::Identity => Ok(self.body.clone()),
+            ContentEncoding::Gzip => decompress_gzip(&self.body),
+            ContentEncoding::Deflate => decompress_deflate(&self.body),
+            ContentEncoding::Other(enc) => {
+                Err(format!("Unsupported response Content-Encoding: {}", enc))
+            }
+        }
+    }
+
+    /// Decompress response body and decode as UTF-8 string.
+    pub fn body_decompressed_str(&self) -> Result<String, String> {
+        let bytes = self.decompress_body()?;
+        String::from_utf8(bytes).map_err(|e| format!("UTF-8 decode error: {}", e))
+    }
+
+    /// Conditionally compress response using Gzip if client accepts gzip encoding and min_bytes threshold is met.
+    pub fn compress_if_accepted(self, req: &HttpRequest, min_bytes: usize) -> Self {
+        if req.accepts_encoding("gzip")
+            && self.body.len() >= min_bytes
+            && !self.headers.has("content-encoding")
+        {
+            self.gzip()
+        } else {
+            self
+        }
     }
 
     /// Parse HTTP Response from raw wire bytes.
@@ -930,6 +1251,7 @@ pub struct HttpServer {
     port: u16,
     router: Arc<HttpRouter>,
     is_running: Arc<AtomicBool>,
+    auto_compress_threshold: Option<usize>,
 }
 
 impl HttpServer {
@@ -939,7 +1261,14 @@ impl HttpServer {
             port,
             router: Arc::new(HttpRouter::new()),
             is_running: Arc::new(AtomicBool::new(false)),
+            auto_compress_threshold: None,
         }
+    }
+
+    /// Enable automatic Gzip compression on responses if client accepts gzip and body >= min_bytes.
+    pub fn with_auto_compression(&mut self, min_bytes: usize) -> &mut Self {
+        self.auto_compress_threshold = Some(min_bytes);
+        self
     }
 
     /// Register a route handler for an HTTP method and path pattern.
@@ -1025,6 +1354,7 @@ impl HttpServer {
 
         let running = Arc::clone(&self.is_running);
         let router = Arc::clone(&self.router);
+        let auto_compress = self.auto_compress_threshold;
 
         GLOBAL_SCHEDULER.spawn(move || {
             while running.load(Ordering::Relaxed) {
@@ -1059,6 +1389,10 @@ impl HttpServer {
                                                     HttpResponse::not_found()
                                                         .text("Route not found")
                                                 };
+
+                                                if let Some(threshold) = auto_compress {
+                                                    res = res.compress_if_accepted(&req, threshold);
+                                                }
 
                                                 if keep_alive {
                                                     res.headers.set("Connection", "keep-alive");
@@ -4046,6 +4380,148 @@ mod tests {
         assert_eq!(report.attempts, 3);
         assert_eq!(report.retries, 2);
         assert!(report.succeeded);
+
+        server.stop();
+    }
+
+    #[test]
+    fn test_http_crc32_standard() {
+        assert_eq!(http_crc32(b""), 0);
+        assert_eq!(http_crc32(b"123456789"), 0xCBF43926);
+    }
+
+    #[test]
+    fn test_compress_decompress_deflate_roundtrip() {
+        // 1. Empty payload
+        let empty_comp = compress_deflate(b"");
+        let empty_decomp =
+            decompress_deflate(&empty_comp).expect("Empty deflate decompress failed");
+        assert_eq!(empty_decomp, b"");
+
+        // 2. Short payload
+        let data = b"Hello, IFA HTTP colorless fibers with deflate compression!";
+        let comp = compress_deflate(data);
+        let decomp = decompress_deflate(&comp).expect("Deflate decompress failed");
+        assert_eq!(decomp, data);
+
+        // 3. Multi-block payload exceeding 32768 chunk boundary (e.g. 70,000 bytes)
+        let mut large = Vec::with_capacity(70000);
+        for i in 0..70000 {
+            large.push((i % 251) as u8);
+        }
+        let comp_large = compress_deflate(&large);
+        let decomp_large = decompress_deflate(&comp_large).expect("Multi-block deflate failed");
+        assert_eq!(decomp_large, large);
+
+        // 4. Corrupted data detection
+        assert!(decompress_deflate(b"").is_err());
+        assert!(decompress_deflate(b"\x00\x05\x00\xFA\xFFbad").is_err());
+    }
+
+    #[test]
+    fn test_compress_decompress_gzip_roundtrip() {
+        // 1. Empty payload
+        let empty_gz = compress_gzip(b"");
+        let empty_decomp = decompress_gzip(&empty_gz).expect("Empty gzip decompress failed");
+        assert_eq!(empty_decomp, b"");
+
+        // 2. Standard text payload
+        let text = b"The quick brown fox jumps over the lazy dog. IFA runtime!";
+        let gz = compress_gzip(text);
+        assert_eq!(gz[0], 0x1F);
+        assert_eq!(gz[1], 0x8B);
+        let decomp = decompress_gzip(&gz).expect("Gzip text decompress failed");
+        assert_eq!(decomp, text);
+
+        // 3. Corrupted CRC32 detection
+        let mut corrupted_crc = gz.clone();
+        let len = corrupted_crc.len();
+        corrupted_crc[len - 8] ^= 0xFF;
+        assert!(decompress_gzip(&corrupted_crc).is_err());
+
+        // 4. Corrupted ISIZE detection
+        let mut corrupted_isize = gz.clone();
+        corrupted_isize[len - 1] ^= 0x01;
+        assert!(decompress_gzip(&corrupted_isize).is_err());
+    }
+
+    #[test]
+    fn test_http_request_response_encoding_helpers() {
+        let req = HttpRequest::new(HttpMethod::Get, "/api/data")
+            .header("Accept-Encoding", "gzip, deflate;q=0.5, br");
+
+        assert!(req.accepts_encoding("gzip"));
+        assert!(req.accepts_encoding("deflate"));
+        assert!(req.accepts_encoding("br"));
+        assert!(!req.accepts_encoding("zstd"));
+
+        let uncompressed = HttpResponse::ok().text("Plain uncompressed body text for testing");
+        assert_eq!(uncompressed.content_encoding(), ContentEncoding::Identity);
+
+        // Test explicit gzip compression
+        let compressed = uncompressed.gzip();
+        assert_eq!(compressed.content_encoding(), ContentEncoding::Gzip);
+        assert_eq!(compressed.headers.get("content-encoding"), Some("gzip"));
+
+        let decompressed_str = compressed
+            .body_decompressed_str()
+            .expect("Decompression failed");
+        assert_eq!(decompressed_str, "Plain uncompressed body text for testing");
+
+        // Test auto compress if accepted threshold
+        let short_resp = HttpResponse::ok().text("short");
+        let not_compressed = short_resp.clone().compress_if_accepted(&req, 64);
+        assert_eq!(not_compressed.content_encoding(), ContentEncoding::Identity);
+
+        let long_text = "A".repeat(128);
+        let long_resp = HttpResponse::ok().text(long_text.clone());
+        let auto_compressed = long_resp.compress_if_accepted(&req, 64);
+        assert_eq!(auto_compressed.content_encoding(), ContentEncoding::Gzip);
+        assert_eq!(auto_compressed.body_decompressed_str().unwrap(), long_text);
+    }
+
+    #[test]
+    fn test_http_server_auto_compression_integration() {
+        let mut server = HttpServer::new(0);
+        server.with_auto_compression(32);
+
+        server.get("/api/article", |_req| {
+            HttpResponse::ok().text("This is an article payload that is long enough to trigger automatic gzip compression in IFA HttpServer.")
+        });
+
+        let bound = server.listen_background().expect("Server listen failed");
+        let port = bound.port();
+        let client = HttpClient::new();
+
+        // 1. Request WITHOUT Accept-Encoding: gzip -> server sends identity (uncompressed)
+        let req_plain = HttpRequest::new(HttpMethod::Get, "/api/article");
+        let resp_plain = client
+            .send(&req_plain, "127.0.0.1", port)
+            .expect("Plain request failed");
+        assert_eq!(resp_plain.status, HttpStatus::OK);
+        assert_eq!(resp_plain.headers.get("content-encoding"), None);
+        assert!(resp_plain
+            .body_str()
+            .unwrap()
+            .starts_with("This is an article"));
+
+        // 2. Request WITH Accept-Encoding: gzip -> server compresses automatically
+        let req_gzip =
+            HttpRequest::new(HttpMethod::Get, "/api/article").header("Accept-Encoding", "gzip");
+        let resp_gzip = client
+            .send(&req_gzip, "127.0.0.1", port)
+            .expect("Gzip request failed");
+        assert_eq!(resp_gzip.status, HttpStatus::OK);
+        assert_eq!(resp_gzip.headers.get("content-encoding"), Some("gzip"));
+
+        // Verify transparent decompression
+        let decompressed_body = resp_gzip
+            .body_decompressed_str()
+            .expect("Decompress response failed");
+        assert_eq!(
+            decompressed_body,
+            "This is an article payload that is long enough to trigger automatic gzip compression in IFA HttpServer."
+        );
 
         server.stop();
     }
