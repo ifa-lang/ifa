@@ -2865,6 +2865,28 @@ pub fn net_bytes_to_string(bytes: List<i64>) -> String {
     return out;
 }
 
+pub fn net_bytes_to_binary_string(bytes: List<i64>) -> String {
+    let len = bytes.len();
+    mut out = "";
+    mut i: i64 = 0;
+    while i < len {
+        out = out + string_from_char(bytes[i] & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn net_binary_string_to_bytes(s: String) -> List<i64> {
+    let len = string_len(s);
+    mut bytes: List<i64> = List::new();
+    mut i: i64 = 0;
+    while i < len {
+        bytes.push(string_char_at(s, i) & 255);
+        i = i + 1;
+    }
+    return bytes;
+}
+
 pub fn deflate_compress_bytes(data: List<i64>) -> List<i64> {
     mut out: List<i64> = List::new();
     let total_len = data.len();
@@ -3136,6 +3158,92 @@ pub fn zlib_compress_string(text: String) -> List<i64> {
 pub fn zlib_decompress_string(z: List<i64>) -> String {
     let bytes = zlib_decompress_bytes(z);
     return net_bytes_to_string(bytes);
+}
+
+// ===========================================================================
+// HTTP Compression & Automatic Server Negotiation (RFC 1952 / RFC 1951)
+// ===========================================================================
+
+pub fn http_header_accepts_encoding(raw_headers_or_req: String, encoding: String) -> bool {
+    let accept = http_get_header(raw_headers_or_req, "Accept-Encoding");
+    if string_len(accept) == 0 {
+        return false;
+    }
+    return string_contains(accept, encoding);
+}
+
+pub fn http_get_content_encoding(raw_headers_or_msg: String) -> String {
+    let enc = http_get_header(raw_headers_or_msg, "Content-Encoding");
+    if string_len(enc) == 0 {
+        return "identity";
+    }
+    return enc;
+}
+
+pub fn http_compress_payload_gzip(body_text: String) -> String {
+    let gz_bytes = gzip_compress_string(body_text);
+    return net_bytes_to_binary_string(gz_bytes);
+}
+
+pub fn http_decompress_payload_gzip(binary_body: String) -> String {
+    let gz_bytes = net_binary_string_to_bytes(binary_body);
+    return gzip_decompress_string(gz_bytes);
+}
+
+pub fn http_compress_payload_deflate(body_text: String) -> String {
+    let def_bytes = deflate_compress_string(body_text);
+    return net_bytes_to_binary_string(def_bytes);
+}
+
+pub fn http_decompress_payload_deflate(binary_body: String) -> String {
+    let def_bytes = net_binary_string_to_bytes(binary_body);
+    return deflate_decompress_string(def_bytes);
+}
+
+pub fn format_http_compressed_response(resp: HttpResponse, req_raw: String, min_compression_len: i64) -> String {
+    let body_len = string_len(resp.body);
+    let accepts_gz = http_header_accepts_encoding(req_raw, "gzip");
+    let accepts_def = http_header_accepts_encoding(req_raw, "deflate");
+
+    mut final_body = resp.body;
+    mut content_encoding = "";
+
+    if body_len >= min_compression_len {
+        if accepts_gz {
+            let gz_bytes = gzip_compress_string(resp.body);
+            final_body = net_bytes_to_binary_string(gz_bytes);
+            content_encoding = "gzip";
+        } else if accepts_def {
+            let def_bytes = deflate_compress_string(resp.body);
+            final_body = net_bytes_to_binary_string(def_bytes);
+            content_encoding = "deflate";
+        }
+    }
+
+    let comp_body_len = string_len(final_body);
+    let len_str = int_to_string(comp_body_len);
+    let code_str = int_to_string(resp.status_code);
+
+    mut res: String = "HTTP/1.1 " + code_str + " " + resp.status_text + "\r\n";
+    res = res + "Content-Type: " + resp.content_type + "\r\n";
+    if string_len(content_encoding) > 0 {
+        res = res + "Content-Encoding: " + content_encoding + "\r\n";
+    }
+    res = res + "Content-Length: " + len_str + "\r\n";
+    res = res + "Connection: close\r\n";
+    res = res + "\r\n";
+    res = res + final_body;
+    return res;
+}
+
+pub fn http_decompress_response_body(resp: HttpResponse, raw_resp: String) -> String {
+    let enc = http_get_content_encoding(raw_resp);
+    if enc == "gzip" {
+        return http_decompress_payload_gzip(resp.body);
+    } else if enc == "deflate" {
+        return http_decompress_payload_deflate(resp.body);
+    }
+    return resp.body;
 }
 
 // ===========================================================================
@@ -5747,6 +5855,113 @@ pub fn test_net_http_reverse_proxy_gateway_and_load_balancer() -> bool {
     return true;
 }
 
+pub fn test_net_http_auto_compression() -> bool {
+    let article_body = "The IFA Programming Language is designed for deterministic high-performance systems with zero GC overhead, colorless async fibers and transparent native HTTP codecs.";
+
+    // 1. Uncompressed / Identity when client does not send Accept-Encoding
+    let req_uncompressed = "GET /api/article HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: IFA/1.0\r\n\r\n";
+    let base_resp = HttpResponse(status_code: 200, status_text: "OK", content_type: "text/plain", body: article_body);
+    let wire_plain = format_http_compressed_response(base_resp, req_uncompressed, 32);
+
+    let parsed_plain = parse_http_response(wire_plain);
+    let enc_plain = http_get_content_encoding(wire_plain);
+    if enc_plain != "identity" {
+        return false;
+    }
+    if parsed_plain.body != article_body {
+        return false;
+    }
+
+    // 2. Gzip compression when client sends Accept-Encoding: gzip, deflate
+    let req_gzip = "GET /api/article HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept-Encoding: gzip, deflate\r\n\r\n";
+    let wire_gzip = format_http_compressed_response(base_resp, req_gzip, 32);
+    let parsed_gzip = parse_http_response(wire_gzip);
+    let enc_gzip = http_get_content_encoding(wire_gzip);
+    if enc_gzip != "gzip" {
+        return false;
+    }
+    let restored_gzip = http_decompress_response_body(parsed_gzip, wire_gzip);
+    if restored_gzip != article_body {
+        return false;
+    }
+
+    // 3. Deflate compression when client sends Accept-Encoding: deflate only
+    let req_deflate = "GET /api/article HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept-Encoding: deflate\r\n\r\n";
+    let wire_def = format_http_compressed_response(base_resp, req_deflate, 32);
+    let parsed_def = parse_http_response(wire_def);
+    let enc_def = http_get_content_encoding(wire_def);
+    if enc_def != "deflate" {
+        return false;
+    }
+    let restored_def = http_decompress_response_body(parsed_def, wire_def);
+    if restored_def != article_body {
+        return false;
+    }
+
+    // 4. Short payload below threshold (min_size = 64) -> not compressed even if Accept-Encoding: gzip
+    let short_resp = HttpResponse(status_code: 200, status_text: "OK", content_type: "text/plain", body: "Hello IFA");
+    let wire_short = format_http_compressed_response(short_resp, req_gzip, 64);
+    let enc_short = http_get_content_encoding(wire_short);
+    if enc_short != "identity" {
+        return false;
+    }
+    let parsed_short = parse_http_response(wire_short);
+    if parsed_short.body != "Hello IFA" {
+        return false;
+    }
+
+    // 5. Integration over loopback TCP socket
+    mut listener = make_tcp_listener(0);
+    if !listener.is_open || listener.port <= 0 {
+        return false;
+    }
+
+    mut client = make_tcp_connect("127.0.0.1", listener.port);
+    if !client.is_open {
+        listener_close(inout listener);
+        return false;
+    }
+
+    mut server = listener_accept(listener);
+    if !server.is_open {
+        stream_close(inout client);
+        listener_close(inout listener);
+        return false;
+    }
+
+    // Client sends Gzip-accepting HTTP request
+    let client_req = "GET /data HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept-Encoding: gzip\r\n\r\n";
+    stream_write(client, client_req);
+
+    let server_raw_req = stream_read(server, 2048);
+    let srv_resp = HttpResponse(status_code: 200, status_text: "OK", content_type: "text/plain", body: article_body);
+    let srv_wire = format_http_compressed_response(srv_resp, server_raw_req, 32);
+    stream_write(server, srv_wire);
+
+    let client_recv_wire = stream_read(client, 65536);
+    let client_resp = parse_http_response(client_recv_wire);
+    let client_enc = http_get_content_encoding(client_recv_wire);
+    if client_enc != "gzip" {
+        stream_close(inout server);
+        stream_close(inout client);
+        listener_close(inout listener);
+        return false;
+    }
+    let client_decompressed = http_decompress_response_body(client_resp, client_recv_wire);
+    if client_decompressed != article_body {
+        stream_close(inout server);
+        stream_close(inout client);
+        listener_close(inout listener);
+        return false;
+    }
+
+    stream_close(inout server);
+    stream_close(inout client);
+    listener_close(inout listener);
+
+    return true;
+}
+
 pub fn test_net_all() -> bool {
     return test_net_tcp_echo()
     && test_net_http_wire()
@@ -5779,7 +5994,8 @@ pub fn test_net_all() -> bool {
     && test_net_http_reverse_proxy_gateway_and_load_balancer()
     && test_net_http_connection_pooling_and_keep_alive()
     && test_net_http_circuit_breaker()
-    && test_net_http_retry_policy();
+    && test_net_http_retry_policy()
+    && test_net_http_auto_compression();
 }
 
 pub fn main() {
@@ -5815,7 +6031,8 @@ pub fn main() {
     let t30 = test_net_http_connection_pooling_and_keep_alive();
     let t31 = test_net_http_circuit_breaker();
     let t32 = test_net_http_retry_policy();
-    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 {
+    let t33 = test_net_http_auto_compression();
+    if t1 && t2 && t3 && t4 && t5 && t6 && t7 && t8 && t9 && t10 && t11 && t12 && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21 && t22 && t23 && t24 && t25 && t26 && t27 && t28 && t29 && t30 && t31 && t32 && t33 {
         println("std/net: ALL TESTS PASSED");
     } else {
         println("std/net: TESTS FAILED");
