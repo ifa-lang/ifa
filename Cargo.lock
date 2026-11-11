@@ -678,6 +678,7 @@ dependencies = [
  "ifa-runtime",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]

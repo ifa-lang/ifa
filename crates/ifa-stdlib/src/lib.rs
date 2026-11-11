@@ -1,6 +1,7 @@
 pub mod collections;
 pub mod crypto;
 pub mod csv;
+pub mod db;
 pub mod fmt;
 pub mod fs;
 pub mod http;
@@ -9,6 +10,7 @@ pub mod iter;
 pub mod json;
 pub mod net;
 pub mod process;
+pub mod simd_parser;
 pub mod sync;
 
 pub use collections::{BinaryHeap, ByteBuffer, Deque, List, Map, Set, StringBuilder};
@@ -19,6 +21,7 @@ pub use crypto::{
     totp_verify, websocket_accept_key, Jwt, JwtClaims, JwtError,
 };
 pub use csv::{decode as decode_csv, encode as encode_csv, CsvTable};
+pub use db::{Database, DbError, Transaction, DB_MAGIC, DB_VERSION, PAGE_SIZE};
 pub use fmt::{
     format_binary, format_float, format_hex, format_octal, pad_center, pad_left, pad_right,
     Alignment, FormatSpecifier,
@@ -59,6 +62,10 @@ pub use net::{
 pub use process::{
     find_best_assembler, find_best_linker, find_system_tool, invoke_assembler, invoke_linker,
     run as process_run, Command as ProcessCommand, ExitStatus as ProcessExitStatus, ProcessOutput,
+};
+pub use simd_parser::{
+    find_byte_vectorized, find_crlf_vectorized, parse_http_request_fast, parse_http_response_fast,
+    FastHttpError, FastHttpRequest, FastHttpResponse, Http2FrameHeader, Http2FrameType,
 };
 pub use sync::{
     bounded, channel, AtomicFlag, AtomicInt, Receiver, RingBuffer, Select, Sender, WaitGroup,

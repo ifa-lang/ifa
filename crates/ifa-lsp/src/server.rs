@@ -277,7 +277,7 @@ impl LanguageServer {
                         )
                     }
                 };
-                let locs = references::handle_references(doc, params);
+                let locs = references::handle_workspace_references(&self.documents, doc, params);
                 (
                     Some(Response::ok(req.id, serde_json::to_value(locs).unwrap())),
                     None,
@@ -332,7 +332,7 @@ impl LanguageServer {
                     Some(d) => d,
                     None => return (Some(Response::ok(req.id, serde_json::Value::Null)), None),
                 };
-                let edit = rename::handle_rename(doc, params);
+                let edit = rename::handle_workspace_rename(&self.documents, doc, params);
                 (
                     Some(Response::ok(
                         req.id,

@@ -587,6 +587,21 @@ pub fn handle_completion(doc: &Document, position: Position) -> CompletionList {
             "comptime fn <name>() -> <ret>",
         ),
         (
+            "comptime assert",
+            "Compile-time invariant validation assertion",
+            "comptime assert(<condition>, <message>);",
+        ),
+        (
+            "size_of",
+            "Compile-time Canonical ABI type byte size",
+            "size_of::<T>()",
+        ),
+        (
+            "align_of",
+            "Compile-time Canonical ABI type alignment",
+            "align_of::<T>()",
+        ),
+        (
             "strict",
             "Deterministic zero-allocation strict mode",
             "strict fn <name>() -> <ret>",

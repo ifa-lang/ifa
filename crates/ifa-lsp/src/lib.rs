@@ -527,6 +527,141 @@ mod tests {
     }
 
     #[test]
+    fn test_lsp_cross_file_workspace_rename_and_references() {
+        let mut server = LanguageServer::new();
+
+        let doc1_code = r#"
+            pub fn shared_calc(x: int) -> int {
+                return x * 10;
+            }
+        "#;
+
+        let doc2_code = r#"
+            pub fn run() -> int {
+                return shared_calc(5);
+            }
+        "#;
+
+        let open_doc1 = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/calc.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": doc1_code
+                }
+            }
+        })
+        .to_string();
+
+        let open_doc2 = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/main.ifa",
+                    "languageId": "ifa",
+                    "version": 1,
+                    "text": doc2_code
+                }
+            }
+        })
+        .to_string();
+
+        server.handle_message(&open_doc1);
+        server.handle_message(&open_doc2);
+
+        // 1. Cross-file references query
+        let ref_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 901,
+            "method": "textDocument/references",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/calc.ifa"
+                },
+                "position": {
+                    "line": 1,
+                    "character": 22
+                },
+                "context": {
+                    "includeDeclaration": true
+                }
+            }
+        })
+        .to_string();
+
+        let (resp_ref, _) = server.handle_message(&ref_req);
+        assert!(resp_ref.is_some());
+        let ref_val: serde_json::Value = serde_json::from_str(&resp_ref.unwrap()).unwrap();
+        let locs = ref_val["result"].as_array().unwrap();
+        let uris: Vec<&str> = locs.iter().filter_map(|l| l["uri"].as_str()).collect();
+        assert!(uris.contains(&"file:///workspace/calc.ifa"));
+        assert!(uris.contains(&"file:///workspace/main.ifa"));
+
+        // 2. Cross-file rename query
+        let rename_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 902,
+            "method": "textDocument/rename",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/calc.ifa"
+                },
+                "position": {
+                    "line": 1,
+                    "character": 22
+                },
+                "newName": "fast_calc"
+            }
+        })
+        .to_string();
+
+        let (resp_rename, _) = server.handle_message(&rename_req);
+        assert!(resp_rename.is_some());
+        let rename_val: serde_json::Value = serde_json::from_str(&resp_rename.unwrap()).unwrap();
+        let changes = &rename_val["result"]["changes"];
+        assert!(changes["file:///workspace/calc.ifa"].is_array());
+        assert!(changes["file:///workspace/main.ifa"].is_array());
+        assert_eq!(
+            changes["file:///workspace/calc.ifa"][0]["newText"],
+            "fast_calc"
+        );
+        assert_eq!(
+            changes["file:///workspace/main.ifa"][0]["newText"],
+            "fast_calc"
+        );
+
+        // 3. Comptime assert completion verification
+        let completion_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 903,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/calc.ifa"
+                },
+                "position": {
+                    "line": 1,
+                    "character": 12
+                }
+            }
+        })
+        .to_string();
+
+        let (resp_comp, _) = server.handle_message(&completion_req);
+        assert!(resp_comp.is_some());
+        let comp_val: serde_json::Value = serde_json::from_str(&resp_comp.unwrap()).unwrap();
+        let items = comp_val["result"]["items"].as_array().unwrap();
+        let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+        assert!(labels.contains(&"comptime assert"));
+        assert!(labels.contains(&"size_of"));
+        assert!(labels.contains(&"align_of"));
+    }
+
+    #[test]
     fn test_lsp_semantic_tokens() {
         let mut server = LanguageServer::new();
         let code = r#"

@@ -11,4 +11,5 @@ description = "Ecosystem Standard Library for IFA: deterministic JSON/CSV encodi
 serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
+thiserror.workspace = true
 ifa-runtime.workspace = true

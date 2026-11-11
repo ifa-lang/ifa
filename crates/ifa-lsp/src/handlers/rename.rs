@@ -1,6 +1,6 @@
 //! Rename and Prepare Rename providers for IFA Language Server.
 
-use crate::document::Document;
+use crate::document::{Document, DocumentStore};
 use crate::protocol::{Position, Range, RenameParams, TextEdit, WorkspaceEdit};
 use ifa_lexer::tokenize;
 use ifa_span::{sym, FileId};
@@ -15,7 +15,7 @@ pub fn handle_prepare_rename(doc: &Document, position: Position) -> Option<Range
     Some(range)
 }
 
-/// Handle `textDocument/rename` request.
+/// Handle `textDocument/rename` request on a single document.
 pub fn handle_rename(doc: &Document, params: RenameParams) -> Option<WorkspaceEdit> {
     let (target_word, _) = doc.word_at_position(params.position)?;
     if is_keyword(target_word) {
@@ -50,6 +50,56 @@ pub fn handle_rename(doc: &Document, params: RenameParams) -> Option<WorkspaceEd
 
     let mut changes = HashMap::new();
     changes.insert(doc.uri.clone(), edits);
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+    })
+}
+
+/// Handle `textDocument/rename` request across the entire workspace.
+pub fn handle_workspace_rename(
+    documents: &DocumentStore,
+    current_doc: &Document,
+    params: RenameParams,
+) -> Option<WorkspaceEdit> {
+    let (target_word, _) = current_doc.word_at_position(params.position)?;
+    if is_keyword(target_word) {
+        return None;
+    }
+
+    let new_name = params.new_name.trim();
+    if !is_valid_ident(new_name) || is_keyword(new_name) {
+        return None;
+    }
+
+    let target_symbol = sym(target_word);
+    let mut changes = HashMap::new();
+
+    for doc in documents.iter() {
+        let file_id = FileId(0);
+        let tokens = tokenize(file_id, &doc.text);
+
+        let mut edits = Vec::new();
+        for tok in tokens {
+            if let ifa_lexer::TokenKind::Ident(s) = tok.kind {
+                if s == target_symbol {
+                    let range = doc.span_to_range(tok.span);
+                    edits.push(TextEdit {
+                        range,
+                        new_text: new_name.to_string(),
+                    });
+                }
+            }
+        }
+
+        if !edits.is_empty() {
+            changes.insert(doc.uri.clone(), edits);
+        }
+    }
+
+    if changes.is_empty() {
+        return None;
+    }
+
     Some(WorkspaceEdit {
         changes: Some(changes),
     })

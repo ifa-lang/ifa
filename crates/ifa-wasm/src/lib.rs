@@ -1,16 +1,27 @@
 pub mod bindings;
 pub mod bundler;
+pub mod component;
 pub mod runner;
 pub mod runtime;
 pub mod validator;
+pub mod wit;
 
 pub use bindings::{TypeScriptBindingsGenerator, WasmExportFunction, WasmType};
 pub use bundler::{WasmBundleResult, WasmBundler};
+pub use component::{
+    CanonLift, ComponentBuilder, ComponentError, ComponentExport, ComponentImport,
+    ComponentInspector, ComponentSectionHeader, ComponentSectionId, StringEncoding,
+    WASM_COMPONENT_MAGIC, WASM_COMPONENT_VERSION,
+};
 pub use runner::{WasmEngine, WasmEngineRunner, WasmExecutionResult, WasmRunnerError};
 pub use runtime::{WasiHostEnvironment, WasmFunctionTable, WasmLinearMemory, WASM_PAGE_SIZE};
 pub use validator::{
     WasmElementSegment, WasmExport, WasmFuncType, WasmModuleInspector, WasmSection, WasmTableDef,
     WasmValidationError,
+};
+pub use wit::{
+    WitField, WitFunction, WitInterface, WitPackage, WitPackageId, WitType, WitVariantCase,
+    WitWorld, WitWorldItem,
 };
 
 #[cfg(test)]
