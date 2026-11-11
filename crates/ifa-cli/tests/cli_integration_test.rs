@@ -524,3 +524,83 @@ fn test_cli_function_pointers_and_thunks_full_pipeline() {
         assert_eq!(exit_code, Some(120), "Standalone binary exit code mismatch");
     }
 }
+
+#[test]
+fn test_cli_wasm_component_and_wit() {
+    let ifa_bin = get_ifa_binary();
+    let temp_dir = std::env::temp_dir().join(format!("ifa_cli_wit_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // 1. Create a minimal valid core wasm file with an export
+    let mut wasm_bytes = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+    let export_payload = [
+        0x01, // 1 export
+        0x03, b'a', b'd', b'd', // name "add"
+        0x00, // kind: func
+        0x00, // func idx: 0
+    ];
+    wasm_bytes.push(0x07);
+    wasm_bytes.push(export_payload.len() as u8);
+    wasm_bytes.extend_from_slice(&export_payload);
+
+    let wasm_file = temp_dir.join("core.wasm");
+    fs::write(&wasm_file, &wasm_bytes).unwrap();
+
+    // 2. Test `ifa wasm component`
+    let comp_file = temp_dir.join("core.component.wasm");
+    let comp_output = Command::new(&ifa_bin)
+        .arg("wasm")
+        .arg("component")
+        .arg(&wasm_file)
+        .arg("-o")
+        .arg(&comp_file)
+        .output()
+        .expect("Failed to execute `ifa wasm component`");
+    assert!(
+        comp_output.status.success(),
+        "ifa wasm component failed: {}",
+        String::from_utf8_lossy(&comp_output.stderr)
+    );
+    assert!(comp_file.exists());
+    let comp_bytes = fs::read(&comp_file).unwrap();
+    // Validate component header: \0asm [0x0d, 0x00, 0x01, 0x00]
+    assert_eq!(&comp_bytes[0..4], b"\0asm");
+    assert_eq!(&comp_bytes[4..8], &[0x0d, 0x00, 0x01, 0x00]);
+
+    // 3. Test `ifa wasm wit`
+    let wit_file = temp_dir.join("greeter.wit");
+    let wit_content = r#"package example:greeter@0.1.0;
+
+interface greeter {
+    greet: func(name: string) -> string;
+}
+
+world host {
+    export greeter;
+}
+"#;
+    fs::write(&wit_file, wit_content).unwrap();
+
+    let ifa_bindings = temp_dir.join("greeter_bindings.ifa");
+    let wit_output = Command::new(&ifa_bin)
+        .arg("wasm")
+        .arg("wit")
+        .arg(&wit_file)
+        .arg("--out-ifa")
+        .arg(&ifa_bindings)
+        .output()
+        .expect("Failed to execute `ifa wasm wit`");
+    assert!(
+        wit_output.status.success(),
+        "ifa wasm wit failed: {}",
+        String::from_utf8_lossy(&wit_output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&wit_output.stdout);
+    assert!(stdout.contains("Parsed WIT package: example:greeter@0.1.0"));
+    assert!(ifa_bindings.exists());
+    let bindings_code = fs::read_to_string(&ifa_bindings).unwrap();
+    assert!(bindings_code.contains("pub fn greet(name: string) -> string;"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

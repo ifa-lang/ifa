@@ -205,6 +205,22 @@ enum WasmCommand {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// Wrap a core WebAssembly module (.wasm) into a WebAssembly Component Model binary (.component.wasm)
+    Component {
+        /// Path to the input .wasm binary file
+        file: PathBuf,
+        /// Destination output component file (.wasm)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Parse and process WebAssembly Interface Type (.wit) files and generate IFA bindings
+    Wit {
+        /// Path to the .wit interface file
+        file: PathBuf,
+        /// Generate IFA binding source file (.ifa)
+        #[arg(long)]
+        out_ifa: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -1260,6 +1276,126 @@ fn main() -> ExitCode {
                         ExitCode::FAILURE
                     }
                 }
+            }
+
+            WasmCommand::Component { file, output } => {
+                let bytes = match fs::read(&file) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("error: failed to read `{}`: {}", file.display(), e);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let inspector = ifa_wasm::WasmModuleInspector::new(&bytes);
+                let exports = match inspector.extract_exports() {
+                    Ok(exp) => exp,
+                    Err(e) => {
+                        eprintln!(
+                            "error: failed to extract exports from `{}`: {}",
+                            file.display(),
+                            e
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let mut builder = ifa_wasm::component::ComponentBuilder::new();
+                builder.add_core_module(bytes);
+                for (lift_idx, exp) in exports.into_iter().enumerate() {
+                    if exp.kind == 0 {
+                        builder.add_canon_lift(ifa_wasm::component::CanonLift {
+                            core_func_index: exp.index,
+                            type_index: 0,
+                            memory_index: None,
+                            realloc_index: None,
+                            string_encoding: ifa_wasm::component::StringEncoding::Utf8,
+                        });
+                        builder.add_export(exp.name, 0x01, lift_idx as u32);
+                    }
+                }
+                let component_bytes = match builder.finish() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("error: failed to build component: {:?}", e);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let out_path = output.unwrap_or_else(|| {
+                    let mut p = file.clone();
+                    p.set_extension("component.wasm");
+                    p
+                });
+                if let Err(e) = fs::write(&out_path, &component_bytes) {
+                    eprintln!(
+                        "error: failed to write component `{}`: {}",
+                        out_path.display(),
+                        e
+                    );
+                    return ExitCode::FAILURE;
+                }
+                println!(
+                    "Created WebAssembly Component Model binary `{}` ({} bytes)",
+                    out_path.display(),
+                    component_bytes.len()
+                );
+                ExitCode::SUCCESS
+            }
+
+            WasmCommand::Wit { file, out_ifa } => {
+                let content = match fs::read_to_string(&file) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("error: failed to read `{}`: {}", file.display(), e);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let pkg = match ifa_wasm::wit::WitPackage::parse(&content) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "error: failed to parse WIT file `{}`: {}",
+                            file.display(),
+                            e
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                };
+                println!("Parsed WIT package: {}", pkg.id.to_string_repr());
+                println!("Interfaces: {}", pkg.interfaces.len());
+                for iface in &pkg.interfaces {
+                    println!(
+                        "  interface {}: {} functions, {} types",
+                        iface.name,
+                        iface.functions.len(),
+                        iface.types.len()
+                    );
+                }
+                println!("Worlds: {}", pkg.worlds.len());
+                for w in &pkg.worlds {
+                    println!(
+                        "  world {}: {} imports, {} exports",
+                        w.name,
+                        w.imports.len(),
+                        w.exports.len()
+                    );
+                }
+
+                if let Some(out_path) = out_ifa {
+                    let mut ifa_code = format!("// Generated from {}\n", file.display());
+                    for iface in &pkg.interfaces {
+                        ifa_code.push_str(&iface.to_ifa_module());
+                        ifa_code.push('\n');
+                    }
+                    if let Err(e) = fs::write(&out_path, ifa_code) {
+                        eprintln!(
+                            "error: failed to write IFA bindings `{}`: {}",
+                            out_path.display(),
+                            e
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    println!("Generated IFA bindings in `{}`", out_path.display());
+                }
+                ExitCode::SUCCESS
             }
         },
     }
