@@ -231,6 +231,16 @@ ifa build
 ./target/dev/kv_store_service
 ```
 
+### Real-Time Streaming & WebSocket Service
+
+High-throughput bidirectional event streaming service demonstrating RFC 6455 WebSocket framing, Server-Sent Events (SSE), and multichannel Pub/Sub fanout:
+
+```bash
+cd examples/realtime_stream_service
+ifa build
+./target/dev/realtime_stream_service
+```
+
 ---
 
 ## 6. Language Server Protocol (LSP 3.17)
