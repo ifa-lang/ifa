@@ -1408,5 +1408,10 @@ impl<T> Default for Channel<T> {
 
 lazy_static::lazy_static! {
     /// Global scheduler instance for IFA colorless fibers.
-    pub static ref GLOBAL_SCHEDULER: FiberScheduler = FiberScheduler::new(2);
+    pub static ref GLOBAL_SCHEDULER: FiberScheduler = FiberScheduler::new(std::cmp::max(
+        8,
+        std::thread::available_parallelism()
+            .map(|p| p.get() * 2)
+            .unwrap_or(8)
+    ));
 }

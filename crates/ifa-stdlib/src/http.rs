@@ -1712,81 +1712,94 @@ impl HttpServer {
         let router = Arc::clone(&self.router);
         let auto_compress = self.auto_compress_threshold;
 
-        GLOBAL_SCHEDULER.spawn(move || {
-            while running.load(Ordering::Relaxed) {
-                if let Ok(Some((mut stream, _))) = listener.try_accept() {
-                    let router_worker = Arc::clone(&router);
-                    GLOBAL_SCHEDULER.spawn(move || {
-                        let mut buf = vec![0u8; 16384];
-                        let mut total_read = 0;
-                        let mut spins = 0;
-                        let mut last_activity = Instant::now();
+        let _ = std::thread::Builder::new()
+            .name("ifa-http-listener".to_string())
+            .spawn(move || {
+                while running.load(Ordering::Relaxed) {
+                    if let Ok(Some((mut stream, _))) = listener.try_accept() {
+                        let router_worker = Arc::clone(&router);
+                        let _ = std::thread::Builder::new()
+                            .name("ifa-http-worker".to_string())
+                            .spawn(move || {
+                                let mut buf = vec![0u8; 16384];
+                                let mut total_read = 0;
+                                let mut spins = 0;
+                                let mut last_activity = Instant::now();
 
-                        loop {
-                            match stream.try_read(&mut buf[total_read..]) {
-                                Ok(Some(0)) => break,
-                                Ok(Some(n)) => {
-                                    total_read += n;
-                                    spins = 0;
-                                    last_activity = Instant::now();
+                                loop {
+                                    match stream.try_read(&mut buf[total_read..]) {
+                                        Ok(Some(0)) => break,
+                                        Ok(Some(n)) => {
+                                            total_read += n;
+                                            spins = 0;
+                                            last_activity = Instant::now();
 
-                                    while total_read > 0 {
-                                        match HttpRequest::parse_from_wire(&buf[..total_read]) {
-                                            Ok((mut req, consumed)) => {
-                                                let keep_alive =
-                                                    http_should_keep_alive(200, &req.headers);
-                                                let mut res = router_worker.dispatch(&mut req);
+                                            while total_read > 0 {
+                                                match HttpRequest::parse_from_wire(
+                                                    &buf[..total_read],
+                                                ) {
+                                                    Ok((mut req, consumed)) => {
+                                                        let keep_alive = http_should_keep_alive(
+                                                            200,
+                                                            &req.headers,
+                                                        );
+                                                        let mut res =
+                                                            router_worker.dispatch(&mut req);
 
-                                                if let Some(threshold) = auto_compress {
-                                                    res = res.compress_if_accepted(&req, threshold);
-                                                }
+                                                        if let Some(threshold) = auto_compress {
+                                                            res = res.compress_if_accepted(
+                                                                &req, threshold,
+                                                            );
+                                                        }
 
-                                                if keep_alive {
-                                                    res.headers.set("Connection", "keep-alive");
-                                                } else {
-                                                    res.headers.set("Connection", "close");
-                                                }
+                                                        if keep_alive {
+                                                            res.headers
+                                                                .set("Connection", "keep-alive");
+                                                        } else {
+                                                            res.headers.set("Connection", "close");
+                                                        }
 
-                                                let wire = res.to_wire_bytes();
-                                                if stream.write_all(&wire).is_err() {
-                                                    return;
-                                                }
+                                                        let wire = res.to_wire_bytes();
+                                                        if stream.write_all(&wire).is_err() {
+                                                            return;
+                                                        }
 
-                                                buf.copy_within(consumed..total_read, 0);
-                                                total_read -= consumed;
+                                                        buf.copy_within(consumed..total_read, 0);
+                                                        total_read -= consumed;
 
-                                                if !keep_alive {
-                                                    return;
+                                                        if !keep_alive {
+                                                            return;
+                                                        }
+                                                    }
+                                                    Err(_) => {
+                                                        // Incomplete request body or headers, await more bytes
+                                                        break;
+                                                    }
                                                 }
                                             }
-                                            Err(_) => {
-                                                // Incomplete request body or headers, await more bytes
-                                                break;
+                                        }
+                                        Ok(None) | Err(_) => {
+                                            spins += 1;
+                                            if spins < 32 {
+                                                std::hint::spin_loop();
+                                            } else {
+                                                if last_activity.elapsed() > Duration::from_secs(30)
+                                                {
+                                                    break;
+                                                }
+                                                GLOBAL_SCHEDULER.yield_now();
+                                                std::thread::sleep(Duration::from_millis(1));
                                             }
                                         }
                                     }
                                 }
-                                Ok(None) | Err(_) => {
-                                    spins += 1;
-                                    if spins < 32 {
-                                        std::hint::spin_loop();
-                                    } else {
-                                        if last_activity.elapsed() > Duration::from_secs(30) {
-                                            break;
-                                        }
-                                        GLOBAL_SCHEDULER.yield_now();
-                                        std::thread::sleep(Duration::from_millis(1));
-                                    }
-                                }
-                            }
-                        }
-                    });
-                } else {
-                    GLOBAL_SCHEDULER.yield_now();
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                            });
+                    } else {
+                        GLOBAL_SCHEDULER.yield_now();
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
-            }
-        });
+            });
 
         Ok(addr)
     }

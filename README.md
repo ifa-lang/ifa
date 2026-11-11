@@ -1,7 +1,6 @@
 # **IFA Programming Language**
 
-[License: MIT/Apache 2.0](#licence)  
-[Version](https://github.com/ifa-lang/ifa/releases)
+[License: MIT/Apache 2.0](#licence) | [Version](https://github.com/ifa-lang/ifa/releases) | [Quickstart & Tour of IFA](docs/TOUR_OF_IFA.md)
 
 ---
 
