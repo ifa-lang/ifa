@@ -137,12 +137,7 @@ impl CsvTable {
     where
         F: Fn(&[String]) -> bool,
     {
-        let filtered_rows = self
-            .rows
-            .iter()
-            .filter(|r| predicate(r))
-            .cloned()
-            .collect();
+        let filtered_rows = self.rows.iter().filter(|r| predicate(r)).cloned().collect();
         Self {
             headers: self.headers.clone(),
             rows: filtered_rows,
@@ -574,10 +569,7 @@ mod tests {
 
         assert_eq!(table.row_count(), 3);
         assert_eq!(table.col_count(), 3);
-        assert_eq!(
-            table.column("name"),
-            Some(vec!["Alice", "Bob", "Charlie"])
-        );
+        assert_eq!(table.column("name"), Some(vec!["Alice", "Bob", "Charlie"]));
         assert_eq!(table.column("invalid"), None);
 
         let admins = table.filter_rows(|r| r.get(2).map(|s| s.as_str()) == Some("Admin"));
@@ -587,7 +579,11 @@ mod tests {
 
     #[test]
     fn test_csv_table_select_columns_and_sort() {
-        let mut table = CsvTable::new(vec!["id".to_string(), "dept".to_string(), "salary".to_string()]);
+        let mut table = CsvTable::new(vec![
+            "id".to_string(),
+            "dept".to_string(),
+            "salary".to_string(),
+        ]);
         table.add_row(vec!["1".to_string(), "Ops".to_string(), "5000".to_string()]);
         table.add_row(vec!["2".to_string(), "Dev".to_string(), "7000".to_string()]);
         table.add_row(vec!["3".to_string(), "Dev".to_string(), "6000".to_string()]);
@@ -628,10 +624,7 @@ name , age , role
  Alice , 30 , Engineer 
 Bob, 25, \"Systems, Architect\"
 ";
-        let options = CsvOptions::new()
-            .comment('#')
-            .trim(true)
-            .has_headers(true);
+        let options = CsvOptions::new().comment('#').trim(true).has_headers(true);
 
         let table = decode_with_options(raw, &options).unwrap();
         assert_eq!(table.headers, vec!["name", "age", "role"]);
@@ -647,9 +640,13 @@ Bob, 25, \"Systems, Architect\"
             let mut writer = CsvWriter::new(&mut buffer)
                 .with_delimiter(';')
                 .with_quote('"');
-            writer.write_record(&["id", "note", "status"]).unwrap();
-            writer.write_record(&["1", "Line with ; inside", "OK"]).unwrap();
-            writer.write_record(&["2", "Line with \"quote\"", "PENDING"]).unwrap();
+            writer.write_record(["id", "note", "status"]).unwrap();
+            writer
+                .write_record(["1", "Line with ; inside", "OK"])
+                .unwrap();
+            writer
+                .write_record(["2", "Line with \"quote\"", "PENDING"])
+                .unwrap();
             writer.flush().unwrap();
         }
 
