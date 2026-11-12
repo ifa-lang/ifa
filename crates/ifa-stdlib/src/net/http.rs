@@ -157,6 +157,11 @@ impl HttpStatus {
     }
 
     #[inline]
+    pub fn as_u16(&self) -> u16 {
+        self.0
+    }
+
+    #[inline]
     pub fn is_informational(&self) -> bool {
         (100..200).contains(&self.0)
     }
@@ -2039,6 +2044,43 @@ impl HttpRequest {
         Self::new(HttpRequestHead::delete(uri), Vec::new())
     }
 
+    /// Construct a standard PATCH request with body and optional content type.
+    pub fn patch(uri: impl Into<String>, body: Vec<u8>, content_type: Option<&str>) -> Self {
+        let mut head = HttpRequestHead::patch(uri);
+        if let Some(ct) = content_type {
+            head.headers.insert("Content-Type", ct);
+        }
+        Self::new(head, body)
+    }
+
+    /// Construct a standard HEAD request.
+    pub fn head(uri: impl Into<String>) -> Self {
+        Self::new(HttpRequestHead::head(uri), Vec::new())
+    }
+
+    /// Construct a standard OPTIONS request.
+    pub fn options(uri: impl Into<String>) -> Self {
+        Self::new(HttpRequestHead::options(uri), Vec::new())
+    }
+
+    /// Construct a request with a serialized JSON payload.
+    pub fn json_payload<T: serde::Serialize>(
+        uri: impl Into<String>,
+        method: HttpMethod,
+        payload: &T,
+    ) -> Result<Self, serde_json::Error> {
+        let bytes = serde_json::to_vec(payload)?;
+        let mut head = HttpRequestHead::new(method, uri, HttpVersion::Http11);
+        head.headers.insert("Content-Type", "application/json");
+        Ok(Self::new(head, bytes))
+    }
+
+    /// Add or update a header on the request head, returning self.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.head.headers.insert(name, value);
+        self
+    }
+
     pub fn method(&self) -> HttpMethod {
         self.head.method
     }
@@ -2159,6 +2201,90 @@ pub struct HttpResponse {
 impl HttpResponse {
     pub fn new(head: HttpResponseHead, body: Vec<u8>) -> Self {
         Self { head, body }
+    }
+
+    /// Construct a standard 200 OK response with body and optional content type.
+    pub fn ok(body: Vec<u8>, content_type: Option<&str>) -> Self {
+        let mut head = HttpResponseHead::ok();
+        if let Some(ct) = content_type {
+            head.headers.insert("Content-Type", ct);
+        }
+        Self::new(head, body)
+    }
+
+    /// Construct a plain text response with the given status code and UTF-8 body.
+    pub fn plain_text(status: HttpStatus, text: impl Into<String>) -> Self {
+        let mut head = HttpResponseHead::new(status, HttpVersion::Http11);
+        head.headers
+            .insert("Content-Type", "text/plain; charset=utf-8");
+        Self::new(head, text.into().into_bytes())
+    }
+
+    /// Construct an HTTP response with serialized JSON payload.
+    pub fn json_payload<T: serde::Serialize>(
+        status: HttpStatus,
+        payload: &T,
+    ) -> Result<Self, serde_json::Error> {
+        let bytes = serde_json::to_vec(payload)?;
+        let mut head = HttpResponseHead::new(status, HttpVersion::Http11);
+        head.headers.insert("Content-Type", "application/json");
+        Ok(Self::new(head, bytes))
+    }
+
+    /// Construct an empty response with the given status code.
+    pub fn empty(status: HttpStatus) -> Self {
+        Self::new(
+            HttpResponseHead::new(status, HttpVersion::Http11),
+            Vec::new(),
+        )
+    }
+
+    /// Construct a redirection response with Location header.
+    pub fn redirect(status: HttpStatus, location: impl Into<String>) -> Self {
+        let mut head = HttpResponseHead::new(status, HttpVersion::Http11);
+        head.headers.insert("Location", location);
+        Self::new(head, Vec::new())
+    }
+
+    /// Add or update a header on the response head, returning self.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.head.headers.insert(name, value);
+        self
+    }
+
+    /// Check if the status code is informational (1xx).
+    pub fn is_informational(&self) -> bool {
+        self.head.status.is_informational()
+    }
+
+    /// Check if the status code is success (2xx).
+    pub fn is_success(&self) -> bool {
+        self.head.status.is_success()
+    }
+
+    /// Check if the status code is redirection (3xx).
+    pub fn is_redirection(&self) -> bool {
+        self.head.status.is_redirection()
+    }
+
+    /// Check if the status code is a client error (4xx).
+    pub fn is_client_error(&self) -> bool {
+        self.head.status.is_client_error()
+    }
+
+    /// Check if the status code is a server error (5xx).
+    pub fn is_server_error(&self) -> bool {
+        self.head.status.is_server_error()
+    }
+
+    /// Return the numeric HTTP status code.
+    pub fn status_code(&self) -> u16 {
+        self.head.status.as_u16()
+    }
+
+    /// Return the standard HTTP reason phrase.
+    pub fn reason_phrase(&self) -> &'static str {
+        self.head.status.reason_phrase()
     }
 
     pub fn status(&self) -> HttpStatus {
@@ -2555,6 +2681,15 @@ impl HttpClient {
         let body = multipart.clone().finish();
         self.post(url, &body, Some(&ct))
     }
+
+    /// Send an `HttpRequest` object to the specified URL using this client.
+    pub fn send_request(
+        &self,
+        url: &str,
+        request: &HttpRequest,
+    ) -> Result<HttpResponse, HttpClientError> {
+        self.request_with_headers(request.method(), url, request.headers(), request.body())
+    }
 }
 
 /// Builder for configuring custom `HttpClient` instances.
@@ -2700,6 +2835,11 @@ pub fn post_multipart(
     multipart: &MultipartBuilder,
 ) -> Result<HttpResponse, HttpClientError> {
     HttpClient::new().post_multipart(url, multipart)
+}
+
+/// Convenience shortcut to issue a request using an `HttpRequest` object.
+pub fn send_request(url: &str, request: &HttpRequest) -> Result<HttpResponse, HttpClientError> {
+    HttpClient::new().send_request(url, request)
 }
 
 #[cfg(test)]
@@ -3604,6 +3744,114 @@ mod tests {
         let (resp_head, resp_body) = client_resp.into_parts();
         assert_eq!(resp_head.status, HttpStatus::OK);
         assert_eq!(resp_body, b"ACK");
+
+        handle.join().expect("server thread finished");
+    }
+
+    #[test]
+    fn test_http_request_and_response_builder_and_shortcuts() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
+        struct TestMsg {
+            message: String,
+            code: u32,
+        }
+
+        // Test HttpRequest builders
+        let req_patch = HttpRequest::patch("/items/42", b"update".to_vec(), Some("text/plain"))
+            .with_header("X-Custom", "val1");
+        assert_eq!(req_patch.method(), HttpMethod::Patch);
+        assert_eq!(req_patch.path(), "/items/42");
+        assert_eq!(req_patch.header("Content-Type"), Some("text/plain"));
+        assert_eq!(req_patch.header("X-Custom"), Some("val1"));
+        assert_eq!(req_patch.body(), b"update");
+
+        let req_head = HttpRequest::head("/ping");
+        assert_eq!(req_head.method(), HttpMethod::Head);
+        assert!(req_head.body().is_empty());
+
+        let req_opt = HttpRequest::options("/cors");
+        assert_eq!(req_opt.method(), HttpMethod::Options);
+
+        let test_payload = TestMsg {
+            message: "hello".to_string(),
+            code: 200,
+        };
+        let req_json = HttpRequest::json_payload("/api", HttpMethod::Post, &test_payload).unwrap();
+        assert_eq!(req_json.header("Content-Type"), Some("application/json"));
+        let parsed_payload: TestMsg = req_json.json().unwrap();
+        assert_eq!(parsed_payload, test_payload);
+
+        // Test HttpResponse builders and status predicates
+        let resp_ok = HttpResponse::ok(b"done".to_vec(), Some("application/octet-stream"))
+            .with_header("X-Trace", "123");
+        assert!(resp_ok.is_success());
+        assert!(!resp_ok.is_client_error());
+        assert_eq!(resp_ok.status_code(), 200);
+        assert_eq!(resp_ok.reason_phrase(), "OK");
+        assert_eq!(resp_ok.header("X-Trace"), Some("123"));
+
+        let resp_text = HttpResponse::plain_text(HttpStatus::BAD_REQUEST, "invalid input");
+        assert!(resp_text.is_client_error());
+        assert_eq!(resp_text.status_code(), 400);
+        assert_eq!(resp_text.text().unwrap(), "invalid input");
+        assert_eq!(
+            resp_text.header("Content-Type"),
+            Some("text/plain; charset=utf-8")
+        );
+
+        let resp_json = HttpResponse::json_payload(HttpStatus::CREATED, &test_payload).unwrap();
+        assert!(resp_json.is_success());
+        assert_eq!(resp_json.status_code(), 201);
+        let resp_msg: TestMsg = resp_json.json().unwrap();
+        assert_eq!(resp_msg, test_payload);
+
+        let resp_redir = HttpResponse::redirect(HttpStatus::FOUND, "/new-url");
+        assert!(resp_redir.is_redirection());
+        assert_eq!(resp_redir.location(), Some("/new-url"));
+
+        let resp_empty = HttpResponse::empty(HttpStatus::NO_CONTENT);
+        assert!(resp_empty.is_success());
+        assert!(resp_empty.body().is_empty());
+
+        let resp_500 = HttpResponse::empty(HttpStatus::INTERNAL_SERVER_ERROR);
+        assert!(resp_500.is_server_error());
+
+        let resp_100 = HttpResponse::empty(HttpStatus::CONTINUE);
+        assert!(resp_100.is_informational());
+
+        // Test send_request convenience function over local listener
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.port().expect("port");
+
+        let handle = thread::spawn(move || {
+            let mut stream = None;
+            for _ in 0..100 {
+                if let Ok(Some((s, _))) = listener.try_accept() {
+                    stream = Some(s);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let stream = stream.expect("accept");
+            stream.set_nonblocking(false).expect("blocking");
+            let mut buf_stream = BufferedTcpStream::new(stream).unwrap();
+
+            let (req_head, body) = read_request(&mut buf_stream, 4096).unwrap().unwrap();
+            assert_eq!(req_head.method, HttpMethod::Patch);
+            assert_eq!(req_head.uri, "/items/10");
+            assert_eq!(body, b"new-patch");
+
+            let mut resp_head = HttpResponseHead::ok();
+            resp_head.headers.insert("Content-Type", "text/plain");
+            resp_head.headers.insert("Connection", "close");
+            write_response_full(&mut buf_stream, &resp_head, b"patched-ok").unwrap();
+        });
+
+        let client_req = HttpRequest::patch("/items/10", b"new-patch".to_vec(), Some("text/plain"));
+        let url = format!("http://127.0.0.1:{}/items/10", port);
+        let resp = send_request(&url, &client_req).expect("send request");
+        assert_eq!(resp.status(), HttpStatus::OK);
+        assert_eq!(resp.text().unwrap(), "patched-ok");
 
         handle.join().expect("server thread finished");
     }
