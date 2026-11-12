@@ -413,6 +413,18 @@ impl HttpRequestHead {
             .and_then(|v| v.trim().parse::<usize>().ok())
     }
 
+    /// Return the Content-Type header value if present.
+    pub fn content_type(&self) -> Option<&str> {
+        self.headers.get(HeaderMap::CONTENT_TYPE)
+    }
+
+    /// Check if Content-Type is application/json.
+    pub fn is_json(&self) -> bool {
+        self.content_type()
+            .map(|ct| ct.to_ascii_lowercase().contains("application/json"))
+            .unwrap_or(false)
+    }
+
     pub fn is_chunked(&self) -> bool {
         self.headers
             .get(HeaderMap::TRANSFER_ENCODING)
@@ -541,6 +553,18 @@ impl HttpResponseHead {
             .and_then(|v| v.trim().parse::<usize>().ok())
     }
 
+    /// Return the Content-Type header value if present.
+    pub fn content_type(&self) -> Option<&str> {
+        self.headers.get(HeaderMap::CONTENT_TYPE)
+    }
+
+    /// Check if Content-Type is application/json.
+    pub fn is_json(&self) -> bool {
+        self.content_type()
+            .map(|ct| ct.to_ascii_lowercase().contains("application/json"))
+            .unwrap_or(false)
+    }
+
     pub fn is_chunked(&self) -> bool {
         self.headers
             .get(HeaderMap::TRANSFER_ENCODING)
@@ -573,6 +597,11 @@ impl HttpResponseHead {
     /// Extract parsed `Cache-Control` directive from response headers.
     pub fn cache_control(&self) -> Option<CacheControl> {
         self.headers.get("cache-control").map(CacheControl::parse)
+    }
+
+    /// Return the Location header value if present (e.g. for redirects).
+    pub fn location(&self) -> Option<&str> {
+        self.headers.get(HeaderMap::LOCATION)
     }
 
     /// Check if Content-Type is multipart/form-data.
@@ -1823,6 +1852,30 @@ impl HttpResponse {
         String::from_utf8_lossy(&self.body)
     }
 
+    pub fn content_length(&self) -> Option<usize> {
+        self.head.content_length()
+    }
+
+    pub fn content_type(&self) -> Option<&str> {
+        self.head.content_type()
+    }
+
+    pub fn is_json(&self) -> bool {
+        self.head.is_json()
+    }
+
+    pub fn location(&self) -> Option<&str> {
+        self.head.location()
+    }
+
+    pub fn is_chunked(&self) -> bool {
+        self.head.is_chunked()
+    }
+
+    pub fn is_keep_alive(&self) -> bool {
+        self.head.is_keep_alive()
+    }
+
     pub fn set_cookies(&self) -> Vec<SetCookie> {
         self.head.set_cookies()
     }
@@ -1981,7 +2034,7 @@ impl HttpClient {
                     return Err(HttpClientError::TooManyRedirects);
                 }
 
-                if let Some(location) = response.headers().get("location") {
+                if let Some(location) = response.location() {
                     current_url = current_url.join(location)?;
                     redirects_followed += 1;
 
@@ -2238,6 +2291,38 @@ pub fn post_json<T: serde::Serialize>(
     payload: &T,
 ) -> Result<HttpResponse, HttpClientError> {
     HttpClient::new().post_json(url, payload)
+}
+
+/// Convenience shortcut to issue a PUT request with a JSON payload.
+pub fn put_json<T: serde::Serialize>(
+    url: &str,
+    payload: &T,
+) -> Result<HttpResponse, HttpClientError> {
+    HttpClient::new().put_json(url, payload)
+}
+
+/// Convenience shortcut to issue a PATCH request with a JSON payload.
+pub fn patch_json<T: serde::Serialize>(
+    url: &str,
+    payload: &T,
+) -> Result<HttpResponse, HttpClientError> {
+    HttpClient::new().patch_json(url, payload)
+}
+
+/// Convenience shortcut to issue an application/x-www-form-urlencoded POST request.
+pub fn post_form(
+    url: &str,
+    fields: &[(&str, &str)],
+) -> Result<HttpResponse, HttpClientError> {
+    HttpClient::new().post_form(url, fields)
+}
+
+/// Convenience shortcut to issue a multipart/form-data POST request.
+pub fn post_multipart(
+    url: &str,
+    multipart: &MultipartBuilder,
+) -> Result<HttpResponse, HttpClientError> {
+    HttpClient::new().post_multipart(url, multipart)
 }
 
 #[cfg(test)]
@@ -2892,6 +2977,85 @@ mod tests {
         assert_eq!(resp_parts.len(), 1);
         assert_eq!(resp_parts[0].name, "status");
         assert_eq!(resp_parts[0].data, b"processed");
+
+        handle.join().expect("server thread finished");
+    }
+
+    #[test]
+    fn test_http_head_and_response_metadata_helpers() {
+        let mut req = HttpRequestHead::post("/api/v1/resource");
+        req.headers.insert("Content-Type", "application/json; charset=utf-8");
+        req.headers.insert("Content-Length", "42");
+        assert_eq!(req.content_type(), Some("application/json; charset=utf-8"));
+        assert!(req.is_json());
+        assert_eq!(req.content_length(), Some(42));
+        assert!(req.is_keep_alive());
+
+        let mut resp_head = HttpResponseHead::ok();
+        resp_head.headers.insert("Content-Type", "application/json");
+        resp_head.headers.insert("Location", "/dashboard");
+        resp_head.headers.insert("Transfer-Encoding", "chunked");
+        assert_eq!(resp_head.content_type(), Some("application/json"));
+        assert!(resp_head.is_json());
+        assert_eq!(resp_head.location(), Some("/dashboard"));
+        assert!(resp_head.is_chunked());
+
+        let resp = HttpResponse::new(resp_head, b"{\"status\":\"ready\"}".to_vec());
+        assert_eq!(resp.content_type(), Some("application/json"));
+        assert!(resp.is_json());
+        assert_eq!(resp.location(), Some("/dashboard"));
+        assert!(resp.is_chunked());
+        assert_eq!(resp.content_length(), None);
+
+        #[derive(serde::Deserialize, PartialEq, Eq, Debug)]
+        struct StatusPayload {
+            status: String,
+        }
+        let parsed: StatusPayload = resp.json().unwrap();
+        assert_eq!(parsed.status, "ready");
+    }
+
+    #[test]
+    fn test_convenience_shortcuts_form_multipart_and_json() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = thread::spawn(move || {
+            let mut stream = None;
+            for _ in 0..100 {
+                if let Ok(Some((s, _))) = listener.try_accept() {
+                    stream = Some(s);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let stream = stream.expect("accept put json");
+            stream.set_nonblocking(false).expect("blocking");
+            let mut b = BufferedTcpStream::new(stream).unwrap();
+            let (req, body) = read_request(&mut b, 1024 * 1024).unwrap().unwrap();
+            assert_eq!(req.method, HttpMethod::Put);
+            assert_eq!(req.content_type(), Some("application/json"));
+            assert!(req.is_json());
+            let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(val["key"], "val1");
+
+            let mut resp = HttpResponseHead::ok();
+            resp.headers.insert("Content-Type", "application/json");
+            resp.headers.insert("Connection", "close");
+            let resp_body = b"{\"updated\":true}";
+            write_response_full(&mut b, &resp, resp_body).unwrap();
+        });
+
+        let url = format!("http://127.0.0.1:{}/items/42", port);
+        #[derive(serde::Serialize)]
+        struct ReqPayload<'a> {
+            key: &'a str,
+        }
+        let resp = put_json(&url, &ReqPayload { key: "val1" }).expect("put_json succeeds");
+        assert_eq!(resp.status(), HttpStatus::OK);
+        assert!(resp.is_json());
+        let body: serde_json::Value = resp.json().expect("parse response json");
+        assert_eq!(body["updated"], true);
 
         handle.join().expect("server thread finished");
     }
