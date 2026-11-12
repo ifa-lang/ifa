@@ -38,6 +38,74 @@ enum WalRecordType {
     Commit = 3,
 }
 
+/// A paginated result set with offset/limit metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page<K, V> {
+    /// Items on this page.
+    pub items: Vec<(K, V)>,
+    /// Total count of matching entries across all pages.
+    pub total: usize,
+    /// Offset of the first item on this page.
+    pub offset: usize,
+    /// Maximum items requested per page.
+    pub limit: usize,
+    /// Whether more items exist after this page.
+    pub has_more: bool,
+}
+
+impl<K, V> Page<K, V> {
+    /// Number of items on the current page.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether this page is empty.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+/// A keyset-paginated result set for cursor-based navigation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeysetPage<K, V> {
+    /// Items on this page.
+    pub items: Vec<(K, V)>,
+    /// Cursor to pass as `after_key` for subsequent queries, or None if at end.
+    pub next_cursor: Option<K>,
+    /// Whether more items exist after this page.
+    pub has_more: bool,
+}
+
+impl<K, V> KeysetPage<K, V> {
+    /// Number of items on the current page.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether this page is empty.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+/// Streaming iterator yielding database entries that start with a given key prefix.
+#[derive(Debug, Clone)]
+pub struct PrefixScanner<'a> {
+    iter: std::collections::btree_map::Range<'a, Vec<u8>, Vec<u8>>,
+    prefix: &'a [u8],
+}
+
+impl<'a> Iterator for PrefixScanner<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.iter.next() {
+            Some((k, v)) if k.starts_with(self.prefix) => Some((k.as_slice(), v.as_slice())),
+            _ => None,
+        }
+    }
+}
+
 /// In-memory and on-disk embedded database instance.
 pub struct Database {
     path: PathBuf,
@@ -163,6 +231,226 @@ impl Database {
     pub fn sync(&mut self) -> Result<(), DbError> {
         self.wal_file.sync_all()?;
         Ok(())
+    }
+
+    /// Insert or update multiple entries in a single atomic WAL batch.
+    pub fn put_batch(&mut self, entries: &[(&[u8], &[u8])]) -> Result<(), DbError> {
+        for (k, v) in entries {
+            if k.len() > u16::MAX as usize {
+                return Err(DbError::KeyTooLarge);
+            }
+            if v.len() > 16 * 1024 * 1024 {
+                return Err(DbError::ValueTooLarge);
+            }
+        }
+
+        for (k, v) in entries {
+            self.append_wal_record(WalRecordType::Put, k, v)?;
+        }
+        self.append_wal_record(WalRecordType::Commit, &[], &[])?;
+
+        if self.is_sync {
+            self.wal_file.sync_data()?;
+        }
+
+        for (k, v) in entries {
+            self.index.insert(k.to_vec(), v.to_vec());
+        }
+        Ok(())
+    }
+
+    /// Delete multiple entries by key in a single atomic WAL batch.
+    /// Returns the number of keys that were actually present and deleted.
+    pub fn delete_batch(&mut self, keys: &[&[u8]]) -> Result<usize, DbError> {
+        let mut count = 0;
+        for k in keys {
+            if self.index.contains_key(*k) {
+                self.append_wal_record(WalRecordType::Delete, k, &[])?;
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            self.append_wal_record(WalRecordType::Commit, &[], &[])?;
+            if self.is_sync {
+                self.wal_file.sync_data()?;
+            }
+            for k in keys {
+                self.index.remove(*k);
+            }
+        }
+        Ok(count)
+    }
+
+    /// Iterate over all key-value entries in lexicographical order.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&[u8], &[u8])> {
+        self.index.iter().map(|(k, v)| (k.as_slice(), v.as_slice()))
+    }
+
+    /// Iterate over all keys in lexicographical order.
+    pub fn keys(&self) -> impl DoubleEndedIterator<Item = &[u8]> {
+        self.index.keys().map(|k| k.as_slice())
+    }
+
+    /// Iterate over all values in lexicographical order.
+    pub fn values(&self) -> impl DoubleEndedIterator<Item = &[u8]> {
+        self.index.values().map(|v| v.as_slice())
+    }
+
+    /// Scan entries starting with `prefix` in lexicographical order.
+    pub fn scan_prefix<'a>(&'a self, prefix: &'a [u8]) -> PrefixScanner<'a> {
+        use std::ops::Bound;
+        PrefixScanner {
+            iter: self
+                .index
+                .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded)),
+            prefix,
+        }
+    }
+
+    /// Scan entries between `start` (inclusive) and `end` (inclusive) in lexicographical order.
+    pub fn scan_range<'a>(
+        &'a self,
+        start: &[u8],
+        end: &[u8],
+    ) -> impl DoubleEndedIterator<Item = (&'a [u8], &'a [u8])> {
+        use std::ops::Bound;
+        self.index
+            .range::<[u8], _>((Bound::Included(start), Bound::Included(end)))
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+    }
+
+    /// Scan entries within arbitrary range bounds.
+    pub fn scan_range_bounds<R>(&self, range: R) -> impl DoubleEndedIterator<Item = (&[u8], &[u8])>
+    where
+        R: std::ops::RangeBounds<[u8]>,
+    {
+        self.index
+            .range::<[u8], R>(range)
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+    }
+
+    /// Paginate through all database entries with offset and limit.
+    pub fn paginate(&self, offset: usize, limit: usize) -> Page<Vec<u8>, Vec<u8>> {
+        let total = self.index.len();
+        let items = self
+            .index
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let has_more = offset + limit < total;
+        Page {
+            items,
+            total,
+            offset,
+            limit,
+            has_more,
+        }
+    }
+
+    /// Paginate through database entries matching a key prefix with offset and limit.
+    pub fn paginate_prefix(
+        &self,
+        prefix: &[u8],
+        offset: usize,
+        limit: usize,
+    ) -> Page<Vec<u8>, Vec<u8>> {
+        let matching: Vec<(&[u8], &[u8])> = self.scan_prefix(prefix).collect();
+        let total = matching.len();
+        let items = matching
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+        let has_more = offset + limit < total;
+        Page {
+            items,
+            total,
+            offset,
+            limit,
+            has_more,
+        }
+    }
+
+    /// High-performance keyset (cursor-based) pagination across all entries.
+    pub fn paginate_keyset(
+        &self,
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> KeysetPage<Vec<u8>, Vec<u8>> {
+        use std::ops::Bound;
+        let range: (Bound<&[u8]>, Bound<&[u8]>) = match after_key {
+            Some(k) => (Bound::Excluded(k), Bound::Unbounded),
+            None => (Bound::Unbounded, Bound::Unbounded),
+        };
+
+        let mut items = Vec::with_capacity(limit);
+        let mut has_more = false;
+
+        for (k, v) in self.index.range::<[u8], _>(range) {
+            if items.len() < limit {
+                items.push((k.clone(), v.clone()));
+            } else {
+                has_more = true;
+                break;
+            }
+        }
+
+        let next_cursor = if has_more {
+            items.last().map(|(k, _)| k.clone())
+        } else {
+            None
+        };
+
+        KeysetPage {
+            items,
+            next_cursor,
+            has_more,
+        }
+    }
+
+    /// High-performance keyset (cursor-based) pagination across entries matching a prefix.
+    pub fn paginate_prefix_keyset(
+        &self,
+        prefix: &[u8],
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> KeysetPage<Vec<u8>, Vec<u8>> {
+        use std::ops::Bound;
+        let start_bound = match after_key {
+            Some(k) => Bound::Excluded(k),
+            None => Bound::Included(prefix),
+        };
+
+        let mut items = Vec::with_capacity(limit);
+        let mut has_more = false;
+
+        for (k, v) in self.index.range::<[u8], _>((start_bound, Bound::Unbounded)) {
+            if !k.starts_with(prefix) {
+                break;
+            }
+            if items.len() < limit {
+                items.push((k.clone(), v.clone()));
+            } else {
+                has_more = true;
+                break;
+            }
+        }
+
+        let next_cursor = if has_more {
+            items.last().map(|(k, _)| k.clone())
+        } else {
+            None
+        };
+
+        KeysetPage {
+            items,
+            next_cursor,
+            has_more,
+        }
     }
 
     /// Compact the WAL file by writing a fresh consolidated log.
@@ -360,6 +648,48 @@ impl<'a> Transaction<'a> {
         self.staged_deletes.push(key.to_vec());
     }
 
+    /// Return all key-value entries in the transaction snapshot.
+    pub fn iter(&self) -> Vec<(&[u8], &[u8])> {
+        let mut map: BTreeMap<&[u8], &[u8]> = BTreeMap::new();
+        for (k, v) in self.db.iter() {
+            if !self.staged_deletes.iter().any(|d| d.as_slice() == k) {
+                map.insert(k, v);
+            }
+        }
+        for (k, v) in &self.staged_puts {
+            map.insert(k.as_slice(), v.as_slice());
+        }
+        map.into_iter().collect()
+    }
+
+    /// Scan entries matching `prefix` in the transaction snapshot.
+    pub fn scan_prefix<'b>(&'b self, prefix: &'b [u8]) -> Vec<(&'b [u8], &'b [u8])> {
+        self.iter()
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .collect()
+    }
+
+    /// Paginate entries in the transaction snapshot.
+    pub fn paginate(&self, offset: usize, limit: usize) -> Page<Vec<u8>, Vec<u8>> {
+        let all = self.iter();
+        let total = all.len();
+        let items = all
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+        let has_more = offset + limit < total;
+        Page {
+            items,
+            total,
+            offset,
+            limit,
+            has_more,
+        }
+    }
+
     /// Atomically commit all staged operations to the WAL.
     pub fn commit(mut self) -> Result<(), DbError> {
         for (k, v) in &self.staged_puts {
@@ -445,6 +775,197 @@ mod tests {
             db.compact().expect("Failed to compact DB");
             assert_eq!(db.len(), 1);
         }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_db_batch_operations_and_replay() {
+        let temp_dir = std::env::temp_dir().join("ifa_test_db_batch");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        {
+            let mut db = Database::open(&temp_dir).expect("Failed to open DB");
+            let entries: [(&[u8], &[u8]); 4] = [
+                (b"cfg:theme", b"dark"),
+                (b"cfg:font_size", b"14"),
+                (b"cfg:lang", b"fr"),
+                (b"cfg:auto_save", b"true"),
+            ];
+
+            db.put_batch(&entries).expect("put_batch failed");
+            assert_eq!(db.len(), 4);
+            assert_eq!(db.get(b"cfg:theme").unwrap(), b"dark");
+            assert_eq!(db.get(b"cfg:auto_save").unwrap(), b"true");
+
+            let del_keys: [&[u8]; 2] = [b"cfg:font_size", b"cfg:non_existent"];
+            let deleted = db.delete_batch(&del_keys).expect("delete_batch failed");
+            assert_eq!(deleted, 1);
+            assert_eq!(db.len(), 3);
+            assert!(!db.contains_key(b"cfg:font_size"));
+        }
+
+        // Reopen to verify WAL replay of batch operations
+        {
+            let db = Database::open(&temp_dir).expect("Failed to reopen DB");
+            assert_eq!(db.len(), 3);
+            assert_eq!(db.get(b"cfg:theme").unwrap(), b"dark");
+            assert_eq!(db.get(b"cfg:lang").unwrap(), b"fr");
+            assert_eq!(db.get(b"cfg:auto_save").unwrap(), b"true");
+            assert!(!db.contains_key(b"cfg:font_size"));
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_db_scan_range_and_prefix() {
+        let temp_dir = std::env::temp_dir().join("ifa_test_db_scan");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let mut db = Database::open(&temp_dir).expect("Failed to open DB");
+        let batch: [(&[u8], &[u8]); 6] = [
+            (b"order:100", b"status=pending"),
+            (b"order:101", b"status=shipped"),
+            (b"order:102", b"status=delivered"),
+            (b"user:001", b"name=Alice"),
+            (b"user:002", b"name=Bob"),
+            (b"user:003", b"name=Charlie"),
+        ];
+        db.put_batch(&batch).unwrap();
+
+        // Test prefix scanning
+        let orders: Vec<(&[u8], &[u8])> = db.scan_prefix(b"order:").collect();
+        assert_eq!(orders.len(), 3);
+        assert_eq!(orders[0].0, b"order:100");
+        assert_eq!(orders[1].0, b"order:101");
+        assert_eq!(orders[2].0, b"order:102");
+
+        let users: Vec<(&[u8], &[u8])> = db.scan_prefix(b"user:").collect();
+        assert_eq!(users.len(), 3);
+        assert_eq!(users[0].0, b"user:001");
+        assert_eq!(users[2].0, b"user:003");
+
+        // Test scan range (inclusive and exclusive)
+        let subrange: Vec<(&[u8], &[u8])> = db.scan_range(b"order:101", b"order:102").collect();
+        assert_eq!(subrange.len(), 2);
+        assert_eq!(subrange[0].0, b"order:101");
+        assert_eq!(subrange[1].0, b"order:102");
+
+        // Test reverse iteration
+        let rev_users: Vec<&[u8]> = db.keys().rev().take(3).collect();
+        assert_eq!(
+            rev_users,
+            vec![
+                b"user:003".as_slice(),
+                b"user:002".as_slice(),
+                b"user:001".as_slice()
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_db_offset_and_keyset_pagination() {
+        let temp_dir = std::env::temp_dir().join("ifa_test_db_pagination");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let mut db = Database::open(&temp_dir).expect("Failed to open DB");
+        for i in 0..10 {
+            let key = format!("item:{:02}", i);
+            let val = format!("val:{}", i);
+            db.put(key.as_bytes(), val.as_bytes()).unwrap();
+        }
+
+        // Test offset-based pagination: page 1 (items 0..4)
+        let p1 = db.paginate(0, 4);
+        assert_eq!(p1.len(), 4);
+        assert_eq!(p1.total, 10);
+        assert!(p1.has_more);
+        assert_eq!(p1.items[0].0, b"item:00");
+        assert_eq!(p1.items[3].0, b"item:03");
+
+        // Page 2 (items 4..8)
+        let p2 = db.paginate(4, 4);
+        assert_eq!(p2.len(), 4);
+        assert!(p2.has_more);
+        assert_eq!(p2.items[0].0, b"item:04");
+
+        // Page 3 (items 8..10)
+        let p3 = db.paginate(8, 4);
+        assert_eq!(p3.len(), 2);
+        assert!(!p3.has_more);
+        assert_eq!(p3.items[0].0, b"item:08");
+        assert_eq!(p3.items[1].0, b"item:09");
+
+        // Test keyset pagination across pages
+        let kp1 = db.paginate_keyset(None, 4);
+        assert_eq!(kp1.len(), 4);
+        assert!(kp1.has_more);
+        assert_eq!(kp1.items[0].0, b"item:00");
+        assert_eq!(kp1.items[3].0, b"item:03");
+        assert_eq!(kp1.next_cursor.as_deref(), Some(b"item:03".as_slice()));
+
+        let kp2 = db.paginate_keyset(kp1.next_cursor.as_deref(), 4);
+        assert_eq!(kp2.len(), 4);
+        assert!(kp2.has_more);
+        assert_eq!(kp2.items[0].0, b"item:04");
+        assert_eq!(kp2.items[3].0, b"item:07");
+        assert_eq!(kp2.next_cursor.as_deref(), Some(b"item:07".as_slice()));
+
+        let kp3 = db.paginate_keyset(kp2.next_cursor.as_deref(), 4);
+        assert_eq!(kp3.len(), 2);
+        assert!(!kp3.has_more);
+        assert_eq!(kp3.items[0].0, b"item:08");
+        assert_eq!(kp3.items[1].0, b"item:09");
+        assert_eq!(kp3.next_cursor, None);
+
+        // Test prefix keyset pagination
+        let pkp = db.paginate_prefix_keyset(b"item:0", None, 5);
+        assert_eq!(pkp.len(), 5);
+        assert!(pkp.has_more);
+        assert_eq!(pkp.items[0].0, b"item:00");
+        assert_eq!(pkp.items[4].0, b"item:04");
+        assert_eq!(pkp.next_cursor.as_deref(), Some(b"item:04".as_slice()));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_db_transaction_query_snapshot() {
+        let temp_dir = std::env::temp_dir().join("ifa_test_db_tx_query");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let mut db = Database::open(&temp_dir).expect("Failed to open DB");
+        db.put(b"k1", b"v1").unwrap();
+        db.put(b"k2", b"v2").unwrap();
+        db.put(b"k3", b"v3").unwrap();
+
+        {
+            let mut tx = db.begin_transaction();
+            tx.delete(b"k2");
+            tx.put(b"k4", b"v4");
+
+            // Verify transaction isolated view
+            let entries = tx.iter();
+            let keys: Vec<&[u8]> = entries.iter().map(|(k, _)| *k).collect();
+            assert_eq!(
+                keys,
+                vec![b"k1".as_slice(), b"k3".as_slice(), b"k4".as_slice()]
+            );
+
+            let page = tx.paginate(0, 2);
+            assert_eq!(page.len(), 2);
+            assert_eq!(page.total, 3);
+            assert!(page.has_more);
+
+            tx.commit().unwrap();
+        }
+
+        assert_eq!(db.len(), 3);
+        assert!(!db.contains_key(b"k2"));
+        assert_eq!(db.get(b"k4").unwrap(), b"v4");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

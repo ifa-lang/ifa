@@ -23,7 +23,10 @@ pub use crypto::{
     Sha256,
 };
 pub use csv::{decode as decode_csv, encode as encode_csv, CsvTable};
-pub use db::{Database, DbError, Transaction, DB_MAGIC, DB_VERSION, PAGE_SIZE};
+pub use db::{
+    Database, DbError, KeysetPage, Page, PrefixScanner, Transaction, DB_MAGIC, DB_VERSION,
+    PAGE_SIZE,
+};
 pub use fmt::{
     decode_hex, encode_hex, escape_str, format_binary, format_float, format_hex, format_hexdump,
     format_octal, pad_center, pad_left, pad_right, unescape_str, write_aligned, write_binary,
