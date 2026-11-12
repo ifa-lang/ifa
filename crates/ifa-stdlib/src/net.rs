@@ -1,15 +1,120 @@
 //! Non-blocking networking, TCP stream management, and multi-connection server (`std::net`).
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{
-    SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs,
+    Ipv4Addr, SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs,
     UdpSocket as StdUdpSocket,
 };
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
 use ifa_runtime::fiber::GLOBAL_SCHEDULER;
 pub use ifa_runtime::reactor::{AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket};
+
+#[cfg(unix)]
+fn sock_set_recv_buffer<T: AsRawFd>(socket: &T, size: usize) -> io::Result<()> {
+    let fd = socket.as_raw_fd();
+    let val = size as libc::c_int;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn sock_get_recv_buffer<T: AsRawFd>(socket: &T) -> io::Result<usize> {
+    let fd = socket.as_raw_fd();
+    let mut val: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&val) as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &mut val as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 {
+        Ok(val as usize)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn sock_set_send_buffer<T: AsRawFd>(socket: &T, size: usize) -> io::Result<()> {
+    let fd = socket.as_raw_fd();
+    let val = size as libc::c_int;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn sock_get_send_buffer<T: AsRawFd>(socket: &T) -> io::Result<usize> {
+    let fd = socket.as_raw_fd();
+    let mut val: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&val) as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &mut val as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 {
+        Ok(val as usize)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn sock_set_recv_buffer<T>(_socket: &T, _size: usize) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sock_get_recv_buffer<T>(_socket: &T) -> io::Result<usize> {
+    Ok(65536)
+}
+
+#[cfg(not(unix))]
+fn sock_set_send_buffer<T>(_socket: &T, _size: usize) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sock_get_send_buffer<T>(_socket: &T) -> io::Result<usize> {
+    Ok(65536)
+}
 
 /// Managed non-blocking TCP Stream.
 pub struct TcpStream {
@@ -126,6 +231,152 @@ impl TcpStream {
             is_open: self.is_open,
         })
     }
+
+    /// Write bytes to the stream non-blockingly. Returns number of bytes written.
+    pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.is_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Stream is closed",
+            ));
+        }
+        self.inner.write(buf)
+    }
+
+    /// Flush the underlying stream.
+    pub fn flush(&mut self) -> io::Result<()> {
+        if !self.is_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Stream is closed",
+            ));
+        }
+        self.inner.flush()
+    }
+
+    /// Peek at incoming data without consuming it from the stream buffer.
+    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.is_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Stream is closed",
+            ));
+        }
+        match self.inner.peek(buf) {
+            Ok(n) => Ok(n),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Sets the read timeout to the timeout specified.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.set_read_timeout(timeout)
+    }
+
+    /// Returns the read timeout of this socket.
+    pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
+        self.inner.read_timeout()
+    }
+
+    /// Sets the write timeout to the timeout specified.
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.set_write_timeout(timeout)
+    }
+
+    /// Returns the write timeout of this socket.
+    pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
+        self.inner.write_timeout()
+    }
+
+    /// Shuts down the read, write, or both halves of this connection.
+    pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        self.inner.shutdown(how)
+    }
+
+    /// Get and clear the last socket error if any.
+    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+        self.inner.take_error()
+    }
+
+    /// Set kernel socket receive buffer size (SO_RCVBUF).
+    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
+        sock_set_recv_buffer(&self.inner, size)
+    }
+
+    /// Retrieve kernel socket receive buffer size (SO_RCVBUF).
+    pub fn recv_buffer_size(&self) -> io::Result<usize> {
+        sock_get_recv_buffer(&self.inner)
+    }
+
+    /// Set kernel socket send buffer size (SO_SNDBUF).
+    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
+        sock_set_send_buffer(&self.inner, size)
+    }
+
+    /// Retrieve kernel socket send buffer size (SO_SNDBUF).
+    pub fn send_buffer_size(&self) -> io::Result<usize> {
+        sock_get_send_buffer(&self.inner)
+    }
+
+    /// Apply standard configuration options to this stream.
+    pub fn apply_config(&self, config: &SocketConfig) -> io::Result<()> {
+        config.apply_tcp(self)
+    }
+}
+
+impl Read for TcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        TcpStream::read(self, buf)
+    }
+}
+
+impl Write for TcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        TcpStream::write(self, buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        TcpStream::flush(self)
+    }
+}
+
+impl Read for &TcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.is_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Stream is closed",
+            ));
+        }
+        match (&self.inner).read(buf) {
+            Ok(n) => Ok(n),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl Write for &TcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.is_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Stream is closed",
+            ));
+        }
+        (&self.inner).write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.is_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Stream is closed",
+            ));
+        }
+        (&self.inner).flush()
+    }
 }
 
 /// Managed non-blocking TCP Listener.
@@ -195,6 +446,16 @@ impl TcpListener {
     /// Close the listener.
     pub fn close(&mut self) {
         self.is_open = false;
+    }
+
+    /// Moves this listener, if possible, into or out of nonblocking mode.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.inner.set_nonblocking(nonblocking)
+    }
+
+    /// Get and clear the last socket error if any.
+    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+        self.inner.take_error()
     }
 }
 
@@ -366,6 +627,119 @@ impl UdpSocket {
         })
     }
 
+    /// Receives data on the socket from the remote address without removing it from the input queue.
+    pub fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        if !self.is_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "UDP socket is closed",
+            ));
+        }
+        match self.inner.peek_from(buf) {
+            Ok(res) => Ok(res),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let dummy: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                Ok((0, dummy))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Receives data on the connected socket without removing it from the input queue.
+    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.is_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "UDP socket is closed",
+            ));
+        }
+        match self.inner.peek(buf) {
+            Ok(n) => Ok(n),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Sets the read timeout to the timeout specified.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.set_read_timeout(timeout)
+    }
+
+    /// Returns the read timeout of this socket.
+    pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
+        self.inner.read_timeout()
+    }
+
+    /// Sets the write timeout to the timeout specified.
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.set_write_timeout(timeout)
+    }
+
+    /// Returns the write timeout of this socket.
+    pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
+        self.inner.write_timeout()
+    }
+
+    /// Get and clear the last socket error if any.
+    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+        self.inner.take_error()
+    }
+
+    /// Join an IPv4 multicast group.
+    pub fn join_multicast_v4(&self, multiaddr: &Ipv4Addr, interface: &Ipv4Addr) -> io::Result<()> {
+        self.inner.join_multicast_v4(multiaddr, interface)
+    }
+
+    /// Leave an IPv4 multicast group.
+    pub fn leave_multicast_v4(&self, multiaddr: &Ipv4Addr, interface: &Ipv4Addr) -> io::Result<()> {
+        self.inner.leave_multicast_v4(multiaddr, interface)
+    }
+
+    /// Set kernel socket receive buffer size (SO_RCVBUF).
+    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
+        sock_set_recv_buffer(&self.inner, size)
+    }
+
+    /// Retrieve kernel socket receive buffer size (SO_RCVBUF).
+    pub fn recv_buffer_size(&self) -> io::Result<usize> {
+        sock_get_recv_buffer(&self.inner)
+    }
+
+    /// Set kernel socket send buffer size (SO_SNDBUF).
+    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
+        sock_set_send_buffer(&self.inner, size)
+    }
+
+    /// Retrieve kernel socket send buffer size (SO_SNDBUF).
+    pub fn send_buffer_size(&self) -> io::Result<usize> {
+        sock_get_send_buffer(&self.inner)
+    }
+
+    /// Non-blocking attempt to read a datagram message into a newly allocated `Datagram`.
+    pub fn recv_datagram(&self, max_size: usize) -> io::Result<Option<Datagram>> {
+        let mut buffer = vec![0u8; max_size];
+        match self.poll_recv_from(&mut buffer)? {
+            Some((n, sender)) => {
+                buffer.truncate(n);
+                Ok(Some(Datagram {
+                    data: buffer,
+                    sender,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Send a datagram message to its destination address.
+    pub fn send_datagram(&self, packet: &Datagram) -> io::Result<usize> {
+        self.send_to(&packet.data, packet.sender)
+    }
+
+    /// Apply standard configuration options to this socket.
+    pub fn apply_config(&self, config: &SocketConfig) -> io::Result<()> {
+        config.apply_udp(self)
+    }
+
     /// Mark socket as closed.
     pub fn close(&mut self) {
         self.is_open = false;
@@ -374,6 +748,205 @@ impl UdpSocket {
     /// Returns true if socket is currently open.
     pub fn is_open(&self) -> bool {
         self.is_open
+    }
+}
+
+/// Ergonomic representation of a network datagram (data payload + remote peer address).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Datagram {
+    pub data: Vec<u8>,
+    pub sender: SocketAddr,
+}
+
+impl Datagram {
+    /// Create a new datagram message.
+    pub fn new(data: Vec<u8>, sender: SocketAddr) -> Self {
+        Self { data, sender }
+    }
+}
+
+/// High-level builder to configure socket options and kernel buffer capacities.
+#[derive(Debug, Clone, Default)]
+pub struct SocketConfig {
+    pub nodelay: Option<bool>,
+    pub ttl: Option<u32>,
+    pub read_timeout: Option<Option<Duration>>,
+    pub write_timeout: Option<Option<Duration>>,
+    pub recv_buffer_size: Option<usize>,
+    pub send_buffer_size: Option<usize>,
+    pub broadcast: Option<bool>,
+}
+
+impl SocketConfig {
+    /// Create an empty configuration builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable or disable Nagle's algorithm (TCP_NODELAY).
+    pub fn nodelay(mut self, enabled: bool) -> Self {
+        self.nodelay = Some(enabled);
+        self
+    }
+
+    /// Set IP Time-To-Live.
+    pub fn ttl(mut self, ttl: u32) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    /// Set socket read timeout.
+    pub fn read_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.read_timeout = Some(timeout);
+        self
+    }
+
+    /// Set socket write timeout.
+    pub fn write_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.write_timeout = Some(timeout);
+        self
+    }
+
+    /// Set kernel socket receive buffer capacity (SO_RCVBUF).
+    pub fn recv_buffer_size(mut self, size: usize) -> Self {
+        self.recv_buffer_size = Some(size);
+        self
+    }
+
+    /// Set kernel socket send buffer capacity (SO_SNDBUF).
+    pub fn send_buffer_size(mut self, size: usize) -> Self {
+        self.send_buffer_size = Some(size);
+        self
+    }
+
+    /// Set SO_BROADCAST option for UDP sockets.
+    pub fn broadcast(mut self, enabled: bool) -> Self {
+        self.broadcast = Some(enabled);
+        self
+    }
+
+    /// Apply configured options to a TCP stream.
+    pub fn apply_tcp(&self, stream: &TcpStream) -> io::Result<()> {
+        if let Some(nd) = self.nodelay {
+            stream.set_nodelay(nd)?;
+        }
+        if let Some(ttl) = self.ttl {
+            stream.set_ttl(ttl)?;
+        }
+        if let Some(to) = self.read_timeout {
+            stream.set_read_timeout(to)?;
+        }
+        if let Some(to) = self.write_timeout {
+            stream.set_write_timeout(to)?;
+        }
+        if let Some(sz) = self.recv_buffer_size {
+            stream.set_recv_buffer_size(sz)?;
+        }
+        if let Some(sz) = self.send_buffer_size {
+            stream.set_send_buffer_size(sz)?;
+        }
+        Ok(())
+    }
+
+    /// Apply configured options to a UDP socket.
+    pub fn apply_udp(&self, socket: &UdpSocket) -> io::Result<()> {
+        if let Some(bc) = self.broadcast {
+            socket.set_broadcast(bc)?;
+        }
+        if let Some(ttl) = self.ttl {
+            socket.set_ttl(ttl)?;
+        }
+        if let Some(to) = self.read_timeout {
+            socket.set_read_timeout(to)?;
+        }
+        if let Some(to) = self.write_timeout {
+            socket.set_write_timeout(to)?;
+        }
+        if let Some(sz) = self.recv_buffer_size {
+            socket.set_recv_buffer_size(sz)?;
+        }
+        if let Some(sz) = self.send_buffer_size {
+            socket.set_send_buffer_size(sz)?;
+        }
+        Ok(())
+    }
+}
+
+/// High-level buffered TCP stream providing ergonomic line-by-line reading and buffered writes.
+pub struct BufferedTcpStream {
+    reader: BufReader<TcpStream>,
+    writer: BufWriter<TcpStream>,
+}
+
+impl BufferedTcpStream {
+    /// Wrap a `TcpStream` with default reader and writer buffer capacities.
+    pub fn new(stream: TcpStream) -> io::Result<Self> {
+        let write_clone = stream.try_clone()?;
+        Ok(Self {
+            reader: BufReader::new(stream),
+            writer: BufWriter::new(write_clone),
+        })
+    }
+
+    /// Wrap a `TcpStream` with explicit reader and writer buffer capacities.
+    pub fn with_capacity(read_cap: usize, write_cap: usize, stream: TcpStream) -> io::Result<Self> {
+        let write_clone = stream.try_clone()?;
+        Ok(Self {
+            reader: BufReader::with_capacity(read_cap, stream),
+            writer: BufWriter::with_capacity(write_cap, write_clone),
+        })
+    }
+
+    /// Read a line of text (ending with '\n' or '\r\n') from the stream.
+    /// Returns `Ok(Some(line))` without trailing newline, or `Ok(None)` on EOF or if would block with 0 bytes.
+    pub fn read_line(&mut self) -> io::Result<Option<String>> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => Ok(None),
+            Ok(_) => {
+                if line.ends_with('\n') {
+                    line.pop();
+                    if line.ends_with('\r') {
+                        line.pop();
+                    }
+                }
+                Ok(Some(line))
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Write a string slice followed by a newline and flush.
+    pub fn write_line(&mut self, line: &str) -> io::Result<()> {
+        self.writer.write_all(line.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()
+    }
+
+    /// Write all bytes into the writer buffer.
+    pub fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.writer.write_all(buf)
+    }
+
+    /// Flush buffered writes to the underlying stream.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+
+    /// Reference to the underlying read stream.
+    pub fn stream(&self) -> &TcpStream {
+        self.reader.get_ref()
+    }
+
+    /// Mutable reference to the underlying read stream.
+    pub fn stream_mut(&mut self) -> &mut TcpStream {
+        self.reader.get_mut()
+    }
+
+    /// Unwraps this buffered stream, returning the underlying reader `TcpStream`.
+    pub fn into_inner(self) -> TcpStream {
+        self.reader.into_inner()
     }
 }
 
@@ -2398,5 +2971,114 @@ mod tests {
 
         // Timer
         AsyncTimer::sleep(Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_high_level_buffered_stream_and_socket_config() {
+        use super::{BufferedTcpStream, Datagram, SocketConfig, TcpListener, TcpStream, UdpSocket};
+
+        // 1. SocketConfig on TCP stream and buffered stream
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.port().expect("port");
+
+        let config = SocketConfig::new()
+            .nodelay(true)
+            .ttl(64)
+            .read_timeout(Some(Duration::from_millis(500)))
+            .write_timeout(Some(Duration::from_millis(500)))
+            .recv_buffer_size(32768)
+            .send_buffer_size(32768);
+
+        let client = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect client");
+        client.apply_config(&config).expect("apply config");
+        assert!(client.nodelay().unwrap());
+        assert_eq!(client.ttl().unwrap(), 64);
+        assert!(client.recv_buffer_size().unwrap() >= 1024);
+        assert!(client.send_buffer_size().unwrap() >= 1024);
+        assert!(client.take_error().unwrap().is_none());
+        assert!(listener.take_error().unwrap().is_none());
+
+        let (server_raw, _) = listener.try_accept().expect("accept").expect("connection");
+        let mut client_buf = BufferedTcpStream::new(client).expect("buffered client");
+        let mut server_buf = BufferedTcpStream::new(server_raw).expect("buffered server");
+
+        // Write lines from client
+        client_buf.write_line("HELLO WORLD").expect("write line 1");
+        client_buf.write_line("SECOND LINE").expect("write line 2");
+
+        // Read lines from server (non-blocking loop with small spin/yield)
+        let mut read_lines = Vec::new();
+        for _ in 0..100 {
+            if let Some(line) = server_buf.read_line().expect("read line") {
+                read_lines.push(line);
+                if read_lines.len() == 2 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(read_lines, vec!["HELLO WORLD", "SECOND LINE"]);
+
+        // Peek on server stream
+        let mut peek_buf = [0u8; 4];
+        client_buf.write_all(b"TEST").expect("write test");
+        client_buf.flush().expect("flush");
+        let mut peek_n = 0;
+        for _ in 0..100 {
+            peek_n = server_buf.stream().peek(&mut peek_buf).unwrap();
+            if peek_n > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(peek_n, 4);
+        assert_eq!(&peek_buf, b"TEST");
+
+        // 2. Datagram and high-level UDP operations
+        let udp1 = UdpSocket::bind("127.0.0.1:0").expect("bind udp1");
+        let udp2 = UdpSocket::bind("127.0.0.1:0").expect("bind udp2");
+        let udp2_addr = udp2.local_addr().expect("udp2 addr");
+
+        let udp_config = SocketConfig::new()
+            .ttl(32)
+            .broadcast(false)
+            .recv_buffer_size(32768)
+            .send_buffer_size(32768);
+        udp1.apply_config(&udp_config).expect("apply config udp1");
+        assert_eq!(udp1.ttl().unwrap(), 32);
+        assert!(!udp1.broadcast().unwrap());
+        assert!(udp1.take_error().unwrap().is_none());
+
+        let packet = Datagram::new(b"DATAGRAM_PACKET".to_vec(), udp2_addr);
+        let sent = udp1.send_datagram(&packet).expect("send datagram");
+        assert_eq!(sent, 15);
+
+        // Peek from udp2
+        let mut udp_peek_buf = [0u8; 32];
+        let mut peeked = false;
+        for _ in 0..50 {
+            let (n, from) = udp2.peek_from(&mut udp_peek_buf).expect("peek_from");
+            if n > 0 {
+                assert_eq!(&udp_peek_buf[..n], b"DATAGRAM_PACKET");
+                assert_eq!(from.port(), udp1.port().unwrap());
+                peeked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(peeked);
+
+        // Recv datagram on udp2
+        let mut received = None;
+        for _ in 0..50 {
+            if let Some(dg) = udp2.recv_datagram(64).expect("recv datagram") {
+                received = Some(dg);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let dg = received.expect("datagram received");
+        assert_eq!(&dg.data, b"DATAGRAM_PACKET");
+        assert_eq!(dg.sender.port(), udp1.port().unwrap());
     }
 }
