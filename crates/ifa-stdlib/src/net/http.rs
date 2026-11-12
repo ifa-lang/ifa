@@ -510,6 +510,42 @@ impl HttpRequestHead {
             None => HashMap::new(),
         }
     }
+
+    /// Extract parsed `Cache-Control` directive from request headers.
+    pub fn cache_control(&self) -> Option<CacheControl> {
+        self.headers.get("cache-control").map(CacheControl::parse)
+    }
+
+    /// Return the raw Authorization header value if present.
+    pub fn authorization(&self) -> Option<&str> {
+        self.headers.get(HeaderMap::AUTHORIZATION)
+    }
+
+    /// Extract Bearer token from Authorization header (RFC 6750).
+    pub fn bearer_token(&self) -> Option<String> {
+        self.authorization().and_then(parse_bearer_token)
+    }
+
+    /// Extract Basic Auth credentials (username, password) from Authorization header.
+    pub fn basic_auth(&self) -> Option<(String, String)> {
+        self.authorization().and_then(parse_basic_auth)
+    }
+
+    /// Set standard Bearer token in Authorization header.
+    pub fn set_bearer_auth(&mut self, token: impl AsRef<str>) {
+        self.headers.insert(
+            HeaderMap::AUTHORIZATION,
+            format!("Bearer {}", token.as_ref()),
+        );
+    }
+
+    /// Set standard Basic Authentication credentials in Authorization header.
+    pub fn set_basic_auth(&mut self, username: &str, password: &str) {
+        self.headers.insert(
+            HeaderMap::AUTHORIZATION,
+            encode_basic_auth(username, password),
+        );
+    }
 }
 
 /// HTTP Response Header metadata.
@@ -1851,6 +1887,47 @@ impl fmt::Display for CacheControl {
     }
 }
 
+/// Encode username and password into a standard HTTP Basic Authorization header value.
+pub fn encode_basic_auth(username: &str, password: &str) -> String {
+    let creds = format!("{}:{}", username, password);
+    let encoded = crate::crypto::base64_encode(creds.as_bytes());
+    format!("Basic {}", encoded)
+}
+
+/// Parse HTTP Basic Authentication credentials from an Authorization header value.
+pub fn parse_basic_auth(header_val: &str) -> Option<(String, String)> {
+    let trimmed = header_val.trim();
+    if trimmed.len() < 6 {
+        return None;
+    }
+    let (scheme, rest) = trimmed.split_at(6);
+    if !scheme.eq_ignore_ascii_case("basic ") {
+        return None;
+    }
+    let decoded_bytes = crate::crypto::base64_decode(rest.trim()).ok()?;
+    let decoded_str = String::from_utf8(decoded_bytes).ok()?;
+    let (user, pass) = decoded_str.split_once(':')?;
+    Some((user.to_string(), pass.to_string()))
+}
+
+/// Parse Bearer token from an Authorization header value (RFC 6750).
+pub fn parse_bearer_token(header_val: &str) -> Option<String> {
+    let trimmed = header_val.trim();
+    if trimmed.len() < 7 {
+        return None;
+    }
+    let (scheme, rest) = trimmed.split_at(7);
+    if !scheme.eq_ignore_ascii_case("bearer ") {
+        return None;
+    }
+    let token = rest.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
 /// Parsed HTTP URL (RFC 3986 basic subset).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpUrl {
@@ -2156,6 +2233,34 @@ impl HttpRequest {
 
     pub fn cookies(&self) -> Vec<Cookie> {
         self.head.cookies()
+    }
+
+    pub fn cache_control(&self) -> Option<CacheControl> {
+        self.head.cache_control()
+    }
+
+    pub fn authorization(&self) -> Option<&str> {
+        self.head.authorization()
+    }
+
+    pub fn bearer_token(&self) -> Option<String> {
+        self.head.bearer_token()
+    }
+
+    pub fn basic_auth(&self) -> Option<(String, String)> {
+        self.head.basic_auth()
+    }
+
+    /// Add or update Bearer authorization header, returning self.
+    pub fn with_bearer_auth(mut self, token: impl AsRef<str>) -> Self {
+        self.head.set_bearer_auth(token);
+        self
+    }
+
+    /// Add or update Basic authorization header, returning self.
+    pub fn with_basic_auth(mut self, username: &str, password: &str) -> Self {
+        self.head.set_basic_auth(username, password);
+        self
     }
 
     pub fn is_multipart(&self) -> bool {
@@ -2690,6 +2795,26 @@ impl HttpClient {
     ) -> Result<HttpResponse, HttpClientError> {
         self.request_with_headers(request.method(), url, request.headers(), request.body())
     }
+
+    /// Return a copy of this client configured with Bearer authentication.
+    pub fn with_bearer_auth(&self, token: impl AsRef<str>) -> Self {
+        let mut client = self.clone();
+        client.default_headers.insert(
+            HeaderMap::AUTHORIZATION,
+            format!("Bearer {}", token.as_ref()),
+        );
+        client
+    }
+
+    /// Return a copy of this client configured with HTTP Basic authentication.
+    pub fn with_basic_auth(&self, username: &str, password: &str) -> Self {
+        let mut client = self.clone();
+        client.default_headers.insert(
+            HeaderMap::AUTHORIZATION,
+            encode_basic_auth(username, password),
+        );
+        client
+    }
 }
 
 /// Builder for configuring custom `HttpClient` instances.
@@ -2729,6 +2854,24 @@ impl HttpClientBuilder {
 
     pub fn header(mut self, name: impl Into<String>, val: impl Into<String>) -> Self {
         self.headers.insert(name, val);
+        self
+    }
+
+    /// Set standard HTTP Bearer token authorization header.
+    pub fn bearer_auth(mut self, token: impl AsRef<str>) -> Self {
+        self.headers.insert(
+            HeaderMap::AUTHORIZATION,
+            format!("Bearer {}", token.as_ref()),
+        );
+        self
+    }
+
+    /// Set standard HTTP Basic authentication credentials.
+    pub fn basic_auth(mut self, username: &str, password: &str) -> Self {
+        self.headers.insert(
+            HeaderMap::AUTHORIZATION,
+            encode_basic_auth(username, password),
+        );
         self
     }
 
@@ -3852,6 +3995,126 @@ mod tests {
         let resp = send_request(&url, &client_req).expect("send request");
         assert_eq!(resp.status(), HttpStatus::OK);
         assert_eq!(resp.text().unwrap(), "patched-ok");
+
+        handle.join().expect("server thread finished");
+    }
+
+    #[test]
+    fn test_http_authentication_and_cache_control_helpers() {
+        // 1. Basic Auth encoding and decoding
+        let encoded = encode_basic_auth("aladdin", "open sesame");
+        assert_eq!(encoded, "Basic YWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+        let (user, pass) = parse_basic_auth(&encoded).expect("parse basic auth");
+        assert_eq!(user, "aladdin");
+        assert_eq!(pass, "open sesame");
+
+        assert!(parse_basic_auth("Bearer token123").is_none());
+        assert!(parse_basic_auth("invalid").is_none());
+
+        // 2. Bearer Token parsing
+        let token_hdr = "Bearer secret-jwt-token-xyz_456";
+        assert_eq!(
+            parse_bearer_token(token_hdr),
+            Some("secret-jwt-token-xyz_456".to_string())
+        );
+        assert_eq!(
+            parse_bearer_token("bearer lowercase-token"),
+            Some("lowercase-token".to_string())
+        );
+        assert!(parse_bearer_token("Basic 1234").is_none());
+        assert!(parse_bearer_token("Bearer ").is_none());
+
+        // 3. HttpRequest builders with auth and Cache-Control
+        let req_bearer = HttpRequest::get("/protected")
+            .with_bearer_auth("token-abc")
+            .with_header("Cache-Control", "no-cache, max-age=3600");
+        assert_eq!(req_bearer.authorization(), Some("Bearer token-abc"));
+        assert_eq!(req_bearer.bearer_token(), Some("token-abc".to_string()));
+        assert!(req_bearer.basic_auth().is_none());
+
+        let cc = req_bearer.cache_control().expect("cache control present");
+        assert!(cc.no_cache);
+        assert_eq!(cc.max_age, Some(3600));
+
+        let req_basic =
+            HttpRequest::post("/login", b"".to_vec(), None).with_basic_auth("admin", "p@ssw0rd");
+        assert_eq!(
+            req_basic.basic_auth(),
+            Some(("admin".to_string(), "p@ssw0rd".to_string()))
+        );
+
+        // 4. Client server exchange verifying auth headers
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.port().expect("port");
+
+        let handle = thread::spawn(move || {
+            // First request: Bearer auth
+            let mut s1 = None;
+            for _ in 0..100 {
+                if let Ok(Some((s, _))) = listener.try_accept() {
+                    s1 = Some(s);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let s1 = s1.expect("accept s1");
+            s1.set_nonblocking(false).expect("blocking");
+            let mut buf1 = BufferedTcpStream::new(s1).unwrap();
+            let req1 = read_request_object(&mut buf1, 1024).unwrap().unwrap();
+            assert_eq!(req1.bearer_token().as_deref(), Some("client-secret-token"));
+
+            let mut resp1_head = HttpResponseHead::ok();
+            resp1_head.headers.insert("Connection", "close");
+            write_http_response(
+                &mut buf1,
+                &HttpResponse::new(resp1_head, b"auth-ok".to_vec()),
+            )
+            .unwrap();
+
+            // Second request: Basic auth
+            let mut s2 = None;
+            for _ in 0..100 {
+                if let Ok(Some((s, _))) = listener.try_accept() {
+                    s2 = Some(s);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let s2 = s2.expect("accept s2");
+            s2.set_nonblocking(false).expect("blocking");
+            let mut buf2 = BufferedTcpStream::new(s2).unwrap();
+            let req2 = read_request_object(&mut buf2, 1024).unwrap().unwrap();
+            assert_eq!(
+                req2.basic_auth(),
+                Some(("alice".to_string(), "secret-key".to_string()))
+            );
+
+            let mut resp2_head = HttpResponseHead::ok();
+            resp2_head.headers.insert("Connection", "close");
+            write_http_response(
+                &mut buf2,
+                &HttpResponse::new(resp2_head, b"basic-ok".to_vec()),
+            )
+            .unwrap();
+        });
+
+        // Client 1: Bearer auth via client builder
+        let client_bearer = HttpClient::builder()
+            .bearer_auth("client-secret-token")
+            .build();
+        let resp_b = client_bearer
+            .get(&format!("http://127.0.0.1:{}/protected", port))
+            .expect("get with bearer");
+        assert_eq!(resp_b.status(), HttpStatus::OK);
+        assert_eq!(resp_b.text().unwrap(), "auth-ok");
+
+        // Client 2: Basic auth via with_basic_auth
+        let client_basic = HttpClient::new().with_basic_auth("alice", "secret-key");
+        let resp_basic = client_basic
+            .get(&format!("http://127.0.0.1:{}/secure", port))
+            .expect("get with basic");
+        assert_eq!(resp_basic.status(), HttpStatus::OK);
+        assert_eq!(resp_basic.text().unwrap(), "basic-ok");
 
         handle.join().expect("server thread finished");
     }
