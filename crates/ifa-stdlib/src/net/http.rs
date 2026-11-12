@@ -299,9 +299,7 @@ impl HeaderMap {
             let removed_val = self.entries.remove(removed_idx).1;
             self.lookup.clear();
             for (i, (k, _)) in self.entries.iter().enumerate() {
-                self.lookup
-                    .entry(k.to_ascii_lowercase())
-                    .or_insert(i);
+                self.lookup.entry(k.to_ascii_lowercase()).or_insert(i);
             }
             Some(removed_val)
         } else {
@@ -445,7 +443,9 @@ impl fmt::Display for HttpParseError {
             HttpParseError::HeaderTooLarge => write!(f, "HTTP header exceeds allowed size"),
             HttpParseError::TooManyHeaders => write!(f, "Too many HTTP headers in request"),
             HttpParseError::InvalidChunkSize => write!(f, "Malformed chunked transfer size"),
-            HttpParseError::InvalidChunkFraming => write!(f, "Invalid chunk framing or missing CRLF"),
+            HttpParseError::InvalidChunkFraming => {
+                write!(f, "Invalid chunk framing or missing CRLF")
+            }
             HttpParseError::UnexpectedEof => write!(f, "Unexpected end of stream"),
             HttpParseError::Io(err) => write!(f, "I/O error during HTTP processing: {}", err),
         }
@@ -507,8 +507,8 @@ pub fn parse_request_head(
     }
 
     let header_bytes = &buf[..header_end];
-    let header_text = std::str::from_utf8(header_bytes)
-        .map_err(|_| HttpParseError::InvalidHeader)?;
+    let header_text =
+        std::str::from_utf8(header_bytes).map_err(|_| HttpParseError::InvalidHeader)?;
 
     let mut lines = header_text.split("\r\n");
     let req_line = lines.next().ok_or(HttpParseError::Incomplete)?;
@@ -579,8 +579,8 @@ pub fn parse_response_head(
     }
 
     let header_bytes = &buf[..header_end];
-    let header_text = std::str::from_utf8(header_bytes)
-        .map_err(|_| HttpParseError::InvalidHeader)?;
+    let header_text =
+        std::str::from_utf8(header_bytes).map_err(|_| HttpParseError::InvalidHeader)?;
 
     let mut lines = header_text.split("\r\n");
     let status_line = lines.next().ok_or(HttpParseError::Incomplete)?;
@@ -640,17 +640,13 @@ pub fn parse_chunk(
         None => return Ok(None),
     };
 
-    let size_line = std::str::from_utf8(&buf[..first_crlf])
-        .map_err(|_| HttpParseError::InvalidChunkSize)?;
+    let size_line =
+        std::str::from_utf8(&buf[..first_crlf]).map_err(|_| HttpParseError::InvalidChunkSize)?;
     // RFC 7230 §4.1.1: chunk-size [ chunk-ext ]
-    let size_hex = size_line
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim();
+    let size_hex = size_line.split(';').next().unwrap_or("").trim();
 
-    let chunk_len = usize::from_str_radix(size_hex, 16)
-        .map_err(|_| HttpParseError::InvalidChunkSize)?;
+    let chunk_len =
+        usize::from_str_radix(size_hex, 16).map_err(|_| HttpParseError::InvalidChunkSize)?;
 
     if chunk_len > max_chunk_size {
         return Err(HttpParseError::InvalidChunkSize);
@@ -722,8 +718,8 @@ pub fn decode_chunked_body<R: BufRead>(
 
         let trimmed = line_buf.trim();
         let size_hex = trimmed.split(';').next().unwrap_or("").trim();
-        let chunk_size = usize::from_str_radix(size_hex, 16)
-            .map_err(|_| HttpParseError::InvalidChunkSize)?;
+        let chunk_size =
+            usize::from_str_radix(size_hex, 16).map_err(|_| HttpParseError::InvalidChunkSize)?;
 
         if chunk_size == 0 {
             // Read trailers until empty line
@@ -812,7 +808,12 @@ pub fn encode_chunk_end_to<W: Write>(
 /// Format an `HttpRequestHead` into standard wire bytes.
 pub fn format_request_head(head: &HttpRequestHead) -> Vec<u8> {
     let mut out = Vec::with_capacity(256);
-    let line = format!("{} {} {}\r\n", head.method.as_str(), head.uri, head.version.as_str());
+    let line = format!(
+        "{} {} {}\r\n",
+        head.method.as_str(),
+        head.uri,
+        head.version.as_str()
+    );
     out.extend_from_slice(line.as_bytes());
 
     for (k, v) in head.headers.iter() {
@@ -879,8 +880,7 @@ pub fn read_request(
         }
     }
 
-    let (head, _) = parse_request_head(&header_buf, &config)?
-        .ok_or(HttpParseError::Incomplete)?;
+    let (head, _) = parse_request_head(&header_buf, &config)?.ok_or(HttpParseError::Incomplete)?;
 
     let body = if head.is_chunked() {
         let (chunked_body, _) = decode_chunked_body(stream, max_body_size)?;
@@ -935,8 +935,7 @@ pub fn read_response(
         }
     }
 
-    let (head, _) = parse_response_head(&header_buf, &config)?
-        .ok_or(HttpParseError::Incomplete)?;
+    let (head, _) = parse_response_head(&header_buf, &config)?.ok_or(HttpParseError::Incomplete)?;
 
     // Handle body framing
     let body = if head.status == HttpStatus::NO_CONTENT || head.status == HttpStatus::NOT_MODIFIED {
@@ -1022,17 +1021,29 @@ mod tests {
 
     #[test]
     fn test_http_version_and_method() {
-        assert_eq!(HttpVersion::from_bytes(b"HTTP/1.1").unwrap(), HttpVersion::Http11);
-        assert_eq!(HttpVersion::from_bytes(b"HTTP/1.0").unwrap(), HttpVersion::Http10);
+        assert_eq!(
+            HttpVersion::from_bytes(b"HTTP/1.1").unwrap(),
+            HttpVersion::Http11
+        );
+        assert_eq!(
+            HttpVersion::from_bytes(b"HTTP/1.0").unwrap(),
+            HttpVersion::Http10
+        );
         assert!(HttpVersion::from_bytes(b"HTTP/2.0").is_err());
 
         assert_eq!(HttpMethod::from_bytes(b"GET").unwrap(), HttpMethod::Get);
         assert_eq!(HttpMethod::from_bytes(b"POST").unwrap(), HttpMethod::Post);
         assert_eq!(HttpMethod::from_bytes(b"PUT").unwrap(), HttpMethod::Put);
-        assert_eq!(HttpMethod::from_bytes(b"DELETE").unwrap(), HttpMethod::Delete);
+        assert_eq!(
+            HttpMethod::from_bytes(b"DELETE").unwrap(),
+            HttpMethod::Delete
+        );
         assert_eq!(HttpMethod::from_bytes(b"PATCH").unwrap(), HttpMethod::Patch);
         assert_eq!(HttpMethod::from_bytes(b"HEAD").unwrap(), HttpMethod::Head);
-        assert_eq!(HttpMethod::from_bytes(b"OPTIONS").unwrap(), HttpMethod::Options);
+        assert_eq!(
+            HttpMethod::from_bytes(b"OPTIONS").unwrap(),
+            HttpMethod::Options
+        );
         assert!(HttpMethod::from_bytes(b"INVALID").is_err());
     }
 
@@ -1169,7 +1180,9 @@ mod tests {
             resp_head.headers.insert("Content-Type", "text/plain");
 
             let wire_head = format_response_head(&resp_head);
-            server_buf.write_all(&wire_head).expect("write response head");
+            server_buf
+                .write_all(&wire_head)
+                .expect("write response head");
             encode_chunk_to(&mut server_buf, b"pong-").expect("chunk 1");
             encode_chunk_to(&mut server_buf, b"payload").expect("chunk 2");
             encode_chunk_end_to(&mut server_buf, None).expect("end chunk");
@@ -1183,7 +1196,8 @@ mod tests {
 
         let mut req_head = HttpRequestHead::new(HttpMethod::Post, "/echo", HttpVersion::Http11);
         req_head.headers.insert("Host", "localhost");
-        write_request_full(&mut client_buf, &req_head, b"ping-payload").expect("write request full");
+        write_request_full(&mut client_buf, &req_head, b"ping-payload")
+            .expect("write request full");
 
         let (resp_head, resp_body) = read_response(&mut client_buf, 65536)
             .expect("read response")
@@ -1195,4 +1209,3 @@ mod tests {
         handle.join().expect("server thread finished");
     }
 }
-
