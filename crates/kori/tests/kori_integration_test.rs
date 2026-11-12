@@ -7,6 +7,7 @@ use kori::lockfile::{LockedPackage, Lockfile};
 use kori::manifest::{
     CrateType, DependencySpec, Manifest, PackageMetadata, ProfileConfig, TargetsConfig,
 };
+use kori::packager::Packager;
 use kori::resolver::DependencyResolver;
 use std::collections::BTreeMap;
 use std::fs;
