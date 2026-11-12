@@ -70,7 +70,9 @@ pub use io::{
 };
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};
 pub use json::{
-    decode as decode_json, encode as encode_json, encode_pretty as encode_json_pretty, JsonValue,
+    create_merge_patch, create_patch as create_json_patch, decode as decode_json,
+    diff as diff_json, encode as encode_json, encode_pretty as encode_json_pretty,
+    parse_patch as parse_json_patch, JsonValue, PatchOperation,
 };
 pub use net::{
     lookup_mime_type, AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket,

@@ -452,6 +452,16 @@ impl JsonValue {
         let ops = parse_patch(patch_doc)?;
         self.apply_patch(&ops)
     }
+
+    /// Compute the RFC 6902 JSON Patch operations required to transform this document into `target`.
+    pub fn diff(&self, target: &JsonValue) -> Vec<PatchOperation> {
+        diff(self, target)
+    }
+
+    /// Compute an RFC 6902 JSON Patch document required to transform this document into `target`.
+    pub fn create_patch(&self, target: &JsonValue) -> JsonValue {
+        create_patch(self, target)
+    }
 }
 
 /// Decode a JSON Pointer reference token according to RFC 6901 (`~1` -> `/`, `~0` -> `~`).
@@ -661,6 +671,114 @@ pub fn create_merge_patch(source: &JsonValue, target: &JsonValue) -> JsonValue {
             } else {
                 target.clone()
             }
+        }
+    }
+}
+
+/// Compute an RFC 6902 JSON Patch sequence of operations representing the minimal differences to transform `source` into `target`.
+pub fn diff(source: &JsonValue, target: &JsonValue) -> Vec<PatchOperation> {
+    let mut ops = Vec::new();
+    diff_recursive(source, target, "", &mut ops);
+    ops
+}
+
+/// Compute an RFC 6902 JSON Patch array document representing the minimal differences to transform `source` into `target`.
+pub fn create_patch(source: &JsonValue, target: &JsonValue) -> JsonValue {
+    let ops = diff(source, target);
+    JsonValue::Array(ops.into_iter().map(|op| op.to_json()).collect())
+}
+
+fn diff_recursive(
+    source: &JsonValue,
+    target: &JsonValue,
+    path: &str,
+    ops: &mut Vec<PatchOperation>,
+) {
+    if source == target {
+        return;
+    }
+
+    match (source, target) {
+        (JsonValue::Object(s_map), JsonValue::Object(t_map)) => {
+            // 1. Remove deleted keys
+            for k in s_map.keys() {
+                if !t_map.contains_key(k) {
+                    let child_path = if path.is_empty() {
+                        format!("/{}", encode_pointer_token(k))
+                    } else {
+                        format!("{}/{}", path, encode_pointer_token(k))
+                    };
+                    ops.push(PatchOperation::Remove { path: child_path });
+                }
+            }
+
+            // 2. Add new keys or recurse on modified keys
+            for (k, t_val) in t_map {
+                let child_path = if path.is_empty() {
+                    format!("/{}", encode_pointer_token(k))
+                } else {
+                    format!("{}/{}", path, encode_pointer_token(k))
+                };
+                match s_map.get(k) {
+                    None => {
+                        ops.push(PatchOperation::Add {
+                            path: child_path,
+                            value: t_val.clone(),
+                        });
+                    }
+                    Some(s_val) => {
+                        if s_val != t_val {
+                            diff_recursive(s_val, t_val, &child_path, ops);
+                        }
+                    }
+                }
+            }
+        }
+        (JsonValue::Array(s_arr), JsonValue::Array(t_arr)) => {
+            let s_len = s_arr.len();
+            let t_len = t_arr.len();
+            let min_len = s_len.min(t_len);
+
+            // 1. Elements at common indices
+            for i in 0..min_len {
+                if s_arr[i] != t_arr[i] {
+                    let child_path = if path.is_empty() {
+                        format!("/{}", i)
+                    } else {
+                        format!("{}/{}", path, i)
+                    };
+                    diff_recursive(&s_arr[i], &t_arr[i], &child_path, ops);
+                }
+            }
+
+            // 2. Truncate extra elements from the end to preserve remaining offsets
+            for i in (t_len..s_len).rev() {
+                let child_path = if path.is_empty() {
+                    format!("/{}", i)
+                } else {
+                    format!("{}/{}", path, i)
+                };
+                ops.push(PatchOperation::Remove { path: child_path });
+            }
+
+            // 3. Append extra elements to the end
+            for (i, item) in t_arr.iter().enumerate().skip(s_len) {
+                let child_path = if path.is_empty() {
+                    format!("/{}", i)
+                } else {
+                    format!("{}/{}", path, i)
+                };
+                ops.push(PatchOperation::Add {
+                    path: child_path,
+                    value: item.clone(),
+                });
+            }
+        }
+        _ => {
+            ops.push(PatchOperation::Replace {
+                path: path.to_string(),
+                value: target.clone(),
+            });
         }
     }
 }
@@ -1385,5 +1503,71 @@ mod tests {
             doc, backup,
             "Document must remain unchanged after failed patch"
         );
+    }
+
+    #[test]
+    fn test_json_patch_diff() {
+        // 1. Identical documents produce empty patch
+        let doc1 = decode(r#"{"a": 1, "b": [2, 3]}"#).unwrap();
+        let ops = diff(&doc1, &doc1);
+        assert!(ops.is_empty());
+
+        // 2. Complex object diff and roundtrip
+        let source_raw = r#"{
+            "title": "Document V1",
+            "author": "Alice",
+            "deprecated_field": true,
+            "stats": {
+                "views": 100,
+                "likes": 10
+            },
+            "tags": ["compiler", "systems"],
+            "escaped/key~name": 42
+        }"#;
+
+        let target_raw = r#"{
+            "title": "Document V2",
+            "stats": {
+                "views": 150,
+                "likes": 10,
+                "shares": 5
+            },
+            "tags": ["compiler", "ifa", "virtual-machine"],
+            "published": true,
+            "escaped/key~name": 99
+        }"#;
+
+        let source = decode(source_raw).unwrap();
+        let target = decode(target_raw).unwrap();
+
+        let patch_doc = create_patch(&source, &target);
+        assert!(patch_doc.is_array());
+
+        let mut transformed = source.clone();
+        let res = transformed.apply_json_patch(&patch_doc);
+        assert!(res.is_ok(), "apply_json_patch failed: {:?}", res);
+        assert_eq!(transformed, target, "Transformed document must match target");
+
+        // 3. Array truncation diff
+        let arr_source = decode(r#"[1, 2, 3, 4, 5]"#).unwrap();
+        let arr_target = decode(r#"[1, 99]"#).unwrap();
+        let mut arr_transformed = arr_source.clone();
+        let arr_patch = create_patch(&arr_source, &arr_target);
+        arr_transformed.apply_json_patch(&arr_patch).unwrap();
+        assert_eq!(arr_transformed, arr_target);
+
+        // 4. Primitive / Type change diff
+        let prim_source = decode(r#"{"val": 123}"#).unwrap();
+        let prim_target = decode(r#"{"val": "one-two-three"}"#).unwrap();
+        let mut prim_transformed = prim_source.clone();
+        let prim_patch = create_patch(&prim_source, &prim_target);
+        prim_transformed.apply_json_patch(&prim_patch).unwrap();
+        assert_eq!(prim_transformed, prim_target);
+
+        // 5. Method syntax on JsonValue
+        let ops_method = source.diff(&target);
+        assert_eq!(ops_method, diff(&source, &target));
+        let patch_method = source.create_patch(&target);
+        assert_eq!(patch_method, patch_doc);
     }
 }
