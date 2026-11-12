@@ -951,6 +951,61 @@ impl BufferedTcpStream {
         self.reader.get_mut()
     }
 
+    /// Returns the data currently buffered in the reader without reading from the OS socket.
+    pub fn buffer(&self) -> &[u8] {
+        self.reader.buffer()
+    }
+
+    /// Returns the number of bytes currently buffered in the reader.
+    pub fn buffer_len(&self) -> usize {
+        self.reader.buffer().len()
+    }
+
+    /// Returns the reader and writer buffer capacities `(read_capacity, write_capacity)`.
+    pub fn capacity(&self) -> (usize, usize) {
+        (self.reader.capacity(), self.writer.capacity())
+    }
+
+    /// Returns the remote peer socket address.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.reader.get_ref().peer_addr()
+    }
+
+    /// Returns the local socket address.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.reader.get_ref().local_addr()
+    }
+
+    /// Sets `TCP_NODELAY` on the underlying connection.
+    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        self.reader.get_ref().set_nodelay(nodelay)
+    }
+
+    /// Gets `TCP_NODELAY` status of the connection.
+    pub fn nodelay(&self) -> io::Result<bool> {
+        self.reader.get_ref().nodelay()
+    }
+
+    /// Sets read timeout on the underlying socket.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.reader.get_ref().set_read_timeout(timeout)
+    }
+
+    /// Gets read timeout of the underlying socket.
+    pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
+        self.reader.get_ref().read_timeout()
+    }
+
+    /// Sets write timeout on the underlying socket.
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.writer.get_ref().set_write_timeout(timeout)
+    }
+
+    /// Gets write timeout of the underlying socket.
+    pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
+        self.writer.get_ref().write_timeout()
+    }
+
     /// Unwraps this buffered stream, returning the underlying reader `TcpStream`.
     pub fn into_inner(self) -> TcpStream {
         self.reader.into_inner()
@@ -3113,5 +3168,51 @@ mod tests {
         let dg = received.expect("datagram received");
         assert_eq!(&dg.data, b"DATAGRAM_PACKET");
         assert_eq!(dg.sender.port(), udp1.port().unwrap());
+    }
+
+    #[test]
+    fn test_buffered_tcp_stream_capabilities() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.port().expect("port");
+        let client = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect");
+        let (server_raw, _) = listener.try_accept().expect("accept").expect("stream");
+
+        let client_buf = BufferedTcpStream::with_capacity(8192, 4096, client).expect("client buf");
+        let server_buf = BufferedTcpStream::new(server_raw).expect("server buf");
+
+        // Capacities
+        let (rcap, wcap) = client_buf.capacity();
+        assert_eq!(rcap, 8192);
+        assert_eq!(wcap, 4096);
+
+        // Addresses
+        let c_peer = client_buf.peer_addr().expect("peer addr");
+        let s_local = server_buf.local_addr().expect("local addr");
+        assert_eq!(c_peer.port(), s_local.port());
+
+        // TCP options
+        client_buf.set_nodelay(true).expect("set nodelay");
+        assert!(client_buf.nodelay().expect("get nodelay"));
+
+        // Timeouts
+        client_buf
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set read timeout");
+        assert_eq!(
+            client_buf.read_timeout().expect("get read timeout"),
+            Some(Duration::from_millis(500))
+        );
+
+        client_buf
+            .set_write_timeout(Some(Duration::from_millis(600)))
+            .expect("set write timeout");
+        assert_eq!(
+            client_buf.write_timeout().expect("get write timeout"),
+            Some(Duration::from_millis(600))
+        );
+
+        // Buffer inspections
+        assert!(client_buf.buffer().is_empty());
+        assert_eq!(client_buf.buffer_len(), 0);
     }
 }

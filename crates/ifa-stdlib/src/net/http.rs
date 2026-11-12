@@ -845,6 +845,34 @@ pub enum Chunk {
     End { trailers: HeaderMap },
 }
 
+impl Chunk {
+    /// Whether this is a terminating chunk (`Chunk::End`).
+    pub fn is_end(&self) -> bool {
+        matches!(self, Chunk::End { .. })
+    }
+
+    /// Return data bytes if this is a data chunk.
+    pub fn data(&self) -> Option<&[u8]> {
+        match self {
+            Chunk::Data(d) => Some(d.as_slice()),
+            Chunk::End { .. } => None,
+        }
+    }
+
+    /// Number of bytes in this chunk payload.
+    pub fn len(&self) -> usize {
+        match self {
+            Chunk::Data(d) => d.len(),
+            Chunk::End { .. } => 0,
+        }
+    }
+
+    /// Whether this chunk payload is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Parse a single chunk from raw buffer.
 /// Returns `Ok(Some((Chunk, consumed_bytes)))` if a chunk was successfully decoded,
 /// `Ok(None)` if buffer is incomplete, or `Err(HttpParseError)`.
@@ -916,67 +944,150 @@ pub fn parse_chunk(
     Ok(Some((Chunk::Data(data), required_len)))
 }
 
+/// Read the next individual HTTP chunk from a buffered reader.
+/// Returns `Ok(Some(Chunk::Data(bytes)))` for data chunks,
+/// `Ok(Some(Chunk::End { trailers }))` for the final chunk (size 0),
+/// or `Ok(None)` if the reader reached EOF before any chunk header was read.
+pub fn read_next_chunk<R: BufRead>(
+    reader: &mut R,
+    max_chunk_size: usize,
+) -> Result<Option<Chunk>, HttpParseError> {
+    let mut line_buf = String::new();
+    let bytes_read = reader
+        .read_line(&mut line_buf)
+        .map_err(|e| HttpParseError::Io(e.to_string()))?;
+    if bytes_read == 0 {
+        return Ok(None);
+    }
+
+    let trimmed = line_buf.trim();
+    let size_hex = trimmed.split(';').next().unwrap_or("").trim();
+    let chunk_size =
+        usize::from_str_radix(size_hex, 16).map_err(|_| HttpParseError::InvalidChunkSize)?;
+
+    if chunk_size == 0 {
+        // Read trailers until empty line
+        let mut trailers = HeaderMap::new();
+        loop {
+            line_buf.clear();
+            let tr_bytes = reader
+                .read_line(&mut line_buf)
+                .map_err(|e| HttpParseError::Io(e.to_string()))?;
+            if tr_bytes == 0 {
+                break;
+            }
+            let t_line = line_buf.trim();
+            if t_line.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = t_line.split_once(':') {
+                trailers.append(k.trim(), v.trim());
+            }
+        }
+        return Ok(Some(Chunk::End { trailers }));
+    }
+
+    if chunk_size > max_chunk_size {
+        return Err(HttpParseError::InvalidChunkSize);
+    }
+
+    let mut chunk_buf = vec![0u8; chunk_size];
+    reader
+        .read_exact(&mut chunk_buf)
+        .map_err(|e| HttpParseError::Io(e.to_string()))?;
+
+    // Read and verify trailing \r\n
+    let mut crlf = [0u8; 2];
+    reader
+        .read_exact(&mut crlf)
+        .map_err(|e| HttpParseError::Io(e.to_string()))?;
+    if &crlf != b"\r\n" {
+        return Err(HttpParseError::InvalidChunkFraming);
+    }
+
+    Ok(Some(Chunk::Data(chunk_buf)))
+}
+
+/// Streaming chunk iterator wrapping a buffered reader.
+pub struct ChunkStream<R: BufRead> {
+    reader: R,
+    max_chunk_size: usize,
+    finished: bool,
+    trailers: HeaderMap,
+}
+
+impl<R: BufRead> ChunkStream<R> {
+    /// Create a new `ChunkStream` over a buffered reader.
+    pub fn new(reader: R, max_chunk_size: usize) -> Self {
+        Self {
+            reader,
+            max_chunk_size,
+            finished: false,
+            trailers: HeaderMap::new(),
+        }
+    }
+
+    /// Read next chunk from the stream. Returns `None` once `Chunk::End` or EOF has been encountered.
+    pub fn next_chunk(&mut self) -> Result<Option<Chunk>, HttpParseError> {
+        if self.finished {
+            return Ok(None);
+        }
+        match read_next_chunk(&mut self.reader, self.max_chunk_size)? {
+            Some(Chunk::End { trailers }) => {
+                self.finished = true;
+                self.trailers = trailers.clone();
+                Ok(Some(Chunk::End { trailers }))
+            }
+            Some(Chunk::Data(data)) => Ok(Some(Chunk::Data(data))),
+            None => {
+                self.finished = true;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Decoded trailers if the stream has finished.
+    pub fn trailers(&self) -> &HeaderMap {
+        &self.trailers
+    }
+
+    /// Whether the stream reached the terminating end-chunk.
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
+    /// Mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
+    /// Unwrap the inner reader.
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+}
+
 /// Helper to decode an entire chunked body from a `BufRead` stream into a byte buffer.
 pub fn decode_chunked_body<R: BufRead>(
     reader: &mut R,
     max_body_size: usize,
 ) -> Result<(Vec<u8>, HeaderMap), HttpParseError> {
     let mut body = Vec::new();
-    let mut line_buf = String::new();
-
     loop {
-        line_buf.clear();
-        let bytes_read = reader
-            .read_line(&mut line_buf)
-            .map_err(|e| HttpParseError::Io(e.to_string()))?;
-        if bytes_read == 0 {
-            return Err(HttpParseError::UnexpectedEof);
-        }
-
-        let trimmed = line_buf.trim();
-        let size_hex = trimmed.split(';').next().unwrap_or("").trim();
-        let chunk_size =
-            usize::from_str_radix(size_hex, 16).map_err(|_| HttpParseError::InvalidChunkSize)?;
-
-        if chunk_size == 0 {
-            // Read trailers until empty line
-            let mut trailers = HeaderMap::new();
-            loop {
-                line_buf.clear();
-                let tr_bytes = reader
-                    .read_line(&mut line_buf)
-                    .map_err(|e| HttpParseError::Io(e.to_string()))?;
-                if tr_bytes == 0 {
-                    break;
+        match read_next_chunk(reader, max_body_size)? {
+            Some(Chunk::Data(data)) => {
+                if body.len() + data.len() > max_body_size {
+                    return Err(HttpParseError::InvalidChunkSize);
                 }
-                let t_line = line_buf.trim();
-                if t_line.is_empty() {
-                    break;
-                }
-                if let Some((k, v)) = t_line.split_once(':') {
-                    trailers.append(k.trim(), v.trim());
-                }
+                body.extend_from_slice(&data);
             }
-            return Ok((body, trailers));
-        }
-
-        if body.len() + chunk_size > max_body_size {
-            return Err(HttpParseError::InvalidChunkSize);
-        }
-
-        let mut chunk_buf = vec![0u8; chunk_size];
-        reader
-            .read_exact(&mut chunk_buf)
-            .map_err(|e| HttpParseError::Io(e.to_string()))?;
-        body.extend_from_slice(&chunk_buf);
-
-        // Read and verify trailing \r\n
-        let mut crlf = [0u8; 2];
-        reader
-            .read_exact(&mut crlf)
-            .map_err(|e| HttpParseError::Io(e.to_string()))?;
-        if &crlf != b"\r\n" {
-            return Err(HttpParseError::InvalidChunkFraming);
+            Some(Chunk::End { trailers }) => return Ok((body, trailers)),
+            None => return Err(HttpParseError::UnexpectedEof),
         }
     }
 }
@@ -1270,42 +1381,95 @@ pub fn format_response_head(head: &HttpResponseHead) -> Vec<u8> {
     out
 }
 
+/// Read an `HttpRequestHead` from a buffered reader up to the empty line separating headers from body.
+pub fn read_request_head<R: BufRead>(
+    reader: &mut R,
+    config: Option<&HttpParserConfig>,
+) -> Result<Option<HttpRequestHead>, HttpParseError> {
+    let default_cfg = HttpParserConfig::default();
+    let cfg = config.unwrap_or(&default_cfg);
+    let mut header_buf = Vec::new();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|e| HttpParseError::Io(e.to_string()))?;
+        if bytes_read == 0 {
+            if header_buf.is_empty() {
+                return Ok(None);
+            } else {
+                return Err(HttpParseError::UnexpectedEof);
+            }
+        }
+
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            header_buf.extend_from_slice(b"\r\n");
+            break;
+        }
+
+        header_buf.extend_from_slice(trimmed.as_bytes());
+        header_buf.extend_from_slice(b"\r\n");
+        if header_buf.len() > cfg.max_header_size {
+            return Err(HttpParseError::HeaderTooLarge);
+        }
+    }
+
+    let (head, _) = parse_request_head(&header_buf, cfg)?.ok_or(HttpParseError::Incomplete)?;
+    Ok(Some(head))
+}
+
+/// Read an `HttpResponseHead` from a buffered reader up to the empty line separating headers from body.
+pub fn read_response_head<R: BufRead>(
+    reader: &mut R,
+    config: Option<&HttpParserConfig>,
+) -> Result<Option<HttpResponseHead>, HttpParseError> {
+    let default_cfg = HttpParserConfig::default();
+    let cfg = config.unwrap_or(&default_cfg);
+    let mut header_buf = Vec::new();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|e| HttpParseError::Io(e.to_string()))?;
+        if bytes_read == 0 {
+            if header_buf.is_empty() {
+                return Ok(None);
+            } else {
+                return Err(HttpParseError::UnexpectedEof);
+            }
+        }
+
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            header_buf.extend_from_slice(b"\r\n");
+            break;
+        }
+
+        header_buf.extend_from_slice(trimmed.as_bytes());
+        header_buf.extend_from_slice(b"\r\n");
+        if header_buf.len() > cfg.max_header_size {
+            return Err(HttpParseError::HeaderTooLarge);
+        }
+    }
+
+    let (head, _) = parse_response_head(&header_buf, cfg)?.ok_or(HttpParseError::Incomplete)?;
+    Ok(Some(head))
+}
+
 /// Read an HTTP request (headers + body) from `BufferedTcpStream`.
 pub fn read_request(
     stream: &mut BufferedTcpStream,
     max_body_size: usize,
 ) -> Result<Option<(HttpRequestHead, Vec<u8>)>, HttpParseError> {
-    let config = HttpParserConfig::default();
-    let mut header_buf = Vec::new();
-
-    // Read header line by line
-    loop {
-        let line = stream
-            .read_line()
-            .map_err(|e| HttpParseError::Io(e.to_string()))?;
-        match line {
-            Some(l) if l.is_empty() => {
-                header_buf.extend_from_slice(b"\r\n");
-                break;
-            }
-            Some(l) => {
-                header_buf.extend_from_slice(l.as_bytes());
-                header_buf.extend_from_slice(b"\r\n");
-                if header_buf.len() > config.max_header_size {
-                    return Err(HttpParseError::HeaderTooLarge);
-                }
-            }
-            None => {
-                if header_buf.is_empty() {
-                    return Ok(None);
-                } else {
-                    return Err(HttpParseError::UnexpectedEof);
-                }
-            }
-        }
-    }
-
-    let (head, _) = parse_request_head(&header_buf, &config)?.ok_or(HttpParseError::Incomplete)?;
+    let head = match read_request_head(stream, None)? {
+        Some(h) => h,
+        None => return Ok(None),
+    };
 
     let body = if head.is_chunked() {
         let (chunked_body, _) = decode_chunked_body(stream, max_body_size)?;
@@ -1331,36 +1495,10 @@ pub fn read_response(
     stream: &mut BufferedTcpStream,
     max_body_size: usize,
 ) -> Result<Option<(HttpResponseHead, Vec<u8>)>, HttpParseError> {
-    let config = HttpParserConfig::default();
-    let mut header_buf = Vec::new();
-
-    loop {
-        let line = stream
-            .read_line()
-            .map_err(|e| HttpParseError::Io(e.to_string()))?;
-        match line {
-            Some(l) if l.is_empty() => {
-                header_buf.extend_from_slice(b"\r\n");
-                break;
-            }
-            Some(l) => {
-                header_buf.extend_from_slice(l.as_bytes());
-                header_buf.extend_from_slice(b"\r\n");
-                if header_buf.len() > config.max_header_size {
-                    return Err(HttpParseError::HeaderTooLarge);
-                }
-            }
-            None => {
-                if header_buf.is_empty() {
-                    return Ok(None);
-                } else {
-                    return Err(HttpParseError::UnexpectedEof);
-                }
-            }
-        }
-    }
-
-    let (head, _) = parse_response_head(&header_buf, &config)?.ok_or(HttpParseError::Incomplete)?;
+    let head = match read_response_head(stream, None)? {
+        Some(h) => h,
+        None => return Ok(None),
+    };
 
     // Handle body framing
     let body = if head.status == HttpStatus::NO_CONTENT || head.status == HttpStatus::NOT_MODIFIED {
@@ -1392,6 +1530,20 @@ pub fn read_response(
     };
 
     Ok(Some((head, body)))
+}
+
+/// Write an `HttpRequestHead` to a writer and flush.
+pub fn write_request_head<W: Write>(writer: &mut W, head: &HttpRequestHead) -> io::Result<()> {
+    let wire_head = format_request_head(head);
+    writer.write_all(&wire_head)?;
+    writer.flush()
+}
+
+/// Write an `HttpResponseHead` to a writer and flush.
+pub fn write_response_head<W: Write>(writer: &mut W, head: &HttpResponseHead) -> io::Result<()> {
+    let wire_head = format_response_head(head);
+    writer.write_all(&wire_head)?;
+    writer.flush()
 }
 
 /// Write a complete HTTP request with body and flush to `BufferedTcpStream`.
@@ -3056,5 +3208,74 @@ mod tests {
         assert_eq!(body["updated"], true);
 
         handle.join().expect("server thread finished");
+    }
+
+    #[test]
+    fn test_chunk_stream_and_head_io() {
+        // 1. Chunk methods
+        let data_chunk = Chunk::Data(b"hello world".to_vec());
+        assert!(!data_chunk.is_end());
+        assert_eq!(data_chunk.data(), Some(b"hello world".as_slice()));
+        assert_eq!(data_chunk.len(), 11);
+        assert!(!data_chunk.is_empty());
+
+        let mut trailers = HeaderMap::new();
+        trailers.insert("X-Digest", "sha256-abc");
+        let end_chunk = Chunk::End {
+            trailers: trailers.clone(),
+        };
+        assert!(end_chunk.is_end());
+        assert_eq!(end_chunk.data(), None);
+        assert_eq!(end_chunk.len(), 0);
+        assert!(end_chunk.is_empty());
+
+        // 2. ChunkStream iterating through chunks
+        let wire = b"5\r\nfirst\r\n6\r\nsecond\r\n0\r\nX-Digest: sha256-abc\r\n\r\n";
+        let mut cursor = io::Cursor::new(wire.as_slice());
+        let mut stream = ChunkStream::new(&mut cursor, 1024);
+
+        let c1 = stream.next_chunk().unwrap().expect("first chunk");
+        assert_eq!(c1, Chunk::Data(b"first".to_vec()));
+        assert!(!stream.is_finished());
+
+        let c2 = stream.next_chunk().unwrap().expect("second chunk");
+        assert_eq!(c2, Chunk::Data(b"second".to_vec()));
+        assert!(!stream.is_finished());
+
+        let c3 = stream.next_chunk().unwrap().expect("end chunk");
+        assert!(c3.is_end());
+        assert!(stream.is_finished());
+        assert_eq!(stream.trailers().get("x-digest"), Some("sha256-abc"));
+
+        // Subsequent calls return None
+        assert!(stream.next_chunk().unwrap().is_none());
+
+        // 3. read_request_head and read_response_head
+        let req_bytes = b"POST /api/upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nchunk\r\n0\r\n\r\n";
+        let mut req_cursor = io::Cursor::new(req_bytes.as_slice());
+        let req_head = read_request_head(&mut req_cursor, None)
+            .unwrap()
+            .expect("read req head");
+        assert_eq!(req_head.method, HttpMethod::Post);
+        assert_eq!(req_head.uri, "/api/upload");
+        assert!(req_head.is_chunked());
+
+        // Immediately read remaining chunks via ChunkStream
+        let mut chunk_reader = ChunkStream::new(&mut req_cursor, 1024);
+        let chk = chunk_reader.next_chunk().unwrap().expect("chunk");
+        assert_eq!(chk, Chunk::Data(b"chunk".to_vec()));
+        let end_chk = chunk_reader.next_chunk().unwrap().expect("end");
+        assert!(end_chk.is_end());
+
+        // 4. write_request_head & write_response_head
+        let mut out_req = Vec::new();
+        let head = HttpRequestHead::new(HttpMethod::Get, "/status", HttpVersion::Http11);
+        write_request_head(&mut out_req, &head).expect("write req head");
+        assert!(out_req.starts_with(b"GET /status HTTP/1.1\r\n"));
+
+        let mut out_resp = Vec::new();
+        let resp_head = HttpResponseHead::ok();
+        write_response_head(&mut out_resp, &resp_head).expect("write resp head");
+        assert!(out_resp.starts_with(b"HTTP/1.1 200 OK\r\n"));
     }
 }
