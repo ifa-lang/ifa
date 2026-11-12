@@ -780,8 +780,7 @@ fn test_async_reactor_ffi_socket_options_and_connected_udp() {
 
     // TCP client and stream options
     let host_cstr = std::ffi::CString::new("127.0.0.1").unwrap();
-    let client_stream_fd =
-        ifa_rt_async_tcp_connect(host_cstr.as_ptr() as *const u8, l_port as u16);
+    let client_stream_fd = ifa_rt_async_tcp_connect(host_cstr.as_ptr() as *const u8, l_port as u16);
     assert!(client_stream_fd >= 1000);
 
     let server_stream_fd = ifa_rt_async_tcp_accept(listener_fd);
