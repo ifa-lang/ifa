@@ -824,8 +824,11 @@ mod tests {
 
         let data = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0fHello World";
         let dump = format_hexdump(data);
-        assert!(dump.starts_with("00000000  00 01 02 03 04 05 06 07  08 09 0a 0b 0c 0d 0e 0f  |................|"));
-        assert!(dump.contains("00000010  48 65 6c 6c 6f 20 57 6f  72 6c 64                 |Hello World|"));
+        assert!(dump.starts_with(
+            "00000000  00 01 02 03 04 05 06 07  08 09 0a 0b 0c 0d 0e 0f  |................|"
+        ));
+        assert!(dump
+            .contains("00000010  48 65 6c 6c 6f 20 57 6f  72 6c 64                 |Hello World|"));
 
         // Hex encode & decode roundtrip
         let raw = b"IFA Fast Serialization Engine \xde\xad\xbe\xef";

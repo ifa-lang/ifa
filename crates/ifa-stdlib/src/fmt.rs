@@ -343,7 +343,11 @@ fn hex_val(b: u8) -> Option<u8> {
 
 /// Stream canonical hexdump format into a writer.
 pub fn write_hexdump<W: fmt::Write>(w: &mut W, data: &[u8], bytes_per_line: usize) -> fmt::Result {
-    let bpl = if bytes_per_line == 0 { 16 } else { bytes_per_line };
+    let bpl = if bytes_per_line == 0 {
+        16
+    } else {
+        bytes_per_line
+    };
     for (line_idx, chunk) in data.chunks(bpl).enumerate() {
         let offset = line_idx * bpl;
         write!(w, "{:08x}  ", offset)?;
@@ -485,7 +489,8 @@ pub fn unescape_str(s: &str) -> Result<String, UnescapeError> {
                         match chars.next() {
                             Some('}') => break,
                             Some(ch) => {
-                                let v = hex_val(ch as u8).ok_or(UnescapeError::InvalidHexDigit(ch))?;
+                                let v =
+                                    hex_val(ch as u8).ok_or(UnescapeError::InvalidHexDigit(ch))?;
                                 hex_val_accum = (hex_val_accum << 4) | (v as u32);
                                 count += 1;
                                 if count > 6 {
@@ -565,7 +570,10 @@ mod tests {
         assert_eq!(decode_hex(&prefixed).unwrap(), data);
 
         assert!(matches!(decode_hex("abc"), Err(HexError::OddLength(3))));
-        assert!(matches!(decode_hex("0xzz"), Err(HexError::InvalidChar { .. })));
+        assert!(matches!(
+            decode_hex("0xzz"),
+            Err(HexError::InvalidChar { .. })
+        ));
     }
 
     #[test]
