@@ -681,3 +681,69 @@ fn test_async_udp_socket_echo_and_reactor_ffi() {
     assert_eq!(ifa_rt_async_close(s_id), 0);
     assert_eq!(ifa_rt_async_close(c_id), 0);
 }
+
+#[test]
+fn test_async_socket_options_and_udp_connected_mode() {
+    use ifa_runtime::reactor::{AsyncTcpListener, AsyncTcpStream, AsyncUdpSocket};
+
+    // 1. TCP socket options
+    let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind tcp listener");
+    let l_addr = listener.local_addr().expect("tcp listener addr");
+    listener.set_ttl(42).expect("set_ttl listener");
+    assert_eq!(listener.ttl().expect("ttl listener"), 42);
+
+    let client_tcp = AsyncTcpStream::connect(l_addr).expect("connect tcp client");
+    let (server_tcp, _) = listener.accept().expect("accept tcp server");
+
+    client_tcp.set_nodelay(true).expect("client set_nodelay true");
+    assert!(client_tcp.nodelay().expect("client nodelay"));
+    client_tcp.set_nodelay(false).expect("client set_nodelay false");
+    assert!(!client_tcp.nodelay().expect("client nodelay"));
+
+    server_tcp.set_ttl(55).expect("server set_ttl");
+    assert_eq!(server_tcp.ttl().expect("server ttl"), 55);
+
+    // 2. UDP socket options and connected mode
+    let s_udp = AsyncUdpSocket::bind("127.0.0.1:0").expect("bind udp server");
+    let c_udp = AsyncUdpSocket::bind("127.0.0.1:0").expect("bind udp client");
+    let s_addr = s_udp.local_addr().expect("s_udp addr");
+    let c_addr = c_udp.local_addr().expect("c_udp addr");
+
+    s_udp.set_ttl(64).expect("s_udp set_ttl");
+    assert_eq!(s_udp.ttl().expect("s_udp ttl"), 64);
+
+    s_udp.set_broadcast(true).expect("set_broadcast");
+    assert!(s_udp.broadcast().expect("broadcast"));
+    s_udp.set_broadcast(false).expect("unset_broadcast");
+    assert!(!s_udp.broadcast().expect("broadcast"));
+
+    // Mode UDP connecté
+    c_udp.connect(s_addr).expect("c_udp connect");
+    assert_eq!(c_udp.peer_addr().expect("c_udp peer_addr"), s_addr);
+
+    s_udp.connect(c_addr).expect("s_udp connect");
+    assert_eq!(s_udp.peer_addr().expect("s_udp peer_addr"), c_addr);
+
+    // Envoi et réception connectés
+    let sent = c_udp.send(b"HELLO_CONNECTED_UDP").expect("c_udp send");
+    assert_eq!(sent, 19);
+
+    let mut buf = [0u8; 32];
+    let recvd = s_udp.recv(&mut buf).expect("s_udp recv");
+    assert_eq!(recvd, 19);
+    assert_eq!(&buf[..recvd], b"HELLO_CONNECTED_UDP");
+
+    // try_send et try_recv
+    let try_sent = s_udp.try_send(b"REPLY_CONNECTED_UDP").expect("s_udp try_send");
+    assert_eq!(try_sent, Some(19));
+
+    // La donnée est immédiatement prête en socket buffer local
+    let mut reply_buf = [0u8; 32];
+    let try_recvd = c_udp.recv(&mut reply_buf).expect("c_udp recv");
+    assert_eq!(try_recvd, 19);
+    assert_eq!(&reply_buf[..try_recvd], b"REPLY_CONNECTED_UDP");
+
+    // try_recv sans données en attente doit retourner Ok(None)
+    let empty_opt = c_udp.try_recv(&mut reply_buf).expect("c_udp try_recv empty");
+    assert_eq!(empty_opt, None);
+}

@@ -58,6 +58,16 @@ impl AsyncTcpListener {
     pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.inner.local_addr()
     }
+
+    /// Set IP Time-To-Live.
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        self.inner.set_ttl(ttl)
+    }
+
+    /// Retrieve IP Time-To-Live.
+    pub fn ttl(&self) -> io::Result<u32> {
+        self.inner.ttl()
+    }
 }
 
 /// Asynchronous non-blocking TCP stream managed by the fiber reactor.
@@ -150,6 +160,26 @@ impl AsyncTcpStream {
     pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.inner.peer_addr()
     }
+
+    /// Set TCP_NODELAY (disable Nagle's algorithm).
+    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        self.inner.set_nodelay(nodelay)
+    }
+
+    /// Retrieve TCP_NODELAY flag.
+    pub fn nodelay(&self) -> io::Result<bool> {
+        self.inner.nodelay()
+    }
+
+    /// Set IP Time-To-Live.
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        self.inner.set_ttl(ttl)
+    }
+
+    /// Retrieve IP Time-To-Live.
+    pub fn ttl(&self) -> io::Result<u32> {
+        self.inner.ttl()
+    }
 }
 
 /// Asynchronous non-blocking UDP socket managed by the fiber reactor.
@@ -229,6 +259,94 @@ impl AsyncUdpSocket {
     /// Retrieve local socket address.
     pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.inner.local_addr()
+    }
+
+    /// Set IP Time-To-Live.
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        self.inner.set_ttl(ttl)
+    }
+
+    /// Retrieve IP Time-To-Live.
+    pub fn ttl(&self) -> io::Result<u32> {
+        self.inner.ttl()
+    }
+
+    /// Connect socket to remote address for direct send/recv.
+    pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
+        self.inner.connect(addr)
+    }
+
+    /// Asynchronously send datagram on connected socket.
+    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        let mut spins = 0;
+        loop {
+            match self.inner.send(buf) {
+                Ok(n) => return Ok(n),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    spins += 1;
+                    if spins < 16 {
+                        std::hint::spin_loop();
+                    } else {
+                        GLOBAL_SCHEDULER.yield_now();
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Asynchronously receive datagram on connected socket.
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut spins = 0;
+        loop {
+            match self.inner.recv(buf) {
+                Ok(n) => return Ok(n),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    spins += 1;
+                    if spins < 16 {
+                        std::hint::spin_loop();
+                    } else {
+                        GLOBAL_SCHEDULER.yield_now();
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Non-blocking attempt to send datagram on connected socket.
+    pub fn try_send(&self, buf: &[u8]) -> io::Result<Option<usize>> {
+        match self.inner.send(buf) {
+            Ok(n) => Ok(Some(n)),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Non-blocking attempt to receive datagram on connected socket.
+    pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        match self.inner.recv(buf) {
+            Ok(n) => Ok(Some(n)),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Enable or disable SO_BROADCAST on UDP socket.
+    pub fn set_broadcast(&self, on: bool) -> io::Result<()> {
+        self.inner.set_broadcast(on)
+    }
+
+    /// Retrieve SO_BROADCAST status.
+    pub fn broadcast(&self) -> io::Result<bool> {
+        self.inner.broadcast()
+    }
+
+    /// Retrieve peer address if connected.
+    pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.peer_addr()
     }
 }
 
