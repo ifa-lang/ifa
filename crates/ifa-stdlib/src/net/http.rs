@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, BufRead, Read, Write};
+use std::time::Duration;
 
-use super::BufferedTcpStream;
+use super::{BufferedTcpStream, TcpStream};
 
 /// Standard HTTP Protocol Version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -400,6 +401,14 @@ impl HttpRequestHead {
         }
         self.version == HttpVersion::Http11
     }
+
+    /// Extract parsed cookies from request `Cookie` header.
+    pub fn cookies(&self) -> Vec<Cookie> {
+        match self.headers.get("cookie") {
+            Some(v) => Cookie::parse_header(v),
+            None => Vec::new(),
+        }
+    }
 }
 
 /// HTTP Response Header metadata.
@@ -468,6 +477,20 @@ impl HttpResponseHead {
             }
         }
         self.version == HttpVersion::Http11
+    }
+
+    /// Extract parsed `Set-Cookie` directives from response headers.
+    pub fn set_cookies(&self) -> Vec<SetCookie> {
+        self.headers
+            .get_all("set-cookie")
+            .into_iter()
+            .filter_map(SetCookie::parse)
+            .collect()
+    }
+
+    /// Extract parsed `Cache-Control` directive from response headers.
+    pub fn cache_control(&self) -> Option<CacheControl> {
+        self.headers.get("cache-control").map(CacheControl::parse)
     }
 }
 
@@ -1068,6 +1091,667 @@ pub fn write_response_full(
     stream.flush()
 }
 
+/// A single HTTP cookie key-value pair (`Cookie` request header).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cookie {
+    pub name: String,
+    pub value: String,
+}
+
+impl Cookie {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+
+    /// Parse multiple cookies from a `Cookie` request header value.
+    pub fn parse_header(value: &str) -> Vec<Cookie> {
+        let mut list = Vec::new();
+        for part in value.split(';') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = part.split_once('=') {
+                list.push(Cookie::new(k.trim(), v.trim()));
+            }
+        }
+        list
+    }
+
+    /// Format a slice of cookies into standard `Cookie` header string value.
+    pub fn format_cookies(cookies: &[Cookie]) -> String {
+        cookies
+            .iter()
+            .map(|c| format!("{}={}", c.name, c.value))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+impl fmt::Display for Cookie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}={}", self.name, self.value)
+    }
+}
+
+/// A parsed `Set-Cookie` response header directive (RFC 6265).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetCookie {
+    pub name: String,
+    pub value: String,
+    pub expires: Option<String>,
+    pub max_age: Option<i64>,
+    pub domain: Option<String>,
+    pub path: Option<String>,
+    pub secure: bool,
+    pub http_only: bool,
+    pub same_site: Option<String>,
+}
+
+impl SetCookie {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            expires: None,
+            max_age: None,
+            domain: None,
+            path: None,
+            secure: false,
+            http_only: false,
+            same_site: None,
+        }
+    }
+
+    /// Parse a `Set-Cookie` header value.
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut parts = value.split(';');
+        let first = parts.next()?.trim();
+        let (name, val) = first.split_once('=')?;
+
+        let mut cookie = SetCookie::new(name.trim(), val.trim());
+        for attr in parts {
+            let attr = attr.trim();
+            if attr.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = attr.split_once('=') {
+                let k_lower = k.trim().to_ascii_lowercase();
+                let v = v.trim();
+                match k_lower.as_str() {
+                    "expires" => cookie.expires = Some(v.to_string()),
+                    "max-age" => cookie.max_age = v.parse::<i64>().ok(),
+                    "domain" => cookie.domain = Some(v.to_string()),
+                    "path" => cookie.path = Some(v.to_string()),
+                    "samesite" => cookie.same_site = Some(v.to_string()),
+                    _ => {}
+                }
+            } else {
+                let attr_lower = attr.to_ascii_lowercase();
+                match attr_lower.as_str() {
+                    "secure" => cookie.secure = true,
+                    "httponly" => cookie.http_only = true,
+                    _ => {}
+                }
+            }
+        }
+        Some(cookie)
+    }
+
+    /// Format to wire `Set-Cookie` header value string.
+    pub fn to_header_value(&self) -> String {
+        let mut parts = vec![format!("{}={}", self.name, self.value)];
+        if let Some(ref exp) = self.expires {
+            parts.push(format!("Expires={}", exp));
+        }
+        if let Some(max_age) = self.max_age {
+            parts.push(format!("Max-Age={}", max_age));
+        }
+        if let Some(ref dom) = self.domain {
+            parts.push(format!("Domain={}", dom));
+        }
+        if let Some(ref p) = self.path {
+            parts.push(format!("Path={}", p));
+        }
+        if self.secure {
+            parts.push("Secure".to_string());
+        }
+        if self.http_only {
+            parts.push("HttpOnly".to_string());
+        }
+        if let Some(ref ss) = self.same_site {
+            parts.push(format!("SameSite={}", ss));
+        }
+        parts.join("; ")
+    }
+}
+
+impl fmt::Display for SetCookie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_header_value())
+    }
+}
+
+/// Parsed HTTP `Cache-Control` header directives (RFC 7234).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CacheControl {
+    pub no_cache: bool,
+    pub no_store: bool,
+    pub no_transform: bool,
+    pub must_revalidate: bool,
+    pub public: bool,
+    pub private: bool,
+    pub max_age: Option<u64>,
+    pub s_maxage: Option<u64>,
+}
+
+impl CacheControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parse from `Cache-Control` header value.
+    pub fn parse(value: &str) -> Self {
+        let mut cc = CacheControl::default();
+        for part in value.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = part.split_once('=') {
+                let k_lower = k.trim().to_ascii_lowercase();
+                let v = v.trim().trim_matches('"');
+                match k_lower.as_str() {
+                    "max-age" => cc.max_age = v.parse::<u64>().ok(),
+                    "s-maxage" => cc.s_maxage = v.parse::<u64>().ok(),
+                    _ => {}
+                }
+            } else {
+                let part_lower = part.to_ascii_lowercase();
+                match part_lower.as_str() {
+                    "no-cache" => cc.no_cache = true,
+                    "no-store" => cc.no_store = true,
+                    "no-transform" => cc.no_transform = true,
+                    "must-revalidate" => cc.must_revalidate = true,
+                    "public" => cc.public = true,
+                    "private" => cc.private = true,
+                    _ => {}
+                }
+            }
+        }
+        cc
+    }
+
+    /// Format to wire `Cache-Control` header value string.
+    pub fn to_header_value(&self) -> String {
+        let mut parts = Vec::new();
+        if self.public {
+            parts.push("public".to_string());
+        }
+        if self.private {
+            parts.push("private".to_string());
+        }
+        if self.no_cache {
+            parts.push("no-cache".to_string());
+        }
+        if self.no_store {
+            parts.push("no-store".to_string());
+        }
+        if self.no_transform {
+            parts.push("no-transform".to_string());
+        }
+        if self.must_revalidate {
+            parts.push("must-revalidate".to_string());
+        }
+        if let Some(ma) = self.max_age {
+            parts.push(format!("max-age={}", ma));
+        }
+        if let Some(sma) = self.s_maxage {
+            parts.push(format!("s-maxage={}", sma));
+        }
+        parts.join(", ")
+    }
+}
+
+impl fmt::Display for CacheControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_header_value())
+    }
+}
+
+/// Parsed HTTP URL (RFC 3986 basic subset).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpUrl {
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+    pub path_and_query: String,
+}
+
+impl HttpUrl {
+    /// Parse an HTTP URL string (e.g. "http://localhost:8080/api/v1?k=v" or "http://example.com/").
+    pub fn parse(url: &str) -> Result<Self, HttpClientError> {
+        let (scheme, rest) = if let Some((s, rem)) = url.split_once("://") {
+            (s.to_ascii_lowercase(), rem)
+        } else {
+            ("http".to_string(), url)
+        };
+
+        if scheme != "http" {
+            if scheme == "https" {
+                return Err(HttpClientError::UnsupportedScheme(
+                    "HTTPS is not supported without TLS".to_string(),
+                ));
+            }
+            return Err(HttpClientError::UnsupportedScheme(scheme));
+        }
+
+        let (host_port, path_and_query) = match rest.find('/') {
+            Some(idx) => (&rest[..idx], &rest[idx..]),
+            None => (rest, "/"),
+        };
+
+        if host_port.is_empty() {
+            return Err(HttpClientError::InvalidUrl("Empty host in URL".to_string()));
+        }
+
+        let (host, port) = if let Some((h, p)) = host_port.split_once(':') {
+            let parsed_port = p
+                .parse::<u16>()
+                .map_err(|_| HttpClientError::InvalidUrl(format!("Invalid port: '{}'", p)))?;
+            (h.to_string(), parsed_port)
+        } else {
+            (host_port.to_string(), 80)
+        };
+
+        let path = if path_and_query.is_empty() {
+            "/".to_string()
+        } else {
+            path_and_query.to_string()
+        };
+
+        Ok(Self {
+            scheme,
+            host,
+            port,
+            path_and_query: path,
+        })
+    }
+
+    /// Return host:port format for TCP socket connection.
+    pub fn socket_addr_str(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// Format standard Host header value (omits :80 if default HTTP port).
+    pub fn host_header_value(&self) -> String {
+        if self.port == 80 {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+
+    /// Resolve a possibly relative redirect target against this base URL.
+    pub fn join(&self, location: &str) -> Result<Self, HttpClientError> {
+        if location.starts_with("http://") || location.starts_with("https://") {
+            HttpUrl::parse(location)
+        } else if location.starts_with('/') {
+            Ok(Self {
+                scheme: self.scheme.clone(),
+                host: self.host.clone(),
+                port: self.port,
+                path_and_query: location.to_string(),
+            })
+        } else {
+            let base_dir = match self.path_and_query.rfind('/') {
+                Some(idx) => &self.path_and_query[..=idx],
+                None => "/",
+            };
+            Ok(Self {
+                scheme: self.scheme.clone(),
+                host: self.host.clone(),
+                port: self.port,
+                path_and_query: format!("{}{}", base_dir, location),
+            })
+        }
+    }
+}
+
+impl fmt::Display for HttpUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}://{}{}",
+            self.scheme,
+            self.host_header_value(),
+            self.path_and_query
+        )
+    }
+}
+
+/// Error type for synchronous HTTP client operations.
+#[derive(Debug)]
+pub enum HttpClientError {
+    Io(io::Error),
+    Parse(HttpParseError),
+    InvalidUrl(String),
+    UnsupportedScheme(String),
+    TooManyRedirects,
+    ConnectionFailed(String),
+    Timeout,
+}
+
+impl fmt::Display for HttpClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HttpClientError::Io(err) => write!(f, "HTTP client I/O error: {}", err),
+            HttpClientError::Parse(err) => write!(f, "HTTP client parse error: {}", err),
+            HttpClientError::InvalidUrl(msg) => write!(f, "Invalid HTTP URL: {}", msg),
+            HttpClientError::UnsupportedScheme(scheme) => {
+                write!(f, "Unsupported HTTP scheme '{}'", scheme)
+            }
+            HttpClientError::TooManyRedirects => write!(f, "Too many HTTP redirects exceeded"),
+            HttpClientError::ConnectionFailed(msg) => write!(f, "Connection failed: {}", msg),
+            HttpClientError::Timeout => write!(f, "HTTP operation timed out"),
+        }
+    }
+}
+
+impl std::error::Error for HttpClientError {}
+
+impl From<io::Error> for HttpClientError {
+    fn from(err: io::Error) -> Self {
+        HttpClientError::Io(err)
+    }
+}
+
+impl From<HttpParseError> for HttpClientError {
+    fn from(err: HttpParseError) -> Self {
+        HttpClientError::Parse(err)
+    }
+}
+
+/// High-level HTTP Response wrapper containing head and decoded body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpResponse {
+    pub head: HttpResponseHead,
+    pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    pub fn new(head: HttpResponseHead, body: Vec<u8>) -> Self {
+        Self { head, body }
+    }
+
+    pub fn status(&self) -> HttpStatus {
+        self.head.status
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        &self.head.headers
+    }
+
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    pub fn text(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.body)
+    }
+
+    pub fn text_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.body)
+    }
+
+    pub fn set_cookies(&self) -> Vec<SetCookie> {
+        self.head.set_cookies()
+    }
+
+    pub fn cache_control(&self) -> Option<CacheControl> {
+        self.head.cache_control()
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.body
+    }
+}
+
+/// Synchronous HTTP Client built on top of `BufferedTcpStream`.
+#[derive(Debug, Clone)]
+pub struct HttpClient {
+    pub timeout: Option<Duration>,
+    pub max_body_size: usize,
+    pub follow_redirects: bool,
+    pub max_redirects: usize,
+    pub default_headers: HeaderMap,
+}
+
+impl Default for HttpClient {
+    fn default() -> Self {
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert("User-Agent", "ifa-stdlib-http/1.0");
+        default_headers.insert("Accept", "*/*");
+        Self {
+            timeout: Some(Duration::from_secs(30)),
+            max_body_size: 16 * 1024 * 1024,
+            follow_redirects: true,
+            max_redirects: 5,
+            default_headers,
+        }
+    }
+}
+
+impl HttpClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn builder() -> HttpClientBuilder {
+        HttpClientBuilder::new()
+    }
+
+    /// Execute a raw request against target host:port.
+    pub fn execute(
+        &self,
+        host_port: &str,
+        mut head: HttpRequestHead,
+        body: &[u8],
+    ) -> Result<HttpResponse, HttpClientError> {
+        let raw_stream = TcpStream::connect(host_port)
+            .map_err(|e| HttpClientError::ConnectionFailed(format!("{}: {}", host_port, e)))?;
+
+        raw_stream.set_nonblocking(false)?;
+        if let Some(to) = self.timeout {
+            raw_stream.set_read_timeout(Some(to))?;
+            raw_stream.set_write_timeout(Some(to))?;
+        }
+
+        let mut buffered = BufferedTcpStream::new(raw_stream)?;
+
+        // Apply default headers if absent
+        for (k, v) in self.default_headers.iter() {
+            if !head.headers.contains_key(k) {
+                head.headers.insert(k, v);
+            }
+        }
+
+        write_request_full(&mut buffered, &head, body)?;
+
+        let (resp_head, resp_body) = read_response(&mut buffered, self.max_body_size)?
+            .ok_or(HttpParseError::UnexpectedEof)?;
+
+        Ok(HttpResponse::new(resp_head, resp_body))
+    }
+
+    /// Perform an HTTP request following redirects if enabled.
+    pub fn request(
+        &self,
+        method: HttpMethod,
+        url: &str,
+        body: &[u8],
+    ) -> Result<HttpResponse, HttpClientError> {
+        let mut current_url = HttpUrl::parse(url)?;
+        let mut current_method = method;
+        let mut current_body = body.to_vec();
+        let mut redirects_followed = 0;
+
+        loop {
+            let mut head = HttpRequestHead::new(
+                current_method,
+                current_url.path_and_query.clone(),
+                HttpVersion::Http11,
+            );
+            head.headers.insert("Host", current_url.host_header_value());
+            head.headers.insert("Connection", "close");
+
+            let host_port = current_url.socket_addr_str();
+            let response = self.execute(&host_port, head, &current_body)?;
+
+            if self.follow_redirects && response.status().is_redirection() {
+                if redirects_followed >= self.max_redirects {
+                    return Err(HttpClientError::TooManyRedirects);
+                }
+
+                if let Some(location) = response.headers().get("location") {
+                    current_url = current_url.join(location)?;
+                    redirects_followed += 1;
+
+                    // RFC 7231 §6.4.2 & §6.4.3: 301/302/303 often change POST/PUT to GET
+                    if response.status() == HttpStatus::SEE_OTHER
+                        || ((response.status() == HttpStatus::MOVED_PERMANENTLY
+                            || response.status() == HttpStatus::FOUND)
+                            && (current_method == HttpMethod::Post
+                                || current_method == HttpMethod::Put))
+                    {
+                        current_method = HttpMethod::Get;
+                        current_body.clear();
+                    }
+                    continue;
+                }
+            }
+
+            return Ok(response);
+        }
+    }
+
+    /// Send a GET request.
+    pub fn get(&self, url: &str) -> Result<HttpResponse, HttpClientError> {
+        self.request(HttpMethod::Get, url, &[])
+    }
+
+    /// Send a POST request.
+    pub fn post(
+        &self,
+        url: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<HttpResponse, HttpClientError> {
+        let mut client = self.clone();
+        if let Some(ct) = content_type {
+            client.default_headers.insert("Content-Type", ct);
+        }
+        client.request(HttpMethod::Post, url, body)
+    }
+
+    /// Send a PUT request.
+    pub fn put(
+        &self,
+        url: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<HttpResponse, HttpClientError> {
+        let mut client = self.clone();
+        if let Some(ct) = content_type {
+            client.default_headers.insert("Content-Type", ct);
+        }
+        client.request(HttpMethod::Put, url, body)
+    }
+
+    /// Send a DELETE request.
+    pub fn delete(&self, url: &str) -> Result<HttpResponse, HttpClientError> {
+        self.request(HttpMethod::Delete, url, &[])
+    }
+}
+
+/// Builder for configuring custom `HttpClient` instances.
+#[derive(Debug, Clone, Default)]
+pub struct HttpClientBuilder {
+    timeout: Option<Duration>,
+    max_body_size: Option<usize>,
+    follow_redirects: Option<bool>,
+    max_redirects: Option<usize>,
+    headers: HeaderMap,
+}
+
+impl HttpClientBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn max_body_size(mut self, size: usize) -> Self {
+        self.max_body_size = Some(size);
+        self
+    }
+
+    pub fn follow_redirects(mut self, follow: bool) -> Self {
+        self.follow_redirects = Some(follow);
+        self
+    }
+
+    pub fn max_redirects(mut self, count: usize) -> Self {
+        self.max_redirects = Some(count);
+        self
+    }
+
+    pub fn header(mut self, name: impl Into<String>, val: impl Into<String>) -> Self {
+        self.headers.insert(name, val);
+        self
+    }
+
+    pub fn build(self) -> HttpClient {
+        let mut client = HttpClient::default();
+        if let Some(to) = self.timeout {
+            client.timeout = Some(to);
+        }
+        if let Some(sz) = self.max_body_size {
+            client.max_body_size = sz;
+        }
+        if let Some(fr) = self.follow_redirects {
+            client.follow_redirects = fr;
+        }
+        if let Some(mr) = self.max_redirects {
+            client.max_redirects = mr;
+        }
+        for (k, v) in self.headers.iter() {
+            client.default_headers.insert(k, v);
+        }
+        client
+    }
+}
+
+/// Convenience shortcut to issue a GET request using default client settings.
+pub fn get(url: &str) -> Result<HttpResponse, HttpClientError> {
+    HttpClient::new().get(url)
+}
+
+/// Convenience shortcut to issue a POST request using default client settings.
+pub fn post(
+    url: &str,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> Result<HttpResponse, HttpClientError> {
+    HttpClient::new().post(url, body, content_type)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1301,5 +1985,148 @@ mod tests {
 
         let resp_err = HttpResponseHead::internal_server_error();
         assert_eq!(resp_err.status, HttpStatus::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_cookie_and_set_cookie_parsing_formatting() {
+        // Cookie parsing
+        let cookie_header = "session_id=abc12345; dark_mode=true; lang=fr";
+        let cookies = Cookie::parse_header(cookie_header);
+        assert_eq!(cookies.len(), 3);
+        assert_eq!(cookies[0].name, "session_id");
+        assert_eq!(cookies[0].value, "abc12345");
+        assert_eq!(cookies[1].name, "dark_mode");
+        assert_eq!(cookies[1].value, "true");
+        assert_eq!(cookies[2].name, "lang");
+        assert_eq!(cookies[2].value, "fr");
+
+        // Format
+        let formatted = Cookie::format_cookies(&cookies);
+        assert_eq!(formatted, "session_id=abc12345; dark_mode=true; lang=fr");
+
+        // Set-Cookie parsing
+        let sc_raw = "token=secret99; Domain=example.com; Path=/api; Max-Age=3600; Secure; HttpOnly; SameSite=Strict";
+        let sc = SetCookie::parse(sc_raw).expect("parsed set-cookie");
+        assert_eq!(sc.name, "token");
+        assert_eq!(sc.value, "secret99");
+        assert_eq!(sc.domain.as_deref(), Some("example.com"));
+        assert_eq!(sc.path.as_deref(), Some("/api"));
+        assert_eq!(sc.max_age, Some(3600));
+        assert!(sc.secure);
+        assert!(sc.http_only);
+        assert_eq!(sc.same_site.as_deref(), Some("Strict"));
+
+        let sc_wire = sc.to_header_value();
+        assert!(sc_wire.contains("token=secret99"));
+        assert!(sc_wire.contains("Path=/api"));
+        assert!(sc_wire.contains("Max-Age=3600"));
+        assert!(sc_wire.contains("Secure"));
+        assert!(sc_wire.contains("HttpOnly"));
+        assert!(sc_wire.contains("SameSite=Strict"));
+    }
+
+    #[test]
+    fn test_cache_control_parsing_formatting() {
+        let raw = "public, max-age=3600, must-revalidate, no-transform";
+        let cc = CacheControl::parse(raw);
+        assert!(cc.public);
+        assert!(!cc.private);
+        assert_eq!(cc.max_age, Some(3600));
+        assert!(cc.must_revalidate);
+        assert!(cc.no_transform);
+        assert!(!cc.no_cache);
+        assert!(!cc.no_store);
+
+        let formatted = cc.to_header_value();
+        assert!(formatted.contains("public"));
+        assert!(formatted.contains("max-age=3600"));
+        assert!(formatted.contains("must-revalidate"));
+        assert!(formatted.contains("no-transform"));
+    }
+
+    #[test]
+    fn test_http_url_parsing_and_resolution() {
+        let u1 = HttpUrl::parse("http://ifa-lang.org/docs/std?v=1").unwrap();
+        assert_eq!(u1.scheme, "http");
+        assert_eq!(u1.host, "ifa-lang.org");
+        assert_eq!(u1.port, 80);
+        assert_eq!(u1.path_and_query, "/docs/std?v=1");
+        assert_eq!(u1.socket_addr_str(), "ifa-lang.org:80");
+        assert_eq!(u1.host_header_value(), "ifa-lang.org");
+
+        let u2 = HttpUrl::parse("http://127.0.0.1:8080/metrics").unwrap();
+        assert_eq!(u2.host, "127.0.0.1");
+        assert_eq!(u2.port, 8080);
+        assert_eq!(u2.host_header_value(), "127.0.0.1:8080");
+
+        // Relative resolution
+        let u3 = u1.join("/guide/install").unwrap();
+        assert_eq!(u3.path_and_query, "/guide/install");
+
+        let u4 = u1.join("submodule").unwrap();
+        assert_eq!(u4.path_and_query, "/docs/submodule");
+
+        // Reject HTTPS without TLS
+        assert!(HttpUrl::parse("https://secure.example.com").is_err());
+    }
+
+    #[test]
+    fn test_http_client_local_flow_and_redirect() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.port().expect("port");
+
+        let handle = thread::spawn(move || {
+            // First request: redirect to /final
+            let mut s1 = None;
+            for _ in 0..100 {
+                if let Ok(Some((stream, _))) = listener.try_accept() {
+                    s1 = Some(stream);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let s1 = s1.expect("s1 accepted");
+            s1.set_nonblocking(false).expect("blocking");
+            let mut b1 = BufferedTcpStream::new(s1).expect("b1");
+            let (req1, _) = read_request(&mut b1, 4096).unwrap().unwrap();
+            assert_eq!(req1.uri, "/initial");
+
+            let mut resp1 = HttpResponseHead::new(HttpStatus::FOUND, HttpVersion::Http11);
+            resp1.headers.insert("Location", "/final");
+            resp1.headers.insert("Connection", "close");
+            write_response_full(&mut b1, &resp1, b"").unwrap();
+
+            // Second request: handled at /final
+            let mut s2 = None;
+            for _ in 0..100 {
+                if let Ok(Some((stream, _))) = listener.try_accept() {
+                    s2 = Some(stream);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let s2 = s2.expect("s2 accepted");
+            s2.set_nonblocking(false).expect("blocking");
+            let mut b2 = BufferedTcpStream::new(s2).expect("b2");
+            let (req2, _) = read_request(&mut b2, 4096).unwrap().unwrap();
+            assert_eq!(req2.uri, "/final");
+
+            let mut resp2 = HttpResponseHead::ok();
+            resp2.headers.insert("Content-Type", "text/plain");
+            resp2.headers.insert("Connection", "close");
+            write_response_full(&mut b2, &resp2, b"Welcome to IFA std::net::http!").unwrap();
+        });
+
+        let client = HttpClient::builder()
+            .timeout(Duration::from_secs(5))
+            .follow_redirects(true)
+            .build();
+
+        let target_url = format!("http://127.0.0.1:{}/initial", port);
+        let resp = client.get(&target_url).expect("http get success");
+        assert_eq!(resp.status(), HttpStatus::OK);
+        assert_eq!(resp.text().unwrap(), "Welcome to IFA std::net::http!");
+
+        handle.join().expect("server thread finished");
     }
 }
