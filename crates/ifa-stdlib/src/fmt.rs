@@ -549,7 +549,7 @@ mod tests {
         assert_eq!(buf, "0b101100");
 
         buf.clear();
-        write_float_prec(&mut buf, 3.14159, 2).unwrap();
+        write_float_prec(&mut buf, std::f64::consts::PI, 2).unwrap();
         assert_eq!(buf, "3.14");
 
         buf.clear();

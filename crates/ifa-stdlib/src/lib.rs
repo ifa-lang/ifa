@@ -790,7 +790,7 @@ mod tests {
         // StringBuilder with fmt::Write support and streaming methods
         use std::fmt::Write;
         let mut sb = StringBuilder::with_capacity(128);
-        write!(&mut sb, "header: {}\n", 1).unwrap();
+        writeln!(&mut sb, "header: {}", 1).unwrap();
         sb.push_line("define i32 @main() {");
         sb.indent();
         sb.push_line("%t0 = add i32 10, 32");
