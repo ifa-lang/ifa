@@ -286,6 +286,16 @@ impl HeaderMap {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Get all matching header values in order of appearance (case-insensitive).
+    pub fn get_all(&self, name: &str) -> Vec<&str> {
+        let key = name.to_ascii_lowercase();
+        self.entries
+            .iter()
+            .filter(|(k, _)| k.to_ascii_lowercase() == key)
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
     /// Check if a header exists.
     pub fn contains_key(&self, name: &str) -> bool {
         let key = name.to_ascii_lowercase();
@@ -339,6 +349,32 @@ impl HttpRequestHead {
         }
     }
 
+    /// Construct a standard HTTP/1.1 GET request head.
+    pub fn get(uri: impl Into<String>) -> Self {
+        Self::new(HttpMethod::Get, uri, HttpVersion::Http11)
+    }
+
+    /// Construct a standard HTTP/1.1 POST request head.
+    pub fn post(uri: impl Into<String>) -> Self {
+        Self::new(HttpMethod::Post, uri, HttpVersion::Http11)
+    }
+
+    /// Construct a standard HTTP/1.1 PUT request head.
+    pub fn put(uri: impl Into<String>) -> Self {
+        Self::new(HttpMethod::Put, uri, HttpVersion::Http11)
+    }
+
+    /// Construct a standard HTTP/1.1 DELETE request head.
+    pub fn delete(uri: impl Into<String>) -> Self {
+        Self::new(HttpMethod::Delete, uri, HttpVersion::Http11)
+    }
+
+    /// Add or update a header, returning self.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(name, value);
+        self
+    }
+
     pub fn content_length(&self) -> Option<usize> {
         self.headers
             .get(HeaderMap::CONTENT_LENGTH)
@@ -385,6 +421,27 @@ impl HttpResponseHead {
 
     pub fn ok() -> Self {
         Self::new(HttpStatus::OK, HttpVersion::Http11)
+    }
+
+    /// Construct a standard 400 Bad Request response head.
+    pub fn bad_request() -> Self {
+        Self::new(HttpStatus::BAD_REQUEST, HttpVersion::Http11)
+    }
+
+    /// Construct a standard 404 Not Found response head.
+    pub fn not_found() -> Self {
+        Self::new(HttpStatus::NOT_FOUND, HttpVersion::Http11)
+    }
+
+    /// Construct a standard 500 Internal Server Error response head.
+    pub fn internal_server_error() -> Self {
+        Self::new(HttpStatus::INTERNAL_SERVER_ERROR, HttpVersion::Http11)
+    }
+
+    /// Add or update a header, returning self.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(name, value);
+        self
     }
 
     pub fn content_length(&self) -> Option<usize> {
@@ -1207,5 +1264,42 @@ mod tests {
         assert_eq!(&resp_body, b"pong-payload");
 
         handle.join().expect("server thread finished");
+    }
+
+    #[test]
+    fn test_header_map_multi_and_builders() {
+        let mut headers = HeaderMap::new();
+        headers.append("Set-Cookie", "sid=123; Path=/");
+        headers.append("SET-COOKIE", "theme=dark; Path=/");
+        headers.append("Accept", "text/html");
+
+        let cookies = headers.get_all("set-cookie");
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(cookies[0], "sid=123; Path=/");
+        assert_eq!(cookies[1], "theme=dark; Path=/");
+
+        let req = HttpRequestHead::get("/api/v1/items")
+            .with_header("Host", "example.com")
+            .with_header("Accept", "application/json");
+        assert_eq!(req.method, HttpMethod::Get);
+        assert_eq!(req.uri, "/api/v1/items");
+        assert_eq!(req.headers.get("host"), Some("example.com"));
+        assert_eq!(req.headers.get("accept"), Some("application/json"));
+
+        let resp_ok = HttpResponseHead::ok().with_header("Content-Type", "application/json");
+        assert_eq!(resp_ok.status, HttpStatus::OK);
+        assert_eq!(
+            resp_ok.headers.get("content-type"),
+            Some("application/json")
+        );
+
+        let resp_nf = HttpResponseHead::not_found();
+        assert_eq!(resp_nf.status, HttpStatus::NOT_FOUND);
+
+        let resp_br = HttpResponseHead::bad_request();
+        assert_eq!(resp_br.status, HttpStatus::BAD_REQUEST);
+
+        let resp_err = HttpResponseHead::internal_server_error();
+        assert_eq!(resp_err.status, HttpStatus::INTERNAL_SERVER_ERROR);
     }
 }
