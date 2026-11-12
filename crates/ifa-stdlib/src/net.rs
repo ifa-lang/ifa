@@ -12,7 +12,10 @@ use std::time::Duration;
 use std::os::unix::io::AsRawFd;
 
 use ifa_runtime::fiber::GLOBAL_SCHEDULER;
-pub use ifa_runtime::reactor::{AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket};
+pub use ifa_runtime::reactor::{
+    AsyncTcpListener, AsyncTcpReadHalf, AsyncTcpStream, AsyncTcpWriteHalf, AsyncTimer,
+    AsyncUdpSocket,
+};
 
 pub mod http;
 
@@ -1009,6 +1012,176 @@ impl BufferedTcpStream {
     /// Unwraps this buffered stream, returning the underlying reader `TcpStream`.
     pub fn into_inner(self) -> TcpStream {
         self.reader.into_inner()
+    }
+
+    /// Borrows the internal reader and writer independently.
+    pub fn split_mut(&mut self) -> (&mut BufReader<TcpStream>, &mut BufWriter<TcpStream>) {
+        (&mut self.reader, &mut self.writer)
+    }
+
+    /// Split this buffered stream into an owned read half and write half.
+    pub fn into_split(self) -> (BufferedReaderHalf, BufferedWriterHalf) {
+        (
+            BufferedReaderHalf {
+                reader: self.reader,
+            },
+            BufferedWriterHalf {
+                writer: self.writer,
+            },
+        )
+    }
+
+    /// Reunite an owned read half and write half into a single `BufferedTcpStream`.
+    pub fn reunite(reader: BufferedReaderHalf, writer: BufferedWriterHalf) -> Self {
+        Self {
+            reader: reader.reader,
+            writer: writer.writer,
+        }
+    }
+
+    /// Unwraps both underlying `TcpStream` handles (reader clone and writer clone).
+    pub fn into_inner_pair(self) -> (TcpStream, io::Result<TcpStream>) {
+        (
+            self.reader.into_inner(),
+            self.writer.into_inner().map_err(|e| e.into_error()),
+        )
+    }
+}
+
+/// Owned read half of a `BufferedTcpStream`.
+pub struct BufferedReaderHalf {
+    reader: BufReader<TcpStream>,
+}
+
+impl BufferedReaderHalf {
+    /// Read a line of text (ending with '\n' or '\r\n') from the stream.
+    /// Returns `Ok(Some(line))` without trailing newline, or `Ok(None)` on EOF or if would block with 0 bytes.
+    pub fn read_line(&mut self) -> io::Result<Option<String>> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => Ok(None),
+            Ok(_) => {
+                if line.ends_with('\n') {
+                    line.pop();
+                    if line.ends_with('\r') {
+                        line.pop();
+                    }
+                }
+                Ok(Some(line))
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Returns the data currently buffered in the reader without reading from the OS socket.
+    pub fn buffer(&self) -> &[u8] {
+        self.reader.buffer()
+    }
+
+    /// Returns the number of bytes currently buffered in the reader.
+    pub fn buffer_len(&self) -> usize {
+        self.reader.buffer().len()
+    }
+
+    /// Returns the reader capacity.
+    pub fn capacity(&self) -> usize {
+        self.reader.capacity()
+    }
+
+    /// Remote peer socket address.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.reader.get_ref().peer_addr()
+    }
+
+    /// Local socket address.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.reader.get_ref().local_addr()
+    }
+
+    /// Unwraps the underlying `TcpStream`.
+    pub fn into_inner(self) -> TcpStream {
+        self.reader.into_inner()
+    }
+
+    /// Reunite this read half with a write half into a single `BufferedTcpStream`.
+    pub fn reunite(self, writer: BufferedWriterHalf) -> BufferedTcpStream {
+        BufferedTcpStream::reunite(self, writer)
+    }
+}
+
+impl io::Read for BufferedReaderHalf {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.reader.read(buf)
+    }
+}
+
+impl io::BufRead for BufferedReaderHalf {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.reader.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.reader.consume(amt);
+    }
+}
+
+/// Owned write half of a `BufferedTcpStream`.
+pub struct BufferedWriterHalf {
+    writer: BufWriter<TcpStream>,
+}
+
+impl BufferedWriterHalf {
+    /// Write a string slice followed by a newline and flush.
+    pub fn write_line(&mut self, line: &str) -> io::Result<()> {
+        self.writer.write_all(line.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()
+    }
+
+    /// Write all bytes into the writer buffer.
+    pub fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.writer.write_all(buf)
+    }
+
+    /// Flush buffered writes to the underlying socket.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+
+    /// Returns the writer capacity.
+    pub fn capacity(&self) -> usize {
+        self.writer.capacity()
+    }
+
+    /// Remote peer socket address.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.writer.get_ref().peer_addr()
+    }
+
+    /// Local socket address.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.writer.get_ref().local_addr()
+    }
+
+    /// Unwraps the underlying `TcpStream`.
+    pub fn into_inner(self) -> Result<TcpStream, io::IntoInnerError<BufWriter<TcpStream>>> {
+        self.writer.into_inner()
+    }
+
+    /// Reunite this write half with a read half into a single `BufferedTcpStream`.
+    pub fn reunite(self, reader: BufferedReaderHalf) -> BufferedTcpStream {
+        BufferedTcpStream::reunite(reader, self)
+    }
+}
+
+impl io::Write for BufferedWriterHalf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
     }
 }
 
@@ -3214,5 +3387,53 @@ mod tests {
         // Buffer inspections
         assert!(client_buf.buffer().is_empty());
         assert_eq!(client_buf.buffer_len(), 0);
+    }
+
+    #[test]
+    fn test_buffered_tcp_stream_split_and_reunite() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.port().expect("port");
+        let client = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect");
+        let (server_raw, _) = listener.try_accept().expect("accept").expect("stream");
+
+        let client_buf = BufferedTcpStream::with_capacity(4096, 4096, client).expect("client buf");
+        let mut server_buf = BufferedTcpStream::new(server_raw).expect("server buf");
+
+        // 1. Borrowed split inspection
+        {
+            let (r_ref, w_ref) = server_buf.split_mut();
+            assert_eq!(r_ref.buffer().len(), 0);
+            w_ref.flush().expect("flush borrowed writer");
+        }
+
+        // 2. Owned split into independent halves
+        let (mut r_half, mut w_half) = client_buf.into_split();
+
+        assert_eq!(r_half.capacity(), 4096);
+        assert_eq!(w_half.capacity(), 4096);
+        assert!(r_half.peer_addr().is_ok());
+        assert!(w_half.local_addr().is_ok());
+
+        // 3. Independent writes and reads across halves
+        w_half.write_line("COMMAND_STATUS").expect("write line");
+
+        let server_line = server_buf.read_line().expect("read line").expect("message");
+        assert_eq!(server_line, "COMMAND_STATUS");
+
+        server_buf
+            .write_line("STATUS_ACTIVE_OK")
+            .expect("server write line");
+
+        let client_line = r_half.read_line().expect("read line").expect("response");
+        assert_eq!(client_line, "STATUS_ACTIVE_OK");
+
+        // 4. Reunite halves into a single BufferedTcpStream
+        let client_reunited = r_half.reunite(w_half);
+        assert_eq!(client_reunited.capacity(), (4096, 4096));
+
+        // 5. Unwrapping handles
+        let (r_stream, w_stream_res) = client_reunited.into_inner_pair();
+        assert!(r_stream.peer_addr().is_ok());
+        assert!(w_stream_res.is_ok());
     }
 }

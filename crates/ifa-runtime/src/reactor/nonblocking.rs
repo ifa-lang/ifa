@@ -68,6 +68,17 @@ impl AsyncTcpListener {
     pub fn ttl(&self) -> io::Result<u32> {
         self.inner.ttl()
     }
+
+    /// Creates a new independently owned handle to the underlying listener.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        let listener = self.inner.try_clone()?;
+        Ok(Self { inner: listener })
+    }
+
+    /// Consume this async listener and return the underlying standard `TcpListener`.
+    pub fn into_std(self) -> TcpListener {
+        self.inner
+    }
 }
 
 /// Asynchronous non-blocking TCP stream managed by the fiber reactor.
@@ -179,6 +190,147 @@ impl AsyncTcpStream {
     /// Retrieve IP Time-To-Live.
     pub fn ttl(&self) -> io::Result<u32> {
         self.inner.ttl()
+    }
+
+    /// Local socket address.
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    /// Create a duplicate handle to the underlying TCP stream.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        let stream = self.inner.try_clone()?;
+        Ok(Self { inner: stream })
+    }
+
+    /// Shuts down the read, write, or both halves of this connection.
+    pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        self.inner.shutdown(how)
+    }
+
+    /// Consume this async stream and return the underlying standard `TcpStream`.
+    pub fn into_std(self) -> TcpStream {
+        self.inner
+    }
+
+    /// Split this async stream into owned read and write halves.
+    pub fn into_split(self) -> io::Result<(AsyncTcpReadHalf, AsyncTcpWriteHalf)> {
+        let write_clone = self.try_clone()?;
+        Ok((
+            AsyncTcpReadHalf { inner: self },
+            AsyncTcpWriteHalf { inner: write_clone },
+        ))
+    }
+}
+
+impl io::Read for AsyncTcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        AsyncTcpStream::read(self, buf)
+    }
+}
+
+impl io::Write for AsyncTcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut spins = 0;
+        loop {
+            match self.inner.write(buf) {
+                Ok(n) => return Ok(n),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    spins += 1;
+                    if spins < 16 {
+                        std::hint::spin_loop();
+                    } else {
+                        GLOBAL_SCHEDULER.yield_now();
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Owned read half of an `AsyncTcpStream`.
+pub struct AsyncTcpReadHalf {
+    inner: AsyncTcpStream,
+}
+
+impl AsyncTcpReadHalf {
+    /// Read data from the stream asynchronously.
+    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+
+    /// Non-blocking read attempt: returns `Ok(None)` if would block.
+    pub fn try_read(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        self.inner.try_read(buf)
+    }
+
+    /// Remote peer address.
+    pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.peer_addr()
+    }
+
+    /// Local socket address.
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    /// Reunite with write half into the original `AsyncTcpStream`.
+    pub fn reunite(self, _writer: AsyncTcpWriteHalf) -> AsyncTcpStream {
+        self.inner
+    }
+}
+
+impl io::Read for AsyncTcpReadHalf {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+/// Owned write half of an `AsyncTcpStream`.
+pub struct AsyncTcpWriteHalf {
+    inner: AsyncTcpStream,
+}
+
+impl AsyncTcpWriteHalf {
+    /// Write data to the stream asynchronously.
+    pub fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.inner.write_all(buf)
+    }
+
+    /// Flush the TCP stream.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+
+    /// Remote peer address.
+    pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.peer_addr()
+    }
+
+    /// Local socket address.
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    /// Reunite with read half into the original `AsyncTcpStream`.
+    pub fn reunite(self, reader: AsyncTcpReadHalf) -> AsyncTcpStream {
+        reader.inner
+    }
+}
+
+impl io::Write for AsyncTcpWriteHalf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        io::Write::write(&mut self.inner, buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -348,6 +500,17 @@ impl AsyncUdpSocket {
     pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.inner.peer_addr()
     }
+
+    /// Creates a new independently owned handle to the underlying UDP socket.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        let socket = self.inner.try_clone()?;
+        Ok(Self { inner: socket })
+    }
+
+    /// Consume this async UDP socket and return the underlying standard `UdpSocket`.
+    pub fn into_std(self) -> std::net::UdpSocket {
+        self.inner
+    }
 }
 
 /// Asynchronous non-blocking timer for fibers.
@@ -367,5 +530,64 @@ impl AsyncTimer {
                 std::hint::spin_loop();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_async_tcp_stream_split_and_traits() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let l_addr = listener.local_addr().expect("local addr");
+
+        let client = AsyncTcpStream::connect(l_addr).expect("connect client");
+        let (mut server, s_peer) = listener.accept().expect("accept connection");
+
+        assert_eq!(s_peer.port(), client.local_addr().expect("local").port());
+        assert_eq!(client.peer_addr().expect("peer").port(), l_addr.port());
+
+        // Split client into read and write halves
+        let (mut read_half, mut write_half) = client.into_split().expect("into_split");
+
+        // Write using write_half (testing io::Write implementation)
+        io::Write::write_all(&mut write_half, b"HELLO REACTOR\n").expect("write_all on half");
+
+        let mut s_buf = [0u8; 64];
+        let n = server.read(&mut s_buf).expect("server read");
+        assert_eq!(&s_buf[..n], b"HELLO REACTOR\n");
+
+        // Server replies
+        server
+            .write_all(b"REACTOR ACK\n")
+            .expect("server write_all");
+
+        // Read using read_half (testing io::Read implementation)
+        let mut c_buf = [0u8; 64];
+        let rn = io::Read::read(&mut read_half, &mut c_buf).expect("read_half read");
+        assert_eq!(&c_buf[..rn], b"REACTOR ACK\n");
+
+        // Reunite halves
+        let client_reunited = read_half.reunite(write_half);
+        assert_eq!(
+            client_reunited.peer_addr().expect("peer").port(),
+            l_addr.port()
+        );
+
+        // Conversions to standard net types
+        let std_stream = client_reunited.into_std();
+        assert_eq!(std_stream.peer_addr().expect("peer").port(), l_addr.port());
+
+        let std_listener = listener.into_std();
+        assert_eq!(
+            std_listener.local_addr().expect("local").port(),
+            l_addr.port()
+        );
+
+        let udp = AsyncUdpSocket::bind("127.0.0.1:0").expect("bind udp");
+        let udp_cloned = udp.try_clone().expect("try_clone udp");
+        let std_udp = udp_cloned.into_std();
+        assert!(std_udp.local_addr().is_ok());
     }
 }

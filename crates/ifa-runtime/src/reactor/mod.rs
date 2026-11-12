@@ -13,7 +13,10 @@ pub mod nonblocking;
 
 pub use io_uring::{IoUringConnector, IoUringCqe, IoUringSqe, KernelTimespec};
 pub use iocp::{IocpCompletionPacket, IocpConnector, IocpOpCode};
-pub use nonblocking::{AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket};
+pub use nonblocking::{
+    AsyncTcpListener, AsyncTcpReadHalf, AsyncTcpStream, AsyncTcpWriteHalf, AsyncTimer,
+    AsyncUdpSocket,
+};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
