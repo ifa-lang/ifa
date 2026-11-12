@@ -62,8 +62,9 @@ pub use json::{
     decode as decode_json, encode as encode_json, encode_pretty as encode_json_pretty, JsonValue,
 };
 pub use net::{
-    lookup_mime_type, AsyncWsConnection, ConnectionInfo, TcpListener as NetTcpListener, TcpServer,
-    TcpStream as NetTcpStream, TokenBucket, WsClient, WsDemux, WsFrame, WsMessage, WsOpcode,
+    lookup_mime_type, AsyncWsConnection, ConnectionInfo, TcpListener as NetTcpListener,
+    TcpListener, TcpServer, TcpStream as NetTcpStream, TcpStream, TokenBucket,
+    UdpSocket as NetUdpSocket, UdpSocket, WsClient, WsDemux, WsFrame, WsMessage, WsOpcode,
     WsServer, WsSession,
 };
 pub use process::{
@@ -835,5 +836,15 @@ mod tests {
         assert!(file_names.contains(&"b.txt".to_string()));
 
         let _ = fs_remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_net_udp_and_tcp_prelude_exports() {
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind prelude UdpSocket");
+        assert!(sock.is_open());
+        assert!(sock.port().unwrap() > 0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind prelude TcpListener");
+        assert!(listener.port().unwrap() > 0);
     }
 }

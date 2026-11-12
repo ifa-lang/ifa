@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{
     SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs,
+    UdpSocket as StdUdpSocket,
 };
 use std::time::Duration;
 
@@ -96,6 +97,35 @@ impl TcpStream {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
     }
+
+    /// Sets the value of the `TCP_NODELAY` option on this socket.
+    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        self.inner.set_nodelay(nodelay)
+    }
+
+    /// Gets the value of the `TCP_NODELAY` option on this socket.
+    pub fn nodelay(&self) -> io::Result<bool> {
+        self.inner.nodelay()
+    }
+
+    /// Sets the value for the `IP_TTL` option on this socket.
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        self.inner.set_ttl(ttl)
+    }
+
+    /// Gets the value of the `IP_TTL` option for this socket.
+    pub fn ttl(&self) -> io::Result<u32> {
+        self.inner.ttl()
+    }
+
+    /// Creates a new independently owned handle to the underlying socket.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        let cloned = self.inner.try_clone()?;
+        Ok(Self {
+            inner: cloned,
+            is_open: self.is_open,
+        })
+    }
 }
 
 /// Managed non-blocking TCP Listener.
@@ -143,9 +173,207 @@ impl TcpListener {
         self.inner.local_addr().map(|a| a.port())
     }
 
+    /// Sets the value for the `IP_TTL` option on this socket.
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        self.inner.set_ttl(ttl)
+    }
+
+    /// Gets the value of the `IP_TTL` option for this socket.
+    pub fn ttl(&self) -> io::Result<u32> {
+        self.inner.ttl()
+    }
+
+    /// Creates a new independently owned handle to the underlying listener.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        let cloned = self.inner.try_clone()?;
+        Ok(Self {
+            inner: cloned,
+            is_open: self.is_open,
+        })
+    }
+
     /// Close the listener.
     pub fn close(&mut self) {
         self.is_open = false;
+    }
+}
+
+/// Managed non-blocking UDP Socket (`std::net::UdpSocket`).
+pub struct UdpSocket {
+    inner: StdUdpSocket,
+    is_open: bool,
+}
+
+impl UdpSocket {
+    /// Bind to a local address and configure socket in non-blocking mode.
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        let socket = StdUdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            inner: socket,
+            is_open: true,
+        })
+    }
+
+    /// Wrap an existing standard UDP socket.
+    pub fn from_std(socket: StdUdpSocket) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            inner: socket,
+            is_open: true,
+        })
+    }
+
+    /// Sends data on the socket to the given address.
+    pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], target: A) -> io::Result<usize> {
+        if !self.is_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "UDP socket is closed",
+            ));
+        }
+        self.inner.send_to(buf, target)
+    }
+
+    /// Receives a single datagram message on the socket.
+    /// In non-blocking mode, if no data is available, returns Ok((0, dummy_addr)).
+    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        if !self.is_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "UDP socket is closed",
+            ));
+        }
+        match self.inner.recv_from(buf) {
+            Ok(res) => Ok(res),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let dummy: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                Ok((0, dummy))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Non-blocking poll for incoming datagram. Returns `Ok(Some((bytes_read, sender_addr)))`
+    /// or `Ok(None)` if no datagram is pending.
+    pub fn poll_recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
+        if !self.is_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "UDP socket is closed",
+            ));
+        }
+        match self.inner.recv_from(buf) {
+            Ok((n, addr)) => Ok(Some((n, addr))),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Connects this UDP socket to a remote address, allowing the `send` and `recv` shortcuts.
+    pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
+        if !self.is_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "UDP socket is closed",
+            ));
+        }
+        self.inner.connect(addr)
+    }
+
+    /// Sends data on the socket to the connected peer.
+    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        if !self.is_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "UDP socket is closed",
+            ));
+        }
+        self.inner.send(buf)
+    }
+
+    /// Receives a single datagram message from the connected peer.
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.is_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "UDP socket is closed",
+            ));
+        }
+        match self.inner.recv(buf) {
+            Ok(n) => Ok(n),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Returns the socket address of the local half of this UDP socket.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    /// Returns the bound port number.
+    pub fn port(&self) -> io::Result<u16> {
+        self.inner.local_addr().map(|a| a.port())
+    }
+
+    /// Returns the socket address of the remote peer this socket was connected to.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.peer_addr()
+    }
+
+    /// Sets the value of the `SO_BROADCAST` option for this socket.
+    pub fn set_broadcast(&self, on: bool) -> io::Result<()> {
+        self.inner.set_broadcast(on)
+    }
+
+    /// Gets the value of the `SO_BROADCAST` option for this socket.
+    pub fn broadcast(&self) -> io::Result<bool> {
+        self.inner.broadcast()
+    }
+
+    /// Sets the value of the `IP_MULTICAST_LOOP` option for this socket.
+    pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
+        self.inner.set_multicast_loop_v4(on)
+    }
+
+    /// Gets the value of the `IP_MULTICAST_LOOP` option for this socket.
+    pub fn multicast_loop_v4(&self) -> io::Result<bool> {
+        self.inner.multicast_loop_v4()
+    }
+
+    /// Sets the value for the `IP_TTL` option on this socket.
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        self.inner.set_ttl(ttl)
+    }
+
+    /// Gets the value of the `IP_TTL` option for this socket.
+    pub fn ttl(&self) -> io::Result<u32> {
+        self.inner.ttl()
+    }
+
+    /// Moves this UDP socket into or out of nonblocking mode.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.inner.set_nonblocking(nonblocking)
+    }
+
+    /// Creates a new independently owned handle to the underlying socket.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        let cloned = self.inner.try_clone()?;
+        Ok(Self {
+            inner: cloned,
+            is_open: self.is_open,
+        })
+    }
+
+    /// Mark socket as closed.
+    pub fn close(&mut self) {
+        self.is_open = false;
+    }
+
+    /// Returns true if socket is currently open.
+    pub fn is_open(&self) -> bool {
+        self.is_open
     }
 }
 
@@ -2041,5 +2269,102 @@ mod tests {
             client.close();
         }
         server.stop();
+    }
+
+    #[test]
+    fn test_udp_socket_lifecycle_and_options() {
+        let mut sock_a = UdpSocket::bind("127.0.0.1:0").expect("bind udp socket a");
+        let mut sock_b = UdpSocket::bind("127.0.0.1:0").expect("bind udp socket b");
+
+        assert!(sock_a.is_open());
+        assert!(sock_b.is_open());
+
+        let addr_a = sock_a.local_addr().expect("local addr a");
+        let addr_b = sock_b.local_addr().expect("local addr b");
+        assert!(sock_a.port().expect("port a") > 0);
+        assert!(sock_b.port().expect("port b") > 0);
+
+        // Test socket options
+        sock_a.set_ttl(64).expect("set ttl");
+        assert_eq!(sock_a.ttl().expect("get ttl"), 64);
+
+        sock_a.set_broadcast(true).expect("set broadcast true");
+        assert!(sock_a.broadcast().expect("get broadcast"));
+        sock_a.set_broadcast(false).expect("set broadcast false");
+        assert!(!sock_a.broadcast().expect("get broadcast"));
+
+        // Datagram communication
+        let payload = b"IFA_UDP_DATAGRAM_TEST";
+        let sent = sock_a
+            .send_to(payload, addr_b)
+            .expect("send_to datagram from a to b");
+        assert_eq!(sent, payload.len());
+
+        // Wait briefly for local socket buffer delivery
+        std::thread::sleep(Duration::from_millis(20));
+
+        let mut recv_buf = [0u8; 128];
+        let poll_res = sock_b.poll_recv_from(&mut recv_buf).expect("poll recv");
+        assert!(poll_res.is_some());
+        let (n, from_addr) = poll_res.unwrap();
+        assert_eq!(n, payload.len());
+        assert_eq!(&recv_buf[..n], payload);
+        assert_eq!(from_addr.port(), addr_a.port());
+
+        // Connected mode test
+        sock_a.connect(addr_b).expect("connect sock_a to sock_b");
+        assert_eq!(sock_a.peer_addr().expect("peer_addr").port(), addr_b.port());
+
+        let conn_payload = b"CONNECTED_UDP_FLOW";
+        let sent_conn = sock_a.send(conn_payload).expect("send connected");
+        assert_eq!(sent_conn, conn_payload.len());
+
+        std::thread::sleep(Duration::from_millis(20));
+        let (recv_n, _) = sock_b.recv_from(&mut recv_buf).expect("recv_from b");
+        assert_eq!(recv_n, conn_payload.len());
+        assert_eq!(&recv_buf[..recv_n], conn_payload);
+
+        // Clone handle
+        let cloned_a = sock_a.try_clone().expect("try_clone");
+        assert_eq!(cloned_a.port().unwrap(), sock_a.port().unwrap());
+
+        // Close sockets
+        sock_a.close();
+        sock_b.close();
+        assert!(!sock_a.is_open());
+        assert!(!sock_b.is_open());
+        assert!(sock_a.send_to(payload, addr_b).is_err());
+    }
+
+    #[test]
+    fn test_tcp_socket_extended_options() {
+        let mut listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp listener");
+        let port = listener.port().expect("listener port");
+
+        listener.set_ttl(42).expect("set_ttl listener");
+        assert_eq!(listener.ttl().expect("get_ttl listener"), 42);
+
+        let cloned_listener = listener.try_clone().expect("clone listener");
+        assert_eq!(cloned_listener.port().unwrap(), port);
+
+        let mut client_stream =
+            TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect client");
+        client_stream.set_nodelay(true).expect("set_nodelay");
+        assert!(client_stream.nodelay().expect("get nodelay"));
+
+        client_stream.set_ttl(64).expect("set_ttl stream");
+        assert_eq!(client_stream.ttl().expect("get_ttl stream"), 64);
+
+        let cloned_client = client_stream.try_clone().expect("clone stream");
+        assert_eq!(
+            cloned_client.peer_addr().unwrap().port(),
+            client_stream.peer_addr().unwrap().port()
+        );
+
+        let accepted = listener.try_accept().expect("try_accept");
+        assert!(accepted.is_some());
+
+        client_stream.close();
+        listener.close();
     }
 }
