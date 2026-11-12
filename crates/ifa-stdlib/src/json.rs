@@ -359,6 +359,99 @@ impl JsonValue {
             _ => Err("Target parent is not an Object or Array".to_string()),
         }
     }
+
+    /// Apply an RFC 7396 JSON Merge Patch to this value.
+    pub fn merge_patch(&mut self, patch: &JsonValue) {
+        match patch {
+            JsonValue::Object(patch_obj) => {
+                if !self.is_object() {
+                    *self = JsonValue::Object(BTreeMap::new());
+                }
+                if let JsonValue::Object(target_map) = self {
+                    for (k, v) in patch_obj {
+                        if v.is_null() {
+                            target_map.remove(k);
+                        } else {
+                            target_map
+                                .entry(k.clone())
+                                .or_insert(JsonValue::Null)
+                                .merge_patch(v);
+                        }
+                    }
+                }
+            }
+            other => {
+                *self = other.clone();
+            }
+        }
+    }
+
+    /// Apply a sequence of RFC 6902 JSON Patch operations atomically.
+    /// If any operation fails, the original document remains unmodified.
+    pub fn apply_patch(&mut self, ops: &[PatchOperation]) -> Result<(), String> {
+        let mut draft = self.clone();
+        for op in ops {
+            match op {
+                PatchOperation::Add { path, value } => {
+                    apply_add(&mut draft, path, value.clone())?;
+                }
+                PatchOperation::Remove { path } => {
+                    apply_remove(&mut draft, path)?;
+                }
+                PatchOperation::Replace { path, value } => {
+                    apply_replace(&mut draft, path, value.clone())?;
+                }
+                PatchOperation::Move { from, path } => {
+                    if path.starts_with(from)
+                        && (path.len() == from.len()
+                            || path.as_bytes().get(from.len()) == Some(&b'/'))
+                        && path != from
+                    {
+                        return Err(format!(
+                            "Cannot move '{}' into its own child location '{}'",
+                            from, path
+                        ));
+                    }
+                    if from == path {
+                        if draft.pointer(from).is_none() {
+                            return Err(format!("Path '{}' does not exist for move", from));
+                        }
+                    } else {
+                        let val = apply_remove(&mut draft, from)?;
+                        apply_add(&mut draft, path, val)?;
+                    }
+                }
+                PatchOperation::Copy { from, path } => {
+                    let val = draft
+                        .pointer(from)
+                        .ok_or_else(|| {
+                            format!("Source location '{}' does not exist for copy", from)
+                        })?
+                        .clone();
+                    apply_add(&mut draft, path, val)?;
+                }
+                PatchOperation::Test { path, value } => {
+                    let existing = draft
+                        .pointer(path)
+                        .ok_or_else(|| format!("Location '{}' does not exist for test", path))?;
+                    if existing != value {
+                        return Err(format!(
+                            "Test operation failed at '{}': expected {}, found {}",
+                            path, value, existing
+                        ));
+                    }
+                }
+            }
+        }
+        *self = draft;
+        Ok(())
+    }
+
+    /// Parse and apply an RFC 6902 JSON Patch document atomically.
+    pub fn apply_json_patch(&mut self, patch_doc: &JsonValue) -> Result<(), String> {
+        let ops = parse_patch(patch_doc)?;
+        self.apply_patch(&ops)
+    }
 }
 
 /// Decode a JSON Pointer reference token according to RFC 6901 (`~1` -> `/`, `~0` -> `~`).
@@ -382,6 +475,344 @@ fn split_pointer(ptr: &str) -> Result<Vec<String>, String> {
         ));
     }
     Ok(ptr[1..].split('/').map(decode_pointer_token).collect())
+}
+
+/// An operation in an RFC 6902 JSON Patch document.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatchOperation {
+    Add { path: String, value: JsonValue },
+    Remove { path: String },
+    Replace { path: String, value: JsonValue },
+    Move { from: String, path: String },
+    Copy { from: String, path: String },
+    Test { path: String, value: JsonValue },
+}
+
+impl PatchOperation {
+    pub fn to_json(&self) -> JsonValue {
+        let mut map = BTreeMap::new();
+        match self {
+            PatchOperation::Add { path, value } => {
+                map.insert("op".to_string(), JsonValue::String("add".to_string()));
+                map.insert("path".to_string(), JsonValue::String(path.clone()));
+                map.insert("value".to_string(), value.clone());
+            }
+            PatchOperation::Remove { path } => {
+                map.insert("op".to_string(), JsonValue::String("remove".to_string()));
+                map.insert("path".to_string(), JsonValue::String(path.clone()));
+            }
+            PatchOperation::Replace { path, value } => {
+                map.insert("op".to_string(), JsonValue::String("replace".to_string()));
+                map.insert("path".to_string(), JsonValue::String(path.clone()));
+                map.insert("value".to_string(), value.clone());
+            }
+            PatchOperation::Move { from, path } => {
+                map.insert("op".to_string(), JsonValue::String("move".to_string()));
+                map.insert("from".to_string(), JsonValue::String(from.clone()));
+                map.insert("path".to_string(), JsonValue::String(path.clone()));
+            }
+            PatchOperation::Copy { from, path } => {
+                map.insert("op".to_string(), JsonValue::String("copy".to_string()));
+                map.insert("from".to_string(), JsonValue::String(from.clone()));
+                map.insert("path".to_string(), JsonValue::String(path.clone()));
+            }
+            PatchOperation::Test { path, value } => {
+                map.insert("op".to_string(), JsonValue::String("test".to_string()));
+                map.insert("path".to_string(), JsonValue::String(path.clone()));
+                map.insert("value".to_string(), value.clone());
+            }
+        }
+        JsonValue::Object(map)
+    }
+}
+
+/// Parse an RFC 6902 JSON Patch array document into structured operations.
+pub fn parse_patch(patch_json: &JsonValue) -> Result<Vec<PatchOperation>, String> {
+    let arr = patch_json
+        .as_array()
+        .ok_or_else(|| "JSON Patch document must be an array of operation objects".to_string())?;
+
+    let mut ops = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| format!("Patch operation at index {} must be an object", idx))?;
+
+        let op = obj
+            .get("op")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("Missing or non-string 'op' field at index {}", idx))?;
+
+        let path = obj
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("Missing or non-string 'path' field at index {}", idx))?
+            .to_string();
+
+        let operation = match op {
+            "add" => {
+                let value = obj
+                    .get("value")
+                    .ok_or_else(|| {
+                        format!("Missing 'value' field for 'add' operation at index {}", idx)
+                    })?
+                    .clone();
+                PatchOperation::Add { path, value }
+            }
+            "remove" => PatchOperation::Remove { path },
+            "replace" => {
+                let value = obj
+                    .get("value")
+                    .ok_or_else(|| {
+                        format!(
+                            "Missing 'value' field for 'replace' operation at index {}",
+                            idx
+                        )
+                    })?
+                    .clone();
+                PatchOperation::Replace { path, value }
+            }
+            "move" => {
+                let from = obj
+                    .get("from")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        format!(
+                            "Missing or non-string 'from' field for 'move' operation at index {}",
+                            idx
+                        )
+                    })?
+                    .to_string();
+                PatchOperation::Move { from, path }
+            }
+            "copy" => {
+                let from = obj
+                    .get("from")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        format!(
+                            "Missing or non-string 'from' field for 'copy' operation at index {}",
+                            idx
+                        )
+                    })?
+                    .to_string();
+                PatchOperation::Copy { from, path }
+            }
+            "test" => {
+                let value = obj
+                    .get("value")
+                    .ok_or_else(|| {
+                        format!(
+                            "Missing 'value' field for 'test' operation at index {}",
+                            idx
+                        )
+                    })?
+                    .clone();
+                PatchOperation::Test { path, value }
+            }
+            unknown => {
+                return Err(format!(
+                    "Unsupported JSON Patch operation '{}' at index {}",
+                    unknown, idx
+                ))
+            }
+        };
+
+        ops.push(operation);
+    }
+
+    Ok(ops)
+}
+
+/// Compute an RFC 7396 JSON Merge Patch document representing the minimal differences to transform `source` into `target`.
+pub fn create_merge_patch(source: &JsonValue, target: &JsonValue) -> JsonValue {
+    match (source, target) {
+        (JsonValue::Object(s_map), JsonValue::Object(t_map)) => {
+            let mut patch = BTreeMap::new();
+            for k in s_map.keys() {
+                if !t_map.contains_key(k) {
+                    patch.insert(k.clone(), JsonValue::Null);
+                }
+            }
+            for (k, v) in t_map {
+                match s_map.get(k) {
+                    Some(s_val) => {
+                        if s_val != v {
+                            if s_val.is_object() && v.is_object() {
+                                let sub_patch = create_merge_patch(s_val, v);
+                                if sub_patch != JsonValue::Object(BTreeMap::new()) {
+                                    patch.insert(k.clone(), sub_patch);
+                                }
+                            } else {
+                                patch.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    None => {
+                        patch.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            JsonValue::Object(patch)
+        }
+        _ => {
+            if source == target {
+                JsonValue::Null
+            } else {
+                target.clone()
+            }
+        }
+    }
+}
+
+fn navigate_parent_mut<'a>(
+    root: &'a mut JsonValue,
+    parent_tokens: &[String],
+) -> Result<&'a mut JsonValue, String> {
+    let mut curr = root;
+    for (i, token) in parent_tokens.iter().enumerate() {
+        curr = match curr {
+            JsonValue::Object(map) => map
+                .get_mut(token)
+                .ok_or_else(|| format!("Segment '{}' not found at step {}", token, i))?,
+            JsonValue::Array(arr) => {
+                if token.len() > 1 && token.starts_with('0') {
+                    return Err(format!("Invalid array index '{}' with leading zero", token));
+                }
+                let idx: usize = token
+                    .parse()
+                    .map_err(|_| format!("Invalid array index '{}'", token))?;
+                let len = arr.len();
+                arr.get_mut(idx)
+                    .ok_or_else(|| format!("Array index {} out of bounds (len {})", idx, len))?
+            }
+            _ => return Err(format!("Cannot traverse non-container at step {}", i)),
+        };
+    }
+    Ok(curr)
+}
+
+fn apply_add(root: &mut JsonValue, path: &str, value: JsonValue) -> Result<(), String> {
+    let tokens = split_pointer(path)?;
+    if tokens.is_empty() {
+        *root = value;
+        return Ok(());
+    }
+    let (last_token, parent_tokens) = tokens.split_last().unwrap();
+    let parent = navigate_parent_mut(root, parent_tokens)?;
+    match parent {
+        JsonValue::Object(map) => {
+            map.insert(last_token.clone(), value);
+            Ok(())
+        }
+        JsonValue::Array(arr) => {
+            if last_token == "-" {
+                arr.push(value);
+                Ok(())
+            } else {
+                if last_token.len() > 1 && last_token.starts_with('0') {
+                    return Err(format!(
+                        "Invalid array index '{}' with leading zero",
+                        last_token
+                    ));
+                }
+                let idx: usize = last_token
+                    .parse()
+                    .map_err(|_| format!("Invalid array index '{}'", last_token))?;
+                if idx <= arr.len() {
+                    arr.insert(idx, value);
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Array index {} out of bounds for add (len {})",
+                        idx,
+                        arr.len()
+                    ))
+                }
+            }
+        }
+        _ => Err("Parent container is neither an object nor an array".to_string()),
+    }
+}
+
+fn apply_remove(root: &mut JsonValue, path: &str) -> Result<JsonValue, String> {
+    let tokens = split_pointer(path)?;
+    if tokens.is_empty() {
+        return Err("Cannot remove root JSON element".to_string());
+    }
+    let (last_token, parent_tokens) = tokens.split_last().unwrap();
+    let parent = navigate_parent_mut(root, parent_tokens)?;
+    match parent {
+        JsonValue::Object(map) => map
+            .remove(last_token)
+            .ok_or_else(|| format!("Path '{}' does not exist in object", path)),
+        JsonValue::Array(arr) => {
+            if last_token.len() > 1 && last_token.starts_with('0') {
+                return Err(format!(
+                    "Invalid array index '{}' with leading zero",
+                    last_token
+                ));
+            }
+            let idx: usize = last_token
+                .parse()
+                .map_err(|_| format!("Invalid array index '{}'", last_token))?;
+            if idx < arr.len() {
+                Ok(arr.remove(idx))
+            } else {
+                Err(format!(
+                    "Array index {} out of bounds for remove (len {})",
+                    idx,
+                    arr.len()
+                ))
+            }
+        }
+        _ => Err("Parent container is neither an object nor an array".to_string()),
+    }
+}
+
+fn apply_replace(root: &mut JsonValue, path: &str, value: JsonValue) -> Result<(), String> {
+    let tokens = split_pointer(path)?;
+    if tokens.is_empty() {
+        *root = value;
+        return Ok(());
+    }
+    let (last_token, parent_tokens) = tokens.split_last().unwrap();
+    let parent = navigate_parent_mut(root, parent_tokens)?;
+    match parent {
+        JsonValue::Object(map) => {
+            if map.contains_key(last_token) {
+                map.insert(last_token.clone(), value);
+                Ok(())
+            } else {
+                Err(format!(
+                    "Property '{}' does not exist for replace",
+                    last_token
+                ))
+            }
+        }
+        JsonValue::Array(arr) => {
+            if last_token.len() > 1 && last_token.starts_with('0') {
+                return Err(format!(
+                    "Invalid array index '{}' with leading zero",
+                    last_token
+                ));
+            }
+            let idx: usize = last_token
+                .parse()
+                .map_err(|_| format!("Invalid array index '{}'", last_token))?;
+            if idx < arr.len() {
+                arr[idx] = value;
+                Ok(())
+            } else {
+                Err(format!(
+                    "Array index {} out of bounds for replace (len {})",
+                    idx,
+                    arr.len()
+                ))
+            }
+        }
+        _ => Err("Parent container is neither an object nor an array".to_string()),
+    }
 }
 
 impl fmt::Display for JsonValue {
@@ -864,5 +1295,95 @@ mod tests {
         let deleted = doc.delete_pointer("/foo/1").unwrap();
         assert_eq!(deleted.unwrap().as_str(), Some("baz"));
         assert_eq!(doc.pointer("/foo/1").unwrap().as_str(), Some("tail"));
+    }
+
+    #[test]
+    fn test_json_merge_patch_rfc7396() {
+        let original_raw = r#"{"a":"b","c":{"d":"e","f":"g"},"h":1}"#;
+        let patch_raw = r#"{"a":"z","c":{"f":null},"h":null,"new_field":true}"#;
+
+        let mut original = decode(original_raw).expect("decode original");
+        let patch = decode(patch_raw).expect("decode patch");
+
+        original.merge_patch(&patch);
+
+        assert_eq!(original.get("a").unwrap().as_str(), Some("z"));
+        let c_obj = original.get("c").unwrap().as_object().unwrap();
+        assert_eq!(c_obj.get("d").unwrap().as_str(), Some("e"));
+        assert_eq!(c_obj.get("f"), None); // removed via null
+        assert_eq!(original.get("h"), None); // removed via null
+        assert_eq!(original.get("new_field").unwrap().as_bool(), Some(true));
+
+        // Test non-object target replaced completely
+        let mut primitive = JsonValue::Number(42.0);
+        primitive.merge_patch(&JsonValue::String("hello".to_string()));
+        assert_eq!(primitive.as_str(), Some("hello"));
+
+        // Test create_merge_patch
+        let s_val = decode(r#"{"title":"IFA Book","author":"John","tags":["code"]}"#).unwrap();
+        let t_val = decode(r#"{"title":"IFA Guide","tags":["code","system"]}"#).unwrap();
+
+        let generated_patch = create_merge_patch(&s_val, &t_val);
+        let mut applied = s_val.clone();
+        applied.merge_patch(&generated_patch);
+        assert_eq!(applied, t_val);
+    }
+
+    #[test]
+    fn test_json_patch_rfc6902() {
+        let doc_raw = r#"{
+            "title": "Old Title",
+            "numbers": [10, 20, 30],
+            "details": {
+                "author": "Alice"
+            }
+        }"#;
+
+        let patch_doc_raw = r#"[
+            {"op": "test", "path": "/title", "value": "Old Title"},
+            {"op": "replace", "path": "/title", "value": "New Title"},
+            {"op": "add", "path": "/details/year", "value": 2026},
+            {"op": "add", "path": "/numbers/1", "value": 15},
+            {"op": "add", "path": "/numbers/-", "value": 40},
+            {"op": "remove", "path": "/numbers/0"},
+            {"op": "copy", "from": "/details/author", "path": "/editor"},
+            {"op": "move", "from": "/editor", "path": "/creator"}
+        ]"#;
+
+        let mut doc = decode(doc_raw).expect("decode initial document");
+        let patch_json = decode(patch_doc_raw).expect("decode patch document");
+
+        let res = doc.apply_json_patch(&patch_json);
+        assert!(res.is_ok(), "apply_json_patch failed: {:?}", res);
+
+        assert_eq!(doc.pointer("/title").unwrap().as_str(), Some("New Title"));
+        assert_eq!(doc.pointer("/details/year").unwrap().as_i64(), Some(2026));
+        assert_eq!(doc.pointer("/creator").unwrap().as_str(), Some("Alice"));
+        assert_eq!(doc.pointer("/editor"), None);
+
+        // numbers was: [10, 20, 30]
+        // add at 1 -> [10, 15, 20, 30]
+        // add at '-' -> [10, 15, 20, 30, 40]
+        // remove 0 -> [15, 20, 30, 40]
+        let arr = doc.pointer("/numbers").unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr[0].as_i64(), Some(15));
+        assert_eq!(arr[1].as_i64(), Some(20));
+        assert_eq!(arr[2].as_i64(), Some(30));
+        assert_eq!(arr[3].as_i64(), Some(40));
+
+        // Test atomicity on failure
+        let backup = doc.clone();
+        let bad_patch_raw = r#"[
+            {"op": "replace", "path": "/title", "value": "Failing Title"},
+            {"op": "test", "path": "/title", "value": "Does Not Match"}
+        ]"#;
+        let bad_patch = decode(bad_patch_raw).unwrap();
+        let fail_res = doc.apply_json_patch(&bad_patch);
+        assert!(fail_res.is_err());
+        assert_eq!(
+            doc, backup,
+            "Document must remain unchanged after failed patch"
+        );
     }
 }
