@@ -695,9 +695,13 @@ fn test_async_socket_options_and_udp_connected_mode() {
     let client_tcp = AsyncTcpStream::connect(l_addr).expect("connect tcp client");
     let (server_tcp, _) = listener.accept().expect("accept tcp server");
 
-    client_tcp.set_nodelay(true).expect("client set_nodelay true");
+    client_tcp
+        .set_nodelay(true)
+        .expect("client set_nodelay true");
     assert!(client_tcp.nodelay().expect("client nodelay"));
-    client_tcp.set_nodelay(false).expect("client set_nodelay false");
+    client_tcp
+        .set_nodelay(false)
+        .expect("client set_nodelay false");
     assert!(!client_tcp.nodelay().expect("client nodelay"));
 
     server_tcp.set_ttl(55).expect("server set_ttl");
@@ -734,7 +738,9 @@ fn test_async_socket_options_and_udp_connected_mode() {
     assert_eq!(&buf[..recvd], b"HELLO_CONNECTED_UDP");
 
     // try_send et try_recv
-    let try_sent = s_udp.try_send(b"REPLY_CONNECTED_UDP").expect("s_udp try_send");
+    let try_sent = s_udp
+        .try_send(b"REPLY_CONNECTED_UDP")
+        .expect("s_udp try_send");
     assert_eq!(try_sent, Some(19));
 
     // La donnée est immédiatement prête en socket buffer local
@@ -744,6 +750,8 @@ fn test_async_socket_options_and_udp_connected_mode() {
     assert_eq!(&reply_buf[..try_recvd], b"REPLY_CONNECTED_UDP");
 
     // try_recv sans données en attente doit retourner Ok(None)
-    let empty_opt = c_udp.try_recv(&mut reply_buf).expect("c_udp try_recv empty");
+    let empty_opt = c_udp
+        .try_recv(&mut reply_buf)
+        .expect("c_udp try_recv empty");
     assert_eq!(empty_opt, None);
 }
