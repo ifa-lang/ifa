@@ -1119,3 +1119,53 @@ crypto-lib = { version = "0.2.1", path = "../crypto-lib" }
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_build_package_resource_telemetry_audit() {
+    let temp_dir = std::env::temp_dir().join(format!("ifa_telemetry_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(temp_dir.join("src")).unwrap();
+
+    let manifest_content = r#"[package]
+name = "audit-app"
+version = "0.1.0"
+authors = ["Dieudonne <jprud67@gmail.com>"]
+edition = "2026"
+license = "MIT"
+description = "Resource telemetry verification package"
+"#;
+    fs::write(temp_dir.join("kori.toml"), manifest_content).unwrap();
+    fs::write(
+        temp_dir.join("src").join("main.ifa"),
+        "pub fn main() -> i64 { return 42; }",
+    )
+    .unwrap();
+
+    let orchestrator = BuildOrchestrator::new(temp_dir.clone()).unwrap();
+
+    // 1. Check phase telemetry
+    let check_report = orchestrator.check().unwrap();
+    assert_eq!(check_report.targets_checked, 1);
+    assert!(check_report.resource_usage.wall_time_ns > 0);
+    assert!(check_report.resource_usage.max_rss_bytes > 0);
+    assert!(check_report.resource_usage.cpu_count >= 1);
+    assert!(check_report
+        .resource_usage
+        .format_summary()
+        .contains("peak rss:"));
+
+    // 2. Build phase telemetry
+    let build_report = orchestrator.build(false, None, true).unwrap();
+    assert!(!build_report.artifacts.is_empty());
+    assert!(build_report.resource_usage.wall_time_ns > 0);
+    assert!(build_report.resource_usage.max_rss_bytes > 0);
+    assert!(build_report.resource_usage.cpu_count >= 1);
+
+    // 3. Packaging phase telemetry
+    let pack_report = Packager::pack(&temp_dir, None).unwrap();
+    assert!(pack_report.resource_usage.wall_time_ns > 0);
+    assert!(pack_report.resource_usage.max_rss_bytes > 0);
+    assert!(pack_report.resource_usage.cpu_count >= 1);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

@@ -607,8 +607,8 @@ fn main() -> ExitCode {
                     Ok(orchestrator) => match orchestrator.check() {
                         Ok(report) => {
                             println!(
-                                "Checked package `{}` ({} target(s)) in {:.2?}: syntax and semantics valid with zero errors.",
-                                report.package, report.targets_checked, report.duration
+                                "Checked package `{}` ({} target(s)) in {:.2?} ({}): syntax and semantics valid with zero errors.",
+                                report.package, report.targets_checked, report.duration, report.resource_usage.format_summary()
                             );
                             return ExitCode::SUCCESS;
                         }
@@ -831,9 +831,10 @@ fn main() -> ExitCode {
                                 .iter()
                                 .find(|a| a.kind == kori::ArtifactKind::Executable);
                             if let Some(exe_art) = exe {
-                                let status = Command::new(&exe_art.path).args(&args).status();
-                                match status {
-                                    Ok(s) => {
+                                let mut cmd = Command::new(&exe_art.path);
+                                cmd.args(&args);
+                                match ifa_runtime::supervise_command(&mut cmd) {
+                                    Ok((s, _telemetry)) => {
                                         return if s.success() {
                                             ExitCode::SUCCESS
                                         } else {
@@ -990,9 +991,10 @@ fn main() -> ExitCode {
                         ) {
                             Ok(report) => {
                                 println!(
-                                    "Finished {} build in {:.2?}",
+                                    "Finished {} build in {:.2?} ({})",
                                     if release { "release" } else { "dev" },
-                                    report.duration
+                                    report.duration,
+                                    report.resource_usage.format_summary()
                                 );
                                 for art in report.artifacts {
                                     println!(

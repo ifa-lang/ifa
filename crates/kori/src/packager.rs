@@ -2,6 +2,7 @@
 
 use crate::error::KoriError;
 use crate::manifest::{DependencySpec, Manifest};
+use ifa_runtime::{ResourceAuditScope, ResourceUsage};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -125,6 +126,7 @@ pub struct PackageReport {
     pub checksum: String,
     pub file_count: usize,
     pub total_bytes: usize,
+    pub resource_usage: ResourceUsage,
 }
 
 /// Report produced after publishing an IFA library.
@@ -355,6 +357,7 @@ impl Packager {
 
     /// Package the project into a deterministic `.kori` distributable bundle.
     pub fn pack(project_dir: &Path, out_dir: Option<&Path>) -> Result<PackageReport, KoriError> {
+        let audit_scope = ResourceAuditScope::start();
         let manifest = Self::validate(project_dir)?;
         let files = Self::collect_files(project_dir)?;
         let archive_bytes = Self::create_archive(&files);
@@ -399,6 +402,7 @@ impl Packager {
             checksum,
             file_count: files.len(),
             total_bytes: archive_bytes.len(),
+            resource_usage: audit_scope.finish(),
         })
     }
 

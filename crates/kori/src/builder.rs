@@ -11,6 +11,7 @@ use ifa_codegen_llvm::{LlvmCompiler, LlvmTargetConfig};
 use ifa_fir::{compile_to_fir, compile_to_fir_with_opts, CacheLayoutPass, SroaPass};
 use ifa_lexer::tokenize;
 use ifa_parser::parse;
+use ifa_runtime::{ResourceAuditScope, ResourceUsage};
 use ifa_sema::{analyze, analyze_with_symbols, symbol_table::ModuleSymbol, SymbolTable};
 use ifa_span::{SourceMap, Symbol, INTERNER};
 use std::fs;
@@ -48,6 +49,7 @@ pub struct BuildReport {
     pub packages_resolved: usize,
     pub artifacts: Vec<BuiltArtifact>,
     pub duration: std::time::Duration,
+    pub resource_usage: ResourceUsage,
 }
 
 /// Static analysis and semantic check execution report.
@@ -56,6 +58,7 @@ pub struct CheckReport {
     pub package: String,
     pub targets_checked: usize,
     pub duration: std::time::Duration,
+    pub resource_usage: ResourceUsage,
 }
 
 /// Multi-target build orchestrator coordinating parsing, FIR lowering, codegen, and FFI bridging.
@@ -106,6 +109,7 @@ impl BuildOrchestrator {
         force: bool,
     ) -> Result<BuildReport, KoriError> {
         let start_time = Instant::now();
+        let audit_scope = ResourceAuditScope::start();
         let profile_dir_name = if release { "release" } else { "dev" };
         let out_dir = self.target_dir.join(profile_dir_name);
         fs::create_dir_all(&out_dir)?;
@@ -151,12 +155,14 @@ impl BuildOrchestrator {
             packages_resolved: build_order.len(),
             artifacts: all_artifacts,
             duration: start_time.elapsed(),
+            resource_usage: audit_scope.finish(),
         })
     }
 
     /// Check syntax and semantics for all package targets and imported local modules without code generation.
     pub fn check(&self) -> Result<CheckReport, KoriError> {
         let start_time = Instant::now();
+        let audit_scope = ResourceAuditScope::start();
         let mut manifest = self.manifest.clone();
         manifest.resolve_targets(&self.root_dir);
 
@@ -223,6 +229,7 @@ impl BuildOrchestrator {
             package: self.manifest.package.name.clone(),
             targets_checked,
             duration: start_time.elapsed(),
+            resource_usage: audit_scope.finish(),
         })
     }
 

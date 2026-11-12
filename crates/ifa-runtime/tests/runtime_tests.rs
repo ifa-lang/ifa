@@ -2650,3 +2650,37 @@ fn test_ifa_rt_sys_resource_primitives() {
     let cpu_time_ns = ifa_rt_sys_cpu_time_ns();
     assert!(cpu_time_ns > 0);
 }
+
+#[test]
+fn test_resource_telemetry_audit_and_supervision() {
+    use ifa_runtime::{supervise_command, ResourceAuditScope, ResourceUsage};
+    use std::process::Command;
+
+    let initial = ResourceUsage::current();
+    assert!(initial.cpu_count >= 1);
+    assert!(initial.max_rss_bytes > 0);
+
+    let scope = ResourceAuditScope::start();
+    // Do some CPU work
+    let mut acc = 0u64;
+    for i in 0..100_000 {
+        acc = acc.wrapping_add(i);
+    }
+    std::hint::black_box(acc);
+
+    let report = scope.finish();
+    assert!(report.wall_time_ns > 0);
+    assert!(report.max_rss_bytes > 0);
+    assert!(report.cpu_count >= 1);
+    let summary = report.format_summary();
+    assert!(summary.contains("peak rss:"));
+    assert!(summary.contains("wall:"));
+
+    // Test subprocess supervision
+    let mut echo_cmd = Command::new("echo");
+    echo_cmd.arg("telemetry-test");
+    let (status, cmd_usage) = supervise_command(&mut echo_cmd).expect("supervise echo");
+    assert!(status.success());
+    assert!(cmd_usage.wall_time_ns > 0);
+    assert!(cmd_usage.max_rss_bytes > 0);
+}

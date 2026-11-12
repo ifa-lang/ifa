@@ -11,6 +11,7 @@ pub mod io;
 pub mod panic;
 pub mod reactor;
 pub mod string;
+pub mod telemetry;
 pub mod wasi;
 
 pub use allocator::{
@@ -55,4 +56,5 @@ pub use reactor::{
     KernelTimespec, GLOBAL_REACTOR,
 };
 pub use string::IfaString;
+pub use telemetry::{supervise_command, ResourceAuditScope, ResourceUsage};
 pub use wasi::*;

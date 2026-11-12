@@ -341,9 +341,10 @@ fn handle_build(
     match orchestrator.build_with_target(release, backend_override, target_str.as_deref(), force) {
         Ok(report) => {
             println!(
-                "Finished {} build in {:.2?}",
+                "Finished {} build in {:.2?} ({})",
                 if release { "release" } else { "dev" },
-                report.duration
+                report.duration,
+                report.resource_usage.format_summary()
             );
             for art in report.artifacts {
                 println!(
@@ -385,9 +386,11 @@ fn handle_run(current_dir: &Path, release: bool, args: Vec<String>) -> ExitCode 
         .find(|a| a.kind == kori::ArtifactKind::Executable);
 
     if let Some(exe_art) = exe {
-        let status = Command::new(&exe_art.path).args(&args).status();
+        let mut cmd = Command::new(&exe_art.path);
+        cmd.args(&args);
+        let status = kori::supervise_command(&mut cmd);
         match status {
-            Ok(s) => {
+            Ok((s, _telemetry)) => {
                 if s.success() {
                     ExitCode::SUCCESS
                 } else {
@@ -645,6 +648,7 @@ fn handle_package(project_dir: &Path, out_dir: Option<&Path>) -> ExitCode {
             println!("  Archive:  {}", report.package_path.display());
             println!("  Checksum: {}", report.checksum);
             println!("  SHA-256:  {}", report.checksum_path.display());
+            println!("  Audit:    {}", report.resource_usage.format_summary());
             ExitCode::SUCCESS
         }
         Err(e) => {
