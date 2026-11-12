@@ -22,7 +22,11 @@ pub use crypto::{
     totp_verify, websocket_accept_key, HmacSha1, HmacSha256, Jwt, JwtClaims, JwtError, Sha1,
     Sha256,
 };
-pub use csv::{decode as decode_csv, encode as encode_csv, CsvTable};
+pub use csv::{
+    decode as decode_csv, decode_with_options as decode_csv_with_options, encode as encode_csv,
+    encode_with_options as encode_csv_with_options, CsvError, CsvOptions, CsvReader, CsvTable,
+    CsvWriter,
+};
 pub use db::{
     Database, DbError, KeysetPage, Page, PrefixScanner, Transaction, DB_MAGIC, DB_VERSION,
     PAGE_SIZE,
