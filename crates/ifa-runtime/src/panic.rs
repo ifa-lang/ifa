@@ -138,14 +138,14 @@ impl IfaBareMetalStackTrace {
             return writer.offset;
         }
 
-        for i in 0..self.count {
+        for (i, &frame) in self.frames[..self.count].iter().enumerate() {
             writer.write_str("  #");
             if i < 10 {
                 writer.write_str("0");
             }
             writer.write_u64(i as u64);
             writer.write_str(": ");
-            writer.write_hex_usize(self.frames[i]);
+            writer.write_hex_usize(frame);
             writer.write_str("\n");
         }
         writer.offset

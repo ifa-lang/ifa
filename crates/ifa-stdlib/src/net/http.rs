@@ -2199,10 +2199,7 @@ impl HttpUrl {
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             return ip.is_loopback();
         }
-        if host.starts_with("127.") {
-            return true;
-        }
-        false
+        host.starts_with("127.")
     }
 
     /// Check if target host is an internal/private or local network address (RFC 1918, link-local, loopback).
