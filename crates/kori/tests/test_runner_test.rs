@@ -1,4 +1,4 @@
-use kori::test_runner::TestRunner;
+use kori::test_runner::{TestRunner, TestSummaryReport};
 use std::fs;
 
 #[test]
@@ -201,6 +201,123 @@ fn test_runner_resource_telemetry_audit() {
     assert!(report.contains("cpu:"));
     assert!(report.contains("peak rss:"));
     assert!(report.contains("cores:"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_runner_json_reporting_success() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("ifa_test_runner_json_ok_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).unwrap();
+    let file_path = temp_dir.join("test_json_ok.ifa");
+
+    let src = r#"
+        pub fn test_alpha() -> () {
+            assert_eq(10 + 20, 30);
+        }
+
+        pub fn test_beta() -> () {
+            assert(true);
+        }
+    "#;
+    fs::write(&file_path, src).unwrap();
+
+    let runner = TestRunner::new(&file_path).with_quiet(true);
+    let summary = runner.run().unwrap();
+
+    let json_compact = summary.to_json().unwrap();
+    let json_pretty = summary.to_json_pretty().unwrap();
+
+    assert!(json_compact.contains("\"success\":true"));
+    assert!(json_compact.contains("\"total_passed\":2"));
+    assert!(json_compact.contains("\"total_failed\":0"));
+
+    let report: TestSummaryReport = serde_json::from_str(&json_pretty).unwrap();
+    assert!(report.success);
+    assert_eq!(report.total_passed, 2);
+    assert_eq!(report.total_failed, 0);
+    assert_eq!(report.total_filtered_out, 0);
+    assert_eq!(report.suites.len(), 1);
+    assert_eq!(report.suites[0].cases.len(), 2);
+    assert_eq!(report.suites[0].cases[0].status, "passed");
+    assert_eq!(report.suites[0].cases[1].status, "passed");
+    assert!(report.resource_usage.wall_time_ns > 0);
+    assert!(report.resource_usage.cpu_count >= 1);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_runner_json_reporting_failure() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("ifa_test_runner_json_fail_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).unwrap();
+    let file_path = temp_dir.join("test_json_fail.ifa");
+
+    let src = r#"
+        pub fn test_pass() -> () {
+            assert(true);
+        }
+
+        pub fn test_fail() -> () {
+            assert_eq(1, 2, "mismatch detected in json test");
+        }
+    "#;
+    fs::write(&file_path, src).unwrap();
+
+    let runner = TestRunner::new(&file_path).with_quiet(true);
+    let summary = runner.run().unwrap();
+
+    let json_str = summary.to_json_pretty().unwrap();
+    let report: TestSummaryReport = serde_json::from_str(&json_str).unwrap();
+
+    assert!(!report.success);
+    assert_eq!(report.total_passed, 1);
+    assert_eq!(report.total_failed, 1);
+    assert_eq!(report.failures.len(), 1);
+    assert!(report.failures[0]
+        .1
+        .contains("mismatch detected in json test"));
+
+    let failed_case = report.suites[0]
+        .cases
+        .iter()
+        .find(|c| c.name == "test_fail")
+        .expect("test_fail must exist in report");
+    assert_eq!(failed_case.status, "failed");
+    assert!(failed_case
+        .failure_reason
+        .as_ref()
+        .unwrap()
+        .contains("mismatch detected in json test"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_runner_with_telemetry_configuration() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("ifa_test_runner_telem_cfg_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).unwrap();
+    let file_path = temp_dir.join("test_telem_cfg.ifa");
+
+    let src = r#"
+        pub fn test_light() -> () {
+            assert(true);
+        }
+    "#;
+    fs::write(&file_path, src).unwrap();
+
+    let runner = TestRunner::new(&file_path)
+        .with_telemetry(true)
+        .with_quiet(true);
+    let summary = runner.run().unwrap();
+
+    assert!(summary.is_success());
+    assert_eq!(summary.suites.len(), 1);
+    assert!(summary.suites[0].resource_usage.max_rss_bytes > 0);
+    assert!(summary.suites[0].resource_usage.cpu_count >= 1);
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

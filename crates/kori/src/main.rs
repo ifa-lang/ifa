@@ -74,6 +74,12 @@ enum Commands {
         /// Execute tests natively via Cranelift JIT
         #[arg(long)]
         native: bool,
+        /// Display granular resource consumption telemetry per test suite
+        #[arg(long, visible_alias = "audit")]
+        telemetry: bool,
+        /// Output test results as deterministic JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Add a dependency to kori.toml
     Add {
@@ -190,7 +196,9 @@ fn main() -> ExitCode {
             filter,
             manifest_path,
             native,
-        } => handle_test(&current_dir, filter, manifest_path, native),
+            telemetry,
+            json,
+        } => handle_test(&current_dir, filter, manifest_path, native, telemetry, json),
         Commands::Add {
             name,
             path,
@@ -417,14 +425,27 @@ fn handle_test(
     filter: Option<String>,
     manifest_path: Option<PathBuf>,
     native: bool,
+    telemetry: bool,
+    json: bool,
 ) -> ExitCode {
     let target_dir = resolve_project_dir(manifest_path, current_dir);
     let runner = kori::test_runner::TestRunner::new(&target_dir)
         .with_filter(filter)
-        .with_native(native);
+        .with_native(native)
+        .with_telemetry(telemetry)
+        .with_quiet(json);
 
     match runner.run() {
         Ok(summary) => {
+            if json {
+                match summary.to_json_pretty() {
+                    Ok(json_output) => println!("{}", json_output),
+                    Err(e) => {
+                        eprintln!("error: failed to serialize test results to JSON: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             if summary.is_success() {
                 ExitCode::SUCCESS
             } else {

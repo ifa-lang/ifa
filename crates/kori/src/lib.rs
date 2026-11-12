@@ -26,4 +26,7 @@ pub use manifest::{
 pub use module_metadata::{ModuleMetadata, IFAM_MAGIC, IFAM_VERSION};
 pub use packager::{PackageIndexEntry, PackageReport, Packager, PublishReport};
 pub use resolver::{DependencyResolver, ResolvedPackage};
-pub use test_runner::{TestCaseResult, TestRunner, TestStatus, TestSuiteResult, TestSummary};
+pub use test_runner::{
+    ResourceUsageReport, TestCaseReport, TestCaseResult, TestRunner, TestStatus, TestSuiteReport,
+    TestSuiteResult, TestSummary, TestSummaryReport,
+};
