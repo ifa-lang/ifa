@@ -2857,7 +2857,7 @@ mod tests {
             let mut resp2 = HttpResponseHead::ok();
             resp2
                 .headers
-                .insert("Content-Type", &resp_form.content_type());
+                .insert("Content-Type", resp_form.content_type());
             resp2.headers.insert("Connection", "close");
             let resp2_body = resp_form.finish();
             write_response_full(&mut b2, &resp2, &resp2_body).unwrap();
