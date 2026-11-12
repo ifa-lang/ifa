@@ -155,3 +155,52 @@ fn test_runner_name_filtering() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_runner_resource_telemetry_audit() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("ifa_test_runner_telem_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).unwrap();
+    let file_path = temp_dir.join("test_telemetry.ifa");
+
+    let src = r#"
+        pub fn test_simple_compute() -> () {
+            let mut sum: i64 = 0;
+            let mut i: i64 = 0;
+            while i < 100 {
+                sum = sum + i;
+                i = i + 1;
+            }
+            assert_eq(sum, 4950);
+        }
+    "#;
+    fs::write(&file_path, src).unwrap();
+
+    let runner = TestRunner::new(&file_path).with_quiet(true);
+    let summary = runner.run().unwrap();
+
+    assert!(summary.is_success());
+    assert_eq!(summary.total_passed, 1);
+    assert_eq!(summary.total_failed, 0);
+
+    // Verify summary telemetry
+    assert!(summary.resource_usage.wall_time_ns > 0);
+    assert!(summary.resource_usage.max_rss_bytes > 0);
+    assert!(summary.resource_usage.cpu_count >= 1);
+
+    // Verify suite-level telemetry
+    assert_eq!(summary.suites.len(), 1);
+    let suite = &summary.suites[0];
+    assert!(suite.resource_usage.wall_time_ns > 0);
+    assert!(suite.resource_usage.max_rss_bytes > 0);
+    assert!(suite.resource_usage.cpu_count >= 1);
+
+    // Verify rendered report contains telemetry summary
+    let report = summary.render_report();
+    assert!(report.contains("wall:"));
+    assert!(report.contains("cpu:"));
+    assert!(report.contains("peak rss:"));
+    assert!(report.contains("cores:"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

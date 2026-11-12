@@ -9,6 +9,7 @@ use ifa_codegen_cranelift::JitEngine;
 use ifa_fir::{compile_to_fir, FirInterpreter, FirModule, FirType, FirValue};
 use ifa_lexer::tokenize;
 use ifa_parser::parse;
+use ifa_runtime::{ResourceAuditScope, ResourceUsage};
 use ifa_span::{SourceMap, INTERNER};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,6 +52,8 @@ pub struct TestSuiteResult {
     pub filtered_out: usize,
     /// Total duration for this suite.
     pub duration: Duration,
+    /// Resource usage telemetry for this test suite.
+    pub resource_usage: ResourceUsage,
 }
 
 /// Aggregated summary of all executed test suites across the package.
@@ -66,6 +69,8 @@ pub struct TestSummary {
     pub total_filtered_out: usize,
     /// Total elapsed wall-clock duration.
     pub total_duration: Duration,
+    /// Aggregated resource usage telemetry across all executed suites.
+    pub resource_usage: ResourceUsage,
     /// Detailed list of all failures: (test_identifier, failure_message).
     pub failure_details: Vec<(String, String)>,
 }
@@ -98,12 +103,13 @@ impl TestSummary {
 
         let status_str = if self.is_success() { "ok" } else { "FAILED" };
         out.push_str(&format!(
-            "test result: {}. {} passed; {} failed; {} filtered out; finished in {:.2?}\nTest result: {} passed; {} failed\n",
+            "test result: {}. {} passed; {} failed; {} filtered out; finished in {:.2?} ({})\nTest result: {} passed; {} failed\n",
             status_str,
             self.total_passed,
             self.total_failed,
             self.total_filtered_out,
             self.total_duration,
+            self.resource_usage.format_summary(),
             self.total_passed,
             self.total_failed
         ));
@@ -203,6 +209,7 @@ impl TestRunner {
 
     /// Execute all discovered tests across the target and return an aggregated `TestSummary`.
     pub fn run(&self) -> Result<TestSummary, KoriError> {
+        let audit_scope = ResourceAuditScope::start();
         let test_files = self.discover_test_files()?;
         let overall_start = Instant::now();
 
@@ -225,6 +232,7 @@ impl TestRunner {
                 total_failed: 0,
                 total_filtered_out: 0,
                 total_duration: overall_start.elapsed(),
+                resource_usage: audit_scope.finish(),
                 failure_details,
             });
         }
@@ -252,6 +260,7 @@ impl TestRunner {
             total_failed,
             total_filtered_out,
             total_duration: overall_start.elapsed(),
+            resource_usage: audit_scope.finish(),
             failure_details,
         };
 
@@ -264,6 +273,7 @@ impl TestRunner {
 
     fn run_test_file(&self, file: &Path) -> Result<TestSuiteResult, KoriError> {
         let suite_start = Instant::now();
+        let audit_scope = ResourceAuditScope::start();
         let src = fs::read_to_string(file).map_err(KoriError::Io)?;
 
         let mut source_map = SourceMap::new();
@@ -290,6 +300,7 @@ impl TestRunner {
                 failed: 1,
                 filtered_out: 0,
                 duration: suite_start.elapsed(),
+                resource_usage: audit_scope.finish(),
             });
         }
 
@@ -331,6 +342,7 @@ impl TestRunner {
                 failed: 1,
                 filtered_out: 0,
                 duration: suite_start.elapsed(),
+                resource_usage: audit_scope.finish(),
             });
         }
 
@@ -352,6 +364,7 @@ impl TestRunner {
                     failed: 1,
                     filtered_out: 0,
                     duration: suite_start.elapsed(),
+                    resource_usage: audit_scope.finish(),
                 });
             }
         };
@@ -377,6 +390,7 @@ impl TestRunner {
                 failed: 0,
                 filtered_out: 0,
                 duration: suite_start.elapsed(),
+                resource_usage: audit_scope.finish(),
             });
         }
 
@@ -441,6 +455,7 @@ impl TestRunner {
             failed,
             filtered_out,
             duration: suite_start.elapsed(),
+            resource_usage: audit_scope.finish(),
         })
     }
 
