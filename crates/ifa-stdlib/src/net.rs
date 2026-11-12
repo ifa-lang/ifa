@@ -14,6 +14,8 @@ use std::os::unix::io::AsRawFd;
 use ifa_runtime::fiber::GLOBAL_SCHEDULER;
 pub use ifa_runtime::reactor::{AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket};
 
+pub mod http;
+
 #[cfg(unix)]
 fn sock_set_recv_buffer<T: AsRawFd>(socket: &T, size: usize) -> io::Result<()> {
     let fd = socket.as_raw_fd();
@@ -292,6 +294,11 @@ impl TcpStream {
     /// Shuts down the read, write, or both halves of this connection.
     pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
         self.inner.shutdown(how)
+    }
+
+    /// Moves this stream into or out of nonblocking mode.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.inner.set_nonblocking(nonblocking)
     }
 
     /// Get and clear the last socket error if any.
@@ -947,6 +954,32 @@ impl BufferedTcpStream {
     /// Unwraps this buffered stream, returning the underlying reader `TcpStream`.
     pub fn into_inner(self) -> TcpStream {
         self.reader.into_inner()
+    }
+}
+
+impl io::Read for BufferedTcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.reader.read(buf)
+    }
+}
+
+impl io::BufRead for BufferedTcpStream {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.reader.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.reader.consume(amt);
+    }
+}
+
+impl io::Write for BufferedTcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
     }
 }
 
