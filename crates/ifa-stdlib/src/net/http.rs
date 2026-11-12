@@ -478,6 +478,33 @@ impl HttpRequestHead {
             })
             .unwrap_or(false)
     }
+
+    /// Return the path portion of the URI (excluding any query string or fragment).
+    pub fn path(&self) -> &str {
+        let uri = self.uri.as_str();
+        let end_idx = uri.find(['?', '#']).unwrap_or(uri.len());
+        &uri[..end_idx]
+    }
+
+    /// Return the optional query string of the URI (excluding the leading '?').
+    pub fn query_string(&self) -> Option<&str> {
+        let uri = self.uri.as_str();
+        if let Some(q_idx) = uri.find('?') {
+            let after_q = &uri[q_idx + 1..];
+            let end_idx = after_q.find('#').unwrap_or(after_q.len());
+            Some(&after_q[..end_idx])
+        } else {
+            None
+        }
+    }
+
+    /// Parse URI query parameters into a key-value map.
+    pub fn query_params(&self) -> HashMap<String, String> {
+        match self.query_string() {
+            Some(qs) => crate::http::parse_form_urlencoded(qs),
+            None => HashMap::new(),
+        }
+    }
 }
 
 /// HTTP Response Header metadata.
@@ -1972,6 +1999,156 @@ impl From<HttpParseError> for HttpClientError {
     }
 }
 
+/// High-level HTTP Request wrapper containing head and decoded body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpRequest {
+    pub head: HttpRequestHead,
+    pub body: Vec<u8>,
+}
+
+impl HttpRequest {
+    pub fn new(head: HttpRequestHead, body: Vec<u8>) -> Self {
+        Self { head, body }
+    }
+
+    /// Construct a standard GET request.
+    pub fn get(uri: impl Into<String>) -> Self {
+        Self::new(HttpRequestHead::get(uri), Vec::new())
+    }
+
+    /// Construct a standard POST request with body and optional content type.
+    pub fn post(uri: impl Into<String>, body: Vec<u8>, content_type: Option<&str>) -> Self {
+        let mut head = HttpRequestHead::post(uri);
+        if let Some(ct) = content_type {
+            head.headers.insert("Content-Type", ct);
+        }
+        Self::new(head, body)
+    }
+
+    /// Construct a standard PUT request with body and optional content type.
+    pub fn put(uri: impl Into<String>, body: Vec<u8>, content_type: Option<&str>) -> Self {
+        let mut head = HttpRequestHead::put(uri);
+        if let Some(ct) = content_type {
+            head.headers.insert("Content-Type", ct);
+        }
+        Self::new(head, body)
+    }
+
+    /// Construct a standard DELETE request.
+    pub fn delete(uri: impl Into<String>) -> Self {
+        Self::new(HttpRequestHead::delete(uri), Vec::new())
+    }
+
+    pub fn method(&self) -> HttpMethod {
+        self.head.method
+    }
+
+    pub fn uri(&self) -> &str {
+        &self.head.uri
+    }
+
+    pub fn path(&self) -> &str {
+        self.head.path()
+    }
+
+    pub fn query_string(&self) -> Option<&str> {
+        self.head.query_string()
+    }
+
+    pub fn query_params(&self) -> HashMap<String, String> {
+        self.head.query_params()
+    }
+
+    pub fn version(&self) -> HttpVersion {
+        self.head.version
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        &self.head.headers
+    }
+
+    pub fn headers_mut(&mut self) -> &mut HeaderMap {
+        &mut self.head.headers
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.head.headers.get(name)
+    }
+
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    pub fn text(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.body)
+    }
+
+    pub fn text_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.body)
+    }
+
+    /// Deserialize the request body as JSON.
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_slice(&self.body)
+    }
+
+    pub fn content_length(&self) -> Option<usize> {
+        self.head.content_length()
+    }
+
+    pub fn content_type(&self) -> Option<&str> {
+        self.head.content_type()
+    }
+
+    pub fn is_json(&self) -> bool {
+        self.head.is_json()
+    }
+
+    pub fn is_chunked(&self) -> bool {
+        self.head.is_chunked()
+    }
+
+    pub fn is_keep_alive(&self) -> bool {
+        self.head.is_keep_alive()
+    }
+
+    pub fn cookies(&self) -> Vec<Cookie> {
+        self.head.cookies()
+    }
+
+    pub fn is_multipart(&self) -> bool {
+        self.head.is_multipart()
+    }
+
+    pub fn multipart_boundary(&self) -> Option<String> {
+        self.head.multipart_boundary()
+    }
+
+    pub fn multipart(&self) -> Result<Vec<MultipartPart>, String> {
+        let boundary = self.multipart_boundary().ok_or_else(|| {
+            "Missing or invalid multipart boundary in Content-Type header".to_string()
+        })?;
+        crate::http::parse_multipart(&self.body, &boundary)
+    }
+
+    pub fn is_form_urlencoded(&self) -> bool {
+        self.head.is_form_urlencoded()
+    }
+
+    pub fn form_data(&self) -> Result<HashMap<String, String>, String> {
+        let text = self.text().map_err(|e| e.to_string())?;
+        Ok(crate::http::parse_form_urlencoded(text))
+    }
+
+    pub fn into_parts(self) -> (HttpRequestHead, Vec<u8>) {
+        (self.head, self.body)
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.body
+    }
+}
+
 /// High-level HTTP Response wrapper containing head and decoded body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
@@ -2073,6 +2250,57 @@ impl HttpResponse {
         let text = self.text().map_err(|e| e.to_string())?;
         Ok(crate::http::parse_form_urlencoded(text))
     }
+
+    pub fn version(&self) -> HttpVersion {
+        self.head.version
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.head.headers.get(name)
+    }
+
+    pub fn headers_mut(&mut self) -> &mut HeaderMap {
+        &mut self.head.headers
+    }
+
+    pub fn into_parts(self) -> (HttpResponseHead, Vec<u8>) {
+        (self.head, self.body)
+    }
+}
+
+/// Read a full HTTP request with its body from a `BufferedTcpStream` into an `HttpRequest` object.
+pub fn read_request_object(
+    stream: &mut BufferedTcpStream,
+    max_body_size: usize,
+) -> Result<Option<HttpRequest>, HttpParseError> {
+    match read_request(stream, max_body_size)? {
+        Some((head, body)) => Ok(Some(HttpRequest::new(head, body))),
+        None => Ok(None),
+    }
+}
+
+/// Read a full HTTP response with its body from a `BufferedTcpStream` into an `HttpResponse` object.
+pub fn read_response_object(
+    stream: &mut BufferedTcpStream,
+    max_body_size: usize,
+) -> Result<Option<HttpResponse>, HttpParseError> {
+    match read_response(stream, max_body_size)? {
+        Some((head, body)) => Ok(Some(HttpResponse::new(head, body))),
+        None => Ok(None),
+    }
+}
+
+/// Write an `HttpRequest` object and its body to `BufferedTcpStream`.
+pub fn write_http_request(stream: &mut BufferedTcpStream, request: &HttpRequest) -> io::Result<()> {
+    write_request_full(stream, &request.head, &request.body)
+}
+
+/// Write an `HttpResponse` object and its body to `BufferedTcpStream`.
+pub fn write_http_response(
+    stream: &mut BufferedTcpStream,
+    response: &HttpResponse,
+) -> io::Result<()> {
+    write_response_full(stream, &response.head, &response.body)
 }
 
 /// Synchronous HTTP Client built on top of `BufferedTcpStream`.
@@ -3277,5 +3505,106 @@ mod tests {
         let resp_head = HttpResponseHead::ok();
         write_response_head(&mut out_resp, &resp_head).expect("write resp head");
         assert!(out_resp.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[test]
+    fn test_http_request_and_response_objects() {
+        // 1. HttpRequest construction, URI inspection and query params
+        let req = HttpRequest::get("/search?q=rust+ifa&page=2#results");
+        assert_eq!(req.method(), HttpMethod::Get);
+        assert_eq!(req.uri(), "/search?q=rust+ifa&page=2#results");
+        assert_eq!(req.path(), "/search");
+        assert_eq!(req.query_string(), Some("q=rust+ifa&page=2"));
+        let params = req.query_params();
+        assert_eq!(params.get("q").map(String::as_str), Some("rust ifa"));
+        assert_eq!(params.get("page").map(String::as_str), Some("2"));
+
+        // JSON payload request
+        let mut post_req = HttpRequest::post(
+            "/api/echo",
+            b"{\"key\":\"value\"}".to_vec(),
+            Some("application/json"),
+        );
+        assert_eq!(post_req.method(), HttpMethod::Post);
+        assert!(post_req.is_json());
+        assert_eq!(post_req.header("Content-Type"), Some("application/json"));
+        assert_eq!(post_req.text().unwrap(), "{\"key\":\"value\"}");
+        #[derive(serde::Deserialize)]
+        struct EchoPayload {
+            key: String,
+        }
+        let parsed: EchoPayload = post_req.json().unwrap();
+        assert_eq!(parsed.key, "value");
+
+        post_req.headers_mut().insert("X-Custom", "ifa-test");
+        assert_eq!(post_req.header("x-custom"), Some("ifa-test"));
+
+        let (head, body) = post_req.into_parts();
+        assert_eq!(head.method, HttpMethod::Post);
+        assert_eq!(body, b"{\"key\":\"value\"}");
+
+        // 2. High-level socket exchange using read_request_object / write_http_response
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = thread::spawn(move || {
+            let mut stream = None;
+            for _ in 0..100 {
+                if let Ok(Some((s, _))) = listener.try_accept() {
+                    stream = Some(s);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let stream = stream.expect("accept stream");
+            stream.set_nonblocking(false).expect("blocking");
+            let mut buf_stream = BufferedTcpStream::new(stream).unwrap();
+
+            // Read request object
+            let server_req = read_request_object(&mut buf_stream, 64 * 1024)
+                .unwrap()
+                .expect("receive request");
+            assert_eq!(server_req.method(), HttpMethod::Post);
+            assert_eq!(server_req.path(), "/api/upload");
+            assert_eq!(
+                server_req.query_params().get("token").map(String::as_str),
+                Some("xyz123")
+            );
+            assert_eq!(server_req.body(), b"payload-bytes");
+
+            // Reply with write_http_response
+            let mut resp_head = HttpResponseHead::ok();
+            resp_head.headers.insert("Content-Type", "text/plain");
+            resp_head.headers.insert("X-Server", "ifa-http");
+            let resp = HttpResponse::new(resp_head, b"ACK".to_vec());
+            write_http_response(&mut buf_stream, &resp).expect("write http response");
+        });
+
+        // Client writes request object and reads response object
+        let client_raw = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect client");
+        client_raw.set_nonblocking(false).expect("blocking");
+        let mut client_buf = BufferedTcpStream::new(client_raw).unwrap();
+
+        let mut client_req = HttpRequest::post(
+            "/api/upload?token=xyz123",
+            b"payload-bytes".to_vec(),
+            Some("application/octet-stream"),
+        );
+        client_req.headers_mut().insert("Connection", "close");
+        write_http_request(&mut client_buf, &client_req).expect("write client req");
+
+        let client_resp = read_response_object(&mut client_buf, 64 * 1024)
+            .unwrap()
+            .expect("read response");
+        assert_eq!(client_resp.status(), HttpStatus::OK);
+        assert_eq!(client_resp.version(), HttpVersion::Http11);
+        assert_eq!(client_resp.header("X-Server"), Some("ifa-http"));
+        assert_eq!(client_resp.text().unwrap(), "ACK");
+
+        let (resp_head, resp_body) = client_resp.into_parts();
+        assert_eq!(resp_head.status, HttpStatus::OK);
+        assert_eq!(resp_body, b"ACK");
+
+        handle.join().expect("server thread finished");
     }
 }
