@@ -1478,6 +1478,16 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_process_audit ... ok"),
+        "Std process audit test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_process_all ... ok"),
+        "Std process all test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_collections_list ... ok"),
         "Std collections list test missing from output:\n{}",
         stdout
@@ -2028,8 +2038,28 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("302 passed; 0 failed"),
-        "Expected 302 passed std unit tests, got:\n{}",
+        stdout.contains("test test_sys_primitives ... ok"),
+        "Std sys primitives test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sys_formatting ... ok"),
+        "Std sys formatting test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sys_snapshot ... ok"),
+        "Std sys snapshot test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_sys_all ... ok"),
+        "Std sys all test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("312 passed; 0 failed"),
+        "Expected 312 passed std unit tests, got:\n{}",
         stdout
     );
 }
