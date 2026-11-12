@@ -7,6 +7,22 @@ use std::time::Duration;
 
 use super::{BufferedTcpStream, TcpStream};
 
+pub use crate::http::{MultipartBuilder, MultipartPart};
+
+/// Extract the boundary parameter from a `multipart/form-data` Content-Type value (RFC 2046 / RFC 7578).
+pub fn extract_multipart_boundary(content_type: &str) -> Option<String> {
+    for part in content_type.split(';') {
+        let trimmed = part.trim();
+        if let Some(rest) = trimmed.strip_prefix("boundary=") {
+            let val = rest.trim().trim_matches('"');
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Standard HTTP Protocol Version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HttpVersion {
@@ -424,6 +440,32 @@ impl HttpRequestHead {
             None => Vec::new(),
         }
     }
+
+    /// Check if Content-Type is multipart/form-data.
+    pub fn is_multipart(&self) -> bool {
+        self.headers
+            .get("content-type")
+            .map(|ct| ct.to_ascii_lowercase().contains("multipart/form-data"))
+            .unwrap_or(false)
+    }
+
+    /// Extract multipart boundary if present in Content-Type header.
+    pub fn multipart_boundary(&self) -> Option<String> {
+        self.headers
+            .get("content-type")
+            .and_then(extract_multipart_boundary)
+    }
+
+    /// Check if Content-Type is application/x-www-form-urlencoded.
+    pub fn is_form_urlencoded(&self) -> bool {
+        self.headers
+            .get("content-type")
+            .map(|ct| {
+                ct.to_ascii_lowercase()
+                    .contains("application/x-www-form-urlencoded")
+            })
+            .unwrap_or(false)
+    }
 }
 
 /// HTTP Response Header metadata.
@@ -531,6 +573,32 @@ impl HttpResponseHead {
     /// Extract parsed `Cache-Control` directive from response headers.
     pub fn cache_control(&self) -> Option<CacheControl> {
         self.headers.get("cache-control").map(CacheControl::parse)
+    }
+
+    /// Check if Content-Type is multipart/form-data.
+    pub fn is_multipart(&self) -> bool {
+        self.headers
+            .get("content-type")
+            .map(|ct| ct.to_ascii_lowercase().contains("multipart/form-data"))
+            .unwrap_or(false)
+    }
+
+    /// Extract multipart boundary if present in Content-Type header.
+    pub fn multipart_boundary(&self) -> Option<String> {
+        self.headers
+            .get("content-type")
+            .and_then(extract_multipart_boundary)
+    }
+
+    /// Check if Content-Type is application/x-www-form-urlencoded.
+    pub fn is_form_urlencoded(&self) -> bool {
+        self.headers
+            .get("content-type")
+            .map(|ct| {
+                ct.to_ascii_lowercase()
+                    .contains("application/x-www-form-urlencoded")
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -923,6 +991,214 @@ pub fn encode_chunk_end_to<W: Write>(
     writer.write_all(b"\r\n")?;
     written += 2;
     Ok(written)
+}
+
+/// Streaming chunked HTTP/1.1 body writer (`Transfer-Encoding: chunked`).
+pub struct ChunkedWriter<W: Write> {
+    writer: W,
+    finished: bool,
+}
+
+impl<W: Write> ChunkedWriter<W> {
+    /// Create a new `ChunkedWriter` wrapping an underlying byte writer.
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer,
+            finished: false,
+        }
+    }
+
+    /// Write an explicit chunk of data to the stream.
+    pub fn write_chunk(&mut self, chunk: &[u8]) -> io::Result<usize> {
+        if self.finished {
+            return Err(io::Error::other(
+                "Cannot write to already finalized ChunkedWriter",
+            ));
+        }
+        if chunk.is_empty() {
+            return Ok(0);
+        }
+        encode_chunk_to(&mut self.writer, chunk)
+    }
+
+    /// Finalize the chunked stream with an end-chunk (`0\r\n\r\n`) and optional trailers.
+    pub fn finish(&mut self, trailers: Option<&HeaderMap>) -> io::Result<usize> {
+        if self.finished {
+            return Ok(0);
+        }
+        self.finished = true;
+        let bytes = encode_chunk_end_to(&mut self.writer, trailers)?;
+        self.writer.flush()?;
+        Ok(bytes)
+    }
+
+    /// Whether this chunked stream has been terminated with a closing chunk.
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.writer
+    }
+
+    /// Mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
+    /// Unwrap the inner writer.
+    pub fn into_inner(self) -> W {
+        self.writer
+    }
+}
+
+impl<W: Write> Write for ChunkedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.write_chunk(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+/// Streaming chunked HTTP/1.1 body reader implementing `std::io::Read`.
+pub struct ChunkedReader<R: BufRead> {
+    reader: R,
+    remaining_chunk_bytes: usize,
+    first_chunk: bool,
+    finished: bool,
+    max_chunk_size: usize,
+    trailers: HeaderMap,
+}
+
+impl<R: BufRead> ChunkedReader<R> {
+    /// Create a new `ChunkedReader` over a buffered input stream.
+    pub fn new(reader: R, max_chunk_size: usize) -> Self {
+        Self {
+            reader,
+            remaining_chunk_bytes: 0,
+            first_chunk: true,
+            finished: false,
+            max_chunk_size,
+            trailers: HeaderMap::new(),
+        }
+    }
+
+    /// Decoded HTTP trailers parsed at the end of the chunked payload.
+    pub fn trailers(&self) -> &HeaderMap {
+        &self.trailers
+    }
+
+    /// Whether the stream reached the final terminating chunk (size 0).
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Reference to the inner reader.
+    pub fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
+    /// Mutable reference to the inner reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
+    /// Consume the `ChunkedReader` and return the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+}
+
+impl<R: BufRead> Read for ChunkedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.finished {
+            return Ok(0);
+        }
+
+        while self.remaining_chunk_bytes == 0 {
+            // Consume CRLF following previous chunk
+            if !self.first_chunk {
+                let mut crlf = [0u8; 2];
+                self.reader.read_exact(&mut crlf)?;
+                if &crlf != b"\r\n" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Missing CRLF delimiter after chunk data",
+                    ));
+                }
+            }
+            self.first_chunk = false;
+
+            // Read chunk-size line
+            let mut line = String::new();
+            let bytes_read = self.reader.read_line(&mut line)?;
+            if bytes_read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Unexpected EOF while reading chunk size",
+                ));
+            }
+
+            let trimmed = line.trim();
+            let size_str = trimmed.split(';').next().unwrap_or("").trim();
+            let chunk_size = usize::from_str_radix(size_str, 16).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid hex chunk size '{}': {}", size_str, e),
+                )
+            })?;
+
+            if chunk_size > self.max_chunk_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Chunk size {} exceeds configured maximum {}",
+                        chunk_size, self.max_chunk_size
+                    ),
+                ));
+            }
+
+            if chunk_size == 0 {
+                // Final terminating chunk: parse optional trailers until empty line
+                loop {
+                    let mut trailer_line = String::new();
+                    let t_bytes = self.reader.read_line(&mut trailer_line)?;
+                    if t_bytes == 0 {
+                        break;
+                    }
+                    let t_trimmed = trailer_line.trim_end_matches(['\r', '\n']);
+                    if t_trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = t_trimmed.split_once(':') {
+                        self.trailers.insert(k.trim(), v.trim());
+                    }
+                }
+                self.finished = true;
+                return Ok(0);
+            }
+
+            self.remaining_chunk_bytes = chunk_size;
+        }
+
+        let to_read = buf.len().min(self.remaining_chunk_bytes);
+        let n = self.reader.read(&mut buf[..to_read])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Unexpected EOF while reading chunk body data",
+            ));
+        }
+        self.remaining_chunk_bytes -= n;
+        Ok(n)
+    }
 }
 
 /// Format an `HttpRequestHead` into standard wire bytes.
@@ -1563,6 +1839,35 @@ impl HttpResponse {
     pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_slice(&self.body)
     }
+
+    /// Check if Content-Type is multipart/form-data.
+    pub fn is_multipart(&self) -> bool {
+        self.head.is_multipart()
+    }
+
+    /// Extract multipart boundary if present in Content-Type header.
+    pub fn multipart_boundary(&self) -> Option<String> {
+        self.head.multipart_boundary()
+    }
+
+    /// Parse multipart form-data body (RFC 7578 / RFC 2046) using Content-Type boundary.
+    pub fn multipart(&self) -> Result<Vec<MultipartPart>, String> {
+        let boundary = self.multipart_boundary().ok_or_else(|| {
+            "Missing or invalid multipart boundary in Content-Type header".to_string()
+        })?;
+        crate::http::parse_multipart(&self.body, &boundary)
+    }
+
+    /// Check if Content-Type is application/x-www-form-urlencoded.
+    pub fn is_form_urlencoded(&self) -> bool {
+        self.head.is_form_urlencoded()
+    }
+
+    /// Parse application/x-www-form-urlencoded body into key-value map.
+    pub fn form_data(&self) -> Result<HashMap<String, String>, String> {
+        let text = self.text().map_err(|e| e.to_string())?;
+        Ok(crate::http::parse_form_urlencoded(text))
+    }
 }
 
 /// Synchronous HTTP Client built on top of `BufferedTcpStream`.
@@ -1639,6 +1944,17 @@ impl HttpClient {
         url: &str,
         body: &[u8],
     ) -> Result<HttpResponse, HttpClientError> {
+        self.request_with_headers(method, url, &HeaderMap::new(), body)
+    }
+
+    /// Perform an HTTP request with explicit custom headers, following redirects if enabled.
+    pub fn request_with_headers(
+        &self,
+        method: HttpMethod,
+        url: &str,
+        extra_headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<HttpResponse, HttpClientError> {
         let mut current_url = HttpUrl::parse(url)?;
         let mut current_method = method;
         let mut current_body = body.to_vec();
@@ -1652,6 +1968,10 @@ impl HttpClient {
             );
             head.headers.insert("Host", current_url.host_header_value());
             head.headers.insert("Connection", "close");
+
+            for (k, v) in extra_headers.iter() {
+                head.headers.insert(k, v);
+            }
 
             let host_port = current_url.socket_addr_str();
             let response = self.execute(&host_port, head, &current_body)?;
@@ -1776,6 +2096,31 @@ impl HttpClient {
         let body = serde_json::to_vec(payload)
             .map_err(|e| HttpClientError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
         self.patch(url, &body, Some("application/json"))
+    }
+
+    /// Convenience helper to send an application/x-www-form-urlencoded POST request.
+    pub fn post_form(
+        &self,
+        url: &str,
+        fields: &[(&str, &str)],
+    ) -> Result<HttpResponse, HttpClientError> {
+        let form_body = crate::http::format_form_urlencoded(fields);
+        self.post(
+            url,
+            form_body.as_bytes(),
+            Some("application/x-www-form-urlencoded"),
+        )
+    }
+
+    /// Convenience helper to send a multipart/form-data POST request.
+    pub fn post_multipart(
+        &self,
+        url: &str,
+        multipart: &MultipartBuilder,
+    ) -> Result<HttpResponse, HttpClientError> {
+        let ct = multipart.content_type();
+        let body = multipart.clone().finish();
+        self.post(url, &body, Some(&ct))
     }
 }
 
@@ -2372,6 +2717,181 @@ mod tests {
         let output: OutputPayload = resp.json().expect("parse response json");
         assert_eq!(output.status, "created");
         assert_eq!(output.id, 101);
+
+        handle.join().expect("server thread finished");
+    }
+
+    #[test]
+    fn test_extract_multipart_boundary_and_headers() {
+        let ct1 = "multipart/form-data; boundary=xyz123";
+        assert_eq!(extract_multipart_boundary(ct1), Some("xyz123".to_string()));
+
+        let ct2 = "multipart/form-data; charset=utf-8; boundary=\"----WebKitBoundary\"";
+        assert_eq!(
+            extract_multipart_boundary(ct2),
+            Some("----WebKitBoundary".to_string())
+        );
+
+        let ct3 = "application/json";
+        assert_eq!(extract_multipart_boundary(ct3), None);
+
+        let mut req = HttpRequestHead::post("/upload");
+        req.headers.insert("Content-Type", ct2);
+        assert!(req.is_multipart());
+        assert!(!req.is_form_urlencoded());
+        assert_eq!(
+            req.multipart_boundary(),
+            Some("----WebKitBoundary".to_string())
+        );
+
+        let mut resp = HttpResponseHead::ok();
+        resp.headers
+            .insert("Content-Type", "application/x-www-form-urlencoded");
+        assert!(!resp.is_multipart());
+        assert!(resp.is_form_urlencoded());
+    }
+
+    #[test]
+    fn test_chunked_writer_and_reader_streaming() {
+        let mut buffer = Vec::new();
+        let mut writer = ChunkedWriter::new(&mut buffer);
+
+        // Write chunks
+        let w1 = writer.write_chunk(b"FirstChunk ").unwrap();
+        assert!(w1 > 0);
+        let w2 = writer.write(b"SecondChunk ").unwrap();
+        assert_eq!(w2, 12);
+        let w3 = writer.write_chunk(b"FinalData").unwrap();
+        assert!(w3 > 0);
+
+        let mut trailers = HeaderMap::new();
+        trailers.insert("X-Checksum", "blake3-mock");
+        writer.finish(Some(&trailers)).unwrap();
+        assert!(writer.is_finished());
+
+        // Now stream read using ChunkedReader with small chunks (7 bytes)
+        let mut cursor = io::Cursor::new(buffer);
+        let mut reader = ChunkedReader::new(&mut cursor, 1024);
+
+        let mut received = Vec::new();
+        let mut chunk_buf = [0u8; 7];
+        loop {
+            let n = reader.read(&mut chunk_buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&chunk_buf[..n]);
+        }
+
+        assert_eq!(received, b"FirstChunk SecondChunk FinalData");
+        assert!(reader.is_finished());
+        assert_eq!(reader.trailers().get("x-checksum"), Some("blake3-mock"));
+    }
+
+    #[test]
+    fn test_http_client_post_form_and_multipart() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.port().expect("port");
+
+        let handle = thread::spawn(move || {
+            // First request: form-urlencoded
+            let mut s1 = None;
+            for _ in 0..100 {
+                if let Ok(Some((stream, _))) = listener.try_accept() {
+                    s1 = Some(stream);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let s1 = s1.expect("stream 1 accepted");
+            s1.set_nonblocking(false).expect("blocking");
+            let mut b1 = BufferedTcpStream::new(s1).expect("buffered 1");
+            let (req1, body1) = read_request(&mut b1, 4096).unwrap().unwrap();
+            assert_eq!(req1.method, HttpMethod::Post);
+            assert_eq!(req1.uri, "/api/form");
+            assert!(req1.is_form_urlencoded());
+
+            let body_str = std::str::from_utf8(&body1).unwrap();
+            let parsed_form = crate::http::parse_form_urlencoded(body_str);
+            assert_eq!(parsed_form.get("user").map(|s| s.as_str()), Some("alice"));
+            assert_eq!(parsed_form.get("role").map(|s| s.as_str()), Some("admin"));
+
+            let mut resp1 = HttpResponseHead::ok();
+            resp1.headers.insert("Content-Type", "text/plain");
+            resp1.headers.insert("Connection", "close");
+            write_response_full(&mut b1, &resp1, b"form-ok").unwrap();
+
+            // Second request: multipart
+            let mut s2 = None;
+            for _ in 0..100 {
+                if let Ok(Some((stream, _))) = listener.try_accept() {
+                    s2 = Some(stream);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let s2 = s2.expect("stream 2 accepted");
+            s2.set_nonblocking(false).expect("blocking");
+            let mut b2 = BufferedTcpStream::new(s2).expect("buffered 2");
+            let (req2, body2) = read_request(&mut b2, 8192).unwrap().unwrap();
+            assert_eq!(req2.method, HttpMethod::Post);
+            assert_eq!(req2.uri, "/api/upload");
+            assert!(req2.is_multipart());
+
+            let boundary = req2.multipart_boundary().expect("multipart boundary");
+            let parts = crate::http::parse_multipart(&body2, &boundary).expect("parse multipart");
+            assert_eq!(parts.len(), 2);
+            assert_eq!(parts[0].name, "description");
+            assert_eq!(parts[0].data, b"System binary update");
+            assert_eq!(parts[1].name, "file");
+            assert_eq!(parts[1].filename.as_deref(), Some("kernel.bin"));
+            assert_eq!(
+                parts[1].content_type.as_deref(),
+                Some("application/octet-stream")
+            );
+            assert_eq!(parts[1].data, b"\x7fELF_DATA");
+
+            // Respond with a multipart response
+            let resp_form =
+                MultipartBuilder::new("respBoundary99").add_field("status", "processed");
+            let mut resp2 = HttpResponseHead::ok();
+            resp2
+                .headers
+                .insert("Content-Type", &resp_form.content_type());
+            resp2.headers.insert("Connection", "close");
+            let resp2_body = resp_form.finish();
+            write_response_full(&mut b2, &resp2, &resp2_body).unwrap();
+        });
+
+        let client = HttpClient::new();
+
+        // 1. Post form urlencoded
+        let form_url = format!("http://127.0.0.1:{}/api/form", port);
+        let resp_form = client
+            .post_form(&form_url, &[("user", "alice"), ("role", "admin")])
+            .expect("post form");
+        assert_eq!(resp_form.status(), HttpStatus::OK);
+        assert_eq!(resp_form.text().unwrap(), "form-ok");
+
+        // 2. Post multipart
+        let upload_url = format!("http://127.0.0.1:{}/api/upload", port);
+        let multi = MultipartBuilder::new("ifaBoundaryTest123")
+            .add_field("description", "System binary update")
+            .add_file(
+                "file",
+                "kernel.bin",
+                "application/octet-stream",
+                b"\x7fELF_DATA",
+            );
+        let resp_multi = client
+            .post_multipart(&upload_url, &multi)
+            .expect("post multipart");
+        assert_eq!(resp_multi.status(), HttpStatus::OK);
+        assert!(resp_multi.is_multipart());
+        let resp_parts = resp_multi.multipart().expect("parse response multipart");
+        assert_eq!(resp_parts.len(), 1);
+        assert_eq!(resp_parts[0].name, "status");
+        assert_eq!(resp_parts[0].data, b"processed");
 
         handle.join().expect("server thread finished");
     }
