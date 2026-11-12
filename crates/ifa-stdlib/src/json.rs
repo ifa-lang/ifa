@@ -1546,7 +1546,10 @@ mod tests {
         let mut transformed = source.clone();
         let res = transformed.apply_json_patch(&patch_doc);
         assert!(res.is_ok(), "apply_json_patch failed: {:?}", res);
-        assert_eq!(transformed, target, "Transformed document must match target");
+        assert_eq!(
+            transformed, target,
+            "Transformed document must match target"
+        );
 
         // 3. Array truncation diff
         let arr_source = decode(r#"[1, 2, 3, 4, 5]"#).unwrap();
