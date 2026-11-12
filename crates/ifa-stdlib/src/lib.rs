@@ -19,7 +19,8 @@ pub use crypto::{
     base64_decode, base64_encode, base64url_decode, base64url_encode, blake3, blake3_hex,
     constant_time_eq, hmac_sha1, hmac_sha1_hex, hmac_sha256, hmac_sha256_hex, hotp,
     pbkdf2_hmac_sha256, pbkdf2_hmac_sha256_hex, sha1, sha1_hex, sha256, sha256_hex, totp,
-    totp_verify, websocket_accept_key, Jwt, JwtClaims, JwtError,
+    totp_verify, websocket_accept_key, HmacSha1, HmacSha256, Jwt, JwtClaims, JwtError, Sha1,
+    Sha256,
 };
 pub use csv::{decode as decode_csv, encode as encode_csv, CsvTable};
 pub use db::{Database, DbError, Transaction, DB_MAGIC, DB_VERSION, PAGE_SIZE};
@@ -182,6 +183,27 @@ mod tests {
             derived,
             "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
         );
+
+        // Streaming Hasher tests from crate root
+        let mut hasher256 = Sha256::new();
+        hasher256.update(b"streaming ");
+        hasher256.update(b"data");
+        assert_eq!(hasher256.finalize(), sha256(b"streaming data"));
+
+        let mut hasher1 = Sha1::new();
+        hasher1.update(b"streaming ");
+        hasher1.update(b"data");
+        assert_eq!(hasher1.finalize(), sha1(b"streaming data"));
+
+        let mut hmac = HmacSha256::new(key);
+        hmac.update(b"streaming ");
+        hmac.update(b"data");
+        assert_eq!(hmac.finalize(), hmac_sha256(key, b"streaming data"));
+
+        let mut hmac1 = HmacSha1::new(key);
+        hmac1.update(b"streaming ");
+        hmac1.update(b"data");
+        assert_eq!(hmac1.finalize(), hmac_sha1(key, b"streaming data"));
     }
 
     #[test]

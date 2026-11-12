@@ -14,88 +14,182 @@ const K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+const SHA256_INITIAL_H: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+#[inline]
+fn sha256_compress_block(h: &mut [u32; 8], chunk: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+
+    let mut a = h[0];
+    let mut b = h[1];
+    let mut c = h[2];
+    let mut d = h[3];
+    let mut e = h[4];
+    let mut f = h[5];
+    let mut g = h[6];
+    let mut h_val = h[7];
+
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let temp1 = h_val
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(K[i])
+            .wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = s0.wrapping_add(maj);
+
+        h_val = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
+
+    h[0] = h[0].wrapping_add(a);
+    h[1] = h[1].wrapping_add(b);
+    h[2] = h[2].wrapping_add(c);
+    h[3] = h[3].wrapping_add(d);
+    h[4] = h[4].wrapping_add(e);
+    h[5] = h[5].wrapping_add(f);
+    h[6] = h[6].wrapping_add(g);
+    h[7] = h[7].wrapping_add(h_val);
+}
+
+/// Incremental SHA-256 hasher implementing NIST FIPS 180-4.
+#[derive(Clone, Debug)]
+pub struct Sha256 {
+    state: [u32; 8],
+    buffer: [u8; 64],
+    buffer_len: usize,
+    total_len: u64,
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha256 {
+    /// Create a new SHA-256 hasher initialized to standard initial hash values.
+    pub fn new() -> Self {
+        Self {
+            state: SHA256_INITIAL_H,
+            buffer: [0u8; 64],
+            buffer_len: 0,
+            total_len: 0,
+        }
+    }
+
+    /// Reset internal state to initial values, clearing all processed data.
+    pub fn reset(&mut self) {
+        self.state = SHA256_INITIAL_H;
+        self.buffer = [0u8; 64];
+        self.buffer_len = 0;
+        self.total_len = 0;
+    }
+
+    /// Ingest data slice incrementally.
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
+
+        if self.buffer_len > 0 {
+            let needed = 64 - self.buffer_len;
+            if data.len() < needed {
+                self.buffer[self.buffer_len..self.buffer_len + data.len()].copy_from_slice(data);
+                self.buffer_len += data.len();
+                return;
+            }
+            self.buffer[self.buffer_len..64].copy_from_slice(&data[..needed]);
+            sha256_compress_block(&mut self.state, &self.buffer);
+            self.buffer_len = 0;
+            data = &data[needed..];
+        }
+
+        while data.len() >= 64 {
+            let block: &[u8; 64] = data[..64].try_into().unwrap();
+            sha256_compress_block(&mut self.state, block);
+            data = &data[64..];
+        }
+
+        if !data.is_empty() {
+            self.buffer[..data.len()].copy_from_slice(data);
+            self.buffer_len = data.len();
+        }
+    }
+
+    /// Finalize hashing and return the 32-byte digest, resetting internal state.
+    pub fn finalize_reset(&mut self) -> [u8; 32] {
+        let bit_len = self.total_len.wrapping_mul(8);
+        self.buffer[self.buffer_len] = 0x80;
+        self.buffer_len += 1;
+
+        if self.buffer_len > 56 {
+            self.buffer[self.buffer_len..64].fill(0);
+            sha256_compress_block(&mut self.state, &self.buffer);
+            self.buffer[..56].fill(0);
+        } else {
+            self.buffer[self.buffer_len..56].fill(0);
+        }
+
+        self.buffer[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        sha256_compress_block(&mut self.state, &self.buffer);
+
+        let mut digest = [0u8; 32];
+        for (i, word) in self.state.iter().enumerate() {
+            digest[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+
+        self.reset();
+        digest
+    }
+
+    /// Finalize hashing and consume hasher, returning the 32-byte digest.
+    pub fn finalize(mut self) -> [u8; 32] {
+        self.finalize_reset()
+    }
+
+    /// Finalize hashing and return digest formatted as lowercase hexadecimal string.
+    pub fn finalize_hex(self) -> String {
+        to_hex(&self.finalize())
+    }
+}
+
+impl std::io::Write for Sha256 {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Compute standard NIST SHA-256 hash digest.
 pub fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-
-    let bit_len = (data.len() as u64) * 8;
-    let mut msg = data.to_vec();
-
-    // Append single '1' bit (0x80)
-    msg.push(0x80);
-
-    // Append zeros until length % 64 == 56
-    while (msg.len() % 64) != 56 {
-        msg.push(0);
-    }
-
-    // Append 64-bit big-endian message bit-length
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-
-    // Process each 512-bit (64-byte) chunk
-    for chunk in msg.as_chunks::<64>().0 {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-
-        let mut a = h[0];
-        let mut b = h[1];
-        let mut c = h[2];
-        let mut d = h[3];
-        let mut e = h[4];
-        let mut f = h[5];
-        let mut g = h[6];
-        let mut h_val = h[7];
-
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h_val
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-
-            h_val = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(h_val);
-    }
-
-    let mut digest = [0u8; 32];
-    for (i, word) in h.iter().enumerate() {
-        digest[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
-    }
-    digest
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize()
 }
 
 /// Compute SHA-256 hash and return as lowercase hexadecimal string.
@@ -104,72 +198,168 @@ pub fn sha256_hex(data: &[u8]) -> String {
     to_hex(&digest)
 }
 
+const SHA1_INITIAL_H: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+
+#[inline]
+fn sha1_compress_block(h: &mut [u32; 5], chunk: &[u8; 64]) {
+    let mut w = [0u32; 80];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    for i in 16..80 {
+        w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+    }
+
+    let mut a = h[0];
+    let mut b = h[1];
+    let mut c = h[2];
+    let mut d = h[3];
+    let mut e = h[4];
+
+    for (i, &w_val) in w.iter().enumerate() {
+        let (f, k) = match i {
+            0..=19 => ((b & c) | ((!b) & d), 0x5a827999),
+            20..=39 => (b ^ c ^ d, 0x6ed9eba1),
+            40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
+            _ => (b ^ c ^ d, 0xca62c1d6),
+        };
+
+        let temp = a
+            .rotate_left(5)
+            .wrapping_add(f)
+            .wrapping_add(e)
+            .wrapping_add(k)
+            .wrapping_add(w_val);
+        e = d;
+        d = c;
+        c = b.rotate_left(30);
+        b = a;
+        a = temp;
+    }
+
+    h[0] = h[0].wrapping_add(a);
+    h[1] = h[1].wrapping_add(b);
+    h[2] = h[2].wrapping_add(c);
+    h[3] = h[3].wrapping_add(d);
+    h[4] = h[4].wrapping_add(e);
+}
+
+/// Incremental SHA-1 hasher implementing FIPS 180-1 / RFC 3174.
+#[derive(Clone, Debug)]
+pub struct Sha1 {
+    state: [u32; 5],
+    buffer: [u8; 64],
+    buffer_len: usize,
+    total_len: u64,
+}
+
+impl Default for Sha1 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha1 {
+    /// Create a new SHA-1 hasher initialized to standard initial hash values.
+    pub fn new() -> Self {
+        Self {
+            state: SHA1_INITIAL_H,
+            buffer: [0u8; 64],
+            buffer_len: 0,
+            total_len: 0,
+        }
+    }
+
+    /// Reset internal state to initial values, clearing all processed data.
+    pub fn reset(&mut self) {
+        self.state = SHA1_INITIAL_H;
+        self.buffer = [0u8; 64];
+        self.buffer_len = 0;
+        self.total_len = 0;
+    }
+
+    /// Ingest data slice incrementally.
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
+
+        if self.buffer_len > 0 {
+            let needed = 64 - self.buffer_len;
+            if data.len() < needed {
+                self.buffer[self.buffer_len..self.buffer_len + data.len()].copy_from_slice(data);
+                self.buffer_len += data.len();
+                return;
+            }
+            self.buffer[self.buffer_len..64].copy_from_slice(&data[..needed]);
+            sha1_compress_block(&mut self.state, &self.buffer);
+            self.buffer_len = 0;
+            data = &data[needed..];
+        }
+
+        while data.len() >= 64 {
+            let block: &[u8; 64] = data[..64].try_into().unwrap();
+            sha1_compress_block(&mut self.state, block);
+            data = &data[64..];
+        }
+
+        if !data.is_empty() {
+            self.buffer[..data.len()].copy_from_slice(data);
+            self.buffer_len = data.len();
+        }
+    }
+
+    /// Finalize hashing and return the 20-byte digest, resetting internal state.
+    pub fn finalize_reset(&mut self) -> [u8; 20] {
+        let bit_len = self.total_len.wrapping_mul(8);
+        self.buffer[self.buffer_len] = 0x80;
+        self.buffer_len += 1;
+
+        if self.buffer_len > 56 {
+            self.buffer[self.buffer_len..64].fill(0);
+            sha1_compress_block(&mut self.state, &self.buffer);
+            self.buffer[..56].fill(0);
+        } else {
+            self.buffer[self.buffer_len..56].fill(0);
+        }
+
+        self.buffer[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        sha1_compress_block(&mut self.state, &self.buffer);
+
+        let mut digest = [0u8; 20];
+        for (i, word) in self.state.iter().enumerate() {
+            digest[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+
+        self.reset();
+        digest
+    }
+
+    /// Finalize hashing and consume hasher, returning the 20-byte digest.
+    pub fn finalize(mut self) -> [u8; 20] {
+        self.finalize_reset()
+    }
+
+    /// Finalize hashing and return digest formatted as lowercase hexadecimal string.
+    pub fn finalize_hex(self) -> String {
+        to_hex(&self.finalize())
+    }
+}
+
+impl std::io::Write for Sha1 {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Compute standard SHA-1 hash digest (FIPS 180-1 / RFC 3174).
 pub fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut h: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
-
-    let bit_len = (data.len() as u64) * 8;
-    let mut msg = data.to_vec();
-
-    // Append single '1' bit (0x80)
-    msg.push(0x80);
-
-    // Append zeros until length % 64 == 56
-    while (msg.len() % 64) != 56 {
-        msg.push(0);
-    }
-
-    // Append 64-bit big-endian bit length
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-
-    for chunk in msg.as_chunks::<64>().0 {
-        let mut w = [0u32; 80];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-
-        let mut a = h[0];
-        let mut b = h[1];
-        let mut c = h[2];
-        let mut d = h[3];
-        let mut e = h[4];
-
-        for (i, &w_val) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5a827999),
-                20..=39 => (b ^ c ^ d, 0x6ed9eba1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
-                _ => (b ^ c ^ d, 0xca62c1d6),
-            };
-
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(w_val);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
-        }
-
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-    }
-
-    let mut digest = [0u8; 20];
-    for (i, word) in h.iter().enumerate() {
-        digest[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
-    }
-    digest
+    let mut hasher = Sha1::new();
+    hasher.update(data);
+    hasher.finalize()
 }
 
 /// Compute SHA-1 hash and return as lowercase hexadecimal string.
@@ -322,32 +512,95 @@ pub fn blake3_hex(data: &[u8]) -> String {
     to_hex(&digest)
 }
 
+/// Incremental HMAC-SHA-256 authenticator (RFC 2104).
+#[derive(Clone, Debug)]
+pub struct HmacSha256 {
+    inner: Sha256,
+    outer_key_pad: [u8; 64],
+    inner_key_pad: [u8; 64],
+}
+
+impl HmacSha256 {
+    /// Initialize a new HMAC-SHA-256 instance with the provided secret key.
+    pub fn new(key: &[u8]) -> Self {
+        let mut key_block = [0u8; 64];
+        if key.len() > 64 {
+            let digest = sha256(key);
+            key_block[..32].copy_from_slice(&digest);
+        } else {
+            key_block[..key.len()].copy_from_slice(key);
+        }
+
+        let mut ipad = [0u8; 64];
+        let mut opad = [0u8; 64];
+        for i in 0..64 {
+            ipad[i] = key_block[i] ^ 0x36;
+            opad[i] = key_block[i] ^ 0x5c;
+        }
+
+        let mut inner = Sha256::new();
+        inner.update(&ipad);
+
+        Self {
+            inner,
+            outer_key_pad: opad,
+            inner_key_pad: ipad,
+        }
+    }
+
+    /// Reset HMAC state for a new message with the same key.
+    pub fn reset(&mut self) {
+        self.inner.reset();
+        self.inner.update(&self.inner_key_pad);
+    }
+
+    /// Feed additional message bytes incrementally into HMAC state.
+    pub fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    /// Finalize and compute MAC digest, consuming the instance.
+    pub fn finalize(self) -> [u8; 32] {
+        let inner_hash = self.inner.finalize();
+        let mut outer = Sha256::new();
+        outer.update(&self.outer_key_pad);
+        outer.update(&inner_hash);
+        outer.finalize()
+    }
+
+    /// Finalize and compute MAC digest, resetting the instance for reuse.
+    pub fn finalize_reset(&mut self) -> [u8; 32] {
+        let inner_hash = self.inner.finalize_reset();
+        let mut outer = Sha256::new();
+        outer.update(&self.outer_key_pad);
+        outer.update(&inner_hash);
+        let digest = outer.finalize();
+        self.inner.update(&self.inner_key_pad);
+        digest
+    }
+
+    /// Finalize and return MAC digest as lowercase hexadecimal string.
+    pub fn finalize_hex(self) -> String {
+        to_hex(&self.finalize())
+    }
+}
+
+impl std::io::Write for HmacSha256 {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Compute HMAC-SHA-256 message authentication code (RFC 2104).
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut k = [0u8; 64];
-    if key.len() > 64 {
-        let digest = sha256(key);
-        k[..32].copy_from_slice(&digest);
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-
-    let mut i_pad = [0u8; 64];
-    let mut o_pad = [0u8; 64];
-    for i in 0..64 {
-        i_pad[i] = k[i] ^ 0x36;
-        o_pad[i] = k[i] ^ 0x5c;
-    }
-
-    let mut inner = Vec::with_capacity(64 + message.len());
-    inner.extend_from_slice(&i_pad);
-    inner.extend_from_slice(message);
-    let inner_hash = sha256(&inner);
-
-    let mut outer = Vec::with_capacity(64 + 32);
-    outer.extend_from_slice(&o_pad);
-    outer.extend_from_slice(&inner_hash);
-    sha256(&outer)
+    let mut hmac = HmacSha256::new(key);
+    hmac.update(message);
+    hmac.finalize()
 }
 
 /// Compute HMAC-SHA-256 and return as lowercase hex string.
@@ -356,32 +609,95 @@ pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     to_hex(&digest)
 }
 
+/// Incremental HMAC-SHA-1 authenticator (RFC 2104).
+#[derive(Clone, Debug)]
+pub struct HmacSha1 {
+    inner: Sha1,
+    outer_key_pad: [u8; 64],
+    inner_key_pad: [u8; 64],
+}
+
+impl HmacSha1 {
+    /// Initialize a new HMAC-SHA-1 instance with the provided secret key.
+    pub fn new(key: &[u8]) -> Self {
+        let mut key_block = [0u8; 64];
+        if key.len() > 64 {
+            let digest = sha1(key);
+            key_block[..20].copy_from_slice(&digest);
+        } else {
+            key_block[..key.len()].copy_from_slice(key);
+        }
+
+        let mut ipad = [0u8; 64];
+        let mut opad = [0u8; 64];
+        for i in 0..64 {
+            ipad[i] = key_block[i] ^ 0x36;
+            opad[i] = key_block[i] ^ 0x5c;
+        }
+
+        let mut inner = Sha1::new();
+        inner.update(&ipad);
+
+        Self {
+            inner,
+            outer_key_pad: opad,
+            inner_key_pad: ipad,
+        }
+    }
+
+    /// Reset HMAC state for a new message with the same key.
+    pub fn reset(&mut self) {
+        self.inner.reset();
+        self.inner.update(&self.inner_key_pad);
+    }
+
+    /// Feed additional message bytes incrementally into HMAC state.
+    pub fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    /// Finalize and compute MAC digest, consuming the instance.
+    pub fn finalize(self) -> [u8; 20] {
+        let inner_hash = self.inner.finalize();
+        let mut outer = Sha1::new();
+        outer.update(&self.outer_key_pad);
+        outer.update(&inner_hash);
+        outer.finalize()
+    }
+
+    /// Finalize and compute MAC digest, resetting the instance for reuse.
+    pub fn finalize_reset(&mut self) -> [u8; 20] {
+        let inner_hash = self.inner.finalize_reset();
+        let mut outer = Sha1::new();
+        outer.update(&self.outer_key_pad);
+        outer.update(&inner_hash);
+        let digest = outer.finalize();
+        self.inner.update(&self.inner_key_pad);
+        digest
+    }
+
+    /// Finalize and return MAC digest as lowercase hexadecimal string.
+    pub fn finalize_hex(self) -> String {
+        to_hex(&self.finalize())
+    }
+}
+
+impl std::io::Write for HmacSha1 {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Compute HMAC-SHA-1 message authentication code (RFC 2104).
 pub fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
-    let mut k = [0u8; 64];
-    if key.len() > 64 {
-        let digest = sha1(key);
-        k[..20].copy_from_slice(&digest);
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-
-    let mut i_pad = [0u8; 64];
-    let mut o_pad = [0u8; 64];
-    for i in 0..64 {
-        i_pad[i] = k[i] ^ 0x36;
-        o_pad[i] = k[i] ^ 0x5c;
-    }
-
-    let mut inner = Vec::with_capacity(64 + message.len());
-    inner.extend_from_slice(&i_pad);
-    inner.extend_from_slice(message);
-    let inner_hash = sha1(&inner);
-
-    let mut outer = Vec::with_capacity(64 + 20);
-    outer.extend_from_slice(&o_pad);
-    outer.extend_from_slice(&inner_hash);
-    sha1(&outer)
+    let mut hmac = HmacSha1::new(key);
+    hmac.update(message);
+    hmac.finalize()
 }
 
 /// Compute HMAC-SHA-1 and return as lowercase hex string.
@@ -698,9 +1014,11 @@ impl Jwt {
 }
 
 fn to_hex(bytes: &[u8]) -> String {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{:02x}", b));
+    for &b in bytes {
+        s.push(HEX_CHARS[(b >> 4) as usize] as char);
+        s.push(HEX_CHARS[(b & 0x0f) as usize] as char);
     }
     s
 }
@@ -888,5 +1206,115 @@ mod tests {
             Jwt::verify_hs256(secret, "invalid.token", 1500, 0).unwrap_err(),
             JwtError::InvalidFormat
         );
+    }
+
+    #[test]
+    fn test_sha256_incremental_and_streaming() {
+        let expected_abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(sha256_hex(b"abc"), expected_abc);
+
+        // Incremental feeding byte-by-byte
+        let mut hasher = Sha256::new();
+        hasher.update(b"a");
+        hasher.update(b"b");
+        hasher.update(b"c");
+        assert_eq!(hasher.finalize_hex(), expected_abc);
+
+        // Reset and reuse
+        let mut reusable = Sha256::new();
+        reusable.update(b"abc");
+        assert_eq!(reusable.finalize_reset(), sha256(b"abc"));
+        reusable.update(b"The quick brown fox jumps over the lazy dog");
+        assert_eq!(
+            reusable.finalize_hex(),
+            "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
+        );
+
+        // Feeding arbitrary chunk sizes (across 64-byte block boundaries)
+        let pattern =
+            b"The quick brown fox jumps over the lazy dog. 1234567890! Repeating pattern.".to_vec();
+        let mut large_input = Vec::new();
+        for _ in 0..10 {
+            large_input.extend_from_slice(&pattern);
+        }
+        let expected_large = sha256_hex(&large_input);
+
+        let mut chunked = Sha256::new();
+        for chunk in large_input.chunks(7) {
+            chunked.update(chunk);
+        }
+        assert_eq!(chunked.finalize_hex(), expected_large);
+    }
+
+    #[test]
+    fn test_sha256_and_sha1_std_io_write() {
+        use std::io::Write;
+
+        let input = b"Streaming SHA-256 and SHA-1 through std::io::Write trait.";
+
+        let mut sha256_writer = Sha256::new();
+        sha256_writer.write_all(input).unwrap();
+        sha256_writer.flush().unwrap();
+        assert_eq!(sha256_writer.finalize(), sha256(input));
+
+        let mut sha1_writer = Sha1::new();
+        sha1_writer.write_all(input).unwrap();
+        sha1_writer.flush().unwrap();
+        assert_eq!(sha1_writer.finalize(), sha1(input));
+    }
+
+    #[test]
+    fn test_sha1_incremental_and_streaming() {
+        let text = b"The quick brown fox jumps over the lazy dog";
+        let expected = sha1_hex(text);
+
+        let mut hasher = Sha1::new();
+        for &byte in text.iter() {
+            hasher.update(&[byte]);
+        }
+        assert_eq!(hasher.finalize_hex(), expected);
+
+        // Reset test
+        let mut reusable = Sha1::new();
+        reusable.update(b"abc");
+        assert_eq!(reusable.finalize_reset(), sha1(b"abc"));
+        reusable.update(text);
+        assert_eq!(reusable.finalize_hex(), expected);
+    }
+
+    #[test]
+    fn test_hmac_streaming_and_reset() {
+        use std::io::Write;
+
+        let key = b"secret-streaming-key";
+        let message = b"Streaming HMAC payload broken into multiple packets.";
+
+        // HMAC-SHA256 streaming
+        let mut hmac256 = HmacSha256::new(key);
+        for chunk in message.chunks(5) {
+            hmac256.write_all(chunk).unwrap();
+        }
+        assert_eq!(hmac256.finalize(), hmac_sha256(key, message));
+
+        // HMAC-SHA256 reset & reuse
+        let mut hmac256_reuse = HmacSha256::new(key);
+        hmac256_reuse.update(b"first message");
+        let _ = hmac256_reuse.finalize_reset();
+        hmac256_reuse.update(message);
+        assert_eq!(hmac256_reuse.finalize(), hmac_sha256(key, message));
+
+        // HMAC-SHA1 streaming
+        let mut hmac1 = HmacSha1::new(key);
+        for chunk in message.chunks(9) {
+            hmac1.write_all(chunk).unwrap();
+        }
+        assert_eq!(hmac1.finalize(), hmac_sha1(key, message));
+
+        // HMAC-SHA1 reset & reuse
+        let mut hmac1_reuse = HmacSha1::new(key);
+        hmac1_reuse.update(b"first message");
+        let _ = hmac1_reuse.finalize_reset();
+        hmac1_reuse.update(message);
+        assert_eq!(hmac1_reuse.finalize(), hmac_sha1(key, message));
     }
 }
