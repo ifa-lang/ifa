@@ -2339,10 +2339,7 @@ mod tests {
             let (req, body) = read_request(&mut b, 4096).unwrap().unwrap();
             assert_eq!(req.method, HttpMethod::Post);
             assert_eq!(req.uri, "/api/data");
-            assert_eq!(
-                req.headers.get("content-type"),
-                Some("application/json")
-            );
+            assert_eq!(req.headers.get("content-type"), Some("application/json"));
             assert_eq!(body, b"{\"key\":\"ifa\"}");
 
             // Respond with 201 Created and JSON body
@@ -2350,7 +2347,8 @@ mod tests {
             let mut resp = HttpResponseHead::created();
             resp.headers.insert("Content-Type", "application/json");
             resp.headers.insert("Connection", "close");
-            resp.headers.insert("Content-Length", resp_body.len().to_string());
+            resp.headers
+                .insert("Content-Length", resp_body.len().to_string());
             write_response_full(&mut b, &resp, resp_body).unwrap();
         });
 
