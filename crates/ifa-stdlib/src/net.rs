@@ -9,7 +9,7 @@ use std::net::{
 use std::time::Duration;
 
 use ifa_runtime::fiber::GLOBAL_SCHEDULER;
-use ifa_runtime::reactor::AsyncTcpStream;
+pub use ifa_runtime::reactor::{AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket};
 
 /// Managed non-blocking TCP Stream.
 pub struct TcpStream {
@@ -2366,5 +2366,37 @@ mod tests {
 
         client_stream.close();
         listener.close();
+    }
+
+    #[test]
+    fn test_async_transports_reexported() {
+        use super::{AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket};
+
+        // UDP async transport
+        let u1 = AsyncUdpSocket::bind("127.0.0.1:0").expect("bind async udp");
+        let u2 = AsyncUdpSocket::bind("127.0.0.1:0").expect("bind async udp");
+        let u2_addr = u2.local_addr().expect("local addr");
+
+        u1.send_to(b"ASYNC_STDLIB_UDP", u2_addr).expect("send_to");
+        let mut buf = [0u8; 32];
+        let (n, from) = u2.recv_from(&mut buf).expect("recv_from");
+        assert_eq!(n, 16);
+        assert_eq!(&buf[..n], b"ASYNC_STDLIB_UDP");
+        assert_eq!(from.port(), u1.local_addr().unwrap().port());
+
+        // TCP async transport
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind async tcp listener");
+        let l_addr = listener.local_addr().expect("local addr");
+        let mut client = AsyncTcpStream::connect(l_addr).expect("connect async client");
+        let (mut server, _) = listener.accept().expect("accept async server");
+
+        client.write_all(b"PING").expect("write ping");
+        let mut tcp_buf = [0u8; 4];
+        let read_n = server.read(&mut tcp_buf).expect("read ping");
+        assert_eq!(read_n, 4);
+        assert_eq!(&tcp_buf, b"PING");
+
+        // Timer
+        AsyncTimer::sleep(Duration::from_millis(1));
     }
 }

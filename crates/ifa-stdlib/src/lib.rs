@@ -62,10 +62,10 @@ pub use json::{
     decode as decode_json, encode as encode_json, encode_pretty as encode_json_pretty, JsonValue,
 };
 pub use net::{
-    lookup_mime_type, AsyncWsConnection, ConnectionInfo, TcpListener as NetTcpListener,
-    TcpListener, TcpServer, TcpStream as NetTcpStream, TcpStream, TokenBucket,
-    UdpSocket as NetUdpSocket, UdpSocket, WsClient, WsDemux, WsFrame, WsMessage, WsOpcode,
-    WsServer, WsSession,
+    lookup_mime_type, AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket,
+    AsyncWsConnection, ConnectionInfo, TcpListener as NetTcpListener, TcpListener, TcpServer,
+    TcpStream as NetTcpStream, TcpStream, TokenBucket, UdpSocket as NetUdpSocket, UdpSocket,
+    WsClient, WsDemux, WsFrame, WsMessage, WsOpcode, WsServer, WsSession,
 };
 pub use process::{
     find_best_assembler, find_best_linker, find_system_tool, invoke_assembler, invoke_linker,

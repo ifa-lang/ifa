@@ -272,6 +272,15 @@ impl AsyncReactor {
         Ok(stream_id)
     }
 
+    /// Retrieve local port of a TCP listener.
+    pub fn tcp_listener_port(&self, listener_id: i32) -> std::io::Result<u16> {
+        let map = self.listeners.lock().unwrap();
+        let listener = map.get(&listener_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "tcp listener not found")
+        })?;
+        Ok(listener.local_addr()?.port())
+    }
+
     /// Connect to remote host and port.
     pub fn tcp_connect(&self, host: &str, port: u16) -> std::io::Result<i32> {
         let addr = format!("{}:{}", host, port);
@@ -348,6 +357,124 @@ impl AsyncReactor {
         socket.recv_from(buf)
     }
 
+    /// Set TCP_NODELAY on an active stream.
+    pub fn tcp_set_nodelay(&self, stream_id: i32, nodelay: bool) -> std::io::Result<()> {
+        let map = self.streams.lock().unwrap();
+        let stream = map
+            .get(&stream_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "stream not found"))?;
+        stream.set_nodelay(nodelay)
+    }
+
+    /// Retrieve TCP_NODELAY setting on an active stream.
+    pub fn tcp_nodelay(&self, stream_id: i32) -> std::io::Result<bool> {
+        let map = self.streams.lock().unwrap();
+        let stream = map
+            .get(&stream_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "stream not found"))?;
+        stream.nodelay()
+    }
+
+    /// Set IP Time-To-Live on an active stream.
+    pub fn tcp_set_ttl(&self, stream_id: i32, ttl: u32) -> std::io::Result<()> {
+        let map = self.streams.lock().unwrap();
+        let stream = map
+            .get(&stream_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "stream not found"))?;
+        stream.set_ttl(ttl)
+    }
+
+    /// Retrieve IP Time-To-Live on an active stream.
+    pub fn tcp_ttl(&self, stream_id: i32) -> std::io::Result<u32> {
+        let map = self.streams.lock().unwrap();
+        let stream = map
+            .get(&stream_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "stream not found"))?;
+        stream.ttl()
+    }
+
+    /// Set IP Time-To-Live on an active TCP listener.
+    pub fn listener_set_ttl(&self, listener_id: i32, ttl: u32) -> std::io::Result<()> {
+        let map = self.listeners.lock().unwrap();
+        let listener = map.get(&listener_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "listener not found")
+        })?;
+        listener.set_ttl(ttl)
+    }
+
+    /// Retrieve IP Time-To-Live on an active TCP listener.
+    pub fn listener_ttl(&self, listener_id: i32) -> std::io::Result<u32> {
+        let map = self.listeners.lock().unwrap();
+        let listener = map.get(&listener_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "listener not found")
+        })?;
+        listener.ttl()
+    }
+
+    /// Connect UDP socket to remote host and port.
+    pub fn udp_connect(&self, sock_id: i32, host: &str, port: u16) -> std::io::Result<()> {
+        let map = self.udp_sockets.lock().unwrap();
+        let socket = map.get(&sock_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "udp socket not found")
+        })?;
+        let target = format!("{}:{}", host, port);
+        socket.connect(&target)
+    }
+
+    /// Asynchronously send datagram on connected UDP socket.
+    pub fn udp_send(&self, sock_id: i32, data: &[u8]) -> std::io::Result<usize> {
+        let map = self.udp_sockets.lock().unwrap();
+        let socket = map.get(&sock_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "udp socket not found")
+        })?;
+        socket.send(data)
+    }
+
+    /// Asynchronously receive datagram from connected UDP socket.
+    pub fn udp_recv(&self, sock_id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
+        let map = self.udp_sockets.lock().unwrap();
+        let socket = map.get(&sock_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "udp socket not found")
+        })?;
+        socket.recv(buf)
+    }
+
+    /// Enable or disable broadcast on UDP socket.
+    pub fn udp_set_broadcast(&self, sock_id: i32, on: bool) -> std::io::Result<()> {
+        let map = self.udp_sockets.lock().unwrap();
+        let socket = map.get(&sock_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "udp socket not found")
+        })?;
+        socket.set_broadcast(on)
+    }
+
+    /// Retrieve broadcast flag on UDP socket.
+    pub fn udp_broadcast(&self, sock_id: i32) -> std::io::Result<bool> {
+        let map = self.udp_sockets.lock().unwrap();
+        let socket = map.get(&sock_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "udp socket not found")
+        })?;
+        socket.broadcast()
+    }
+
+    /// Set IP Time-To-Live on UDP socket.
+    pub fn udp_set_ttl(&self, sock_id: i32, ttl: u32) -> std::io::Result<()> {
+        let map = self.udp_sockets.lock().unwrap();
+        let socket = map.get(&sock_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "udp socket not found")
+        })?;
+        socket.set_ttl(ttl)
+    }
+
+    /// Retrieve IP Time-To-Live on UDP socket.
+    pub fn udp_ttl(&self, sock_id: i32) -> std::io::Result<u32> {
+        let map = self.udp_sockets.lock().unwrap();
+        let socket = map.get(&sock_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "udp socket not found")
+        })?;
+        socket.ttl()
+    }
+
     /// Close listener, stream, or UDP socket.
     pub fn close(&self, handle_id: i32) -> bool {
         let mut listeners = self.listeners.lock().unwrap();
@@ -409,6 +536,15 @@ pub extern "C" fn ifa_rt_async_sleep(millis: u64) {
 #[no_mangle]
 pub extern "C" fn ifa_rt_async_tcp_listen(port: u16, _backlog: i32) -> i32 {
     GLOBAL_REACTOR.tcp_listen(port).unwrap_or(-1)
+}
+
+/// Retrieve the bound port of an asynchronous TCP listener.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_tcp_listener_port(listener_fd: i32) -> i32 {
+    GLOBAL_REACTOR
+        .tcp_listener_port(listener_fd)
+        .map(|p| p as i32)
+        .unwrap_or(-1)
 }
 
 /// Asynchronously accept a connection on a TCP listener handle.
@@ -519,6 +655,153 @@ pub extern "C" fn ifa_rt_async_udp_recv_from(sock_id: i32, buf: *mut u8, len: us
     let slice = unsafe { std::slice::from_raw_parts_mut(buf, len) };
     match GLOBAL_REACTOR.udp_recv_from(sock_id, slice) {
         Ok((n, _)) => n as isize,
+        Err(_) => -1,
+    }
+}
+
+/// Set TCP_NODELAY (disable Nagle's algorithm) on an active TCP stream.
+/// Returns 0 on success, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_tcp_set_nodelay(stream_fd: i32, nodelay: i32) -> i32 {
+    match GLOBAL_REACTOR.tcp_set_nodelay(stream_fd, nodelay != 0) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Retrieve TCP_NODELAY status on an active TCP stream.
+/// Returns 1 if enabled, 0 if disabled, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_tcp_get_nodelay(stream_fd: i32) -> i32 {
+    match GLOBAL_REACTOR.tcp_nodelay(stream_fd) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Set IP Time-To-Live on an active TCP stream.
+/// Returns 0 on success, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_tcp_set_ttl(stream_fd: i32, ttl: u32) -> i32 {
+    match GLOBAL_REACTOR.tcp_set_ttl(stream_fd, ttl) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Retrieve IP Time-To-Live on an active TCP stream.
+/// Returns TTL value on success, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_tcp_get_ttl(stream_fd: i32) -> i32 {
+    match GLOBAL_REACTOR.tcp_ttl(stream_fd) {
+        Ok(ttl) => ttl as i32,
+        Err(_) => -1,
+    }
+}
+
+/// Set IP Time-To-Live on an active TCP listener.
+/// Returns 0 on success, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_tcp_listener_set_ttl(listener_fd: i32, ttl: u32) -> i32 {
+    match GLOBAL_REACTOR.listener_set_ttl(listener_fd, ttl) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Retrieve IP Time-To-Live on an active TCP listener.
+/// Returns TTL value on success, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_tcp_listener_get_ttl(listener_fd: i32) -> i32 {
+    match GLOBAL_REACTOR.listener_ttl(listener_fd) {
+        Ok(ttl) => ttl as i32,
+        Err(_) => -1,
+    }
+}
+
+/// Connect UDP socket to remote host and port for direct send/recv.
+/// Returns 0 on success, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_udp_connect(sock_id: i32, host: *const u8, port: u16) -> i32 {
+    if host.is_null() {
+        return -1;
+    }
+    let host_str = unsafe {
+        match std::ffi::CStr::from_ptr(host as *const std::ffi::c_char).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+    match GLOBAL_REACTOR.udp_connect(sock_id, host_str, port) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Asynchronously send datagram on connected UDP socket.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_udp_send(sock_id: i32, buf: *const u8, len: usize) -> isize {
+    if buf.is_null() || len == 0 {
+        return 0;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(buf, len) };
+    match GLOBAL_REACTOR.udp_send(sock_id, slice) {
+        Ok(n) => n as isize,
+        Err(_) => -1,
+    }
+}
+
+/// Asynchronously receive datagram from connected UDP socket.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_udp_recv(sock_id: i32, buf: *mut u8, len: usize) -> isize {
+    if buf.is_null() || len == 0 {
+        return 0;
+    }
+    let slice = unsafe { std::slice::from_raw_parts_mut(buf, len) };
+    match GLOBAL_REACTOR.udp_recv(sock_id, slice) {
+        Ok(n) => n as isize,
+        Err(_) => -1,
+    }
+}
+
+/// Enable or disable SO_BROADCAST on UDP socket.
+/// Returns 0 on success, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_udp_set_broadcast(sock_id: i32, broadcast: i32) -> i32 {
+    match GLOBAL_REACTOR.udp_set_broadcast(sock_id, broadcast != 0) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Retrieve SO_BROADCAST setting on UDP socket.
+/// Returns 1 if broadcast enabled, 0 if disabled, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_udp_get_broadcast(sock_id: i32) -> i32 {
+    match GLOBAL_REACTOR.udp_broadcast(sock_id) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Set IP Time-To-Live on UDP socket.
+/// Returns 0 on success, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_udp_set_ttl(sock_id: i32, ttl: u32) -> i32 {
+    match GLOBAL_REACTOR.udp_set_ttl(sock_id, ttl) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Retrieve IP Time-To-Live on UDP socket.
+/// Returns TTL value on success, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn ifa_rt_async_udp_get_ttl(sock_id: i32) -> i32 {
+    match GLOBAL_REACTOR.udp_ttl(sock_id) {
+        Ok(ttl) => ttl as i32,
         Err(_) => -1,
     }
 }

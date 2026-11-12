@@ -755,3 +755,94 @@ fn test_async_socket_options_and_udp_connected_mode() {
         .expect("c_udp try_recv empty");
     assert_eq!(empty_opt, None);
 }
+
+#[test]
+fn test_async_reactor_ffi_socket_options_and_connected_udp() {
+    use ifa_runtime::{
+        ifa_rt_async_close, ifa_rt_async_tcp_accept, ifa_rt_async_tcp_connect,
+        ifa_rt_async_tcp_get_nodelay, ifa_rt_async_tcp_get_ttl, ifa_rt_async_tcp_listen,
+        ifa_rt_async_tcp_listener_get_ttl, ifa_rt_async_tcp_listener_port,
+        ifa_rt_async_tcp_listener_set_ttl, ifa_rt_async_tcp_set_nodelay, ifa_rt_async_tcp_set_ttl,
+        ifa_rt_async_udp_bind, ifa_rt_async_udp_connect, ifa_rt_async_udp_get_broadcast,
+        ifa_rt_async_udp_get_ttl, ifa_rt_async_udp_port, ifa_rt_async_udp_recv,
+        ifa_rt_async_udp_send, ifa_rt_async_udp_set_broadcast, ifa_rt_async_udp_set_ttl,
+    };
+
+    // 1. TCP FFI listener socket options
+    let listener_fd = ifa_rt_async_tcp_listen(0, 128);
+    assert!(listener_fd >= 1000);
+
+    let l_port = ifa_rt_async_tcp_listener_port(listener_fd);
+    assert!(l_port > 0);
+
+    assert_eq!(ifa_rt_async_tcp_listener_set_ttl(listener_fd, 48), 0);
+    assert_eq!(ifa_rt_async_tcp_listener_get_ttl(listener_fd), 48);
+
+    // TCP client and stream options
+    let host_cstr = std::ffi::CString::new("127.0.0.1").unwrap();
+    let client_stream_fd =
+        ifa_rt_async_tcp_connect(host_cstr.as_ptr() as *const u8, l_port as u16);
+    assert!(client_stream_fd >= 1000);
+
+    let server_stream_fd = ifa_rt_async_tcp_accept(listener_fd);
+    assert!(server_stream_fd >= 1000);
+
+    // Stream nodelay
+    assert_eq!(ifa_rt_async_tcp_set_nodelay(client_stream_fd, 1), 0);
+    assert_eq!(ifa_rt_async_tcp_get_nodelay(client_stream_fd), 1);
+    assert_eq!(ifa_rt_async_tcp_set_nodelay(client_stream_fd, 0), 0);
+    assert_eq!(ifa_rt_async_tcp_get_nodelay(client_stream_fd), 0);
+
+    // Stream TTL
+    assert_eq!(ifa_rt_async_tcp_set_ttl(server_stream_fd, 52), 0);
+    assert_eq!(ifa_rt_async_tcp_get_ttl(server_stream_fd), 52);
+
+    assert_eq!(ifa_rt_async_close(client_stream_fd), 0);
+    assert_eq!(ifa_rt_async_close(server_stream_fd), 0);
+
+    // 2. UDP FFI socket options and connected mode
+    let s_id = ifa_rt_async_udp_bind(0);
+    let c_id = ifa_rt_async_udp_bind(0);
+    assert!(s_id >= 1000);
+    assert!(c_id >= 1000);
+
+    let s_port = ifa_rt_async_udp_port(s_id);
+    let c_port = ifa_rt_async_udp_port(c_id);
+    assert!(s_port > 0);
+    assert!(c_port > 0);
+
+    // UDP TTL
+    assert_eq!(ifa_rt_async_udp_set_ttl(s_id, 32), 0);
+    assert_eq!(ifa_rt_async_udp_get_ttl(s_id), 32);
+
+    // UDP broadcast
+    assert_eq!(ifa_rt_async_udp_set_broadcast(s_id, 1), 0);
+    assert_eq!(ifa_rt_async_udp_get_broadcast(s_id), 1);
+    assert_eq!(ifa_rt_async_udp_set_broadcast(s_id, 0), 0);
+    assert_eq!(ifa_rt_async_udp_get_broadcast(s_id), 0);
+
+    // UDP connect FFI
+    let localhost = std::ffi::CString::new("127.0.0.1").unwrap();
+    assert_eq!(
+        ifa_rt_async_udp_connect(c_id, localhost.as_ptr() as *const u8, s_port as u16),
+        0
+    );
+    assert_eq!(
+        ifa_rt_async_udp_connect(s_id, localhost.as_ptr() as *const u8, c_port as u16),
+        0
+    );
+
+    // Connected send & recv FFI
+    let payload = b"CONNECTED_FFI_PAYLOAD";
+    let sent = ifa_rt_async_udp_send(c_id, payload.as_ptr(), payload.len());
+    assert_eq!(sent, payload.len() as isize);
+
+    let mut recv_buf = [0u8; 64];
+    let recvd = ifa_rt_async_udp_recv(s_id, recv_buf.as_mut_ptr(), recv_buf.len());
+    assert_eq!(recvd, payload.len() as isize);
+    assert_eq!(&recv_buf[..recvd as usize], payload);
+
+    assert_eq!(ifa_rt_async_close(s_id), 0);
+    assert_eq!(ifa_rt_async_close(c_id), 0);
+    assert_eq!(ifa_rt_async_close(listener_fd), 0);
+}
