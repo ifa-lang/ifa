@@ -1,6 +1,6 @@
 //! Minimalist HTTP/1.1 wire parser, serializer, and chunked transfer codec over `BufferedTcpStream` (`std::net::http`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, BufRead, Read, Write};
 use std::time::Duration;
@@ -259,6 +259,34 @@ impl HeaderMap {
     pub const ETAG: &'static str = "etag";
     pub const IF_NONE_MATCH: &'static str = "if-none-match";
     pub const AUTHORIZATION: &'static str = "authorization";
+    pub const CACHE_CONTROL: &'static str = "cache-control";
+    pub const UPGRADE: &'static str = "upgrade";
+    pub const KEEP_ALIVE: &'static str = "keep-alive";
+    pub const PROXY_AUTHENTICATE: &'static str = "proxy-authenticate";
+    pub const PROXY_AUTHORIZATION: &'static str = "proxy-authorization";
+    pub const TE: &'static str = "te";
+    pub const TRAILER: &'static str = "trailer";
+    pub const PROXY_CONNECTION: &'static str = "proxy-connection";
+    pub const FORWARDED: &'static str = "forwarded";
+    pub const X_FORWARDED_FOR: &'static str = "x-forwarded-for";
+    pub const X_FORWARDED_PROTO: &'static str = "x-forwarded-proto";
+    pub const X_FORWARDED_HOST: &'static str = "x-forwarded-host";
+    pub const ACCEPT_ENCODING: &'static str = "accept-encoding";
+    pub const CONTENT_ENCODING: &'static str = "content-encoding";
+
+    /// Standard hop-by-hop headers as defined in RFC 7230 §6.1 and related specs.
+    pub const HOP_BY_HOP_HEADERS: &'static [&'static str] = &[
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "proxy-connection",
+    ];
 
     pub fn new() -> Self {
         Self {
@@ -349,6 +377,120 @@ impl HeaderMap {
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.entries.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// Check if a header name is a standard hop-by-hop header (case-insensitive).
+    pub fn is_hop_by_hop(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        Self::HOP_BY_HOP_HEADERS.iter().any(|&h| h == lower)
+    }
+
+    /// Extract connection option tokens specified in the `Connection` header(s).
+    pub fn connection_tokens(&self) -> Vec<String> {
+        let mut tokens = Vec::new();
+        for val in self.get_all("connection") {
+            for token in val.split(',') {
+                let trimmed = token.trim();
+                if !trimmed.is_empty() {
+                    tokens.push(trimmed.to_ascii_lowercase());
+                }
+            }
+        }
+        tokens
+    }
+
+    /// Check if this HeaderMap contains any hop-by-hop headers (standard or in Connection header).
+    pub fn contains_hop_by_hop(&self) -> bool {
+        let conn_tokens = self.connection_tokens();
+        for (k, _) in self.entries.iter() {
+            let lower = k.to_ascii_lowercase();
+            if Self::is_hop_by_hop(&lower) || conn_tokens.contains(&lower) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Strip all hop-by-hop headers as required by RFC 7230 intermediaries and gateways:
+    /// removes standard hop-by-hop headers, all headers listed in the `Connection` header,
+    /// and the `Connection` header itself.
+    pub fn strip_hop_by_hop(&mut self) {
+        let mut to_remove: HashSet<String> = self.connection_tokens().into_iter().collect();
+        for &h in Self::HOP_BY_HOP_HEADERS {
+            to_remove.insert(h.to_string());
+        }
+
+        self.entries
+            .retain(|(k, _)| !to_remove.contains(&k.to_ascii_lowercase()));
+        self.lookup.clear();
+        for (i, (k, _)) in self.entries.iter().enumerate() {
+            self.lookup.entry(k.to_ascii_lowercase()).or_insert(i);
+        }
+    }
+
+    /// Check if a header name is valid according to RFC 7230 §3.2.6 token rules.
+    pub fn is_valid_name(name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        name.bytes().all(|b| {
+            matches!(
+                b,
+                b'a'..=b'z'
+                    | b'A'..=b'Z'
+                    | b'0'..=b'9'
+                    | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+        })
+    }
+
+    /// Check if a header value is valid (prevents CRLF injection and NUL byte poisoning).
+    pub fn is_valid_value(value: &str) -> bool {
+        !value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+    }
+
+    /// Attempt to insert a header, returning an error if the name or value fails RFC validation.
+    pub fn try_insert(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), HttpParseError> {
+        let name_str = name.into();
+        let val_str = value.into();
+        if !Self::is_valid_name(&name_str) || !Self::is_valid_value(&val_str) {
+            return Err(HttpParseError::InvalidHeader);
+        }
+        self.insert(name_str, val_str);
+        Ok(())
+    }
+
+    /// Attempt to append a header, returning an error if the name or value fails RFC validation.
+    pub fn try_append(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), HttpParseError> {
+        let name_str = name.into();
+        let val_str = value.into();
+        if !Self::is_valid_name(&name_str) || !Self::is_valid_value(&val_str) {
+            return Err(HttpParseError::InvalidHeader);
+        }
+        self.append(name_str, val_str);
+        Ok(())
     }
 }
 
@@ -546,6 +688,17 @@ impl HttpRequestHead {
             encode_basic_auth(username, password),
         );
     }
+
+    /// Strip hop-by-hop headers from this request head.
+    pub fn strip_hop_by_hop_headers(&mut self) {
+        self.headers.strip_hop_by_hop();
+    }
+
+    /// Return a copy of this request head with all hop-by-hop headers stripped.
+    pub fn with_hop_by_hop_stripped(mut self) -> Self {
+        self.headers.strip_hop_by_hop();
+        self
+    }
 }
 
 /// HTTP Response Header metadata.
@@ -696,6 +849,17 @@ impl HttpResponseHead {
                     .contains("application/x-www-form-urlencoded")
             })
             .unwrap_or(false)
+    }
+
+    /// Strip hop-by-hop headers from this response head.
+    pub fn strip_hop_by_hop_headers(&mut self) {
+        self.headers.strip_hop_by_hop();
+    }
+
+    /// Return a copy of this response head with all hop-by-hop headers stripped.
+    pub fn with_hop_by_hop_stripped(mut self) -> Self {
+        self.headers.strip_hop_by_hop();
+        self
     }
 }
 
@@ -2025,6 +2189,62 @@ impl HttpUrl {
             })
         }
     }
+
+    /// Check if target host is loopback (localhost, 127.x.x.x, ::1).
+    pub fn is_loopback(&self) -> bool {
+        let host = self.host.to_ascii_lowercase();
+        if host == "localhost" || host == "::1" || host == "[::1]" {
+            return true;
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return ip.is_loopback();
+        }
+        if host.starts_with("127.") {
+            return true;
+        }
+        false
+    }
+
+    /// Check if target host is an internal/private or local network address (RFC 1918, link-local, loopback).
+    pub fn is_private_or_local(&self) -> bool {
+        if self.is_loopback() {
+            return true;
+        }
+        let host = self.host.to_ascii_lowercase();
+        if host.ends_with(".local")
+            || host.ends_with(".localhost")
+            || host.ends_with(".internal")
+            || host == "local"
+        {
+            return true;
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            match ip {
+                std::net::IpAddr::V4(ipv4) => {
+                    let oct = ipv4.octets();
+                    oct[0] == 10
+                        || (oct[0] == 172 && (16..=31).contains(&oct[1]))
+                        || (oct[0] == 192 && oct[1] == 168)
+                        || (oct[0] == 169 && oct[1] == 254)
+                        || oct[0] == 0
+                        || oct[0] == 127
+                }
+                std::net::IpAddr::V6(ipv6) => {
+                    ipv6.is_loopback()
+                        || ipv6.is_unspecified()
+                        || (ipv6.segments()[0] & 0xfe00) == 0xfc00
+                        || (ipv6.segments()[0] & 0xffc0) == 0xfe80
+                }
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Format standard origin string: scheme://host[:port].
+    pub fn origin(&self) -> String {
+        format!("{}://{}", self.scheme, self.host_header_value())
+    }
 }
 
 impl fmt::Display for HttpUrl {
@@ -2049,6 +2269,7 @@ pub enum HttpClientError {
     TooManyRedirects,
     ConnectionFailed(String),
     Timeout,
+    SecurityViolation(String),
 }
 
 impl fmt::Display for HttpClientError {
@@ -2063,6 +2284,9 @@ impl fmt::Display for HttpClientError {
             HttpClientError::TooManyRedirects => write!(f, "Too many HTTP redirects exceeded"),
             HttpClientError::ConnectionFailed(msg) => write!(f, "Connection failed: {}", msg),
             HttpClientError::Timeout => write!(f, "HTTP operation timed out"),
+            HttpClientError::SecurityViolation(msg) => {
+                write!(f, "HTTP client security violation: {}", msg)
+            }
         }
     }
 }
@@ -2294,6 +2518,17 @@ impl HttpRequest {
     pub fn into_bytes(self) -> Vec<u8> {
         self.body
     }
+
+    /// Strip hop-by-hop headers from this request.
+    pub fn strip_hop_by_hop_headers(&mut self) {
+        self.head.strip_hop_by_hop_headers();
+    }
+
+    /// Return a copy of this request with all hop-by-hop headers stripped.
+    pub fn with_hop_by_hop_stripped(mut self) -> Self {
+        self.head.strip_hop_by_hop_headers();
+        self
+    }
 }
 
 /// High-level HTTP Response wrapper containing head and decoded body.
@@ -2497,6 +2732,17 @@ impl HttpResponse {
     pub fn into_parts(self) -> (HttpResponseHead, Vec<u8>) {
         (self.head, self.body)
     }
+
+    /// Strip hop-by-hop headers from this response.
+    pub fn strip_hop_by_hop_headers(&mut self) {
+        self.head.strip_hop_by_hop_headers();
+    }
+
+    /// Return a copy of this response with all hop-by-hop headers stripped.
+    pub fn with_hop_by_hop_stripped(mut self) -> Self {
+        self.head.strip_hop_by_hop_headers();
+        self
+    }
 }
 
 /// Read a full HTTP request with its body from a `BufferedTcpStream` into an `HttpRequest` object.
@@ -2541,6 +2787,8 @@ pub struct HttpClient {
     pub max_body_size: usize,
     pub follow_redirects: bool,
     pub max_redirects: usize,
+    pub allow_private_networks: bool,
+    pub strip_hop_by_hop_headers: bool,
     pub default_headers: HeaderMap,
 }
 
@@ -2554,6 +2802,8 @@ impl Default for HttpClient {
             max_body_size: 16 * 1024 * 1024,
             follow_redirects: true,
             max_redirects: 5,
+            allow_private_networks: true,
+            strip_hop_by_hop_headers: true,
             default_headers,
         }
     }
@@ -2625,17 +2875,28 @@ impl HttpClient {
         let mut redirects_followed = 0;
 
         loop {
+            if !self.allow_private_networks && current_url.is_private_or_local() {
+                return Err(HttpClientError::SecurityViolation(format!(
+                    "Blocked request to private/local network address '{}'",
+                    current_url.host
+                )));
+            }
+
             let mut head = HttpRequestHead::new(
                 current_method,
                 current_url.path_and_query.clone(),
                 HttpVersion::Http11,
             );
             head.headers.insert("Host", current_url.host_header_value());
-            head.headers.insert("Connection", "close");
 
             for (k, v) in extra_headers.iter() {
                 head.headers.insert(k, v);
             }
+
+            if self.strip_hop_by_hop_headers {
+                head.strip_hop_by_hop_headers();
+            }
+            head.headers.insert("Connection", "close");
 
             let host_port = current_url.socket_addr_str();
             let response = self.execute(&host_port, head, &current_body)?;
@@ -2824,6 +3085,8 @@ pub struct HttpClientBuilder {
     max_body_size: Option<usize>,
     follow_redirects: Option<bool>,
     max_redirects: Option<usize>,
+    allow_private_networks: Option<bool>,
+    strip_hop_by_hop_headers: Option<bool>,
     headers: HeaderMap,
 }
 
@@ -2849,6 +3112,18 @@ impl HttpClientBuilder {
 
     pub fn max_redirects(mut self, count: usize) -> Self {
         self.max_redirects = Some(count);
+        self
+    }
+
+    /// Enable or disable access to private or local network addresses (anti-SSRF protection).
+    pub fn allow_private_networks(mut self, allow: bool) -> Self {
+        self.allow_private_networks = Some(allow);
+        self
+    }
+
+    /// Enable or disable stripping hop-by-hop headers from outgoing requests.
+    pub fn strip_hop_by_hop(mut self, strip: bool) -> Self {
+        self.strip_hop_by_hop_headers = Some(strip);
         self
     }
 
@@ -2888,6 +3163,12 @@ impl HttpClientBuilder {
         }
         if let Some(mr) = self.max_redirects {
             client.max_redirects = mr;
+        }
+        if let Some(apn) = self.allow_private_networks {
+            client.allow_private_networks = apn;
+        }
+        if let Some(sh) = self.strip_hop_by_hop_headers {
+            client.strip_hop_by_hop_headers = sh;
         }
         for (k, v) in self.headers.iter() {
             client.default_headers.insert(k, v);
@@ -4117,5 +4398,100 @@ mod tests {
         assert_eq!(resp_basic.text().unwrap(), "basic-ok");
 
         handle.join().expect("server thread finished");
+    }
+
+    #[test]
+    fn test_http_security_validation_and_hop_by_hop_filtering() {
+        // 1. Hop-by-hop detection
+        assert!(HeaderMap::is_hop_by_hop("connection"));
+        assert!(HeaderMap::is_hop_by_hop("keep-alive"));
+        assert!(HeaderMap::is_hop_by_hop("upgrade"));
+        assert!(HeaderMap::is_hop_by_hop("proxy-authenticate"));
+        assert!(HeaderMap::is_hop_by_hop("proxy-authorization"));
+        assert!(HeaderMap::is_hop_by_hop("te"));
+        assert!(HeaderMap::is_hop_by_hop("trailer"));
+        assert!(HeaderMap::is_hop_by_hop("transfer-encoding"));
+        assert!(!HeaderMap::is_hop_by_hop("content-type"));
+        assert!(!HeaderMap::is_hop_by_hop("authorization"));
+
+        // 2. Hop-by-hop stripping including Connection tokens
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", "application/json");
+        headers.insert("Connection", "keep-alive, X-Hop-Header");
+        headers.insert("Keep-Alive", "timeout=5, max=100");
+        headers.insert("Upgrade", "websocket");
+        headers.insert("X-Hop-Header", "temp-val");
+        headers.insert("X-Permanent", "stays");
+
+        assert!(headers.contains_hop_by_hop());
+        headers.strip_hop_by_hop();
+
+        assert!(!headers.contains_hop_by_hop());
+        assert_eq!(headers.get("content-type"), Some("application/json"));
+        assert_eq!(headers.get("x-permanent"), Some("stays"));
+        assert!(headers.get("connection").is_none());
+        assert!(headers.get("keep-alive").is_none());
+        assert!(headers.get("upgrade").is_none());
+        assert!(headers.get("x-hop-header").is_none());
+
+        // 3. RFC Header name & value validation (anti-CRLF injection)
+        assert!(HeaderMap::is_valid_name("X-Custom-Token_1"));
+        assert!(!HeaderMap::is_valid_name("Invalid Header"));
+        assert!(!HeaderMap::is_valid_name("Invalid:Header"));
+        assert!(!HeaderMap::is_valid_name(""));
+
+        assert!(HeaderMap::is_valid_value("Valid value 123 !@#"));
+        assert!(!HeaderMap::is_valid_value("Injected\r\nHeader: bad"));
+        assert!(!HeaderMap::is_valid_value("Injected\nHeader: bad"));
+
+        let mut safe_map = HeaderMap::new();
+        assert!(safe_map.try_insert("X-Valid", "good").is_ok());
+        assert!(safe_map.try_insert("X Injected", "value").is_err());
+        assert!(safe_map.try_insert("X-Valid", "bad\r\nvalue").is_err());
+
+        // 4. Request and Response head stripping helpers
+        let mut req_head = HttpRequestHead::get("/api/test");
+        req_head.headers.insert("Connection", "close");
+        req_head.headers.insert("Upgrade", "websocket");
+        req_head.headers.insert("X-Api-Key", "secret");
+
+        let stripped_req_head = req_head.with_hop_by_hop_stripped();
+        assert!(stripped_req_head.headers.get("connection").is_none());
+        assert!(stripped_req_head.headers.get("upgrade").is_none());
+        assert_eq!(stripped_req_head.headers.get("x-api-key"), Some("secret"));
+
+        let mut resp_head = HttpResponseHead::ok();
+        resp_head.headers.insert("Transfer-Encoding", "chunked");
+        resp_head.headers.insert("X-Data", "123");
+        let stripped_resp = resp_head.with_hop_by_hop_stripped();
+        assert!(stripped_resp.headers.get("transfer-encoding").is_none());
+        assert_eq!(stripped_resp.headers.get("x-data"), Some("123"));
+
+        // 5. HttpUrl security inspection (anti-SSRF)
+        let local_url = HttpUrl::parse("http://localhost:8080/status").unwrap();
+        assert!(local_url.is_loopback());
+        assert!(local_url.is_private_or_local());
+        assert_eq!(local_url.origin(), "http://localhost:8080");
+
+        let ip_url = HttpUrl::parse("http://192.168.1.100/admin").unwrap();
+        assert!(!ip_url.is_loopback());
+        assert!(ip_url.is_private_or_local());
+
+        let public_url = HttpUrl::parse("http://example.com/api").unwrap();
+        assert!(!public_url.is_loopback());
+        assert!(!public_url.is_private_or_local());
+        assert_eq!(public_url.origin(), "http://example.com");
+
+        // 6. HttpClient anti-SSRF enforcement
+        let client_restricted = HttpClient::builder().allow_private_networks(false).build();
+        let err = client_restricted
+            .get("http://127.0.0.1:9999/private")
+            .unwrap_err();
+        match err {
+            HttpClientError::SecurityViolation(msg) => {
+                assert!(msg.contains("private/local network"));
+            }
+            other => panic!("Expected SecurityViolation, got: {:?}", other),
+        }
     }
 }
