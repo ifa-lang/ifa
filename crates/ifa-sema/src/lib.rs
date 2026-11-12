@@ -584,4 +584,31 @@ mod tests {
             res.diagnostics
         );
     }
+
+    #[test]
+    fn test_system_telemetry_builtins_resolution() {
+        let code = r#"
+            pub fn main() {
+                let cores = cpu_count();
+                let rss = max_rss();
+                let res_mem = memory_resident();
+                let virt_mem = memory_virtual();
+                let cpu_ns = cpu_time_ns();
+
+                let sys_cores = sys_cpu_count();
+                let sys_rss = sys_max_rss();
+                let sys_res = sys_memory_resident();
+                let sys_virt = sys_memory_virtual();
+                let sys_ns = sys_cpu_time_ns();
+
+                let total = cores + rss + res_mem + virt_mem + cpu_ns + sys_cores + sys_rss + sys_res + sys_virt + sys_ns;
+            }
+        "#;
+        let res = parse_and_analyze(code);
+        assert!(
+            !res.has_errors(),
+            "Expected system telemetry builtins to resolve without errors, got: {:?}",
+            res.diagnostics
+        );
+    }
 }

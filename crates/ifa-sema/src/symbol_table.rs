@@ -2873,6 +2873,33 @@ impl SymbolTable {
             span: dummy,
         });
 
+        // Global system telemetry and resource usage builtins
+        let sys_funcs = [
+            "max_rss",
+            "sys_max_rss",
+            "cpu_time_ns",
+            "sys_cpu_time_ns",
+            "cpu_count",
+            "sys_cpu_count",
+            "memory_resident",
+            "sys_memory_resident",
+            "memory_virtual",
+            "sys_memory_virtual",
+        ];
+        for fn_name in sys_funcs {
+            let _ = self.define_function(FunctionSymbol {
+                name: INTERNER.intern(fn_name),
+                is_pub: true,
+                is_strict: false,
+                is_comptime: false,
+                is_extern: None,
+                generics: Vec::new(),
+                params: Vec::new(),
+                ret_ty: Type::Int(crate::types::IntType::I64),
+                span: dummy,
+            });
+        }
+
         // Global network builtins
         let _ = self.define_function(FunctionSymbol {
             name: INTERNER.intern("tcp_listen"),

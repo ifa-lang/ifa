@@ -1,0 +1,124 @@
+// Pure IFA Standard Library: System Telemetry & Resource Audit Subsystem (`std/sys.ifa`)
+// Deterministic abstractions for process memory residency, CPU execution time,
+// logical core topology, and resource usage telemetry.
+
+pub struct SysResourceSnapshot {
+    max_rss_bytes: i64,
+    resident_bytes: i64,
+    virtual_bytes: i64,
+    cpu_time_ns: i64,
+    cpu_count: i64
+}
+
+// ---------------------------------------------------------------------------
+// 1. Low-Level Native System Resource Primitives
+// ---------------------------------------------------------------------------
+
+pub fn sys_get_max_rss() -> i64 {
+    return sys_max_rss();
+}
+
+pub fn sys_get_cpu_time_ns() -> i64 {
+    return sys_cpu_time_ns();
+}
+
+pub fn sys_get_cpu_count() -> i64 {
+    return sys_cpu_count();
+}
+
+pub fn sys_get_memory_resident() -> i64 {
+    return sys_memory_resident();
+}
+
+pub fn sys_get_memory_virtual() -> i64 {
+    return sys_memory_virtual();
+}
+
+// ---------------------------------------------------------------------------
+// 2. High-Level Telemetry Snapshot and Inspection
+// ---------------------------------------------------------------------------
+
+pub fn sys_snapshot() -> SysResourceSnapshot {
+    return SysResourceSnapshot(
+        max_rss_bytes: sys_max_rss(),
+        resident_bytes: sys_memory_resident(),
+        virtual_bytes: sys_memory_virtual(),
+        cpu_time_ns: sys_cpu_time_ns(),
+        cpu_count: sys_cpu_count()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3. Human-Readable Telemetry Formatting Helpers
+// ---------------------------------------------------------------------------
+
+pub fn sys_int_to_digit(d: i64) -> String {
+    if d == 0 { return "0"; }
+    if d == 1 { return "1"; }
+    if d == 2 { return "2"; }
+    if d == 3 { return "3"; }
+    if d == 4 { return "4"; }
+    if d == 5 { return "5"; }
+    if d == 6 { return "6"; }
+    if d == 7 { return "7"; }
+    if d == 8 { return "8"; }
+    if d == 9 { return "9"; }
+    return "0";
+}
+
+pub fn sys_int_to_str(mut n: i64) -> String {
+    if n == 0 {
+        return "0";
+    }
+    mut is_neg = false;
+    if n < 0 {
+        is_neg = true;
+        n = 0 - n;
+    }
+    mut digits = "";
+    while n > 0 {
+        let rem = n % 10;
+        let d = sys_int_to_digit(rem);
+        digits = d + digits;
+        n = n / 10;
+    }
+    if is_neg {
+        return "-" + digits;
+    }
+    return digits;
+}
+
+pub fn sys_format_bytes(bytes: i64) -> String {
+    if bytes < 1024 {
+        return sys_int_to_str(bytes) + " B";
+    }
+    let kib = bytes / 1024;
+    if kib < 1024 {
+        return sys_int_to_str(kib) + " KiB";
+    }
+    let mib = kib / 1024;
+    if mib < 1024 {
+        return sys_int_to_str(mib) + " MiB";
+    }
+    let gib = mib / 1024;
+    return sys_int_to_str(gib) + " GiB";
+}
+
+pub fn sys_format_duration_ms(nanos: i64) -> String {
+    let ms = nanos / 1000000;
+    return sys_int_to_str(ms) + " ms";
+}
+
+pub fn sys_format_summary(snapshot: SysResourceSnapshot) -> String {
+    mut res: String = "CPU Cores: ";
+    res = res + sys_int_to_str(snapshot.cpu_count);
+    res = res + " | Max RSS: ";
+    res = res + sys_format_bytes(snapshot.max_rss_bytes);
+    res = res + " | Resident: ";
+    res = res + sys_format_bytes(snapshot.resident_bytes);
+    res = res + " | Virtual: ";
+    res = res + sys_format_bytes(snapshot.virtual_bytes);
+    res = res + " | CPU Time: ";
+    res = res + sys_format_duration_ms(snapshot.cpu_time_ns);
+    return res;
+}

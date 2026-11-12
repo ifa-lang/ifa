@@ -2753,6 +2753,7 @@ impl<'a> FirInterpreter<'a> {
                     Ok(FirValue::Bool(std::env::set_current_dir(path).is_ok()))
                 } else if fn_name == "sys::cpu_count"
                     || fn_name == "cpu_count"
+                    || fn_name == "sys_cpu_count"
                     || fn_name == "sys::resources::cpu_count"
                     || fn_name == "ifa_rt_sys_cpu_count"
                 {
@@ -2762,10 +2763,12 @@ impl<'a> FirInterpreter<'a> {
                     Ok(FirValue::Int(count))
                 } else if fn_name == "sys::max_rss"
                     || fn_name == "max_rss"
+                    || fn_name == "sys_max_rss"
                     || fn_name == "sys::resources::max_rss"
                     || fn_name == "ifa_rt_sys_max_rss"
                     || fn_name == "sys::memory_resident"
                     || fn_name == "memory_resident"
+                    || fn_name == "sys_memory_resident"
                     || fn_name == "sys::resources::memory_resident"
                     || fn_name == "ifa_rt_sys_memory_resident"
                 {
@@ -2784,6 +2787,7 @@ impl<'a> FirInterpreter<'a> {
                     Ok(FirValue::Int(1024 * 1024))
                 } else if fn_name == "sys::memory_virtual"
                     || fn_name == "memory_virtual"
+                    || fn_name == "sys_memory_virtual"
                     || fn_name == "sys::resources::memory_virtual"
                     || fn_name == "ifa_rt_sys_memory_virtual"
                 {
@@ -2801,6 +2805,7 @@ impl<'a> FirInterpreter<'a> {
                     Ok(FirValue::Int(4096 * 1024))
                 } else if fn_name == "sys::cpu_time_ns"
                     || fn_name == "cpu_time_ns"
+                    || fn_name == "sys_cpu_time_ns"
                     || fn_name == "sys::resources::cpu_time_ns"
                     || fn_name == "ifa_rt_sys_cpu_time_ns"
                 {

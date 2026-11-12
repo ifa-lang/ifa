@@ -1180,17 +1180,18 @@ impl<'a, M: Module> FunctionTranslator<'a, M> {
                     "string_char_at" | "String::char_at" => "ifa_rt_string_char_at",
                     "string_substr" | "String::substr" | "substring" => "ifa_rt_string_substr",
                     "int_to_str" | "int_to_string" => "ifa_rt_string_from_i64",
-                    "sys::max_rss" | "max_rss" | "sys::resources::max_rss" => "ifa_rt_sys_max_rss",
-                    "sys::cpu_time_ns" | "cpu_time_ns" | "sys::resources::cpu_time_ns" => {
+                    "sys::max_rss" | "max_rss" | "sys_max_rss" | "sys::resources::max_rss" => "ifa_rt_sys_max_rss",
+                    "sys::cpu_time_ns" | "cpu_time_ns" | "sys_cpu_time_ns" | "sys::resources::cpu_time_ns" => {
                         "ifa_rt_sys_cpu_time_ns"
                     }
-                    "sys::cpu_count" | "cpu_count" | "sys::resources::cpu_count" => {
+                    "sys::cpu_count" | "cpu_count" | "sys_cpu_count" | "sys::resources::cpu_count" => {
                         "ifa_rt_sys_cpu_count"
                     }
                     "sys::memory_resident"
                     | "memory_resident"
+                    | "sys_memory_resident"
                     | "sys::resources::memory_resident" => "ifa_rt_sys_memory_resident",
-                    "sys::memory_virtual" | "memory_virtual" | "sys::resources::memory_virtual" => {
+                    "sys::memory_virtual" | "memory_virtual" | "sys_memory_virtual" | "sys::resources::memory_virtual" => {
                         "ifa_rt_sys_memory_virtual"
                     }
                     _ => fn_name.as_str(),
