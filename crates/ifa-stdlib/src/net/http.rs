@@ -370,6 +370,21 @@ impl HttpRequestHead {
         Self::new(HttpMethod::Delete, uri, HttpVersion::Http11)
     }
 
+    /// Construct a standard HTTP/1.1 PATCH request head.
+    pub fn patch(uri: impl Into<String>) -> Self {
+        Self::new(HttpMethod::Patch, uri, HttpVersion::Http11)
+    }
+
+    /// Construct a standard HTTP/1.1 HEAD request head.
+    pub fn head(uri: impl Into<String>) -> Self {
+        Self::new(HttpMethod::Head, uri, HttpVersion::Http11)
+    }
+
+    /// Construct a standard HTTP/1.1 OPTIONS request head.
+    pub fn options(uri: impl Into<String>) -> Self {
+        Self::new(HttpMethod::Options, uri, HttpVersion::Http11)
+    }
+
     /// Add or update a header, returning self.
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(name, value);
@@ -432,9 +447,34 @@ impl HttpResponseHead {
         Self::new(HttpStatus::OK, HttpVersion::Http11)
     }
 
+    /// Construct a standard 201 Created response head.
+    pub fn created() -> Self {
+        Self::new(HttpStatus::CREATED, HttpVersion::Http11)
+    }
+
+    /// Construct a standard 202 Accepted response head.
+    pub fn accepted() -> Self {
+        Self::new(HttpStatus::ACCEPTED, HttpVersion::Http11)
+    }
+
+    /// Construct a standard 204 No Content response head.
+    pub fn no_content() -> Self {
+        Self::new(HttpStatus::NO_CONTENT, HttpVersion::Http11)
+    }
+
     /// Construct a standard 400 Bad Request response head.
     pub fn bad_request() -> Self {
         Self::new(HttpStatus::BAD_REQUEST, HttpVersion::Http11)
+    }
+
+    /// Construct a standard 401 Unauthorized response head.
+    pub fn unauthorized() -> Self {
+        Self::new(HttpStatus::UNAUTHORIZED, HttpVersion::Http11)
+    }
+
+    /// Construct a standard 403 Forbidden response head.
+    pub fn forbidden() -> Self {
+        Self::new(HttpStatus::FORBIDDEN, HttpVersion::Http11)
     }
 
     /// Construct a standard 404 Not Found response head.
@@ -1518,6 +1558,11 @@ impl HttpResponse {
     pub fn into_bytes(self) -> Vec<u8> {
         self.body
     }
+
+    /// Deserialize the response body as JSON.
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_slice(&self.body)
+    }
 }
 
 /// Synchronous HTTP Client built on top of `BufferedTcpStream`.
@@ -1675,6 +1720,63 @@ impl HttpClient {
     pub fn delete(&self, url: &str) -> Result<HttpResponse, HttpClientError> {
         self.request(HttpMethod::Delete, url, &[])
     }
+
+    /// Send a PATCH request.
+    pub fn patch(
+        &self,
+        url: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<HttpResponse, HttpClientError> {
+        let mut client = self.clone();
+        if let Some(ct) = content_type {
+            client.default_headers.insert("Content-Type", ct);
+        }
+        client.request(HttpMethod::Patch, url, body)
+    }
+
+    /// Send a HEAD request.
+    pub fn head(&self, url: &str) -> Result<HttpResponse, HttpClientError> {
+        self.request(HttpMethod::Head, url, &[])
+    }
+
+    /// Send an OPTIONS request.
+    pub fn options(&self, url: &str) -> Result<HttpResponse, HttpClientError> {
+        self.request(HttpMethod::Options, url, &[])
+    }
+
+    /// Convenience helper to send a JSON POST request.
+    pub fn post_json<T: serde::Serialize>(
+        &self,
+        url: &str,
+        payload: &T,
+    ) -> Result<HttpResponse, HttpClientError> {
+        let body = serde_json::to_vec(payload)
+            .map_err(|e| HttpClientError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
+        self.post(url, &body, Some("application/json"))
+    }
+
+    /// Convenience helper to send a JSON PUT request.
+    pub fn put_json<T: serde::Serialize>(
+        &self,
+        url: &str,
+        payload: &T,
+    ) -> Result<HttpResponse, HttpClientError> {
+        let body = serde_json::to_vec(payload)
+            .map_err(|e| HttpClientError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
+        self.put(url, &body, Some("application/json"))
+    }
+
+    /// Convenience helper to send a JSON PATCH request.
+    pub fn patch_json<T: serde::Serialize>(
+        &self,
+        url: &str,
+        payload: &T,
+    ) -> Result<HttpResponse, HttpClientError> {
+        let body = serde_json::to_vec(payload)
+            .map_err(|e| HttpClientError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
+        self.patch(url, &body, Some("application/json"))
+    }
 }
 
 /// Builder for configuring custom `HttpClient` instances.
@@ -1750,6 +1852,47 @@ pub fn post(
     content_type: Option<&str>,
 ) -> Result<HttpResponse, HttpClientError> {
     HttpClient::new().post(url, body, content_type)
+}
+
+/// Convenience shortcut to issue a PUT request using default client settings.
+pub fn put(
+    url: &str,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> Result<HttpResponse, HttpClientError> {
+    HttpClient::new().put(url, body, content_type)
+}
+
+/// Convenience shortcut to issue a DELETE request using default client settings.
+pub fn delete(url: &str) -> Result<HttpResponse, HttpClientError> {
+    HttpClient::new().delete(url)
+}
+
+/// Convenience shortcut to issue a PATCH request using default client settings.
+pub fn patch(
+    url: &str,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> Result<HttpResponse, HttpClientError> {
+    HttpClient::new().patch(url, body, content_type)
+}
+
+/// Convenience shortcut to issue a HEAD request using default client settings.
+pub fn head(url: &str) -> Result<HttpResponse, HttpClientError> {
+    HttpClient::new().head(url)
+}
+
+/// Convenience shortcut to issue an OPTIONS request using default client settings.
+pub fn options(url: &str) -> Result<HttpResponse, HttpClientError> {
+    HttpClient::new().options(url)
+}
+
+/// Convenience shortcut to issue a POST request with a JSON payload.
+pub fn post_json<T: serde::Serialize>(
+    url: &str,
+    payload: &T,
+) -> Result<HttpResponse, HttpClientError> {
+    HttpClient::new().post_json(url, payload)
 }
 
 #[cfg(test)]
@@ -2126,6 +2269,111 @@ mod tests {
         let resp = client.get(&target_url).expect("http get success");
         assert_eq!(resp.status(), HttpStatus::OK);
         assert_eq!(resp.text().unwrap(), "Welcome to IFA std::net::http!");
+
+        handle.join().expect("server thread finished");
+    }
+
+    #[test]
+    fn test_http_extended_heads_and_json() {
+        let req_patch = HttpRequestHead::patch("/items/1");
+        assert_eq!(req_patch.method, HttpMethod::Patch);
+        assert_eq!(req_patch.uri, "/items/1");
+
+        let req_head = HttpRequestHead::head("/ping");
+        assert_eq!(req_head.method, HttpMethod::Head);
+
+        let req_opt = HttpRequestHead::options("/api");
+        assert_eq!(req_opt.method, HttpMethod::Options);
+
+        let r_created = HttpResponseHead::created();
+        assert_eq!(r_created.status, HttpStatus::CREATED);
+        let r_accepted = HttpResponseHead::accepted();
+        assert_eq!(r_accepted.status, HttpStatus::ACCEPTED);
+        let r_no_content = HttpResponseHead::no_content();
+        assert_eq!(r_no_content.status, HttpStatus::NO_CONTENT);
+        let r_bad_req = HttpResponseHead::bad_request();
+        assert_eq!(r_bad_req.status, HttpStatus::BAD_REQUEST);
+        let r_unauth = HttpResponseHead::unauthorized();
+        assert_eq!(r_unauth.status, HttpStatus::UNAUTHORIZED);
+        let r_forbid = HttpResponseHead::forbidden();
+        assert_eq!(r_forbid.status, HttpStatus::FORBIDDEN);
+        let r_notfound = HttpResponseHead::not_found();
+        assert_eq!(r_notfound.status, HttpStatus::NOT_FOUND);
+
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct TestMessage {
+            name: String,
+            count: u32,
+        }
+
+        let orig = TestMessage {
+            name: "IFA Stdlib".to_string(),
+            count: 7,
+        };
+        let body = serde_json::to_vec(&orig).unwrap();
+        let resp = HttpResponse {
+            head: HttpResponseHead::ok(),
+            body,
+        };
+        let parsed: TestMessage = resp.json().unwrap();
+        assert_eq!(parsed, orig);
+    }
+
+    #[test]
+    fn test_http_client_post_json_and_patch() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.port().expect("port");
+
+        let handle = thread::spawn(move || {
+            let mut s = None;
+            for _ in 0..100 {
+                if let Ok(Some((stream, _))) = listener.try_accept() {
+                    s = Some(stream);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let s = s.expect("stream accepted");
+            s.set_nonblocking(false).expect("blocking");
+            let mut b = BufferedTcpStream::new(s).expect("buffered stream");
+            let (req, body) = read_request(&mut b, 4096).unwrap().unwrap();
+            assert_eq!(req.method, HttpMethod::Post);
+            assert_eq!(req.uri, "/api/data");
+            assert_eq!(
+                req.headers.get("content-type"),
+                Some("application/json")
+            );
+            assert_eq!(body, b"{\"key\":\"ifa\"}");
+
+            // Respond with 201 Created and JSON body
+            let resp_body = b"{\"status\":\"created\",\"id\":101}";
+            let mut resp = HttpResponseHead::created();
+            resp.headers.insert("Content-Type", "application/json");
+            resp.headers.insert("Connection", "close");
+            resp.headers.insert("Content-Length", resp_body.len().to_string());
+            write_response_full(&mut b, &resp, resp_body).unwrap();
+        });
+
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct InputPayload {
+            key: String,
+        }
+
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct OutputPayload {
+            status: String,
+            id: u64,
+        }
+
+        let target_url = format!("http://127.0.0.1:{}/api/data", port);
+        let resp = HttpClient::new()
+            .post_json(&target_url, &InputPayload { key: "ifa".into() })
+            .expect("post_json");
+
+        assert_eq!(resp.status(), HttpStatus::CREATED);
+        let output: OutputPayload = resp.json().expect("parse response json");
+        assert_eq!(output.status, "created");
+        assert_eq!(output.id, 101);
 
         handle.join().expect("server thread finished");
     }
