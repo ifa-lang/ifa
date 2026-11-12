@@ -24,8 +24,10 @@ pub use crypto::{
 pub use csv::{decode as decode_csv, encode as encode_csv, CsvTable};
 pub use db::{Database, DbError, Transaction, DB_MAGIC, DB_VERSION, PAGE_SIZE};
 pub use fmt::{
-    format_binary, format_float, format_hex, format_octal, pad_center, pad_left, pad_right,
-    Alignment, FormatSpecifier,
+    decode_hex, encode_hex, escape_str, format_binary, format_float, format_hex, format_hexdump,
+    format_octal, pad_center, pad_left, pad_right, unescape_str, write_aligned, write_binary,
+    write_escaped_str, write_float_prec, write_hex, write_hex_bytes, write_hexdump,
+    write_int_aligned, write_octal, Alignment, FormatSpecifier, HexDump, HexError, UnescapeError,
 };
 pub use fs::{
     append as fs_append, copy as fs_copy, create_dir as fs_create_dir,
@@ -762,30 +764,80 @@ mod tests {
     #[test]
     fn test_byte_buffer_and_string_builder() {
         // ByteBuffer
-        let mut buf = ByteBuffer::new();
+        let mut buf = ByteBuffer::with_capacity(64);
+        assert!(buf.capacity() >= 64);
         buf.write_u8(0x7F);
         buf.write_u32_le(0x12345678);
         buf.write_u64_be(0xDEADBEEFCAFE0011);
+        buf.write_i16_be(-1234);
+        buf.write_f32_le(42.5);
+        buf.write_f64_be(1234.5678);
         buf.write_str("IFA_BOOTSTRAP");
 
         assert_eq!(buf.read_u8(0), Some(0x7F));
         assert_eq!(buf.read_u32_le(1), Some(0x12345678));
+        assert_eq!(buf.read_u64_be(5), Some(0xDEADBEEFCAFE0011));
         assert_eq!(buf.read_u8(buf.len() - 1), Some(b'P'));
+        assert_eq!(buf.read_bytes(buf.len() - 3, 3), Some(b"RAP".as_slice()));
 
-        // StringBuilder
-        let mut sb = StringBuilder::new();
+        // Hex conversion & parsing in ByteBuffer
+        let hex_str = buf.to_hex(false);
+        let mut hex_buf = ByteBuffer::new();
+        let written = hex_buf.write_hex_str(&hex_str).unwrap();
+        assert_eq!(written, buf.len());
+        assert_eq!(hex_buf.as_slice(), buf.as_slice());
+
+        // StringBuilder with fmt::Write support and streaming methods
+        use std::fmt::Write;
+        let mut sb = StringBuilder::with_capacity(128);
+        write!(&mut sb, "header: {}\n", 1).unwrap();
         sb.push_line("define i32 @main() {");
         sb.indent();
         sb.push_line("%t0 = add i32 10, 32");
+        sb.push_repeat("// comment\n", 2);
+        sb.push_binary(0b1101, true);
+        sb.push_char('\n');
+        sb.push_hex_bytes(b"ABC", true);
+        sb.push_char('\n');
+        sb.push_aligned("val", 8, Alignment::Right, '.');
+        sb.push_char('\n');
         sb.push_line("ret i32 %t0");
         sb.dedent();
         sb.push_line("}");
+
+        assert!(sb.starts_with("header: 1\n"));
+        assert!(sb.contains("// comment\n// comment\n"));
+        assert!(sb.contains("0b1101\n414243\n.....val\n"));
+        assert!(sb.ends_with("}\n"));
 
         let result = sb.into_string();
         assert!(result.contains("define i32 @main() {"));
         assert!(result.contains("    %t0 = add i32 10, 32\n"));
         assert!(result.contains("    ret i32 %t0\n"));
-        assert!(result.ends_with("}\n"));
+    }
+
+    #[test]
+    fn test_formatting_streaming_and_hexdump() {
+        let mut out = String::new();
+        write_aligned(&mut out, "hello", 10, Alignment::Center, '*').unwrap();
+        assert_eq!(out, "**hello***");
+
+        let data = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0fHello World";
+        let dump = format_hexdump(data);
+        assert!(dump.starts_with("00000000  00 01 02 03 04 05 06 07  08 09 0a 0b 0c 0d 0e 0f  |................|"));
+        assert!(dump.contains("00000010  48 65 6c 6c 6f 20 57 6f  72 6c 64                 |Hello World|"));
+
+        // Hex encode & decode roundtrip
+        let raw = b"IFA Fast Serialization Engine \xde\xad\xbe\xef";
+        let hex = encode_hex(raw, true);
+        let decoded = decode_hex(&hex).unwrap();
+        assert_eq!(decoded, raw);
+
+        // String escape & unescape roundtrip
+        let unescaped = "Line 1\nLine 2\t\"Quotes\" & \\Backslashes\\ \u{1f980}";
+        let escaped = escape_str(unescaped);
+        let roundtrip = unescape_str(&escaped).unwrap();
+        assert_eq!(roundtrip, unescaped);
     }
 
     #[test]

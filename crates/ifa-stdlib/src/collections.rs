@@ -329,6 +329,26 @@ impl ByteBuffer {
         }
     }
 
+    /// Current allocated capacity in bytes.
+    pub fn capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    /// Reserve additional capacity for at least `additional` more bytes without redundant reallocations.
+    pub fn reserve(&mut self, additional: usize) {
+        self.bytes.reserve(additional);
+    }
+
+    /// Shrink capacity to fit current length.
+    pub fn shrink_to_fit(&mut self) {
+        self.bytes.shrink_to_fit();
+    }
+
+    /// Truncate buffer to specified length.
+    pub fn truncate(&mut self, new_len: usize) {
+        self.bytes.truncate(new_len);
+    }
+
     /// Length in bytes.
     pub fn len(&self) -> usize {
         self.bytes.len()
@@ -394,9 +414,54 @@ impl ByteBuffer {
         self.bytes.extend_from_slice(&val.to_be_bytes());
     }
 
+    /// Append a little-endian signed 16-bit integer.
+    pub fn write_i16_le(&mut self, val: i16) {
+        self.bytes.extend_from_slice(&val.to_le_bytes());
+    }
+
+    /// Append a big-endian signed 16-bit integer.
+    pub fn write_i16_be(&mut self, val: i16) {
+        self.bytes.extend_from_slice(&val.to_be_bytes());
+    }
+
+    /// Append a little-endian signed 32-bit integer.
+    pub fn write_i32_le(&mut self, val: i32) {
+        self.bytes.extend_from_slice(&val.to_le_bytes());
+    }
+
+    /// Append a big-endian signed 32-bit integer.
+    pub fn write_i32_be(&mut self, val: i32) {
+        self.bytes.extend_from_slice(&val.to_be_bytes());
+    }
+
     /// Append a little-endian signed 64-bit integer.
     pub fn write_i64_le(&mut self, val: i64) {
         self.bytes.extend_from_slice(&val.to_le_bytes());
+    }
+
+    /// Append a big-endian signed 64-bit integer.
+    pub fn write_i64_be(&mut self, val: i64) {
+        self.bytes.extend_from_slice(&val.to_be_bytes());
+    }
+
+    /// Append a little-endian 32-bit float.
+    pub fn write_f32_le(&mut self, val: f32) {
+        self.bytes.extend_from_slice(&val.to_le_bytes());
+    }
+
+    /// Append a big-endian 32-bit float.
+    pub fn write_f32_be(&mut self, val: f32) {
+        self.bytes.extend_from_slice(&val.to_be_bytes());
+    }
+
+    /// Append a little-endian 64-bit float.
+    pub fn write_f64_le(&mut self, val: f64) {
+        self.bytes.extend_from_slice(&val.to_le_bytes());
+    }
+
+    /// Append a big-endian 64-bit float.
+    pub fn write_f64_be(&mut self, val: f64) {
+        self.bytes.extend_from_slice(&val.to_be_bytes());
     }
 
     /// Append arbitrary byte slice.
@@ -414,11 +479,41 @@ impl ByteBuffer {
         self.bytes.get(offset).copied()
     }
 
+    /// Read little-endian u16 at offset.
+    pub fn read_u16_le(&self, offset: usize) -> Option<u16> {
+        if offset + 2 <= self.bytes.len() {
+            let slice: [u8; 2] = self.bytes[offset..offset + 2].try_into().ok()?;
+            Some(u16::from_le_bytes(slice))
+        } else {
+            None
+        }
+    }
+
+    /// Read big-endian u16 at offset.
+    pub fn read_u16_be(&self, offset: usize) -> Option<u16> {
+        if offset + 2 <= self.bytes.len() {
+            let slice: [u8; 2] = self.bytes[offset..offset + 2].try_into().ok()?;
+            Some(u16::from_be_bytes(slice))
+        } else {
+            None
+        }
+    }
+
     /// Read little-endian u32 at offset.
     pub fn read_u32_le(&self, offset: usize) -> Option<u32> {
         if offset + 4 <= self.bytes.len() {
             let slice: [u8; 4] = self.bytes[offset..offset + 4].try_into().ok()?;
             Some(u32::from_le_bytes(slice))
+        } else {
+            None
+        }
+    }
+
+    /// Read big-endian u32 at offset.
+    pub fn read_u32_be(&self, offset: usize) -> Option<u32> {
+        if offset + 4 <= self.bytes.len() {
+            let slice: [u8; 4] = self.bytes[offset..offset + 4].try_into().ok()?;
+            Some(u32::from_be_bytes(slice))
         } else {
             None
         }
@@ -432,6 +527,78 @@ impl ByteBuffer {
         } else {
             None
         }
+    }
+
+    /// Read big-endian u64 at offset.
+    pub fn read_u64_be(&self, offset: usize) -> Option<u64> {
+        if offset + 8 <= self.bytes.len() {
+            let slice: [u8; 8] = self.bytes[offset..offset + 8].try_into().ok()?;
+            Some(u64::from_be_bytes(slice))
+        } else {
+            None
+        }
+    }
+
+    /// Read little-endian i32 at offset.
+    pub fn read_i32_le(&self, offset: usize) -> Option<i32> {
+        if offset + 4 <= self.bytes.len() {
+            let slice: [u8; 4] = self.bytes[offset..offset + 4].try_into().ok()?;
+            Some(i32::from_le_bytes(slice))
+        } else {
+            None
+        }
+    }
+
+    /// Read big-endian i32 at offset.
+    pub fn read_i32_be(&self, offset: usize) -> Option<i32> {
+        if offset + 4 <= self.bytes.len() {
+            let slice: [u8; 4] = self.bytes[offset..offset + 4].try_into().ok()?;
+            Some(i32::from_be_bytes(slice))
+        } else {
+            None
+        }
+    }
+
+    /// Read little-endian i64 at offset.
+    pub fn read_i64_le(&self, offset: usize) -> Option<i64> {
+        if offset + 8 <= self.bytes.len() {
+            let slice: [u8; 8] = self.bytes[offset..offset + 8].try_into().ok()?;
+            Some(i64::from_le_bytes(slice))
+        } else {
+            None
+        }
+    }
+
+    /// Read big-endian i64 at offset.
+    pub fn read_i64_be(&self, offset: usize) -> Option<i64> {
+        if offset + 8 <= self.bytes.len() {
+            let slice: [u8; 8] = self.bytes[offset..offset + 8].try_into().ok()?;
+            Some(i64::from_be_bytes(slice))
+        } else {
+            None
+        }
+    }
+
+    /// Read a sub-slice of bytes at offset with length.
+    pub fn read_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        if offset + len <= self.bytes.len() {
+            Some(&self.bytes[offset..offset + len])
+        } else {
+            None
+        }
+    }
+
+    /// Encode internal buffer as hexadecimal string.
+    pub fn to_hex(&self, uppercase: bool) -> String {
+        crate::fmt::encode_hex(&self.bytes, uppercase)
+    }
+
+    /// Decode and append hexadecimal string directly into the byte buffer.
+    pub fn write_hex_str(&mut self, hex: &str) -> Result<usize, crate::fmt::HexError> {
+        let decoded = crate::fmt::decode_hex(hex)?;
+        let count = decoded.len();
+        self.bytes.extend(decoded);
+        Ok(count)
     }
 }
 
@@ -460,6 +627,31 @@ impl StringBuilder {
             indent_level: 0,
             indent_unit: "    ".to_string(),
         }
+    }
+
+    /// Current allocated capacity of the internal buffer.
+    pub fn capacity(&self) -> usize {
+        self.buffer.capacity()
+    }
+
+    /// Reserve additional space for at least `additional` more bytes without redundant reallocations.
+    pub fn reserve(&mut self, additional: usize) {
+        self.buffer.reserve(additional);
+    }
+
+    /// Shrink string capacity to match its current length.
+    pub fn shrink_to_fit(&mut self) {
+        self.buffer.shrink_to_fit();
+    }
+
+    /// Truncate string to specified byte length.
+    pub fn truncate(&mut self, new_len: usize) {
+        self.buffer.truncate(new_len);
+    }
+
+    /// Remove the last character from buffer and return it, if any.
+    pub fn pop(&mut self) -> Option<char> {
+        self.buffer.pop()
     }
 
     /// Number of bytes in buffer.
@@ -531,6 +723,72 @@ impl StringBuilder {
         self.buffer.push('\n');
     }
 
+    /// Repeat and append a string `count` times without intermediary allocations.
+    pub fn push_repeat(&mut self, s: &str, count: usize) {
+        self.buffer.reserve(s.len() * count);
+        for _ in 0..count {
+            self.buffer.push_str(s);
+        }
+    }
+
+    /// Append binary representation of integer.
+    pub fn push_binary(&mut self, val: u64, prefix: bool) {
+        let _ = crate::fmt::write_binary(self, val, prefix);
+    }
+
+    /// Append octal representation of integer.
+    pub fn push_octal(&mut self, val: u64, prefix: bool) {
+        let _ = crate::fmt::write_octal(self, val, prefix);
+    }
+
+    /// Append float formatted with decimal precision.
+    pub fn push_float(&mut self, val: f64, precision: usize) {
+        let _ = crate::fmt::write_float_prec(self, val, precision);
+    }
+
+    /// Append raw byte slice encoded as hexadecimal.
+    pub fn push_hex_bytes(&mut self, bytes: &[u8], uppercase: bool) {
+        let _ = crate::fmt::write_hex_bytes(self, bytes, uppercase);
+    }
+
+    /// Append text formatted with field alignment and fill character.
+    pub fn push_aligned(
+        &mut self,
+        s: &str,
+        width: usize,
+        alignment: crate::fmt::Alignment,
+        pad_char: char,
+    ) {
+        let _ = crate::fmt::write_aligned(self, s, width, alignment, pad_char);
+    }
+
+    /// Append multiple lines indented with the current indentation level.
+    pub fn push_indent_lines(&mut self, text: &str) {
+        for line in text.lines() {
+            self.push_line(line);
+        }
+    }
+
+    /// Access inner string as byte slice.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.buffer.as_bytes()
+    }
+
+    /// Check if builder starts with given prefix.
+    pub fn starts_with(&self, pat: &str) -> bool {
+        self.buffer.starts_with(pat)
+    }
+
+    /// Check if builder ends with given suffix.
+    pub fn ends_with(&self, pat: &str) -> bool {
+        self.buffer.ends_with(pat)
+    }
+
+    /// Check if builder contains given substring pattern.
+    pub fn contains(&self, pat: &str) -> bool {
+        self.buffer.contains(pat)
+    }
+
     /// Access inner string as slice.
     pub fn as_str(&self) -> &str {
         &self.buffer
@@ -539,6 +797,23 @@ impl StringBuilder {
     /// Consume builder and return constructed string.
     pub fn into_string(self) -> String {
         self.buffer
+    }
+
+    /// Consume builder and return underlying byte vector without extra allocation.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.buffer.into_bytes()
+    }
+}
+
+impl fmt::Write for StringBuilder {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.buffer.push_str(s);
+        Ok(())
+    }
+
+    fn write_char(&mut self, c: char) -> fmt::Result {
+        self.buffer.push(c);
+        Ok(())
     }
 }
 
