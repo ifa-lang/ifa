@@ -4970,3 +4970,29 @@ fn test_unary_inout_on_rvalue_rejected() {
         res.diagnostics
     );
 }
+
+#[test]
+fn test_std_sys_module_semantic_analysis() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sys_path = manifest_dir.join("../../std/sys.ifa");
+    let sys_code = std::fs::read_to_string(&sys_path).expect("std/sys.ifa must exist");
+    let res = run_analysis(&sys_code);
+    assert!(
+        !res.has_errors(),
+        "std/sys.ifa semantic analysis should succeed without error: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn test_std_process_module_semantic_analysis() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let proc_path = manifest_dir.join("../../std/process.ifa");
+    let proc_code = std::fs::read_to_string(&proc_path).expect("std/process.ifa must exist");
+    let res = run_analysis(&proc_code);
+    assert!(
+        !res.has_errors(),
+        "std/process.ifa semantic analysis should succeed without error: {:?}",
+        res.diagnostics
+    );
+}

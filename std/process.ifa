@@ -47,6 +47,50 @@ pub fn process_exec_with_stdin(cmd: String, args: String, stdin_str: String) -> 
     return exec_with_stdin(cmd, args, stdin_str);
 }
 
+pub struct ProcessAuditSnapshot {
+    exit_code: i64,
+    cpu_time_ns: i64,
+    max_rss_bytes: i64
+}
+
+pub struct ProcessOutputAudit {
+    stdout: String,
+    cpu_time_ns: i64,
+    max_rss_bytes: i64
+}
+
+pub fn process_exec_audited(cmd: String, args: String) -> ProcessAuditSnapshot {
+    let t0 = sys_cpu_time_ns();
+    let code = exec(cmd, args);
+    let t1 = sys_cpu_time_ns();
+    let rss = sys_max_rss();
+    mut delta_t = t1 - t0;
+    if delta_t < 0 {
+        delta_t = 0;
+    }
+    return ProcessAuditSnapshot(
+        exit_code: code,
+        cpu_time_ns: delta_t,
+        max_rss_bytes: rss
+    );
+}
+
+pub fn process_exec_output_audited(cmd: String, args: String) -> ProcessOutputAudit {
+    let t0 = sys_cpu_time_ns();
+    let out = exec_output(cmd, args);
+    let t1 = sys_cpu_time_ns();
+    let rss = sys_max_rss();
+    mut delta_t = t1 - t0;
+    if delta_t < 0 {
+        delta_t = 0;
+    }
+    return ProcessOutputAudit(
+        stdout: out,
+        cpu_time_ns: delta_t,
+        max_rss_bytes: rss
+    );
+}
+
 pub fn process_find_linker() -> String {
     return find_linker();
 }
@@ -144,6 +188,14 @@ pub fn test_process_cwd() -> bool {
     return string_len(cwd) > 0;
 }
 
+pub fn test_process_audit() -> bool {
+    let audit = process_exec_audited("echo", "IFA_AUDIT_OK");
+    let is_ok = audit.exit_code == 0;
+    let out_audit = process_exec_output_audited("echo", "IFA_OUT_AUDIT");
+    let out_len = string_len(out_audit.stdout);
+    return is_ok && (out_len >= 13) && (audit.max_rss_bytes >= 0);
+}
+
 pub fn test_process_all() -> bool {
     let t1 = test_process_find_linker();
     let t2 = test_process_find_tool();
@@ -151,7 +203,8 @@ pub fn test_process_all() -> bool {
     let t4 = test_process_build_assembler_command();
     let t5 = test_process_echo();
     let t6 = test_process_cwd();
-    return t1 && t2 && t3 && t4 && t5 && t6;
+    let t7 = test_process_audit();
+    return t1 && t2 && t3 && t4 && t5 && t6 && t7;
 }
 
 pub fn main() {

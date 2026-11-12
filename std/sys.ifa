@@ -122,3 +122,44 @@ pub fn sys_format_summary(snapshot: SysResourceSnapshot) -> String {
     res = res + sys_format_duration_ms(snapshot.cpu_time_ns);
     return res;
 }
+
+// ---------------------------------------------------------------------------
+// 4. Automated Test Suites for std/sys
+// ---------------------------------------------------------------------------
+
+pub fn test_sys_primitives() -> bool {
+    let cores = sys_get_cpu_count();
+    let max_rss = sys_get_max_rss();
+    let res = sys_get_memory_resident();
+    let virt = sys_get_memory_virtual();
+    let cpu_ns = sys_get_cpu_time_ns();
+    return (cores >= 1) && (max_rss >= 0) && (res >= 0) && (virt >= 0) && (cpu_ns >= 0);
+}
+
+pub fn test_sys_snapshot() -> bool {
+    let snap = sys_snapshot();
+    let s = sys_format_summary(snap);
+    return (snap.cpu_count >= 1) && (string_len(s) > 10);
+}
+
+pub fn test_sys_formatting() -> bool {
+    let b1 = sys_format_bytes(512);
+    let b2 = sys_format_bytes(2048);
+    let d1 = sys_format_duration_ms(5000000);
+    return (b1 == "512 B") && (b2 == "2 KiB") && (d1 == "5 ms");
+}
+
+pub fn test_sys_all() -> bool {
+    let t1 = test_sys_primitives();
+    let t2 = test_sys_snapshot();
+    let t3 = test_sys_formatting();
+    return t1 && t2 && t3;
+}
+
+pub fn main() {
+    if test_sys_all() {
+        println("std/sys: ALL TESTS PASSED");
+    } else {
+        println("std/sys: TESTS FAILED");
+    }
+}

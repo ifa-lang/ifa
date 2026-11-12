@@ -13,6 +13,7 @@ import fmt;
 import csv;
 import io;
 import db;
+import sys;
 
 pub fn test_std_all() -> bool {
     let t_crypto = crypto::test_crypto_all();
@@ -36,7 +37,8 @@ pub fn test_std_all() -> bool {
         && process::test_process_build_linker_command()
         && process::test_process_build_assembler_command()
         && process::test_process_echo()
-        && process::test_process_cwd();
+        && process::test_process_cwd()
+        && process::test_process_audit();
 
     let t_collections = collections::test_collections_list()
         && collections::test_collections_map()
@@ -64,6 +66,8 @@ pub fn test_std_all() -> bool {
 
     let t_db = db::test_db_all();
 
+    let t_sys = sys::test_sys_all();
+
     return t_crypto
         && t_fs
         && t_process
@@ -75,7 +79,8 @@ pub fn test_std_all() -> bool {
         && t_fmt
         && t_csv
         && t_io
-        && t_db;
+        && t_db
+        && t_sys;
 }
 
 pub fn main() {
