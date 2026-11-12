@@ -123,6 +123,9 @@ enum Commands {
         /// Compile and run in release mode
         #[arg(short, long)]
         release: bool,
+        /// Display execution resource telemetry audit summary
+        #[arg(long)]
+        telemetry: bool,
         /// Optional trailing arguments passed directly to the program
         #[arg(last = true)]
         args: Vec<String>,
@@ -806,6 +809,7 @@ fn main() -> ExitCode {
             file,
             native,
             release,
+            telemetry,
             args,
         } => {
             let manifest_dir = if let Some(ref f) = file {
@@ -834,7 +838,10 @@ fn main() -> ExitCode {
                                 let mut cmd = Command::new(&exe_art.path);
                                 cmd.args(&args);
                                 match ifa_runtime::supervise_command(&mut cmd) {
-                                    Ok((s, _telemetry)) => {
+                                    Ok((s, telem)) => {
+                                        if telemetry {
+                                            println!("[telemetry] {}", telem.format_summary());
+                                        }
                                         return if s.success() {
                                             ExitCode::SUCCESS
                                         } else {
@@ -862,6 +869,12 @@ fn main() -> ExitCode {
                     }
                 }
             }
+
+            let audit_scope = if telemetry {
+                Some(ifa_runtime::ResourceAuditScope::start())
+            } else {
+                None
+            };
 
             let target_file = match file {
                 Some(f) => f,
@@ -929,6 +942,9 @@ fn main() -> ExitCode {
                         match jit.run_main() {
                             Ok(code) => {
                                 println!("Program finished with native exit code: {}", code);
+                                if let Some(ref scope) = audit_scope {
+                                    println!("[telemetry] {}", scope.finish().format_summary());
+                                }
                                 ExitCode::SUCCESS
                             }
                             Err(e) => {
@@ -948,6 +964,9 @@ fn main() -> ExitCode {
                     Ok(val) => {
                         if val != ifa_fir::FirValue::Unit {
                             println!("Program finished with result: {}", val);
+                        }
+                        if let Some(ref scope) = audit_scope {
+                            println!("[telemetry] {}", scope.finish().format_summary());
                         }
                         ExitCode::SUCCESS
                     }

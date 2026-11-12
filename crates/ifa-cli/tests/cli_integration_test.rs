@@ -716,3 +716,150 @@ pub fn main() -> i64 {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_cli_supervised_resource_usage_telemetry() {
+    let ifa_bin = get_ifa_binary();
+    let temp_dir =
+        std::env::temp_dir().join(format!("ifa_cli_telemetry_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(temp_dir.join("src")).unwrap();
+
+    let manifest_content = r#"[package]
+name = "telemetry_demo"
+version = "0.1.0"
+edition = "2026"
+authors = ["ASSOGBA Prudence Dieudonné <jprud67@gmail.com>"]
+license = "MIT"
+description = "Supervised resource usage telemetry end-to-end verification"
+"#;
+    fs::write(temp_dir.join("kori.toml"), manifest_content).unwrap();
+
+    let main_source = r#"pub fn main() -> i64 {
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 1000 {
+        sum = sum + i;
+        i = i + 1;
+    }
+    return 0;
+}
+"#;
+    let main_file = temp_dir.join("src/main.ifa");
+    fs::write(&main_file, main_source).unwrap();
+
+    // 1. End-to-end `ifa check` with package ResourceUsage telemetry audit
+    let check_output = Command::new(&ifa_bin)
+        .arg("check")
+        .current_dir(&temp_dir)
+        .output()
+        .expect("Failed to execute `ifa check`");
+    assert!(
+        check_output.status.success(),
+        "ifa check failed: {}",
+        String::from_utf8_lossy(&check_output.stderr)
+    );
+    let check_stdout = String::from_utf8_lossy(&check_output.stdout);
+    assert!(
+        check_stdout.contains("Checked package `telemetry_demo`"),
+        "Missing package check header: {}",
+        check_stdout
+    );
+    assert!(
+        check_stdout.contains("wall:")
+            && check_stdout.contains("peak rss:")
+            && check_stdout.contains("cores:"),
+        "Missing telemetry metrics in ifa check output: {}",
+        check_stdout
+    );
+
+    // 2. End-to-end `ifa build` with package ResourceUsage telemetry audit
+    let build_output = Command::new(&ifa_bin)
+        .arg("build")
+        .current_dir(&temp_dir)
+        .output()
+        .expect("Failed to execute `ifa build`");
+    assert!(
+        build_output.status.success(),
+        "ifa build failed: {}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+    let build_stdout = String::from_utf8_lossy(&build_output.stdout);
+    assert!(
+        build_stdout.contains("Finished dev build"),
+        "Missing build summary: {}",
+        build_stdout
+    );
+    assert!(
+        build_stdout.contains("peak rss:") && build_stdout.contains("cores:"),
+        "Missing telemetry metrics in ifa build output: {}",
+        build_stdout
+    );
+
+    // 3. End-to-end `ifa run --telemetry` on supervised package executable
+    let run_pkg_output = Command::new(&ifa_bin)
+        .arg("run")
+        .arg("--telemetry")
+        .current_dir(&temp_dir)
+        .output()
+        .expect("Failed to execute `ifa run --telemetry`");
+    assert!(
+        run_pkg_output.status.success(),
+        "ifa run --telemetry on package failed: {}",
+        String::from_utf8_lossy(&run_pkg_output.stderr)
+    );
+    let run_pkg_stdout = String::from_utf8_lossy(&run_pkg_output.stdout);
+    assert!(
+        run_pkg_stdout.contains("[telemetry]")
+            && run_pkg_stdout.contains("wall:")
+            && run_pkg_stdout.contains("peak rss:")
+            && run_pkg_stdout.contains("cores:"),
+        "Missing telemetry audit header in ifa run output: {}",
+        run_pkg_stdout
+    );
+
+    // 4. End-to-end `ifa run --telemetry` on single file (FIR interpreter)
+    let run_interp_output = Command::new(&ifa_bin)
+        .arg("run")
+        .arg("--telemetry")
+        .arg(&main_file)
+        .output()
+        .expect("Failed to execute `ifa run --telemetry <file>`");
+    assert!(
+        run_interp_output.status.success(),
+        "ifa run --telemetry file failed: {}",
+        String::from_utf8_lossy(&run_interp_output.stderr)
+    );
+    let run_interp_stdout = String::from_utf8_lossy(&run_interp_output.stdout);
+    assert!(
+        run_interp_stdout.contains("[telemetry]")
+            && run_interp_stdout.contains("peak rss:")
+            && run_interp_stdout.contains("cores:"),
+        "Missing telemetry audit in interp output: {}",
+        run_interp_stdout
+    );
+
+    // 5. End-to-end `ifa run --telemetry --native` on single file (Cranelift JIT)
+    let run_jit_output = Command::new(&ifa_bin)
+        .arg("run")
+        .arg("--telemetry")
+        .arg("--native")
+        .arg(&main_file)
+        .output()
+        .expect("Failed to execute `ifa run --telemetry --native <file>`");
+    assert!(
+        run_jit_output.status.success(),
+        "ifa run --telemetry --native file failed: {}",
+        String::from_utf8_lossy(&run_jit_output.stderr)
+    );
+    let run_jit_stdout = String::from_utf8_lossy(&run_jit_output.stdout);
+    assert!(
+        run_jit_stdout.contains("[telemetry]")
+            && run_jit_stdout.contains("peak rss:")
+            && run_jit_stdout.contains("cores:"),
+        "Missing telemetry audit in JIT output: {}",
+        run_jit_stdout
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
