@@ -55,7 +55,8 @@ pub use http::{
 };
 pub use io::{
     copy_stream, pipe_lines, read_to_end as io_read_to_end, read_to_string as io_read_to_string,
-    BufferedReader, BufferedWriter, MemoryStream,
+    BufferedReader, BufferedWriter, ChainedReader, CountingReader, CountingWriter, LimitedReader,
+    LineWriter, MemoryStream,
 };
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};
 pub use json::{

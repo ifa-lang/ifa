@@ -72,6 +72,22 @@ impl<R: Read> BufferedReader<R> {
     }
 }
 
+impl<R: Read> Read for BufferedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<R: Read> BufRead for BufferedReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+    }
+}
+
 /// Buffered writer wrapper providing batch flushing.
 pub struct BufferedWriter<W: Write> {
     inner: BufWriter<W>,
@@ -110,6 +126,76 @@ impl<W: Write> BufferedWriter<W> {
     pub fn into_inner(mut self) -> io::Result<W> {
         self.inner.flush()?;
         self.inner.into_inner().map_err(|e| e.into_error())
+    }
+}
+
+impl<W: Write> Write for BufferedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Line-buffered writer wrapper that automatically flushes when a newline is written.
+pub struct LineWriter<W: Write> {
+    inner: BufWriter<W>,
+}
+
+impl<W: Write> LineWriter<W> {
+    /// Create a new line-buffered writer.
+    pub fn new(writer: W) -> Self {
+        Self {
+            inner: BufWriter::new(writer),
+        }
+    }
+
+    /// Write byte slice and flush if it contains a newline.
+    pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        if buf[..n].contains(&b'\n') {
+            self.inner.flush()?;
+        }
+        Ok(n)
+    }
+
+    /// Write all bytes and flush if it contains a newline.
+    pub fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.inner.write_all(buf)?;
+        if buf.contains(&b'\n') {
+            self.inner.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Write a string slice followed by a newline and flush.
+    pub fn write_line(&mut self, line: &str) -> io::Result<()> {
+        self.inner.write_all(line.as_bytes())?;
+        self.inner.write_all(b"\n")?;
+        self.inner.flush()
+    }
+
+    /// Explicitly flush internal buffer.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+
+    /// Unwrap inner writer after flushing.
+    pub fn into_inner(mut self) -> io::Result<W> {
+        self.inner.flush()?;
+        self.inner.into_inner().map_err(|e| e.into_error())
+    }
+}
+
+impl<W: Write> Write for LineWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush()
     }
 }
 
@@ -218,6 +304,100 @@ impl MemoryStream {
         self.buffer[self.position..self.position + bytes.len()].copy_from_slice(bytes);
         self.position += bytes.len();
     }
+
+    /// Read exactly `len` bytes from the current position or return UnexpectedEof.
+    pub fn read_exact_bytes(&mut self, len: usize) -> io::Result<Vec<u8>> {
+        if self.position + len > self.buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Unexpected end of memory stream",
+            ));
+        }
+        let slice = self.buffer[self.position..self.position + len].to_vec();
+        self.position += len;
+        Ok(slice)
+    }
+
+    /// Write an unsigned 8-bit integer.
+    pub fn write_u8(&mut self, val: u8) {
+        self.write_bytes(&[val]);
+    }
+
+    /// Write a 16-bit unsigned integer in big-endian byte order.
+    pub fn write_u16_be(&mut self, val: u16) {
+        self.write_bytes(&val.to_be_bytes());
+    }
+
+    /// Write a 16-bit unsigned integer in little-endian byte order.
+    pub fn write_u16_le(&mut self, val: u16) {
+        self.write_bytes(&val.to_le_bytes());
+    }
+
+    /// Write a 32-bit unsigned integer in big-endian byte order.
+    pub fn write_u32_be(&mut self, val: u32) {
+        self.write_bytes(&val.to_be_bytes());
+    }
+
+    /// Write a 32-bit unsigned integer in little-endian byte order.
+    pub fn write_u32_le(&mut self, val: u32) {
+        self.write_bytes(&val.to_le_bytes());
+    }
+
+    /// Write a 64-bit unsigned integer in big-endian byte order.
+    pub fn write_u64_be(&mut self, val: u64) {
+        self.write_bytes(&val.to_be_bytes());
+    }
+
+    /// Write a 64-bit unsigned integer in little-endian byte order.
+    pub fn write_u64_le(&mut self, val: u64) {
+        self.write_bytes(&val.to_le_bytes());
+    }
+
+    /// Read an unsigned 8-bit integer.
+    pub fn read_u8(&mut self) -> io::Result<u8> {
+        let b = self.read_exact_bytes(1)?;
+        Ok(b[0])
+    }
+
+    /// Read a 16-bit unsigned integer in big-endian byte order.
+    pub fn read_u16_be(&mut self) -> io::Result<u16> {
+        let b = self.read_exact_bytes(2)?;
+        Ok(u16::from_be_bytes([b[0], b[1]]))
+    }
+
+    /// Read a 16-bit unsigned integer in little-endian byte order.
+    pub fn read_u16_le(&mut self) -> io::Result<u16> {
+        let b = self.read_exact_bytes(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    /// Read a 32-bit unsigned integer in big-endian byte order.
+    pub fn read_u32_be(&mut self) -> io::Result<u32> {
+        let b = self.read_exact_bytes(4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// Read a 32-bit unsigned integer in little-endian byte order.
+    pub fn read_u32_le(&mut self) -> io::Result<u32> {
+        let b = self.read_exact_bytes(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// Read a 64-bit unsigned integer in big-endian byte order.
+    pub fn read_u64_be(&mut self) -> io::Result<u64> {
+        let b = self.read_exact_bytes(8)?;
+        Ok(u64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    /// Read a 64-bit unsigned integer in little-endian byte order.
+    pub fn read_u64_le(&mut self) -> io::Result<u64> {
+        let b = self.read_exact_bytes(8)?;
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
 }
 
 impl Read for MemoryStream {
@@ -310,4 +490,369 @@ pub fn pipe_lines<R: Read, W: Write>(
     }
     writer.flush()?;
     Ok(count)
+}
+
+/// Reader wrapper that counts the total number of bytes read.
+pub struct CountingReader<R: Read> {
+    inner: R,
+    bytes_read: u64,
+}
+
+impl<R: Read> CountingReader<R> {
+    /// Create a new counting reader starting at 0 bytes.
+    pub fn new(reader: R) -> Self {
+        Self {
+            inner: reader,
+            bytes_read: 0,
+        }
+    }
+
+    /// Total number of bytes successfully read so far.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Reset the byte counter to zero.
+    pub fn reset_count(&mut self) {
+        self.bytes_read = 0;
+    }
+
+    /// Borrow the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Mutably borrow the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes_read += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: BufRead> BufRead for CountingReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+        self.bytes_read += amt as u64;
+    }
+}
+
+/// Writer wrapper that counts the total number of bytes written.
+pub struct CountingWriter<W: Write> {
+    inner: W,
+    bytes_written: u64,
+}
+
+impl<W: Write> CountingWriter<W> {
+    /// Create a new counting writer starting at 0 bytes.
+    pub fn new(writer: W) -> Self {
+        Self {
+            inner: writer,
+            bytes_written: 0,
+        }
+    }
+
+    /// Total number of bytes successfully written so far.
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    /// Reset the byte counter to zero.
+    pub fn reset_count(&mut self) {
+        self.bytes_written = 0;
+    }
+
+    /// Borrow the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Mutably borrow the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.bytes_written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Reader wrapper that reads at most `limit` bytes from the underlying reader.
+pub struct LimitedReader<R: Read> {
+    inner: R,
+    limit: u64,
+}
+
+impl<R: Read> LimitedReader<R> {
+    /// Create a new reader with an upper limit of `limit` bytes.
+    pub fn new(reader: R, limit: u64) -> Self {
+        Self {
+            inner: reader,
+            limit,
+        }
+    }
+
+    /// Remaining allowed byte count before reaching EOF.
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// Set a new limit for remaining bytes.
+    pub fn set_limit(&mut self, limit: u64) {
+        self.limit = limit;
+    }
+
+    /// Borrow the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Mutably borrow the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.limit == 0 {
+            return Ok(0);
+        }
+        let max_read = (buf.len() as u64).min(self.limit) as usize;
+        let n = self.inner.read(&mut buf[..max_read])?;
+        self.limit -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Reader that sequentially chains two readers together.
+pub struct ChainedReader<R1: Read, R2: Read> {
+    first: Option<R1>,
+    second: R2,
+}
+
+impl<R1: Read, R2: Read> ChainedReader<R1, R2> {
+    /// Create a chained reader yielding bytes from `first` then `second`.
+    pub fn new(first: R1, second: R2) -> Self {
+        Self {
+            first: Some(first),
+            second,
+        }
+    }
+
+    /// Borrow the second reader.
+    pub fn get_second(&self) -> &R2 {
+        &self.second
+    }
+
+    /// Mutably borrow the second reader.
+    pub fn get_second_mut(&mut self) -> &mut R2 {
+        &mut self.second
+    }
+}
+
+impl<R1: Read, R2: Read> Read for ChainedReader<R1, R2> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(first) = &mut self.first {
+            let n = first.read(buf)?;
+            if n > 0 || buf.is_empty() {
+                return Ok(n);
+            }
+            self.first = None;
+        }
+        self.second.read(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_memory_stream_basic_read_write() {
+        let mut stream = MemoryStream::new();
+        assert!(stream.is_empty());
+        assert_eq!(stream.len(), 0);
+        assert_eq!(stream.position(), 0);
+
+        stream.write_bytes(b"hello world");
+        assert_eq!(stream.len(), 11);
+        assert_eq!(stream.position(), 11);
+        assert_eq!(stream.as_bytes(), b"hello world");
+
+        stream.set_position(0);
+        assert_eq!(stream.position(), 0);
+
+        let data = stream.read_bytes(5);
+        assert_eq!(data, b"hello");
+        assert_eq!(stream.position(), 5);
+
+        let remaining = stream.read_bytes(100);
+        assert_eq!(remaining, b" world");
+        assert_eq!(stream.position(), 11);
+
+        // seek
+        stream.seek(SeekFrom::Start(6)).expect("seek start");
+        assert_eq!(stream.position(), 6);
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).expect("read exact");
+        assert_eq!(&buf, b"world");
+
+        // truncate & clear
+        stream.truncate(5);
+        assert_eq!(stream.len(), 5);
+        assert_eq!(stream.as_bytes(), b"hello");
+        stream.clear();
+        assert!(stream.is_empty());
+    }
+
+    #[test]
+    fn test_memory_stream_binary_endian() {
+        let mut stream = MemoryStream::new();
+        stream.write_u8(0x42);
+        stream.write_u16_be(0x1234);
+        stream.write_u16_le(0x1234);
+        stream.write_u32_be(0xAABBCCDD);
+        stream.write_u32_le(0xAABBCCDD);
+        stream.write_u64_be(0x0102030405060708);
+        stream.write_u64_le(0x0102030405060708);
+
+        stream.set_position(0);
+        assert_eq!(stream.read_u8().unwrap(), 0x42);
+        assert_eq!(stream.read_u16_be().unwrap(), 0x1234);
+        assert_eq!(stream.read_u16_le().unwrap(), 0x1234);
+        assert_eq!(stream.read_u32_be().unwrap(), 0xAABBCCDD);
+        assert_eq!(stream.read_u32_le().unwrap(), 0xAABBCCDD);
+        assert_eq!(stream.read_u64_be().unwrap(), 0x0102030405060708);
+        assert_eq!(stream.read_u64_le().unwrap(), 0x0102030405060708);
+
+        // UnexpectedEof test
+        assert!(stream.read_u8().is_err());
+    }
+
+    #[test]
+    fn test_buffered_reader_and_writer() {
+        let source = b"line 1\nline 2\r\nline 3";
+        let mut reader = BufferedReader::new(&source[..]);
+
+        assert_eq!(reader.read_line().unwrap(), Some("line 1".to_string()));
+        assert_eq!(reader.read_line().unwrap(), Some("line 2".to_string()));
+        assert_eq!(reader.read_line().unwrap(), Some("line 3".to_string()));
+        assert_eq!(reader.read_line().unwrap(), None);
+
+        let mut output = Vec::new();
+        {
+            let mut writer = BufferedWriter::new(&mut output);
+            writer.write_line("first").unwrap();
+            writer.write_line("second").unwrap();
+            writer.flush().unwrap();
+        }
+        assert_eq!(output, b"first\nsecond\n");
+    }
+
+    #[test]
+    fn test_line_writer() {
+        let mut output = Vec::new();
+        {
+            let mut line_writer = LineWriter::new(&mut output);
+            line_writer.write_all(b"partial ").unwrap();
+            line_writer.write_line("done").unwrap();
+        }
+        assert_eq!(output, b"partial done\n");
+    }
+
+    #[test]
+    fn test_counting_reader_and_writer() {
+        let data = b"The quick brown fox jumps over the lazy dog";
+        let mut cr = CountingReader::new(&data[..]);
+        let mut buf = [0u8; 10];
+        let n1 = cr.read(&mut buf).unwrap();
+        assert_eq!(n1, 10);
+        assert_eq!(cr.bytes_read(), 10);
+
+        let mut rem = Vec::new();
+        let n2 = cr.read_to_end(&mut rem).unwrap();
+        assert_eq!(n2, data.len() - 10);
+        assert_eq!(cr.bytes_read(), data.len() as u64);
+
+        let mut dest = Vec::new();
+        {
+            let mut cw = CountingWriter::new(&mut dest);
+            cw.write_all(b"hello").unwrap();
+            assert_eq!(cw.bytes_written(), 5);
+            cw.write_all(b" world").unwrap();
+            assert_eq!(cw.bytes_written(), 11);
+            cw.flush().unwrap();
+        }
+        assert_eq!(dest, b"hello world");
+    }
+
+    #[test]
+    fn test_limited_and_chained_reader() {
+        let data = b"0123456789abcdef";
+        let mut limited = LimitedReader::new(&data[..], 8);
+        let mut read_buf = Vec::new();
+        limited.read_to_end(&mut read_buf).unwrap();
+        assert_eq!(read_buf, b"01234567");
+        assert_eq!(limited.limit(), 0);
+
+        let part1 = b"abc";
+        let part2 = b"def";
+        let mut chained = ChainedReader::new(&part1[..], &part2[..]);
+        let mut chained_buf = Vec::new();
+        chained.read_to_end(&mut chained_buf).unwrap();
+        assert_eq!(chained_buf, b"abcdef");
+    }
+
+    #[test]
+    fn test_pipe_and_copy_helpers() {
+        let input = b"alpha\nbeta\ngamma\n";
+        let mut reader = BufferedReader::new(&input[..]);
+        let mut dest = Vec::new();
+        {
+            let mut writer = BufferedWriter::new(&mut dest);
+            let count = pipe_lines(&mut reader, &mut writer).unwrap();
+            assert_eq!(count, 3);
+        }
+        assert_eq!(dest, b"alpha\nbeta\ngamma\n");
+
+        let mut mem_src = MemoryStream::from_bytes(b"stream copy test");
+        let mut mem_dst = MemoryStream::new();
+        let copied = copy_stream(&mut mem_src, &mut mem_dst).unwrap();
+        assert_eq!(copied, 16);
+        assert_eq!(mem_dst.as_bytes(), b"stream copy test");
+    }
 }
