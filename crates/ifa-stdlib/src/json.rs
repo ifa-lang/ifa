@@ -195,6 +195,193 @@ impl JsonValue {
             }
         }
     }
+
+    /// Retrieve a reference to the value at the given RFC 6901 JSON Pointer.
+    pub fn pointer(&self, ptr: &str) -> Option<&JsonValue> {
+        let tokens = split_pointer(ptr).ok()?;
+        let mut curr = self;
+        for token in tokens {
+            match curr {
+                JsonValue::Object(map) => {
+                    curr = map.get(&token)?;
+                }
+                JsonValue::Array(arr) => {
+                    if token.len() > 1 && token.starts_with('0') {
+                        return None;
+                    }
+                    let idx: usize = token.parse().ok()?;
+                    curr = arr.get(idx)?;
+                }
+                _ => return None,
+            }
+        }
+        Some(curr)
+    }
+
+    /// Retrieve a mutable reference to the value at the given RFC 6901 JSON Pointer.
+    pub fn pointer_mut(&mut self, ptr: &str) -> Option<&mut JsonValue> {
+        let tokens = split_pointer(ptr).ok()?;
+        let mut curr = self;
+        for token in tokens {
+            match curr {
+                JsonValue::Object(map) => {
+                    curr = map.get_mut(&token)?;
+                }
+                JsonValue::Array(arr) => {
+                    if token.len() > 1 && token.starts_with('0') {
+                        return None;
+                    }
+                    let idx: usize = token.parse().ok()?;
+                    curr = arr.get_mut(idx)?;
+                }
+                _ => return None,
+            }
+        }
+        Some(curr)
+    }
+
+    /// Set or insert a value at the specified RFC 6901 JSON Pointer.
+    pub fn set_pointer(&mut self, ptr: &str, val: JsonValue) -> Result<(), String> {
+        let tokens = split_pointer(ptr)?;
+        if tokens.is_empty() {
+            *self = val;
+            return Ok(());
+        }
+
+        let (last_token, parent_tokens) = tokens.split_last().unwrap();
+        let mut curr = self;
+        for (i, token) in parent_tokens.iter().enumerate() {
+            curr = match curr {
+                JsonValue::Object(map) => map
+                    .get_mut(token)
+                    .ok_or_else(|| format!("Segment '{}' not found at step {}", token, i))?,
+                JsonValue::Array(arr) => {
+                    if token.len() > 1 && token.starts_with('0') {
+                        return Err(format!("Invalid array index '{}' with leading zero", token));
+                    }
+                    let idx: usize = token
+                        .parse()
+                        .map_err(|_| format!("Invalid array index '{}'", token))?;
+                    let len = arr.len();
+                    arr.get_mut(idx)
+                        .ok_or_else(|| format!("Array index {} out of bounds (len {})", idx, len))?
+                }
+                _ => return Err(format!("Cannot traverse non-container at step {}", i)),
+            };
+        }
+
+        match curr {
+            JsonValue::Object(map) => {
+                map.insert(last_token.clone(), val);
+                Ok(())
+            }
+            JsonValue::Array(arr) => {
+                if last_token == "-" {
+                    arr.push(val);
+                    Ok(())
+                } else {
+                    if last_token.len() > 1 && last_token.starts_with('0') {
+                        return Err(format!(
+                            "Invalid array index '{}' with leading zero",
+                            last_token
+                        ));
+                    }
+                    let idx: usize = last_token
+                        .parse()
+                        .map_err(|_| format!("Invalid array index '{}'", last_token))?;
+                    if idx < arr.len() {
+                        arr[idx] = val;
+                        Ok(())
+                    } else if idx == arr.len() {
+                        arr.push(val);
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "Array index {} out of bounds for insertion (len {})",
+                            idx,
+                            arr.len()
+                        ))
+                    }
+                }
+            }
+            _ => Err("Target parent is not an Object or Array".to_string()),
+        }
+    }
+
+    /// Remove a value at the specified RFC 6901 JSON Pointer, returning the removed value if present.
+    pub fn delete_pointer(&mut self, ptr: &str) -> Result<Option<JsonValue>, String> {
+        let tokens = split_pointer(ptr)?;
+        if tokens.is_empty() {
+            let old = std::mem::replace(self, JsonValue::Null);
+            return Ok(Some(old));
+        }
+
+        let (last_token, parent_tokens) = tokens.split_last().unwrap();
+        let mut curr = self;
+        for (i, token) in parent_tokens.iter().enumerate() {
+            curr = match curr {
+                JsonValue::Object(map) => map
+                    .get_mut(token)
+                    .ok_or_else(|| format!("Segment '{}' not found at step {}", token, i))?,
+                JsonValue::Array(arr) => {
+                    if token.len() > 1 && token.starts_with('0') {
+                        return Err(format!("Invalid array index '{}' with leading zero", token));
+                    }
+                    let idx: usize = token
+                        .parse()
+                        .map_err(|_| format!("Invalid array index '{}'", token))?;
+                    let len = arr.len();
+                    arr.get_mut(idx)
+                        .ok_or_else(|| format!("Array index {} out of bounds (len {})", idx, len))?
+                }
+                _ => return Err(format!("Cannot traverse non-container at step {}", i)),
+            };
+        }
+
+        match curr {
+            JsonValue::Object(map) => Ok(map.remove(last_token)),
+            JsonValue::Array(arr) => {
+                if last_token.len() > 1 && last_token.starts_with('0') {
+                    return Err(format!(
+                        "Invalid array index '{}' with leading zero",
+                        last_token
+                    ));
+                }
+                let idx: usize = last_token
+                    .parse()
+                    .map_err(|_| format!("Invalid array index '{}'", last_token))?;
+                if idx < arr.len() {
+                    Ok(Some(arr.remove(idx)))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Err("Target parent is not an Object or Array".to_string()),
+        }
+    }
+}
+
+/// Decode a JSON Pointer reference token according to RFC 6901 (`~1` -> `/`, `~0` -> `~`).
+pub fn decode_pointer_token(token: &str) -> String {
+    token.replace("~1", "/").replace("~0", "~")
+}
+
+/// Encode a string as a JSON Pointer reference token according to RFC 6901 (`~` -> `~0`, `/` -> `~1`).
+pub fn encode_pointer_token(token: &str) -> String {
+    token.replace('~', "~0").replace('/', "~1")
+}
+
+fn split_pointer(ptr: &str) -> Result<Vec<String>, String> {
+    if ptr.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !ptr.starts_with('/') {
+        return Err(format!(
+            "Invalid JSON Pointer '{}': must start with '/'",
+            ptr
+        ));
+    }
+    Ok(ptr[1..].split('/').map(decode_pointer_token).collect())
 }
 
 impl fmt::Display for JsonValue {
@@ -625,5 +812,57 @@ mod tests {
         assert_eq!(flattened.get("server.tls").unwrap().as_bool(), Some(true));
         assert_eq!(flattened.get("env").unwrap().as_str(), Some("dev"));
         assert_eq!(flattened.get("debug").unwrap().as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_json_pointer_rfc6901() {
+        let raw = r#"{
+            "foo": ["bar", "baz"],
+            "": 0,
+            "a/b": 1,
+            "c%d": 2,
+            "e^f": 3,
+            "g|h": 4,
+            "i\\j": 5,
+            "k\"l": 6,
+            " ": 7,
+            "m~n": 8
+        }"#;
+
+        let mut doc = decode(raw).expect("decode rfc sample");
+
+        // Pointer lookup tests
+        assert_eq!(doc.pointer("").unwrap(), &doc);
+        assert_eq!(doc.pointer("/foo").unwrap().as_array().unwrap().len(), 2);
+        assert_eq!(doc.pointer("/foo/0").unwrap().as_str(), Some("bar"));
+        assert_eq!(doc.pointer("/foo/1").unwrap().as_str(), Some("baz"));
+        assert_eq!(doc.pointer("/foo/2"), None);
+        assert_eq!(doc.pointer("/").unwrap().as_i64(), Some(0));
+        assert_eq!(doc.pointer("/a~1b").unwrap().as_i64(), Some(1));
+        assert_eq!(doc.pointer("/c%d").unwrap().as_i64(), Some(2));
+        assert_eq!(doc.pointer("/m~0n").unwrap().as_i64(), Some(8));
+
+        // pointer_mut
+        if let Some(val) = doc.pointer_mut("/foo/0") {
+            *val = JsonValue::String("qux".to_string());
+        }
+        assert_eq!(doc.pointer("/foo/0").unwrap().as_str(), Some("qux"));
+
+        // set_pointer on array end with '-'
+        assert!(doc
+            .set_pointer("/foo/-", JsonValue::String("tail".to_string()))
+            .is_ok());
+        assert_eq!(doc.pointer("/foo/2").unwrap().as_str(), Some("tail"));
+
+        // set_pointer in object
+        assert!(doc
+            .set_pointer("/nested/child", JsonValue::Bool(true))
+            .is_err()); // non-existing parent
+        assert!(doc.set_pointer("/foo/new_key", JsonValue::Null).is_err()); // not an object
+
+        // delete_pointer
+        let deleted = doc.delete_pointer("/foo/1").unwrap();
+        assert_eq!(deleted.unwrap().as_str(), Some("baz"));
+        assert_eq!(doc.pointer("/foo/1").unwrap().as_str(), Some("tail"));
     }
 }
