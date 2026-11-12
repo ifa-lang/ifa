@@ -2310,10 +2310,7 @@ pub fn patch_json<T: serde::Serialize>(
 }
 
 /// Convenience shortcut to issue an application/x-www-form-urlencoded POST request.
-pub fn post_form(
-    url: &str,
-    fields: &[(&str, &str)],
-) -> Result<HttpResponse, HttpClientError> {
+pub fn post_form(url: &str, fields: &[(&str, &str)]) -> Result<HttpResponse, HttpClientError> {
     HttpClient::new().post_form(url, fields)
 }
 
@@ -2984,7 +2981,8 @@ mod tests {
     #[test]
     fn test_http_head_and_response_metadata_helpers() {
         let mut req = HttpRequestHead::post("/api/v1/resource");
-        req.headers.insert("Content-Type", "application/json; charset=utf-8");
+        req.headers
+            .insert("Content-Type", "application/json; charset=utf-8");
         req.headers.insert("Content-Length", "42");
         assert_eq!(req.content_type(), Some("application/json; charset=utf-8"));
         assert!(req.is_json());
