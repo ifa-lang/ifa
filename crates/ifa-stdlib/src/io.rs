@@ -4566,7 +4566,10 @@ pub struct HexReader<R: Read> {
 impl<R: Read> HexReader<R> {
     /// Creates a new `HexReader` wrapping `inner`.
     pub fn new(inner: R) -> Self {
-        Self { inner, pending: None }
+        Self {
+            inner,
+            pending: None,
+        }
     }
 
     /// Consumes the adapter and returns the underlying reader.
