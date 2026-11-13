@@ -72,17 +72,18 @@ pub use io::{
     limited, limited_writer, multi_reader, multi_writer, pad_writer, pipe_lines, prefix_writer,
     prefixed, pushback_reader, read_ivarint, read_sleb128, read_to_end as io_read_to_end,
     read_to_string as io_read_to_string, read_uvarint, repeat, sink, skip_reader, suffix_writer,
-    suffixed, try_read_ivarint, try_read_sleb128, try_read_uvarint, varint_reader, varint_writer,
-    write_ivarint, write_sleb128, write_uvarint, zigzag_decode, zigzag_encode, Adler32Hasher,
-    Adler32Reader, Adler32Writer, Base64Reader, Base64Writer, BufferedReader, BufferedWriter,
-    ChainedReader, ChunkIter, ChunkReader, ChunkWriter, CountingReader, CountingWriter,
-    Crc32Hasher, Crc32Reader, Crc32Writer, CrcFramedIter, CrcFramedReader, CrcFramedWriter,
-    DelimitedIter, DelimitedReader, DelimitedWriter, EmptyReader, FramedIter, FramedReader,
-    FramedWriter, HexReader, HexWriter, IVarintIter, LengthFieldKind, LimitedReader, LimitedWriter,
-    LineWriter, MemoryStream, MultiReader, MultiWriter, PadWriter, PrefixWriter, PrefixedReader,
-    PushbackReader, RepeatReader, SinkWriter, SkipReader, Sleb128Iter, SuffixWriter,
-    SuffixedReader, TeeReader, TeeWriter, UVarintIter, VarintReader, VarintWriter,
-    DEFAULT_MAX_DELIMITED_RECORD_SIZE, DEFAULT_MAX_FRAME_SIZE, MAX_VARINT_LEN_U32,
+    suffixed, try_read_ivarint, try_read_sleb128, try_read_uvarint, varint_framed_reader,
+    varint_framed_writer, varint_reader, varint_writer, write_ivarint, write_sleb128,
+    write_uvarint, zigzag_decode, zigzag_encode, Adler32Hasher, Adler32Reader, Adler32Writer,
+    Base64Reader, Base64Writer, BufferedReader, BufferedWriter, ChainedReader, ChunkIter,
+    ChunkReader, ChunkWriter, CountingReader, CountingWriter, Crc32Hasher, Crc32Reader,
+    Crc32Writer, CrcFramedIter, CrcFramedReader, CrcFramedWriter, DelimitedIter, DelimitedReader,
+    DelimitedWriter, EmptyReader, FramedIter, FramedReader, FramedWriter, HexReader, HexWriter,
+    IVarintIter, LengthFieldKind, LimitedReader, LimitedWriter, LineWriter, MemoryStream,
+    MultiReader, MultiWriter, PadWriter, PrefixWriter, PrefixedReader, PushbackReader,
+    RepeatReader, SinkWriter, SkipReader, Sleb128Iter, SuffixWriter, SuffixedReader, TeeReader,
+    TeeWriter, UVarintIter, VarintFramedIter, VarintFramedReader, VarintFramedWriter, VarintReader,
+    VarintWriter, DEFAULT_MAX_DELIMITED_RECORD_SIZE, DEFAULT_MAX_FRAME_SIZE, MAX_VARINT_LEN_U32,
     MAX_VARINT_LEN_U64,
 };
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};
@@ -1014,5 +1015,28 @@ mod tests {
 
         let mut reader = varint_reader(out.as_slice());
         assert_eq!(reader.read_sleb128().unwrap(), 987654);
+    }
+
+    #[test]
+    fn test_io_varint_framed_prelude_exports() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = varint_framed_writer(&mut sink);
+            writer.write_frame_str("ifa-varint-frame").unwrap();
+            writer.write_frame(b"stream payload").unwrap();
+            assert_eq!(writer.frames_written(), 2);
+        }
+
+        let mut reader = varint_framed_reader(sink.as_slice());
+        assert_eq!(
+            reader.read_frame_to_string().unwrap(),
+            Some("ifa-varint-frame".to_string())
+        );
+        assert_eq!(
+            reader.read_frame().unwrap(),
+            Some(b"stream payload".to_vec())
+        );
+        assert_eq!(reader.read_frame().unwrap(), None);
+        assert_eq!(reader.frames_read(), 2);
     }
 }

@@ -3628,6 +3628,247 @@ pub fn varint_reader<R: Read>(reader: R) -> VarintReader<R> {
     VarintReader::new(reader)
 }
 
+// ─── Varint-Delimited Framed Stream Adapters ─────────────────────────────────
+
+/// Stream writer that prefixes each payload with its byte length encoded as a compact LEB128 varint.
+///
+/// Varint framing is used in binary streaming protocols (such as Protocol Buffers length-delimited
+/// messages, QUIC stream chunks, and WebAssembly modules) to avoid fixed multi-byte header overhead.
+/// Payloads up to 127 bytes require only a single-byte length prefix.
+#[derive(Debug, Clone)]
+pub struct VarintFramedWriter<W: Write> {
+    inner: W,
+    frames_written: u64,
+    bytes_written: u64,
+}
+
+impl<W: Write> VarintFramedWriter<W> {
+    /// Create a new `VarintFramedWriter` wrapping `writer`.
+    pub fn new(writer: W) -> Self {
+        Self {
+            inner: writer,
+            frames_written: 0,
+            bytes_written: 0,
+        }
+    }
+
+    /// Total number of complete frames written.
+    pub fn frames_written(&self) -> u64 {
+        self.frames_written
+    }
+
+    /// Total number of bytes written (including varint length prefixes and payloads).
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    /// Write a frame payload prefixed by its LEB128 varint length.
+    pub fn write_frame(&mut self, payload: &[u8]) -> io::Result<()> {
+        let mut header = [0u8; MAX_VARINT_LEN_U64];
+        let hlen = encode_uvarint(payload.len() as u64, &mut header);
+        self.inner.write_all(&header[..hlen])?;
+        if !payload.is_empty() {
+            self.inner.write_all(payload)?;
+        }
+        self.frames_written += 1;
+        self.bytes_written += (hlen + payload.len()) as u64;
+        Ok(())
+    }
+
+    /// Write a UTF-8 string frame.
+    pub fn write_frame_str(&mut self, text: &str) -> io::Result<()> {
+        self.write_frame(text.as_bytes())
+    }
+
+    /// Flush the underlying writer.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+
+    /// Reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    /// Consume this writer, returning the inner writer, frames written, and bytes written.
+    pub fn into_parts(self) -> (W, u64, u64) {
+        (self.inner, self.frames_written, self.bytes_written)
+    }
+}
+
+/// Helper constructor to create a new [`VarintFramedWriter`].
+pub fn varint_framed_writer<W: Write>(writer: W) -> VarintFramedWriter<W> {
+    VarintFramedWriter::new(writer)
+}
+
+/// Stream reader that unpacks frames delimited by a compact LEB128 varint length prefix.
+#[derive(Debug, Clone)]
+pub struct VarintFramedReader<R: Read> {
+    inner: R,
+    max_frame_size: usize,
+    frames_read: u64,
+}
+
+impl<R: Read> VarintFramedReader<R> {
+    /// Create a new `VarintFramedReader` with the default maximum frame size (16 MiB).
+    pub fn new(reader: R) -> Self {
+        Self::with_max_frame_size(reader, DEFAULT_MAX_FRAME_SIZE)
+    }
+
+    /// Create a new `VarintFramedReader` with a specified maximum frame size in bytes.
+    pub fn with_max_frame_size(reader: R, max_frame_size: usize) -> Self {
+        Self {
+            inner: reader,
+            max_frame_size: max_frame_size.max(1),
+            frames_read: 0,
+        }
+    }
+
+    /// Configured maximum payload size in bytes.
+    pub fn max_frame_size(&self) -> usize {
+        self.max_frame_size
+    }
+
+    /// Set a new maximum payload size in bytes (at least 1 byte).
+    pub fn set_max_frame_size(&mut self, max: usize) {
+        self.max_frame_size = max.max(1);
+    }
+
+    /// Number of frames successfully read so far.
+    pub fn frames_read(&self) -> u64 {
+        self.frames_read
+    }
+
+    /// Read the next frame payload into the provided reusable buffer.
+    ///
+    /// Clears `buf` before reading.
+    /// Returns `Ok(Some(bytes_read))` or `Ok(None)` on clean EOF before any header bytes are read.
+    /// Returns `Err(UnexpectedEof)` if EOF occurs midway through reading the varint header or payload.
+    /// Returns `Err(InvalidData)` if the header indicates a frame larger than `max_frame_size`.
+    pub fn read_frame_buf(&mut self, buf: &mut Vec<u8>) -> io::Result<Option<usize>> {
+        buf.clear();
+        let payload_len = match try_read_uvarint(&mut self.inner)? {
+            Some(len) => len,
+            None => return Ok(None),
+        };
+
+        if payload_len > (self.max_frame_size as u64) || payload_len > (usize::MAX as u64) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "varint frame payload length {} exceeds configured maximum {}",
+                    payload_len, self.max_frame_size
+                ),
+            ));
+        }
+
+        let len = payload_len as usize;
+        buf.resize(len, 0);
+        self.inner.read_exact(buf)?;
+        self.frames_read += 1;
+        Ok(Some(len))
+    }
+
+    /// Read the next frame payload into a newly allocated `Vec<u8>`.
+    ///
+    /// Returns `Ok(Some(frame))` or `Ok(None)` on clean EOF.
+    pub fn read_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut buf = Vec::new();
+        match self.read_frame_buf(&mut buf)? {
+            Some(_) => Ok(Some(buf)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the next frame and parse it as a UTF-8 string.
+    pub fn read_frame_to_string(&mut self) -> io::Result<Option<String>> {
+        match self.read_frame()? {
+            Some(bytes) => String::from_utf8(bytes).map(Some).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid UTF-8 in varint frame: {}", e),
+                )
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// Convert this `VarintFramedReader` into an iterator yielding frame byte buffers.
+    pub fn into_frames(self) -> VarintFramedIter<R> {
+        VarintFramedIter { reader: self }
+    }
+
+    /// Reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    /// Consume this reader, returning inner reader, max frame size, and frames read.
+    pub fn into_parts(self) -> (R, usize, u64) {
+        (self.inner, self.max_frame_size, self.frames_read)
+    }
+}
+
+/// Helper constructor to create a new [`VarintFramedReader`].
+pub fn varint_framed_reader<R: Read>(reader: R) -> VarintFramedReader<R> {
+    VarintFramedReader::new(reader)
+}
+
+/// Iterator over frames produced by a [`VarintFramedReader`].
+#[derive(Debug)]
+pub struct VarintFramedIter<R: Read> {
+    reader: VarintFramedReader<R>,
+}
+
+impl<R: Read> VarintFramedIter<R> {
+    /// Reference to the underlying framed reader.
+    pub fn get_ref(&self) -> &VarintFramedReader<R> {
+        &self.reader
+    }
+
+    /// Mutable reference to the underlying framed reader.
+    pub fn get_mut(&mut self) -> &mut VarintFramedReader<R> {
+        &mut self.reader
+    }
+
+    /// Unwrap the inner `VarintFramedReader`.
+    pub fn into_inner(self) -> VarintFramedReader<R> {
+        self.reader
+    }
+}
+
+impl<R: Read> Iterator for VarintFramedIter<R> {
+    type Item = io::Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.reader.read_frame() {
+            Ok(Some(frame)) => Some(Ok(frame)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
 /// Helper function to locate a byte needle in a haystack slice without allocations.
 #[inline]
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -7550,5 +7791,124 @@ mod base64_streaming_tests {
         let err_10th = decode_sleb128(&invalid_10th).unwrap_err();
         assert_eq!(err_10th.kind(), io::ErrorKind::InvalidData);
         assert!(err_10th.to_string().contains("invalid sign-extension bits"));
+    }
+
+    #[test]
+    fn test_varint_framed_basic() {
+        let mut sink = Vec::new();
+        let payload_300 = vec![0xAB; 300];
+        {
+            let mut writer = varint_framed_writer(&mut sink);
+            writer.write_frame_str("hello").unwrap();
+            writer.write_frame(b"").unwrap(); // Empty frame (length 0 = 1 byte varint)
+            writer.write_frame_str("world").unwrap();
+            writer.write_frame(&payload_300).unwrap(); // 300 bytes -> 2-byte varint: [0xAC, 0x02]
+            writer.flush().unwrap();
+
+            assert_eq!(writer.frames_written(), 4);
+            // "hello": 1 header + 5 payload = 6
+            // "": 1 header + 0 payload = 1
+            // "world": 1 header + 5 payload = 6
+            // payload_300: 2 header + 300 payload = 302
+            // Total = 315
+            assert_eq!(writer.bytes_written(), 315);
+        }
+
+        let mut reader = varint_framed_reader(sink.as_slice());
+        assert_eq!(reader.frames_read(), 0);
+        assert_eq!(reader.max_frame_size(), DEFAULT_MAX_FRAME_SIZE);
+
+        assert_eq!(
+            reader.read_frame_to_string().unwrap(),
+            Some("hello".to_string())
+        );
+        assert_eq!(reader.read_frame().unwrap(), Some(Vec::new()));
+        assert_eq!(
+            reader.read_frame_to_string().unwrap(),
+            Some("world".to_string())
+        );
+        assert_eq!(reader.read_frame().unwrap(), Some(payload_300));
+        assert_eq!(reader.read_frame().unwrap(), None); // Clean EOF
+        assert_eq!(reader.frames_read(), 4);
+    }
+
+    #[test]
+    fn test_varint_framed_iter_and_buf() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = VarintFramedWriter::new(&mut sink);
+            writer.write_frame(b"msg1").unwrap();
+            writer.write_frame(b"msg2").unwrap();
+            writer.write_frame(b"msg3").unwrap();
+        }
+
+        // Test reusable buffer
+        {
+            let mut reader = VarintFramedReader::new(sink.as_slice());
+            let mut buf = Vec::new();
+            assert_eq!(reader.read_frame_buf(&mut buf).unwrap(), Some(4));
+            assert_eq!(&buf, b"msg1");
+            assert_eq!(reader.read_frame_buf(&mut buf).unwrap(), Some(4));
+            assert_eq!(&buf, b"msg2");
+            assert_eq!(reader.read_frame_buf(&mut buf).unwrap(), Some(4));
+            assert_eq!(&buf, b"msg3");
+            assert_eq!(reader.read_frame_buf(&mut buf).unwrap(), None);
+        }
+
+        // Test into_frames iterator
+        let reader = VarintFramedReader::new(sink.as_slice());
+        let frames: Vec<Vec<u8>> = reader.into_frames().map(|r| r.unwrap()).collect();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(&frames[0], b"msg1");
+        assert_eq!(&frames[1], b"msg2");
+        assert_eq!(&frames[2], b"msg3");
+    }
+
+    #[test]
+    fn test_varint_framed_errors_and_limits() {
+        // Exceeds max frame size
+        let mut sink = Vec::new();
+        {
+            let mut writer = VarintFramedWriter::new(&mut sink);
+            writer.write_frame(b"payload too long").unwrap();
+        }
+        let mut reader = VarintFramedReader::with_max_frame_size(sink.as_slice(), 5);
+        assert_eq!(reader.max_frame_size(), 5);
+        reader.set_max_frame_size(4);
+        assert_eq!(reader.max_frame_size(), 4);
+        let res = reader.read_frame();
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds configured maximum"));
+
+        // Premature EOF in payload
+        let truncated_payload = [0x05, b'a', b'b']; // header says 5 bytes, only 2 provided
+        let mut r_trunc = VarintFramedReader::new(&truncated_payload[..]);
+        let err_trunc = r_trunc.read_frame().unwrap_err();
+        assert_eq!(err_trunc.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Premature EOF in multi-byte varint header
+        let truncated_header = [0x80]; // continuation bit set, but stream ends
+        let mut r_trunc_h = VarintFramedReader::new(&truncated_header[..]);
+        let err_trunc_h = r_trunc_h.read_frame().unwrap_err();
+        assert_eq!(err_trunc_h.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Accessors & unwrapping
+        let mut writer = VarintFramedWriter::new(Vec::new());
+        writer.write_frame_str("test").unwrap();
+        assert_eq!(writer.get_ref().len(), 5);
+        assert_eq!(writer.get_mut().len(), 5);
+        let (inner_w, fw, bw) = writer.into_parts();
+        assert_eq!(inner_w.len(), 5);
+        assert_eq!(fw, 1);
+        assert_eq!(bw, 5);
+
+        let reader = VarintFramedReader::new(&inner_w[..]);
+        assert_eq!(reader.get_ref().len(), 5);
+        let (inner_r, mfs, fr) = reader.into_parts();
+        assert_eq!(inner_r.len(), 5);
+        assert_eq!(mfs, DEFAULT_MAX_FRAME_SIZE);
+        assert_eq!(fr, 0);
     }
 }
