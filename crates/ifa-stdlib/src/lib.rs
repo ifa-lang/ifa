@@ -1813,7 +1813,10 @@ mod tests {
         assert!(empty_iv.is_empty());
 
         let invalid = Interval::new(25, 10);
-        assert!(matches!(invalid, Err(IntervalError::InvertedBounds { start: 25, end: 10 })));
+        assert!(matches!(
+            invalid,
+            Err(IntervalError::InvertedBounds { start: 25, end: 10 })
+        ));
         assert!(format!("{}", invalid.unwrap_err()).contains("Invalid interval bounds"));
 
         let unchecked = Interval::new_unchecked(5, 12);
@@ -1850,8 +1853,14 @@ mod tests {
 
         // Intersection
         assert_eq!(iv.intersection(&disjoint_left), None);
-        assert_eq!(iv.intersection(&overlap_left), Some(Interval::new(10, 15).unwrap()));
-        assert_eq!(iv.intersection(&overlap_right), Some(Interval::new(15, 20).unwrap()));
+        assert_eq!(
+            iv.intersection(&overlap_left),
+            Some(Interval::new(10, 15).unwrap())
+        );
+        assert_eq!(
+            iv.intersection(&overlap_right),
+            Some(Interval::new(15, 20).unwrap())
+        );
 
         // Span
         let spanned = iv.span(&overlap_right);
@@ -1878,14 +1887,20 @@ mod tests {
             Some("first")
         );
         assert_eq!(map.len(), 3);
-        assert_eq!(map.get(&Interval::new(10, 20).unwrap()), Some(&"first_updated"));
+        assert_eq!(
+            map.get(&Interval::new(10, 20).unwrap()),
+            Some(&"first_updated")
+        );
         assert_eq!(map[&Interval::new(10, 20).unwrap()], "first_updated");
 
         // get_mut
         if let Some(val) = map.get_mut(&Interval::new(10, 20).unwrap()) {
             *val = "first_mutated";
         }
-        assert_eq!(map.get(&Interval::new(10, 20).unwrap()), Some(&"first_mutated"));
+        assert_eq!(
+            map.get(&Interval::new(10, 20).unwrap()),
+            Some(&"first_mutated")
+        );
 
         // Point queries
         assert!(map.contains_point(&12));
@@ -1905,14 +1920,23 @@ mod tests {
         assert!(map.query_overlapping(&disjoint_query).is_empty());
 
         // Removal
-        assert_eq!(map.remove(&Interval::new(10, 20).unwrap()), Some("first_mutated"));
+        assert_eq!(
+            map.remove(&Interval::new(10, 20).unwrap()),
+            Some("first_mutated")
+        );
         assert_eq!(map.len(), 2);
         assert!(!map.contains_key(&Interval::new(10, 20).unwrap()));
         assert_eq!(map.remove(&Interval::new(10, 20).unwrap()), None);
 
         // Iteration and order
         let keys = map.intervals();
-        assert_eq!(keys, vec![Interval::new(5, 15).unwrap(), Interval::new(25, 35).unwrap()]);
+        assert_eq!(
+            keys,
+            vec![
+                Interval::new(5, 15).unwrap(),
+                Interval::new(25, 35).unwrap()
+            ]
+        );
 
         let collected: Vec<_> = map.iter().map(|(k, v)| (*k, *v)).collect();
         assert_eq!(
@@ -1931,7 +1955,10 @@ mod tests {
         assert_eq!(from_iter_map.len(), 2);
         from_iter_map.extend(vec![(Interval::new(11, 15).unwrap(), 300)]);
         assert_eq!(from_iter_map.len(), 3);
-        assert_eq!(from_iter_map.get(&Interval::new(11, 15).unwrap()), Some(&300));
+        assert_eq!(
+            from_iter_map.get(&Interval::new(11, 15).unwrap()),
+            Some(&300)
+        );
 
         // Stress balancing (AVL rotations)
         let mut avl_map = IntervalMap::new();
@@ -1940,14 +1967,23 @@ mod tests {
         }
         assert_eq!(avl_map.len(), 50);
         for i in 0..50 {
-            assert_eq!(avl_map.get(&Interval::new(i * 10, i * 10 + 5).unwrap()), Some(&i));
+            assert_eq!(
+                avl_map.get(&Interval::new(i * 10, i * 10 + 5).unwrap()),
+                Some(&i)
+            );
         }
         for i in (0..50).step_by(2) {
-            assert_eq!(avl_map.remove(&Interval::new(i * 10, i * 10 + 5).unwrap()), Some(i));
+            assert_eq!(
+                avl_map.remove(&Interval::new(i * 10, i * 10 + 5).unwrap()),
+                Some(i)
+            );
         }
         assert_eq!(avl_map.len(), 25);
         for i in (1..50).step_by(2) {
-            assert_eq!(avl_map.get(&Interval::new(i * 10, i * 10 + 5).unwrap()), Some(&i));
+            assert_eq!(
+                avl_map.get(&Interval::new(i * 10, i * 10 + 5).unwrap()),
+                Some(&i)
+            );
         }
 
         avl_map.clear();

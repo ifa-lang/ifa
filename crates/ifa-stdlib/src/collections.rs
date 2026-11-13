@@ -3421,7 +3421,10 @@ impl<K: Ord + Clone, V> IntervalNode<K, V> {
 }
 
 fn rotate_right<K: Ord + Clone, V>(mut y: Box<IntervalNode<K, V>>) -> Box<IntervalNode<K, V>> {
-    let mut x = y.left.take().expect("left child must exist for right rotation");
+    let mut x = y
+        .left
+        .take()
+        .expect("left child must exist for right rotation");
     y.left = x.right.take();
     y.update();
     x.right = Some(y);
@@ -3430,7 +3433,10 @@ fn rotate_right<K: Ord + Clone, V>(mut y: Box<IntervalNode<K, V>>) -> Box<Interv
 }
 
 fn rotate_left<K: Ord + Clone, V>(mut x: Box<IntervalNode<K, V>>) -> Box<IntervalNode<K, V>> {
-    let mut y = x.right.take().expect("right child must exist for left rotation");
+    let mut y = x
+        .right
+        .take()
+        .expect("right child must exist for left rotation");
     x.right = y.left.take();
     x.update();
     y.left = Some(x);
@@ -3486,9 +3492,7 @@ fn insert_node<K: Ord + Clone, V>(
     rebalance(current)
 }
 
-fn extract_min<K: Ord + Clone, V>(
-    mut node: IntervalNodeBox<K, V>,
-) -> MinExtract<K, V> {
+fn extract_min<K: Ord + Clone, V>(mut node: IntervalNodeBox<K, V>) -> MinExtract<K, V> {
     if node.left.is_none() {
         let right = node.right.take();
         (node, right)
@@ -3844,7 +3848,11 @@ impl<K: Ord + Clone> IntervalSet<K> {
 
     /// Find all intervals in the set containing the given point.
     pub fn query_point(&self, point: &K) -> Vec<&Interval<K>> {
-        self.inner.query_point(point).into_iter().map(|(k, _)| k).collect()
+        self.inner
+            .query_point(point)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
     }
 
     /// Find all intervals in the set overlapping with the given interval.
