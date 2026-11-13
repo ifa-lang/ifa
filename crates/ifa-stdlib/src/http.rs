@@ -452,6 +452,21 @@ impl HttpRequest {
         self
     }
 
+    /// Set HTTP Basic Authentication header (RFC 7617).
+    /// Format: `Authorization: Basic <base64(username:password)>`
+    pub fn with_basic_auth(mut self, username: &str, password: &str) -> Self {
+        self.headers
+            .set("Authorization", encode_basic_auth(username, password));
+        self
+    }
+
+    /// Set HTTP Bearer token Authentication header (RFC 6750).
+    /// Format: `Authorization: Bearer <token>`
+    pub fn with_bearer_auth(mut self, token: &str) -> Self {
+        self.headers.set("Authorization", format!("Bearer {}", token.trim()));
+        self
+    }
+
     pub fn body(mut self, body: Vec<u8>) -> Self {
         self.headers.set("Content-Length", body.len().to_string());
         self.body = body;
@@ -5985,5 +6000,33 @@ mod tests {
         assert_eq!(mod_url.query_map().get("limit").map(|s| s.as_str()), Some("10"));
         let chained = mod_url.with_query_param("foo", "baz");
         assert_eq!(chained.query_map().get("foo").map(|s| s.as_str()), Some("baz"));
+    }
+
+    #[test]
+    fn test_request_auth_helpers() {
+        // Basic auth fluent builder and parsing
+        let req1 = HttpRequest::new(HttpMethod::Get, "/api/v1/protected")
+            .with_basic_auth("admin", "secret_pass123");
+        assert_eq!(
+            req1.authorization(),
+            Some("Basic YWRtaW46c2VjcmV0X3Bhc3MxMjM=")
+        );
+        let parsed_creds = req1.basic_auth();
+        assert_eq!(
+            parsed_creds,
+            Some(("admin".to_string(), "secret_pass123".to_string()))
+        );
+
+        // Bearer token fluent builder and parsing
+        let req2 = HttpRequest::new(HttpMethod::Post, "/api/v1/orders")
+            .with_bearer_auth("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.xyz");
+        assert_eq!(
+            req2.authorization(),
+            Some("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.xyz")
+        );
+        assert_eq!(
+            req2.bearer_token(),
+            Some("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.xyz".to_string())
+        );
     }
 }
