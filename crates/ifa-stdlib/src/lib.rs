@@ -15,10 +15,10 @@ pub mod sync;
 pub mod sys;
 
 pub use collections::{
-    BinaryHeap, BitSet, BitSetError, BitSetIter, ByteBuffer, CycleError, Deque, DiGraph,
-    DirectedGraph, DisjointSet, Eviction, FenwickTree, Interval, IntervalError, IntervalMap,
-    IntervalMapIter, IntervalSet, List, LruCache, Map, SegmentTree, Set, StringBuilder, Trie,
-    TrieSet,
+    BinaryHeap, BitSet, BitSetError, BitSetIter, BloomFilter, ByteBuffer, CycleError, Deque,
+    DiGraph, DirectedGraph, DisjointSet, Eviction, FenwickTree, Interval, IntervalError,
+    IntervalMap, IntervalMapIter, IntervalSet, List, LruCache, Map, SegmentTree, Set,
+    StringBuilder, Trie, TrieSet,
 };
 pub use crypto::{
     base64_decode, base64_encode, base64url_decode, base64url_encode, blake3, blake3_hex,
@@ -2154,5 +2154,54 @@ mod tests {
         assert!(st_min.update(5, 25)); // index 5 was 11, now 25
         assert_eq!(st_min.query_range(0, 6), Some(13));
         assert_eq!(st_min.query_range(4, 6), Some(15)); // min(15, 25, 20)
+    }
+
+    #[test]
+    fn test_bloom_filter() {
+        let mut bf = BloomFilter::with_rate(100, 0.01);
+        assert_eq!(bf.len(), 0);
+        assert!(bf.is_empty());
+
+        let words = ["apple", "banana", "cherry", "date", "elderberry"];
+        for word in &words {
+            bf.insert(word);
+        }
+
+        assert_eq!(bf.len(), 5);
+        assert!(!bf.is_empty());
+
+        // Zero false negatives: all inserted items MUST be contained
+        for word in &words {
+            assert!(bf.contains(word));
+        }
+
+        // Test non-members (low probability of false positive)
+        let non_members = ["fig", "grape", "honeydew", "kiwi", "lemon", "mango"];
+        let mut false_positives = 0;
+        for nm in &non_members {
+            if bf.contains(nm) {
+                false_positives += 1;
+            }
+        }
+        assert!(
+            false_positives <= 1,
+            "Excessive false positives: {false_positives}"
+        );
+
+        // Clear
+        bf.clear();
+        assert_eq!(bf.len(), 0);
+        assert!(bf.is_empty());
+        for word in &words {
+            assert!(!bf.contains(word));
+        }
+
+        // Explicit size and hashes constructor
+        let mut custom = BloomFilter::with_size_and_hashes(256, 4);
+        assert_eq!(custom.num_bits(), 256);
+        assert_eq!(custom.num_hashes(), 4);
+        custom.insert(b"test_payload_123");
+        assert!(custom.contains(b"test_payload_123"));
+        assert!(!custom.contains(b"other_payload_456"));
     }
 }

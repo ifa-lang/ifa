@@ -18,6 +18,9 @@
 //! - `Interval<T>`: Half-open interval `[start, end)` with span, overlap and containment logic.
 //! - `IntervalMap<K, V>`: Deterministic augmented AVL interval tree for fast overlap and point queries.
 //! - `IntervalSet<K>`: Deterministic set of intervals with contiguous merging and collision testing.
+//! - `FenwickTree`: Binary Indexed Tree (BIT) for O(log N) prefix sums and point updates.
+//! - `SegmentTree<T>`: Deterministic segment tree for arbitrary associative range queries.
+//! - `BloomFilter`: Space-efficient deterministic probabilistic membership filter.
 
 use std::collections::{btree_map, btree_set, BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -4103,5 +4106,135 @@ impl<T: Copy, F: Fn(T, T) -> T> SegmentTree<T, F> {
             right /= 2;
         }
         Some((self.combine)(left_res, right_res))
+    }
+}
+
+/// Deterministic, space-efficient probabilistic set (`BloomFilter`) with zero false negatives.
+///
+/// Implemented using Murmur3-like double hashing (Kirsch-Mitzenmacher technique) over a deterministic [`BitSet`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BloomFilter {
+    bits: BitSet,
+    num_hashes: usize,
+    count: usize,
+}
+
+impl BloomFilter {
+    /// FNV-1a 64-bit hash constant.
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    /// Create a Bloom filter configured for optimal false positive probability given `expected_items` and target `fp_rate`.
+    ///
+    /// The bit array size `m` and number of hashes `k` are computed deterministically:
+    /// `m = - (n * ln(p)) / (ln(2)^2)`
+    /// `k = (m / n) * ln(2)`
+    pub fn with_rate(expected_items: usize, fp_rate: f64) -> Self {
+        let n = (expected_items.max(1)) as f64;
+        let p = fp_rate.clamp(1e-9, 0.5);
+
+        let ln2 = std::f64::consts::LN_2;
+        let m = (-(n * p.ln()) / (ln2 * ln2)).ceil() as usize;
+        let m = m.max(64); // minimum 64 bits (1 word)
+        let k = (((m as f64) / n) * ln2).round() as usize;
+        let k = k.clamp(1, 30);
+
+        Self::with_size_and_hashes(m, k)
+    }
+
+    /// Create a Bloom filter with an explicit bit array size `num_bits` and `num_hashes`.
+    pub fn with_size_and_hashes(num_bits: usize, num_hashes: usize) -> Self {
+        let size = num_bits.max(64);
+        let k = num_hashes.clamp(1, 50);
+        Self {
+            bits: BitSet::repeat(false, size),
+            num_hashes: k,
+            count: 0,
+        }
+    }
+
+    /// Return the total number of bits in the filter.
+    pub fn num_bits(&self) -> usize {
+        self.bits.len()
+    }
+
+    /// Return the number of hash functions used.
+    pub fn num_hashes(&self) -> usize {
+        self.num_hashes
+    }
+
+    /// Return the number of elements inserted so far.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Return `true` if no elements have been inserted.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Deterministic 64-bit FNV-1a hash.
+    fn hash_fnv1a(data: &[u8], seed: u64) -> u64 {
+        let mut hash = Self::FNV_OFFSET_BASIS ^ seed;
+        for &byte in data {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(Self::FNV_PRIME);
+        }
+        hash
+    }
+
+    /// Generate `k` deterministic bit positions for the given byte slice using Kirsch-Mitzenmacher optimization:
+    /// `g_i(x) = (h1(x) + i * h2(x)) mod m`
+    fn bit_indices(num_bits: usize, num_hashes: usize, data: &[u8]) -> impl Iterator<Item = usize> {
+        let h1 = Self::hash_fnv1a(data, 0);
+        let h2 = Self::hash_fnv1a(data, 0x9e3779b97f4a7c15).wrapping_add(1) | 1; // ensure non-zero & odd
+        let m = num_bits as u64;
+
+        (0..num_hashes).map(move |i| {
+            let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
+            (combined % m) as usize
+        })
+    }
+
+    /// Insert a byte slice into the filter.
+    pub fn insert(&mut self, item: impl AsRef<[u8]>) {
+        let data = item.as_ref();
+        let m = self.bits.len();
+        let k = self.num_hashes;
+        for idx in Self::bit_indices(m, k, data) {
+            self.bits.insert(idx);
+        }
+        self.count += 1;
+    }
+
+    /// Check if an item might be present in the filter.
+    ///
+    /// - Returns `false`: the item is **guaranteed** not in the filter (no false negatives).
+    /// - Returns `true`: the item is **probably** in the filter (possible false positive).
+    pub fn contains(&self, item: impl AsRef<[u8]>) -> bool {
+        let data = item.as_ref();
+        let m = self.bits.len();
+        let k = self.num_hashes;
+        for idx in Self::bit_indices(m, k, data) {
+            if !self.bits.contains(idx) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Clear all bits and reset the item count.
+    pub fn clear(&mut self) {
+        let len = self.bits.len();
+        self.bits = BitSet::repeat(false, len);
+        self.count = 0;
+    }
+
+    /// Estimate current false positive rate based on the number of set bits.
+    pub fn estimated_fp_rate(&self) -> f64 {
+        let set_bits = self.bits.count_ones() as f64;
+        let m = self.bits.len() as f64;
+        let k = self.num_hashes as f64;
+        (set_bits / m).powf(k)
     }
 }
