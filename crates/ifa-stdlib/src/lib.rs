@@ -64,9 +64,10 @@ pub use http::{
     PooledConnection, RouteSegment, SameSite, SessionStore, SseEvent, UpstreamBackend,
 };
 pub use io::{
-    copy_stream, pipe_lines, read_to_end as io_read_to_end, read_to_string as io_read_to_string,
-    BufferedReader, BufferedWriter, ChainedReader, CountingReader, CountingWriter, LimitedReader,
-    LineWriter, MemoryStream, TeeReader, TeeWriter,
+    copy_stream, empty, pipe_lines, read_to_end as io_read_to_end,
+    read_to_string as io_read_to_string, repeat, sink, BufferedReader, BufferedWriter,
+    ChainedReader, CountingReader, CountingWriter, EmptyReader, LimitedReader, LineWriter,
+    MemoryStream, RepeatReader, SinkWriter, TeeReader, TeeWriter,
 };
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};
 pub use json::{
@@ -959,5 +960,23 @@ mod tests {
         }
         assert_eq!(dest1, b"dual write verification");
         assert_eq!(dest2, b"dual write verification");
+    }
+
+    #[test]
+    fn test_io_empty_sink_repeat_exports() {
+        use std::io::{Read, Write};
+
+        let mut r = empty();
+        let mut b = [0u8; 4];
+        assert_eq!(r.read(&mut b).unwrap(), 0);
+
+        let mut s = sink();
+        assert_eq!(s.write(b"void").unwrap(), 4);
+        s.flush().unwrap();
+
+        let mut rep = repeat(b'Q');
+        let mut rep_buf = [0u8; 3];
+        assert_eq!(rep.read(&mut rep_buf).unwrap(), 3);
+        assert_eq!(rep_buf, [b'Q', b'Q', b'Q']);
     }
 }

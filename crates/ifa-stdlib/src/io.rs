@@ -797,6 +797,100 @@ impl<W1: Write, W2: Write> Write for TeeWriter<W1, W2> {
     }
 }
 
+/// An empty stream reader that immediately yields EOF (0 bytes read).
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct EmptyReader;
+
+impl EmptyReader {
+    /// Create a new empty reader.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+/// Create a new reader that always yields EOF immediately.
+pub fn empty() -> EmptyReader {
+    EmptyReader
+}
+
+impl Read for EmptyReader {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        Ok(0)
+    }
+}
+
+impl BufRead for EmptyReader {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        Ok(&[])
+    }
+
+    fn consume(&mut self, _amt: usize) {}
+}
+
+impl Seek for EmptyReader {
+    fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+        Ok(0)
+    }
+}
+
+/// A sink writer that silently discards all written bytes (analogous to `/dev/null`).
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct SinkWriter;
+
+impl SinkWriter {
+    /// Create a new sink writer.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+/// Create a new sink writer that silently consumes and discards all data.
+pub fn sink() -> SinkWriter {
+    SinkWriter
+}
+
+impl Write for SinkWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A reader that infinitely yields a repeated single byte.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct RepeatReader {
+    byte: u8,
+}
+
+impl RepeatReader {
+    /// Create a new repeated byte reader.
+    pub fn new(byte: u8) -> Self {
+        Self { byte }
+    }
+
+    /// Return the byte value being repeated.
+    pub fn byte(&self) -> u8 {
+        self.byte
+    }
+}
+
+/// Create a new reader that infinitely repeats a given byte value.
+pub fn repeat(byte: u8) -> RepeatReader {
+    RepeatReader::new(byte)
+}
+
+impl Read for RepeatReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        for b in buf.iter_mut() {
+            *b = self.byte;
+        }
+        Ok(buf.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -978,5 +1072,35 @@ mod tests {
         }
         assert_eq!(out1, b"dual output");
         assert_eq!(out2, b"dual output");
+    }
+
+    #[test]
+    fn test_empty_sink_repeat_primitives() {
+        // EmptyReader
+        let mut empty_reader = empty();
+        let mut buf = [0u8; 16];
+        assert_eq!(empty_reader.read(&mut buf).unwrap(), 0);
+        assert!(empty_reader.fill_buf().unwrap().is_empty());
+        empty_reader.consume(10);
+        assert_eq!(empty_reader.seek(SeekFrom::Start(100)).unwrap(), 0);
+
+        // SinkWriter
+        let mut sink_writer = sink();
+        assert_eq!(sink_writer.write(b"discarded data").unwrap(), 14);
+        sink_writer.flush().unwrap();
+
+        // RepeatReader alone
+        let mut rep = repeat(0x42);
+        assert_eq!(rep.byte(), 0x42);
+        let mut rep_buf = [0u8; 5];
+        assert_eq!(rep.read(&mut rep_buf).unwrap(), 5);
+        assert_eq!(rep_buf, [0x42; 5]);
+
+        // RepeatReader with LimitedReader
+        let mut limited = LimitedReader::new(repeat(b'Z'), 8);
+        let mut limited_buf = Vec::new();
+        let n = limited.read_to_end(&mut limited_buf).unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(limited_buf, b"ZZZZZZZZ");
     }
 }
