@@ -4758,6 +4758,314 @@ pub fn adler32_reader<R: Read>(reader: R) -> Adler32Reader<R> {
     Adler32Reader::new(reader)
 }
 
+// ---------------------------------------------------------------------------
+// Adler-32 Verified Framed Reader & Writer
+// ---------------------------------------------------------------------------
+
+/// Stream writer that prefixes each payload with its byte length and an Adler-32 checksum.
+///
+/// Each frame written has the structure:
+/// `[length: header_len][adler32: 4 bytes BE][payload: length bytes]`
+#[derive(Debug, Clone)]
+pub struct AdlerFramedWriter<W: Write> {
+    inner: W,
+    field_kind: LengthFieldKind,
+    frames_written: u64,
+    bytes_written: u64,
+}
+
+impl<W: Write> AdlerFramedWriter<W> {
+    /// Create a new `AdlerFramedWriter` with standard 4-byte big-endian length prefix.
+    pub fn new(writer: W) -> Self {
+        Self::with_length_field(writer, LengthFieldKind::U32Be)
+    }
+
+    /// Create a new `AdlerFramedWriter` with the specified length field encoding.
+    pub fn with_length_field(writer: W, field_kind: LengthFieldKind) -> Self {
+        Self {
+            inner: writer,
+            field_kind,
+            frames_written: 0,
+            bytes_written: 0,
+        }
+    }
+
+    /// Return the length field kind.
+    pub fn length_field(&self) -> LengthFieldKind {
+        self.field_kind
+    }
+
+    /// Total number of complete frames written.
+    pub fn frames_written(&self) -> u64 {
+        self.frames_written
+    }
+
+    /// Total number of bytes written (including length prefixes, Adler-32 checksums, and payloads).
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    /// Write a frame payload prefixed by its encoded length and 4-byte big-endian Adler-32 checksum.
+    pub fn write_frame(&mut self, payload: &[u8]) -> io::Result<()> {
+        let mut header = [0u8; 8];
+        let hlen = self.field_kind.encode_len(payload.len(), &mut header)?;
+        let adler = adler32_digest(payload);
+        self.inner.write_all(&header[..hlen])?;
+        self.inner.write_all(&adler.to_be_bytes())?;
+        if !payload.is_empty() {
+            self.inner.write_all(payload)?;
+        }
+        self.frames_written += 1;
+        self.bytes_written += (hlen + 4 + payload.len()) as u64;
+        Ok(())
+    }
+
+    /// Write a UTF-8 string frame.
+    pub fn write_frame_str(&mut self, text: &str) -> io::Result<()> {
+        self.write_frame(text.as_bytes())
+    }
+
+    /// Flush the underlying writer.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+
+    /// Reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    /// Consume this writer, returning the inner writer, field kind, frames written, and bytes written.
+    pub fn into_parts(self) -> (W, LengthFieldKind, u64, u64) {
+        (
+            self.inner,
+            self.field_kind,
+            self.frames_written,
+            self.bytes_written,
+        )
+    }
+}
+
+/// Helper function to create a new `AdlerFramedWriter` with standard 4-byte big-endian framing.
+pub fn adler_framed_writer<W: Write>(writer: W) -> AdlerFramedWriter<W> {
+    AdlerFramedWriter::new(writer)
+}
+
+/// Stream reader that unpacks length-delimited frames verified by an Adler-32 checksum.
+#[derive(Debug, Clone)]
+pub struct AdlerFramedReader<R: Read> {
+    inner: R,
+    field_kind: LengthFieldKind,
+    max_frame_size: usize,
+    frames_read: u64,
+}
+
+impl<R: Read> AdlerFramedReader<R> {
+    /// Create a new `AdlerFramedReader` with standard 4-byte big-endian length prefix and default max frame size (16 MiB).
+    pub fn new(reader: R) -> Self {
+        Self::with_options(reader, LengthFieldKind::U32Be, DEFAULT_MAX_FRAME_SIZE)
+    }
+
+    /// Create a new `AdlerFramedReader` with specified length field encoding and maximum frame size.
+    pub fn with_options(reader: R, field_kind: LengthFieldKind, max_frame_size: usize) -> Self {
+        Self {
+            inner: reader,
+            field_kind,
+            max_frame_size: max_frame_size.max(1),
+            frames_read: 0,
+        }
+    }
+
+    /// Configured length field encoding.
+    pub fn length_field(&self) -> LengthFieldKind {
+        self.field_kind
+    }
+
+    /// Configured maximum payload size in bytes.
+    pub fn max_frame_size(&self) -> usize {
+        self.max_frame_size
+    }
+
+    /// Set a new maximum payload size in bytes (at least 1 byte).
+    pub fn set_max_frame_size(&mut self, max: usize) {
+        self.max_frame_size = max.max(1);
+    }
+
+    /// Number of frames successfully read and verified so far.
+    pub fn frames_read(&self) -> u64 {
+        self.frames_read
+    }
+
+    /// Read the next frame payload into the provided reusable buffer and verify Adler-32 checksum.
+    ///
+    /// Clears `buf` before reading.
+    /// Returns `Ok(Some(bytes_read))` or `Ok(None)` on clean EOF before any header bytes are read.
+    /// Returns `Err(UnexpectedEof)` if EOF occurs midway through reading the header, checksum, or payload.
+    /// Returns `Err(InvalidData)` if the header indicates a frame larger than `max_frame_size` or if Adler-32 verification fails.
+    pub fn read_frame_buf(&mut self, buf: &mut Vec<u8>) -> io::Result<Option<usize>> {
+        buf.clear();
+        let hlen = self.field_kind.header_len();
+        let mut header = [0u8; 8];
+        let mut header_read = 0;
+
+        while header_read < hlen {
+            let n = self.inner.read(&mut header[header_read..hlen])?;
+            if n == 0 {
+                if header_read == 0 {
+                    return Ok(None);
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "incomplete Adler frame length prefix: read {} of {} bytes",
+                            header_read, hlen
+                        ),
+                    ));
+                }
+            }
+            header_read += n;
+        }
+
+        let payload_len = self.field_kind.decode_len(&header[..hlen]);
+        if payload_len > self.max_frame_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Adler frame payload length {} exceeds configured maximum {}",
+                    payload_len, self.max_frame_size
+                ),
+            ));
+        }
+
+        let mut adler_buf = [0u8; 4];
+        self.inner.read_exact(&mut adler_buf)?;
+        let expected_adler = u32::from_be_bytes(adler_buf);
+
+        buf.resize(payload_len, 0);
+        if payload_len > 0 {
+            self.inner.read_exact(buf)?;
+        }
+
+        let actual_adler = adler32_digest(buf);
+        if actual_adler != expected_adler {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Adler-32 checksum mismatch: expected 0x{:08X}, computed 0x{:08X}",
+                    expected_adler, actual_adler
+                ),
+            ));
+        }
+
+        self.frames_read += 1;
+        Ok(Some(payload_len))
+    }
+
+    /// Read the next complete verified frame from the stream into a new `Vec<u8>`.
+    ///
+    /// Returns `Ok(None)` on clean EOF before any header byte is read.
+    pub fn read_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut buf = Vec::new();
+        match self.read_frame_buf(&mut buf)? {
+            Some(_) => Ok(Some(buf)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the next frame and parse it as a UTF-8 string.
+    pub fn read_frame_to_string(&mut self) -> io::Result<Option<String>> {
+        match self.read_frame()? {
+            Some(bytes) => String::from_utf8(bytes).map(Some).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid UTF-8 in Adler frame: {}", e),
+                )
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// Convert this `AdlerFramedReader` into an iterator yielding verified frame byte buffers.
+    pub fn into_frames(self) -> AdlerFramedIter<R> {
+        AdlerFramedIter { reader: self }
+    }
+
+    /// Reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    /// Consume this reader, returning inner reader, field kind, max frame size, and frames read.
+    pub fn into_parts(self) -> (R, LengthFieldKind, usize, u64) {
+        (
+            self.inner,
+            self.field_kind,
+            self.max_frame_size,
+            self.frames_read,
+        )
+    }
+}
+
+/// Helper function to create a new `AdlerFramedReader` with standard 4-byte big-endian framing.
+pub fn adler_framed_reader<R: Read>(reader: R) -> AdlerFramedReader<R> {
+    AdlerFramedReader::new(reader)
+}
+
+/// Iterator over Adler-32 validated frames produced by an `AdlerFramedReader`.
+#[derive(Debug)]
+pub struct AdlerFramedIter<R: Read> {
+    reader: AdlerFramedReader<R>,
+}
+
+impl<R: Read> AdlerFramedIter<R> {
+    /// Reference to the underlying framed reader.
+    pub fn get_ref(&self) -> &AdlerFramedReader<R> {
+        &self.reader
+    }
+
+    /// Mutable reference to the underlying framed reader.
+    pub fn get_mut(&mut self) -> &mut AdlerFramedReader<R> {
+        &mut self.reader
+    }
+
+    /// Unwrap the inner `AdlerFramedReader`.
+    pub fn into_inner(self) -> AdlerFramedReader<R> {
+        self.reader
+    }
+}
+
+impl<R: Read> Iterator for AdlerFramedIter<R> {
+    type Item = io::Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.reader.read_frame() {
+            Ok(Some(frame)) => Some(Ok(frame)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7910,5 +8218,190 @@ mod base64_streaming_tests {
         assert_eq!(inner_r.len(), 5);
         assert_eq!(mfs, DEFAULT_MAX_FRAME_SIZE);
         assert_eq!(fr, 0);
+    }
+
+    #[test]
+    fn test_adler_framed_basic() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = adler_framed_writer(&mut sink);
+            assert_eq!(writer.length_field(), LengthFieldKind::U32Be);
+            assert_eq!(writer.frames_written(), 0);
+            assert_eq!(writer.bytes_written(), 0);
+
+            writer.write_frame(b"hello").unwrap();
+            writer.write_frame_str("world").unwrap();
+            writer.write_frame(b"").unwrap(); // empty frame test
+            writer.flush().unwrap();
+
+            assert_eq!(writer.frames_written(), 3);
+            // frame 1: 4 (len) + 4 (adler) + 5 = 13
+            // frame 2: 4 (len) + 4 (adler) + 5 = 13
+            // frame 3: 4 (len) + 4 (adler) + 0 = 8
+            // total = 34 bytes
+            assert_eq!(writer.bytes_written(), 34);
+        }
+
+        let mut reader = adler_framed_reader(sink.as_slice());
+        assert_eq!(reader.length_field(), LengthFieldKind::U32Be);
+        assert_eq!(reader.frames_read(), 0);
+
+        let f1 = reader.read_frame().unwrap().unwrap();
+        assert_eq!(f1, b"hello");
+        assert_eq!(reader.frames_read(), 1);
+
+        let s2 = reader.read_frame_to_string().unwrap().unwrap();
+        assert_eq!(s2, "world");
+        assert_eq!(reader.frames_read(), 2);
+
+        let f3 = reader.read_frame().unwrap().unwrap();
+        assert!(f3.is_empty());
+        assert_eq!(reader.frames_read(), 3);
+
+        // EOF clean
+        assert!(reader.read_frame().unwrap().is_none());
+        assert!(reader.read_frame_to_string().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_adler_framed_corruption_detection() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = AdlerFramedWriter::new(&mut sink);
+            writer.write_frame(b"critical secure message").unwrap();
+        }
+
+        // Corrupt one payload byte
+        let last_idx = sink.len() - 1;
+        sink[last_idx] ^= 0xFF;
+
+        let mut reader = AdlerFramedReader::new(sink.as_slice());
+        let err = reader.read_frame().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Adler-32 checksum mismatch"));
+    }
+
+    #[test]
+    fn test_adler_framed_iter_and_buf() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = AdlerFramedWriter::new(&mut sink);
+            writer.write_frame(b"packet_1").unwrap();
+            writer.write_frame(b"packet_2").unwrap();
+            writer.write_frame(b"packet_3").unwrap();
+        }
+
+        // Test reusable buffer
+        {
+            let mut reader = AdlerFramedReader::new(sink.as_slice());
+            let mut buf = Vec::new();
+            assert_eq!(reader.read_frame_buf(&mut buf).unwrap(), Some(8));
+            assert_eq!(&buf, b"packet_1");
+            assert_eq!(reader.read_frame_buf(&mut buf).unwrap(), Some(8));
+            assert_eq!(&buf, b"packet_2");
+            assert_eq!(reader.read_frame_buf(&mut buf).unwrap(), Some(8));
+            assert_eq!(&buf, b"packet_3");
+            assert_eq!(reader.read_frame_buf(&mut buf).unwrap(), None);
+        }
+
+        // Test into_frames iterator
+        let reader = AdlerFramedReader::new(sink.as_slice());
+        let mut iter = reader.into_frames();
+        assert_eq!(iter.get_ref().frames_read(), 0);
+        assert_eq!(iter.get_mut().frames_read(), 0);
+        let frames: Vec<Vec<u8>> = iter.map(|r| r.unwrap()).collect();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(&frames[0], b"packet_1");
+        assert_eq!(&frames[1], b"packet_2");
+        assert_eq!(&frames[2], b"packet_3");
+    }
+
+    #[test]
+    fn test_adler_framed_errors_and_options() {
+        // Test various LengthFieldKinds
+        let kinds = [
+            LengthFieldKind::U8,
+            LengthFieldKind::U16Le,
+            LengthFieldKind::U16Be,
+            LengthFieldKind::U32Le,
+            LengthFieldKind::U64Be,
+            LengthFieldKind::U64Le,
+        ];
+
+        for &kind in &kinds {
+            let mut sink = Vec::new();
+            {
+                let mut writer = AdlerFramedWriter::with_length_field(&mut sink, kind);
+                writer.write_frame(b"poly-framed").unwrap();
+            }
+            let mut reader = AdlerFramedReader::with_options(sink.as_slice(), kind, 1024);
+            let frame = reader.read_frame().unwrap().unwrap();
+            assert_eq!(frame, b"poly-framed");
+        }
+
+        // Exceeds max frame size
+        let mut sink = Vec::new();
+        {
+            let mut writer = AdlerFramedWriter::new(&mut sink);
+            writer.write_frame(b"excessive frame length").unwrap();
+        }
+        let mut reader =
+            AdlerFramedReader::with_options(sink.as_slice(), LengthFieldKind::U32Be, 10);
+        assert_eq!(reader.max_frame_size(), 10);
+        reader.set_max_frame_size(5);
+        assert_eq!(reader.max_frame_size(), 5);
+        let err = reader.read_frame().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds configured maximum"));
+
+        // Truncations: header, adler, and payload
+        let mut valid_sink = Vec::new();
+        {
+            let mut writer = AdlerFramedWriter::new(&mut valid_sink);
+            writer.write_frame(b"12345678").unwrap(); // 4 + 4 + 8 = 16 bytes
+        }
+        assert_eq!(valid_sink.len(), 16);
+
+        // Truncated header (read 2 of 4 bytes)
+        let mut r_hdr = AdlerFramedReader::new(&valid_sink[..2]);
+        let err_hdr = r_hdr.read_frame().unwrap_err();
+        assert_eq!(err_hdr.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(err_hdr
+            .to_string()
+            .contains("incomplete Adler frame length prefix"));
+
+        // Truncated adler (header present, but only 2 of 4 checksum bytes)
+        let mut r_adler = AdlerFramedReader::new(&valid_sink[..6]);
+        let err_adler = r_adler.read_frame().unwrap_err();
+        assert_eq!(err_adler.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Truncated payload (header and adler present, but only 4 of 8 payload bytes)
+        let mut r_pay = AdlerFramedReader::new(&valid_sink[..12]);
+        let err_pay = r_pay.read_frame().unwrap_err();
+        assert_eq!(err_pay.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Accessors & into_parts
+        let mut writer = AdlerFramedWriter::new(Vec::new());
+        writer.write_frame_str("alpha").unwrap();
+        assert_eq!(writer.get_ref().len(), 13);
+        assert_eq!(writer.get_mut().len(), 13);
+        let (inner_w, fk_w, fw, bw) = writer.into_parts();
+        assert_eq!(inner_w.len(), 13);
+        assert_eq!(fk_w, LengthFieldKind::U32Be);
+        assert_eq!(fw, 1);
+        assert_eq!(bw, 13);
+
+        let reader = AdlerFramedReader::new(&inner_w[..]);
+        assert_eq!(reader.get_ref().len(), 13);
+        let (inner_r, fk_r, mfs, fr) = reader.into_parts();
+        assert_eq!(inner_r.len(), 13);
+        assert_eq!(fk_r, LengthFieldKind::U32Be);
+        assert_eq!(mfs, DEFAULT_MAX_FRAME_SIZE);
+        assert_eq!(fr, 0);
+
+        // AdlerFramedIter into_inner
+        let reader2 = AdlerFramedReader::new(&inner_w[..]);
+        let iter2 = reader2.into_frames();
+        let _inner_r2 = iter2.into_inner();
     }
 }

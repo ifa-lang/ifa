@@ -64,20 +64,21 @@ pub use http::{
     PooledConnection, RouteSegment, SameSite, SessionStore, SseEvent, UpstreamBackend,
 };
 pub use io::{
-    adler32_digest, adler32_reader, adler32_writer, base64_reader, base64_writer, chain,
-    chunk_reader, chunk_writer, chunks, copy_stream, crc32_digest, crc32_reader, crc32_writer,
-    crc_framed_reader, crc_framed_writer, decode_ivarint, decode_sleb128, decode_uvarint,
-    delimited_reader, delimited_writer, empty, encode_ivarint, encode_sleb128, encode_sleb128_vec,
-    encode_uvarint, encode_uvarint_vec, framed_reader, framed_writer, hex_reader, hex_writer,
-    limited, limited_writer, multi_reader, multi_writer, pad_writer, pipe_lines, prefix_writer,
-    prefixed, pushback_reader, read_ivarint, read_sleb128, read_to_end as io_read_to_end,
-    read_to_string as io_read_to_string, read_uvarint, repeat, sink, skip_reader, suffix_writer,
-    suffixed, try_read_ivarint, try_read_sleb128, try_read_uvarint, varint_framed_reader,
-    varint_framed_writer, varint_reader, varint_writer, write_ivarint, write_sleb128,
-    write_uvarint, zigzag_decode, zigzag_encode, Adler32Hasher, Adler32Reader, Adler32Writer,
-    Base64Reader, Base64Writer, BufferedReader, BufferedWriter, ChainedReader, ChunkIter,
-    ChunkReader, ChunkWriter, CountingReader, CountingWriter, Crc32Hasher, Crc32Reader,
-    Crc32Writer, CrcFramedIter, CrcFramedReader, CrcFramedWriter, DelimitedIter, DelimitedReader,
+    adler32_digest, adler32_reader, adler32_writer, adler_framed_reader, adler_framed_writer,
+    base64_reader, base64_writer, chain, chunk_reader, chunk_writer, chunks, copy_stream,
+    crc32_digest, crc32_reader, crc32_writer, crc_framed_reader, crc_framed_writer, decode_ivarint,
+    decode_sleb128, decode_uvarint, delimited_reader, delimited_writer, empty, encode_ivarint,
+    encode_sleb128, encode_sleb128_vec, encode_uvarint, encode_uvarint_vec, framed_reader,
+    framed_writer, hex_reader, hex_writer, limited, limited_writer, multi_reader, multi_writer,
+    pad_writer, pipe_lines, prefix_writer, prefixed, pushback_reader, read_ivarint, read_sleb128,
+    read_to_end as io_read_to_end, read_to_string as io_read_to_string, read_uvarint, repeat, sink,
+    skip_reader, suffix_writer, suffixed, try_read_ivarint, try_read_sleb128, try_read_uvarint,
+    varint_framed_reader, varint_framed_writer, varint_reader, varint_writer, write_ivarint,
+    write_sleb128, write_uvarint, zigzag_decode, zigzag_encode, Adler32Hasher, Adler32Reader,
+    Adler32Writer, AdlerFramedIter, AdlerFramedReader, AdlerFramedWriter, Base64Reader,
+    Base64Writer, BufferedReader, BufferedWriter, ChainedReader, ChunkIter, ChunkReader,
+    ChunkWriter, CountingReader, CountingWriter, Crc32Hasher, Crc32Reader, Crc32Writer,
+    CrcFramedIter, CrcFramedReader, CrcFramedWriter, DelimitedIter, DelimitedReader,
     DelimitedWriter, EmptyReader, FramedIter, FramedReader, FramedWriter, HexReader, HexWriter,
     IVarintIter, LengthFieldKind, LimitedReader, LimitedWriter, LineWriter, MemoryStream,
     MultiReader, MultiWriter, PadWriter, PrefixWriter, PrefixedReader, PushbackReader,
@@ -1035,6 +1036,29 @@ mod tests {
         assert_eq!(
             reader.read_frame().unwrap(),
             Some(b"stream payload".to_vec())
+        );
+        assert_eq!(reader.read_frame().unwrap(), None);
+        assert_eq!(reader.frames_read(), 2);
+    }
+
+    #[test]
+    fn test_io_adler_framed_prelude_exports() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = adler_framed_writer(&mut sink);
+            writer.write_frame_str("ifa-adler-frame").unwrap();
+            writer.write_frame(b"adler payload").unwrap();
+            assert_eq!(writer.frames_written(), 2);
+        }
+
+        let mut reader = adler_framed_reader(sink.as_slice());
+        assert_eq!(
+            reader.read_frame_to_string().unwrap(),
+            Some("ifa-adler-frame".to_string())
+        );
+        assert_eq!(
+            reader.read_frame().unwrap(),
+            Some(b"adler payload".to_vec())
         );
         assert_eq!(reader.read_frame().unwrap(), None);
         assert_eq!(reader.frames_read(), 2);
