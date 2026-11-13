@@ -697,6 +697,106 @@ impl<R1: Read, R2: Read> Read for ChainedReader<R1, R2> {
     }
 }
 
+/// Reader wrapper that duplicates each byte read into a secondary writer.
+/// Analogous to the UNIX `tee` utility or Go's `io.TeeReader`.
+pub struct TeeReader<R: Read, W: Write> {
+    reader: R,
+    writer: W,
+}
+
+impl<R: Read, W: Write> TeeReader<R, W> {
+    /// Create a new `TeeReader` reading from `reader` and mirroring to `writer`.
+    pub fn new(reader: R, writer: W) -> Self {
+        Self { reader, writer }
+    }
+
+    /// Access the underlying reader.
+    pub fn get_reader(&self) -> &R {
+        &self.reader
+    }
+
+    /// Mutably access the underlying reader.
+    pub fn get_reader_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
+    /// Access the underlying writer.
+    pub fn get_writer(&self) -> &W {
+        &self.writer
+    }
+
+    /// Mutably access the underlying writer.
+    pub fn get_writer_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
+    /// Unpack both the reader and writer.
+    pub fn into_inner(self) -> (R, W) {
+        (self.reader, self.writer)
+    }
+}
+
+impl<R: Read, W: Write> Read for TeeReader<R, W> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.reader.read(buf)?;
+        if n > 0 {
+            self.writer.write_all(&buf[..n])?;
+        }
+        Ok(n)
+    }
+}
+
+/// Writer wrapper that writes each byte to two destinations simultaneously.
+pub struct TeeWriter<W1: Write, W2: Write> {
+    writer1: W1,
+    writer2: W2,
+}
+
+impl<W1: Write, W2: Write> TeeWriter<W1, W2> {
+    /// Create a new `TeeWriter` copying writes to both writers.
+    pub fn new(writer1: W1, writer2: W2) -> Self {
+        Self { writer1, writer2 }
+    }
+
+    /// Access the first writer.
+    pub fn get_first(&self) -> &W1 {
+        &self.writer1
+    }
+
+    /// Mutably access the first writer.
+    pub fn get_first_mut(&mut self) -> &mut W1 {
+        &mut self.writer1
+    }
+
+    /// Access the second writer.
+    pub fn get_second(&self) -> &W2 {
+        &self.writer2
+    }
+
+    /// Mutably access the second writer.
+    pub fn get_second_mut(&mut self) -> &mut W2 {
+        &mut self.writer2
+    }
+
+    /// Unpack both underlying writers.
+    pub fn into_inner(self) -> (W1, W2) {
+        (self.writer1, self.writer2)
+    }
+}
+
+impl<W1: Write, W2: Write> Write for TeeWriter<W1, W2> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writer1.write_all(buf)?;
+        self.writer2.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer1.flush()?;
+        self.writer2.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,5 +954,29 @@ mod tests {
         let copied = copy_stream(&mut mem_src, &mut mem_dst).unwrap();
         assert_eq!(copied, 16);
         assert_eq!(mem_dst.as_bytes(), b"stream copy test");
+    }
+
+    #[test]
+    fn test_tee_reader_and_writer() {
+        // Test TeeReader
+        let src = b"hello stream tee";
+        let mut mirrored = Vec::new();
+        let mut tee = TeeReader::new(&src[..], &mut mirrored);
+        let mut consumed = Vec::new();
+        tee.read_to_end(&mut consumed).unwrap();
+
+        assert_eq!(consumed, b"hello stream tee");
+        assert_eq!(mirrored, b"hello stream tee");
+
+        // Test TeeWriter
+        let mut out1 = Vec::new();
+        let mut out2 = Vec::new();
+        {
+            let mut tw = TeeWriter::new(&mut out1, &mut out2);
+            tw.write_all(b"dual output").unwrap();
+            tw.flush().unwrap();
+        }
+        assert_eq!(out1, b"dual output");
+        assert_eq!(out2, b"dual output");
     }
 }

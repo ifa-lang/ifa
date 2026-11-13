@@ -66,7 +66,7 @@ pub use http::{
 pub use io::{
     copy_stream, pipe_lines, read_to_end as io_read_to_end, read_to_string as io_read_to_string,
     BufferedReader, BufferedWriter, ChainedReader, CountingReader, CountingWriter, LimitedReader,
-    LineWriter, MemoryStream,
+    LineWriter, MemoryStream, TeeReader, TeeWriter,
 };
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};
 pub use json::{
@@ -935,5 +935,29 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind prelude TcpListener");
         assert!(listener.port().unwrap() > 0);
+    }
+
+    #[test]
+    fn test_io_tee_stream_exports() {
+        use std::io::{Read, Write};
+
+        let data = b"tee stream verification";
+        let mut tap = Vec::new();
+        let mut tee = TeeReader::new(&data[..], &mut tap);
+        let mut result = Vec::new();
+        tee.read_to_end(&mut result).unwrap();
+
+        assert_eq!(result, b"tee stream verification");
+        assert_eq!(tap, b"tee stream verification");
+
+        let mut dest1 = Vec::new();
+        let mut dest2 = Vec::new();
+        {
+            let mut tw = TeeWriter::new(&mut dest1, &mut dest2);
+            tw.write_all(b"dual write verification").unwrap();
+            tw.flush().unwrap();
+        }
+        assert_eq!(dest1, b"dual write verification");
+        assert_eq!(dest2, b"dual write verification");
     }
 }
