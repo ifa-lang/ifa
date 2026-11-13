@@ -65,11 +65,12 @@ pub use http::{
 };
 pub use io::{
     chain, chunk_reader, chunk_writer, chunks, copy_stream, empty, limited, limited_writer,
-    multi_reader, multi_writer, pad_writer, pipe_lines, prefixed, read_to_end as io_read_to_end,
-    read_to_string as io_read_to_string, repeat, sink, skip_reader, BufferedReader, BufferedWriter,
-    ChainedReader, ChunkIter, ChunkReader, ChunkWriter, CountingReader, CountingWriter,
-    EmptyReader, LimitedReader, LimitedWriter, LineWriter, MemoryStream, MultiReader, MultiWriter,
-    PadWriter, PrefixedReader, RepeatReader, SinkWriter, SkipReader, TeeReader, TeeWriter,
+    multi_reader, multi_writer, pad_writer, pipe_lines, prefix_writer, prefixed, pushback_reader,
+    read_to_end as io_read_to_end, read_to_string as io_read_to_string, repeat, sink, skip_reader,
+    BufferedReader, BufferedWriter, ChainedReader, ChunkIter, ChunkReader, ChunkWriter,
+    CountingReader, CountingWriter, EmptyReader, LimitedReader, LimitedWriter, LineWriter,
+    MemoryStream, MultiReader, MultiWriter, PadWriter, PrefixWriter, PrefixedReader,
+    PushbackReader, RepeatReader, SinkWriter, SkipReader, TeeReader, TeeWriter,
 };
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};
 pub use json::{

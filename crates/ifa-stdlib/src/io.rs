@@ -1644,6 +1644,250 @@ impl<W: Write> Write for PadWriter<W> {
     }
 }
 
+/// Reader wrapper that allows bytes to be pushed back (unread) into the stream
+/// to be consumed by subsequent read operations, and provides lookahead peeking functionality.
+#[derive(Debug, Clone)]
+pub struct PushbackReader<R: Read> {
+    inner: R,
+    buffer: Vec<u8>,
+    pos: usize,
+}
+
+impl<R: Read> PushbackReader<R> {
+    /// Create a new `PushbackReader` wrapping `inner`.
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buffer: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    /// Create a new `PushbackReader` with preallocated buffer capacity.
+    pub fn with_capacity(inner: R, capacity: usize) -> Self {
+        Self {
+            inner,
+            buffer: Vec::with_capacity(capacity),
+            pos: 0,
+        }
+    }
+
+    /// Push bytes back onto the stream so they will be read next.
+    /// If multiple bytes are pushed back, they will be read in the order provided:
+    /// e.g. pushing `[1, 2]` means `1` will be read before `2`.
+    pub fn unread(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.pos > 0 {
+            self.buffer.drain(..self.pos);
+            self.pos = 0;
+        }
+        let mut new_buf = Vec::with_capacity(bytes.len() + self.buffer.len());
+        new_buf.extend_from_slice(bytes);
+        new_buf.extend_from_slice(&self.buffer);
+        self.buffer = new_buf;
+    }
+
+    /// Push a single byte back onto the stream.
+    pub fn unread_byte(&mut self, byte: u8) {
+        self.unread(&[byte]);
+    }
+
+    /// Number of bytes currently held in the pushback buffer.
+    pub fn unread_len(&self) -> usize {
+        self.buffer.len().saturating_sub(self.pos)
+    }
+
+    /// Returns `true` if there are pushback bytes waiting to be read.
+    pub fn has_unread(&self) -> bool {
+        self.unread_len() > 0
+    }
+
+    /// Clear all pushback bytes.
+    pub fn clear_unread(&mut self) {
+        self.buffer.clear();
+        self.pos = 0;
+    }
+
+    /// Peek up to `buf.len()` bytes from the stream without advancing the read position.
+    pub fn peek(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let available = self.unread_len();
+        if available < buf.len() {
+            let needed = buf.len() - available;
+            let mut temp = vec![0u8; needed];
+            let n = self.inner.read(&mut temp)?;
+            if n > 0 {
+                if self.pos > 0 {
+                    self.buffer.drain(..self.pos);
+                    self.pos = 0;
+                }
+                self.buffer.extend_from_slice(&temp[..n]);
+            }
+        }
+        let available_now = self.unread_len();
+        let to_copy = buf.len().min(available_now);
+        buf[..to_copy].copy_from_slice(&self.buffer[self.pos..self.pos + to_copy]);
+        Ok(to_copy)
+    }
+
+    /// Peek a single byte from the stream without consuming it.
+    pub fn peek_byte(&mut self) -> io::Result<Option<u8>> {
+        let mut b = [0u8; 1];
+        let n = self.peek(&mut b)?;
+        if n == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(b[0]))
+        }
+    }
+
+    /// Reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Consume this wrapper, returning the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+/// Helper function to create a new `PushbackReader`.
+pub fn pushback_reader<R: Read>(reader: R) -> PushbackReader<R> {
+    PushbackReader::new(reader)
+}
+
+impl<R: Read> Read for PushbackReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.pos < self.buffer.len() {
+            let available = self.buffer.len() - self.pos;
+            let to_read = available.min(buf.len());
+            buf[..to_read].copy_from_slice(&self.buffer[self.pos..self.pos + to_read]);
+            self.pos += to_read;
+            if self.pos >= self.buffer.len() {
+                self.buffer.clear();
+                self.pos = 0;
+            }
+            Ok(to_read)
+        } else {
+            self.inner.read(buf)
+        }
+    }
+}
+
+impl<R: BufRead> BufRead for PushbackReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.pos < self.buffer.len() {
+            Ok(&self.buffer[self.pos..])
+        } else {
+            self.inner.fill_buf()
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        if self.pos < self.buffer.len() {
+            let available = self.buffer.len() - self.pos;
+            let consumed = amt.min(available);
+            self.pos += consumed;
+            if self.pos >= self.buffer.len() {
+                self.buffer.clear();
+                self.pos = 0;
+            }
+            let remaining = amt.saturating_sub(consumed);
+            if remaining > 0 {
+                self.inner.consume(remaining);
+            }
+        } else {
+            self.inner.consume(amt);
+        }
+    }
+}
+
+/// Writer wrapper that automatically writes a specified prefix (header, magic bytes)
+/// to the underlying stream before any payload bytes are written or upon the first flush.
+#[derive(Debug, Clone)]
+pub struct PrefixWriter<W: Write> {
+    inner: W,
+    prefix: Vec<u8>,
+    prefix_written: bool,
+}
+
+impl<W: Write> PrefixWriter<W> {
+    /// Create a new `PrefixWriter` that prepends `prefix` on the first write or flush.
+    pub fn new(inner: W, prefix: Vec<u8>) -> Self {
+        Self {
+            inner,
+            prefix,
+            prefix_written: false,
+        }
+    }
+
+    /// The prefix bytes to be written.
+    pub fn prefix(&self) -> &[u8] {
+        &self.prefix
+    }
+
+    /// Whether the prefix has already been written to the underlying stream.
+    pub fn is_prefix_written(&self) -> bool {
+        self.prefix_written
+    }
+
+    /// Explicitly ensure the prefix has been written to the underlying writer.
+    pub fn write_prefix(&mut self) -> io::Result<()> {
+        if !self.prefix_written {
+            if !self.prefix.is_empty() {
+                self.inner.write_all(&self.prefix)?;
+            }
+            self.prefix_written = true;
+        }
+        Ok(())
+    }
+
+    /// Reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Consume this wrapper, returning the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+/// Helper function to create a new `PrefixWriter`.
+pub fn prefix_writer<W: Write>(writer: W, prefix: Vec<u8>) -> PrefixWriter<W> {
+    PrefixWriter::new(writer, prefix)
+}
+
+impl<W: Write> Write for PrefixWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_prefix()?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.write_prefix()?;
+        self.inner.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2202,5 +2446,100 @@ mod tests {
         assert_eq!(pw2.get_ref(), b"init");
         let inner = pw2.into_inner();
         assert_eq!(inner, b"init");
+    }
+
+    #[test]
+    fn test_pushback_reader() {
+        let data = b"hello world";
+        let mut pbr = pushback_reader(&data[..]);
+        assert_eq!(pbr.unread_len(), 0);
+        assert!(!pbr.has_unread());
+        assert_eq!(pbr.get_ref(), &&data[..]);
+
+        // Peek byte before consuming
+        assert_eq!(pbr.peek_byte().unwrap(), Some(b'h'));
+        assert_eq!(pbr.unread_len(), 1);
+        assert!(pbr.has_unread());
+
+        // Peek multiple bytes
+        let mut peek_buf = [0u8; 4];
+        let n_peek = pbr.peek(&mut peek_buf).unwrap();
+        assert_eq!(n_peek, 4);
+        assert_eq!(&peek_buf, b"hell");
+
+        // Read 3 bytes (should come from the peeked/pushback buffer)
+        let mut read_buf = [0u8; 3];
+        let n_read = pbr.read(&mut read_buf).unwrap();
+        assert_eq!(n_read, 3);
+        assert_eq!(&read_buf, b"hel");
+        assert_eq!(pbr.unread_len(), 1); // 'l' still unread
+
+        // Unread bytes
+        pbr.unread(b"XYZ");
+        assert_eq!(pbr.unread_len(), 4); // "XYZl"
+        assert!(pbr.has_unread());
+
+        let mut read_all = Vec::new();
+        pbr.read_to_end(&mut read_all).unwrap();
+        assert_eq!(read_all, b"XYZlo world");
+        assert_eq!(pbr.unread_len(), 0);
+        assert!(!pbr.has_unread());
+
+        // Test unread_byte and clear_unread
+        let mut pbr2 = PushbackReader::with_capacity(&data[..], 16);
+        pbr2.unread_byte(b'A');
+        pbr2.unread_byte(b'B');
+        assert_eq!(pbr2.unread_len(), 2);
+        pbr2.clear_unread();
+        assert_eq!(pbr2.unread_len(), 0);
+
+        // Test BufRead implementation
+        let lines_data = b"first line\nsecond line\n";
+        let mut pbr_buf = pushback_reader(BufferedReader::new(&lines_data[..]));
+        pbr_buf.unread(b"injected ");
+        let mut line = String::new();
+        pbr_buf.read_line(&mut line).unwrap();
+        assert_eq!(line, "injected first line\n");
+
+        // Test into_inner and get_mut
+        pbr2.get_mut();
+        let _inner = pbr2.into_inner();
+    }
+
+    #[test]
+    fn test_prefix_writer() {
+        let mut out = Vec::new();
+        let mut pw = prefix_writer(&mut out, b"HEADER:".to_vec());
+        assert_eq!(pw.prefix(), b"HEADER:");
+        assert!(!pw.is_prefix_written());
+        assert_eq!(pw.get_ref().len(), 0);
+
+        // First write should write prefix first
+        let n = pw.write(b"data").unwrap();
+        assert_eq!(n, 4);
+        assert!(pw.is_prefix_written());
+        pw.flush().unwrap();
+        assert_eq!(pw.get_ref().as_slice(), b"HEADER:data");
+
+        // Subsequent write should not write prefix again
+        pw.write_all(b"-more").unwrap();
+        pw.flush().unwrap();
+        assert_eq!(pw.get_ref().as_slice(), b"HEADER:data-more");
+        drop(pw);
+        assert_eq!(out, b"HEADER:data-more");
+
+        // Test flush without prior write writes prefix
+        let mut pw2 = prefix_writer(Vec::new(), b"MAGIC".to_vec());
+        pw2.flush().unwrap();
+        assert!(pw2.is_prefix_written());
+        assert_eq!(pw2.get_ref(), b"MAGIC");
+
+        // Test write_prefix explicit call
+        let mut pw3 = prefix_writer(Vec::new(), b"PREFIX".to_vec());
+        pw3.write_prefix().unwrap();
+        assert!(pw3.is_prefix_written());
+        assert_eq!(pw3.get_ref(), b"PREFIX");
+        let inner = pw3.into_inner();
+        assert_eq!(inner, b"PREFIX");
     }
 }
