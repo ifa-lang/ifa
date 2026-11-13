@@ -2812,6 +2812,536 @@ impl<R: Read> Iterator for CrcFramedIter<R> {
     }
 }
 
+// ─── Varint / LEB128 & ZigZag Encoding and I/O Adapters ──────────────────────
+
+/// Maximum length in bytes of an encoded 64-bit unsigned integer (LEB128 varint).
+pub const MAX_VARINT_LEN_U64: usize = 10;
+
+/// Maximum length in bytes of an encoded 32-bit unsigned integer (LEB128 varint).
+pub const MAX_VARINT_LEN_U32: usize = 5;
+
+/// ZigZag-encodes a signed 64-bit integer into an unsigned 64-bit integer.
+///
+/// Maps small signed integers (positive or negative) to small unsigned integers:
+/// `0 -> 0`, `-1 -> 1`, `1 -> 2`, `-2 -> 3`, etc.
+#[inline]
+pub const fn zigzag_encode(val: i64) -> u64 {
+    ((val as u64) << 1) ^ ((val >> 63) as u64)
+}
+
+/// Decodes a ZigZag-encoded unsigned 64-bit integer back to a signed 64-bit integer.
+#[inline]
+pub const fn zigzag_decode(val: u64) -> i64 {
+    let half = (val >> 1) as i64;
+    if (val & 1) == 1 {
+        !half
+    } else {
+        half
+    }
+}
+
+/// Encodes a 64-bit unsigned integer into standard LEB128 varint format into `buf`.
+///
+/// Returns the number of bytes written (between 1 and 10).
+///
+/// # Panics
+/// Panics if `buf.len()` is insufficient to hold the encoded value.
+pub fn encode_uvarint(mut val: u64, buf: &mut [u8]) -> usize {
+    let mut i = 0;
+    while val >= 0x80 {
+        assert!(i < buf.len(), "buffer too small for varint encoding");
+        buf[i] = ((val & 0x7F) as u8) | 0x80;
+        val >>= 7;
+        i += 1;
+    }
+    assert!(i < buf.len(), "buffer too small for varint encoding");
+    buf[i] = val as u8;
+    i + 1
+}
+
+/// Encodes a 64-bit unsigned integer into standard LEB128 varint format, appending bytes to `out`.
+///
+/// Returns the number of bytes appended (between 1 and 10).
+pub fn encode_uvarint_vec(mut val: u64, out: &mut Vec<u8>) -> usize {
+    let mut count = 0;
+    while val >= 0x80 {
+        out.push(((val & 0x7F) as u8) | 0x80);
+        val >>= 7;
+        count += 1;
+    }
+    out.push(val as u8);
+    count + 1
+}
+
+/// Decodes a 64-bit unsigned integer from a LEB128 varint byte slice.
+///
+/// Returns `Ok((value, bytes_consumed))` on success.
+/// Returns `ErrorKind::UnexpectedEof` if the slice ends before the termination byte.
+/// Returns `ErrorKind::InvalidData` if the encoded integer overflows 64 bits.
+pub fn decode_uvarint(slice: &[u8]) -> io::Result<(u64, usize)> {
+    let mut res: u64 = 0;
+    let mut shift: u32 = 0;
+    for (i, &byte) in slice.iter().enumerate() {
+        if i >= MAX_VARINT_LEN_U64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Varint overflow: exceeds 64-bit integer representation",
+            ));
+        }
+        let val = (byte & 0x7F) as u64;
+        if i == 9 && val > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Varint overflow: 10th byte exceeds 1-bit capacity for 64-bit unsigned integer",
+            ));
+        }
+        res |= val << shift;
+        if (byte & 0x80) == 0 {
+            return Ok((res, i + 1));
+        }
+        shift += 7;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "Unexpected EOF while decoding varint",
+    ))
+}
+
+/// Encodes a signed 64-bit integer using ZigZag encoding and LEB128 varint into `buf`.
+///
+/// Returns the number of bytes written.
+pub fn encode_ivarint(val: i64, buf: &mut [u8]) -> usize {
+    encode_uvarint(zigzag_encode(val), buf)
+}
+
+/// Decodes a signed 64-bit integer from a ZigZag-encoded LEB128 byte slice.
+///
+/// Returns `Ok((value, bytes_consumed))`.
+pub fn decode_ivarint(slice: &[u8]) -> io::Result<(i64, usize)> {
+    let (u, len) = decode_uvarint(slice)?;
+    Ok((zigzag_decode(u), len))
+}
+
+/// Writes an unsigned 64-bit integer as a LEB128 varint to `writer`.
+///
+/// Returns the number of bytes written.
+pub fn write_uvarint<W: Write>(writer: &mut W, val: u64) -> io::Result<usize> {
+    let mut buf = [0u8; MAX_VARINT_LEN_U64];
+    let n = encode_uvarint(val, &mut buf);
+    writer.write_all(&buf[..n])?;
+    Ok(n)
+}
+
+/// Writes a signed 64-bit integer as a ZigZag-encoded LEB128 varint to `writer`.
+///
+/// Returns the number of bytes written.
+pub fn write_ivarint<W: Write>(writer: &mut W, val: i64) -> io::Result<usize> {
+    write_uvarint(writer, zigzag_encode(val))
+}
+
+/// Attempts to read an unsigned 64-bit integer as a LEB128 varint from `reader`.
+///
+/// Returns `Ok(Some(value))` if successfully decoded.
+/// Returns `Ok(None)` if clean EOF is encountered before any byte is read.
+/// Returns `ErrorKind::UnexpectedEof` if EOF occurs after reading partial continuation bytes.
+/// Returns `ErrorKind::InvalidData` if the integer exceeds 64 bits.
+pub fn try_read_uvarint<R: Read>(reader: &mut R) -> io::Result<Option<u64>> {
+    let mut res: u64 = 0;
+    let mut shift: u32 = 0;
+    let mut buf = [0u8; 1];
+    let mut bytes_read = 0;
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            if bytes_read == 0 {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Unexpected EOF while reading varint sequence",
+            ));
+        }
+
+        let byte = buf[0];
+        bytes_read += 1;
+
+        if bytes_read > MAX_VARINT_LEN_U64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Varint overflow: exceeds 64-bit integer representation",
+            ));
+        }
+
+        let val = (byte & 0x7F) as u64;
+        if bytes_read == 10 && val > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Varint overflow: 10th byte exceeds 1-bit capacity for 64-bit unsigned integer",
+            ));
+        }
+
+        res |= val << shift;
+        if (byte & 0x80) == 0 {
+            return Ok(Some(res));
+        }
+        shift += 7;
+    }
+}
+
+/// Reads an unsigned 64-bit integer as a LEB128 varint from `reader`.
+///
+/// Returns `ErrorKind::UnexpectedEof` if no bytes are available or stream ends prematurely.
+pub fn read_uvarint<R: Read>(reader: &mut R) -> io::Result<u64> {
+    match try_read_uvarint(reader)? {
+        Some(v) => Ok(v),
+        None => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Unexpected EOF: no varint data available",
+        )),
+    }
+}
+
+/// Attempts to read a signed 64-bit ZigZag-encoded LEB128 varint from `reader`.
+pub fn try_read_ivarint<R: Read>(reader: &mut R) -> io::Result<Option<i64>> {
+    Ok(try_read_uvarint(reader)?.map(zigzag_decode))
+}
+
+/// Reads a signed 64-bit ZigZag-encoded LEB128 varint from `reader`.
+pub fn read_ivarint<R: Read>(reader: &mut R) -> io::Result<i64> {
+    let u = read_uvarint(reader)?;
+    Ok(zigzag_decode(u))
+}
+
+/// Stream writer adapter that encodes integers as compact LEB128 / ZigZag varints.
+#[derive(Debug, Clone)]
+pub struct VarintWriter<W: Write> {
+    inner: W,
+    values_written: u64,
+    bytes_written: u64,
+}
+
+impl<W: Write> VarintWriter<W> {
+    /// Create a new `VarintWriter` wrapping `inner`.
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            values_written: 0,
+            bytes_written: 0,
+        }
+    }
+
+    /// Write an unsigned 64-bit integer in LEB128 format.
+    pub fn write_uvarint(&mut self, val: u64) -> io::Result<usize> {
+        let n = write_uvarint(&mut self.inner, val)?;
+        self.values_written += 1;
+        self.bytes_written += n as u64;
+        Ok(n)
+    }
+
+    /// Write a signed 64-bit integer in ZigZag LEB128 format.
+    pub fn write_ivarint(&mut self, val: i64) -> io::Result<usize> {
+        let n = write_ivarint(&mut self.inner, val)?;
+        self.values_written += 1;
+        self.bytes_written += n as u64;
+        Ok(n)
+    }
+
+    /// Write an unsigned 32-bit integer in LEB128 format.
+    pub fn write_u32(&mut self, val: u32) -> io::Result<usize> {
+        self.write_uvarint(val as u64)
+    }
+
+    /// Write a signed 32-bit integer in ZigZag LEB128 format.
+    pub fn write_i32(&mut self, val: i32) -> io::Result<usize> {
+        self.write_ivarint(val as i64)
+    }
+
+    /// Total count of integer values written through this adapter.
+    pub fn values_written(&self) -> u64 {
+        self.values_written
+    }
+
+    /// Total count of bytes written through this adapter.
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    /// Reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Consume this adapter, returning the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    /// Consume this adapter, returning `(inner, values_written, bytes_written)`.
+    pub fn into_parts(self) -> (W, u64, u64) {
+        (self.inner, self.values_written, self.bytes_written)
+    }
+}
+
+impl<W: Write> Write for VarintWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.bytes_written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Stream reader adapter that decodes compact LEB128 / ZigZag varints.
+#[derive(Debug, Clone)]
+pub struct VarintReader<R: Read> {
+    inner: R,
+    values_read: u64,
+    bytes_read: u64,
+}
+
+impl<R: Read> VarintReader<R> {
+    /// Create a new `VarintReader` wrapping `inner`.
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            values_read: 0,
+            bytes_read: 0,
+        }
+    }
+
+    /// Attempt to read the next unsigned 64-bit LEB128 varint.
+    ///
+    /// Returns `Ok(Some(val))` on success, or `Ok(None)` if clean EOF is reached.
+    pub fn try_read_uvarint(&mut self) -> io::Result<Option<u64>> {
+        let mut res: u64 = 0;
+        let mut shift: u32 = 0;
+        let mut buf = [0u8; 1];
+        let mut bytes_for_this = 0;
+
+        loop {
+            let n = self.inner.read(&mut buf)?;
+            if n == 0 {
+                if bytes_for_this == 0 {
+                    return Ok(None);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Unexpected EOF in the middle of varint byte sequence",
+                ));
+            }
+
+            let byte = buf[0];
+            bytes_for_this += 1;
+            self.bytes_read += 1;
+
+            if bytes_for_this > MAX_VARINT_LEN_U64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Varint overflow: exceeds 64-bit integer representation",
+                ));
+            }
+
+            let val = (byte & 0x7F) as u64;
+            if bytes_for_this == 10 && val > 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Varint overflow: 10th byte exceeds 1-bit capacity for 64-bit unsigned integer",
+                ));
+            }
+
+            res |= val << shift;
+            if (byte & 0x80) == 0 {
+                self.values_read += 1;
+                return Ok(Some(res));
+            }
+            shift += 7;
+        }
+    }
+
+    /// Read the next unsigned 64-bit LEB128 varint.
+    pub fn read_uvarint(&mut self) -> io::Result<u64> {
+        match self.try_read_uvarint()? {
+            Some(v) => Ok(v),
+            None => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Unexpected EOF: no varint data available",
+            )),
+        }
+    }
+
+    /// Attempt to read the next signed 64-bit ZigZag LEB128 varint.
+    pub fn try_read_ivarint(&mut self) -> io::Result<Option<i64>> {
+        Ok(self.try_read_uvarint()?.map(zigzag_decode))
+    }
+
+    /// Read the next signed 64-bit ZigZag LEB128 varint.
+    pub fn read_ivarint(&mut self) -> io::Result<i64> {
+        let u = self.read_uvarint()?;
+        Ok(zigzag_decode(u))
+    }
+
+    /// Read the next unsigned 32-bit LEB128 varint.
+    pub fn read_u32(&mut self) -> io::Result<u32> {
+        let val = self.read_uvarint()?;
+        if val > u32::MAX as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Varint value exceeds u32 range",
+            ));
+        }
+        Ok(val as u32)
+    }
+
+    /// Read the next signed 32-bit ZigZag LEB128 varint.
+    pub fn read_i32(&mut self) -> io::Result<i32> {
+        let val = self.read_ivarint()?;
+        if val < (i32::MIN as i64) || val > (i32::MAX as i64) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Varint value exceeds i32 range",
+            ));
+        }
+        Ok(val as i32)
+    }
+
+    /// Total count of integer values read through this adapter.
+    pub fn values_read(&self) -> u64 {
+        self.values_read
+    }
+
+    /// Total count of bytes read through this adapter.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Consume this adapter, returning the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    /// Consume this adapter, returning `(inner, values_read, bytes_read)`.
+    pub fn into_parts(self) -> (R, u64, u64) {
+        (self.inner, self.values_read, self.bytes_read)
+    }
+
+    /// Create an iterator yielding `io::Result<u64>` until clean EOF.
+    pub fn into_uvarints(self) -> UVarintIter<R> {
+        UVarintIter { reader: self }
+    }
+
+    /// Create an iterator yielding `io::Result<i64>` until clean EOF.
+    pub fn into_ivarints(self) -> IVarintIter<R> {
+        IVarintIter { reader: self }
+    }
+}
+
+impl<R: Read> Read for VarintReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes_read += n as u64;
+        Ok(n)
+    }
+}
+
+/// Iterator over unsigned 64-bit varints read from a `VarintReader`.
+#[derive(Debug)]
+pub struct UVarintIter<R: Read> {
+    reader: VarintReader<R>,
+}
+
+impl<R: Read> UVarintIter<R> {
+    /// Reference to the underlying `VarintReader`.
+    pub fn get_ref(&self) -> &VarintReader<R> {
+        &self.reader
+    }
+
+    /// Mutable reference to the underlying `VarintReader`.
+    pub fn get_mut(&mut self) -> &mut VarintReader<R> {
+        &mut self.reader
+    }
+
+    /// Consume this iterator, returning the underlying `VarintReader`.
+    pub fn into_inner(self) -> VarintReader<R> {
+        self.reader
+    }
+}
+
+impl<R: Read> Iterator for UVarintIter<R> {
+    type Item = io::Result<u64>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.reader.try_read_uvarint() {
+            Ok(Some(v)) => Some(Ok(v)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+/// Iterator over signed 64-bit varints read from a `VarintReader`.
+#[derive(Debug)]
+pub struct IVarintIter<R: Read> {
+    reader: VarintReader<R>,
+}
+
+impl<R: Read> IVarintIter<R> {
+    /// Reference to the underlying `VarintReader`.
+    pub fn get_ref(&self) -> &VarintReader<R> {
+        &self.reader
+    }
+
+    /// Mutable reference to the underlying `VarintReader`.
+    pub fn get_mut(&mut self) -> &mut VarintReader<R> {
+        &mut self.reader
+    }
+
+    /// Consume this iterator, returning the underlying `VarintReader`.
+    pub fn into_inner(self) -> VarintReader<R> {
+        self.reader
+    }
+}
+
+impl<R: Read> Iterator for IVarintIter<R> {
+    type Item = io::Result<i64>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.reader.try_read_ivarint() {
+            Ok(Some(v)) => Some(Ok(v)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+/// Convenience constructor for [`VarintWriter`].
+pub fn varint_writer<W: Write>(writer: W) -> VarintWriter<W> {
+    VarintWriter::new(writer)
+}
+
+/// Convenience constructor for [`VarintReader`].
+pub fn varint_reader<R: Read>(reader: R) -> VarintReader<R> {
+    VarintReader::new(reader)
+}
+
 /// Helper function to locate a byte needle in a haystack slice without allocations.
 #[inline]
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -6369,5 +6899,240 @@ mod base64_streaming_tests {
         assert_eq!(kind_r, LengthFieldKind::U32Be);
         assert_eq!(max_sz, DEFAULT_MAX_FRAME_SIZE);
         assert_eq!(frames_r, 0);
+    }
+
+    #[test]
+    fn test_varint_zigzag_bijection() {
+        assert_eq!(zigzag_encode(0), 0);
+        assert_eq!(zigzag_decode(0), 0);
+
+        assert_eq!(zigzag_encode(-1), 1);
+        assert_eq!(zigzag_decode(1), -1);
+
+        assert_eq!(zigzag_encode(1), 2);
+        assert_eq!(zigzag_decode(2), 1);
+
+        assert_eq!(zigzag_encode(-2), 3);
+        assert_eq!(zigzag_decode(3), -2);
+
+        assert_eq!(zigzag_encode(2), 4);
+        assert_eq!(zigzag_decode(4), 2);
+
+        // Edge values
+        assert_eq!(zigzag_decode(zigzag_encode(i64::MIN)), i64::MIN);
+        assert_eq!(zigzag_decode(zigzag_encode(i64::MAX)), i64::MAX);
+        assert_eq!(
+            zigzag_decode(zigzag_encode(i32::MIN as i64)),
+            i32::MIN as i64
+        );
+        assert_eq!(
+            zigzag_decode(zigzag_encode(i32::MAX as i64)),
+            i32::MAX as i64
+        );
+
+        for val in -500..=500 {
+            assert_eq!(zigzag_decode(zigzag_encode(val)), val);
+        }
+    }
+
+    #[test]
+    fn test_uvarint_encode_decode_known_vectors() {
+        let test_cases: &[(u64, &[u8])] = &[
+            (0, &[0x00]),
+            (1, &[0x01]),
+            (127, &[0x7F]),
+            (128, &[0x80, 0x01]),
+            (300, &[0xAC, 0x02]),
+            (16384, &[0x80, 0x80, 0x01]),
+            (624485, &[0xE5, 0x8E, 0x26]),
+        ];
+
+        let mut buf = [0u8; MAX_VARINT_LEN_U64];
+        for &(val, expected_bytes) in test_cases {
+            let written = encode_uvarint(val, &mut buf);
+            assert_eq!(&buf[..written], expected_bytes);
+
+            let (decoded, consumed) = decode_uvarint(expected_bytes).unwrap();
+            assert_eq!(decoded, val);
+            assert_eq!(consumed, expected_bytes.len());
+        }
+
+        // Test u64::MAX
+        let written = encode_uvarint(u64::MAX, &mut buf);
+        assert_eq!(written, 10);
+        let (decoded, consumed) = decode_uvarint(&buf[..written]).unwrap();
+        assert_eq!(decoded, u64::MAX);
+        assert_eq!(consumed, 10);
+    }
+
+    #[test]
+    fn test_uvarint_vec_helper() {
+        let mut out = Vec::new();
+        let n1 = encode_uvarint_vec(300, &mut out);
+        assert_eq!(n1, 2);
+        let n2 = encode_uvarint_vec(127, &mut out);
+        assert_eq!(n2, 1);
+        assert_eq!(&out, &[0xAC, 0x02, 0x7F]);
+
+        let (v1, len1) = decode_uvarint(&out).unwrap();
+        assert_eq!(v1, 300);
+        assert_eq!(len1, 2);
+
+        let (v2, len2) = decode_uvarint(&out[len1..]).unwrap();
+        assert_eq!(v2, 127);
+        assert_eq!(len2, 1);
+    }
+
+    #[test]
+    fn test_ivarint_encode_decode() {
+        let values = [-1000000i64, -128, -64, -1, 0, 1, 63, 127, 255, 1000000];
+        let mut buf = [0u8; MAX_VARINT_LEN_U64];
+
+        for &val in &values {
+            let n = encode_ivarint(val, &mut buf);
+            let (decoded, consumed) = decode_ivarint(&buf[..n]).unwrap();
+            assert_eq!(decoded, val);
+            assert_eq!(consumed, n);
+        }
+    }
+
+    #[test]
+    fn test_varint_decode_error_unexpected_eof() {
+        // Empty slice
+        let empty_err = decode_uvarint(&[]).unwrap_err();
+        assert_eq!(empty_err.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Sequence with continuation bit set but truncated
+        let truncated = [0x80u8, 0x80];
+        let trunc_err = decode_uvarint(&truncated).unwrap_err();
+        assert_eq!(trunc_err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn test_varint_decode_error_overflow() {
+        // 11 continuation bytes -> overflow
+        let overflow_11 = [0x80u8; 11];
+        let err1 = decode_uvarint(&overflow_11).unwrap_err();
+        assert_eq!(err1.kind(), io::ErrorKind::InvalidData);
+        assert!(err1.to_string().contains("exceeds 64-bit"));
+
+        // 10th byte with upper bits set (> 1) -> overflow for u64
+        let mut overflow_10 = [0x80u8; 10];
+        overflow_10[9] = 0x02; // Bit 1 is set -> 2 > 1
+        let err2 = decode_uvarint(&overflow_10).unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
+        assert!(err2
+            .to_string()
+            .contains("10th byte exceeds 1-bit capacity"));
+    }
+
+    #[test]
+    fn test_varint_writer_and_reader_streaming() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = VarintWriter::new(&mut sink);
+            assert_eq!(writer.values_written(), 0);
+            assert_eq!(writer.bytes_written(), 0);
+
+            writer.write_uvarint(0).unwrap();
+            writer.write_uvarint(128).unwrap();
+            writer.write_ivarint(-42).unwrap();
+            writer.write_u32(1000).unwrap();
+            writer.write_i32(-999).unwrap();
+
+            // Interleaved raw bytes via Write implementation
+            writer.write_all(b"RAW").unwrap();
+            writer.flush().unwrap();
+
+            assert_eq!(writer.values_written(), 5);
+            assert_eq!(writer.bytes_written(), sink.len() as u64);
+        }
+
+        let mut reader = VarintReader::new(sink.as_slice());
+        assert_eq!(reader.values_read(), 0);
+        assert_eq!(reader.bytes_read(), 0);
+
+        assert_eq!(reader.read_uvarint().unwrap(), 0);
+        assert_eq!(reader.read_uvarint().unwrap(), 128);
+        assert_eq!(reader.read_ivarint().unwrap(), -42);
+        assert_eq!(reader.read_u32().unwrap(), 1000);
+        assert_eq!(reader.read_i32().unwrap(), -999);
+
+        // Read the interleaved raw bytes
+        let mut raw_buf = [0u8; 3];
+        reader.read_exact(&mut raw_buf).unwrap();
+        assert_eq!(&raw_buf, b"RAW");
+
+        assert_eq!(reader.values_read(), 5);
+        assert_eq!(reader.bytes_read(), sink.len() as u64);
+
+        // At end of stream
+        assert_eq!(reader.try_read_uvarint().unwrap(), None);
+        let eof_err = reader.read_uvarint().unwrap_err();
+        assert_eq!(eof_err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn test_varint_iterators() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = VarintWriter::new(&mut sink);
+            writer.write_uvarint(10).unwrap();
+            writer.write_uvarint(20).unwrap();
+            writer.write_uvarint(30).unwrap();
+        }
+
+        let reader = VarintReader::new(sink.as_slice());
+        let u_iter = reader.into_uvarints();
+        let u_vals: Vec<u64> = u_iter.map(|r| r.unwrap()).collect();
+        assert_eq!(u_vals, vec![10, 20, 30]);
+
+        let mut sink_i = Vec::new();
+        {
+            let mut writer = VarintWriter::new(&mut sink_i);
+            writer.write_ivarint(-10).unwrap();
+            writer.write_ivarint(0).unwrap();
+            writer.write_ivarint(10).unwrap();
+        }
+
+        let reader_i = VarintReader::new(sink_i.as_slice());
+        let i_iter = reader_i.into_ivarints();
+        let i_vals: Vec<i64> = i_iter.map(|r| r.unwrap()).collect();
+        assert_eq!(i_vals, vec![-10, 0, 10]);
+    }
+
+    #[test]
+    fn test_varint_range_checks() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = VarintWriter::new(&mut sink);
+            // Write value exceeding u32
+            writer.write_uvarint(u32::MAX as u64 + 1).unwrap();
+            // Write value exceeding i32
+            writer.write_ivarint(i32::MAX as i64 + 1).unwrap();
+        }
+
+        let mut reader = VarintReader::new(sink.as_slice());
+        let err_u32 = reader.read_u32().unwrap_err();
+        assert_eq!(err_u32.kind(), io::ErrorKind::InvalidData);
+        assert!(err_u32.to_string().contains("exceeds u32 range"));
+
+        let err_i32 = reader.read_i32().unwrap_err();
+        assert_eq!(err_i32.kind(), io::ErrorKind::InvalidData);
+        assert!(err_i32.to_string().contains("exceeds i32 range"));
+    }
+
+    #[test]
+    fn test_varint_parts_and_shorthand_constructors() {
+        let mut sink = Vec::new();
+        let writer = varint_writer(&mut sink);
+        let (inner, vals_w, bytes_w) = writer.into_parts();
+        assert_eq!(vals_w, 0);
+        assert_eq!(bytes_w, 0);
+
+        let reader = varint_reader(inner.as_slice());
+        let (_inner_r, vals_r, bytes_r) = reader.into_parts();
+        assert_eq!(vals_r, 0);
+        assert_eq!(bytes_r, 0);
     }
 }
