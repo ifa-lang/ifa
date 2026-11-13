@@ -2127,9 +2127,10 @@ impl Url {
                     host = auth_work[1..bracket_end].to_string();
                     let remainder = &auth_work[bracket_end + 1..];
                     if let Some(port_str) = remainder.strip_prefix(':') {
-                        port = Some(port_str.parse::<u16>().map_err(|_| {
-                            format!("Invalid port '{}' in authority", port_str)
-                        })?);
+                        port =
+                            Some(port_str.parse::<u16>().map_err(|_| {
+                                format!("Invalid port '{}' in authority", port_str)
+                            })?);
                     }
                 } else {
                     return Err("Unclosed IPv6 bracket in authority".to_string());
@@ -5853,10 +5854,13 @@ mod tests {
 
         // Check query parsing
         let pairs = url.query_pairs();
-        assert_eq!(pairs, vec![
-            ("filter".to_string(), "active".to_string()),
-            ("sort".to_string(), "desc".to_string()),
-        ]);
+        assert_eq!(
+            pairs,
+            vec![
+                ("filter".to_string(), "active".to_string()),
+                ("sort".to_string(), "desc".to_string()),
+            ]
+        );
         let map = url.query_map();
         assert_eq!(map.get("filter").map(|s| s.as_str()), Some("active"));
         assert_eq!(map.get("sort").map(|s| s.as_str()), Some("desc"));
