@@ -64,10 +64,11 @@ pub use http::{
     PooledConnection, RouteSegment, SameSite, SessionStore, SseEvent, UpstreamBackend,
 };
 pub use io::{
-    chain, copy_stream, empty, limited, limited_writer, multi_reader, multi_writer, pipe_lines,
-    prefixed, read_to_end as io_read_to_end, read_to_string as io_read_to_string, repeat, sink,
-    BufferedReader, BufferedWriter, ChainedReader, CountingReader, CountingWriter, EmptyReader,
-    LimitedReader, LimitedWriter, LineWriter, MemoryStream, MultiReader, MultiWriter,
+    chain, chunk_reader, chunk_writer, chunks, copy_stream, empty, limited, limited_writer,
+    multi_reader, multi_writer, pipe_lines, prefixed, read_to_end as io_read_to_end,
+    read_to_string as io_read_to_string, repeat, sink, BufferedReader, BufferedWriter,
+    ChainedReader, ChunkIter, ChunkReader, ChunkWriter, CountingReader, CountingWriter,
+    EmptyReader, LimitedReader, LimitedWriter, LineWriter, MemoryStream, MultiReader, MultiWriter,
     PrefixedReader, RepeatReader, SinkWriter, TeeReader, TeeWriter,
 };
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};

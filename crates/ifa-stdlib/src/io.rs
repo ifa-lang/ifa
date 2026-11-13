@@ -1232,6 +1232,213 @@ impl<R: Read + BufRead> BufRead for MultiReader<R> {
     }
 }
 
+/// Reader wrapper that constrains read requests to at most `chunk_size` bytes.
+/// Also provides helpers to read discrete byte chunks (`read_chunk`, `read_exact_chunk`)
+/// and to convert into a streaming chunk iterator.
+#[derive(Debug, Clone)]
+pub struct ChunkReader<R: Read> {
+    inner: R,
+    chunk_size: usize,
+}
+
+impl<R: Read> ChunkReader<R> {
+    /// Create a new `ChunkReader` with the specified chunk size (at least 1 byte).
+    pub fn new(reader: R, chunk_size: usize) -> Self {
+        Self {
+            inner: reader,
+            chunk_size: chunk_size.max(1),
+        }
+    }
+
+    /// Return the configured maximum chunk size.
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    /// Set a new maximum chunk size (at least 1 byte).
+    pub fn set_chunk_size(&mut self, chunk_size: usize) {
+        self.chunk_size = chunk_size.max(1);
+    }
+
+    /// Read the next available chunk of up to `chunk_size` bytes.
+    /// Returns `Ok(None)` on EOF (when 0 bytes are read).
+    pub fn read_chunk(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut buf = vec![0u8; self.chunk_size];
+        let n = self.inner.read(&mut buf)?;
+        if n == 0 {
+            Ok(None)
+        } else {
+            buf.truncate(n);
+            Ok(Some(buf))
+        }
+    }
+
+    /// Read an exact full chunk of `chunk_size` bytes.
+    /// Returns `Ok(None)` if stream is at EOF before reading any bytes.
+    /// Returns `Err(UnexpectedEof)` if EOF is reached with fewer than `chunk_size` bytes read.
+    pub fn read_exact_chunk(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut buf = vec![0u8; self.chunk_size];
+        let mut total = 0;
+        while total < self.chunk_size {
+            let n = self.inner.read(&mut buf[total..])?;
+            if n == 0 {
+                if total == 0 {
+                    return Ok(None);
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "incomplete chunk: read {} bytes, expected {}",
+                            total, self.chunk_size
+                        ),
+                    ));
+                }
+            }
+            total += n;
+        }
+        Ok(Some(buf))
+    }
+
+    /// Convert this `ChunkReader` into an iterator yielding byte chunks.
+    pub fn into_chunks(self) -> ChunkIter<R> {
+        ChunkIter {
+            reader: self.inner,
+            chunk_size: self.chunk_size,
+        }
+    }
+
+    /// Borrow the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Mutably borrow the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+/// Helper function to create a new `ChunkReader`.
+pub fn chunk_reader<R: Read>(reader: R, chunk_size: usize) -> ChunkReader<R> {
+    ChunkReader::new(reader, chunk_size)
+}
+
+impl<R: Read> Read for ChunkReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let to_read = buf.len().min(self.chunk_size);
+        self.inner.read(&mut buf[..to_read])
+    }
+}
+
+impl<R: Read + BufRead> BufRead for ChunkReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        let buf = self.inner.fill_buf()?;
+        let len = buf.len().min(self.chunk_size);
+        Ok(&buf[..len])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+    }
+}
+
+/// Iterator yielding consecutive byte chunks of up to `chunk_size` bytes from an underlying reader.
+#[derive(Debug)]
+pub struct ChunkIter<R: Read> {
+    reader: R,
+    chunk_size: usize,
+}
+
+impl<R: Read> Iterator for ChunkIter<R> {
+    type Item = io::Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buf = vec![0u8; self.chunk_size];
+        match self.reader.read(&mut buf) {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some(Ok(buf))
+            }
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+/// Helper function to create a chunk iterator from any reader.
+pub fn chunks<R: Read>(reader: R, chunk_size: usize) -> ChunkIter<R> {
+    chunk_reader(reader, chunk_size).into_chunks()
+}
+
+/// Writer wrapper that splits write requests into chunks of at most `chunk_size` bytes.
+#[derive(Debug, Clone)]
+pub struct ChunkWriter<W: Write> {
+    inner: W,
+    chunk_size: usize,
+}
+
+impl<W: Write> ChunkWriter<W> {
+    /// Create a new `ChunkWriter` with the specified chunk size (at least 1 byte).
+    pub fn new(writer: W, chunk_size: usize) -> Self {
+        Self {
+            inner: writer,
+            chunk_size: chunk_size.max(1),
+        }
+    }
+
+    /// Return the configured maximum chunk size.
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    /// Set a new maximum chunk size (at least 1 byte).
+    pub fn set_chunk_size(&mut self, chunk_size: usize) {
+        self.chunk_size = chunk_size.max(1);
+    }
+
+    /// Borrow the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Mutably borrow the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+/// Helper function to create a new `ChunkWriter`.
+pub fn chunk_writer<W: Write>(writer: W, chunk_size: usize) -> ChunkWriter<W> {
+    ChunkWriter::new(writer, chunk_size)
+}
+
+impl<W: Write> Write for ChunkWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let to_write = buf.len().min(self.chunk_size);
+        self.inner.write(&buf[..to_write])
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1604,5 +1811,98 @@ mod tests {
 
         let inner_readers = mr2.into_readers();
         assert_eq!(inner_readers.len(), 2);
+    }
+
+    #[test]
+    fn test_chunk_reader_and_iter() {
+        let data = b"abcdefghijklm"; // 13 bytes
+        let mut cr = chunk_reader(&data[..], 4);
+        assert_eq!(cr.chunk_size(), 4);
+        assert_eq!(*cr.get_ref(), &data[..]);
+
+        // Reading with a larger buffer only returns up to chunk_size
+        let mut buf = [0u8; 10];
+        let n1 = cr.read(&mut buf).unwrap();
+        assert_eq!(n1, 4);
+        assert_eq!(&buf[..n1], b"abcd");
+
+        // Next read chunk
+        let c2 = cr.read_chunk().unwrap();
+        assert_eq!(c2, Some(b"efgh".to_vec()));
+
+        // Next read chunk
+        let c3 = cr.read_chunk().unwrap();
+        assert_eq!(c3, Some(b"ijkl".to_vec()));
+
+        // Remaining 1 byte
+        let c4 = cr.read_chunk().unwrap();
+        assert_eq!(c4, Some(b"m".to_vec()));
+
+        // EOF
+        let c5 = cr.read_chunk().unwrap();
+        assert_eq!(c5, None);
+
+        // Test into_chunks iterator
+        let chunk_iter = chunks(&data[..], 5);
+        let collected: Vec<Vec<u8>> = chunk_iter.map(|r| r.unwrap()).collect();
+        assert_eq!(collected.len(), 3);
+        assert_eq!(collected[0], b"abcde");
+        assert_eq!(collected[1], b"fghij");
+        assert_eq!(collected[2], b"klm");
+
+        // Test read_exact_chunk
+        let exact_data = b"12345678"; // 8 bytes
+        let mut cr_exact = chunk_reader(&exact_data[..], 4);
+        assert_eq!(cr_exact.read_exact_chunk().unwrap(), Some(b"1234".to_vec()));
+        assert_eq!(cr_exact.read_exact_chunk().unwrap(), Some(b"5678".to_vec()));
+        assert_eq!(cr_exact.read_exact_chunk().unwrap(), None);
+
+        // Test read_exact_chunk partial UnexpectedEof
+        let partial_data = b"1234567"; // 7 bytes with chunk 4
+        let mut cr_part = chunk_reader(&partial_data[..], 4);
+        assert_eq!(cr_part.read_exact_chunk().unwrap(), Some(b"1234".to_vec()));
+        let err = cr_part.read_exact_chunk().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Test set_chunk_size and into_inner
+        let mut cr_dynamic = chunk_reader(&data[..], 2);
+        cr_dynamic.set_chunk_size(10);
+        assert_eq!(cr_dynamic.chunk_size(), 10);
+        let inner = cr_dynamic.into_inner();
+        assert_eq!(inner, &data[..]);
+
+        // Test BufRead implementation
+        let buf_data = b"hello\nworld\n";
+        let mut cr_buf = chunk_reader(BufferedReader::new(&buf_data[..]), 3);
+        let mut line = String::new();
+        cr_buf.read_line(&mut line).unwrap();
+        assert_eq!(line, "hello\n");
+    }
+
+    #[test]
+    fn test_chunk_writer() {
+        let mut out = Vec::new();
+        {
+            let mut cw = chunk_writer(&mut out, 3);
+            assert_eq!(cw.chunk_size(), 3);
+            assert_eq!(cw.get_ref().len(), 0);
+
+            // Writing 7 bytes should only write 3 bytes
+            let n = cw.write(b"abcdefg").unwrap();
+            assert_eq!(n, 3);
+            cw.flush().unwrap();
+        }
+        assert_eq!(out, b"abc");
+
+        // Test set_chunk_size, get_mut, into_inner
+        let mut cw2 = chunk_writer(Vec::new(), 2);
+        cw2.set_chunk_size(5);
+        assert_eq!(cw2.chunk_size(), 5);
+        cw2.get_mut().extend_from_slice(b"pre");
+        let n2 = cw2.write(b"12345678").unwrap();
+        assert_eq!(n2, 5);
+        cw2.flush().unwrap();
+        let inner = cw2.into_inner();
+        assert_eq!(inner, b"pre12345");
     }
 }
