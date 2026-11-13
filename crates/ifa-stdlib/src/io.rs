@@ -2879,6 +2879,260 @@ impl<R: Read> Iterator for DelimitedIter<R> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CRC-32/ISO-HDLC (polynomial 0xEDB88320, reflected input/output, init 0xFFFFFFFF)
+// Pure-Rust, no external crate required.
+// ---------------------------------------------------------------------------
+
+/// CRC-32 lookup table (reflected polynomial 0xEDB88320).
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if crc & 1 != 0 {
+                crc = 0xEDB8_8320 ^ (crc >> 1);
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// Update a running CRC-32 state with additional bytes.
+#[inline]
+fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
+    for &b in bytes {
+        crc = CRC32_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc
+}
+
+/// Compute the CRC-32/ISO-HDLC checksum of a byte slice.
+///
+/// # Examples
+/// ```rust
+/// use ifa_stdlib::io::crc32_digest;
+/// assert_eq!(crc32_digest(b"123456789"), 0xCBF4_3926);
+/// ```
+pub fn crc32_digest(data: &[u8]) -> u32 {
+    crc32_update(0xFFFF_FFFF, data) ^ 0xFFFF_FFFF
+}
+
+/// Incremental CRC-32 hasher.
+///
+/// Processes data chunk by chunk and returns the final checksum via [`Crc32Hasher::finalize`].
+///
+/// # Examples
+/// ```rust
+/// use ifa_stdlib::io::Crc32Hasher;
+/// let mut h = Crc32Hasher::new();
+/// h.update(b"hello");
+/// h.update(b" world");
+/// let crc = h.finalize();
+/// use ifa_stdlib::io::crc32_digest;
+/// assert_eq!(crc, crc32_digest(b"hello world"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct Crc32Hasher {
+    state: u32,
+}
+
+impl Default for Crc32Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Crc32Hasher {
+    /// Create a new hasher with the standard CRC-32 initial value.
+    pub fn new() -> Self {
+        Self { state: 0xFFFF_FFFF }
+    }
+
+    /// Process additional bytes.
+    pub fn update(&mut self, data: &[u8]) {
+        self.state = crc32_update(self.state, data);
+    }
+
+    /// Finalise and return the CRC-32 checksum.
+    ///
+    /// **Note**: calling `finalize` does not reset the hasher. Create a new
+    /// [`Crc32Hasher`] for each independent message.
+    pub fn finalize(&self) -> u32 {
+        self.state ^ 0xFFFF_FFFF
+    }
+
+    /// Reset the hasher to its initial state.
+    pub fn reset(&mut self) {
+        self.state = 0xFFFF_FFFF;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Crc32Writer
+// ---------------------------------------------------------------------------
+
+/// A [`Write`] adapter that computes the CRC-32 checksum of everything written
+/// through it, forwarding all bytes to the wrapped writer unchanged.
+///
+/// # Examples
+/// ```rust
+/// use ifa_stdlib::io::{Crc32Writer, crc32_digest};
+/// let mut buf = Vec::new();
+/// let mut w = Crc32Writer::new(&mut buf);
+/// w.write_all(b"hello").unwrap();
+/// w.write_all(b" world").unwrap();
+/// let crc = w.checksum();
+/// assert_eq!(crc, crc32_digest(b"hello world"));
+/// assert_eq!(buf, b"hello world");
+/// ```
+pub struct Crc32Writer<W: Write> {
+    inner: W,
+    hasher: Crc32Hasher,
+    bytes_written: usize,
+}
+
+impl<W: Write> Crc32Writer<W> {
+    /// Wrap `writer` and start accumulating a CRC-32 checksum.
+    pub fn new(writer: W) -> Self {
+        Self {
+            inner: writer,
+            hasher: Crc32Hasher::new(),
+            bytes_written: 0,
+        }
+    }
+
+    /// Return the current CRC-32 checksum over all bytes written so far.
+    pub fn checksum(&self) -> u32 {
+        self.hasher.finalize()
+    }
+
+    /// Return the total number of bytes written through this adapter.
+    pub fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+
+    /// Obtain a reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Obtain a mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap this adapter, returning `(inner_writer, final_checksum, bytes_written)`.
+    pub fn into_parts(self) -> (W, u32, usize) {
+        let crc = self.hasher.finalize();
+        (self.inner, crc, self.bytes_written)
+    }
+
+    /// Unwrap this adapter, returning the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for Crc32Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.bytes_written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+
+
+// ---------------------------------------------------------------------------
+// Crc32Reader
+// ---------------------------------------------------------------------------
+
+/// A [`Read`] adapter that computes the CRC-32 checksum of everything read
+/// from the wrapped reader, forwarding the data unchanged to the caller.
+///
+/// # Examples
+/// ```rust
+/// use std::io::Read;
+/// use ifa_stdlib::io::{Crc32Reader, crc32_digest};
+/// let data = b"hello world";
+/// let mut r = Crc32Reader::new(data.as_ref());
+/// let mut out = Vec::new();
+/// r.read_to_end(&mut out).unwrap();
+/// assert_eq!(r.checksum(), crc32_digest(b"hello world"));
+/// assert_eq!(out, b"hello world");
+/// ```
+pub struct Crc32Reader<R: Read> {
+    inner: R,
+    hasher: Crc32Hasher,
+    bytes_read: usize,
+}
+
+impl<R: Read> Crc32Reader<R> {
+    /// Wrap `reader` and start accumulating a CRC-32 checksum.
+    pub fn new(reader: R) -> Self {
+        Self {
+            inner: reader,
+            hasher: Crc32Hasher::new(),
+            bytes_read: 0,
+        }
+    }
+
+    /// Return the current CRC-32 checksum over all bytes read so far.
+    pub fn checksum(&self) -> u32 {
+        self.hasher.finalize()
+    }
+
+    /// Return the total number of bytes read through this adapter.
+    pub fn bytes_read(&self) -> usize {
+        self.bytes_read
+    }
+
+    /// Obtain a reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Obtain a mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap this adapter, returning `(inner_reader, final_checksum, bytes_read)`.
+    pub fn into_parts(self) -> (R, u32, usize) {
+        let crc = self.hasher.finalize();
+        (self.inner, crc, self.bytes_read)
+    }
+
+    /// Unwrap this adapter, returning the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for Crc32Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.bytes_read += n;
+        Ok(n)
+    }
+}
+
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4043,5 +4297,177 @@ mod tests {
         assert_eq!(delim2, b"\0");
         assert_eq!(max_size, 4096);
         assert_eq!(records_read, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // CRC-32 tests
+    // -----------------------------------------------------------------------
+
+    /// CRC-32 of "123456789" is the standard check value 0xCBF43926.
+    #[test]
+    fn test_crc32_known_check_value() {
+        assert_eq!(crc32_digest(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn test_crc32_empty() {
+        // CRC-32 of empty slice is 0x00000000
+        assert_eq!(crc32_digest(b""), 0x0000_0000);
+    }
+
+    #[test]
+    fn test_crc32_single_byte() {
+        // CRC-32 of [0x00] is 0xD202EF8D
+        assert_eq!(crc32_digest(&[0x00u8]), 0xD202_EF8D);
+    }
+
+    #[test]
+    fn test_crc32_hasher_incremental_matches_one_shot() {
+        let data = b"hello world";
+        let mut h = Crc32Hasher::new();
+        h.update(&data[..5]);
+        h.update(&data[5..]);
+        assert_eq!(h.finalize(), crc32_digest(data));
+    }
+
+    #[test]
+    fn test_crc32_hasher_reset() {
+        let mut h = Crc32Hasher::new();
+        h.update(b"garbage");
+        h.reset();
+        h.update(b"123456789");
+        assert_eq!(h.finalize(), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn test_crc32_hasher_clone() {
+        let mut h1 = Crc32Hasher::new();
+        h1.update(b"hello");
+        let mut h2 = h1.clone();
+        h1.update(b" world");
+        h2.update(b" world");
+        assert_eq!(h1.finalize(), h2.finalize());
+    }
+
+    #[test]
+    fn test_crc32_writer_basic() {
+        let mut buf = Vec::new();
+        let mut w = Crc32Writer::new(&mut buf);
+        w.write_all(b"123456789").unwrap();
+        assert_eq!(w.checksum(), 0xCBF4_3926);
+        assert_eq!(w.bytes_written(), 9);
+        assert_eq!(buf, b"123456789");
+    }
+
+    #[test]
+    fn test_crc32_writer_incremental() {
+        let mut buf = Vec::new();
+        let mut w = Crc32Writer::new(&mut buf);
+        w.write_all(b"hello").unwrap();
+        w.write_all(b" world").unwrap();
+        assert_eq!(w.checksum(), crc32_digest(b"hello world"));
+        assert_eq!(w.bytes_written(), 11);
+    }
+
+    #[test]
+    fn test_crc32_writer_into_parts() {
+        let mut buf = Vec::new();
+        let mut w = Crc32Writer::new(&mut buf);
+        w.write_all(b"abc").unwrap();
+        let (_, crc, bytes) = w.into_parts();
+        assert_eq!(crc, crc32_digest(b"abc"));
+        assert_eq!(bytes, 3);
+    }
+
+    #[test]
+    fn test_crc32_writer_get_ref_mut() {
+        let mut buf = Vec::new();
+        let mut w = Crc32Writer::new(&mut buf);
+        w.write_all(b"x").unwrap();
+        let _ = w.get_ref();
+        let _ = w.get_mut();
+        let inner = w.into_inner();
+        assert_eq!(inner, b"x");
+    }
+
+    #[test]
+    fn test_crc32_writer_flush() {
+        let mut buf = Vec::new();
+        let mut w = Crc32Writer::new(&mut buf);
+        w.write_all(b"flush test").unwrap();
+        w.flush().unwrap();
+        assert_eq!(w.bytes_written(), 10);
+    }
+
+    #[test]
+    fn test_crc32_reader_basic() {
+        let data = b"123456789";
+        let mut r = Crc32Reader::new(data.as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(r.checksum(), 0xCBF4_3926);
+        assert_eq!(r.bytes_read(), 9);
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn test_crc32_reader_incremental() {
+        let data = b"hello world";
+        let mut r = Crc32Reader::new(data.as_ref());
+        let mut chunk = [0u8; 5];
+        r.read_exact(&mut chunk).unwrap();
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        assert_eq!(r.checksum(), crc32_digest(b"hello world"));
+        assert_eq!(r.bytes_read(), 11);
+    }
+
+    #[test]
+    fn test_crc32_reader_empty() {
+        let mut r = Crc32Reader::new(b"".as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(r.checksum(), 0x0000_0000);
+        assert_eq!(r.bytes_read(), 0);
+    }
+
+    #[test]
+    fn test_crc32_reader_into_parts() {
+        let data = b"abc";
+        let mut r = Crc32Reader::new(data.as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        let (_, crc, bytes) = r.into_parts();
+        assert_eq!(crc, crc32_digest(b"abc"));
+        assert_eq!(bytes, 3);
+    }
+
+    #[test]
+    fn test_crc32_reader_get_ref_mut() {
+        let data = b"hello";
+        let mut r = Crc32Reader::new(data.as_ref());
+        let mut buf = [0u8; 5];
+        r.read_exact(&mut buf).unwrap();
+        let _ = r.get_ref();
+        let _ = r.get_mut();
+        let _ = r.into_inner();
+    }
+
+    #[test]
+    fn test_crc32_writer_reader_roundtrip() {
+        // Write then read back through CRC adapters: both checksums must agree
+        let payload = b"The quick brown fox jumps over the lazy dog";
+        let mut buf = Vec::new();
+        let mut w = Crc32Writer::new(&mut buf);
+        w.write_all(payload).unwrap();
+        let write_crc = w.checksum();
+
+        let mut r = Crc32Reader::new(buf.as_slice());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        let read_crc = r.checksum();
+
+        assert_eq!(write_crc, read_crc);
+        assert_eq!(out, payload);
     }
 }
