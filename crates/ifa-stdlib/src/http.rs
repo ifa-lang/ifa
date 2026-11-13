@@ -1903,6 +1903,56 @@ impl HttpClient {
         read_http_response(&mut stream)
     }
 
+    /// Send an HTTP request targeted at a structured `Url`.
+    pub fn send_url(&self, req: &mut HttpRequest, url: &Url) -> io::Result<HttpResponse> {
+        if url.host.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Url has no host defined",
+            ));
+        }
+        let port = url.port.unwrap_or(match url.scheme.as_str() {
+            "https" | "wss" => 443,
+            _ => 80,
+        });
+
+        // Set Host header if not already explicitly set
+        if req.headers.get("Host").is_none() {
+            req.headers.set("Host", url.host.as_str());
+        }
+        // Align request target with URL's path and query
+        req.path = url.request_target();
+
+        self.send(req, &url.host, port)
+    }
+
+    /// Execute a non-blocking GET request targeting a structured `Url`.
+    pub fn get_url(&self, url: &Url) -> io::Result<HttpResponse> {
+        let req = HttpRequest::new(HttpMethod::Get, url.request_target())
+            .header("Host", url.host.as_str())
+            .header("User-Agent", "IFA-HttpClient/0.1.0")
+            .header("Connection", "close");
+        let port = url.port.unwrap_or(match url.scheme.as_str() {
+            "https" | "wss" => 443,
+            _ => 80,
+        });
+        self.send(&req, &url.host, port)
+    }
+
+    /// Execute a non-blocking POST request with JSON payload targeting a structured `Url`.
+    pub fn post_url_json(&self, url: &Url, payload: &JsonValue) -> io::Result<HttpResponse> {
+        let req = HttpRequest::new(HttpMethod::Post, url.request_target())
+            .header("Host", url.host.as_str())
+            .header("User-Agent", "IFA-HttpClient/0.1.0")
+            .header("Connection", "close")
+            .json(payload);
+        let port = url.port.unwrap_or(match url.scheme.as_str() {
+            "https" | "wss" => 443,
+            _ => 80,
+        });
+        self.send(&req, &url.host, port)
+    }
+
     /// Execute a non-blocking GET request.
     pub fn get(&self, host: &str, port: u16, path: &str) -> io::Result<HttpResponse> {
         let req = HttpRequest::new(HttpMethod::Get, path)
@@ -2188,6 +2238,40 @@ impl Url {
             Some(q) => parse_form_urlencoded(q),
             None => HashMap::new(),
         }
+    }
+
+    /// Retrieve the relative path and query string suitable for HTTP request lines (e.g., `/path?query`).
+    pub fn request_target(&self) -> String {
+        let p = if self.path.is_empty() { "/" } else { &self.path };
+        if let Some(ref q) = self.query {
+            format!("{}?{}", p, q)
+        } else {
+            p.to_string()
+        }
+    }
+
+    /// Fluently append or update a query parameter key-value pair.
+    pub fn with_query_param(mut self, key: &str, value: &str) -> Self {
+        self.set_query_param(key, value);
+        self
+    }
+
+    /// Set or update a query parameter key-value pair.
+    pub fn set_query_param(&mut self, key: &str, value: &str) {
+        let mut pairs = self.query_pairs();
+        let mut found = false;
+        for (k, v) in pairs.iter_mut() {
+            if k == key {
+                *v = value.to_string();
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            pairs.push((key.to_string(), value.to_string()));
+        }
+        let ref_pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        self.query = Some(format_form_urlencoded(&ref_pairs));
     }
 
     /// Reconstruct standard RFC 3986 URI string representation.
@@ -5893,5 +5977,13 @@ mod tests {
         assert_eq!(rel_pairs[0], ("q".to_string(), "ifa language".to_string()));
         assert_eq!(rel_pairs[1], ("page".to_string(), "1".to_string()));
         assert_eq!(rel_url.to_uri_string(), "/search?q=ifa+language&page=1");
+
+        // 5. request_target and query param manipulation
+        let mut mod_url = Url::parse("https://example.com/api/data?foo=bar").unwrap();
+        assert_eq!(mod_url.request_target(), "/api/data?foo=bar");
+        mod_url.set_query_param("limit", "10");
+        assert_eq!(mod_url.query_map().get("limit").map(|s| s.as_str()), Some("10"));
+        let chained = mod_url.with_query_param("foo", "baz");
+        assert_eq!(chained.query_map().get("foo").map(|s| s.as_str()), Some("baz"));
     }
 }
