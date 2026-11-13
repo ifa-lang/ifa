@@ -1439,6 +1439,211 @@ impl<W: Write> Write for ChunkWriter<W> {
     }
 }
 
+/// Reader wrapper that skips (discards) the first `skip` bytes of an underlying reader.
+#[derive(Debug, Clone)]
+pub struct SkipReader<R: Read> {
+    inner: R,
+    remaining_skip: u64,
+}
+
+impl<R: Read> SkipReader<R> {
+    /// Create a new `SkipReader` that discards up to `skip` bytes from `reader`.
+    pub fn new(reader: R, skip: u64) -> Self {
+        Self {
+            inner: reader,
+            remaining_skip: skip,
+        }
+    }
+
+    /// Number of bytes remaining to skip.
+    pub fn remaining_skip(&self) -> u64 {
+        self.remaining_skip
+    }
+
+    /// Returns `true` if all requested skip bytes have been discarded.
+    pub fn is_skipped(&self) -> bool {
+        self.remaining_skip == 0
+    }
+
+    /// Set a new number of bytes to skip.
+    pub fn set_remaining_skip(&mut self, skip: u64) {
+        self.remaining_skip = skip;
+    }
+
+    /// Eagerly read and discard all remaining skip bytes from the underlying reader.
+    ///
+    /// Returns the number of bytes successfully skipped before reaching EOF.
+    pub fn skip_all(&mut self) -> io::Result<u64> {
+        let mut total_skipped = 0u64;
+        let mut buf = [0u8; 8192];
+        while self.remaining_skip > 0 {
+            let to_read = (self.remaining_skip.min(buf.len() as u64)) as usize;
+            let n = self.inner.read(&mut buf[..to_read])?;
+            if n == 0 {
+                // Reached EOF before skipping all bytes
+                break;
+            }
+            self.remaining_skip -= n as u64;
+            total_skipped += n as u64;
+        }
+        Ok(total_skipped)
+    }
+
+    /// Borrow the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Mutably borrow the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+/// Helper function to create a new `SkipReader`.
+pub fn skip_reader<R: Read>(reader: R, skip: u64) -> SkipReader<R> {
+    SkipReader::new(reader, skip)
+}
+
+impl<R: Read> Read for SkipReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining_skip > 0 {
+            let mut discard_buf = [0u8; 4096];
+            while self.remaining_skip > 0 {
+                let to_read = (self.remaining_skip.min(discard_buf.len() as u64)) as usize;
+                let n = self.inner.read(&mut discard_buf[..to_read])?;
+                if n == 0 {
+                    // EOF encountered while skipping
+                    return Ok(0);
+                }
+                self.remaining_skip -= n as u64;
+            }
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl<R: BufRead> BufRead for SkipReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        while self.remaining_skip > 0 {
+            let available = self.inner.fill_buf()?;
+            if available.is_empty() {
+                return Ok(&[]);
+            }
+            let to_consume = (self.remaining_skip.min(available.len() as u64)) as usize;
+            self.inner.consume(to_consume);
+            self.remaining_skip -= to_consume as u64;
+        }
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+    }
+}
+
+/// Writer wrapper that tracks bytes written and allows padding the output stream
+/// to align with a specified block size boundary (e.g., 512-byte tar blocks, 16-byte crypto blocks).
+#[derive(Debug, Clone)]
+pub struct PadWriter<W: Write> {
+    inner: W,
+    block_size: usize,
+    bytes_written: u64,
+}
+
+impl<W: Write> PadWriter<W> {
+    /// Create a new `PadWriter` with the specified block size (minimum 1).
+    pub fn new(writer: W, block_size: usize) -> Self {
+        Self {
+            inner: writer,
+            block_size: block_size.max(1),
+            bytes_written: 0,
+        }
+    }
+
+    /// Block size in bytes used for alignment.
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    /// Set a new block size (minimum 1).
+    pub fn set_block_size(&mut self, block_size: usize) {
+        self.block_size = block_size.max(1);
+    }
+
+    /// Total number of bytes written so far through this writer (including padding).
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    /// Number of bytes needed to align to the next block boundary.
+    /// Returns 0 if already block-aligned.
+    pub fn padding_needed(&self) -> usize {
+        let rem = (self.bytes_written % (self.block_size as u64)) as usize;
+        if rem == 0 {
+            0
+        } else {
+            self.block_size - rem
+        }
+    }
+
+    /// Pad the stream with `pad_byte` to the next block boundary.
+    /// Returns the number of pad bytes written (0 if already aligned).
+    pub fn pad(&mut self, pad_byte: u8) -> io::Result<usize> {
+        let needed = self.padding_needed();
+        if needed == 0 {
+            return Ok(0);
+        }
+        let padding = vec![pad_byte; needed];
+        self.inner.write_all(&padding)?;
+        self.bytes_written += needed as u64;
+        Ok(needed)
+    }
+
+    /// Pad the stream with zero bytes (`0x00`) to the next block boundary.
+    /// Returns the number of pad bytes written (0 if already aligned).
+    pub fn pad_zero(&mut self) -> io::Result<usize> {
+        self.pad(0)
+    }
+
+    /// Borrow the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Mutably borrow the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+/// Helper function to create a new `PadWriter`.
+pub fn pad_writer<W: Write>(writer: W, block_size: usize) -> PadWriter<W> {
+    PadWriter::new(writer, block_size)
+}
+
+impl<W: Write> Write for PadWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.bytes_written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1904,5 +2109,98 @@ mod tests {
         cw2.flush().unwrap();
         let inner = cw2.into_inner();
         assert_eq!(inner, b"pre12345");
+    }
+
+    #[test]
+    fn test_skip_reader() {
+        let data = b"hello world from ifa";
+        let mut sr = skip_reader(&data[..], 6);
+        assert_eq!(sr.remaining_skip(), 6);
+        assert!(!sr.is_skipped());
+        assert_eq!(sr.get_ref(), &&data[..]);
+
+        let mut output = String::new();
+        sr.read_to_string(&mut output).unwrap();
+        assert_eq!(output, "world from ifa");
+        assert_eq!(sr.remaining_skip(), 0);
+        assert!(sr.is_skipped());
+
+        // Test skip_all
+        let data2 = b"1234567890abcdef";
+        let mut sr2 = skip_reader(&data2[..], 10);
+        let skipped = sr2.skip_all().unwrap();
+        assert_eq!(skipped, 10);
+        assert!(sr2.is_skipped());
+        let mut rest = Vec::new();
+        sr2.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"abcdef");
+
+        // Test EOF before skipping finishes
+        let short_data = b"short";
+        let mut sr_short = skip_reader(&short_data[..], 20);
+        let skipped_short = sr_short.skip_all().unwrap();
+        assert_eq!(skipped_short, 5);
+        assert_eq!(sr_short.remaining_skip(), 15);
+        assert!(!sr_short.is_skipped());
+        let mut empty_buf = [0u8; 10];
+        let n = sr_short.read(&mut empty_buf).unwrap();
+        assert_eq!(n, 0);
+
+        // Test set_remaining_skip, get_mut, into_inner
+        let mut sr3 = skip_reader(&data[..], 100);
+        sr3.set_remaining_skip(3);
+        assert_eq!(sr3.remaining_skip(), 3);
+        let inner = sr3.into_inner();
+        assert_eq!(inner, &data[..]);
+
+        // Test BufRead implementation
+        let buf_data = b"prefix\nfirst line\nsecond line\n";
+        let mut sr_buf = skip_reader(BufferedReader::new(&buf_data[..]), 7);
+        let mut line = String::new();
+        sr_buf.read_line(&mut line).unwrap();
+        assert_eq!(line, "first line\n");
+    }
+
+    #[test]
+    fn test_pad_writer() {
+        let mut out = Vec::new();
+        let mut pw = pad_writer(&mut out, 8);
+        assert_eq!(pw.block_size(), 8);
+        assert_eq!(pw.bytes_written(), 0);
+        assert_eq!(pw.padding_needed(), 0);
+
+        // Write 5 bytes
+        pw.write_all(b"hello").unwrap();
+        assert_eq!(pw.bytes_written(), 5);
+        assert_eq!(pw.padding_needed(), 3);
+
+        // Pad with zeros to 8 bytes
+        let padded = pw.pad_zero().unwrap();
+        assert_eq!(padded, 3);
+        assert_eq!(pw.bytes_written(), 8);
+        assert_eq!(pw.padding_needed(), 0);
+
+        // Pad when already aligned does nothing
+        assert_eq!(pw.pad(b'X').unwrap(), 0);
+
+        // Write 2 bytes and pad with custom byte
+        pw.write_all(b"ab").unwrap();
+        assert_eq!(pw.bytes_written(), 10);
+        assert_eq!(pw.padding_needed(), 6);
+        let padded2 = pw.pad(b'#').unwrap();
+        assert_eq!(padded2, 6);
+        assert_eq!(pw.bytes_written(), 16);
+
+        pw.flush().unwrap();
+        assert_eq!(out, b"hello\0\0\0ab######");
+
+        // Test set_block_size, get_ref, get_mut, into_inner
+        let mut pw2 = pad_writer(Vec::new(), 4);
+        pw2.set_block_size(16);
+        assert_eq!(pw2.block_size(), 16);
+        pw2.get_mut().extend_from_slice(b"init");
+        assert_eq!(pw2.get_ref(), b"init");
+        let inner = pw2.into_inner();
+        assert_eq!(inner, b"init");
     }
 }
