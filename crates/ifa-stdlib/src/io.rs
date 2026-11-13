@@ -2504,6 +2504,314 @@ impl<R: Read> Iterator for FramedIter<R> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CRC-32 Verified Framed Reader & Writer
+// ---------------------------------------------------------------------------
+
+/// Stream writer that prefixes each payload with its byte length and an IEEE 802.3 CRC-32 checksum.
+///
+/// Each frame written has the structure:
+/// `[length: header_len][crc32: 4 bytes BE][payload: length bytes]`
+#[derive(Debug, Clone)]
+pub struct CrcFramedWriter<W: Write> {
+    inner: W,
+    field_kind: LengthFieldKind,
+    frames_written: u64,
+    bytes_written: u64,
+}
+
+impl<W: Write> CrcFramedWriter<W> {
+    /// Create a new `CrcFramedWriter` with standard 4-byte big-endian length prefix.
+    pub fn new(writer: W) -> Self {
+        Self::with_length_field(writer, LengthFieldKind::U32Be)
+    }
+
+    /// Create a new `CrcFramedWriter` with the specified length field encoding.
+    pub fn with_length_field(writer: W, field_kind: LengthFieldKind) -> Self {
+        Self {
+            inner: writer,
+            field_kind,
+            frames_written: 0,
+            bytes_written: 0,
+        }
+    }
+
+    /// Return the length field kind.
+    pub fn length_field(&self) -> LengthFieldKind {
+        self.field_kind
+    }
+
+    /// Total number of complete frames written.
+    pub fn frames_written(&self) -> u64 {
+        self.frames_written
+    }
+
+    /// Total number of bytes written (including length prefixes, CRC-32 checksums, and payloads).
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    /// Write a frame payload prefixed by its encoded length and 4-byte big-endian CRC-32 checksum.
+    pub fn write_frame(&mut self, payload: &[u8]) -> io::Result<()> {
+        let mut header = [0u8; 8];
+        let hlen = self.field_kind.encode_len(payload.len(), &mut header)?;
+        let crc = crc32_digest(payload);
+        self.inner.write_all(&header[..hlen])?;
+        self.inner.write_all(&crc.to_be_bytes())?;
+        if !payload.is_empty() {
+            self.inner.write_all(payload)?;
+        }
+        self.frames_written += 1;
+        self.bytes_written += (hlen + 4 + payload.len()) as u64;
+        Ok(())
+    }
+
+    /// Write a UTF-8 string frame.
+    pub fn write_frame_str(&mut self, text: &str) -> io::Result<()> {
+        self.write_frame(text.as_bytes())
+    }
+
+    /// Flush the underlying writer.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+
+    /// Reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    /// Consume this writer, returning the inner writer, field kind, frames written, and bytes written.
+    pub fn into_parts(self) -> (W, LengthFieldKind, u64, u64) {
+        (
+            self.inner,
+            self.field_kind,
+            self.frames_written,
+            self.bytes_written,
+        )
+    }
+}
+
+/// Helper function to create a new `CrcFramedWriter` with standard 4-byte big-endian framing.
+pub fn crc_framed_writer<W: Write>(writer: W) -> CrcFramedWriter<W> {
+    CrcFramedWriter::new(writer)
+}
+
+/// Stream reader that unpacks length-delimited frames verified by an IEEE 802.3 CRC-32 checksum.
+#[derive(Debug, Clone)]
+pub struct CrcFramedReader<R: Read> {
+    inner: R,
+    field_kind: LengthFieldKind,
+    max_frame_size: usize,
+    frames_read: u64,
+}
+
+impl<R: Read> CrcFramedReader<R> {
+    /// Create a new `CrcFramedReader` with standard 4-byte big-endian length prefix and default max frame size (16 MiB).
+    pub fn new(reader: R) -> Self {
+        Self::with_options(reader, LengthFieldKind::U32Be, DEFAULT_MAX_FRAME_SIZE)
+    }
+
+    /// Create a new `CrcFramedReader` with specified length field encoding and maximum frame size.
+    pub fn with_options(reader: R, field_kind: LengthFieldKind, max_frame_size: usize) -> Self {
+        Self {
+            inner: reader,
+            field_kind,
+            max_frame_size: max_frame_size.max(1),
+            frames_read: 0,
+        }
+    }
+
+    /// Configured length field encoding.
+    pub fn length_field(&self) -> LengthFieldKind {
+        self.field_kind
+    }
+
+    /// Configured maximum payload size in bytes.
+    pub fn max_frame_size(&self) -> usize {
+        self.max_frame_size
+    }
+
+    /// Set a new maximum payload size in bytes (at least 1 byte).
+    pub fn set_max_frame_size(&mut self, max: usize) {
+        self.max_frame_size = max.max(1);
+    }
+
+    /// Number of frames successfully read and verified so far.
+    pub fn frames_read(&self) -> u64 {
+        self.frames_read
+    }
+
+    /// Read the next frame payload into the provided reusable buffer and verify CRC-32 checksum.
+    ///
+    /// Clears `buf` before reading.
+    /// Returns `Ok(Some(bytes_read))` or `Ok(None)` on clean EOF before any header bytes are read.
+    /// Returns `Err(UnexpectedEof)` if EOF occurs midway through reading the header, CRC, or payload.
+    /// Returns `Err(InvalidData)` if the header indicates a frame larger than `max_frame_size` or if CRC-32 verification fails.
+    pub fn read_frame_buf(&mut self, buf: &mut Vec<u8>) -> io::Result<Option<usize>> {
+        buf.clear();
+        let hlen = self.field_kind.header_len();
+        let mut header = [0u8; 8];
+        let mut header_read = 0;
+
+        while header_read < hlen {
+            let n = self.inner.read(&mut header[header_read..hlen])?;
+            if n == 0 {
+                if header_read == 0 {
+                    return Ok(None);
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "incomplete CRC frame length prefix: read {} of {} bytes",
+                            header_read, hlen
+                        ),
+                    ));
+                }
+            }
+            header_read += n;
+        }
+
+        let payload_len = self.field_kind.decode_len(&header[..hlen]);
+        if payload_len > self.max_frame_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "CRC frame payload length {} exceeds configured maximum {}",
+                    payload_len, self.max_frame_size
+                ),
+            ));
+        }
+
+        let mut crc_buf = [0u8; 4];
+        self.inner.read_exact(&mut crc_buf)?;
+        let expected_crc = u32::from_be_bytes(crc_buf);
+
+        buf.resize(payload_len, 0);
+        if payload_len > 0 {
+            self.inner.read_exact(buf)?;
+        }
+
+        let actual_crc = crc32_digest(buf);
+        if actual_crc != expected_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "CRC-32 checksum mismatch: expected 0x{:08X}, computed 0x{:08X}",
+                    expected_crc, actual_crc
+                ),
+            ));
+        }
+
+        self.frames_read += 1;
+        Ok(Some(payload_len))
+    }
+
+    /// Read the next complete verified frame from the stream into a new `Vec<u8>`.
+    ///
+    /// Returns `Ok(None)` on clean EOF before any header byte is read.
+    pub fn read_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut buf = Vec::new();
+        match self.read_frame_buf(&mut buf)? {
+            Some(_) => Ok(Some(buf)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the next frame and parse it as a UTF-8 string.
+    pub fn read_frame_to_string(&mut self) -> io::Result<Option<String>> {
+        match self.read_frame()? {
+            Some(bytes) => String::from_utf8(bytes).map(Some).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid UTF-8 in CRC frame: {}", e),
+                )
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// Convert this `CrcFramedReader` into an iterator yielding verified frame byte buffers.
+    pub fn into_frames(self) -> CrcFramedIter<R> {
+        CrcFramedIter { reader: self }
+    }
+
+    /// Reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    /// Consume this reader, returning inner reader, field kind, max frame size, and frames read.
+    pub fn into_parts(self) -> (R, LengthFieldKind, usize, u64) {
+        (
+            self.inner,
+            self.field_kind,
+            self.max_frame_size,
+            self.frames_read,
+        )
+    }
+}
+
+/// Helper function to create a new `CrcFramedReader` with standard 4-byte big-endian framing.
+pub fn crc_framed_reader<R: Read>(reader: R) -> CrcFramedReader<R> {
+    CrcFramedReader::new(reader)
+}
+
+/// Iterator over CRC-validated frames produced by a `CrcFramedReader`.
+#[derive(Debug)]
+pub struct CrcFramedIter<R: Read> {
+    reader: CrcFramedReader<R>,
+}
+
+impl<R: Read> CrcFramedIter<R> {
+    /// Reference to the underlying framed reader.
+    pub fn get_ref(&self) -> &CrcFramedReader<R> {
+        &self.reader
+    }
+
+    /// Mutable reference to the underlying framed reader.
+    pub fn get_mut(&mut self) -> &mut CrcFramedReader<R> {
+        &mut self.reader
+    }
+
+    /// Unwrap the inner `CrcFramedReader`.
+    pub fn into_inner(self) -> CrcFramedReader<R> {
+        self.reader
+    }
+}
+
+impl<R: Read> Iterator for CrcFramedIter<R> {
+    type Item = io::Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.reader.read_frame() {
+            Ok(Some(frame)) => Some(Ok(frame)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
 /// Helper function to locate a byte needle in a haystack slice without allocations.
 #[inline]
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -5859,5 +6167,207 @@ mod base64_streaming_tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, b"Man");
+    }
+
+    #[test]
+    fn test_crc_framed_roundtrip_basic() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = CrcFramedWriter::new(&mut sink);
+            assert_eq!(writer.frames_written(), 0);
+            assert_eq!(writer.bytes_written(), 0);
+            assert_eq!(writer.length_field(), LengthFieldKind::U32Be);
+
+            writer.write_frame_str("alpha").unwrap();
+            writer.write_frame_str("beta").unwrap();
+            writer.write_frame(b"gamma").unwrap();
+            writer.flush().unwrap();
+
+            assert_eq!(writer.frames_written(), 3);
+            // 3 frames: each has 4-byte len + 4-byte CRC + payload
+            // "alpha": 4 + 4 + 5 = 13
+            // "beta":  4 + 4 + 4 = 12
+            // "gamma": 4 + 4 + 5 = 13
+            // Total = 38
+            assert_eq!(writer.bytes_written(), 38);
+        }
+
+        let mut reader = CrcFramedReader::new(sink.as_slice());
+        assert_eq!(reader.frames_read(), 0);
+        assert_eq!(reader.length_field(), LengthFieldKind::U32Be);
+
+        assert_eq!(
+            reader.read_frame_to_string().unwrap(),
+            Some("alpha".to_string())
+        );
+        assert_eq!(
+            reader.read_frame_to_string().unwrap(),
+            Some("beta".to_string())
+        );
+        assert_eq!(reader.read_frame().unwrap(), Some(b"gamma".to_vec()));
+        assert_eq!(reader.read_frame().unwrap(), None); // Clean EOF
+        assert_eq!(reader.frames_read(), 3);
+    }
+
+    #[test]
+    fn test_crc_framed_empty_and_binary() {
+        let mut sink = Vec::new();
+        let payload = vec![0x00, 0xFF, 0x7E, 0x55, 0xAA, 0x12];
+        {
+            let mut writer = crc_framed_writer(&mut sink);
+            writer.write_frame(b"").unwrap();
+            writer.write_frame(&payload).unwrap();
+            writer.flush().unwrap();
+        }
+
+        let mut reader = crc_framed_reader(sink.as_slice());
+        assert_eq!(reader.read_frame().unwrap(), Some(Vec::new()));
+        assert_eq!(reader.read_frame().unwrap(), Some(payload));
+        assert_eq!(reader.read_frame().unwrap(), None);
+    }
+
+    #[test]
+    fn test_crc_framed_corrupted_payload() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = CrcFramedWriter::new(&mut sink);
+            writer.write_frame(b"secure payload").unwrap();
+        }
+
+        // Corrupt one byte in the payload
+        let last_idx = sink.len() - 1;
+        sink[last_idx] ^= 0x01;
+
+        let mut reader = CrcFramedReader::new(sink.as_slice());
+        let res = reader.read_frame();
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("CRC-32 checksum mismatch"));
+    }
+
+    #[test]
+    fn test_crc_framed_corrupted_crc_header() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = CrcFramedWriter::new(&mut sink);
+            writer.write_frame(b"another payload").unwrap();
+        }
+
+        // Corrupt one byte in the 4-byte CRC header (index 4 to 7 in U32Be)
+        sink[5] ^= 0x80;
+
+        let mut reader = CrcFramedReader::new(sink.as_slice());
+        let res = reader.read_frame();
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("CRC-32 checksum mismatch"));
+    }
+
+    #[test]
+    fn test_crc_framed_incomplete_header_and_payload() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = CrcFramedWriter::new(&mut sink);
+            writer.write_frame(b"complete frame").unwrap();
+        }
+
+        // Truncate inside length header (2 bytes of 4)
+        let mut reader_trunc_len = CrcFramedReader::new(&sink[..2]);
+        let err1 = reader_trunc_len.read_frame().unwrap_err();
+        assert_eq!(err1.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Truncate inside CRC header (4 bytes len + 2 bytes crc)
+        let mut reader_trunc_crc = CrcFramedReader::new(&sink[..6]);
+        let err2 = reader_trunc_crc.read_frame().unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Truncate inside payload (4 bytes len + 4 bytes crc + partial payload)
+        let mut reader_trunc_pay = CrcFramedReader::new(&sink[..12]);
+        let err3 = reader_trunc_pay.read_frame().unwrap_err();
+        assert_eq!(err3.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn test_crc_framed_max_frame_size_exceeded() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = CrcFramedWriter::new(&mut sink);
+            writer.write_frame(b"0123456789abcdef").unwrap();
+        }
+
+        let mut reader = CrcFramedReader::with_options(sink.as_slice(), LengthFieldKind::U32Be, 10);
+        assert_eq!(reader.max_frame_size(), 10);
+        reader.set_max_frame_size(8);
+        assert_eq!(reader.max_frame_size(), 8);
+
+        let res = reader.read_frame();
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds configured maximum"));
+    }
+
+    #[test]
+    fn test_crc_framed_into_frames_iterator() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = CrcFramedWriter::new(&mut sink);
+            writer.write_frame(b"frame 1").unwrap();
+            writer.write_frame(b"frame 2").unwrap();
+            writer.write_frame(b"frame 3").unwrap();
+        }
+
+        let reader = CrcFramedReader::new(sink.as_slice());
+        let iter = reader.into_frames();
+        assert_eq!(iter.get_ref().frames_read(), 0);
+        let items: Vec<Vec<u8>> = iter.map(|res| res.unwrap()).collect();
+        assert_eq!(
+            items,
+            vec![
+                b"frame 1".to_vec(),
+                b"frame 2".to_vec(),
+                b"frame 3".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_crc_framed_different_length_kinds() {
+        for kind in [
+            LengthFieldKind::U16Be,
+            LengthFieldKind::U16Le,
+            LengthFieldKind::U32Le,
+            LengthFieldKind::U64Be,
+        ] {
+            let mut sink = Vec::new();
+            {
+                let mut writer = CrcFramedWriter::with_length_field(&mut sink, kind);
+                assert_eq!(writer.length_field(), kind);
+                writer.write_frame(b"test kind payload").unwrap();
+            }
+
+            let mut reader = CrcFramedReader::with_options(sink.as_slice(), kind, 1024);
+            assert_eq!(reader.length_field(), kind);
+            let frame = reader.read_frame().unwrap().unwrap();
+            assert_eq!(frame, b"test kind payload");
+        }
+    }
+
+    #[test]
+    fn test_crc_framed_constructor_shorthands_and_parts() {
+        let mut sink = Vec::new();
+        let writer = crc_framed_writer(&mut sink);
+        let (inner, kind, frames, bytes) = writer.into_parts();
+        assert_eq!(kind, LengthFieldKind::U32Be);
+        assert_eq!(frames, 0);
+        assert_eq!(bytes, 0);
+
+        let reader = crc_framed_reader(inner.as_slice());
+        let (_inner_r, kind_r, max_sz, frames_r) = reader.into_parts();
+        assert_eq!(kind_r, LengthFieldKind::U32Be);
+        assert_eq!(max_sz, DEFAULT_MAX_FRAME_SIZE);
+        assert_eq!(frames_r, 0);
     }
 }
