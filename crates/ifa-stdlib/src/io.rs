@@ -891,6 +891,168 @@ impl Read for RepeatReader {
     }
 }
 
+/// Reader wrapper that prefixes a stream with an in-memory byte buffer.
+/// Useful for peeking, replaying headers, or injecting handshake bytes on non-seekable streams.
+#[derive(Debug, Clone)]
+pub struct PrefixedReader<R: Read> {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: R,
+}
+
+impl<R: Read> PrefixedReader<R> {
+    /// Create a new `PrefixedReader` that yields `prefix` bytes before reading from `inner`.
+    pub fn new(prefix: Vec<u8>, inner: R) -> Self {
+        Self {
+            prefix,
+            pos: 0,
+            inner,
+        }
+    }
+
+    /// Total length of the prefix buffer in bytes.
+    pub fn prefix_len(&self) -> usize {
+        self.prefix.len()
+    }
+
+    /// Number of remaining prefix bytes waiting to be read.
+    pub fn prefix_remaining(&self) -> usize {
+        self.prefix.len().saturating_sub(self.pos)
+    }
+
+    /// Reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying reader, discarding any remaining unread prefix bytes.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+/// Helper function to create a new `PrefixedReader`.
+pub fn prefixed<R: Read>(prefix: Vec<u8>, reader: R) -> PrefixedReader<R> {
+    PrefixedReader::new(prefix, reader)
+}
+
+impl<R: Read> Read for PrefixedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.pos < self.prefix.len() {
+            let available = self.prefix.len() - self.pos;
+            let to_read = available.min(buf.len());
+            buf[..to_read].copy_from_slice(&self.prefix[self.pos..self.pos + to_read]);
+            self.pos += to_read;
+            Ok(to_read)
+        } else {
+            self.inner.read(buf)
+        }
+    }
+}
+
+impl<R: Read + BufRead> BufRead for PrefixedReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.pos < self.prefix.len() {
+            Ok(&self.prefix[self.pos..])
+        } else {
+            self.inner.fill_buf()
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        if self.pos < self.prefix.len() {
+            let available = self.prefix.len() - self.pos;
+            let taken = available.min(amt);
+            self.pos += taken;
+            let rem = amt - taken;
+            if rem > 0 {
+                self.inner.consume(rem);
+            }
+        } else {
+            self.inner.consume(amt);
+        }
+    }
+}
+
+/// Writer that duplicates all writes and flushes across multiple destination writers.
+#[derive(Debug, Default, Clone)]
+pub struct MultiWriter<W: Write> {
+    writers: Vec<W>,
+}
+
+impl<W: Write> MultiWriter<W> {
+    /// Create a new `MultiWriter` targeting the provided list of writers.
+    pub fn new(writers: Vec<W>) -> Self {
+        Self { writers }
+    }
+
+    /// Create a new empty `MultiWriter` with preallocated writer capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            writers: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Add a destination writer.
+    pub fn add_writer(&mut self, writer: W) {
+        self.writers.push(writer);
+    }
+
+    /// Number of configured destination writers.
+    pub fn len(&self) -> usize {
+        self.writers.len()
+    }
+
+    /// Check if no destination writers are configured.
+    pub fn is_empty(&self) -> bool {
+        self.writers.is_empty()
+    }
+
+    /// Slice reference to all destination writers.
+    pub fn writers(&self) -> &[W] {
+        &self.writers
+    }
+
+    /// Mutable slice reference to all destination writers.
+    pub fn writers_mut(&mut self) -> &mut [W] {
+        &mut self.writers
+    }
+
+    /// Consume this writer and return the vector of destination writers.
+    pub fn into_writers(self) -> Vec<W> {
+        self.writers
+    }
+}
+
+/// Helper function to create a new `MultiWriter`.
+pub fn multi_writer<W: Write>(writers: Vec<W>) -> MultiWriter<W> {
+    MultiWriter::new(writers)
+}
+
+impl<W: Write> Write for MultiWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        for w in &mut self.writers {
+            w.write_all(buf)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        for w in &mut self.writers {
+            w.flush()?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,5 +1264,73 @@ mod tests {
         let n = limited.read_to_end(&mut limited_buf).unwrap();
         assert_eq!(n, 8);
         assert_eq!(limited_buf, b"ZZZZZZZZ");
+    }
+
+    #[test]
+    fn test_prefixed_reader() {
+        let prefix = b"GET / HTTP/1.1\r\n".to_vec();
+        let payload = b"Host: localhost\r\n\r\n";
+        let mut reader = prefixed(prefix.clone(), &payload[..]);
+
+        assert_eq!(reader.prefix_len(), 16);
+        assert_eq!(reader.prefix_remaining(), 16);
+
+        // Read first part (part of prefix)
+        let mut chunk1 = [0u8; 4];
+        let n1 = reader.read(&mut chunk1).unwrap();
+        assert_eq!(n1, 4);
+        assert_eq!(&chunk1, b"GET ");
+        assert_eq!(reader.prefix_remaining(), 12);
+
+        // Read remaining all together
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(reader.prefix_remaining(), 0);
+
+        let expected = b"/ HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec();
+        assert_eq!(rest, expected);
+
+        // Test BufRead implementation
+        let mut buf_reader = prefixed(b"line 1\n".to_vec(), &b"line 2\n"[..]);
+        let mut line1 = String::new();
+        buf_reader.read_line(&mut line1).unwrap();
+        assert_eq!(line1, "line 1\n");
+
+        let mut line2 = String::new();
+        buf_reader.read_line(&mut line2).unwrap();
+        assert_eq!(line2, "line 2\n");
+    }
+
+    #[test]
+    fn test_multi_writer() {
+        let mut dest1 = Vec::new();
+        let mut dest2 = Vec::new();
+        let mut dest3 = Vec::new();
+
+        {
+            let mut mw = multi_writer(vec![&mut dest1, &mut dest2, &mut dest3]);
+            assert_eq!(mw.len(), 3);
+            assert!(!mw.is_empty());
+
+            let n = mw.write(b"broadcast data ").unwrap();
+            assert_eq!(n, 15);
+            mw.write_all(b"stream test").unwrap();
+            mw.flush().unwrap();
+        }
+
+        assert_eq!(dest1, b"broadcast data stream test");
+        assert_eq!(dest2, b"broadcast data stream test");
+        assert_eq!(dest3, b"broadcast data stream test");
+
+        // Test with_capacity and add_writer
+        let mut mw2: MultiWriter<Vec<u8>> = MultiWriter::with_capacity(2);
+        assert!(mw2.is_empty());
+        mw2.add_writer(Vec::new());
+        mw2.add_writer(Vec::new());
+        assert_eq!(mw2.len(), 2);
+        mw2.write_all(b"test").unwrap();
+        let writers = mw2.into_writers();
+        assert_eq!(writers[0], b"test");
+        assert_eq!(writers[1], b"test");
     }
 }
