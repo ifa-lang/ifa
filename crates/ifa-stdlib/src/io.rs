@@ -658,6 +658,75 @@ impl<R: Read> Read for LimitedReader<R> {
     }
 }
 
+/// Helper function to create a new `LimitedReader`.
+pub fn limited<R: Read>(reader: R, limit: u64) -> LimitedReader<R> {
+    LimitedReader::new(reader, limit)
+}
+
+/// Writer wrapper that writes at most `limit` bytes to the underlying writer.
+/// Once the limit is reached, further writes return 0 bytes written.
+#[derive(Debug, Clone)]
+pub struct LimitedWriter<W: Write> {
+    inner: W,
+    limit: u64,
+}
+
+impl<W: Write> LimitedWriter<W> {
+    /// Create a new writer with an upper limit of `limit` bytes.
+    pub fn new(writer: W, limit: u64) -> Self {
+        Self {
+            inner: writer,
+            limit,
+        }
+    }
+
+    /// Remaining allowed byte count before reaching the limit.
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// Set a new limit for remaining bytes.
+    pub fn set_limit(&mut self, limit: u64) {
+        self.limit = limit;
+    }
+
+    /// Borrow the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Mutably borrow the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+/// Helper function to create a new `LimitedWriter`.
+pub fn limited_writer<W: Write>(writer: W, limit: u64) -> LimitedWriter<W> {
+    LimitedWriter::new(writer, limit)
+}
+
+impl<W: Write> Write for LimitedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.limit == 0 {
+            return Ok(0);
+        }
+        let max_write = (buf.len() as u64).min(self.limit) as usize;
+        let n = self.inner.write(&buf[..max_write])?;
+        self.limit -= n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Reader that sequentially chains two readers together.
 pub struct ChainedReader<R1: Read, R2: Read> {
     first: Option<R1>,
@@ -695,6 +764,11 @@ impl<R1: Read, R2: Read> Read for ChainedReader<R1, R2> {
         }
         self.second.read(buf)
     }
+}
+
+/// Helper function to chain two readers together into a `ChainedReader`.
+pub fn chain<R1: Read, R2: Read>(first: R1, second: R2) -> ChainedReader<R1, R2> {
+    ChainedReader::new(first, second)
 }
 
 /// Reader wrapper that duplicates each byte read into a secondary writer.
@@ -1053,6 +1127,111 @@ impl<W: Write> Write for MultiWriter<W> {
     }
 }
 
+/// Reader that sequentially concatenates multiple readers into a single continuous stream.
+/// When the current reader reaches EOF (returns 0 bytes), `MultiReader` advances to the next reader.
+#[derive(Debug, Default, Clone)]
+pub struct MultiReader<R: Read> {
+    readers: Vec<R>,
+    current: usize,
+}
+
+impl<R: Read> MultiReader<R> {
+    /// Create a new `MultiReader` from a vector of readers.
+    pub fn new(readers: Vec<R>) -> Self {
+        Self {
+            readers,
+            current: 0,
+        }
+    }
+
+    /// Create an empty `MultiReader` with preallocated capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            readers: Vec::with_capacity(capacity),
+            current: 0,
+        }
+    }
+
+    /// Add a reader to the end of the sequence.
+    pub fn add_reader(&mut self, reader: R) {
+        self.readers.push(reader);
+    }
+
+    /// Total number of readers configured in the sequence.
+    pub fn len(&self) -> usize {
+        self.readers.len()
+    }
+
+    /// Check if no readers are configured.
+    pub fn is_empty(&self) -> bool {
+        self.readers.is_empty()
+    }
+
+    /// Index of the current active reader.
+    pub fn current_index(&self) -> usize {
+        self.current
+    }
+
+    /// Number of remaining readers (including the current active reader, if any).
+    pub fn remaining_readers(&self) -> usize {
+        self.readers.len().saturating_sub(self.current)
+    }
+
+    /// Slice reference to all readers.
+    pub fn readers(&self) -> &[R] {
+        &self.readers
+    }
+
+    /// Mutable slice reference to all readers.
+    pub fn readers_mut(&mut self) -> &mut [R] {
+        &mut self.readers
+    }
+
+    /// Consume this reader and return the vector of readers.
+    pub fn into_readers(self) -> Vec<R> {
+        self.readers
+    }
+}
+
+/// Helper function to create a new `MultiReader`.
+pub fn multi_reader<R: Read>(readers: Vec<R>) -> MultiReader<R> {
+    MultiReader::new(readers)
+}
+
+impl<R: Read> Read for MultiReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.current < self.readers.len() {
+            let n = self.readers[self.current].read(buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            self.current += 1;
+        }
+        Ok(0)
+    }
+}
+
+impl<R: Read + BufRead> BufRead for MultiReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        while self.current < self.readers.len() {
+            if !self.readers[self.current].fill_buf()?.is_empty() {
+                return self.readers[self.current].fill_buf();
+            }
+            self.current += 1;
+        }
+        Ok(&[])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        if self.current < self.readers.len() {
+            self.readers[self.current].consume(amt);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1332,5 +1511,98 @@ mod tests {
         let writers = mw2.into_writers();
         assert_eq!(writers[0], b"test");
         assert_eq!(writers[1], b"test");
+    }
+
+    #[test]
+    fn test_limited_writer() {
+        let mut out = Vec::new();
+        {
+            let mut lw = limited_writer(&mut out, 10);
+            assert_eq!(lw.limit(), 10);
+            let n1 = lw.write(b"0123456789extra").unwrap();
+            assert_eq!(n1, 10);
+            assert_eq!(lw.limit(), 0);
+            let n2 = lw.write(b"more").unwrap();
+            assert_eq!(n2, 0);
+            lw.flush().unwrap();
+        }
+        assert_eq!(out, b"0123456789");
+
+        // Test set_limit, get_ref, get_mut, into_inner
+        let mut lw2 = limited_writer(Vec::new(), 5);
+        lw2.write_all(b"abc").unwrap();
+        assert_eq!(lw2.limit(), 2);
+        assert_eq!(lw2.get_ref(), b"abc");
+        lw2.get_mut().extend_from_slice(b"!");
+        lw2.set_limit(10);
+        assert_eq!(lw2.limit(), 10);
+        let inner = lw2.into_inner();
+        assert_eq!(inner, b"abc!");
+    }
+
+    #[test]
+    fn test_limited_and_chain_helpers() {
+        let data = b"helloworld";
+        let mut lim = limited(&data[..], 5);
+        let mut buf = Vec::new();
+        lim.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"hello");
+
+        let p1 = b"abc";
+        let p2 = b"xyz";
+        let mut ch = chain(&p1[..], &p2[..]);
+        let mut ch_buf = Vec::new();
+        ch.read_to_end(&mut ch_buf).unwrap();
+        assert_eq!(ch_buf, b"abcxyz");
+    }
+
+    #[test]
+    fn test_multi_reader() {
+        // Empty MultiReader
+        let mut empty_mr: MultiReader<&[u8]> = multi_reader(vec![]);
+        assert!(empty_mr.is_empty());
+        assert_eq!(empty_mr.len(), 0);
+        assert_eq!(empty_mr.current_index(), 0);
+        assert_eq!(empty_mr.remaining_readers(), 0);
+        let mut buf = [0u8; 10];
+        assert_eq!(empty_mr.read(&mut buf).unwrap(), 0);
+
+        // Multiple parts
+        let part1 = b"Hello, ";
+        let part2 = b"wonderful ";
+        let part3 = b"world!";
+        let mut mr = multi_reader(vec![&part1[..], &part2[..], &part3[..]]);
+        assert_eq!(mr.len(), 3);
+        assert_eq!(mr.remaining_readers(), 3);
+        assert_eq!(mr.current_index(), 0);
+
+        let mut output = Vec::new();
+        let bytes_read = mr.read_to_end(&mut output).unwrap();
+        assert_eq!(bytes_read, 23);
+        assert_eq!(output, b"Hello, wonderful world!");
+        assert_eq!(mr.current_index(), 3);
+        assert_eq!(mr.remaining_readers(), 0);
+
+        // Test with_capacity, add_reader, and into_readers
+        let mut mr2: MultiReader<&[u8]> = MultiReader::with_capacity(2);
+        mr2.add_reader(b"first\n");
+        mr2.add_reader(b"second\n");
+        assert_eq!(mr2.len(), 2);
+        assert_eq!(mr2.readers().len(), 2);
+        assert_eq!(mr2.readers_mut().len(), 2);
+
+        // Test BufRead
+        let mut line1 = String::new();
+        mr2.read_line(&mut line1).unwrap();
+        assert_eq!(line1, "first\n");
+        let mut line2 = String::new();
+        mr2.read_line(&mut line2).unwrap();
+        assert_eq!(line2, "second\n");
+        let mut line3 = String::new();
+        mr2.read_line(&mut line3).unwrap();
+        assert_eq!(line3, "");
+
+        let inner_readers = mr2.into_readers();
+        assert_eq!(inner_readers.len(), 2);
     }
 }
