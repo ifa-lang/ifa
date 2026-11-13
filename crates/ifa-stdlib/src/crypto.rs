@@ -2100,6 +2100,248 @@ impl Jwt {
     }
 }
 
+/// Fills `buffer` with cryptographically secure random bytes from the OS entropy source.
+pub fn secure_random_fill(buffer: &mut [u8]) -> Result<(), String> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::fs::File;
+        let mut file = File::open("/dev/urandom")
+            .map_err(|e| format!("failed to open /dev/urandom: {}", e))?;
+        file.read_exact(buffer)
+            .map_err(|e| format!("failed to read from /dev/urandom: {}", e))?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn SystemFunction036(pbBuffer: *mut u8, dwLen: u32) -> u8;
+        }
+        let len = buffer.len();
+        let ret = unsafe { SystemFunction036(buffer.as_mut_ptr(), len as u32) };
+        if ret != 0 {
+            Ok(())
+        } else {
+            Err("SystemFunction036 (RtlGenRandom) failed".to_string())
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err("Secure entropy source is unsupported on this platform".to_string())
+    }
+}
+
+/// Generates `len` cryptographically secure random bytes from the OS entropy source.
+pub fn secure_random_bytes(len: usize) -> Result<Vec<u8>, String> {
+    let mut buf = vec![0u8; len];
+    secure_random_fill(&mut buf)?;
+    Ok(buf)
+}
+
+/// Generates a cryptographically secure random hex-encoded token of `byte_len` random bytes (producing 2*byte_len characters).
+pub fn secure_random_token(byte_len: usize) -> Result<String, String> {
+    let bytes = secure_random_bytes(byte_len)?;
+    Ok(hex_encode(&bytes))
+}
+
+/// Generates a cryptographically secure random URL-safe base64 token of `byte_len` random bytes (unpadded).
+pub fn secure_random_token_base64(byte_len: usize) -> Result<String, String> {
+    let bytes = secure_random_bytes(byte_len)?;
+    Ok(base64url_encode(&bytes).trim_end_matches('=').to_string())
+}
+
+/// Error encountered while parsing or generating an RFC 4122 / RFC 9562 UUID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UuidError {
+    InvalidLength(usize),
+    InvalidFormat,
+    InvalidCharacter(char),
+    EntropyError(String),
+}
+
+impl std::fmt::Display for UuidError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidLength(len) => write!(f, "Invalid UUID string length: {}", len),
+            Self::InvalidFormat => write!(f, "Invalid UUID format"),
+            Self::InvalidCharacter(c) => write!(f, "Invalid character in UUID string: '{}'", c),
+            Self::EntropyError(err) => write!(f, "Failed to gather entropy for UUID: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for UuidError {}
+
+/// RFC 4122 / RFC 9562 Universally Unique Identifier (UUID).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Uuid([u8; 16]);
+
+impl Uuid {
+    /// Nil UUID (00000000-0000-0000-0000-000000000000).
+    pub const NIL: Self = Self([0u8; 16]);
+
+    /// Returns the Nil UUID.
+    pub const fn nil() -> Self {
+        Self::NIL
+    }
+
+    /// Check if this UUID is the Nil UUID.
+    pub fn is_nil(&self) -> bool {
+        self.0 == [0u8; 16]
+    }
+
+    /// Creates a UUID directly from raw 16 bytes.
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns a reference to the raw 16 bytes of the UUID.
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    /// Consumes the UUID and returns the raw 16 bytes.
+    pub const fn into_bytes(self) -> [u8; 16] {
+        self.0
+    }
+
+    /// Returns the UUID version (e.g. 4 for random UUID), or None if nil.
+    pub fn version(&self) -> Option<usize> {
+        if self.is_nil() {
+            None
+        } else {
+            Some((self.0[6] >> 4) as usize)
+        }
+    }
+
+    /// Generates a new random Version 4 UUID according to RFC 4122.
+    pub fn new_v4() -> Result<Self, UuidError> {
+        let mut bytes = [0u8; 16];
+        secure_random_fill(&mut bytes).map_err(UuidError::EntropyError)?;
+        // Set version 4: bits 4-7 of octet 6 to 0100_2
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        // Set variant RFC 4122: bits 6-7 of octet 8 to 10_2
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Ok(Self(bytes))
+    }
+
+    /// Generates a new random Version 4 UUID according to RFC 4122, panicking on entropy failure.
+    pub fn v4() -> Self {
+        Self::new_v4().expect("Failed to generate secure random UUID v4")
+    }
+
+    /// Formats the UUID as a canonical hyphenated string (8-4-4-4-12 lowercase hex characters).
+    pub fn to_hyphenated_string(&self) -> String {
+        let b = &self.0;
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            b[0], b[1], b[2], b[3],
+            b[4], b[5],
+            b[6], b[7],
+            b[8], b[9],
+            b[10], b[11], b[12], b[13], b[14], b[15]
+        )
+    }
+
+    /// Formats the UUID as a simple 32-character lowercase hex string without hyphens.
+    pub fn to_simple_string(&self) -> String {
+        to_hex(&self.0)
+    }
+
+    /// Parses a UUID from string in standard hyphenated, simple hex, braced, or URN format.
+    pub fn parse_str(input: &str) -> Result<Self, UuidError> {
+        let trimmed = input.trim();
+        let s = if let Some(stripped) = trimmed.strip_prefix("urn:uuid:") {
+            stripped
+        } else if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            &trimmed[1..trimmed.len() - 1]
+        } else {
+            trimmed
+        };
+
+        if s.len() == 36 {
+            // Standard hyphenated format: 8-4-4-4-12
+            let b = s.as_bytes();
+            if b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
+                return Err(UuidError::InvalidFormat);
+            }
+            let mut hex_clean = String::with_capacity(32);
+            hex_clean.push_str(&s[0..8]);
+            hex_clean.push_str(&s[9..13]);
+            hex_clean.push_str(&s[14..18]);
+            hex_clean.push_str(&s[19..23]);
+            hex_clean.push_str(&s[24..36]);
+            Self::from_hex_32(&hex_clean)
+        } else if s.len() == 32 {
+            Self::from_hex_32(s)
+        } else {
+            Err(UuidError::InvalidLength(s.len()))
+        }
+    }
+
+    fn from_hex_32(hex: &str) -> Result<Self, UuidError> {
+        if hex.len() != 32 {
+            return Err(UuidError::InvalidLength(hex.len()));
+        }
+        let mut bytes = [0u8; 16];
+        for i in 0..16 {
+            let slice = &hex[i * 2..i * 2 + 2];
+            bytes[i] = u8::from_str_radix(slice, 16).map_err(|_| {
+                let bad_ch = slice
+                    .chars()
+                    .find(|c| !c.is_ascii_hexdigit())
+                    .unwrap_or('?');
+                UuidError::InvalidCharacter(bad_ch)
+            })?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl std::fmt::Display for Uuid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_hyphenated_string())
+    }
+}
+
+impl std::fmt::Debug for Uuid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Uuid({})", self.to_hyphenated_string())
+    }
+}
+
+impl std::str::FromStr for Uuid {
+    type Err = UuidError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_str(s)
+    }
+}
+
+impl Serialize for Uuid {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_hyphenated_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Uuid {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::parse_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -3022,5 +3264,104 @@ mod tests {
         // Error cases: length exceeding 255 * HashLen
         assert!(hkdf_sha1_expand(&prk, &info, 255 * 20 + 1).is_err());
         assert_eq!(hkdf_sha1_expand(&prk, &info, 0).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_secure_random_and_tokens() {
+        let empty: Result<Vec<u8>, String> = secure_random_bytes(0);
+        assert_eq!(empty.unwrap(), Vec::<u8>::new());
+
+        let bytes = secure_random_bytes(32).unwrap();
+        assert_eq!(bytes.len(), 32);
+
+        // Check tokens
+        let hex_tok = secure_random_token(16).unwrap();
+        assert_eq!(hex_tok.len(), 32);
+        assert!(hex_tok.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let b64_tok = secure_random_token_base64(32).unwrap();
+        assert!(!b64_tok.is_empty());
+        assert!(!b64_tok.contains('='));
+        assert!(!b64_tok.contains('+'));
+        assert!(!b64_tok.contains('/'));
+    }
+
+    #[test]
+    fn test_uuid_nil() {
+        let nil = Uuid::nil();
+        assert!(nil.is_nil());
+        assert_eq!(nil.version(), None);
+        assert_eq!(nil.to_string(), "00000000-0000-0000-0000-000000000000");
+        assert_eq!(nil.to_simple_string(), "00000000000000000000000000000000");
+        assert_eq!(nil.as_bytes(), &[0u8; 16]);
+
+        let parsed = Uuid::parse_str("00000000-0000-0000-0000-000000000000").unwrap();
+        assert_eq!(parsed, nil);
+    }
+
+    #[test]
+    fn test_uuid_v4_generation_and_properties() {
+        let u1 = Uuid::new_v4().unwrap();
+        let u2 = Uuid::v4();
+        assert_ne!(u1, u2);
+        assert!(!u1.is_nil());
+        assert_eq!(u1.version(), Some(4));
+        assert_eq!(u2.version(), Some(4));
+
+        let s1 = u1.to_string();
+        assert_eq!(s1.len(), 36);
+        // Byte 6 high nibble must be 4
+        assert_eq!(&s1[14..15], "4");
+        // Byte 8 high nibble must be 8, 9, a, or b
+        let var_ch = s1.chars().nth(19).unwrap();
+        assert!(matches!(var_ch, '8' | '9' | 'a' | 'b'));
+
+        let simple = u1.to_simple_string();
+        assert_eq!(simple.len(), 32);
+        assert_eq!(simple, s1.replace('-', ""));
+    }
+
+    #[test]
+    fn test_uuid_parse_all_formats_and_serde() {
+        let raw = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let u_hyphenated = Uuid::parse_str(raw).unwrap();
+        assert_eq!(u_hyphenated.to_string(), raw);
+        assert_eq!(u_hyphenated.version(), Some(1));
+
+        // Simple 32-hex
+        let u_simple = Uuid::parse_str("6ba7b8109dad11d180b400c04fd430c8").unwrap();
+        assert_eq!(u_simple, u_hyphenated);
+
+        // Braced format
+        let u_braced = Uuid::parse_str("{6ba7b810-9dad-11d1-80b4-00c04fd430c8}").unwrap();
+        assert_eq!(u_braced, u_hyphenated);
+
+        // URN format
+        let u_urn = Uuid::parse_str("urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8").unwrap();
+        assert_eq!(u_urn, u_hyphenated);
+
+        // FromStr trait
+        let u_from_str: Uuid = raw.parse().unwrap();
+        assert_eq!(u_from_str, u_hyphenated);
+
+        // Serde JSON round-trip
+        let json = serde_json::to_string(&u_hyphenated).unwrap();
+        assert_eq!(json, format!("\"{}\"", raw));
+        let decoded: Uuid = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, u_hyphenated);
+
+        // Error cases
+        assert!(matches!(
+            Uuid::parse_str("short"),
+            Err(UuidError::InvalidLength(5))
+        ));
+        assert!(matches!(
+            Uuid::parse_str("6ba7b810_9dad_11d1_80b4_00c04fd430c8"),
+            Err(UuidError::InvalidFormat)
+        ));
+        assert!(matches!(
+            Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430cz"),
+            Err(UuidError::InvalidCharacter('z'))
+        ));
     }
 }

@@ -22,10 +22,11 @@ pub use crypto::{
     hkdf_sha256_hex, hmac_sha1, hmac_sha1_hex, hmac_sha1_verify, hmac_sha1_verify_hex, hmac_sha256,
     hmac_sha256_hex, hmac_sha256_verify, hmac_sha256_verify_hex, hotp, pbkdf2_hmac_sha1,
     pbkdf2_hmac_sha1_hex, pbkdf2_hmac_sha1_verify, pbkdf2_hmac_sha1_verify_hex, pbkdf2_hmac_sha256,
-    pbkdf2_hmac_sha256_hex, pbkdf2_hmac_sha256_verify, pbkdf2_hmac_sha256_verify_hex, sha1,
+    pbkdf2_hmac_sha256_hex, pbkdf2_hmac_sha256_verify, pbkdf2_hmac_sha256_verify_hex,
+    secure_random_bytes, secure_random_fill, secure_random_token, secure_random_token_base64, sha1,
     sha1_hex, sha256, sha256_hex, totp, totp_verify, websocket_accept_key, HmacSha1,
     HmacSha1Reader, HmacSha1Writer, HmacSha256, HmacSha256Reader, HmacSha256Writer, Jwt, JwtClaims,
-    JwtError, Sha1, Sha1Reader, Sha1Writer, Sha256, Sha256Reader, Sha256Writer,
+    JwtError, Sha1, Sha1Reader, Sha1Writer, Sha256, Sha256Reader, Sha256Writer, Uuid, UuidError,
 };
 pub use csv::{
     decode as decode_csv, decode_with_options as decode_csv_with_options, encode as encode_csv,
@@ -1166,5 +1167,18 @@ mod tests {
             okm1_hex,
             "085a01ea1b10f36933068b56efa5ad81a4f14b822f5b091568a9cdd4f155fda2c22e422478d305f3f896"
         );
+
+        // UUID v4 and Secure Random
+        let u = Uuid::new_v4().unwrap();
+        assert_eq!(u.version(), Some(4));
+        let u_str = u.to_string();
+        assert_eq!(u_str.len(), 36);
+        let parsed: Uuid = u_str.parse().unwrap();
+        assert_eq!(parsed, u);
+
+        let tok = secure_random_token(16).unwrap();
+        assert_eq!(tok.len(), 32);
+        let b64 = secure_random_token_base64(24).unwrap();
+        assert_eq!(b64.len(), 32);
     }
 }
