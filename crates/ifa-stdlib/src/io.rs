@@ -2827,7 +2827,10 @@ impl<R: Read> DelimitedReader<R> {
         match self.read_record()? {
             Some(bytes) => {
                 let s = String::from_utf8(bytes).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("invalid utf-8 record: {e}"))
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid utf-8 record: {e}"),
+                    )
                 })?;
                 Ok(Some(s))
             }
@@ -3945,7 +3948,9 @@ mod tests {
         let mut wire = Vec::new();
         let mut writer = DelimitedWriter::new(&mut wire, b"---SPLIT---");
         writer.write_record_str("first chunk").unwrap();
-        writer.write_record_str("second chunk with utf8: bénin").unwrap();
+        writer
+            .write_record_str("second chunk with utf8: bénin")
+            .unwrap();
 
         let mut reader = DelimitedReader::new(wire.as_slice(), b"---SPLIT---");
         let mut rec1 = Vec::new();
