@@ -16,7 +16,8 @@ pub mod sys;
 
 pub use collections::{
     BinaryHeap, BitSet, BitSetError, BitSetIter, ByteBuffer, CycleError, Deque, DiGraph,
-    DirectedGraph, DisjointSet, Eviction, List, LruCache, Map, Set, StringBuilder, Trie, TrieSet,
+    DirectedGraph, DisjointSet, Eviction, Interval, IntervalError, IntervalMap, IntervalMapIter,
+    IntervalSet, List, LruCache, Map, Set, StringBuilder, Trie, TrieSet,
 };
 pub use crypto::{
     base64_decode, base64_encode, base64url_decode, base64url_encode, blake3, blake3_hex,
@@ -1797,5 +1798,233 @@ mod tests {
 
         set3.clear();
         assert!(set3.is_empty());
+    }
+
+    #[test]
+    fn test_collections_interval_operations() {
+        // Validation and creation
+        let iv = Interval::new(10, 20).unwrap();
+        assert_eq!(iv.start, 10);
+        assert_eq!(iv.end, 20);
+        assert!(!iv.is_empty());
+        assert_eq!(format!("{}", iv), "[10, 20)");
+
+        let empty_iv = Interval::new(15, 15).unwrap();
+        assert!(empty_iv.is_empty());
+
+        let invalid = Interval::new(25, 10);
+        assert!(matches!(invalid, Err(IntervalError::InvertedBounds { start: 25, end: 10 })));
+        assert!(format!("{}", invalid.unwrap_err()).contains("Invalid interval bounds"));
+
+        let unchecked = Interval::new_unchecked(5, 12);
+        assert_eq!(unchecked.start, 5);
+        assert_eq!(unchecked.end, 12);
+
+        // Point containment
+        assert!(!iv.contains_point(&9));
+        assert!(iv.contains_point(&10));
+        assert!(iv.contains_point(&15));
+        assert!(iv.contains_point(&19));
+        assert!(!iv.contains_point(&20));
+
+        // Interval containment
+        let inner = Interval::new(12, 18).unwrap();
+        assert!(iv.contains_interval(&inner));
+        assert!(!inner.contains_interval(&iv));
+        assert!(iv.contains_interval(&iv));
+
+        // Overlap & Touches
+        let disjoint_left = Interval::new(0, 10).unwrap();
+        let disjoint_right = Interval::new(20, 30).unwrap();
+        let overlap_left = Interval::new(5, 15).unwrap();
+        let overlap_right = Interval::new(15, 25).unwrap();
+
+        assert!(!iv.overlaps(&disjoint_left));
+        assert!(iv.touches(&disjoint_left));
+        assert!(!iv.overlaps(&disjoint_right));
+        assert!(iv.touches(&disjoint_right));
+
+        assert!(iv.overlaps(&overlap_left));
+        assert!(!iv.touches(&overlap_left));
+        assert!(iv.overlaps(&overlap_right));
+
+        // Intersection
+        assert_eq!(iv.intersection(&disjoint_left), None);
+        assert_eq!(iv.intersection(&overlap_left), Some(Interval::new(10, 15).unwrap()));
+        assert_eq!(iv.intersection(&overlap_right), Some(Interval::new(15, 20).unwrap()));
+
+        // Span
+        let spanned = iv.span(&overlap_right);
+        assert_eq!(spanned, Interval::new(10, 25).unwrap());
+        let spanned_disjoint = iv.span(&disjoint_left);
+        assert_eq!(spanned_disjoint, Interval::new(0, 20).unwrap());
+    }
+
+    #[test]
+    fn test_collections_interval_map() {
+        let mut map: IntervalMap<i32, &'static str> = IntervalMap::new();
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
+
+        // Insertion
+        assert_eq!(map.insert(Interval::new(10, 20).unwrap(), "first"), None);
+        assert_eq!(map.insert(Interval::new(25, 35).unwrap(), "second"), None);
+        assert_eq!(map.insert(Interval::new(5, 15).unwrap(), "third"), None);
+        assert_eq!(map.len(), 3);
+
+        // Duplicate update
+        assert_eq!(
+            map.insert(Interval::new(10, 20).unwrap(), "first_updated"),
+            Some("first")
+        );
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get(&Interval::new(10, 20).unwrap()), Some(&"first_updated"));
+        assert_eq!(map[&Interval::new(10, 20).unwrap()], "first_updated");
+
+        // get_mut
+        if let Some(val) = map.get_mut(&Interval::new(10, 20).unwrap()) {
+            *val = "first_mutated";
+        }
+        assert_eq!(map.get(&Interval::new(10, 20).unwrap()), Some(&"first_mutated"));
+
+        // Point queries
+        assert!(map.contains_point(&12));
+        let point_12 = map.query_point(&12);
+        assert_eq!(point_12.len(), 2); // [5, 15) and [10, 20)
+        assert!(!map.contains_point(&40));
+        assert!(map.query_point(&40).is_empty());
+
+        // Overlapping queries
+        let query_iv = Interval::new(18, 26).unwrap();
+        assert!(map.any_overlaps(&query_iv));
+        let overlap_res = map.query_overlapping(&query_iv);
+        assert_eq!(overlap_res.len(), 2); // [10, 20) overlaps with [18, 26), and [25, 35) overlaps with [18, 26)
+
+        let disjoint_query = Interval::new(40, 50).unwrap();
+        assert!(!map.any_overlaps(&disjoint_query));
+        assert!(map.query_overlapping(&disjoint_query).is_empty());
+
+        // Removal
+        assert_eq!(map.remove(&Interval::new(10, 20).unwrap()), Some("first_mutated"));
+        assert_eq!(map.len(), 2);
+        assert!(!map.contains_key(&Interval::new(10, 20).unwrap()));
+        assert_eq!(map.remove(&Interval::new(10, 20).unwrap()), None);
+
+        // Iteration and order
+        let keys = map.intervals();
+        assert_eq!(keys, vec![Interval::new(5, 15).unwrap(), Interval::new(25, 35).unwrap()]);
+
+        let collected: Vec<_> = map.iter().map(|(k, v)| (*k, *v)).collect();
+        assert_eq!(
+            collected,
+            vec![
+                (Interval::new(5, 15).unwrap(), "third"),
+                (Interval::new(25, 35).unwrap(), "second")
+            ]
+        );
+
+        // FromIterator and Extend
+        let mut from_iter_map: IntervalMap<i32, i32> = IntervalMap::from_iter(vec![
+            (Interval::new(1, 5).unwrap(), 100),
+            (Interval::new(6, 10).unwrap(), 200),
+        ]);
+        assert_eq!(from_iter_map.len(), 2);
+        from_iter_map.extend(vec![(Interval::new(11, 15).unwrap(), 300)]);
+        assert_eq!(from_iter_map.len(), 3);
+        assert_eq!(from_iter_map.get(&Interval::new(11, 15).unwrap()), Some(&300));
+
+        // Stress balancing (AVL rotations)
+        let mut avl_map = IntervalMap::new();
+        for i in 0..50 {
+            avl_map.insert(Interval::new(i * 10, i * 10 + 5).unwrap(), i);
+        }
+        assert_eq!(avl_map.len(), 50);
+        for i in 0..50 {
+            assert_eq!(avl_map.get(&Interval::new(i * 10, i * 10 + 5).unwrap()), Some(&i));
+        }
+        for i in (0..50).step_by(2) {
+            assert_eq!(avl_map.remove(&Interval::new(i * 10, i * 10 + 5).unwrap()), Some(i));
+        }
+        assert_eq!(avl_map.len(), 25);
+        for i in (1..50).step_by(2) {
+            assert_eq!(avl_map.get(&Interval::new(i * 10, i * 10 + 5).unwrap()), Some(&i));
+        }
+
+        avl_map.clear();
+        assert!(avl_map.is_empty());
+        assert_eq!(avl_map.len(), 0);
+    }
+
+    #[test]
+    fn test_collections_interval_set() {
+        let mut set: IntervalSet<i32> = IntervalSet::new();
+        assert!(set.is_empty());
+        assert_eq!(set.len(), 0);
+
+        assert!(set.insert(Interval::new(10, 20).unwrap()));
+        assert!(set.insert(Interval::new(30, 40).unwrap()));
+        assert!(!set.insert(Interval::new(10, 20).unwrap())); // duplicate
+        assert_eq!(set.len(), 2);
+
+        assert!(set.contains(&Interval::new(10, 20).unwrap()));
+        assert!(!set.contains(&Interval::new(15, 25).unwrap()));
+
+        assert!(set.contains_point(&15));
+        assert!(!set.contains_point(&25));
+        assert!(set.contains_point(&35));
+
+        assert!(set.any_overlaps(&Interval::new(15, 25).unwrap()));
+        assert!(!set.any_overlaps(&Interval::new(21, 29).unwrap()));
+
+        let pt_res = set.query_point(&15);
+        assert_eq!(pt_res, vec![&Interval::new(10, 20).unwrap()]);
+
+        let ov_res = set.query_overlapping(&Interval::new(18, 35).unwrap());
+        assert_eq!(
+            ov_res,
+            vec![
+                &Interval::new(10, 20).unwrap(),
+                &Interval::new(30, 40).unwrap()
+            ]
+        );
+
+        assert!(set.remove(&Interval::new(10, 20).unwrap()));
+        assert!(!set.remove(&Interval::new(10, 20).unwrap()));
+        assert_eq!(set.len(), 1);
+
+        // Merging test
+        let mut merge_set = IntervalSet::new();
+        merge_set.insert(Interval::new(1, 5).unwrap());
+        merge_set.insert(Interval::new(3, 8).unwrap());
+        merge_set.insert(Interval::new(8, 10).unwrap());
+        merge_set.insert(Interval::new(15, 20).unwrap());
+        merge_set.insert(Interval::new(18, 22).unwrap());
+        merge_set.insert(Interval::new(30, 35).unwrap());
+
+        let merged = merge_set.merged();
+        assert_eq!(
+            merged,
+            vec![
+                Interval::new(1, 10).unwrap(),
+                Interval::new(15, 22).unwrap(),
+                Interval::new(30, 35).unwrap(),
+            ]
+        );
+
+        // Empty set merge
+        let empty: IntervalSet<i32> = IntervalSet::new();
+        assert!(empty.merged().is_empty());
+
+        // FromIterator and Extend
+        let mut set2 = IntervalSet::from_iter(vec![
+            Interval::new(0, 10).unwrap(),
+            Interval::new(20, 30).unwrap(),
+        ]);
+        assert_eq!(set2.len(), 2);
+        set2.extend(vec![Interval::new(40, 50).unwrap()]);
+        assert_eq!(set2.len(), 3);
+
+        set2.clear();
+        assert!(set2.is_empty());
     }
 }

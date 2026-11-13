@@ -15,6 +15,9 @@
 //! - `DirectedGraph<N, E>`: Deterministic directed graph for dependency resolution, DAG scheduling and SCC.
 //! - `Trie<V>`: Deterministic prefix tree for ordered string indexing, predictive search and prefix matching.
 //! - `TrieSet`: Deterministic prefix-based unique string set with autocompletion and longest-prefix resolution.
+//! - `Interval<T>`: Half-open interval `[start, end)` with span, overlap and containment logic.
+//! - `IntervalMap<K, V>`: Deterministic augmented AVL interval tree for fast overlap and point queries.
+//! - `IntervalSet<K>`: Deterministic set of intervals with contiguous merging and collision testing.
 
 use std::collections::{btree_map, btree_set, BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -3255,6 +3258,649 @@ impl Extend<String> for TrieSet {
     fn extend<I: IntoIterator<Item = String>>(&mut self, iter: I) {
         for s in iter {
             self.insert(&s);
+        }
+    }
+}
+
+/// Error returned when attempting to construct an invalid interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntervalError<T> {
+    /// The lower bound is strictly greater than the upper bound.
+    InvertedBounds { start: T, end: T },
+}
+
+impl<T: fmt::Debug> fmt::Display for IntervalError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvertedBounds { start, end } => {
+                write!(
+                    f,
+                    "Invalid interval bounds: start ({:?}) must be <= end ({:?})",
+                    start, end
+                )
+            }
+        }
+    }
+}
+
+impl<T: fmt::Debug> std::error::Error for IntervalError<T> {}
+
+/// Half-open interval `[start, end)` representing a contiguous range.
+///
+/// Invariant: `start <= end`. When `start == end`, the interval is considered empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Interval<T> {
+    /// Start of interval (inclusive).
+    pub start: T,
+    /// End of interval (exclusive).
+    pub end: T,
+}
+
+impl<T: fmt::Display> fmt::Display for Interval<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}, {})", self.start, self.end)
+    }
+}
+
+impl<T: Ord + Clone> Interval<T> {
+    /// Create a validated half-open interval `[start, end)`.
+    ///
+    /// Returns `Err(IntervalError::InvertedBounds)` if `start > end`.
+    pub fn new(start: T, end: T) -> Result<Self, IntervalError<T>> {
+        if start > end {
+            Err(IntervalError::InvertedBounds { start, end })
+        } else {
+            Ok(Self { start, end })
+        }
+    }
+
+    /// Create an interval without checking boundary invariants.
+    pub const fn new_unchecked(start: T, end: T) -> Self {
+        Self { start, end }
+    }
+
+    /// Check if point falls within `[start, end)`.
+    pub fn contains_point(&self, point: &T) -> bool {
+        self.start <= *point && *point < self.end
+    }
+
+    /// Check if this interval completely contains another interval.
+    pub fn contains_interval(&self, other: &Self) -> bool {
+        self.start <= other.start && other.end <= self.end
+    }
+
+    /// Check if this interval overlaps with another interval.
+    ///
+    /// Two half-open intervals `[a, b)` and `[c, d)` overlap if `a < d && c < b`.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+
+    /// Check if this interval is adjacent to another (i.e. touches borders without overlapping).
+    pub fn touches(&self, other: &Self) -> bool {
+        self.end == other.start || other.end == self.start
+    }
+
+    /// Return the intersection of two intervals, or `None` if they do not overlap.
+    pub fn intersection(&self, other: &Self) -> Option<Self> {
+        if self.overlaps(other) {
+            let start = std::cmp::max(self.start.clone(), other.start.clone());
+            let end = std::cmp::min(self.end.clone(), other.end.clone());
+            Some(Self { start, end })
+        } else {
+            None
+        }
+    }
+
+    /// Return the smallest bounding interval spanning both intervals.
+    pub fn span(&self, other: &Self) -> Self {
+        let start = std::cmp::min(self.start.clone(), other.start.clone());
+        let end = std::cmp::max(self.end.clone(), other.end.clone());
+        Self { start, end }
+    }
+
+    /// Return `true` if interval has zero length (`start == end`).
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IntervalNode<K, V> {
+    interval: Interval<K>,
+    value: V,
+    max_end: K,
+    height: usize,
+    left: Option<Box<IntervalNode<K, V>>>,
+    right: Option<Box<IntervalNode<K, V>>>,
+}
+
+type IntervalNodeBox<K, V> = Box<IntervalNode<K, V>>;
+type IntervalNodeLink<K, V> = Option<IntervalNodeBox<K, V>>;
+type MinExtract<K, V> = (IntervalNodeBox<K, V>, IntervalNodeLink<K, V>);
+
+impl<K: Ord + Clone, V> IntervalNode<K, V> {
+    fn new(interval: Interval<K>, value: V) -> Self {
+        let max_end = interval.end.clone();
+        Self {
+            interval,
+            value,
+            max_end,
+            height: 1,
+            left: None,
+            right: None,
+        }
+    }
+
+    fn height(node: &Option<Box<Self>>) -> usize {
+        node.as_ref().map_or(0, |n| n.height)
+    }
+
+    fn update(&mut self) {
+        let left_h = Self::height(&self.left);
+        let right_h = Self::height(&self.right);
+        self.height = 1 + std::cmp::max(left_h, right_h);
+
+        let mut max = self.interval.end.clone();
+        if let Some(ref l) = self.left {
+            if l.max_end > max {
+                max = l.max_end.clone();
+            }
+        }
+        if let Some(ref r) = self.right {
+            if r.max_end > max {
+                max = r.max_end.clone();
+            }
+        }
+        self.max_end = max;
+    }
+
+    fn balance_factor(&self) -> isize {
+        Self::height(&self.left) as isize - Self::height(&self.right) as isize
+    }
+}
+
+fn rotate_right<K: Ord + Clone, V>(mut y: Box<IntervalNode<K, V>>) -> Box<IntervalNode<K, V>> {
+    let mut x = y.left.take().expect("left child must exist for right rotation");
+    y.left = x.right.take();
+    y.update();
+    x.right = Some(y);
+    x.update();
+    x
+}
+
+fn rotate_left<K: Ord + Clone, V>(mut x: Box<IntervalNode<K, V>>) -> Box<IntervalNode<K, V>> {
+    let mut y = x.right.take().expect("right child must exist for left rotation");
+    x.right = y.left.take();
+    x.update();
+    y.left = Some(x);
+    y.update();
+    y
+}
+
+fn rebalance<K: Ord + Clone, V>(mut node: Box<IntervalNode<K, V>>) -> Box<IntervalNode<K, V>> {
+    node.update();
+    let bf = node.balance_factor();
+
+    if bf > 1 {
+        if let Some(ref left) = node.left {
+            if left.balance_factor() < 0 {
+                let l = node.left.take().unwrap();
+                node.left = Some(rotate_left(l));
+            }
+        }
+        return rotate_right(node);
+    } else if bf < -1 {
+        if let Some(ref right) = node.right {
+            if right.balance_factor() > 0 {
+                let r = node.right.take().unwrap();
+                node.right = Some(rotate_right(r));
+            }
+        }
+        return rotate_left(node);
+    }
+
+    node
+}
+
+fn insert_node<K: Ord + Clone, V>(
+    node: Option<Box<IntervalNode<K, V>>>,
+    interval: Interval<K>,
+    value: V,
+    old_val: &mut Option<V>,
+) -> Box<IntervalNode<K, V>> {
+    let mut current = match node {
+        Some(n) => n,
+        None => return Box::new(IntervalNode::new(interval, value)),
+    };
+
+    if interval < current.interval {
+        current.left = Some(insert_node(current.left.take(), interval, value, old_val));
+    } else if interval > current.interval {
+        current.right = Some(insert_node(current.right.take(), interval, value, old_val));
+    } else {
+        *old_val = Some(std::mem::replace(&mut current.value, value));
+        return current;
+    }
+
+    rebalance(current)
+}
+
+fn extract_min<K: Ord + Clone, V>(
+    mut node: IntervalNodeBox<K, V>,
+) -> MinExtract<K, V> {
+    if node.left.is_none() {
+        let right = node.right.take();
+        (node, right)
+    } else {
+        let (min_node, new_left) = extract_min(node.left.take().unwrap());
+        node.left = new_left;
+        (min_node, Some(rebalance(node)))
+    }
+}
+
+fn remove_node<K: Ord + Clone, V>(
+    node: Option<Box<IntervalNode<K, V>>>,
+    key: &Interval<K>,
+    removed_val: &mut Option<V>,
+) -> Option<Box<IntervalNode<K, V>>> {
+    let mut current = node?;
+
+    if *key < current.interval {
+        current.left = remove_node(current.left.take(), key, removed_val);
+    } else if *key > current.interval {
+        current.right = remove_node(current.right.take(), key, removed_val);
+    } else {
+        *removed_val = Some(current.value);
+        if current.left.is_none() {
+            return current.right;
+        } else if current.right.is_none() {
+            return current.left;
+        } else {
+            let right = current.right.take().unwrap();
+            let (mut successor, new_right) = extract_min(right);
+            successor.left = current.left.take();
+            successor.right = new_right;
+            return Some(rebalance(successor));
+        }
+    }
+
+    Some(rebalance(current))
+}
+
+fn query_point_rec<'a, K: Ord + Clone, V>(
+    node: &'a Option<Box<IntervalNode<K, V>>>,
+    point: &K,
+    results: &mut Vec<(&'a Interval<K>, &'a V)>,
+) {
+    if let Some(ref n) = node {
+        if n.max_end <= *point {
+            return;
+        }
+        if let Some(ref left) = n.left {
+            if left.max_end > *point {
+                query_point_rec(&n.left, point, results);
+            }
+        }
+        if n.interval.contains_point(point) {
+            results.push((&n.interval, &n.value));
+        }
+        if n.interval.start <= *point {
+            query_point_rec(&n.right, point, results);
+        }
+    }
+}
+
+fn query_overlapping_rec<'a, K: Ord + Clone, V>(
+    node: &'a Option<Box<IntervalNode<K, V>>>,
+    query: &Interval<K>,
+    results: &mut Vec<(&'a Interval<K>, &'a V)>,
+) {
+    if let Some(ref n) = node {
+        if n.max_end <= query.start {
+            return;
+        }
+        if let Some(ref left) = n.left {
+            if left.max_end > query.start {
+                query_overlapping_rec(&n.left, query, results);
+            }
+        }
+        if n.interval.overlaps(query) {
+            results.push((&n.interval, &n.value));
+        }
+        if query.end > n.interval.start {
+            query_overlapping_rec(&n.right, query, results);
+        }
+    }
+}
+
+fn in_order_entries<'a, K: Ord + Clone, V>(
+    node: &'a Option<Box<IntervalNode<K, V>>>,
+    out: &mut Vec<(&'a Interval<K>, &'a V)>,
+) {
+    if let Some(ref n) = node {
+        in_order_entries(&n.left, out);
+        out.push((&n.interval, &n.value));
+        in_order_entries(&n.right, out);
+    }
+}
+
+/// Deterministic augmented AVL interval tree (`IntervalMap<K, V>`).
+///
+/// Stores key-value mappings where keys are half-open intervals `[start, end)`.
+/// Provides logarithmic search, point containment lookups, and overlapping range queries
+/// with guaranteed bit-for-bit deterministic traversal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntervalMap<K: Ord + Clone, V> {
+    root: Option<Box<IntervalNode<K, V>>>,
+    len: usize,
+}
+
+impl<K: Ord + Clone, V> Default for IntervalMap<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K: Ord + Clone, V> IntervalMap<K, V> {
+    /// Create an empty interval map.
+    pub fn new() -> Self {
+        Self { root: None, len: 0 }
+    }
+
+    /// Return the number of intervals in the map.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Check if the map is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Clear all intervals from the map.
+    pub fn clear(&mut self) {
+        self.root = None;
+        self.len = 0;
+    }
+
+    /// Insert an interval and value into the map.
+    ///
+    /// If an identical interval was already present, replaces the value and returns the old one.
+    pub fn insert(&mut self, interval: Interval<K>, value: V) -> Option<V> {
+        let mut old = None;
+        self.root = Some(insert_node(self.root.take(), interval, value, &mut old));
+        if old.is_none() {
+            self.len += 1;
+        }
+        old
+    }
+
+    /// Remove an interval from the map, returning its value if present.
+    pub fn remove(&mut self, interval: &Interval<K>) -> Option<V> {
+        let mut removed = None;
+        self.root = remove_node(self.root.take(), interval, &mut removed);
+        if removed.is_some() {
+            self.len -= 1;
+        }
+        removed
+    }
+
+    /// Get a reference to the value associated with an exact interval.
+    pub fn get(&self, interval: &Interval<K>) -> Option<&V> {
+        let mut curr = self.root.as_ref();
+        while let Some(node) = curr {
+            if interval < &node.interval {
+                curr = node.left.as_ref();
+            } else if interval > &node.interval {
+                curr = node.right.as_ref();
+            } else {
+                return Some(&node.value);
+            }
+        }
+        None
+    }
+
+    /// Get a mutable reference to the value associated with an exact interval.
+    pub fn get_mut(&mut self, interval: &Interval<K>) -> Option<&mut V> {
+        let mut curr = self.root.as_mut();
+        while let Some(node) = curr {
+            if interval < &node.interval {
+                curr = node.left.as_mut();
+            } else if interval > &node.interval {
+                curr = node.right.as_mut();
+            } else {
+                return Some(&mut node.value);
+            }
+        }
+        None
+    }
+
+    /// Check if map contains the exact interval.
+    pub fn contains_key(&self, interval: &Interval<K>) -> bool {
+        self.get(interval).is_some()
+    }
+
+    /// Find all intervals containing the given point.
+    pub fn query_point(&self, point: &K) -> Vec<(&Interval<K>, &V)> {
+        let mut results = Vec::new();
+        query_point_rec(&self.root, point, &mut results);
+        results
+    }
+
+    /// Find all intervals overlapping with the given query interval.
+    pub fn query_overlapping(&self, query: &Interval<K>) -> Vec<(&Interval<K>, &V)> {
+        let mut results = Vec::new();
+        query_overlapping_rec(&self.root, query, &mut results);
+        results
+    }
+
+    /// Check if any interval overlaps with the given query interval.
+    pub fn any_overlaps(&self, query: &Interval<K>) -> bool {
+        !self.query_overlapping(query).is_empty()
+    }
+
+    /// Check if any interval contains the given point.
+    pub fn contains_point(&self, point: &K) -> bool {
+        !self.query_point(point).is_empty()
+    }
+
+    /// Return all intervals in deterministic lexicographical order.
+    pub fn intervals(&self) -> Vec<Interval<K>> {
+        let mut res = Vec::with_capacity(self.len);
+        let mut entries = Vec::with_capacity(self.len);
+        in_order_entries(&self.root, &mut entries);
+        for (k, _) in entries {
+            res.push(k.clone());
+        }
+        res
+    }
+
+    /// Return an iterator visiting all entries in ascending interval order.
+    pub fn iter(&self) -> IntervalMapIter<'_, K, V> {
+        IntervalMapIter::new(&self.root)
+    }
+}
+
+impl<K: Ord + Clone, V> Index<&Interval<K>> for IntervalMap<K, V> {
+    type Output = V;
+    fn index(&self, index: &Interval<K>) -> &Self::Output {
+        self.get(index).expect("no entry found for interval")
+    }
+}
+
+/// Deterministic in-order iterator over entries of an `IntervalMap`.
+pub struct IntervalMapIter<'a, K, V> {
+    stack: Vec<&'a IntervalNode<K, V>>,
+}
+
+impl<'a, K: Ord + Clone, V> IntervalMapIter<'a, K, V> {
+    fn new(root: &'a Option<Box<IntervalNode<K, V>>>) -> Self {
+        let mut iter = Self { stack: Vec::new() };
+        iter.push_left(root.as_deref());
+        iter
+    }
+
+    fn push_left(&mut self, mut node: Option<&'a IntervalNode<K, V>>) {
+        while let Some(n) = node {
+            self.stack.push(n);
+            node = n.left.as_deref();
+        }
+    }
+}
+
+impl<'a, K: Ord + Clone, V> Iterator for IntervalMapIter<'a, K, V> {
+    type Item = (&'a Interval<K>, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.stack.pop()?;
+        self.push_left(node.right.as_deref());
+        Some((&node.interval, &node.value))
+    }
+}
+
+impl<'a, K: Ord + Clone, V> IntoIterator for &'a IntervalMap<K, V> {
+    type Item = (&'a Interval<K>, &'a V);
+    type IntoIter = IntervalMapIter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<K: Ord + Clone, V> FromIterator<(Interval<K>, V)> for IntervalMap<K, V> {
+    fn from_iter<I: IntoIterator<Item = (Interval<K>, V)>>(iter: I) -> Self {
+        let mut map = Self::new();
+        for (k, v) in iter {
+            map.insert(k, v);
+        }
+        map
+    }
+}
+
+impl<K: Ord + Clone, V> Extend<(Interval<K>, V)> for IntervalMap<K, V> {
+    fn extend<I: IntoIterator<Item = (Interval<K>, V)>>(&mut self, iter: I) {
+        for (k, v) in iter {
+            self.insert(k, v);
+        }
+    }
+}
+
+/// Deterministic set of intervals backed by `IntervalMap`.
+///
+/// Supports containment queries, overlap checks, and contiguous interval merging.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IntervalSet<K: Ord + Clone> {
+    inner: IntervalMap<K, ()>,
+}
+
+impl<K: Ord + Clone> IntervalSet<K> {
+    /// Create an empty interval set.
+    pub fn new() -> Self {
+        Self {
+            inner: IntervalMap::new(),
+        }
+    }
+
+    /// Return the number of intervals in the set.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Check if the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Clear all intervals from the set.
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    /// Insert an interval into the set. Returns `true` if it was not already present.
+    pub fn insert(&mut self, interval: Interval<K>) -> bool {
+        self.inner.insert(interval, ()).is_none()
+    }
+
+    /// Remove an interval from the set. Returns `true` if it was present.
+    pub fn remove(&mut self, interval: &Interval<K>) -> bool {
+        self.inner.remove(interval).is_some()
+    }
+
+    /// Check if the set contains the exact interval.
+    pub fn contains(&self, interval: &Interval<K>) -> bool {
+        self.inner.contains_key(interval)
+    }
+
+    /// Check if any interval in the set contains the given point.
+    pub fn contains_point(&self, point: &K) -> bool {
+        self.inner.contains_point(point)
+    }
+
+    /// Check if any interval in the set overlaps with the given interval.
+    pub fn any_overlaps(&self, interval: &Interval<K>) -> bool {
+        self.inner.any_overlaps(interval)
+    }
+
+    /// Find all intervals in the set containing the given point.
+    pub fn query_point(&self, point: &K) -> Vec<&Interval<K>> {
+        self.inner.query_point(point).into_iter().map(|(k, _)| k).collect()
+    }
+
+    /// Find all intervals in the set overlapping with the given interval.
+    pub fn query_overlapping(&self, interval: &Interval<K>) -> Vec<&Interval<K>> {
+        self.inner
+            .query_overlapping(interval)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    /// Return all intervals in deterministic lexicographical order.
+    pub fn intervals(&self) -> Vec<Interval<K>> {
+        self.inner.intervals()
+    }
+
+    /// Return a merged, minimal list of disjoint intervals covering the exact same points.
+    ///
+    /// Consecutive overlapping or adjacent (`touches`) intervals are fused together.
+    pub fn merged(&self) -> Vec<Interval<K>> {
+        let intervals = self.intervals();
+        if intervals.is_empty() {
+            return Vec::new();
+        }
+        let mut merged = Vec::new();
+        let mut current = intervals[0].clone();
+
+        for next in intervals.into_iter().skip(1) {
+            if next.start <= current.end {
+                if next.end > current.end {
+                    current.end = next.end;
+                }
+            } else {
+                merged.push(current);
+                current = next;
+            }
+        }
+        merged.push(current);
+        merged
+    }
+}
+
+impl<K: Ord + Clone> FromIterator<Interval<K>> for IntervalSet<K> {
+    fn from_iter<I: IntoIterator<Item = Interval<K>>>(iter: I) -> Self {
+        let mut set = Self::new();
+        for item in iter {
+            set.insert(item);
+        }
+        set
+    }
+}
+
+impl<K: Ord + Clone> Extend<Interval<K>> for IntervalSet<K> {
+    fn extend<I: IntoIterator<Item = Interval<K>>>(&mut self, iter: I) {
+        for item in iter {
+            self.insert(item);
         }
     }
 }
