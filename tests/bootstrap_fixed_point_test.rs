@@ -1913,6 +1913,31 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
+        stdout.contains("test test_io_crc32_known_vector ... ok"),
+        "Std io CRC-32 known vector test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_io_crc32_empty ... ok"),
+        "Std io CRC-32 empty test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_io_crc32_hasher_incremental ... ok"),
+        "Std io CRC-32 hasher incremental test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_io_crc32_hasher_reset ... ok"),
+        "Std io CRC-32 hasher reset test missing from output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("test test_io_crc32_all ... ok"),
+        "Std io CRC-32 all test missing from output:\n{}",
+        stdout
+    );
+    assert!(
         stdout.contains("test test_net_crc32_and_adler32 ... ok"),
         "Std net crc32 and adler32 test missing from output:\n{}",
         stdout
@@ -2058,8 +2083,8 @@ fn test_autonomous_stdlib_unit_tests() {
         stdout
     );
     assert!(
-        stdout.contains("312 passed; 0 failed"),
-        "Expected 312 passed std unit tests, got:\n{}",
+        stdout.contains("322 passed; 0 failed"),
+        "Expected 322 passed std unit tests, got:\n{}",
         stdout
     );
 }
