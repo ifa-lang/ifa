@@ -3013,6 +3013,166 @@ pub fn read_ivarint<R: Read>(reader: &mut R) -> io::Result<i64> {
     Ok(zigzag_decode(u))
 }
 
+/// Encodes a signed 64-bit integer using two's-complement SLEB128 into `buf`.
+///
+/// Returns the number of bytes written (between 1 and 10).
+///
+/// # Panics
+/// Panics if `buf.len()` is insufficient to hold the encoded value.
+pub fn encode_sleb128(mut val: i64, buf: &mut [u8]) -> usize {
+    let mut i = 0;
+    let mut more = true;
+    while more {
+        let byte = (val & 0x7F) as u8;
+        val >>= 7;
+        if (val == 0 && (byte & 0x40) == 0) || (val == -1 && (byte & 0x40) != 0) {
+            more = false;
+            assert!(i < buf.len(), "buffer too small for SLEB128 encoding");
+            buf[i] = byte;
+        } else {
+            assert!(i < buf.len(), "buffer too small for SLEB128 encoding");
+            buf[i] = byte | 0x80;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Encodes a signed 64-bit integer using two's-complement SLEB128, appending bytes to `out`.
+///
+/// Returns the number of bytes appended (between 1 and 10).
+pub fn encode_sleb128_vec(mut val: i64, out: &mut Vec<u8>) -> usize {
+    let mut count = 0;
+    let mut more = true;
+    while more {
+        let byte = (val & 0x7F) as u8;
+        val >>= 7;
+        if (val == 0 && (byte & 0x40) == 0) || (val == -1 && (byte & 0x40) != 0) {
+            more = false;
+            out.push(byte);
+        } else {
+            out.push(byte | 0x80);
+        }
+        count += 1;
+    }
+    count
+}
+
+/// Decodes a signed 64-bit integer from a two's-complement SLEB128 byte slice.
+///
+/// Returns `Ok((value, bytes_consumed))` on success.
+/// Returns `ErrorKind::UnexpectedEof` if the slice ends before the termination byte.
+/// Returns `ErrorKind::InvalidData` if the encoded integer overflows 64 bits.
+pub fn decode_sleb128(slice: &[u8]) -> io::Result<(i64, usize)> {
+    let mut res: i64 = 0;
+    let mut shift: u32 = 0;
+    for (i, &byte) in slice.iter().enumerate() {
+        if i >= MAX_VARINT_LEN_U64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SLEB128 overflow: exceeds 64-bit signed integer representation",
+            ));
+        }
+
+        if i == 9 && byte != 0x00 && byte != 0x7F {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SLEB128 overflow: 10th byte contains invalid sign-extension bits",
+            ));
+        }
+
+        res |= ((byte & 0x7F) as i64) << shift;
+        shift += 7;
+
+        if (byte & 0x80) == 0 {
+            if shift < 64 && (byte & 0x40) != 0 {
+                res |= !0i64 << shift;
+            }
+            return Ok((res, i + 1));
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "Unexpected EOF while decoding SLEB128",
+    ))
+}
+
+/// Writes a signed 64-bit integer as a two's-complement SLEB128 varint to `writer`.
+///
+/// Returns the number of bytes written.
+pub fn write_sleb128<W: Write>(writer: &mut W, val: i64) -> io::Result<usize> {
+    let mut buf = [0u8; MAX_VARINT_LEN_U64];
+    let n = encode_sleb128(val, &mut buf);
+    writer.write_all(&buf[..n])?;
+    Ok(n)
+}
+
+/// Attempts to read a signed 64-bit integer as a two's-complement SLEB128 varint from `reader`.
+///
+/// Returns `Ok(Some(value))` if successfully decoded.
+/// Returns `Ok(None)` if clean EOF is encountered before any byte is read.
+/// Returns `ErrorKind::UnexpectedEof` if EOF occurs after reading partial continuation bytes.
+/// Returns `ErrorKind::InvalidData` if the integer exceeds 64 bits.
+pub fn try_read_sleb128<R: Read>(reader: &mut R) -> io::Result<Option<i64>> {
+    let mut res: i64 = 0;
+    let mut shift: u32 = 0;
+    let mut buf = [0u8; 1];
+    let mut bytes_read = 0;
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            if bytes_read == 0 {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Unexpected EOF while reading SLEB128 sequence",
+            ));
+        }
+
+        let byte = buf[0];
+        bytes_read += 1;
+
+        if bytes_read > MAX_VARINT_LEN_U64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SLEB128 overflow: exceeds 64-bit signed integer representation",
+            ));
+        }
+
+        if bytes_read == 10 && byte != 0x00 && byte != 0x7F {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SLEB128 overflow: 10th byte contains invalid sign-extension bits",
+            ));
+        }
+
+        res |= ((byte & 0x7F) as i64) << shift;
+        shift += 7;
+
+        if (byte & 0x80) == 0 {
+            if shift < 64 && (byte & 0x40) != 0 {
+                res |= !0i64 << shift;
+            }
+            return Ok(Some(res));
+        }
+    }
+}
+
+/// Reads a signed 64-bit integer as a two's-complement SLEB128 varint from `reader`.
+///
+/// Returns `ErrorKind::UnexpectedEof` if no bytes are available or stream ends prematurely.
+pub fn read_sleb128<R: Read>(reader: &mut R) -> io::Result<i64> {
+    match try_read_sleb128(reader)? {
+        Some(v) => Ok(v),
+        None => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Unexpected EOF: no SLEB128 data available",
+        )),
+    }
+}
+
 /// Stream writer adapter that encodes integers as compact LEB128 / ZigZag varints.
 #[derive(Debug, Clone)]
 pub struct VarintWriter<W: Write> {
@@ -3055,6 +3215,19 @@ impl<W: Write> VarintWriter<W> {
     /// Write a signed 32-bit integer in ZigZag LEB128 format.
     pub fn write_i32(&mut self, val: i32) -> io::Result<usize> {
         self.write_ivarint(val as i64)
+    }
+
+    /// Write a signed 64-bit integer in two's-complement SLEB128 format.
+    pub fn write_sleb128(&mut self, val: i64) -> io::Result<usize> {
+        let n = write_sleb128(&mut self.inner, val)?;
+        self.values_written += 1;
+        self.bytes_written += n as u64;
+        Ok(n)
+    }
+
+    /// Write a signed 32-bit integer in two's-complement SLEB128 format.
+    pub fn write_sleb128_i32(&mut self, val: i32) -> io::Result<usize> {
+        self.write_sleb128(val as i64)
     }
 
     /// Total count of integer values written through this adapter.
@@ -3213,6 +3386,79 @@ impl<R: Read> VarintReader<R> {
         Ok(val as i32)
     }
 
+    /// Attempt to read the next signed 64-bit integer in two's-complement SLEB128 format.
+    pub fn try_read_sleb128(&mut self) -> io::Result<Option<i64>> {
+        let mut res: i64 = 0;
+        let mut shift: u32 = 0;
+        let mut buf = [0u8; 1];
+        let mut bytes_for_this = 0;
+
+        loop {
+            let n = self.inner.read(&mut buf)?;
+            if n == 0 {
+                if bytes_for_this == 0 {
+                    return Ok(None);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Unexpected EOF in the middle of SLEB128 byte sequence",
+                ));
+            }
+
+            let byte = buf[0];
+            bytes_for_this += 1;
+            self.bytes_read += 1;
+
+            if bytes_for_this > MAX_VARINT_LEN_U64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SLEB128 overflow: exceeds 64-bit signed integer representation",
+                ));
+            }
+
+            if bytes_for_this == 10 && byte != 0x00 && byte != 0x7F {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SLEB128 overflow: 10th byte contains invalid sign-extension bits",
+                ));
+            }
+
+            res |= ((byte & 0x7F) as i64) << shift;
+            shift += 7;
+
+            if (byte & 0x80) == 0 {
+                if shift < 64 && (byte & 0x40) != 0 {
+                    res |= !0i64 << shift;
+                }
+                self.values_read += 1;
+                return Ok(Some(res));
+            }
+        }
+    }
+
+    /// Read the next signed 64-bit integer in two's-complement SLEB128 format.
+    pub fn read_sleb128(&mut self) -> io::Result<i64> {
+        match self.try_read_sleb128()? {
+            Some(v) => Ok(v),
+            None => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Unexpected EOF: no SLEB128 data available",
+            )),
+        }
+    }
+
+    /// Read the next signed 32-bit integer in two's-complement SLEB128 format.
+    pub fn read_sleb128_i32(&mut self) -> io::Result<i32> {
+        let val = self.read_sleb128()?;
+        if val < (i32::MIN as i64) || val > (i32::MAX as i64) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SLEB128 value exceeds i32 range",
+            ));
+        }
+        Ok(val as i32)
+    }
+
     /// Total count of integer values read through this adapter.
     pub fn values_read(&self) -> u64 {
         self.values_read
@@ -3251,6 +3497,11 @@ impl<R: Read> VarintReader<R> {
     /// Create an iterator yielding `io::Result<i64>` until clean EOF.
     pub fn into_ivarints(self) -> IVarintIter<R> {
         IVarintIter { reader: self }
+    }
+
+    /// Create an iterator yielding `io::Result<i64>` decoded as two's-complement SLEB128 until clean EOF.
+    pub fn into_sleb128s(self) -> Sleb128Iter<R> {
+        Sleb128Iter { reader: self }
     }
 }
 
@@ -3325,6 +3576,41 @@ impl<R: Read> Iterator for IVarintIter<R> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.reader.try_read_ivarint() {
+            Ok(Some(v)) => Some(Ok(v)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+/// Iterator over two's-complement SLEB128 signed integers read from a `VarintReader`.
+#[derive(Debug)]
+pub struct Sleb128Iter<R: Read> {
+    reader: VarintReader<R>,
+}
+
+impl<R: Read> Sleb128Iter<R> {
+    /// Reference to the underlying `VarintReader`.
+    pub fn get_ref(&self) -> &VarintReader<R> {
+        &self.reader
+    }
+
+    /// Mutable reference to the underlying `VarintReader`.
+    pub fn get_mut(&mut self) -> &mut VarintReader<R> {
+        &mut self.reader
+    }
+
+    /// Consume this iterator, returning the underlying `VarintReader`.
+    pub fn into_inner(self) -> VarintReader<R> {
+        self.reader
+    }
+}
+
+impl<R: Read> Iterator for Sleb128Iter<R> {
+    type Item = io::Result<i64>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.reader.try_read_sleb128() {
             Ok(Some(v)) => Some(Ok(v)),
             Ok(None) => None,
             Err(e) => Some(Err(e)),
@@ -7134,5 +7420,135 @@ mod base64_streaming_tests {
         let (_inner_r, vals_r, bytes_r) = reader.into_parts();
         assert_eq!(vals_r, 0);
         assert_eq!(bytes_r, 0);
+    }
+
+    #[test]
+    fn test_sleb128_known_vectors() {
+        let test_cases: &[(i64, &[u8])] = &[
+            (0, &[0x00]),
+            (1, &[0x01]),
+            (-1, &[0x7F]),
+            (63, &[0x3F]),
+            (-64, &[0x40]),
+            (64, &[0xC0, 0x00]),
+            (-65, &[0xBF, 0x7F]),
+            (127, &[0xFF, 0x00]),
+            (-128, &[0x80, 0x7F]),
+            (128, &[0x80, 0x01]),
+            (-129, &[0xFF, 0x7E]),
+        ];
+
+        let mut buf = [0u8; MAX_VARINT_LEN_U64];
+        for &(val, expected_bytes) in test_cases {
+            let written = encode_sleb128(val, &mut buf);
+            assert_eq!(&buf[..written], expected_bytes);
+
+            let (decoded, consumed) = decode_sleb128(expected_bytes).unwrap();
+            assert_eq!(decoded, val);
+            assert_eq!(consumed, expected_bytes.len());
+        }
+
+        // Test boundary values
+        for &val in &[i32::MIN as i64, i32::MAX as i64, i64::MIN, i64::MAX] {
+            let n = encode_sleb128(val, &mut buf);
+            let (decoded, consumed) = decode_sleb128(&buf[..n]).unwrap();
+            assert_eq!(decoded, val);
+            assert_eq!(consumed, n);
+        }
+
+        // Continuous range check
+        for val in -1000..=1000 {
+            let n = encode_sleb128(val, &mut buf);
+            let (decoded, consumed) = decode_sleb128(&buf[..n]).unwrap();
+            assert_eq!(decoded, val);
+            assert_eq!(consumed, n);
+        }
+    }
+
+    #[test]
+    fn test_sleb128_vec_helper() {
+        let mut out = Vec::new();
+        let n1 = encode_sleb128_vec(-65, &mut out);
+        assert_eq!(n1, 2);
+        let n2 = encode_sleb128_vec(64, &mut out);
+        assert_eq!(n2, 2);
+        assert_eq!(&out, &[0xBF, 0x7F, 0xC0, 0x00]);
+
+        let (v1, len1) = decode_sleb128(&out).unwrap();
+        assert_eq!(v1, -65);
+        assert_eq!(len1, 2);
+
+        let (v2, len2) = decode_sleb128(&out[len1..]).unwrap();
+        assert_eq!(v2, 64);
+        assert_eq!(len2, 2);
+    }
+
+    #[test]
+    fn test_sleb128_stream_reader_writer() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = VarintWriter::new(&mut sink);
+            assert_eq!(writer.write_sleb128(-1).unwrap(), 1);
+            assert_eq!(writer.write_sleb128(64).unwrap(), 2);
+            assert_eq!(writer.write_sleb128_i32(-9999).unwrap(), 3);
+            assert_eq!(writer.write_sleb128(i64::MIN).unwrap(), 10);
+            assert_eq!(writer.write_sleb128(i64::MAX).unwrap(), 10);
+            assert_eq!(writer.values_written(), 5);
+        }
+
+        let mut reader = VarintReader::new(sink.as_slice());
+        assert_eq!(reader.read_sleb128().unwrap(), -1);
+        assert_eq!(reader.read_sleb128().unwrap(), 64);
+        assert_eq!(reader.read_sleb128_i32().unwrap(), -9999);
+        assert_eq!(reader.read_sleb128().unwrap(), i64::MIN);
+        assert_eq!(reader.read_sleb128().unwrap(), i64::MAX);
+        assert_eq!(reader.values_read(), 5);
+        assert_eq!(reader.try_read_sleb128().unwrap(), None);
+    }
+
+    #[test]
+    fn test_sleb128_iterators() {
+        let mut sink = Vec::new();
+        {
+            let mut writer = VarintWriter::new(&mut sink);
+            writer.write_sleb128(-42).unwrap();
+            writer.write_sleb128(0).unwrap();
+            writer.write_sleb128(42).unwrap();
+        }
+
+        let reader = VarintReader::new(sink.as_slice());
+        let iter = reader.into_sleb128s();
+        let vals: Vec<i64> = iter.map(|r| r.unwrap()).collect();
+        assert_eq!(vals, vec![-42, 0, 42]);
+    }
+
+    #[test]
+    fn test_sleb128_errors() {
+        // Unexpected EOF
+        let truncated = [0x80, 0x80];
+        let err_eof = decode_sleb128(&truncated).unwrap_err();
+        assert_eq!(err_eof.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Reader unexpected EOF
+        let mut reader = VarintReader::new(&truncated[..]);
+        let err_r = reader.read_sleb128().unwrap_err();
+        assert_eq!(err_r.kind(), io::ErrorKind::UnexpectedEof);
+
+        // i32 range check
+        let mut sink = Vec::new();
+        {
+            let mut writer = VarintWriter::new(&mut sink);
+            writer.write_sleb128(i32::MAX as i64 + 1).unwrap();
+        }
+        let mut reader_i32 = VarintReader::new(sink.as_slice());
+        let err_i32 = reader_i32.read_sleb128_i32().unwrap_err();
+        assert_eq!(err_i32.kind(), io::ErrorKind::InvalidData);
+        assert!(err_i32.to_string().contains("exceeds i32 range"));
+
+        // Invalid sign bits in 10th byte
+        let invalid_10th = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
+        let err_10th = decode_sleb128(&invalid_10th).unwrap_err();
+        assert_eq!(err_10th.kind(), io::ErrorKind::InvalidData);
+        assert!(err_10th.to_string().contains("invalid sign-extension bits"));
     }
 }

@@ -66,22 +66,24 @@ pub use http::{
 pub use io::{
     adler32_digest, adler32_reader, adler32_writer, base64_reader, base64_writer, chain,
     chunk_reader, chunk_writer, chunks, copy_stream, crc32_digest, crc32_reader, crc32_writer,
-    crc_framed_reader, crc_framed_writer, decode_ivarint, decode_uvarint, delimited_reader,
-    delimited_writer, empty, encode_ivarint, encode_uvarint, encode_uvarint_vec, framed_reader,
-    framed_writer, hex_reader, hex_writer, limited, limited_writer, multi_reader, multi_writer,
-    pad_writer, pipe_lines, prefix_writer, prefixed, pushback_reader, read_ivarint,
-    read_to_end as io_read_to_end, read_to_string as io_read_to_string, read_uvarint, repeat, sink,
-    skip_reader, suffix_writer, suffixed, try_read_ivarint, try_read_uvarint, varint_reader,
-    varint_writer, write_ivarint, write_uvarint, zigzag_decode, zigzag_encode, Adler32Hasher,
+    crc_framed_reader, crc_framed_writer, decode_ivarint, decode_sleb128, decode_uvarint,
+    delimited_reader, delimited_writer, empty, encode_ivarint, encode_sleb128, encode_sleb128_vec,
+    encode_uvarint, encode_uvarint_vec, framed_reader, framed_writer, hex_reader, hex_writer,
+    limited, limited_writer, multi_reader, multi_writer, pad_writer, pipe_lines, prefix_writer,
+    prefixed, pushback_reader, read_ivarint, read_sleb128, read_to_end as io_read_to_end,
+    read_to_string as io_read_to_string, read_uvarint, repeat, sink, skip_reader, suffix_writer,
+    suffixed, try_read_ivarint, try_read_sleb128, try_read_uvarint, varint_reader, varint_writer,
+    write_ivarint, write_sleb128, write_uvarint, zigzag_decode, zigzag_encode, Adler32Hasher,
     Adler32Reader, Adler32Writer, Base64Reader, Base64Writer, BufferedReader, BufferedWriter,
     ChainedReader, ChunkIter, ChunkReader, ChunkWriter, CountingReader, CountingWriter,
     Crc32Hasher, Crc32Reader, Crc32Writer, CrcFramedIter, CrcFramedReader, CrcFramedWriter,
     DelimitedIter, DelimitedReader, DelimitedWriter, EmptyReader, FramedIter, FramedReader,
     FramedWriter, HexReader, HexWriter, IVarintIter, LengthFieldKind, LimitedReader, LimitedWriter,
     LineWriter, MemoryStream, MultiReader, MultiWriter, PadWriter, PrefixWriter, PrefixedReader,
-    PushbackReader, RepeatReader, SinkWriter, SkipReader, SuffixWriter, SuffixedReader, TeeReader,
-    TeeWriter, UVarintIter, VarintReader, VarintWriter, DEFAULT_MAX_DELIMITED_RECORD_SIZE,
-    DEFAULT_MAX_FRAME_SIZE, MAX_VARINT_LEN_U32, MAX_VARINT_LEN_U64,
+    PushbackReader, RepeatReader, SinkWriter, SkipReader, Sleb128Iter, SuffixWriter,
+    SuffixedReader, TeeReader, TeeWriter, UVarintIter, VarintReader, VarintWriter,
+    DEFAULT_MAX_DELIMITED_RECORD_SIZE, DEFAULT_MAX_FRAME_SIZE, MAX_VARINT_LEN_U32,
+    MAX_VARINT_LEN_U64,
 };
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};
 pub use json::{
@@ -992,5 +994,25 @@ mod tests {
         let mut rep_buf = [0u8; 3];
         assert_eq!(rep.read(&mut rep_buf).unwrap(), 3);
         assert_eq!(rep_buf, [b'Q', b'Q', b'Q']);
+    }
+
+    #[test]
+    fn test_io_sleb128_prelude_exports() {
+        let mut sink = Vec::new();
+        let written = encode_sleb128_vec(-12345, &mut sink);
+        assert!(written > 0);
+
+        let (val, consumed) = decode_sleb128(&sink).unwrap();
+        assert_eq!(val, -12345);
+        assert_eq!(consumed, written);
+
+        let mut out = Vec::new();
+        {
+            let mut writer = varint_writer(&mut out);
+            writer.write_sleb128(987654).unwrap();
+        }
+
+        let mut reader = varint_reader(out.as_slice());
+        assert_eq!(reader.read_sleb128().unwrap(), 987654);
     }
 }
