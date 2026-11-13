@@ -15,8 +15,8 @@ pub mod sync;
 pub mod sys;
 
 pub use collections::{
-    BinaryHeap, BitSet, BitSetError, BitSetIter, ByteBuffer, Deque, DisjointSet, Eviction, List,
-    LruCache, Map, Set, StringBuilder,
+    BinaryHeap, BitSet, BitSetError, BitSetIter, ByteBuffer, CycleError, Deque, DiGraph,
+    DirectedGraph, DisjointSet, Eviction, List, LruCache, Map, Set, StringBuilder,
 };
 pub use crypto::{
     base64_decode, base64_encode, base64url_decode, base64url_encode, blake3, blake3_hex,
@@ -1497,5 +1497,131 @@ mod tests {
         assert!(ds2.is_empty());
         assert_eq!(ds2.len(), 0);
         assert_eq!(ds2.set_count(), 0);
+    }
+
+    #[test]
+    fn test_collections_directed_graph() {
+        let mut g: DirectedGraph<&str, u32> = DirectedGraph::new();
+        assert!(g.is_empty());
+        assert_eq!(g.node_count(), 0);
+        assert_eq!(g.edge_count(), 0);
+
+        // Add nodes
+        assert!(g.add_node("A"));
+        assert!(g.add_node("B"));
+        assert!(!g.add_node("A")); // Duplicate
+        assert_eq!(g.node_count(), 2);
+        assert!(g.contains_node(&"A"));
+        assert!(!g.contains_node(&"Z"));
+
+        // Add edges (automatically creates C and D)
+        assert_eq!(g.add_edge("A", "B", 10), None);
+        assert_eq!(g.add_edge("B", "C", 20), None);
+        assert_eq!(g.add_edge("A", "C", 15), None);
+        assert_eq!(g.add_edge("C", "D", 30), None);
+        assert_eq!(g.node_count(), 4);
+        assert_eq!(g.edge_count(), 4);
+
+        // Edge inspection & mutation
+        assert!(g.contains_edge(&"A", &"B"));
+        assert!(!g.contains_edge(&"B", &"A"));
+        assert_eq!(g.edge_weight(&"A", &"B"), Some(&10));
+        *g.edge_weight_mut(&"A", &"B").unwrap() = 12;
+        assert_eq!(g.edge_weight(&"A", &"B"), Some(&12));
+
+        // Degrees
+        assert_eq!(g.in_degree(&"A"), 0);
+        assert_eq!(g.out_degree(&"A"), 2);
+        assert_eq!(g.in_degree(&"C"), 2);
+        assert_eq!(g.out_degree(&"C"), 1);
+        assert_eq!(g.in_degree(&"D"), 1);
+        assert_eq!(g.out_degree(&"D"), 0);
+
+        // Sources & Sinks
+        assert_eq!(g.sources(), vec!["A"]);
+        assert_eq!(g.sinks(), vec!["D"]);
+
+        // Topological Sort on DAG
+        let topo = g
+            .topological_sort()
+            .expect("DAG must have valid topological order");
+        assert_eq!(topo[0], "A");
+        assert_eq!(topo[3], "D");
+        // Verify dependency order: A before B, A before C, B before C, C before D
+        let pos_a = topo.iter().position(|&x| x == "A").unwrap();
+        let pos_b = topo.iter().position(|&x| x == "B").unwrap();
+        let pos_c = topo.iter().position(|&x| x == "C").unwrap();
+        let pos_d = topo.iter().position(|&x| x == "D").unwrap();
+        assert!(pos_a < pos_b);
+        assert!(pos_b < pos_c);
+        assert!(pos_c < pos_d);
+
+        // Reachability & Shortest path
+        let reachable_a = g.reachable_from(&"A");
+        assert_eq!(reachable_a.len(), 4);
+        assert!(g.is_reachable(&"A", &"D"));
+        assert!(!g.is_reachable(&"D", &"A"));
+
+        let path = g.shortest_path(&"A", &"D");
+        assert_eq!(path, Some(vec!["A", "C", "D"])); // A -> C -> D has length 2
+
+        // Transpose graph
+        let trans = g.transpose();
+        assert_eq!(trans.node_count(), 4);
+        assert_eq!(trans.edge_count(), 4);
+        assert!(trans.contains_edge(&"D", &"C"));
+        assert!(trans.contains_edge(&"C", &"A"));
+        assert_eq!(trans.sources(), vec!["D"]);
+        assert_eq!(trans.sinks(), vec!["A"]);
+
+        // Remove edge and node
+        assert_eq!(g.remove_edge(&"A", &"C"), Some(15));
+        assert_eq!(g.edge_count(), 3);
+        assert!(!g.contains_edge(&"A", &"C"));
+
+        assert!(g.remove_node(&"B"));
+        assert_eq!(g.node_count(), 3);
+        assert_eq!(g.edge_count(), 1); // Only C -> D remains
+        assert!(!g.contains_node(&"B"));
+
+        // Cycle detection & SCC
+        let mut cyclic: DiGraph<i32> = DiGraph::new();
+        cyclic.add_edge_unweighted(1, 2);
+        cyclic.add_edge_unweighted(2, 3);
+        cyclic.add_edge_unweighted(3, 1);
+        cyclic.add_edge_unweighted(3, 4);
+
+        assert!(cyclic.has_cycle());
+        let cycle_path = cyclic.find_cycle();
+        assert!(cycle_path.is_some());
+        let c = cycle_path.unwrap();
+        assert_eq!(c.first(), c.last()); // Must start and end at same node
+
+        let err = cyclic.topological_sort().unwrap_err();
+        assert!(err.cycle.is_some());
+
+        // Strongly connected components
+        let sccs = cyclic.strongly_connected_components();
+        // Should have {1, 2, 3} as one SCC, and {4} as another
+        assert_eq!(sccs.len(), 2);
+        let scc_cycle = sccs.iter().find(|s| s.contains(&1)).unwrap();
+        assert_eq!(scc_cycle.len(), 3);
+        assert!(scc_cycle.contains(&1) && scc_cycle.contains(&2) && scc_cycle.contains(&3));
+
+        let scc_leaf = sccs.iter().find(|s| s.contains(&4)).unwrap();
+        assert_eq!(scc_leaf.len(), 1);
+
+        // FromIterator & Extend
+        let mut g2 = DiGraph::from_iter(vec![(10, 20), (20, 30)]);
+        assert_eq!(g2.node_count(), 3);
+        assert_eq!(g2.edge_count(), 2);
+        g2.extend(vec![(30, 40), (40, 50)]);
+        assert_eq!(g2.node_count(), 5);
+        assert_eq!(g2.edge_count(), 4);
+
+        g2.clear();
+        assert!(g2.is_empty());
+        assert_eq!(g2.node_count(), 0);
+        assert_eq!(g2.edge_count(), 0);
     }
 }

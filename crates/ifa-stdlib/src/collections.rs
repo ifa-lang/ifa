@@ -12,8 +12,9 @@
 //! - `LruCache<K, V>`: Bounded-capacity Least Recently Used cache with deterministic eviction.
 //! - `BitSet`: Compact, deterministic bit vector for set operations and compiler dataflow analysis.
 //! - `DisjointSet<T>`: Deterministic Union-Find forest with path compression and union by rank.
+//! - `DirectedGraph<N, E>`: Deterministic directed graph for dependency resolution, DAG scheduling and SCC.
 
-use std::collections::{btree_map, btree_set, BTreeMap, BTreeSet};
+use std::collections::{btree_map, btree_set, BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::ops::{
     BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Index, IndexMut, Not, Sub,
@@ -2290,6 +2291,559 @@ impl<T: Ord + Clone> Extend<(T, T)> for DisjointSet<T> {
     fn extend<I: IntoIterator<Item = (T, T)>>(&mut self, iter: I) {
         for (a, b) in iter {
             self.union_insert(a, b);
+        }
+    }
+}
+
+/// Error indicating that a directed graph contains an unexpected cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CycleError<N> {
+    /// Ordered list of nodes forming the cycle, if identified.
+    pub cycle: Option<Vec<N>>,
+}
+
+impl<N: fmt::Debug> fmt::Display for CycleError<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(ref c) = self.cycle {
+            write!(f, "Cycle detected in directed graph: {:?}", c)
+        } else {
+            write!(f, "Cycle detected in directed graph")
+        }
+    }
+}
+
+impl<N: fmt::Debug> std::error::Error for CycleError<N> {}
+
+/// Unweighted deterministic directed graph.
+pub type DiGraph<N> = DirectedGraph<N, ()>;
+
+/// Deterministic directed graph (`DirectedGraph<N, E>`) with edge weights/labels.
+///
+/// All adjacency representations are stored in ordered B-Trees, guaranteeing bit-for-bit
+/// reproducible iteration, deterministic topological sorting, and canonical cycle reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectedGraph<N: Ord + Clone, E: Clone = ()> {
+    outgoing: BTreeMap<N, BTreeMap<N, E>>,
+    incoming: BTreeMap<N, BTreeMap<N, E>>,
+}
+
+impl<N: Ord + Clone, E: Clone> Default for DirectedGraph<N, E> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<N: Ord + Clone, E: Clone> DirectedGraph<N, E> {
+    /// Create a new empty directed graph.
+    pub fn new() -> Self {
+        Self {
+            outgoing: BTreeMap::new(),
+            incoming: BTreeMap::new(),
+        }
+    }
+
+    /// Create a directed graph initialized with the given nodes.
+    pub fn with_nodes<I: IntoIterator<Item = N>>(nodes: I) -> Self {
+        let mut graph = Self::new();
+        for node in nodes {
+            graph.add_node(node);
+        }
+        graph
+    }
+
+    /// Check if the graph has no nodes.
+    pub fn is_empty(&self) -> bool {
+        self.outgoing.is_empty()
+    }
+
+    /// Total number of nodes in the graph.
+    pub fn node_count(&self) -> usize {
+        self.outgoing.len()
+    }
+
+    /// Total number of directed edges in the graph.
+    pub fn edge_count(&self) -> usize {
+        self.outgoing.values().map(|m| m.len()).sum()
+    }
+
+    /// Check if a node is present in the graph.
+    pub fn contains_node(&self, node: &N) -> bool {
+        self.outgoing.contains_key(node)
+    }
+
+    /// Check if a directed edge exists from `from` to `to`.
+    pub fn contains_edge(&self, from: &N, to: &N) -> bool {
+        self.outgoing.get(from).is_some_and(|m| m.contains_key(to))
+    }
+
+    /// Add a node to the graph if not already present.
+    ///
+    /// Returns `true` if the node was newly added, or `false` if it already existed.
+    pub fn add_node(&mut self, node: N) -> bool {
+        if self.outgoing.contains_key(&node) {
+            return false;
+        }
+        self.outgoing.insert(node.clone(), BTreeMap::new());
+        self.incoming.insert(node, BTreeMap::new());
+        true
+    }
+
+    /// Remove a node and all its incoming and outgoing edges from the graph.
+    ///
+    /// Returns `true` if the node was removed, or `false` if it was not present.
+    pub fn remove_node(&mut self, node: &N) -> bool {
+        if !self.contains_node(node) {
+            return false;
+        }
+
+        // Remove outgoing edges from this node from predecessors' incoming lists
+        if let Some(succs) = self.outgoing.remove(node) {
+            for (succ, _) in succs {
+                if let Some(succ_in) = self.incoming.get_mut(&succ) {
+                    succ_in.remove(node);
+                }
+            }
+        }
+
+        // Remove incoming edges to this node from predecessors' outgoing lists
+        if let Some(preds) = self.incoming.remove(node) {
+            for (pred, _) in preds {
+                if let Some(pred_out) = self.outgoing.get_mut(&pred) {
+                    pred_out.remove(node);
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Add a directed edge from `from` to `to` with weight `weight`.
+    ///
+    /// Automatically adds `from` and `to` nodes if they do not yet exist.
+    /// Returns previous edge weight if the edge already existed.
+    pub fn add_edge(&mut self, from: N, to: N, weight: E) -> Option<E> {
+        self.add_node(from.clone());
+        self.add_node(to.clone());
+
+        self.incoming
+            .get_mut(&to)
+            .unwrap()
+            .insert(from.clone(), weight.clone());
+        self.outgoing.get_mut(&from).unwrap().insert(to, weight)
+    }
+
+    /// Remove a directed edge from `from` to `to`.
+    ///
+    /// Returns the removed edge weight, or `None` if the edge was not present.
+    pub fn remove_edge(&mut self, from: &N, to: &N) -> Option<E> {
+        let prev = self.outgoing.get_mut(from)?.remove(to);
+        if prev.is_some() {
+            if let Some(to_in) = self.incoming.get_mut(to) {
+                to_in.remove(from);
+            }
+        }
+        prev
+    }
+
+    /// Get a reference to the weight of the directed edge from `from` to `to`.
+    pub fn edge_weight(&self, from: &N, to: &N) -> Option<&E> {
+        self.outgoing.get(from)?.get(to)
+    }
+
+    /// Get a mutable reference to the weight of the directed edge from `from` to `to`.
+    pub fn edge_weight_mut(&mut self, from: &N, to: &N) -> Option<&mut E> {
+        self.outgoing.get_mut(from)?.get_mut(to)
+    }
+
+    /// Iterator over references to all nodes in deterministic ascending order.
+    pub fn nodes(&self) -> btree_map::Keys<'_, N, BTreeMap<N, E>> {
+        self.outgoing.keys()
+    }
+
+    /// Set of all nodes in the graph.
+    pub fn nodes_set(&self) -> BTreeSet<N> {
+        self.outgoing.keys().cloned().collect()
+    }
+
+    /// Return all directed edges `(from, to, weight)` in deterministic order.
+    pub fn edges(&self) -> Vec<(&N, &N, &E)> {
+        let mut list = Vec::with_capacity(self.edge_count());
+        for (from, targets) in &self.outgoing {
+            for (to, weight) in targets {
+                list.push((from, to, weight));
+            }
+        }
+        list
+    }
+
+    /// In-degree (number of incoming directed edges) of `node`.
+    pub fn in_degree(&self, node: &N) -> usize {
+        self.incoming.get(node).map_or(0, |m| m.len())
+    }
+
+    /// Out-degree (number of outgoing directed edges) of `node`.
+    pub fn out_degree(&self, node: &N) -> usize {
+        self.outgoing.get(node).map_or(0, |m| m.len())
+    }
+
+    /// Successors of `node` as a map of target node to edge weight.
+    pub fn successors(&self, node: &N) -> Option<&BTreeMap<N, E>> {
+        self.outgoing.get(node)
+    }
+
+    /// Predecessors of `node` as a map of source node to edge weight.
+    pub fn predecessors(&self, node: &N) -> Option<&BTreeMap<N, E>> {
+        self.incoming.get(node)
+    }
+
+    /// Deterministic list of source nodes (in-degree == 0), sorted in ascending order.
+    pub fn sources(&self) -> Vec<N> {
+        self.nodes()
+            .filter(|n| self.in_degree(n) == 0)
+            .cloned()
+            .collect()
+    }
+
+    /// Deterministic list of sink nodes (out-degree == 0), sorted in ascending order.
+    pub fn sinks(&self) -> Vec<N> {
+        self.nodes()
+            .filter(|n| self.out_degree(n) == 0)
+            .cloned()
+            .collect()
+    }
+
+    /// Compute a deterministic topological ordering of all nodes using Kahn's algorithm.
+    ///
+    /// If multiple nodes have in-degree 0 at any step, the lexicographically smallest
+    /// node (according to `Ord`) is dequeued first, guaranteeing bit-for-bit reproducibility.
+    ///
+    /// Returns `Ok(ordered_nodes)` or `Err(CycleError)` if the graph contains at least one cycle.
+    pub fn topological_sort(&self) -> Result<Vec<N>, CycleError<N>> {
+        let mut in_degrees: BTreeMap<N, usize> = BTreeMap::new();
+        for node in self.nodes() {
+            in_degrees.insert(node.clone(), self.in_degree(node));
+        }
+
+        let mut zero_in_degree: BTreeSet<N> = BTreeSet::new();
+        for (node, &deg) in &in_degrees {
+            if deg == 0 {
+                zero_in_degree.insert(node.clone());
+            }
+        }
+
+        let mut order = Vec::with_capacity(self.node_count());
+
+        while let Some(node) = zero_in_degree.iter().next().cloned() {
+            zero_in_degree.remove(&node);
+            order.push(node.clone());
+
+            if let Some(succs) = self.successors(&node) {
+                for next in succs.keys() {
+                    let deg = in_degrees.get_mut(next).unwrap();
+                    *deg -= 1;
+                    if *deg == 0 {
+                        zero_in_degree.insert(next.clone());
+                    }
+                }
+            }
+        }
+
+        if order.len() == self.node_count() {
+            Ok(order)
+        } else {
+            Err(CycleError {
+                cycle: self.find_cycle(),
+            })
+        }
+    }
+
+    /// Check if the directed graph contains any cycles.
+    pub fn has_cycle(&self) -> bool {
+        self.topological_sort().is_err()
+    }
+
+    /// Search for a directed cycle in the graph.
+    ///
+    /// If a cycle exists, returns `Some(vec![n1, n2, ..., nk, n1])`.
+    /// Otherwise returns `None`.
+    pub fn find_cycle(&self) -> Option<Vec<N>> {
+        #[derive(Copy, Clone, PartialEq, Eq)]
+        enum Color {
+            White,
+            Gray,
+            Black,
+        }
+
+        struct DfsContext<'a, N: Ord + Clone, E: Clone> {
+            graph: &'a DirectedGraph<N, E>,
+            colors: BTreeMap<N, Color>,
+            path: Vec<N>,
+            cycle: Option<Vec<N>>,
+        }
+
+        impl<'a, N: Ord + Clone, E: Clone> DfsContext<'a, N, E> {
+            fn dfs(&mut self, u: N) -> bool {
+                self.colors.insert(u.clone(), Color::Gray);
+                self.path.push(u.clone());
+
+                if let Some(succs) = self.graph.successors(&u) {
+                    for v in succs.keys() {
+                        match self.colors.get(v).copied().unwrap_or(Color::White) {
+                            Color::Gray => {
+                                if let Some(pos) = self.path.iter().position(|x| x == v) {
+                                    let mut c = self.path[pos..].to_vec();
+                                    c.push(v.clone());
+                                    self.cycle = Some(c);
+                                    return true;
+                                }
+                            }
+                            Color::White => {
+                                if self.dfs(v.clone()) {
+                                    return true;
+                                }
+                            }
+                            Color::Black => {}
+                        }
+                    }
+                }
+
+                self.path.pop();
+                self.colors.insert(u, Color::Black);
+                false
+            }
+        }
+
+        let mut ctx = DfsContext {
+            graph: self,
+            colors: BTreeMap::new(),
+            path: Vec::new(),
+            cycle: None,
+        };
+
+        for node in self.nodes() {
+            if ctx.colors.get(node).copied().unwrap_or(Color::White) == Color::White
+                && ctx.dfs(node.clone())
+            {
+                return ctx.cycle;
+            }
+        }
+
+        None
+    }
+
+    /// Compute Strongly Connected Components (SCC) using Tarjan's algorithm.
+    ///
+    /// Returns the components ordered deterministically, where each component
+    /// is represented as a deterministic set of its nodes.
+    pub fn strongly_connected_components(&self) -> Vec<BTreeSet<N>> {
+        struct TarjanContext<'a, N: Ord + Clone, E: Clone> {
+            graph: &'a DirectedGraph<N, E>,
+            index: usize,
+            indices: BTreeMap<N, usize>,
+            lowlink: BTreeMap<N, usize>,
+            on_stack: BTreeSet<N>,
+            stack: Vec<N>,
+            sccs: Vec<BTreeSet<N>>,
+        }
+
+        impl<'a, N: Ord + Clone, E: Clone> TarjanContext<'a, N, E> {
+            fn strongconnect(&mut self, v: N) {
+                self.indices.insert(v.clone(), self.index);
+                self.lowlink.insert(v.clone(), self.index);
+                self.index += 1;
+                self.stack.push(v.clone());
+                self.on_stack.insert(v.clone());
+
+                if let Some(succs) = self.graph.successors(&v) {
+                    for w in succs.keys() {
+                        if !self.indices.contains_key(w) {
+                            self.strongconnect(w.clone());
+                            let w_low = self.lowlink[w];
+                            let v_low = self.lowlink.get_mut(&v).unwrap();
+                            *v_low = (*v_low).min(w_low);
+                        } else if self.on_stack.contains(w) {
+                            let w_idx = self.indices[w];
+                            let v_low = self.lowlink.get_mut(&v).unwrap();
+                            *v_low = (*v_low).min(w_idx);
+                        }
+                    }
+                }
+
+                if self.lowlink[&v] == self.indices[&v] {
+                    let mut scc = BTreeSet::new();
+                    while let Some(w) = self.stack.pop() {
+                        self.on_stack.remove(&w);
+                        let is_v = w == v;
+                        scc.insert(w);
+                        if is_v {
+                            break;
+                        }
+                    }
+                    self.sccs.push(scc);
+                }
+            }
+        }
+
+        let mut ctx = TarjanContext {
+            graph: self,
+            index: 0,
+            indices: BTreeMap::new(),
+            lowlink: BTreeMap::new(),
+            on_stack: BTreeSet::new(),
+            stack: Vec::new(),
+            sccs: Vec::new(),
+        };
+
+        for node in self.nodes() {
+            if !ctx.indices.contains_key(node) {
+                ctx.strongconnect(node.clone());
+            }
+        }
+
+        ctx.sccs
+    }
+
+    /// Find all nodes reachable from `start` via directed edges.
+    pub fn reachable_from(&self, start: &N) -> BTreeSet<N> {
+        let mut visited = BTreeSet::new();
+        if !self.contains_node(start) {
+            return visited;
+        }
+
+        let mut queue = VecDeque::new();
+        visited.insert(start.clone());
+        queue.push_back(start.clone());
+
+        while let Some(curr) = queue.pop_front() {
+            if let Some(succs) = self.successors(&curr) {
+                for next in succs.keys() {
+                    if visited.insert(next.clone()) {
+                        queue.push_back(next.clone());
+                    }
+                }
+            }
+        }
+
+        visited
+    }
+
+    /// Check if `to` is reachable from `from` along directed edges.
+    pub fn is_reachable(&self, from: &N, to: &N) -> bool {
+        if from == to {
+            return self.contains_node(from);
+        }
+        self.reachable_from(from).contains(to)
+    }
+
+    /// Find the shortest unweighted path from `start` to `goal` using Breadth-First Search (BFS).
+    ///
+    /// Returns `Some([start, ..., goal])` if a path exists, or `None`.
+    pub fn shortest_path(&self, start: &N, goal: &N) -> Option<Vec<N>> {
+        if !self.contains_node(start) || !self.contains_node(goal) {
+            return None;
+        }
+        if start == goal {
+            return Some(vec![start.clone()]);
+        }
+
+        let mut visited = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        let mut parent: BTreeMap<N, N> = BTreeMap::new();
+
+        visited.insert(start.clone());
+        queue.push_back(start.clone());
+
+        while let Some(curr) = queue.pop_front() {
+            if curr == *goal {
+                break;
+            }
+            if let Some(succs) = self.successors(&curr) {
+                for next in succs.keys() {
+                    if visited.insert(next.clone()) {
+                        parent.insert(next.clone(), curr.clone());
+                        queue.push_back(next.clone());
+                    }
+                }
+            }
+        }
+
+        if !visited.contains(goal) {
+            return None;
+        }
+
+        let mut path = Vec::new();
+        let mut curr = goal.clone();
+        path.push(curr.clone());
+        while let Some(p) = parent.get(&curr) {
+            path.push(p.clone());
+            if p == start {
+                break;
+            }
+            curr = p.clone();
+        }
+        path.reverse();
+        Some(path)
+    }
+
+    /// Create the transpose (reverse) graph where every directed edge `(u, v)` is reversed to `(v, u)`.
+    pub fn transpose(&self) -> Self {
+        Self {
+            outgoing: self.incoming.clone(),
+            incoming: self.outgoing.clone(),
+        }
+    }
+
+    /// Clear all nodes and edges from the directed graph.
+    pub fn clear(&mut self) {
+        self.outgoing.clear();
+        self.incoming.clear();
+    }
+}
+
+impl<N: Ord + Clone> DirectedGraph<N, ()> {
+    /// Add an unweighted directed edge from `from` to `to`.
+    pub fn add_unweighted_edge(&mut self, from: N, to: N) -> bool {
+        self.add_edge(from, to, ()).is_none()
+    }
+
+    /// Add an unweighted directed edge from `from` to `to` (ergonomic alias).
+    pub fn add_edge_unweighted(&mut self, from: N, to: N) -> bool {
+        self.add_unweighted_edge(from, to)
+    }
+}
+
+impl<N: Ord + Clone, E: Clone> FromIterator<(N, N, E)> for DirectedGraph<N, E> {
+    fn from_iter<I: IntoIterator<Item = (N, N, E)>>(iter: I) -> Self {
+        let mut graph = Self::new();
+        for (u, v, w) in iter {
+            graph.add_edge(u, v, w);
+        }
+        graph
+    }
+}
+
+impl<N: Ord + Clone> FromIterator<(N, N)> for DirectedGraph<N, ()> {
+    fn from_iter<I: IntoIterator<Item = (N, N)>>(iter: I) -> Self {
+        let mut graph = Self::new();
+        for (u, v) in iter {
+            graph.add_edge(u, v, ());
+        }
+        graph
+    }
+}
+
+impl<N: Ord + Clone, E: Clone> Extend<(N, N, E)> for DirectedGraph<N, E> {
+    fn extend<I: IntoIterator<Item = (N, N, E)>>(&mut self, iter: I) {
+        for (u, v, w) in iter {
+            self.add_edge(u, v, w);
+        }
+    }
+}
+
+impl<N: Ord + Clone> Extend<(N, N)> for DirectedGraph<N, ()> {
+    fn extend<I: IntoIterator<Item = (N, N)>>(&mut self, iter: I) {
+        for (u, v) in iter {
+            self.add_edge(u, v, ());
         }
     }
 }
