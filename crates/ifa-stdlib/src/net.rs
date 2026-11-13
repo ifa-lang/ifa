@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{
-    Ipv4Addr, SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs,
-    UdpSocket as StdUdpSocket,
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener,
+    TcpStream as StdTcpStream, ToSocketAddrs, UdpSocket as StdUdpSocket,
 };
 use std::time::Duration;
 
@@ -2613,6 +2613,79 @@ pub fn lookup_mime_type(extension: &str) -> &'static str {
     }
 }
 
+/// Resolves a host name to a list of IP addresses.
+///
+/// If `host` already represents an IP address, returns that single address.
+/// For hostnames, uses the system resolver to determine associated IPv4 and IPv6 addresses.
+pub fn resolve_host(host: &str) -> io::Result<Vec<IpAddr>> {
+    let dummy_port = 0u16;
+    let addrs: Vec<SocketAddr> = (host, dummy_port).to_socket_addrs()?.collect();
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("unable to resolve host: {host}"),
+        ));
+    }
+    let mut ips = Vec::new();
+    for addr in addrs {
+        let ip = addr.ip();
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+    Ok(ips)
+}
+
+/// Resolves a host name or IP address returning only IPv4 addresses.
+pub fn resolve_host_v4(host: &str) -> io::Result<Vec<Ipv4Addr>> {
+    let ips = resolve_host(host)?;
+    let v4s: Vec<Ipv4Addr> = ips
+        .into_iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+    if v4s.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no IPv4 addresses resolved for: {host}"),
+        ));
+    }
+    Ok(v4s)
+}
+
+/// Resolves a host name or IP address returning only IPv6 addresses.
+pub fn resolve_host_v6(host: &str) -> io::Result<Vec<Ipv6Addr>> {
+    let ips = resolve_host(host)?;
+    let v6s: Vec<Ipv6Addr> = ips
+        .into_iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(_) => None,
+            IpAddr::V6(v6) => Some(v6),
+        })
+        .collect();
+    if v6s.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no IPv6 addresses resolved for: {host}"),
+        ));
+    }
+    Ok(v6s)
+}
+
+/// Resolves a host:port string into a list of socket addresses.
+pub fn resolve_socket_addrs<A: ToSocketAddrs>(addr: A) -> io::Result<Vec<SocketAddr>> {
+    let addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "failed to resolve any socket addresses",
+        ));
+    }
+    Ok(addrs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3435,5 +3508,41 @@ mod tests {
         let (r_stream, w_stream_res) = client_reunited.into_inner_pair();
         assert!(r_stream.peer_addr().is_ok());
         assert!(w_stream_res.is_ok());
+    }
+
+    #[test]
+    fn test_dns_resolution_utilities() {
+        // Resolve loopback IP literals
+        let ips = resolve_host("127.0.0.1").expect("resolve 127.0.0.1");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
+
+        let v4s = resolve_host_v4("127.0.0.1").expect("resolve v4 127.0.0.1");
+        assert_eq!(v4s, vec![Ipv4Addr::new(127, 0, 0, 1)]);
+
+        let v6_res = resolve_host_v6("127.0.0.1");
+        assert!(v6_res.is_err());
+
+        // Resolve IPv6 loopback
+        let v6_ips = resolve_host("::1").expect("resolve ::1");
+        assert_eq!(
+            v6_ips,
+            vec![IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))]
+        );
+
+        let v6s = resolve_host_v6("::1").expect("resolve v6 ::1");
+        assert_eq!(v6s, vec![Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)]);
+
+        // Resolve localhost hostname (usually resolves to 127.0.0.1 and/or ::1)
+        let localhost_ips = resolve_host("localhost").expect("resolve localhost");
+        assert!(!localhost_ips.is_empty());
+        assert!(
+            localhost_ips.contains(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+                || localhost_ips.contains(&IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)))
+        );
+
+        // Resolve socket address
+        let addrs = resolve_socket_addrs("127.0.0.1:8080").expect("resolve socket addrs");
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].port(), 8080);
     }
 }

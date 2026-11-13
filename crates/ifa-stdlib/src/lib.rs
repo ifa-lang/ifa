@@ -106,11 +106,12 @@ pub use json::{
     FilterOp, FilterPredicate, JsonValue, PatchOperation, PathSegment,
 };
 pub use net::{
-    lookup_mime_type, AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket,
-    AsyncWsConnection, BufferedTcpStream, ConnectionInfo, Datagram, SocketConfig,
-    TcpListener as NetTcpListener, TcpListener, TcpServer, TcpStream as NetTcpStream, TcpStream,
-    TokenBucket, UdpSocket as NetUdpSocket, UdpSocket, WsClient, WsDemux, WsFrame, WsMessage,
-    WsOpcode, WsServer, WsSession,
+    lookup_mime_type, resolve_host, resolve_host_v4, resolve_host_v6, resolve_socket_addrs,
+    AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket, AsyncWsConnection,
+    BufferedTcpStream, ConnectionInfo, Datagram, SocketConfig, TcpListener as NetTcpListener,
+    TcpListener, TcpServer, TcpStream as NetTcpStream, TcpStream, TokenBucket,
+    UdpSocket as NetUdpSocket, UdpSocket, WsClient, WsDemux, WsFrame, WsMessage, WsOpcode,
+    WsServer, WsSession,
 };
 pub use process::{
     find_best_assembler, find_best_linker, find_system_tool, invoke_assembler, invoke_linker,
