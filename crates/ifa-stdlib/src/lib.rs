@@ -17,7 +17,8 @@ pub mod sys;
 pub use collections::{
     BinaryHeap, BitSet, BitSetError, BitSetIter, ByteBuffer, CycleError, Deque, DiGraph,
     DirectedGraph, DisjointSet, Eviction, FenwickTree, Interval, IntervalError, IntervalMap,
-    IntervalMapIter, IntervalSet, List, LruCache, Map, Set, StringBuilder, Trie, TrieSet,
+    IntervalMapIter, IntervalSet, List, LruCache, Map, SegmentTree, Set, StringBuilder, Trie,
+    TrieSet,
 };
 pub use crypto::{
     base64_decode, base64_encode, base64url_decode, base64url_encode, blake3, blake3_hex,
@@ -2113,5 +2114,45 @@ mod tests {
         // Clear
         ft_slice.clear();
         assert_eq!(ft_slice.prefix_sum(4), Some(0));
+    }
+
+    #[test]
+    fn test_segment_tree_sum_and_min() {
+        // Empty segment tree
+        let empty = SegmentTree::new(&[] as &[i64], 0, |a, b| a + b);
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+        assert_eq!(empty.query_range(0, 0), None);
+
+        // Sum segment tree
+        let vals = [1, 3, 5, 7, 9, 11];
+        let mut st_sum = SegmentTree::new(&vals, 0, |a, b| a + b);
+        assert_eq!(st_sum.len(), 6);
+        assert!(!st_sum.is_empty());
+
+        assert_eq!(st_sum.query_range(0, 5), Some(36));
+        assert_eq!(st_sum.query_range(1, 3), Some(15)); // 3 + 5 + 7
+        assert_eq!(st_sum.query_range(2, 4), Some(21)); // 5 + 7 + 9
+        assert_eq!(st_sum.query_range(4, 4), Some(9));
+        assert_eq!(st_sum.query_range(3, 2), None); // start > end
+        assert_eq!(st_sum.query_range(0, 6), None); // out of bounds
+
+        // Point update
+        assert!(st_sum.update(2, 10)); // index 2 was 5, now 10
+        assert_eq!(st_sum.query_range(1, 3), Some(20)); // 3 + 10 + 7
+        assert_eq!(st_sum.query_range(0, 5), Some(41)); // 36 + 5
+        assert!(!st_sum.update(10, 0)); // out of bounds update
+
+        // Min segment tree
+        let vals_min = [18, 17, 13, 19, 15, 11, 20];
+        let mut st_min = SegmentTree::new(&vals_min, i64::MAX, |a, b| a.min(b));
+        assert_eq!(st_min.query_range(0, 6), Some(11));
+        assert_eq!(st_min.query_range(0, 3), Some(13)); // min(18, 17, 13, 19)
+        assert_eq!(st_min.query_range(3, 4), Some(15)); // min(19, 15)
+
+        // Point update on min tree
+        assert!(st_min.update(5, 25)); // index 5 was 11, now 25
+        assert_eq!(st_min.query_range(0, 6), Some(13));
+        assert_eq!(st_min.query_range(4, 6), Some(15)); // min(15, 25, 20)
     }
 }

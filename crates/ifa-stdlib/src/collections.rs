@@ -4011,3 +4011,97 @@ impl<T: Default + Copy + std::ops::AddAssign + std::ops::Sub<Output = T>> Fenwic
         self.tree.fill(T::default());
     }
 }
+
+/// Deterministic Segment Tree for arbitrary associative binary operations (sum, min, max, gcd).
+/// Supports point update in O(log N) and range query in O(log N).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentTree<T, F> {
+    tree: Vec<T>,
+    size: usize,
+    identity: T,
+    combine: F,
+}
+
+impl<T: Copy, F: Fn(T, T) -> T> SegmentTree<T, F> {
+    /// Construct a segment tree from initial slice of values, an identity element and a combine function.
+    pub fn new(values: &[T], identity: T, combine: F) -> Self {
+        let size = values.len();
+        if size == 0 {
+            return Self {
+                tree: Vec::new(),
+                size: 0,
+                identity,
+                combine,
+            };
+        }
+        let mut tree = vec![identity; 2 * size];
+        // Leaf nodes
+        for (i, &val) in values.iter().enumerate() {
+            tree[size + i] = val;
+        }
+        // Build internal nodes from bottom up
+        for i in (1..size).rev() {
+            tree[i] = combine(tree[2 * i], tree[2 * i + 1]);
+        }
+        Self {
+            tree,
+            size,
+            identity,
+            combine,
+        }
+    }
+
+    /// Return the number of elements in the tree.
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Return `true` if the tree has length 0.
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// Update value at `idx` (0-based) to `value` in O(log N).
+    ///
+    /// Returns `false` if `idx >= self.len()`.
+    pub fn update(&mut self, mut idx: usize, value: T) -> bool {
+        if idx >= self.size {
+            return false;
+        }
+        idx += self.size;
+        self.tree[idx] = value;
+        idx /= 2;
+        while idx > 0 {
+            self.tree[idx] = (self.combine)(self.tree[2 * idx], self.tree[2 * idx + 1]);
+            idx /= 2;
+        }
+        true
+    }
+
+    /// Query the aggregate over range `[start, end]` (inclusive) in O(log N).
+    ///
+    /// Returns `None` if `start > end` or `end >= self.len()`.
+    pub fn query_range(&self, start: usize, end: usize) -> Option<T> {
+        if start > end || end >= self.size {
+            return None;
+        }
+        let mut left = start + self.size;
+        let mut right = end + self.size + 1; // half-open [left, right)
+        let mut left_res = self.identity;
+        let mut right_res = self.identity;
+
+        while left < right {
+            if left % 2 == 1 {
+                left_res = (self.combine)(left_res, self.tree[left]);
+                left += 1;
+            }
+            if right % 2 == 1 {
+                right -= 1;
+                right_res = (self.combine)(self.tree[right], right_res);
+            }
+            left /= 2;
+            right /= 2;
+        }
+        Some((self.combine)(left_res, right_res))
+    }
+}
