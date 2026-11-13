@@ -2504,6 +2504,378 @@ impl<R: Read> Iterator for FramedIter<R> {
     }
 }
 
+/// Helper function to locate a byte needle in a haystack slice without allocations.
+#[inline]
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Default maximum record size for delimited streams (16 MiB).
+pub const DEFAULT_MAX_DELIMITED_RECORD_SIZE: usize = 16 * 1024 * 1024;
+
+/// A writer wrapper that writes structured records separated by a custom multi-byte delimiter.
+#[derive(Debug)]
+pub struct DelimitedWriter<W: Write> {
+    inner: W,
+    delimiter: Vec<u8>,
+    records_written: usize,
+    bytes_written: usize,
+}
+
+impl<W: Write> DelimitedWriter<W> {
+    /// Create a new `DelimitedWriter` with the specified delimiter.
+    pub fn new(inner: W, delimiter: impl Into<Vec<u8>>) -> Self {
+        let delimiter = delimiter.into();
+        assert!(!delimiter.is_empty(), "delimiter must not be empty");
+        Self {
+            inner,
+            delimiter,
+            records_written: 0,
+            bytes_written: 0,
+        }
+    }
+
+    /// Returns a slice to the delimiter.
+    pub fn delimiter(&self) -> &[u8] {
+        &self.delimiter
+    }
+
+    /// Number of records successfully written through `write_record` or `write_record_str`.
+    pub fn records_written(&self) -> usize {
+        self.records_written
+    }
+
+    /// Total number of bytes written to the underlying sink.
+    pub fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+
+    /// Write a record followed by the configured delimiter.
+    pub fn write_record(&mut self, record: &[u8]) -> io::Result<()> {
+        self.inner.write_all(record)?;
+        self.inner.write_all(&self.delimiter)?;
+        self.records_written += 1;
+        self.bytes_written += record.len() + self.delimiter.len();
+        Ok(())
+    }
+
+    /// Write a string slice record followed by the configured delimiter.
+    pub fn write_record_str(&mut self, record: &str) -> io::Result<()> {
+        self.write_record(record.as_bytes())
+    }
+
+    /// Flush the underlying writer.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+
+    /// Immutably borrow the inner writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Mutably borrow the inner writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap the inner writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    /// Consume the writer and return `(inner, delimiter, records_written, bytes_written)`.
+    pub fn into_parts(self) -> (W, Vec<u8>, usize, usize) {
+        (
+            self.inner,
+            self.delimiter,
+            self.records_written,
+            self.bytes_written,
+        )
+    }
+}
+
+impl<W: Write> Write for DelimitedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.bytes_written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Helper function to create a new `DelimitedWriter`.
+pub fn delimited_writer<W: Write>(writer: W, delimiter: impl Into<Vec<u8>>) -> DelimitedWriter<W> {
+    DelimitedWriter::new(writer, delimiter)
+}
+
+/// A reader wrapper that extracts records separated by a custom multi-byte delimiter.
+#[derive(Debug)]
+pub struct DelimitedReader<R: Read> {
+    inner: R,
+    delimiter: Vec<u8>,
+    buf: Vec<u8>,
+    pos: usize,
+    max_record_size: usize,
+    strip_delimiter: bool,
+    records_read: usize,
+    bytes_read: usize,
+    eof_reached: bool,
+}
+
+impl<R: Read> DelimitedReader<R> {
+    /// Create a new `DelimitedReader` with the specified delimiter and default max record size (16 MiB).
+    pub fn new(inner: R, delimiter: impl Into<Vec<u8>>) -> Self {
+        Self::with_max_record_size(inner, delimiter, DEFAULT_MAX_DELIMITED_RECORD_SIZE)
+    }
+
+    /// Create a new `DelimitedReader` with specified delimiter and maximum record size.
+    pub fn with_max_record_size(
+        inner: R,
+        delimiter: impl Into<Vec<u8>>,
+        max_record_size: usize,
+    ) -> Self {
+        let delimiter = delimiter.into();
+        assert!(!delimiter.is_empty(), "delimiter must not be empty");
+        Self {
+            inner,
+            delimiter,
+            buf: Vec::with_capacity(8192),
+            pos: 0,
+            max_record_size,
+            strip_delimiter: true,
+            records_read: 0,
+            bytes_read: 0,
+            eof_reached: false,
+        }
+    }
+
+    /// Get configured delimiter slice.
+    pub fn delimiter(&self) -> &[u8] {
+        &self.delimiter
+    }
+
+    /// Get maximum record size allowed.
+    pub fn max_record_size(&self) -> usize {
+        self.max_record_size
+    }
+
+    /// Set maximum record size allowed.
+    pub fn set_max_record_size(&mut self, max: usize) {
+        self.max_record_size = max;
+    }
+
+    /// Whether the delimiter is stripped from the returned records.
+    pub fn strip_delimiter(&self) -> bool {
+        self.strip_delimiter
+    }
+
+    /// Configure whether the delimiter should be stripped from returned records.
+    pub fn set_strip_delimiter(&mut self, strip: bool) {
+        self.strip_delimiter = strip;
+    }
+
+    /// Number of records read so far.
+    pub fn records_read(&self) -> usize {
+        self.records_read
+    }
+
+    /// Total number of raw stream bytes consumed.
+    pub fn bytes_read(&self) -> usize {
+        self.bytes_read
+    }
+
+    /// Immutably borrow inner reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Mutably borrow inner reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap the inner reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    /// Consume the reader and return `(inner, delimiter, max_record_size, records_read)`.
+    pub fn into_parts(self) -> (R, Vec<u8>, usize, usize) {
+        (
+            self.inner,
+            self.delimiter,
+            self.max_record_size,
+            self.records_read,
+        )
+    }
+
+    /// Convert this `DelimitedReader` into an iterator yielding record byte buffers.
+    pub fn into_records(self) -> DelimitedIter<R> {
+        DelimitedIter { reader: self }
+    }
+
+    /// Read the next record into the supplied buffer, clearing it first.
+    ///
+    /// Returns `Ok(Some(n))` with number of bytes in record, or `Ok(None)` when EOF is reached.
+    pub fn read_record_buf(&mut self, out: &mut Vec<u8>) -> io::Result<Option<usize>> {
+        out.clear();
+        let delim_len = self.delimiter.len();
+
+        loop {
+            // Search for delimiter in remaining buffer: self.buf[self.pos..]
+            let available = &self.buf[self.pos..];
+            if let Some(idx) = find_subslice(available, &self.delimiter) {
+                let record_len = if self.strip_delimiter {
+                    idx
+                } else {
+                    idx + delim_len
+                };
+
+                if record_len > self.max_record_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "delimited record size ({} bytes) exceeds configured maximum ({} bytes)",
+                            record_len, self.max_record_size
+                        ),
+                    ));
+                }
+
+                out.extend_from_slice(&available[..record_len]);
+                self.pos += idx + delim_len;
+                self.records_read += 1;
+                self.bytes_read += idx + delim_len;
+                return Ok(Some(out.len()));
+            }
+
+            // Check if buffer exceeds max_record_size without finding delimiter
+            let current_len = self.buf.len() - self.pos;
+            if current_len > self.max_record_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "delimited record size exceeds configured maximum ({} bytes)",
+                        self.max_record_size
+                    ),
+                ));
+            }
+
+            // If EOF already reached on inner stream
+            if self.eof_reached {
+                if current_len > 0 {
+                    // Final trailing record without trailing delimiter
+                    if current_len > self.max_record_size {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "delimited record size ({} bytes) exceeds configured maximum ({} bytes)",
+                                current_len, self.max_record_size
+                            ),
+                        ));
+                    }
+                    out.extend_from_slice(&self.buf[self.pos..]);
+                    self.pos = self.buf.len();
+                    self.records_read += 1;
+                    self.bytes_read += current_len;
+                    return Ok(Some(out.len()));
+                } else {
+                    return Ok(None);
+                }
+            }
+
+            // Compact buffer if pos > 0
+            if self.pos > 0 {
+                self.buf.drain(..self.pos);
+                self.pos = 0;
+            }
+
+            // Read more data from inner reader
+            let mut chunk = [0u8; 8192];
+            let n = self.inner.read(&mut chunk)?;
+            if n == 0 {
+                self.eof_reached = true;
+                // Loop around to either yield trailing bytes or return None
+            } else {
+                self.buf.extend_from_slice(&chunk[..n]);
+            }
+        }
+    }
+
+    /// Read next record returning a new `Vec<u8>`.
+    pub fn read_record(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut out = Vec::new();
+        match self.read_record_buf(&mut out)? {
+            Some(_) => Ok(Some(out)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read next record and parse it as a UTF-8 String.
+    pub fn read_record_to_string(&mut self) -> io::Result<Option<String>> {
+        match self.read_record()? {
+            Some(bytes) => {
+                let s = String::from_utf8(bytes).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("invalid utf-8 record: {e}"))
+                })?;
+                Ok(Some(s))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+/// Helper function to create a new `DelimitedReader`.
+pub fn delimited_reader<R: Read>(reader: R, delimiter: impl Into<Vec<u8>>) -> DelimitedReader<R> {
+    DelimitedReader::new(reader, delimiter)
+}
+
+/// Iterator over records produced by a `DelimitedReader`.
+#[derive(Debug)]
+pub struct DelimitedIter<R: Read> {
+    reader: DelimitedReader<R>,
+}
+
+impl<R: Read> DelimitedIter<R> {
+    /// Reference to the underlying delimited reader.
+    pub fn get_ref(&self) -> &DelimitedReader<R> {
+        &self.reader
+    }
+
+    /// Mutable reference to the underlying delimited reader.
+    pub fn get_mut(&mut self) -> &mut DelimitedReader<R> {
+        &mut self.reader
+    }
+
+    /// Unwrap the inner `DelimitedReader`.
+    pub fn into_inner(self) -> DelimitedReader<R> {
+        self.reader
+    }
+}
+
+impl<R: Read> Iterator for DelimitedIter<R> {
+    type Item = io::Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.reader.read_record() {
+            Ok(Some(record)) => Some(Ok(record)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3535,5 +3907,136 @@ mod tests {
 
         let r2 = framed_reader(buf.as_slice());
         let _inner2 = r2.into_inner();
+    }
+
+    #[test]
+    fn test_delimited_writer_and_reader_basic() {
+        let mut wire = Vec::new();
+        let mut writer = delimited_writer(&mut wire, b"\r\n");
+        writer.write_record(b"LINE 1").unwrap();
+        writer.write_record(b"LINE 2").unwrap();
+        writer.write_record(b"LINE 3").unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(writer.records_written(), 3);
+        assert_eq!(wire.as_slice(), b"LINE 1\r\nLINE 2\r\nLINE 3\r\n");
+
+        let mut reader = delimited_reader(wire.as_slice(), b"\r\n");
+        assert_eq!(reader.delimiter(), b"\r\n");
+
+        let r1 = reader.read_record().unwrap();
+        assert_eq!(r1.as_deref(), Some(&b"LINE 1"[..]));
+
+        let r2 = reader.read_record_to_string().unwrap();
+        assert_eq!(r2.as_deref(), Some("LINE 2"));
+
+        let r3 = reader.read_record().unwrap();
+        assert_eq!(r3.as_deref(), Some(&b"LINE 3"[..]));
+
+        let r4 = reader.read_record().unwrap();
+        assert_eq!(r4, None);
+
+        assert_eq!(reader.records_read(), 3);
+        assert_eq!(reader.bytes_read(), wire.len());
+    }
+
+    #[test]
+    fn test_delimited_multi_byte_custom_separator() {
+        let mut wire = Vec::new();
+        let mut writer = DelimitedWriter::new(&mut wire, b"---SPLIT---");
+        writer.write_record_str("first chunk").unwrap();
+        writer.write_record_str("second chunk with utf8: bénin").unwrap();
+
+        let mut reader = DelimitedReader::new(wire.as_slice(), b"---SPLIT---");
+        let mut rec1 = Vec::new();
+        let n1 = reader.read_record_buf(&mut rec1).unwrap();
+        assert_eq!(n1, Some(11));
+        assert_eq!(rec1.as_slice(), b"first chunk");
+
+        let s2 = reader.read_record_to_string().unwrap();
+        assert_eq!(s2.as_deref(), Some("second chunk with utf8: bénin"));
+
+        let s3 = reader.read_record().unwrap();
+        assert_eq!(s3, None);
+    }
+
+    #[test]
+    fn test_delimited_reader_into_records_iterator() {
+        let data = b"apple;banana;cherry;date;";
+        let reader = delimited_reader(&data[..], b";");
+        let mut iter = reader.into_records();
+
+        let items: Vec<String> = iter
+            .by_ref()
+            .map(|res| String::from_utf8(res.expect("valid chunk")).unwrap())
+            .collect();
+        assert_eq!(items, vec!["apple", "banana", "cherry", "date"]);
+
+        assert_eq!(iter.get_ref().records_read(), 4);
+        iter.get_mut();
+        let inner = iter.into_inner();
+        assert_eq!(inner.records_read(), 4);
+    }
+
+    #[test]
+    fn test_delimited_reader_keep_delimiter_and_trailing_bytes_at_eof() {
+        // Stream without ending delimiter: "one###two###three"
+        let data = b"one###two###three";
+        let mut reader = delimited_reader(&data[..], b"###");
+        reader.set_strip_delimiter(false);
+        assert!(!reader.strip_delimiter());
+
+        let r1 = reader.read_record().unwrap();
+        assert_eq!(r1.as_deref(), Some(&b"one###"[..]));
+
+        let r2 = reader.read_record().unwrap();
+        assert_eq!(r2.as_deref(), Some(&b"two###"[..]));
+
+        // Trailing bytes at EOF has no trailing delimiter
+        let r3 = reader.read_record().unwrap();
+        assert_eq!(r3.as_deref(), Some(&b"three"[..]));
+
+        let r4 = reader.read_record().unwrap();
+        assert_eq!(r4, None);
+        assert_eq!(reader.records_read(), 3);
+    }
+
+    #[test]
+    fn test_delimited_reader_max_record_size_limit() {
+        let data = b"short###this_is_a_very_long_chunk_that_exceeds_threshold###end";
+        let mut reader = DelimitedReader::with_max_record_size(&data[..], b"###", 10);
+        assert_eq!(reader.max_record_size(), 10);
+
+        let r1 = reader.read_record().unwrap();
+        assert_eq!(r1.as_deref(), Some(&b"short"[..]));
+
+        let err = reader.read_record().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds configured maximum"));
+    }
+
+    #[test]
+    fn test_delimited_reader_writer_inspectors_and_into_parts() {
+        let mut sink = Vec::new();
+        let mut writer = delimited_writer(&mut sink, b"\0");
+        writer.write_record(b"cmd1").unwrap();
+        assert_eq!(writer.get_ref().len(), 5);
+        writer.get_mut();
+        let (_inner, delim, records, bytes) = writer.into_parts();
+        assert_eq!(delim, b"\0");
+        assert_eq!(records, 1);
+        assert_eq!(bytes, 5);
+
+        let mut reader = delimited_reader(sink.as_slice(), b"\0");
+        reader.set_max_record_size(4096);
+        assert_eq!(reader.max_record_size(), 4096);
+        let rec = reader.read_record().unwrap();
+        assert_eq!(rec.as_deref(), Some(&b"cmd1"[..]));
+        assert_eq!(reader.get_ref().len(), 0);
+        reader.get_mut();
+        let (_inner, delim2, max_size, records_read) = reader.into_parts();
+        assert_eq!(delim2, b"\0");
+        assert_eq!(max_size, 4096);
+        assert_eq!(records_read, 1);
     }
 }
