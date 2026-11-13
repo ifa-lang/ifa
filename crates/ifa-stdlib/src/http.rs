@@ -2033,6 +2033,210 @@ pub fn format_form_urlencoded(pairs: &[(&str, &str)]) -> String {
     out
 }
 
+/// Parse a query string or form into an ordered list of key-value pairs (preserving duplicates and order).
+pub fn parse_query_pairs(query: &str) -> Vec<(String, String)> {
+    let clean_query = query.strip_prefix('?').unwrap_or(query);
+    if clean_query.is_empty() {
+        return Vec::new();
+    }
+    let mut pairs = Vec::new();
+    for part in clean_query.split('&') {
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = part.split_once('=') {
+            let key = url_decode(k).unwrap_or_else(|_| k.to_string());
+            let val = url_decode(v).unwrap_or_else(|_| v.to_string());
+            pairs.push((key, val));
+        } else {
+            let key = url_decode(part).unwrap_or_else(|_| part.to_string());
+            pairs.push((key, String::new()));
+        }
+    }
+    pairs
+}
+
+/// Structured RFC 3986 URI/URL representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Url {
+    pub scheme: String,
+    pub host: String,
+    pub port: Option<u16>,
+    pub path: String,
+    pub query: Option<String>,
+    pub fragment: Option<String>,
+    pub userinfo: Option<String>,
+}
+
+impl Url {
+    /// Parse an absolute or origin-relative URL/URI string according to RFC 3986.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err("URL string is empty".to_string());
+        }
+
+        let mut work = trimmed;
+
+        // 1. Extract fragment if present (#...)
+        let fragment = if let Some((before_frag, frag)) = work.split_once('#') {
+            work = before_frag;
+            Some(frag.to_string())
+        } else {
+            None
+        };
+
+        // 2. Extract query if present (?...)
+        let query = if let Some((before_q, q)) = work.split_once('?') {
+            work = before_q;
+            Some(q.to_string())
+        } else {
+            None
+        };
+
+        // 3. Scheme and Authority vs relative path
+        let (scheme, authority, path) = if let Some((sch, rest)) = work.split_once("://") {
+            if sch.is_empty() {
+                return Err("Missing scheme before '://'".to_string());
+            }
+            let (auth, p) = match rest.find('/') {
+                Some(idx) => (&rest[..idx], &rest[idx..]),
+                None => (rest, "/"),
+            };
+            (sch.to_ascii_lowercase(), Some(auth), p.to_string())
+        } else {
+            // Origin-relative or path-only
+            ("".to_string(), None, work.to_string())
+        };
+
+        // 4. Parse authority: [userinfo@]host[:port]
+        let mut host = String::new();
+        let mut port = None;
+        let mut userinfo = None;
+
+        if let Some(auth) = authority {
+            let mut auth_work = auth;
+            if let Some((uinfo, rest)) = auth_work.split_once('@') {
+                userinfo = Some(uinfo.to_string());
+                auth_work = rest;
+            }
+
+            // Handle IPv6 bracketed address: [::1]:8080 or [::1]
+            if auth_work.starts_with('[') {
+                if let Some(bracket_end) = auth_work.find(']') {
+                    host = auth_work[1..bracket_end].to_string();
+                    let remainder = &auth_work[bracket_end + 1..];
+                    if let Some(port_str) = remainder.strip_prefix(':') {
+                        port = Some(port_str.parse::<u16>().map_err(|_| {
+                            format!("Invalid port '{}' in authority", port_str)
+                        })?);
+                    }
+                } else {
+                    return Err("Unclosed IPv6 bracket in authority".to_string());
+                }
+            } else if let Some((h, p_str)) = auth_work.split_once(':') {
+                host = h.to_ascii_lowercase();
+                port = Some(
+                    p_str
+                        .parse::<u16>()
+                        .map_err(|_| format!("Invalid port '{}' in authority", p_str))?,
+                );
+            } else {
+                host = auth_work.to_ascii_lowercase();
+            }
+        }
+
+        // Canonical default port resolution if scheme known
+        let effective_port = match (port, scheme.as_str()) {
+            (Some(p), _) => Some(p),
+            (None, "http") => Some(80),
+            (None, "https") => Some(443),
+            (None, "ws") => Some(80),
+            (None, "wss") => Some(443),
+            _ => None,
+        };
+
+        let normalized_path = if path.is_empty() {
+            "/".to_string()
+        } else {
+            path
+        };
+
+        Ok(Url {
+            scheme,
+            host,
+            port: effective_port,
+            path: normalized_path,
+            query,
+            fragment,
+            userinfo,
+        })
+    }
+
+    /// Return parsed query parameters as an ordered list of (key, value) pairs.
+    pub fn query_pairs(&self) -> Vec<(String, String)> {
+        match &self.query {
+            Some(q) => parse_query_pairs(q),
+            None => Vec::new(),
+        }
+    }
+
+    /// Return query parameters converted to a HashMap.
+    pub fn query_map(&self) -> HashMap<String, String> {
+        match &self.query {
+            Some(q) => parse_form_urlencoded(q),
+            None => HashMap::new(),
+        }
+    }
+
+    /// Reconstruct standard RFC 3986 URI string representation.
+    pub fn to_uri_string(&self) -> String {
+        let mut out = String::new();
+        if !self.scheme.is_empty() {
+            out.push_str(&self.scheme);
+            out.push_str("://");
+            if let Some(ref u) = self.userinfo {
+                out.push_str(u);
+                out.push('@');
+            }
+            if self.host.contains(':') && !self.host.starts_with('[') {
+                out.push('[');
+                out.push_str(&self.host);
+                out.push(']');
+            } else {
+                out.push_str(&self.host);
+            }
+            if let Some(p) = self.port {
+                let default_port = match self.scheme.as_str() {
+                    "http" | "ws" => 80,
+                    "https" | "wss" => 443,
+                    _ => 0,
+                };
+                if p != default_port {
+                    out.push(':');
+                    out.push_str(&p.to_string());
+                }
+            }
+        }
+        out.push_str(&self.path);
+        if let Some(ref q) = self.query {
+            out.push('?');
+            out.push_str(q);
+        }
+        if let Some(ref f) = self.fragment {
+            out.push('#');
+            out.push_str(f);
+        }
+        out
+    }
+}
+
+impl std::fmt::Display for Url {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_uri_string())
+    }
+}
+
 /// Parse HTTP `Cookie` header into key-value map (RFC 6265).
 pub fn parse_cookies(header: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -5632,5 +5836,58 @@ mod tests {
         assert_eq!(resp_net_auth.body_str().unwrap(), "Fiber member: member-42");
 
         server.stop();
+    }
+
+    #[test]
+    fn test_rfc3986_url_parsing_and_formatting() {
+        // 1. Full absolute HTTPS URL with userinfo, custom port, query and fragment
+        let raw = "https://alice:secret@example.com:8443/api/v1/resource?filter=active&sort=desc#section-2";
+        let url = Url::parse(raw).expect("parse full url");
+        assert_eq!(url.scheme, "https");
+        assert_eq!(url.host, "example.com");
+        assert_eq!(url.port, Some(8443));
+        assert_eq!(url.userinfo, Some("alice:secret".to_string()));
+        assert_eq!(url.path, "/api/v1/resource");
+        assert_eq!(url.query, Some("filter=active&sort=desc".to_string()));
+        assert_eq!(url.fragment, Some("section-2".to_string()));
+
+        // Check query parsing
+        let pairs = url.query_pairs();
+        assert_eq!(pairs, vec![
+            ("filter".to_string(), "active".to_string()),
+            ("sort".to_string(), "desc".to_string()),
+        ]);
+        let map = url.query_map();
+        assert_eq!(map.get("filter").map(|s| s.as_str()), Some("active"));
+        assert_eq!(map.get("sort").map(|s| s.as_str()), Some("desc"));
+
+        // Roundtrip to URI string
+        assert_eq!(url.to_uri_string(), raw);
+        assert_eq!(format!("{}", url), raw);
+
+        // 2. Default port omission for standard schemes
+        let std_http = Url::parse("http://example.org:80/index.html").expect("parse http 80");
+        assert_eq!(std_http.port, Some(80));
+        assert_eq!(std_http.to_uri_string(), "http://example.org/index.html");
+
+        let std_https = Url::parse("https://api.github.com/events").expect("parse https 443");
+        assert_eq!(std_https.port, Some(443));
+        assert_eq!(std_https.to_uri_string(), "https://api.github.com/events");
+
+        // 3. IPv6 authority URL
+        let ipv6_url = Url::parse("http://[::1]:9090/status").expect("parse ipv6");
+        assert_eq!(ipv6_url.host, "::1");
+        assert_eq!(ipv6_url.port, Some(9090));
+        assert_eq!(ipv6_url.to_uri_string(), "http://[::1]:9090/status");
+
+        // 4. Origin-relative path with query
+        let rel_url = Url::parse("/search?q=ifa+language&page=1").expect("parse relative");
+        assert_eq!(rel_url.scheme, "");
+        assert_eq!(rel_url.host, "");
+        assert_eq!(rel_url.path, "/search");
+        let rel_pairs = rel_url.query_pairs();
+        assert_eq!(rel_pairs[0], ("q".to_string(), "ifa language".to_string()));
+        assert_eq!(rel_pairs[1], ("page".to_string(), "1".to_string()));
+        assert_eq!(rel_url.to_uri_string(), "/search?q=ifa+language&page=1");
     }
 }

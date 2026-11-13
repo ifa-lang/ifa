@@ -66,13 +66,13 @@ pub use http::{
     format_form_urlencoded, format_set_cookie, http_should_keep_alive, is_hop_by_hop_header,
     jwt_auth_middleware, matches_if_match, matches_if_none_match, negotiate_content_type,
     parse_accept_header, parse_basic_auth, parse_bearer_token, parse_cookies,
-    parse_form_urlencoded, parse_multipart, parse_sse_events, read_http_response, url_decode,
-    url_encode, AcceptItem, CircuitState, Cookie, CookieJar, CorsConfig, HttpCircuitBreaker,
+    parse_form_urlencoded, parse_multipart, parse_query_pairs, parse_sse_events, read_http_response,
+    url_decode, url_encode, AcceptItem, CircuitState, Cookie, CookieJar, CorsConfig, HttpCircuitBreaker,
     HttpCircuitBreakerConfig, HttpClient, HttpConnectionPool, HttpConnectionPoolConfig,
     HttpHandler, HttpHeaders, HttpLoadBalancer, HttpMethod, HttpMiddleware, HttpProxyGateway,
     HttpRequest, HttpResponse, HttpRetryPolicy, HttpRetryReport, HttpRoute, HttpRouter, HttpServer,
     HttpSession, HttpStatus, LoadBalancingStrategy, MultipartBuilder, MultipartPart,
-    PooledConnection, RouteSegment, SameSite, SessionStore, SseEvent, UpstreamBackend,
+    PooledConnection, RouteSegment, SameSite, SessionStore, SseEvent, UpstreamBackend, Url,
 };
 pub use io::{
     adler32_digest, adler32_reader, adler32_writer, adler_framed_reader, adler_framed_writer,
