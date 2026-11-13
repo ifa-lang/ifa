@@ -568,7 +568,92 @@ pub fn byte_stream_to_bytes(stream: ByteStream) -> List<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Unit Tests for std/io Subsystem
+// 6. CRC-32 (ISO 3309 / IEEE 802.3) — pure-IFA implementation
+//    Polynomial: 0xEDB88320 (reflected / little-endian bit order)
+// ---------------------------------------------------------------------------
+
+// Internal: CRC-32 lookup table value for one byte.
+// Pre-computes the 8-step LFSR reduction inline to avoid a 256-entry array.
+fn crc32_table_entry(byte_val: i64) -> i64 {
+    mut crc: i64 = byte_val & 255;
+    mut i: i64 = 0;
+    while i < 8 {
+        if (crc & 1) == 1 {
+            crc = ((crc >> 1) & 2147483647) ^ -306674912; // 0xEDB88320 as i64 signed
+        } else {
+            crc = (crc >> 1) & 2147483647;
+        }
+        i = i + 1;
+    }
+    return crc;
+}
+
+// Internal: update a running CRC-32 state with a list of bytes.
+fn crc32_update(state: i64, bytes: List<i64>) -> i64 {
+    mut crc: i64 = state;
+    mut idx: i64 = 0;
+    let len = bytes.len();
+    while idx < len {
+        let b = bytes[idx] & 255;
+        let table_val = crc32_table_entry(((crc ^ b) & 255));
+        crc = table_val ^ (((crc >> 8) & 16777215)); // 0x00FFFFFF
+        idx = idx + 1;
+    }
+    return crc;
+}
+
+// Internal: convert a string to a list of its UTF-8 code units (bytes 0-255).
+fn string_to_bytes(s: String) -> List<i64> {
+    let len = string_len(s);
+    mut result: List<i64> = List::new();
+    mut i: i64 = 0;
+    while i < len {
+        result.push(string_char_at(s, i) & 255);
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Compute the CRC-32 checksum of `data` (a list of bytes).
+/// Returns the standard CRC-32 value (ISO 3309 / IEEE 802.3).
+pub fn crc32_digest_bytes(data: List<i64>) -> i64 {
+    let raw = crc32_update(-1, data); // init with 0xFFFFFFFF
+    return (raw ^ -1) & 4294967295;  // final XOR, mask to 32 bits
+}
+
+/// Compute the CRC-32 checksum of a string (treating each character as a byte).
+pub fn crc32_digest(s: String) -> i64 {
+    return crc32_digest_bytes(string_to_bytes(s));
+}
+
+/// Incremental CRC-32 hasher.
+pub struct Crc32Hasher {
+    state: i64
+}
+
+pub fn crc32_hasher_new() -> Crc32Hasher {
+    return Crc32Hasher(state: -1); // 0xFFFFFFFF
+}
+
+/// Feed more bytes into the hasher.
+pub fn crc32_hasher_update(inout h: Crc32Hasher, data: List<i64>) {
+    h.state = crc32_update(h.state, data);
+}
+
+/// Feed more characters from a string into the hasher.
+pub fn crc32_hasher_update_str(inout h: Crc32Hasher, s: String) {
+    crc32_hasher_update(inout h, string_to_bytes(s));
+}
+
+/// Return the final CRC-32 checksum and reset the hasher.
+pub fn crc32_hasher_finalize(inout h: Crc32Hasher) -> i64 {
+    let result = (h.state ^ -1) & 4294967295;
+    h.state = -1; // reset
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// 7. Unit Tests for std/io Subsystem
 // ---------------------------------------------------------------------------
 
 pub fn test_io_string_reader_lines() -> bool {
@@ -669,12 +754,52 @@ pub fn test_io_byte_stream_endianness() -> bool {
         && is_eof;
 }
 
+// CRC-32 known check value: "123456789" => 0xCBF43926 = 3421780262
+pub fn test_io_crc32_known_vector() -> bool {
+    let crc = crc32_digest("123456789");
+    return crc == 3421780262;
+}
+
+// CRC-32 of empty string must be 0x00000000 = 0
+pub fn test_io_crc32_empty() -> bool {
+    return crc32_digest("") == 0;
+}
+
+// Incremental hasher must match one-shot digest
+pub fn test_io_crc32_hasher_incremental() -> bool {
+    mut h = crc32_hasher_new();
+    crc32_hasher_update_str(inout h, "1234");
+    crc32_hasher_update_str(inout h, "56789");
+    let incremental = crc32_hasher_finalize(inout h);
+    let oneshot = crc32_digest("123456789");
+    return incremental == oneshot;
+}
+
+// Hasher resets after finalize
+pub fn test_io_crc32_hasher_reset() -> bool {
+    mut h = crc32_hasher_new();
+    crc32_hasher_update_str(inout h, "abc");
+    let _ = crc32_hasher_finalize(inout h);
+    // After reset, feeding the same data must give the same result
+    crc32_hasher_update_str(inout h, "abc");
+    let second = crc32_hasher_finalize(inout h);
+    return second == crc32_digest("abc");
+}
+
+pub fn test_io_crc32_all() -> bool {
+    return test_io_crc32_known_vector()
+        && test_io_crc32_empty()
+        && test_io_crc32_hasher_incremental()
+        && test_io_crc32_hasher_reset();
+}
+
 pub fn test_io_all() -> bool {
     return test_io_string_reader_lines()
         && test_io_string_reader_seek_and_peek()
         && test_io_string_writer_accumulation()
         && test_io_buffered_reader_and_writer()
-        && test_io_byte_stream_endianness();
+        && test_io_byte_stream_endianness()
+        && test_io_crc32_all();
 }
 
 pub fn main() {
