@@ -6,6 +6,10 @@
 //! - `Set<T>`: Deterministic unique set ordered lexicographically.
 //! - `ByteBuffer`: High-throughput binary builder with little/big-endian encoding.
 //! - `StringBuilder`: Deterministic string synthesis and code formatting buffer.
+//! - `RingBuffer<T>`: Fixed-capacity circular FIFO ring buffer.
+//! - `BinaryHeap<T>`: Priority queue ordered by min or max comparator.
+//! - `Deque<T>`: Double-ended queue with amortized O(1) front and back operations.
+//! - `LruCache<K, V>`: Bounded-capacity Least Recently Used cache with deterministic eviction.
 
 use std::collections::{btree_map, btree_set, BTreeMap, BTreeSet};
 use std::fmt;
@@ -1077,5 +1081,358 @@ impl<T> Deque<T> {
     /// Peek the back element.
     pub fn peek_back(&self) -> Option<&T> {
         self.inner.back()
+    }
+}
+
+/// Eviction details resulting from an insertion into an [`LruCache`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eviction<K, V> {
+    /// Previous value associated with the key if the key was already present.
+    pub old_value: Option<V>,
+    /// Displaced key-value pair evicted from the cache if capacity was exceeded.
+    pub evicted: Option<(K, V)>,
+}
+
+/// Node slot stored in [`LruCache`].
+#[derive(Debug, Clone)]
+struct LruNode<K, V> {
+    key: K,
+    value: V,
+    prev: Option<usize>, // toward MRU (head)
+    next: Option<usize>, // toward LRU (tail)
+}
+
+/// Deterministic Least Recently Used (LRU) Cache with bounded capacity.
+///
+/// Guaranteed bit-for-bit reproducibility via ordered indexing, completely safe
+/// slot-indexed arena allocation, and zero raw pointers or unsafe blocks.
+///
+/// # Examples
+/// ```
+/// use ifa_stdlib::collections::LruCache;
+///
+/// let mut cache = LruCache::new(2);
+/// cache.put("a", 1);
+/// cache.put("b", 2);
+/// assert_eq!(cache.get(&"a"), Some(&1));
+/// cache.put("c", 3); // evicts "b" because "a" was accessed
+/// assert_eq!(cache.get(&"b"), None);
+/// assert_eq!(cache.get(&"a"), Some(&1));
+/// assert_eq!(cache.get(&"c"), Some(&3));
+/// ```
+#[derive(Debug, Clone)]
+pub struct LruCache<K: Ord + Clone, V> {
+    capacity: usize,
+    map: BTreeMap<K, usize>,
+    nodes: Vec<Option<LruNode<K, V>>>,
+    free_slots: Vec<usize>,
+    head: Option<usize>, // MRU
+    tail: Option<usize>, // LRU
+}
+
+impl<K: Ord + Clone, V> LruCache<K, V> {
+    /// Create a new bounded LRU cache with non-zero capacity.
+    ///
+    /// # Panics
+    /// Panics if `capacity == 0`.
+    pub fn new(capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "LruCache capacity must be strictly greater than 0"
+        );
+        Self {
+            capacity,
+            map: BTreeMap::new(),
+            nodes: Vec::new(),
+            free_slots: Vec::new(),
+            head: None,
+            tail: None,
+        }
+    }
+
+    /// Return maximum capacity of the cache.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Return current number of elements in the cache.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Check if cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Check if cache has reached its maximum capacity.
+    pub fn is_full(&self) -> bool {
+        self.len() >= self.capacity
+    }
+
+    /// Clear all cached elements.
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.nodes.clear();
+        self.free_slots.clear();
+        self.head = None;
+        self.tail = None;
+    }
+
+    /// Check whether a key is present without altering recency.
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.map.contains_key(key)
+    }
+
+    /// Peek value for a key without altering recency.
+    pub fn peek(&self, key: &K) -> Option<&V> {
+        let &idx = self.map.get(key)?;
+        let node = self.nodes.get(idx)?.as_ref()?;
+        Some(&node.value)
+    }
+
+    /// Peek mutable value for a key without altering recency.
+    pub fn peek_mut(&mut self, key: &K) -> Option<&mut V> {
+        let &idx = self.map.get(key)?;
+        let node = self.nodes.get_mut(idx)?.as_mut()?;
+        Some(&mut node.value)
+    }
+
+    /// Peek the Most Recently Used (MRU) entry.
+    pub fn peek_mru(&self) -> Option<(&K, &V)> {
+        let idx = self.head?;
+        let node = self.nodes.get(idx)?.as_ref()?;
+        Some((&node.key, &node.value))
+    }
+
+    /// Peek the Least Recently Used (LRU) entry.
+    pub fn peek_lru(&self) -> Option<(&K, &V)> {
+        let idx = self.tail?;
+        let node = self.nodes.get(idx)?.as_ref()?;
+        Some((&node.key, &node.value))
+    }
+
+    /// Retrieve reference to a value, promoting the key to Most Recently Used (MRU).
+    pub fn get(&mut self, key: &K) -> Option<&V> {
+        let &idx = self.map.get(key)?;
+        self.move_to_head(idx);
+        let node = self.nodes.get(idx)?.as_ref()?;
+        Some(&node.value)
+    }
+
+    /// Retrieve mutable reference to a value, promoting the key to Most Recently Used (MRU).
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        let &idx = self.map.get(key)?;
+        self.move_to_head(idx);
+        let node = self.nodes.get_mut(idx)?.as_mut()?;
+        Some(&mut node.value)
+    }
+
+    /// Insert or update a key-value pair, promoting it to Most Recently Used (MRU).
+    ///
+    /// If the key already exists, updates the value and returns the old value.
+    /// If inserting a new key causes the cache to exceed its capacity, the LRU element is evicted.
+    pub fn put(&mut self, key: K, value: V) -> Option<V> {
+        self.put_with_eviction(key, value).old_value
+    }
+
+    /// Insert or update a key-value pair with complete eviction report.
+    pub fn put_with_eviction(&mut self, key: K, value: V) -> Eviction<K, V> {
+        if let Some(&idx) = self.map.get(&key) {
+            let old_val = {
+                let node = self.nodes[idx].as_mut().expect("valid node index");
+                std::mem::replace(&mut node.value, value)
+            };
+            self.move_to_head(idx);
+            Eviction {
+                old_value: Some(old_val),
+                evicted: None,
+            }
+        } else {
+            let mut evicted = None;
+            if self.len() >= self.capacity {
+                evicted = self.pop_lru();
+            }
+
+            let idx = if let Some(free_idx) = self.free_slots.pop() {
+                self.nodes[free_idx] = Some(LruNode {
+                    key: key.clone(),
+                    value,
+                    prev: None,
+                    next: None,
+                });
+                free_idx
+            } else {
+                let new_idx = self.nodes.len();
+                self.nodes.push(Some(LruNode {
+                    key: key.clone(),
+                    value,
+                    prev: None,
+                    next: None,
+                }));
+                new_idx
+            };
+
+            self.attach_head(idx);
+            self.map.insert(key, idx);
+
+            Eviction {
+                old_value: None,
+                evicted,
+            }
+        }
+    }
+
+    /// Remove a key-value pair from the cache.
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let idx = self.map.remove(key)?;
+        self.detach(idx);
+        let node = self.nodes[idx].take().expect("valid node");
+        self.free_slots.push(idx);
+        Some(node.value)
+    }
+
+    /// Evict and return the Least Recently Used (LRU) entry.
+    pub fn pop_lru(&mut self) -> Option<(K, V)> {
+        let tail_idx = self.tail?;
+        self.detach(tail_idx);
+        let node = self.nodes[tail_idx].take().expect("valid tail node");
+        self.map.remove(&node.key);
+        self.free_slots.push(tail_idx);
+        Some((node.key, node.value))
+    }
+
+    /// Evict and return the Most Recently Used (MRU) entry.
+    pub fn pop_mru(&mut self) -> Option<(K, V)> {
+        let head_idx = self.head?;
+        self.detach(head_idx);
+        let node = self.nodes[head_idx].take().expect("valid head node");
+        self.map.remove(&node.key);
+        self.free_slots.push(head_idx);
+        Some((node.key, node.value))
+    }
+
+    /// Return an iterator visiting items in order from MRU (head) to LRU (tail).
+    pub fn iter(&self) -> LruIter<'_, K, V> {
+        LruIter {
+            cache: self,
+            curr: self.head,
+        }
+    }
+
+    /// Return an iterator visiting keys in order from MRU (head) to LRU (tail).
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.iter().map(|(k, _)| k)
+    }
+
+    /// Return an iterator visiting values in order from MRU (head) to LRU (tail).
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.iter().map(|(_, v)| v)
+    }
+
+    // --- Internal doubly linked list utilities ---
+
+    fn detach(&mut self, idx: usize) {
+        let (prev, next) = {
+            let node = self.nodes[idx].as_ref().expect("node exists");
+            (node.prev, node.next)
+        };
+
+        if let Some(p) = prev {
+            if let Some(p_node) = self.nodes[p].as_mut() {
+                p_node.next = next;
+            }
+        } else {
+            self.head = next;
+        }
+
+        if let Some(n) = next {
+            if let Some(n_node) = self.nodes[n].as_mut() {
+                n_node.prev = prev;
+            }
+        } else {
+            self.tail = prev;
+        }
+
+        if let Some(node) = self.nodes[idx].as_mut() {
+            node.prev = None;
+            node.next = None;
+        }
+    }
+
+    fn attach_head(&mut self, idx: usize) {
+        let old_head = self.head;
+        if let Some(node) = self.nodes[idx].as_mut() {
+            node.prev = None;
+            node.next = old_head;
+        }
+
+        if let Some(h) = old_head {
+            if let Some(h_node) = self.nodes[h].as_mut() {
+                h_node.prev = Some(idx);
+            }
+        } else {
+            self.tail = Some(idx);
+        }
+
+        self.head = Some(idx);
+    }
+
+    fn move_to_head(&mut self, idx: usize) {
+        if self.head == Some(idx) {
+            return;
+        }
+        self.detach(idx);
+        self.attach_head(idx);
+    }
+}
+
+/// Iterator over entries of an [`LruCache`] from Most Recently Used to Least Recently Used.
+pub struct LruIter<'a, K: Ord + Clone, V> {
+    cache: &'a LruCache<K, V>,
+    curr: Option<usize>,
+}
+
+impl<'a, K: Ord + Clone, V> Iterator for LruIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let idx = self.curr?;
+        let node = self.cache.nodes.get(idx)?.as_ref()?;
+        self.curr = node.next;
+        Some((&node.key, &node.value))
+    }
+}
+
+impl<K: Ord + Clone + PartialEq, V: PartialEq> PartialEq for LruCache<K, V> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.capacity != other.capacity || self.len() != other.len() {
+            return false;
+        }
+        self.iter().eq(other.iter())
+    }
+}
+
+impl<K: Ord + Clone + Eq, V: Eq> Eq for LruCache<K, V> {}
+
+impl<K: Ord + Clone, V> IntoIterator for LruCache<K, V> {
+    type Item = (K, V);
+    type IntoIter = LruIntoIter<K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        LruIntoIter { cache: self }
+    }
+}
+
+/// Consuming iterator over entries of an [`LruCache`] from Most Recently Used to Least Recently Used.
+pub struct LruIntoIter<K: Ord + Clone, V> {
+    cache: LruCache<K, V>,
+}
+
+impl<K: Ord + Clone, V> Iterator for LruIntoIter<K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.cache.pop_mru()
     }
 }

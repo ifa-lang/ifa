@@ -14,7 +14,9 @@ pub mod simd_parser;
 pub mod sync;
 pub mod sys;
 
-pub use collections::{BinaryHeap, ByteBuffer, Deque, List, Map, Set, StringBuilder};
+pub use collections::{
+    BinaryHeap, ByteBuffer, Deque, Eviction, List, LruCache, Map, Set, StringBuilder,
+};
 pub use crypto::{
     base64_decode, base64_encode, base64url_decode, base64url_encode, blake3, blake3_hex,
     constant_time_eq, constant_time_eq_hex, hex_decode, hex_encode, hkdf_sha1, hkdf_sha1_expand,
@@ -1180,5 +1182,107 @@ mod tests {
         assert_eq!(tok.len(), 32);
         let b64 = secure_random_token_base64(24).unwrap();
         assert_eq!(b64.len(), 32);
+    }
+
+    #[test]
+    fn test_lru_cache_operations() {
+        let mut cache: LruCache<&str, i32> = LruCache::new(3);
+        assert_eq!(cache.capacity(), 3);
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert!(!cache.is_full());
+
+        // Fill up to capacity
+        assert_eq!(cache.put("k1", 100), None);
+        assert_eq!(cache.put("k2", 200), None);
+        assert_eq!(cache.put("k3", 300), None);
+        assert_eq!(cache.len(), 3);
+        assert!(cache.is_full());
+
+        // Check MRU and LRU
+        assert_eq!(cache.peek_mru(), Some((&"k3", &300)));
+        assert_eq!(cache.peek_lru(), Some((&"k1", &100)));
+
+        // Access "k1", promoting it to MRU
+        assert_eq!(cache.get(&"k1"), Some(&100));
+        assert_eq!(cache.peek_mru(), Some((&"k1", &100)));
+        assert_eq!(cache.peek_lru(), Some((&"k2", &200)));
+
+        // Insert "k4", which should evict "k2" (the LRU)
+        let ev = cache.put_with_eviction("k4", 400);
+        assert_eq!(ev.old_value, None);
+        assert_eq!(ev.evicted, Some(("k2", 200)));
+        assert_eq!(cache.len(), 3);
+        assert!(!cache.contains_key(&"k2"));
+        assert_eq!(cache.get(&"k2"), None);
+        assert_eq!(cache.peek_mru(), Some((&"k4", &400)));
+        assert_eq!(cache.peek_lru(), Some((&"k3", &300)));
+
+        // Update existing key
+        let ev_update = cache.put_with_eviction("k3", 350);
+        assert_eq!(ev_update.old_value, Some(300));
+        assert_eq!(ev_update.evicted, None);
+        assert_eq!(cache.peek_mru(), Some((&"k3", &350)));
+        assert_eq!(cache.peek_lru(), Some((&"k1", &100)));
+
+        // Peek mutable without changing recency
+        if let Some(val) = cache.peek_mut(&"k1") {
+            *val += 5;
+        }
+        assert_eq!(cache.peek_lru(), Some((&"k1", &105)));
+
+        // Iteration from MRU to LRU
+        let items: Vec<(&&str, &i32)> = cache.iter().collect();
+        assert_eq!(items, vec![(&"k3", &350), (&"k4", &400), (&"k1", &105)]);
+
+        let keys: Vec<&str> = cache.keys().copied().collect();
+        assert_eq!(keys, vec!["k3", "k4", "k1"]);
+
+        // Remove
+        assert_eq!(cache.remove(&"k4"), Some(400));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.peek_mru(), Some((&"k3", &350)));
+        assert_eq!(cache.peek_lru(), Some((&"k1", &105)));
+
+        // Pop LRU
+        assert_eq!(cache.pop_lru(), Some(("k1", 105)));
+        assert_eq!(cache.len(), 1);
+
+        // Pop MRU
+        assert_eq!(cache.pop_mru(), Some(("k3", 350)));
+        assert!(cache.is_empty());
+        assert_eq!(cache.pop_lru(), None);
+        assert_eq!(cache.pop_mru(), None);
+
+        // Clear
+        cache.put("a", 1);
+        cache.put("b", 2);
+        assert_eq!(cache.len(), 2);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_ring_buffer_fifo() {
+        let mut rb = collections::RingBuffer::new(3);
+        assert_eq!(rb.capacity(), 3);
+        assert_eq!(rb.len(), 0);
+        assert!(rb.is_empty());
+
+        assert!(rb.push(10));
+        assert!(rb.push(20));
+        assert!(rb.push(30));
+        assert!(rb.is_full());
+        assert!(!rb.push(40));
+
+        assert_eq!(rb.peek(), Some(&10));
+        assert_eq!(rb.pop(), Some(10));
+        assert_eq!(rb.pop(), Some(20));
+
+        assert!(rb.push(50));
+        assert_eq!(rb.pop(), Some(30));
+        assert_eq!(rb.pop(), Some(50));
+        assert_eq!(rb.pop(), None);
     }
 }
