@@ -5,12 +5,18 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn get_ifa_binary() -> PathBuf {
+    if let Some(bin) = option_env!("CARGO_BIN_EXE_ifa") {
+        let p = PathBuf::from(bin);
+        if p.exists() {
+            return p;
+        }
+    }
     let mut path = std::env::current_exe().expect("current exe");
     path.pop();
     if path.ends_with("deps") {
         path.pop();
     }
-    path.push("ifa");
+    path.push(if cfg!(windows) { "ifa.exe" } else { "ifa" });
     path
 }
 

@@ -38,6 +38,8 @@ jobs:
             sudo apt-get install -y -q lld clang || true
           }
           (curl -fsSL https://wasmtime.dev/install.sh | bash && echo "$HOME/.wasmtime/bin" >> $GITHUB_PATH) || true
+      - name: Build Workspace Binaries
+        run: cargo build --workspace --bins -q
       - name: Run Tests
         timeout-minutes: 10
         run: cargo test --workspace -q

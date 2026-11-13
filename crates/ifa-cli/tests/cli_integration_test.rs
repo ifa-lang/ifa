@@ -2,12 +2,18 @@ use std::fs;
 use std::process::Command;
 
 fn get_ifa_binary() -> std::path::PathBuf {
+    if let Some(bin) = option_env!("CARGO_BIN_EXE_ifa") {
+        let p = std::path::PathBuf::from(bin);
+        if p.exists() {
+            return p;
+        }
+    }
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // remove test binary name
     if path.ends_with("deps") {
         path.pop();
     }
-    path.push("ifa");
+    path.push(if cfg!(windows) { "ifa.exe" } else { "ifa" });
     path
 }
 
