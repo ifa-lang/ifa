@@ -15,8 +15,8 @@ pub mod sync;
 pub mod sys;
 
 pub use collections::{
-    BinaryHeap, BitSet, BitSetError, BitSetIter, ByteBuffer, Deque, Eviction, List, LruCache, Map,
-    Set, StringBuilder,
+    BinaryHeap, BitSet, BitSetError, BitSetIter, ByteBuffer, Deque, DisjointSet, Eviction, List,
+    LruCache, Map, Set, StringBuilder,
 };
 pub use crypto::{
     base64_decode, base64_encode, base64url_decode, base64url_encode, blake3, blake3_hex,
@@ -1417,5 +1417,85 @@ mod tests {
         // Display formatting
         let disp = format!("{inter_set}");
         assert_eq!(disp, "BitSet(2/4 bits: [2, 3])");
+    }
+
+    #[test]
+    fn test_collections_disjoint_set() {
+        let mut ds: DisjointSet<String> = DisjointSet::new();
+        assert!(ds.is_empty());
+        assert_eq!(ds.len(), 0);
+        assert_eq!(ds.set_count(), 0);
+
+        // Insert elements
+        assert!(ds.insert("a".to_string()));
+        assert!(ds.insert("b".to_string()));
+        assert!(ds.insert("c".to_string()));
+        assert!(ds.insert("d".to_string()));
+        assert!(!ds.insert("a".to_string())); // duplicate
+
+        assert_eq!(ds.len(), 4);
+        assert_eq!(ds.set_count(), 4);
+        assert!(ds.contains(&"a".to_string()));
+        assert!(!ds.contains(&"z".to_string()));
+
+        // Initial singletons: find returns themselves
+        assert_eq!(ds.find(&"a".to_string()), Some("a".to_string()));
+        assert_eq!(ds.find(&"b".to_string()), Some("b".to_string()));
+        assert!(!ds.connected(&"a".to_string(), &"b".to_string()));
+
+        // Union a and b
+        assert!(ds.union(&"a".to_string(), &"b".to_string()));
+        assert_eq!(ds.set_count(), 3);
+        assert!(ds.connected(&"a".to_string(), &"b".to_string()));
+        assert_eq!(ds.component_size(&"a".to_string()), Some(2));
+        assert_eq!(ds.component_size(&"b".to_string()), Some(2));
+
+        // Union duplicate should return false
+        assert!(!ds.union(&"a".to_string(), &"b".to_string()));
+        assert_eq!(ds.set_count(), 3);
+
+        // Union c and d
+        assert!(ds.union(&"c".to_string(), &"d".to_string()));
+        assert_eq!(ds.set_count(), 2);
+
+        // Union (a, b) group with (c, d) group
+        assert!(ds.union(&"b".to_string(), &"c".to_string()));
+        assert_eq!(ds.set_count(), 1);
+        assert!(ds.connected(&"a".to_string(), &"d".to_string()));
+        assert_eq!(ds.component_size(&"d".to_string()), Some(4));
+
+        // Union insert
+        assert!(ds.union_insert("e".to_string(), "f".to_string()));
+        assert_eq!(ds.len(), 6);
+        assert_eq!(ds.set_count(), 2);
+        assert!(ds.connected(&"e".to_string(), &"f".to_string()));
+        assert!(!ds.connected(&"a".to_string(), &"e".to_string()));
+
+        // Roots and components
+        let roots = ds.roots();
+        assert_eq!(roots.len(), 2);
+
+        let comps = ds.components();
+        assert_eq!(comps.len(), 2);
+        let total_elems: usize = comps.values().map(|s| s.len()).sum();
+        assert_eq!(total_elems, 6);
+
+        // FromIterator & Extend
+        let mut ds2 = DisjointSet::from_iter(vec![1, 2, 3, 4, 5]);
+        assert_eq!(ds2.len(), 5);
+        assert_eq!(ds2.set_count(), 5);
+
+        // Extend edges
+        ds2.extend(vec![(1, 2), (2, 3), (4, 5)]);
+        assert_eq!(ds2.set_count(), 2);
+        assert!(ds2.connected(&1, &3));
+        assert!(ds2.connected(&4, &5));
+        assert!(!ds2.connected(&1, &5));
+
+        // Clear
+        ds2.clear();
+        assert!(ds2.is_empty());
+        assert_eq!(ds2.len(), 0);
+        assert_eq!(ds2.set_count(), 0);
     }
 }

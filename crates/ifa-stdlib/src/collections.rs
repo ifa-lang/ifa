@@ -11,6 +11,7 @@
 //! - `Deque<T>`: Double-ended queue with amortized O(1) front and back operations.
 //! - `LruCache<K, V>`: Bounded-capacity Least Recently Used cache with deterministic eviction.
 //! - `BitSet`: Compact, deterministic bit vector for set operations and compiler dataflow analysis.
+//! - `DisjointSet<T>`: Deterministic Union-Find forest with path compression and union by rank.
 
 use std::collections::{btree_map, btree_set, BTreeMap, BTreeSet};
 use std::fmt;
@@ -2053,5 +2054,242 @@ impl fmt::Display for BitSet {
             first = false;
         }
         write!(f, "])")
+    }
+}
+
+/// Deterministic Disjoint-Set forest (Union-Find) with path compression and union by rank.
+///
+/// Guaranteed bit-by-bit reproducible ordering via lexicographic BTree mapping.
+/// Used for compiler dataflow alias analysis, type unification, connected component
+/// detection, and memory arena co-allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisjointSet<T: Ord + Clone> {
+    parent: BTreeMap<T, T>,
+    rank: BTreeMap<T, usize>,
+    size: BTreeMap<T, usize>,
+    count: usize,
+}
+
+impl<T: Ord + Clone> Default for DisjointSet<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Ord + Clone> DisjointSet<T> {
+    /// Create an empty disjoint-set forest.
+    pub fn new() -> Self {
+        Self {
+            parent: BTreeMap::new(),
+            rank: BTreeMap::new(),
+            size: BTreeMap::new(),
+            count: 0,
+        }
+    }
+
+    /// Create a disjoint-set forest initialized with elements as distinct singletons.
+    pub fn with_elements<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut ds = Self::new();
+        for item in iter {
+            ds.insert(item);
+        }
+        ds
+    }
+
+    /// Returns `true` if the disjoint-set contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.parent.is_empty()
+    }
+
+    /// Total number of elements across all disjoint sets.
+    pub fn len(&self) -> usize {
+        self.parent.len()
+    }
+
+    /// Total number of distinct connected components (disjoint sets).
+    pub fn set_count(&self) -> usize {
+        self.count
+    }
+
+    /// Returns `true` if `elem` is tracked in the disjoint-set forest.
+    pub fn contains(&self, elem: &T) -> bool {
+        self.parent.contains_key(elem)
+    }
+
+    /// Insert an element as a new singleton set if not already present.
+    ///
+    /// Returns `true` if the element was newly added, or `false` if it already exists.
+    pub fn insert(&mut self, elem: T) -> bool {
+        if self.parent.contains_key(&elem) {
+            return false;
+        }
+        self.parent.insert(elem.clone(), elem.clone());
+        self.rank.insert(elem.clone(), 0);
+        self.size.insert(elem, 1);
+        self.count += 1;
+        true
+    }
+
+    /// Find the canonical representative (root) of the set containing `elem`,
+    /// applying two-pass path compression for near-constant amortized time complexity O(α(N)).
+    ///
+    /// Returns `None` if `elem` is not present in the disjoint-set forest.
+    pub fn find(&mut self, elem: &T) -> Option<T> {
+        if !self.parent.contains_key(elem) {
+            return None;
+        }
+
+        // Pass 1: Find root
+        let mut root = elem.clone();
+        while let Some(p) = self.parent.get(&root) {
+            if p == &root {
+                break;
+            }
+            root = p.clone();
+        }
+
+        // Pass 2: Path compression (flatten tree towards root)
+        let mut curr = elem.clone();
+        while let Some(p) = self.parent.get(&curr).cloned() {
+            if p == root {
+                break;
+            }
+            self.parent.insert(curr, root.clone());
+            curr = p;
+        }
+
+        Some(root)
+    }
+
+    /// Find the canonical representative of `elem`, inserting `elem` as a new singleton if absent.
+    pub fn find_or_insert(&mut self, elem: T) -> T {
+        if !self.parent.contains_key(&elem) {
+            self.insert(elem.clone());
+            elem
+        } else {
+            self.find(&elem).unwrap_or(elem)
+        }
+    }
+
+    /// Unify the disjoint sets containing `a` and `b` using union by rank.
+    ///
+    /// Returns:
+    /// - `false` if `a` or `b` does not exist, or if they are already in the same set.
+    /// - `true` if two previously disjoint sets were successfully merged.
+    pub fn union(&mut self, a: &T, b: &T) -> bool {
+        let root_a = match self.find(a) {
+            Some(r) => r,
+            None => return false,
+        };
+        let root_b = match self.find(b) {
+            Some(r) => r,
+            None => return false,
+        };
+
+        if root_a == root_b {
+            return false;
+        }
+
+        let rank_a = self.rank.get(&root_a).copied().unwrap_or(0);
+        let rank_b = self.rank.get(&root_b).copied().unwrap_or(0);
+        let size_a = self.size.get(&root_a).copied().unwrap_or(1);
+        let size_b = self.size.get(&root_b).copied().unwrap_or(1);
+
+        if rank_a < rank_b {
+            self.parent.insert(root_a.clone(), root_b.clone());
+            self.size.insert(root_b, size_a + size_b);
+            self.size.remove(&root_a);
+        } else if rank_a > rank_b {
+            self.parent.insert(root_b.clone(), root_a.clone());
+            self.size.insert(root_a, size_a + size_b);
+            self.size.remove(&root_b);
+        } else {
+            self.parent.insert(root_b.clone(), root_a.clone());
+            self.rank.insert(root_a.clone(), rank_a + 1);
+            self.size.insert(root_a, size_a + size_b);
+            self.size.remove(&root_b);
+        }
+
+        self.count -= 1;
+        true
+    }
+
+    /// Ensure both `a` and `b` are inserted into the disjoint set, then unite them.
+    ///
+    /// Returns `true` if a new union was formed, or `false` if they were already in the same set.
+    pub fn union_insert(&mut self, a: T, b: T) -> bool {
+        self.find_or_insert(a.clone());
+        self.find_or_insert(b.clone());
+        self.union(&a, &b)
+    }
+
+    /// Check if elements `a` and `b` belong to the same connected component / set.
+    pub fn connected(&mut self, a: &T, b: &T) -> bool {
+        match (self.find(a), self.find(b)) {
+            (Some(ra), Some(rb)) => ra == rb,
+            _ => false,
+        }
+    }
+
+    /// Get the cardinality (number of elements) of the set containing `elem`.
+    pub fn component_size(&mut self, elem: &T) -> Option<usize> {
+        let root = self.find(elem)?;
+        self.size.get(&root).copied()
+    }
+
+    /// Returns the deterministic set of canonical representatives (roots) of all components.
+    pub fn roots(&mut self) -> BTreeSet<T> {
+        let keys: Vec<T> = self.parent.keys().cloned().collect();
+        let mut roots = BTreeSet::new();
+        for key in keys {
+            if let Some(root) = self.find(&key) {
+                roots.insert(root);
+            }
+        }
+        roots
+    }
+
+    /// Group all elements into their respective disjoint components.
+    ///
+    /// Returns a deterministic mapping from canonical root to all member elements.
+    pub fn components(&mut self) -> BTreeMap<T, BTreeSet<T>> {
+        let keys: Vec<T> = self.parent.keys().cloned().collect();
+        let mut comp = BTreeMap::new();
+        for key in keys {
+            if let Some(root) = self.find(&key) {
+                comp.entry(root).or_insert_with(BTreeSet::new).insert(key);
+            }
+        }
+        comp
+    }
+
+    /// Clear all elements from the disjoint-set forest.
+    pub fn clear(&mut self) {
+        self.parent.clear();
+        self.rank.clear();
+        self.size.clear();
+        self.count = 0;
+    }
+}
+
+impl<T: Ord + Clone> FromIterator<T> for DisjointSet<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self::with_elements(iter)
+    }
+}
+
+impl<T: Ord + Clone> Extend<T> for DisjointSet<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for item in iter {
+            self.insert(item);
+        }
+    }
+}
+
+impl<T: Ord + Clone> Extend<(T, T)> for DisjointSet<T> {
+    fn extend<I: IntoIterator<Item = (T, T)>>(&mut self, iter: I) {
+        for (a, b) in iter {
+            self.union_insert(a, b);
+        }
     }
 }
