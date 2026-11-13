@@ -10,10 +10,14 @@
 //! - `BinaryHeap<T>`: Priority queue ordered by min or max comparator.
 //! - `Deque<T>`: Double-ended queue with amortized O(1) front and back operations.
 //! - `LruCache<K, V>`: Bounded-capacity Least Recently Used cache with deterministic eviction.
+//! - `BitSet`: Compact, deterministic bit vector for set operations and compiler dataflow analysis.
 
 use std::collections::{btree_map, btree_set, BTreeMap, BTreeSet};
 use std::fmt;
-use std::ops::{Index, IndexMut};
+use std::ops::{
+    BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Index, IndexMut, Not, Sub,
+    SubAssign,
+};
 
 /// Deterministic ordered map using B-Tree for guaranteed bit-by-bit iteration reproducibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1434,5 +1438,620 @@ impl<K: Ord + Clone, V> Iterator for LruIntoIter<K, V> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.cache.pop_mru()
+    }
+}
+
+/// Errors encountered during bit set operations, parsing, or conversions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BitSetError {
+    /// Encountered an invalid bit character (expected '0' or '1').
+    InvalidCharacter { pos: usize, ch: char },
+    /// Insufficient bytes provided to construct the requested bit set length.
+    InsufficientBytes { required: usize, provided: usize },
+}
+
+impl fmt::Display for BitSetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCharacter { pos, ch } => {
+                write!(f, "invalid bit character '{ch}' at position {pos}")
+            }
+            Self::InsufficientBytes { required, provided } => {
+                write!(
+                    f,
+                    "insufficient bytes: required {required}, provided {provided}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BitSetError {}
+
+/// Compact, deterministic bit vector (`BitSet`) for high-performance set operations,
+/// compiler dataflow analysis (liveness, reaching definitions), and dense boolean arrays.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct BitSet {
+    words: Vec<u64>,
+    nbits: usize,
+}
+
+impl BitSet {
+    const BITS_PER_WORD: usize = 64;
+
+    /// Create an empty bit set with 0 bits.
+    pub const fn new() -> Self {
+        Self {
+            words: Vec::new(),
+            nbits: 0,
+        }
+    }
+
+    /// Create an empty bit set pre-allocated for at least `bits` bits.
+    pub fn with_capacity(bits: usize) -> Self {
+        let num_words = bits.div_ceil(Self::BITS_PER_WORD);
+        Self {
+            words: Vec::with_capacity(num_words),
+            nbits: 0,
+        }
+    }
+
+    /// Create a bit set of `len` bits initialized to `val`.
+    pub fn repeat(val: bool, len: usize) -> Self {
+        let num_words = len.div_ceil(Self::BITS_PER_WORD);
+        let word_val = if val { !0u64 } else { 0u64 };
+        let mut set = Self {
+            words: vec![word_val; num_words],
+            nbits: len,
+        };
+        set.sanitize_unused_bits();
+        set
+    }
+
+    /// Construct a bit set from a little-endian byte slice of `len` bits.
+    pub fn from_bytes(bytes: &[u8], len: usize) -> Result<Self, BitSetError> {
+        let required = len.div_ceil(8);
+        if bytes.len() < required {
+            return Err(BitSetError::InsufficientBytes {
+                required,
+                provided: bytes.len(),
+            });
+        }
+
+        let num_words = len.div_ceil(Self::BITS_PER_WORD);
+        let mut words = Vec::with_capacity(num_words);
+        for chunk in bytes[..required].chunks(8) {
+            let mut le_chunk = [0u8; 8];
+            le_chunk[..chunk.len()].copy_from_slice(chunk);
+            words.push(u64::from_le_bytes(le_chunk));
+        }
+        words.resize(num_words, 0);
+
+        let mut set = Self { words, nbits: len };
+        set.sanitize_unused_bits();
+        Ok(set)
+    }
+
+    /// Parse a bit set from an ASCII binary string (e.g. `"10110"`).
+    ///
+    /// The bit at index `i` corresponds to character `i`.
+    pub fn from_bit_string(s: &str) -> Result<Self, BitSetError> {
+        let mut set = Self::with_capacity(s.len());
+        for (i, ch) in s.char_indices() {
+            match ch {
+                '0' => {}
+                '1' => {
+                    set.insert(i);
+                }
+                _ => return Err(BitSetError::InvalidCharacter { pos: i, ch }),
+            }
+        }
+        set.nbits = s.len();
+        set.sanitize_unused_bits();
+        Ok(set)
+    }
+
+    /// Return the logical length in bits.
+    pub fn len(&self) -> usize {
+        self.nbits
+    }
+
+    /// Check if the bit set contains 0 bits.
+    pub fn is_empty(&self) -> bool {
+        self.nbits == 0
+    }
+
+    /// Return allocated capacity in bits.
+    pub fn capacity(&self) -> usize {
+        self.words.len() * Self::BITS_PER_WORD
+    }
+
+    /// Check if bit at index `bit` is set to 1.
+    pub fn contains(&self, bit: usize) -> bool {
+        if bit >= self.nbits {
+            return false;
+        }
+        let word_idx = bit / Self::BITS_PER_WORD;
+        let bit_idx = bit % Self::BITS_PER_WORD;
+        (self.words[word_idx] & (1u64 << bit_idx)) != 0
+    }
+
+    /// Get value of bit at index `bit`, or `None` if out of bounds.
+    pub fn get(&self, bit: usize) -> Option<bool> {
+        if bit < self.nbits {
+            Some(self.contains(bit))
+        } else {
+            None
+        }
+    }
+
+    /// Set bit at index `bit` to 1. Expands length if `bit >= self.len()`.
+    ///
+    /// Returns `true` if the bit was not previously set.
+    pub fn insert(&mut self, bit: usize) -> bool {
+        if bit >= self.nbits {
+            self.nbits = bit + 1;
+            self.ensure_capacity(self.nbits);
+        }
+        let word_idx = bit / Self::BITS_PER_WORD;
+        let bit_idx = bit % Self::BITS_PER_WORD;
+        let mask = 1u64 << bit_idx;
+        let prev = (self.words[word_idx] & mask) != 0;
+        self.words[word_idx] |= mask;
+        !prev
+    }
+
+    /// Reset bit at index `bit` to 0. Returns `true` if bit was previously set.
+    pub fn remove(&mut self, bit: usize) -> bool {
+        if bit >= self.nbits {
+            return false;
+        }
+        let word_idx = bit / Self::BITS_PER_WORD;
+        let bit_idx = bit % Self::BITS_PER_WORD;
+        let mask = 1u64 << bit_idx;
+        let prev = (self.words[word_idx] & mask) != 0;
+        self.words[word_idx] &= !mask;
+        prev
+    }
+
+    /// Toggle bit at index `bit`. Expands length if `bit >= self.len()`.
+    ///
+    /// Returns the new state of the bit.
+    pub fn toggle(&mut self, bit: usize) -> bool {
+        if bit >= self.nbits {
+            self.nbits = bit + 1;
+            self.ensure_capacity(self.nbits);
+        }
+        let word_idx = bit / Self::BITS_PER_WORD;
+        let bit_idx = bit % Self::BITS_PER_WORD;
+        let mask = 1u64 << bit_idx;
+        self.words[word_idx] ^= mask;
+        (self.words[word_idx] & mask) != 0
+    }
+
+    /// Set bit at index `bit` to `val`.
+    pub fn set(&mut self, bit: usize, val: bool) {
+        if val {
+            self.insert(bit);
+        } else if bit < self.nbits {
+            self.remove(bit);
+        }
+    }
+
+    /// Clear all bits to 0 without altering logical length.
+    pub fn clear(&mut self) {
+        self.words.fill(0);
+    }
+
+    /// Fill all bits up to `len()` with `val`.
+    pub fn fill(&mut self, val: bool) {
+        let w_val = if val { !0u64 } else { 0u64 };
+        self.words.fill(w_val);
+        self.sanitize_unused_bits();
+    }
+
+    /// Truncate bit set to `new_len` bits.
+    pub fn truncate(&mut self, new_len: usize) {
+        if new_len < self.nbits {
+            self.nbits = new_len;
+            let req_words = new_len.div_ceil(Self::BITS_PER_WORD);
+            self.words.truncate(req_words);
+            self.sanitize_unused_bits();
+        }
+    }
+
+    /// Resize bit set to `new_len` bits, filling newly added bits with `val`.
+    pub fn resize(&mut self, new_len: usize, val: bool) {
+        if new_len < self.nbits {
+            self.truncate(new_len);
+        } else if new_len > self.nbits {
+            let old_len = self.nbits;
+            self.nbits = new_len;
+            let new_words = new_len.div_ceil(Self::BITS_PER_WORD);
+            self.words.resize(new_words, 0);
+            if val {
+                for i in old_len..new_len {
+                    let w = i / Self::BITS_PER_WORD;
+                    let b = i % Self::BITS_PER_WORD;
+                    self.words[w] |= 1u64 << b;
+                }
+            }
+            self.sanitize_unused_bits();
+        }
+    }
+
+    /// Return the total number of set bits (popcount).
+    pub fn count_ones(&self) -> usize {
+        self.words.iter().map(|&w| w.count_ones() as usize).sum()
+    }
+
+    /// Return the total number of clear bits (zeros).
+    pub fn count_zeros(&self) -> usize {
+        self.nbits.saturating_sub(self.count_ones())
+    }
+
+    /// Check if all bits are set to 1 (returns `false` if empty).
+    pub fn all(&self) -> bool {
+        !self.is_empty() && self.count_ones() == self.nbits
+    }
+
+    /// Check if at least one bit is set to 1.
+    pub fn any(&self) -> bool {
+        self.words.iter().any(|&w| w != 0)
+    }
+
+    /// Check if no bits are set to 1.
+    pub fn none(&self) -> bool {
+        !self.any()
+    }
+
+    /// In-place bitwise union with another bit set (`self |= other`).
+    pub fn union_with(&mut self, other: &Self) {
+        let max_len = std::cmp::max(self.nbits, other.nbits);
+        self.ensure_capacity(max_len);
+        self.nbits = max_len;
+        for (i, &w) in other.words.iter().enumerate() {
+            self.words[i] |= w;
+        }
+        self.sanitize_unused_bits();
+    }
+
+    /// In-place bitwise intersection with another bit set (`self &= other`).
+    pub fn intersect_with(&mut self, other: &Self) {
+        let min_len = std::cmp::min(self.nbits, other.nbits);
+        self.nbits = min_len;
+        let req_words = min_len.div_ceil(Self::BITS_PER_WORD);
+        self.words.truncate(req_words);
+        let common = std::cmp::min(self.words.len(), other.words.len());
+        for i in 0..common {
+            self.words[i] &= other.words[i];
+        }
+        for i in common..self.words.len() {
+            self.words[i] = 0;
+        }
+        self.sanitize_unused_bits();
+    }
+
+    /// In-place bitwise difference with another bit set (`self &= !other`).
+    pub fn difference_with(&mut self, other: &Self) {
+        let common = std::cmp::min(self.words.len(), other.words.len());
+        for i in 0..common {
+            self.words[i] &= !other.words[i];
+        }
+        self.sanitize_unused_bits();
+    }
+
+    /// In-place bitwise symmetric difference with another bit set (`self ^= other`).
+    pub fn symmetric_difference_with(&mut self, other: &Self) {
+        let max_len = std::cmp::max(self.nbits, other.nbits);
+        self.ensure_capacity(max_len);
+        self.nbits = max_len;
+        for (i, &w) in other.words.iter().enumerate() {
+            self.words[i] ^= w;
+        }
+        self.sanitize_unused_bits();
+    }
+
+    /// Check if `self` and `other` have no set bits in common.
+    pub fn is_disjoint(&self, other: &Self) -> bool {
+        let common = std::cmp::min(self.words.len(), other.words.len());
+        self.words[..common]
+            .iter()
+            .zip(&other.words[..common])
+            .all(|(&a, &b)| (a & b) == 0)
+    }
+
+    /// Check if all set bits of `self` are also set in `other`.
+    pub fn is_subset(&self, other: &Self) -> bool {
+        for (i, &w) in self.words.iter().enumerate() {
+            if i < other.words.len() {
+                if (w & !other.words[i]) != 0 {
+                    return false;
+                }
+            } else if w != 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Check if all set bits of `other` are also set in `self`.
+    pub fn is_superset(&self, other: &Self) -> bool {
+        other.is_subset(self)
+    }
+
+    /// Deterministic iterator over the indices of set bits in ascending order.
+    pub fn ones(&self) -> BitSetIter<'_> {
+        BitSetIter {
+            words: &self.words,
+            word_idx: 0,
+            curr_word: 0,
+        }
+    }
+
+    /// Alias for [`BitSet::ones`].
+    pub fn iter(&self) -> BitSetIter<'_> {
+        self.ones()
+    }
+
+    /// Export bit set to little-endian bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let num_bytes = self.nbits.div_ceil(8);
+        let mut out = Vec::with_capacity(num_bytes);
+        for &w in &self.words {
+            let bytes = w.to_le_bytes();
+            for b in bytes {
+                if out.len() < num_bytes {
+                    out.push(b);
+                } else {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Convert bit set to an ASCII binary string (e.g. `"10110"`).
+    pub fn to_bit_string(&self) -> String {
+        let mut s = String::with_capacity(self.nbits);
+        for i in 0..self.nbits {
+            if self.contains(i) {
+                s.push('1');
+            } else {
+                s.push('0');
+            }
+        }
+        s
+    }
+
+    fn ensure_capacity(&mut self, required_bits: usize) {
+        let req_words = required_bits.div_ceil(Self::BITS_PER_WORD);
+        if self.words.len() < req_words {
+            self.words.resize(req_words, 0);
+        }
+    }
+
+    fn sanitize_unused_bits(&mut self) {
+        let rem = self.nbits % Self::BITS_PER_WORD;
+        if rem != 0 {
+            if let Some(last) = self.words.last_mut() {
+                let mask = (1u64 << rem) - 1;
+                *last &= mask;
+            }
+        }
+    }
+}
+
+/// Deterministic iterator yielding the indices of set bits (ones) in ascending order.
+#[derive(Debug, Clone)]
+pub struct BitSetIter<'a> {
+    words: &'a [u64],
+    word_idx: usize,
+    curr_word: u64,
+}
+
+impl<'a> Iterator for BitSetIter<'a> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.curr_word == 0 {
+            if self.word_idx >= self.words.len() {
+                return None;
+            }
+            self.curr_word = self.words[self.word_idx];
+            self.word_idx += 1;
+        }
+
+        let bit_in_word = self.curr_word.trailing_zeros() as usize;
+        self.curr_word &= self.curr_word.wrapping_sub(1);
+        let absolute_idx = (self.word_idx - 1) * BitSet::BITS_PER_WORD + bit_in_word;
+        Some(absolute_idx)
+    }
+}
+
+impl<'a> IntoIterator for &'a BitSet {
+    type Item = usize;
+    type IntoIter = BitSetIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.ones()
+    }
+}
+
+impl Index<usize> for BitSet {
+    type Output = bool;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        static TRUE: bool = true;
+        static FALSE: bool = false;
+        if index >= self.nbits {
+            panic!(
+                "index out of bounds: the len is {} but the index is {}",
+                self.nbits, index
+            );
+        }
+        if self.contains(index) {
+            &TRUE
+        } else {
+            &FALSE
+        }
+    }
+}
+
+impl FromIterator<usize> for BitSet {
+    fn from_iter<T: IntoIterator<Item = usize>>(iter: T) -> Self {
+        let mut set = Self::new();
+        for item in iter {
+            set.insert(item);
+        }
+        set
+    }
+}
+
+impl Extend<usize> for BitSet {
+    fn extend<T: IntoIterator<Item = usize>>(&mut self, iter: T) {
+        for item in iter {
+            self.insert(item);
+        }
+    }
+}
+
+impl BitOr for &BitSet {
+    type Output = BitSet;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        let mut res = self.clone();
+        res.union_with(rhs);
+        res
+    }
+}
+
+impl BitOr for BitSet {
+    type Output = BitSet;
+
+    fn bitor(mut self, rhs: Self) -> Self::Output {
+        self.union_with(&rhs);
+        self
+    }
+}
+
+impl BitOrAssign<&BitSet> for BitSet {
+    fn bitor_assign(&mut self, rhs: &BitSet) {
+        self.union_with(rhs);
+    }
+}
+
+impl BitAnd for &BitSet {
+    type Output = BitSet;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        let mut res = self.clone();
+        res.intersect_with(rhs);
+        res
+    }
+}
+
+impl BitAnd for BitSet {
+    type Output = BitSet;
+
+    fn bitand(mut self, rhs: Self) -> Self::Output {
+        self.intersect_with(&rhs);
+        self
+    }
+}
+
+impl BitAndAssign<&BitSet> for BitSet {
+    fn bitand_assign(&mut self, rhs: &BitSet) {
+        self.intersect_with(rhs);
+    }
+}
+
+impl BitXor for &BitSet {
+    type Output = BitSet;
+
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        let mut res = self.clone();
+        res.symmetric_difference_with(rhs);
+        res
+    }
+}
+
+impl BitXor for BitSet {
+    type Output = BitSet;
+
+    fn bitxor(mut self, rhs: Self) -> Self::Output {
+        self.symmetric_difference_with(&rhs);
+        self
+    }
+}
+
+impl BitXorAssign<&BitSet> for BitSet {
+    fn bitxor_assign(&mut self, rhs: &BitSet) {
+        self.symmetric_difference_with(rhs);
+    }
+}
+
+impl Sub for &BitSet {
+    type Output = BitSet;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        let mut res = self.clone();
+        res.difference_with(rhs);
+        res
+    }
+}
+
+impl Sub for BitSet {
+    type Output = BitSet;
+
+    fn sub(mut self, rhs: Self) -> Self::Output {
+        self.difference_with(&rhs);
+        self
+    }
+}
+
+impl SubAssign<&BitSet> for BitSet {
+    fn sub_assign(&mut self, rhs: &BitSet) {
+        self.difference_with(rhs);
+    }
+}
+
+impl Not for &BitSet {
+    type Output = BitSet;
+
+    fn not(self) -> Self::Output {
+        let mut res = self.clone();
+        for w in &mut res.words {
+            *w = !*w;
+        }
+        res.sanitize_unused_bits();
+        res
+    }
+}
+
+impl Not for BitSet {
+    type Output = BitSet;
+
+    fn not(mut self) -> Self::Output {
+        for w in &mut self.words {
+            *w = !*w;
+        }
+        self.sanitize_unused_bits();
+        self
+    }
+}
+
+impl fmt::Display for BitSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BitSet({}/{} bits: [", self.count_ones(), self.nbits)?;
+        let mut first = true;
+        for idx in self.ones() {
+            if !first {
+                write!(f, ", ")?;
+            }
+            write!(f, "{idx}")?;
+            first = false;
+        }
+        write!(f, "])")
     }
 }

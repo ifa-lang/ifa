@@ -15,7 +15,8 @@ pub mod sync;
 pub mod sys;
 
 pub use collections::{
-    BinaryHeap, ByteBuffer, Deque, Eviction, List, LruCache, Map, Set, StringBuilder,
+    BinaryHeap, BitSet, BitSetError, BitSetIter, ByteBuffer, Deque, Eviction, List, LruCache, Map,
+    Set, StringBuilder,
 };
 pub use crypto::{
     base64_decode, base64_encode, base64url_decode, base64url_encode, blake3, blake3_hex,
@@ -1284,5 +1285,137 @@ mod tests {
         assert_eq!(rb.pop(), Some(30));
         assert_eq!(rb.pop(), Some(50));
         assert_eq!(rb.pop(), None);
+    }
+
+    #[test]
+    fn test_bitset_operations_and_dataflow() {
+        // Basic creation and bit manipulation
+        let mut bs = BitSet::new();
+        assert!(bs.is_empty());
+        assert_eq!(bs.len(), 0);
+        assert_eq!(bs.count_ones(), 0);
+        assert_eq!(bs.count_zeros(), 0);
+        assert!(bs.none());
+        assert!(!bs.any());
+
+        assert!(bs.insert(0));
+        assert!(bs.insert(2));
+        assert!(bs.insert(63));
+        assert!(bs.insert(64));
+        assert!(bs.insert(130));
+        assert!(!bs.insert(2)); // already present
+
+        assert_eq!(bs.len(), 131);
+        assert_eq!(bs.count_ones(), 5);
+        assert_eq!(bs.count_zeros(), 126);
+        assert!(bs.contains(0));
+        assert!(bs.contains(2));
+        assert!(bs.contains(63));
+        assert!(bs.contains(64));
+        assert!(bs.contains(130));
+        assert!(!bs.contains(1));
+        assert!(!bs.contains(131));
+        assert_eq!(bs.get(130), Some(true));
+        assert_eq!(bs.get(131), None);
+        assert!(bs[0]);
+        assert!(!bs[1]);
+
+        // Toggle and remove
+        assert!(!bs.toggle(0)); // 0 becomes false
+        assert!(!bs.contains(0));
+        assert!(bs.toggle(0)); // 0 becomes true again
+        assert!(bs.contains(0));
+
+        assert!(bs.remove(2));
+        assert!(!bs.contains(2));
+        assert!(!bs.remove(2)); // already removed
+
+        // Ones iterator (ordered, deterministic)
+        let ones: Vec<usize> = bs.ones().collect();
+        assert_eq!(ones, vec![0, 63, 64, 130]);
+
+        // String representation
+        let bitstr = "1011001";
+        let parsed = BitSet::from_bit_string(bitstr).unwrap();
+        assert_eq!(parsed.len(), 7);
+        assert_eq!(parsed.count_ones(), 4);
+        assert_eq!(parsed.to_bit_string(), bitstr);
+
+        let err = BitSet::from_bit_string("10120");
+        assert!(matches!(
+            err,
+            Err(BitSetError::InvalidCharacter { pos: 3, ch: '2' })
+        ));
+
+        // Bytes roundtrip
+        let bytes = parsed.to_bytes();
+        let from_b = BitSet::from_bytes(&bytes, parsed.len()).unwrap();
+        assert_eq!(from_b, parsed);
+
+        let err_bytes = BitSet::from_bytes(&[0xFF], 16);
+        assert!(matches!(
+            err_bytes,
+            Err(BitSetError::InsufficientBytes {
+                required: 2,
+                provided: 1
+            })
+        ));
+
+        // Repeat, clear, and fill
+        let mut rep = BitSet::repeat(true, 10);
+        assert_eq!(rep.len(), 10);
+        assert!(rep.all());
+        assert_eq!(rep.count_ones(), 10);
+
+        rep.clear();
+        assert_eq!(rep.count_ones(), 0);
+        assert!(rep.none());
+        assert_eq!(rep.len(), 10);
+
+        rep.fill(true);
+        assert!(rep.all());
+
+        rep.truncate(5);
+        assert_eq!(rep.len(), 5);
+        assert_eq!(rep.count_ones(), 5);
+
+        rep.resize(8, false);
+        assert_eq!(rep.len(), 8);
+        assert_eq!(rep.count_ones(), 5);
+        assert_eq!(rep.to_bit_string(), "11111000");
+
+        // Set operations: union, intersect, difference, symmetric difference
+        let mut a = BitSet::new();
+        a.insert(1);
+        a.insert(2);
+        a.insert(3);
+
+        let mut b = BitSet::new();
+        b.insert(2);
+        b.insert(3);
+        b.insert(4);
+
+        let union_set = &a | &b;
+        assert_eq!(union_set.ones().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+
+        let inter_set = &a & &b;
+        assert_eq!(inter_set.ones().collect::<Vec<_>>(), vec![2, 3]);
+
+        let diff_set = &a - &b;
+        assert_eq!(diff_set.ones().collect::<Vec<_>>(), vec![1]);
+
+        let sym_diff = &a ^ &b;
+        assert_eq!(sym_diff.ones().collect::<Vec<_>>(), vec![1, 4]);
+
+        // Disjoint, subset, superset
+        let disjoint_set = BitSet::from_iter(vec![10, 20]);
+        assert!(a.is_disjoint(&disjoint_set));
+
+        assert!(inter_set.is_subset(&a));
+        assert!(a.is_superset(&inter_set));
+
+        // Display formatting
+        let disp = format!("{inter_set}");
+        assert_eq!(disp, "BitSet(2/4 bits: [2, 3])");
     }
 }
