@@ -3912,3 +3912,102 @@ impl<K: Ord + Clone> Extend<Interval<K>> for IntervalSet<K> {
         }
     }
 }
+
+/// A deterministic Fenwick Tree (Binary Indexed Tree) for prefix sums and point updates.
+///
+/// Operates on 0-based indices for ease of use in algorithms, while maintaining
+/// standard internal 1-based indexing for efficient bit manipulation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FenwickTree<T> {
+    tree: Vec<T>,
+    size: usize,
+}
+
+impl<T: Default + Copy + std::ops::AddAssign + std::ops::Sub<Output = T>> FenwickTree<T> {
+    /// Construct a Fenwick tree of specified length with all values initialized to zero/default.
+    pub fn new(size: usize) -> Self {
+        Self {
+            tree: vec![T::default(); size + 1],
+            size,
+        }
+    }
+
+    /// Construct a Fenwick tree from a slice of initial values in O(N) time.
+    pub fn from_slice(values: &[T]) -> Self {
+        let size = values.len();
+        let mut tree = vec![T::default(); size + 1];
+        for (i, &val) in values.iter().enumerate() {
+            tree[i + 1] = val;
+        }
+        for i in 1..=size {
+            let parent = i + (i & (!i + 1));
+            if parent <= size {
+                let current_val = tree[i];
+                tree[parent] += current_val;
+            }
+        }
+        Self { tree, size }
+    }
+
+    /// Return the number of elements in the tree.
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Return `true` if the tree has length 0.
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// Add `delta` to the value at index `idx` (0-based).
+    ///
+    /// Returns `false` if `idx >= self.len()`.
+    pub fn add(&mut self, idx: usize, delta: T) -> bool {
+        if idx >= self.size {
+            return false;
+        }
+        let mut i = idx + 1;
+        while i <= self.size {
+            self.tree[i] += delta;
+            i += i & (!i + 1);
+        }
+        true
+    }
+
+    /// Query the prefix sum `sum(0..=idx)` inclusive.
+    ///
+    /// Returns `None` if `idx >= self.len()`.
+    pub fn prefix_sum(&self, idx: usize) -> Option<T> {
+        if idx >= self.size {
+            return None;
+        }
+        let mut sum = T::default();
+        let mut i = idx + 1;
+        while i > 0 {
+            sum += self.tree[i];
+            i -= i & (!i + 1);
+        }
+        Some(sum)
+    }
+
+    /// Query the range sum `sum(start..=end)` inclusive.
+    ///
+    /// Returns `None` if `start > end` or `end >= self.len()`.
+    pub fn range_sum(&self, start: usize, end: usize) -> Option<T> {
+        if start > end || end >= self.size {
+            return None;
+        }
+        let end_sum = self.prefix_sum(end)?;
+        if start == 0 {
+            Some(end_sum)
+        } else {
+            let before_sum = self.prefix_sum(start - 1)?;
+            Some(end_sum - before_sum)
+        }
+    }
+
+    /// Reset all values in the tree to zero.
+    pub fn clear(&mut self) {
+        self.tree.fill(T::default());
+    }
+}

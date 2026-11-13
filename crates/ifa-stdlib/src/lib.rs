@@ -16,8 +16,8 @@ pub mod sys;
 
 pub use collections::{
     BinaryHeap, BitSet, BitSetError, BitSetIter, ByteBuffer, CycleError, Deque, DiGraph,
-    DirectedGraph, DisjointSet, Eviction, Interval, IntervalError, IntervalMap, IntervalMapIter,
-    IntervalSet, List, LruCache, Map, Set, StringBuilder, Trie, TrieSet,
+    DirectedGraph, DisjointSet, Eviction, FenwickTree, Interval, IntervalError, IntervalMap,
+    IntervalMapIter, IntervalSet, List, LruCache, Map, Set, StringBuilder, Trie, TrieSet,
 };
 pub use crypto::{
     base64_decode, base64_encode, base64url_decode, base64url_encode, blake3, blake3_hex,
@@ -2062,5 +2062,56 @@ mod tests {
 
         set2.clear();
         assert!(set2.is_empty());
+    }
+
+    #[test]
+    fn test_fenwick_tree_operations() {
+        // Empty tree
+        let empty: FenwickTree<i64> = FenwickTree::new(0);
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.prefix_sum(0), None);
+        assert_eq!(empty.range_sum(0, 0), None);
+
+        // Incremental add
+        let mut ft = FenwickTree::new(5);
+        assert_eq!(ft.len(), 5);
+        assert!(!ft.is_empty());
+
+        assert!(ft.add(0, 3));
+        assert!(ft.add(1, 2));
+        assert!(ft.add(2, -1));
+        assert!(ft.add(3, 6));
+        assert!(ft.add(4, 5));
+        assert!(!ft.add(5, 10)); // Out of bounds
+
+        assert_eq!(ft.prefix_sum(0), Some(3));
+        assert_eq!(ft.prefix_sum(1), Some(5));
+        assert_eq!(ft.prefix_sum(2), Some(4));
+        assert_eq!(ft.prefix_sum(3), Some(10));
+        assert_eq!(ft.prefix_sum(4), Some(15));
+        assert_eq!(ft.prefix_sum(5), None);
+
+        // Range sums
+        assert_eq!(ft.range_sum(0, 0), Some(3));
+        assert_eq!(ft.range_sum(0, 4), Some(15));
+        assert_eq!(ft.range_sum(1, 3), Some(7)); // 2 + (-1) + 6 = 7
+        assert_eq!(ft.range_sum(2, 4), Some(10)); // -1 + 6 + 5 = 10
+        assert_eq!(ft.range_sum(3, 2), None); // start > end
+        assert_eq!(ft.range_sum(0, 5), None); // out of bounds
+
+        // Construction from slice
+        let vals = [10, 20, 30, 40, 50];
+        let mut ft_slice = FenwickTree::from_slice(&vals);
+        assert_eq!(ft_slice.prefix_sum(4), Some(150));
+        assert_eq!(ft_slice.range_sum(1, 3), Some(90));
+
+        // Update existing index
+        ft_slice.add(2, -15); // index 2 becomes 30 - 15 = 15
+        assert_eq!(ft_slice.range_sum(1, 3), Some(75));
+
+        // Clear
+        ft_slice.clear();
+        assert_eq!(ft_slice.prefix_sum(4), Some(0));
     }
 }
