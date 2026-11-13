@@ -2984,6 +2984,7 @@ impl Crc32Hasher {
 ///
 /// # Examples
 /// ```rust
+/// use std::io::Write;
 /// use ifa_stdlib::io::{Crc32Writer, crc32_digest};
 /// let mut buf = Vec::new();
 /// let mut w = Crc32Writer::new(&mut buf);
