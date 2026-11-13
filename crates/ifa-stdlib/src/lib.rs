@@ -64,19 +64,20 @@ pub use http::{
     PooledConnection, RouteSegment, SameSite, SessionStore, SseEvent, UpstreamBackend,
 };
 pub use io::{
-    base64_reader, base64_writer, chain, chunk_reader, chunk_writer, chunks, copy_stream,
-    crc32_digest, delimited_reader, delimited_writer, empty, framed_reader, framed_writer,
-    hex_reader, hex_writer, limited, limited_writer, multi_reader, multi_writer, pad_writer,
-    pipe_lines, prefix_writer, prefixed, pushback_reader, read_to_end as io_read_to_end,
+    adler32_digest, adler32_reader, adler32_writer, base64_reader, base64_writer, chain,
+    chunk_reader, chunk_writer, chunks, copy_stream, crc32_digest, crc32_reader, crc32_writer,
+    delimited_reader, delimited_writer, empty, framed_reader, framed_writer, hex_reader,
+    hex_writer, limited, limited_writer, multi_reader, multi_writer, pad_writer, pipe_lines,
+    prefix_writer, prefixed, pushback_reader, read_to_end as io_read_to_end,
     read_to_string as io_read_to_string, repeat, sink, skip_reader, suffix_writer, suffixed,
-    Base64Reader, Base64Writer, BufferedReader, BufferedWriter, ChainedReader, ChunkIter,
-    ChunkReader, ChunkWriter, CountingReader, CountingWriter, Crc32Hasher, Crc32Reader,
-    Crc32Writer, DelimitedIter, DelimitedReader, DelimitedWriter, EmptyReader, FramedIter,
-    FramedReader, FramedWriter, HexReader, HexWriter, LengthFieldKind, LimitedReader,
-    LimitedWriter, LineWriter, MemoryStream, MultiReader, MultiWriter, PadWriter, PrefixWriter,
-    PrefixedReader, PushbackReader, RepeatReader, SinkWriter, SkipReader, SuffixWriter,
-    SuffixedReader, TeeReader, TeeWriter, DEFAULT_MAX_DELIMITED_RECORD_SIZE,
-    DEFAULT_MAX_FRAME_SIZE,
+    Adler32Hasher, Adler32Reader, Adler32Writer, Base64Reader, Base64Writer, BufferedReader,
+    BufferedWriter, ChainedReader, ChunkIter, ChunkReader, ChunkWriter, CountingReader,
+    CountingWriter, Crc32Hasher, Crc32Reader, Crc32Writer, DelimitedIter, DelimitedReader,
+    DelimitedWriter, EmptyReader, FramedIter, FramedReader, FramedWriter, HexReader, HexWriter,
+    LengthFieldKind, LimitedReader, LimitedWriter, LineWriter, MemoryStream, MultiReader,
+    MultiWriter, PadWriter, PrefixWriter, PrefixedReader, PushbackReader, RepeatReader, SinkWriter,
+    SkipReader, SuffixWriter, SuffixedReader, TeeReader, TeeWriter,
+    DEFAULT_MAX_DELIMITED_RECORD_SIZE, DEFAULT_MAX_FRAME_SIZE,
 };
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};
 pub use json::{

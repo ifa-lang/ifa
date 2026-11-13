@@ -3130,6 +3130,269 @@ impl<R: Read> Read for Crc32Reader<R> {
     }
 }
 
+/// Convenience constructor — equivalent to [`Crc32Writer::new`].
+pub fn crc32_writer<W: Write>(writer: W) -> Crc32Writer<W> {
+    Crc32Writer::new(writer)
+}
+
+/// Convenience constructor — equivalent to [`Crc32Reader::new`].
+pub fn crc32_reader<R: Read>(reader: R) -> Crc32Reader<R> {
+    Crc32Reader::new(reader)
+}
+
+// ---------------------------------------------------------------------------
+// Adler-32 Checksum Primitives & Streaming Adapters
+// ---------------------------------------------------------------------------
+
+const ADLER32_BASE: u32 = 65521;
+const ADLER32_NMAX: usize = 5552;
+
+/// Update running Adler-32 state (s1, s2) with additional bytes.
+#[inline]
+fn adler32_update(mut s1: u32, mut s2: u32, bytes: &[u8]) -> (u32, u32) {
+    for chunk in bytes.chunks(ADLER32_NMAX) {
+        for &b in chunk {
+            s1 += b as u32;
+            s2 += s1;
+        }
+        s1 %= ADLER32_BASE;
+        s2 %= ADLER32_BASE;
+    }
+    (s1, s2)
+}
+
+/// Compute the Adler-32 checksum (RFC 1950) of a byte slice.
+///
+/// # Examples
+/// ```rust
+/// use ifa_stdlib::io::adler32_digest;
+/// assert_eq!(adler32_digest(b"Wikipedia"), 300286872);
+/// assert_eq!(adler32_digest(b""), 1);
+/// ```
+pub fn adler32_digest(data: &[u8]) -> u32 {
+    let (s1, s2) = adler32_update(1, 0, data);
+    (s2 << 16) | s1
+}
+
+/// Incremental Adler-32 hasher.
+///
+/// Processes data chunk by chunk and returns the final checksum via [`Adler32Hasher::finalize`].
+///
+/// # Examples
+/// ```rust
+/// use ifa_stdlib::io::Adler32Hasher;
+/// let mut h = Adler32Hasher::new();
+/// h.update(b"Wiki");
+/// h.update(b"pedia");
+/// let adler = h.finalize();
+/// use ifa_stdlib::io::adler32_digest;
+/// assert_eq!(adler, adler32_digest(b"Wikipedia"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct Adler32Hasher {
+    s1: u32,
+    s2: u32,
+}
+
+impl Default for Adler32Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Adler32Hasher {
+    /// Create a new hasher with the standard Adler-32 initial values (`s1 = 1`, `s2 = 0`).
+    pub fn new() -> Self {
+        Self { s1: 1, s2: 0 }
+    }
+
+    /// Process additional bytes.
+    pub fn update(&mut self, data: &[u8]) {
+        let (s1, s2) = adler32_update(self.s1, self.s2, data);
+        self.s1 = s1;
+        self.s2 = s2;
+    }
+
+    /// Finalise and return the Adler-32 checksum.
+    ///
+    /// **Note**: calling `finalize` does not reset the hasher. Create a new
+    /// [`Adler32Hasher`] or call [`Adler32Hasher::reset`] for independent messages.
+    pub fn finalize(&self) -> u32 {
+        (self.s2 << 16) | self.s1
+    }
+
+    /// Reset the hasher to its initial state.
+    pub fn reset(&mut self) {
+        self.s1 = 1;
+        self.s2 = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adler32Writer
+// ---------------------------------------------------------------------------
+
+/// A [`Write`] adapter that computes the Adler-32 checksum of everything written
+/// through it, forwarding all bytes to the wrapped writer unchanged.
+///
+/// # Examples
+/// ```rust
+/// use std::io::Write;
+/// use ifa_stdlib::io::{Adler32Writer, adler32_digest};
+/// let mut buf = Vec::new();
+/// let mut w = Adler32Writer::new(&mut buf);
+/// w.write_all(b"Wiki").unwrap();
+/// w.write_all(b"pedia").unwrap();
+/// let adler = w.checksum();
+/// assert_eq!(adler, adler32_digest(b"Wikipedia"));
+/// assert_eq!(buf, b"Wikipedia");
+/// ```
+pub struct Adler32Writer<W: Write> {
+    inner: W,
+    hasher: Adler32Hasher,
+    bytes_written: usize,
+}
+
+impl<W: Write> Adler32Writer<W> {
+    /// Wrap `writer` and start accumulating an Adler-32 checksum.
+    pub fn new(writer: W) -> Self {
+        Self {
+            inner: writer,
+            hasher: Adler32Hasher::new(),
+            bytes_written: 0,
+        }
+    }
+
+    /// Return the current Adler-32 checksum over all bytes written so far.
+    pub fn checksum(&self) -> u32 {
+        self.hasher.finalize()
+    }
+
+    /// Return the total number of bytes written through this adapter.
+    pub fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+
+    /// Obtain a reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Obtain a mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap this adapter, returning `(inner_writer, final_checksum, bytes_written)`.
+    pub fn into_parts(self) -> (W, u32, usize) {
+        let adler = self.hasher.finalize();
+        (self.inner, adler, self.bytes_written)
+    }
+
+    /// Unwrap this adapter, returning the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for Adler32Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.bytes_written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adler32Reader
+// ---------------------------------------------------------------------------
+
+/// A [`Read`] adapter that computes the Adler-32 checksum of everything read
+/// from the wrapped reader, forwarding the data unchanged to the caller.
+///
+/// # Examples
+/// ```rust
+/// use std::io::Read;
+/// use ifa_stdlib::io::{Adler32Reader, adler32_digest};
+/// let data = b"Wikipedia";
+/// let mut r = Adler32Reader::new(data.as_ref());
+/// let mut out = Vec::new();
+/// r.read_to_end(&mut out).unwrap();
+/// assert_eq!(r.checksum(), adler32_digest(b"Wikipedia"));
+/// assert_eq!(out, b"Wikipedia");
+/// ```
+pub struct Adler32Reader<R: Read> {
+    inner: R,
+    hasher: Adler32Hasher,
+    bytes_read: usize,
+}
+
+impl<R: Read> Adler32Reader<R> {
+    /// Wrap `reader` and start accumulating an Adler-32 checksum.
+    pub fn new(reader: R) -> Self {
+        Self {
+            inner: reader,
+            hasher: Adler32Hasher::new(),
+            bytes_read: 0,
+        }
+    }
+
+    /// Return the current Adler-32 checksum over all bytes read so far.
+    pub fn checksum(&self) -> u32 {
+        self.hasher.finalize()
+    }
+
+    /// Return the total number of bytes read through this adapter.
+    pub fn bytes_read(&self) -> usize {
+        self.bytes_read
+    }
+
+    /// Obtain a reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Obtain a mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap this adapter, returning `(inner_reader, final_checksum, bytes_read)`.
+    pub fn into_parts(self) -> (R, u32, usize) {
+        let adler = self.hasher.finalize();
+        (self.inner, adler, self.bytes_read)
+    }
+
+    /// Unwrap this adapter, returning the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for Adler32Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.bytes_read += n;
+        Ok(n)
+    }
+}
+
+/// Convenience constructor — equivalent to [`Adler32Writer::new`].
+pub fn adler32_writer<W: Write>(writer: W) -> Adler32Writer<W> {
+    Adler32Writer::new(writer)
+}
+
+/// Convenience constructor — equivalent to [`Adler32Reader::new`].
+pub fn adler32_reader<R: Read>(reader: R) -> Adler32Reader<R> {
+    Adler32Reader::new(reader)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4466,6 +4729,193 @@ mod tests {
 
         assert_eq!(write_crc, read_crc);
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn test_adler32_known_vectors() {
+        assert_eq!(adler32_digest(b"Wikipedia"), 300286872);
+        assert_eq!(adler32_digest(b"123456789"), 152961502);
+        assert_eq!(adler32_digest(b""), 1);
+        assert_eq!(adler32_digest(b"a"), 6422626);
+    }
+
+    #[test]
+    fn test_adler32_large_buffer() {
+        let data = vec![b'A'; 10_000];
+        assert_eq!(adler32_digest(&data), 2277632920);
+    }
+
+    #[test]
+    fn test_adler32_hasher_incremental_matches_one_shot() {
+        let mut h = Adler32Hasher::new();
+        let data = b"The quick brown fox jumps over the lazy dog";
+        for chunk in data.chunks(7) {
+            h.update(chunk);
+        }
+        assert_eq!(h.finalize(), adler32_digest(data));
+    }
+
+    #[test]
+    fn test_adler32_hasher_reset() {
+        let mut h = Adler32Hasher::new();
+        h.update(b"Wikipedia");
+        assert_eq!(h.finalize(), 300286872);
+        h.reset();
+        assert_eq!(h.finalize(), 1);
+        h.update(b"123456789");
+        assert_eq!(h.finalize(), 152961502);
+    }
+
+    #[test]
+    fn test_adler32_hasher_clone() {
+        let mut h = Adler32Hasher::new();
+        h.update(b"Wiki");
+        let mut h2 = h.clone();
+        h.update(b"pedia");
+        h2.update(b"pedia");
+        assert_eq!(h.finalize(), h2.finalize());
+    }
+
+    #[test]
+    fn test_adler32_writer_basic() {
+        let mut buf = Vec::new();
+        let mut w = Adler32Writer::new(&mut buf);
+        w.write_all(b"Wikipedia").unwrap();
+        w.flush().unwrap();
+        assert_eq!(w.bytes_written(), 9);
+        assert_eq!(w.checksum(), 300286872);
+        assert_eq!(buf, b"Wikipedia");
+    }
+
+    #[test]
+    fn test_adler32_writer_incremental() {
+        let mut buf = Vec::new();
+        let mut w = Adler32Writer::new(&mut buf);
+        w.write_all(b"1234").unwrap();
+        w.write_all(b"56789").unwrap();
+        assert_eq!(w.bytes_written(), 9);
+        assert_eq!(w.checksum(), adler32_digest(b"123456789"));
+        assert_eq!(buf, b"123456789");
+    }
+
+    #[test]
+    fn test_adler32_writer_into_parts() {
+        let mut buf = Vec::new();
+        let mut w = Adler32Writer::new(&mut buf);
+        w.write_all(b"abc").unwrap();
+        let (_inner, adler, count) = w.into_parts();
+        assert_eq!(count, 3);
+        assert_eq!(adler, adler32_digest(b"abc"));
+    }
+
+    #[test]
+    fn test_adler32_writer_get_ref_mut() {
+        let mut buf = Vec::new();
+        let mut w = Adler32Writer::new(&mut buf);
+        w.write_all(b"hi").unwrap();
+        assert_eq!(w.get_ref().len(), 2);
+        w.get_mut().clear();
+        assert_eq!(w.get_ref().len(), 0);
+        let _ = w.into_inner();
+    }
+
+    #[test]
+    fn test_adler32_reader_basic() {
+        let data = b"Wikipedia";
+        let mut r = Adler32Reader::new(data.as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(r.bytes_read(), 9);
+        assert_eq!(r.checksum(), 300286872);
+        assert_eq!(out, b"Wikipedia");
+    }
+
+    #[test]
+    fn test_adler32_reader_incremental() {
+        let data = b"123456789";
+        let mut r = Adler32Reader::new(data.as_ref());
+        let mut buf = [0u8; 3];
+        let n1 = r.read(&mut buf).unwrap();
+        let n2 = r.read(&mut buf).unwrap();
+        assert_eq!(n1, 3);
+        assert_eq!(n2, 3);
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        assert_eq!(r.checksum(), adler32_digest(b"123456789"));
+        assert_eq!(r.bytes_read(), 9);
+    }
+
+    #[test]
+    fn test_adler32_reader_empty() {
+        let empty: &[u8] = &[];
+        let mut r = Adler32Reader::new(empty);
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(r.bytes_read(), 0);
+        assert_eq!(r.checksum(), 1);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_adler32_reader_into_parts() {
+        let data = b"abc";
+        let mut r = Adler32Reader::new(data.as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        let (_inner, adler, count) = r.into_parts();
+        assert_eq!(count, 3);
+        assert_eq!(adler, adler32_digest(b"abc"));
+    }
+
+    #[test]
+    fn test_adler32_reader_get_ref_mut() {
+        let data = b"hello";
+        let mut r = Adler32Reader::new(data.as_ref());
+        let mut buf = [0u8; 5];
+        r.read_exact(&mut buf).unwrap();
+        let _ = r.get_ref();
+        let _ = r.get_mut();
+        let _ = r.into_inner();
+    }
+
+    #[test]
+    fn test_adler32_writer_reader_roundtrip() {
+        let payload = b"The quick brown fox jumps over the lazy dog";
+        let mut buf = Vec::new();
+        let mut w = Adler32Writer::new(&mut buf);
+        w.write_all(payload).unwrap();
+        let write_adler = w.checksum();
+
+        let mut r = Adler32Reader::new(buf.as_slice());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        let read_adler = r.checksum();
+
+        assert_eq!(write_adler, read_adler);
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn test_checksum_shorthands() {
+        let mut buf = Vec::new();
+        let mut cw = crc32_writer(&mut buf);
+        cw.write_all(b"123456789").unwrap();
+        assert_eq!(cw.checksum(), 0xCBF4_3926);
+
+        let mut cr = crc32_reader(buf.as_slice());
+        let mut out = Vec::new();
+        cr.read_to_end(&mut out).unwrap();
+        assert_eq!(cr.checksum(), 0xCBF4_3926);
+
+        let mut abuf = Vec::new();
+        let mut aw = adler32_writer(&mut abuf);
+        aw.write_all(b"Wikipedia").unwrap();
+        assert_eq!(aw.checksum(), 300286872);
+
+        let mut ar = adler32_reader(abuf.as_slice());
+        let mut aout = Vec::new();
+        ar.read_to_end(&mut aout).unwrap();
+        assert_eq!(ar.checksum(), 300286872);
     }
 }
 
