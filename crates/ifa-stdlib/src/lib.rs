@@ -20,7 +20,7 @@ pub use crypto::{
     constant_time_eq, hmac_sha1, hmac_sha1_hex, hmac_sha256, hmac_sha256_hex, hotp,
     pbkdf2_hmac_sha256, pbkdf2_hmac_sha256_hex, sha1, sha1_hex, sha256, sha256_hex, totp,
     totp_verify, websocket_accept_key, HmacSha1, HmacSha256, Jwt, JwtClaims, JwtError, Sha1,
-    Sha256,
+    Sha1Reader, Sha1Writer, Sha256, Sha256Reader, Sha256Writer,
 };
 pub use csv::{
     decode as decode_csv, decode_with_options as decode_csv_with_options, encode as encode_csv,
@@ -233,6 +233,32 @@ mod tests {
         hmac1.update(b"streaming ");
         hmac1.update(b"data");
         assert_eq!(hmac1.finalize(), hmac_sha1(key, b"streaming data"));
+
+        // Streaming Hash Writer and Reader adapters
+        use std::io::{Read, Write};
+        let payload = b"Cryptographic streaming pipeline test payload.";
+
+        let mut sink256 = Vec::new();
+        let mut w256 = Sha256Writer::new(&mut sink256);
+        w256.write_all(payload).unwrap();
+        assert_eq!(w256.digest_hex(), sha256_hex(payload));
+        assert_eq!(sink256.as_slice(), payload);
+
+        let mut r256 = Sha256Reader::new(payload.as_slice());
+        let mut drain256 = Vec::new();
+        r256.read_to_end(&mut drain256).unwrap();
+        assert_eq!(r256.digest_hex(), sha256_hex(payload));
+
+        let mut sink1 = Vec::new();
+        let mut w1 = Sha1Writer::new(&mut sink1);
+        w1.write_all(payload).unwrap();
+        assert_eq!(w1.digest_hex(), sha1_hex(payload));
+        assert_eq!(sink1.as_slice(), payload);
+
+        let mut r1 = Sha1Reader::new(payload.as_slice());
+        let mut drain1 = Vec::new();
+        r1.read_to_end(&mut drain1).unwrap();
+        assert_eq!(r1.digest_hex(), sha1_hex(payload));
     }
 
     #[test]

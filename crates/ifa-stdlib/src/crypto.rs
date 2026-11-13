@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::{self, Read, Write};
 
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -198,6 +199,186 @@ pub fn sha256_hex(data: &[u8]) -> String {
     to_hex(&digest)
 }
 
+// ---------------------------------------------------------------------------
+// Sha256Writer & Sha256Reader
+// ---------------------------------------------------------------------------
+
+/// A [`Write`] adapter that computes the SHA-256 digest of everything written
+/// to the wrapped writer, forwarding the data unchanged downstream.
+///
+/// # Examples
+/// ```rust
+/// use std::io::Write;
+/// use ifa_stdlib::crypto::{Sha256Writer, sha256_hex};
+///
+/// let mut sink = Vec::new();
+/// {
+///     let mut writer = Sha256Writer::new(&mut sink);
+///     writer.write_all(b"Hello, IFA!").unwrap();
+///     assert_eq!(writer.digest_hex(), sha256_hex(b"Hello, IFA!"));
+///     assert_eq!(writer.bytes_written(), 11);
+/// }
+/// assert_eq!(sink, b"Hello, IFA!");
+/// ```
+#[derive(Clone, Debug)]
+pub struct Sha256Writer<W: Write> {
+    inner: W,
+    hasher: Sha256,
+    bytes_written: usize,
+}
+
+impl<W: Write> Sha256Writer<W> {
+    /// Wrap `writer` and start accumulating a SHA-256 digest.
+    pub fn new(writer: W) -> Self {
+        Self {
+            inner: writer,
+            hasher: Sha256::new(),
+            bytes_written: 0,
+        }
+    }
+
+    /// Return the current SHA-256 digest over all bytes written so far.
+    pub fn digest(&self) -> [u8; 32] {
+        self.hasher.clone().finalize()
+    }
+
+    /// Return the current SHA-256 digest formatted as a lowercase hexadecimal string.
+    pub fn digest_hex(&self) -> String {
+        self.hasher.clone().finalize_hex()
+    }
+
+    /// Return the total number of bytes written through this adapter.
+    pub fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+
+    /// Obtain a reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Obtain a mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap this adapter, returning `(inner_writer, final_digest, bytes_written)`.
+    pub fn into_parts(self) -> (W, [u8; 32], usize) {
+        let digest = self.hasher.finalize();
+        (self.inner, digest, self.bytes_written)
+    }
+
+    /// Unwrap this adapter, returning `(inner_writer, hex_digest, bytes_written)`.
+    pub fn into_parts_hex(self) -> (W, String, usize) {
+        let (inner, digest, bytes) = self.into_parts();
+        (inner, to_hex(&digest), bytes)
+    }
+
+    /// Unwrap this adapter, returning the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for Sha256Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.bytes_written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A [`Read`] adapter that computes the SHA-256 digest of everything read
+/// from the wrapped reader, forwarding the data unchanged to the caller.
+///
+/// # Examples
+/// ```rust
+/// use std::io::Read;
+/// use ifa_stdlib::crypto::{Sha256Reader, sha256_hex};
+///
+/// let data = b"Hello, IFA streaming!";
+/// let mut reader = Sha256Reader::new(data.as_ref());
+/// let mut out = Vec::new();
+/// reader.read_to_end(&mut out).unwrap();
+///
+/// assert_eq!(reader.digest_hex(), sha256_hex(b"Hello, IFA streaming!"));
+/// assert_eq!(reader.bytes_read(), data.len());
+/// assert_eq!(out, data);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Sha256Reader<R: Read> {
+    inner: R,
+    hasher: Sha256,
+    bytes_read: usize,
+}
+
+impl<R: Read> Sha256Reader<R> {
+    /// Wrap `reader` and start accumulating a SHA-256 digest.
+    pub fn new(reader: R) -> Self {
+        Self {
+            inner: reader,
+            hasher: Sha256::new(),
+            bytes_read: 0,
+        }
+    }
+
+    /// Return the current SHA-256 digest over all bytes read so far.
+    pub fn digest(&self) -> [u8; 32] {
+        self.hasher.clone().finalize()
+    }
+
+    /// Return the current SHA-256 digest formatted as a lowercase hexadecimal string.
+    pub fn digest_hex(&self) -> String {
+        self.hasher.clone().finalize_hex()
+    }
+
+    /// Return the total number of bytes read through this adapter.
+    pub fn bytes_read(&self) -> usize {
+        self.bytes_read
+    }
+
+    /// Obtain a reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Obtain a mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap this adapter, returning `(inner_reader, final_digest, bytes_read)`.
+    pub fn into_parts(self) -> (R, [u8; 32], usize) {
+        let digest = self.hasher.finalize();
+        (self.inner, digest, self.bytes_read)
+    }
+
+    /// Unwrap this adapter, returning `(inner_reader, hex_digest, bytes_read)`.
+    pub fn into_parts_hex(self) -> (R, String, usize) {
+        let (inner, digest, bytes) = self.into_parts();
+        (inner, to_hex(&digest), bytes)
+    }
+
+    /// Unwrap this adapter, returning the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for Sha256Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.bytes_read += n;
+        Ok(n)
+    }
+}
+
 const SHA1_INITIAL_H: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
 
 #[inline]
@@ -366,6 +547,186 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
 pub fn sha1_hex(data: &[u8]) -> String {
     let digest = sha1(data);
     to_hex(&digest)
+}
+
+// ---------------------------------------------------------------------------
+// Sha1Writer & Sha1Reader
+// ---------------------------------------------------------------------------
+
+/// A [`Write`] adapter that computes the SHA-1 digest of everything written
+/// to the wrapped writer, forwarding the data unchanged downstream.
+///
+/// # Examples
+/// ```rust
+/// use std::io::Write;
+/// use ifa_stdlib::crypto::{Sha1Writer, sha1_hex};
+///
+/// let mut sink = Vec::new();
+/// {
+///     let mut writer = Sha1Writer::new(&mut sink);
+///     writer.write_all(b"Hello, IFA SHA-1!").unwrap();
+///     assert_eq!(writer.digest_hex(), sha1_hex(b"Hello, IFA SHA-1!"));
+///     assert_eq!(writer.bytes_written(), 17);
+/// }
+/// assert_eq!(sink, b"Hello, IFA SHA-1!");
+/// ```
+#[derive(Clone, Debug)]
+pub struct Sha1Writer<W: Write> {
+    inner: W,
+    hasher: Sha1,
+    bytes_written: usize,
+}
+
+impl<W: Write> Sha1Writer<W> {
+    /// Wrap `writer` and start accumulating a SHA-1 digest.
+    pub fn new(writer: W) -> Self {
+        Self {
+            inner: writer,
+            hasher: Sha1::new(),
+            bytes_written: 0,
+        }
+    }
+
+    /// Return the current SHA-1 digest over all bytes written so far.
+    pub fn digest(&self) -> [u8; 20] {
+        self.hasher.clone().finalize()
+    }
+
+    /// Return the current SHA-1 digest formatted as a lowercase hexadecimal string.
+    pub fn digest_hex(&self) -> String {
+        self.hasher.clone().finalize_hex()
+    }
+
+    /// Return the total number of bytes written through this adapter.
+    pub fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+
+    /// Obtain a reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Obtain a mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap this adapter, returning `(inner_writer, final_digest, bytes_written)`.
+    pub fn into_parts(self) -> (W, [u8; 20], usize) {
+        let digest = self.hasher.finalize();
+        (self.inner, digest, self.bytes_written)
+    }
+
+    /// Unwrap this adapter, returning `(inner_writer, hex_digest, bytes_written)`.
+    pub fn into_parts_hex(self) -> (W, String, usize) {
+        let (inner, digest, bytes) = self.into_parts();
+        (inner, to_hex(&digest), bytes)
+    }
+
+    /// Unwrap this adapter, returning the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for Sha1Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.bytes_written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A [`Read`] adapter that computes the SHA-1 digest of everything read
+/// from the wrapped reader, forwarding the data unchanged to the caller.
+///
+/// # Examples
+/// ```rust
+/// use std::io::Read;
+/// use ifa_stdlib::crypto::{Sha1Reader, sha1_hex};
+///
+/// let data = b"Hello, IFA SHA-1 streaming!";
+/// let mut reader = Sha1Reader::new(data.as_ref());
+/// let mut out = Vec::new();
+/// reader.read_to_end(&mut out).unwrap();
+///
+/// assert_eq!(reader.digest_hex(), sha1_hex(b"Hello, IFA SHA-1 streaming!"));
+/// assert_eq!(reader.bytes_read(), data.len());
+/// assert_eq!(out, data);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Sha1Reader<R: Read> {
+    inner: R,
+    hasher: Sha1,
+    bytes_read: usize,
+}
+
+impl<R: Read> Sha1Reader<R> {
+    /// Wrap `reader` and start accumulating a SHA-1 digest.
+    pub fn new(reader: R) -> Self {
+        Self {
+            inner: reader,
+            hasher: Sha1::new(),
+            bytes_read: 0,
+        }
+    }
+
+    /// Return the current SHA-1 digest over all bytes read so far.
+    pub fn digest(&self) -> [u8; 20] {
+        self.hasher.clone().finalize()
+    }
+
+    /// Return the current SHA-1 digest formatted as a lowercase hexadecimal string.
+    pub fn digest_hex(&self) -> String {
+        self.hasher.clone().finalize_hex()
+    }
+
+    /// Return the total number of bytes read through this adapter.
+    pub fn bytes_read(&self) -> usize {
+        self.bytes_read
+    }
+
+    /// Obtain a reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Obtain a mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap this adapter, returning `(inner_reader, final_digest, bytes_read)`.
+    pub fn into_parts(self) -> (R, [u8; 20], usize) {
+        let digest = self.hasher.finalize();
+        (self.inner, digest, self.bytes_read)
+    }
+
+    /// Unwrap this adapter, returning `(inner_reader, hex_digest, bytes_read)`.
+    pub fn into_parts_hex(self) -> (R, String, usize) {
+        let (inner, digest, bytes) = self.into_parts();
+        (inner, to_hex(&digest), bytes)
+    }
+
+    /// Unwrap this adapter, returning the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for Sha1Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.bytes_read += n;
+        Ok(n)
+    }
 }
 
 const BASE64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1316,5 +1677,173 @@ mod tests {
         let _ = hmac1_reuse.finalize_reset();
         hmac1_reuse.update(message);
         assert_eq!(hmac1_reuse.finalize(), hmac_sha1(key, message));
+    }
+
+    #[test]
+    fn test_sha256_streaming_writer_and_reader() {
+        use std::io::{Read, Write};
+
+        let message = b"Deterministic IFA cryptographic streaming hash verification.";
+        let expected_digest = sha256(message);
+        let expected_hex = sha256_hex(message);
+
+        // Test Sha256Writer
+        let mut sink = Vec::new();
+        let mut writer = Sha256Writer::new(&mut sink);
+        assert_eq!(writer.bytes_written(), 0);
+        assert_eq!(writer.get_ref().len(), 0);
+        writer.get_mut().reserve(64);
+
+        for chunk in message.chunks(7) {
+            let n = writer.write(chunk).unwrap();
+            assert_eq!(n, chunk.len());
+        }
+        writer.flush().unwrap();
+
+        assert_eq!(writer.bytes_written(), message.len());
+        assert_eq!(writer.digest(), expected_digest);
+        assert_eq!(writer.digest_hex(), expected_hex);
+        assert_eq!(sink.as_slice(), message);
+
+        // Test into_parts & into_parts_hex & into_inner
+        let sink2 = Vec::new();
+        let mut writer2 = Sha256Writer::new(sink2);
+        writer2.write_all(message).unwrap();
+        let (out_sink, out_digest, bytes) = writer2.into_parts();
+        assert_eq!(out_sink.as_slice(), message);
+        assert_eq!(out_digest, expected_digest);
+        assert_eq!(bytes, message.len());
+
+        let sink3 = Vec::new();
+        let mut writer3 = Sha256Writer::new(sink3);
+        writer3.write_all(message).unwrap();
+        let (_out_sink3, hex, _) = writer3.into_parts_hex();
+        assert_eq!(hex, expected_hex);
+
+        let writer4 = Sha256Writer::new(Vec::new());
+        let _inner = writer4.into_inner();
+
+        // Test Sha256Reader
+        let mut reader = Sha256Reader::new(message.as_slice());
+        assert_eq!(reader.bytes_read(), 0);
+        assert_eq!(reader.get_ref().len(), message.len());
+        let _ = reader.get_mut();
+
+        let mut read_buf = Vec::new();
+        let mut temp = [0u8; 9];
+        loop {
+            let n = reader.read(&mut temp).unwrap();
+            if n == 0 {
+                break;
+            }
+            read_buf.extend_from_slice(&temp[..n]);
+        }
+
+        assert_eq!(read_buf.as_slice(), message);
+        assert_eq!(reader.bytes_read(), message.len());
+        assert_eq!(reader.digest(), expected_digest);
+        assert_eq!(reader.digest_hex(), expected_hex);
+
+        // Test reader into_parts & into_parts_hex & into_inner
+        let reader2 = Sha256Reader::new(message.as_slice());
+        let mut drain = Vec::new();
+        let mut reader2 = reader2;
+        reader2.read_to_end(&mut drain).unwrap();
+        let (inner_r, dig, n_read) = reader2.into_parts();
+        assert_eq!(inner_r.len(), 0);
+        assert_eq!(dig, expected_digest);
+        assert_eq!(n_read, message.len());
+
+        let mut reader3 = Sha256Reader::new(message.as_slice());
+        reader3.read_to_end(&mut drain).unwrap();
+        let (_, hex_r, _) = reader3.into_parts_hex();
+        assert_eq!(hex_r, expected_hex);
+
+        let reader4 = Sha256Reader::new(message.as_slice());
+        let _ = reader4.into_inner();
+    }
+
+    #[test]
+    fn test_sha1_streaming_writer_and_reader() {
+        use std::io::{Read, Write};
+
+        let message = b"The quick brown fox jumps over the lazy dog";
+        let expected_digest = sha1(message);
+        let expected_hex = sha1_hex(message);
+
+        // Test Sha1Writer
+        let mut sink = Vec::new();
+        let mut writer = Sha1Writer::new(&mut sink);
+        assert_eq!(writer.bytes_written(), 0);
+        assert_eq!(writer.get_ref().len(), 0);
+        writer.get_mut().reserve(32);
+
+        for chunk in message.chunks(5) {
+            let n = writer.write(chunk).unwrap();
+            assert_eq!(n, chunk.len());
+        }
+        writer.flush().unwrap();
+
+        assert_eq!(writer.bytes_written(), message.len());
+        assert_eq!(writer.digest(), expected_digest);
+        assert_eq!(writer.digest_hex(), expected_hex);
+        assert_eq!(sink.as_slice(), message);
+
+        // Test into_parts & into_parts_hex & into_inner
+        let sink2 = Vec::new();
+        let mut writer2 = Sha1Writer::new(sink2);
+        writer2.write_all(message).unwrap();
+        let (out_sink, out_digest, bytes) = writer2.into_parts();
+        assert_eq!(out_sink.as_slice(), message);
+        assert_eq!(out_digest, expected_digest);
+        assert_eq!(bytes, message.len());
+
+        let sink3 = Vec::new();
+        let mut writer3 = Sha1Writer::new(sink3);
+        writer3.write_all(message).unwrap();
+        let (_out_sink3, hex, _) = writer3.into_parts_hex();
+        assert_eq!(hex, expected_hex);
+
+        let writer4 = Sha1Writer::new(Vec::new());
+        let _inner = writer4.into_inner();
+
+        // Test Sha1Reader
+        let mut reader = Sha1Reader::new(message.as_slice());
+        assert_eq!(reader.bytes_read(), 0);
+        assert_eq!(reader.get_ref().len(), message.len());
+        let _ = reader.get_mut();
+
+        let mut read_buf = Vec::new();
+        let mut temp = [0u8; 8];
+        loop {
+            let n = reader.read(&mut temp).unwrap();
+            if n == 0 {
+                break;
+            }
+            read_buf.extend_from_slice(&temp[..n]);
+        }
+
+        assert_eq!(read_buf.as_slice(), message);
+        assert_eq!(reader.bytes_read(), message.len());
+        assert_eq!(reader.digest(), expected_digest);
+        assert_eq!(reader.digest_hex(), expected_hex);
+
+        // Test reader into_parts & into_parts_hex & into_inner
+        let reader2 = Sha1Reader::new(message.as_slice());
+        let mut drain = Vec::new();
+        let mut reader2 = reader2;
+        reader2.read_to_end(&mut drain).unwrap();
+        let (inner_r, dig, n_read) = reader2.into_parts();
+        assert_eq!(inner_r.len(), 0);
+        assert_eq!(dig, expected_digest);
+        assert_eq!(n_read, message.len());
+
+        let mut reader3 = Sha1Reader::new(message.as_slice());
+        reader3.read_to_end(&mut drain).unwrap();
+        let (_, hex_r, _) = reader3.into_parts_hex();
+        assert_eq!(hex_r, expected_hex);
+
+        let reader4 = Sha1Reader::new(message.as_slice());
+        let _ = reader4.into_inner();
     }
 }
