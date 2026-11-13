@@ -17,9 +17,11 @@ pub mod sys;
 pub use collections::{BinaryHeap, ByteBuffer, Deque, List, Map, Set, StringBuilder};
 pub use crypto::{
     base64_decode, base64_encode, base64url_decode, base64url_encode, blake3, blake3_hex,
-    constant_time_eq, hmac_sha1, hmac_sha1_hex, hmac_sha256, hmac_sha256_hex, hotp,
-    pbkdf2_hmac_sha256, pbkdf2_hmac_sha256_hex, sha1, sha1_hex, sha256, sha256_hex, totp,
-    totp_verify, websocket_accept_key, HmacSha1, HmacSha256, Jwt, JwtClaims, JwtError, Sha1,
+    constant_time_eq, constant_time_eq_hex, hex_decode, hex_encode, hmac_sha1, hmac_sha1_hex,
+    hmac_sha1_verify, hmac_sha1_verify_hex, hmac_sha256, hmac_sha256_hex, hmac_sha256_verify,
+    hmac_sha256_verify_hex, hotp, pbkdf2_hmac_sha256, pbkdf2_hmac_sha256_hex, sha1, sha1_hex,
+    sha256, sha256_hex, totp, totp_verify, websocket_accept_key, HmacSha1, HmacSha1Reader,
+    HmacSha1Writer, HmacSha256, HmacSha256Reader, HmacSha256Writer, Jwt, JwtClaims, JwtError, Sha1,
     Sha1Reader, Sha1Writer, Sha256, Sha256Reader, Sha256Writer,
 };
 pub use csv::{
@@ -259,6 +261,41 @@ mod tests {
         let mut drain1 = Vec::new();
         r1.read_to_end(&mut drain1).unwrap();
         assert_eq!(r1.digest_hex(), sha1_hex(payload));
+
+        // Hex codecs and constant-time verification
+        let hex_val = hex_encode(b"ifa");
+        assert_eq!(hex_val, "696661");
+        assert_eq!(hex_decode(&hex_val).unwrap(), b"ifa");
+        assert!(constant_time_eq_hex(b"ifa", "696661"));
+        assert!(constant_time_eq_hex(b"ifa", "696661"));
+        assert!(!constant_time_eq_hex(b"ifa", "696662"));
+
+        // Streaming HMAC Writer and Reader adapters
+        let mut hmac_sink256 = Vec::new();
+        let mut hw256 = HmacSha256Writer::new(&mut hmac_sink256, key);
+        hw256.write_all(payload).unwrap();
+        assert_eq!(hw256.mac_hex(), hmac_sha256_hex(key, payload));
+        assert!(hw256.verify_hex(&hmac_sha256_hex(key, payload)));
+        assert_eq!(hmac_sink256.as_slice(), payload);
+
+        let mut hr256 = HmacSha256Reader::new(payload.as_slice(), key);
+        let mut hdrain256 = Vec::new();
+        hr256.read_to_end(&mut hdrain256).unwrap();
+        assert_eq!(hr256.mac_hex(), hmac_sha256_hex(key, payload));
+        assert!(hr256.verify(&hmac_sha256(key, payload)));
+
+        let mut hmac_sink1 = Vec::new();
+        let mut hw1 = HmacSha1Writer::new(&mut hmac_sink1, key);
+        hw1.write_all(payload).unwrap();
+        assert_eq!(hw1.mac_hex(), hmac_sha1_hex(key, payload));
+        assert!(hw1.verify_hex(&hmac_sha1_hex(key, payload)));
+        assert_eq!(hmac_sink1.as_slice(), payload);
+
+        let mut hr1 = HmacSha1Reader::new(payload.as_slice(), key);
+        let mut hdrain1 = Vec::new();
+        hr1.read_to_end(&mut hdrain1).unwrap();
+        assert_eq!(hr1.mac_hex(), hmac_sha1_hex(key, payload));
+        assert!(hr1.verify(&hmac_sha1(key, payload)));
     }
 
     #[test]

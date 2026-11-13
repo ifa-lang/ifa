@@ -832,6 +832,47 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Encode a byte slice into a lowercase hexadecimal string.
+pub fn hex_encode(data: &[u8]) -> String {
+    to_hex(data)
+}
+
+/// Decode a hexadecimal string into raw bytes.
+pub fn hex_decode(input: &str) -> Result<Vec<u8>, String> {
+    let s = input.trim();
+    if !s.len().is_multiple_of(2) {
+        return Err("Hex string must have an even length".to_string());
+    }
+    let mut bytes = Vec::with_capacity(s.len() / 2);
+    let slice = s.as_bytes();
+    for i in (0..slice.len()).step_by(2) {
+        let hi = hex_val(slice[i])
+            .ok_or_else(|| format!("Invalid hex character '{}'", slice[i] as char))?;
+        let lo = hex_val(slice[i + 1])
+            .ok_or_else(|| format!("Invalid hex character '{}'", slice[i + 1] as char))?;
+        bytes.push((hi << 4) | lo);
+    }
+    Ok(bytes)
+}
+
+#[inline]
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Compare a byte slice with an expected hexadecimal string in constant time.
+pub fn constant_time_eq_hex(actual: &[u8], expected_hex: &str) -> bool {
+    match hex_decode(expected_hex) {
+        Ok(expected) => constant_time_eq(actual, &expected),
+        Err(_) => false,
+    }
+}
+
 /// Encode bytes to URL-safe Base64 without padding according to RFC 4648 / RFC 7515 (JWS).
 pub fn base64url_encode(data: &[u8]) -> String {
     let b64 = base64_encode(data);
@@ -944,6 +985,18 @@ impl HmacSha256 {
     pub fn finalize_hex(self) -> String {
         to_hex(&self.finalize())
     }
+
+    /// Verify whether the accumulated HMAC matches an expected MAC tag in constant time.
+    pub fn verify(&self, expected_tag: &[u8]) -> bool {
+        let mac = self.clone().finalize();
+        constant_time_eq(&mac, expected_tag)
+    }
+
+    /// Verify whether the accumulated HMAC matches an expected lowercase or uppercase hex tag in constant time.
+    pub fn verify_hex(&self, expected_hex: &str) -> bool {
+        let mac = self.clone().finalize();
+        constant_time_eq_hex(&mac, expected_hex)
+    }
 }
 
 impl std::io::Write for HmacSha256 {
@@ -968,6 +1021,215 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     let digest = hmac_sha256(key, message);
     to_hex(&digest)
+}
+
+/// Verify an HMAC-SHA-256 message authentication code in constant time (RFC 2104).
+pub fn hmac_sha256_verify(key: &[u8], message: &[u8], expected_tag: &[u8]) -> bool {
+    let mac = hmac_sha256(key, message);
+    constant_time_eq(&mac, expected_tag)
+}
+
+/// Verify an HMAC-SHA-256 hex string in constant time (RFC 2104).
+pub fn hmac_sha256_verify_hex(key: &[u8], message: &[u8], expected_hex: &str) -> bool {
+    let mac = hmac_sha256(key, message);
+    constant_time_eq_hex(&mac, expected_hex)
+}
+
+/// A [`Write`] adapter that computes the HMAC-SHA-256 tag of everything written
+/// while forwarding the bytes to the underlying writer.
+///
+/// # Examples
+/// ```rust
+/// use std::io::Write;
+/// use ifa_stdlib::crypto::{HmacSha256Writer, hmac_sha256_hex};
+///
+/// let key = b"secret-key";
+/// let mut sink = Vec::new();
+/// let mut writer = HmacSha256Writer::new(&mut sink, key);
+/// writer.write_all(b"hello world").unwrap();
+///
+/// assert_eq!(writer.mac_hex(), hmac_sha256_hex(key, b"hello world"));
+/// assert!(writer.verify_hex(&hmac_sha256_hex(key, b"hello world")));
+/// ```
+#[derive(Clone, Debug)]
+pub struct HmacSha256Writer<W: Write> {
+    inner: W,
+    hmac: HmacSha256,
+    bytes_written: usize,
+}
+
+impl<W: Write> HmacSha256Writer<W> {
+    /// Wrap `writer` and initialize an HMAC-SHA-256 authenticator with `key`.
+    pub fn new(writer: W, key: &[u8]) -> Self {
+        Self {
+            inner: writer,
+            hmac: HmacSha256::new(key),
+            bytes_written: 0,
+        }
+    }
+
+    /// Return the current HMAC-SHA-256 tag over all bytes written so far.
+    pub fn mac(&self) -> [u8; 32] {
+        self.hmac.clone().finalize()
+    }
+
+    /// Return the current HMAC-SHA-256 tag formatted as a lowercase hexadecimal string.
+    pub fn mac_hex(&self) -> String {
+        self.hmac.clone().finalize_hex()
+    }
+
+    /// Verify whether the accumulated HMAC-SHA-256 matches an expected tag in constant time.
+    pub fn verify(&self, expected_tag: &[u8]) -> bool {
+        self.hmac.verify(expected_tag)
+    }
+
+    /// Verify whether the accumulated HMAC-SHA-256 matches an expected hex string in constant time.
+    pub fn verify_hex(&self, expected_hex: &str) -> bool {
+        self.hmac.verify_hex(expected_hex)
+    }
+
+    /// Return the total number of bytes written through this adapter.
+    pub fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+
+    /// Obtain a reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Obtain a mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap this adapter, returning `(inner_writer, final_mac, bytes_written)`.
+    pub fn into_parts(self) -> (W, [u8; 32], usize) {
+        let mac = self.hmac.finalize();
+        (self.inner, mac, self.bytes_written)
+    }
+
+    /// Unwrap this adapter, returning `(inner_writer, hex_mac, bytes_written)`.
+    pub fn into_parts_hex(self) -> (W, String, usize) {
+        let (inner, mac, bytes) = self.into_parts();
+        (inner, to_hex(&mac), bytes)
+    }
+
+    /// Unwrap this adapter, returning the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for HmacSha256Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hmac.update(&buf[..n]);
+        self.bytes_written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A [`Read`] adapter that computes the HMAC-SHA-256 tag of everything read
+/// from the wrapped reader, forwarding data unchanged to the caller.
+///
+/// # Examples
+/// ```rust
+/// use std::io::Read;
+/// use ifa_stdlib::crypto::{HmacSha256Reader, hmac_sha256_hex};
+///
+/// let key = b"secret-key";
+/// let message = b"authenticated streaming payload";
+/// let mut reader = HmacSha256Reader::new(message.as_slice(), key);
+/// let mut buf = Vec::new();
+/// reader.read_to_end(&mut buf).unwrap();
+///
+/// assert_eq!(buf, message);
+/// assert!(reader.verify_hex(&hmac_sha256_hex(key, message)));
+/// ```
+#[derive(Clone, Debug)]
+pub struct HmacSha256Reader<R: Read> {
+    inner: R,
+    hmac: HmacSha256,
+    bytes_read: usize,
+}
+
+impl<R: Read> HmacSha256Reader<R> {
+    /// Wrap `reader` and initialize an HMAC-SHA-256 authenticator with `key`.
+    pub fn new(reader: R, key: &[u8]) -> Self {
+        Self {
+            inner: reader,
+            hmac: HmacSha256::new(key),
+            bytes_read: 0,
+        }
+    }
+
+    /// Return the current HMAC-SHA-256 tag over all bytes read so far.
+    pub fn mac(&self) -> [u8; 32] {
+        self.hmac.clone().finalize()
+    }
+
+    /// Return the current HMAC-SHA-256 tag formatted as a lowercase hexadecimal string.
+    pub fn mac_hex(&self) -> String {
+        self.hmac.clone().finalize_hex()
+    }
+
+    /// Verify whether the accumulated HMAC-SHA-256 matches an expected tag in constant time.
+    pub fn verify(&self, expected_tag: &[u8]) -> bool {
+        self.hmac.verify(expected_tag)
+    }
+
+    /// Verify whether the accumulated HMAC-SHA-256 matches an expected hex string in constant time.
+    pub fn verify_hex(&self, expected_hex: &str) -> bool {
+        self.hmac.verify_hex(expected_hex)
+    }
+
+    /// Return the total number of bytes read through this adapter.
+    pub fn bytes_read(&self) -> usize {
+        self.bytes_read
+    }
+
+    /// Obtain a reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Obtain a mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap this adapter, returning `(inner_reader, final_mac, bytes_read)`.
+    pub fn into_parts(self) -> (R, [u8; 32], usize) {
+        let mac = self.hmac.finalize();
+        (self.inner, mac, self.bytes_read)
+    }
+
+    /// Unwrap this adapter, returning `(inner_reader, hex_mac, bytes_read)`.
+    pub fn into_parts_hex(self) -> (R, String, usize) {
+        let (inner, mac, bytes) = self.into_parts();
+        (inner, to_hex(&mac), bytes)
+    }
+
+    /// Unwrap this adapter, returning the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for HmacSha256Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.hmac.update(&buf[..n]);
+            self.bytes_read += n;
+        }
+        Ok(n)
+    }
 }
 
 /// Incremental HMAC-SHA-1 authenticator (RFC 2104).
@@ -1041,6 +1303,18 @@ impl HmacSha1 {
     pub fn finalize_hex(self) -> String {
         to_hex(&self.finalize())
     }
+
+    /// Verify whether the accumulated HMAC matches an expected MAC tag in constant time.
+    pub fn verify(&self, expected_tag: &[u8]) -> bool {
+        let mac = self.clone().finalize();
+        constant_time_eq(&mac, expected_tag)
+    }
+
+    /// Verify whether the accumulated HMAC matches an expected lowercase or uppercase hex tag in constant time.
+    pub fn verify_hex(&self, expected_hex: &str) -> bool {
+        let mac = self.clone().finalize();
+        constant_time_eq_hex(&mac, expected_hex)
+    }
 }
 
 impl std::io::Write for HmacSha1 {
@@ -1065,6 +1339,215 @@ pub fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
 pub fn hmac_sha1_hex(key: &[u8], message: &[u8]) -> String {
     let digest = hmac_sha1(key, message);
     to_hex(&digest)
+}
+
+/// Verify an HMAC-SHA-1 message authentication code in constant time (RFC 2104).
+pub fn hmac_sha1_verify(key: &[u8], message: &[u8], expected_tag: &[u8]) -> bool {
+    let mac = hmac_sha1(key, message);
+    constant_time_eq(&mac, expected_tag)
+}
+
+/// Verify an HMAC-SHA-1 hex string in constant time (RFC 2104).
+pub fn hmac_sha1_verify_hex(key: &[u8], message: &[u8], expected_hex: &str) -> bool {
+    let mac = hmac_sha1(key, message);
+    constant_time_eq_hex(&mac, expected_hex)
+}
+
+/// A [`Write`] adapter that computes the HMAC-SHA-1 tag of everything written
+/// while forwarding the bytes to the underlying writer.
+///
+/// # Examples
+/// ```rust
+/// use std::io::Write;
+/// use ifa_stdlib::crypto::{HmacSha1Writer, hmac_sha1_hex};
+///
+/// let key = b"secret-key";
+/// let mut sink = Vec::new();
+/// let mut writer = HmacSha1Writer::new(&mut sink, key);
+/// writer.write_all(b"hello world").unwrap();
+///
+/// assert_eq!(writer.mac_hex(), hmac_sha1_hex(key, b"hello world"));
+/// assert!(writer.verify_hex(&hmac_sha1_hex(key, b"hello world")));
+/// ```
+#[derive(Clone, Debug)]
+pub struct HmacSha1Writer<W: Write> {
+    inner: W,
+    hmac: HmacSha1,
+    bytes_written: usize,
+}
+
+impl<W: Write> HmacSha1Writer<W> {
+    /// Wrap `writer` and initialize an HMAC-SHA-1 authenticator with `key`.
+    pub fn new(writer: W, key: &[u8]) -> Self {
+        Self {
+            inner: writer,
+            hmac: HmacSha1::new(key),
+            bytes_written: 0,
+        }
+    }
+
+    /// Return the current HMAC-SHA-1 tag over all bytes written so far.
+    pub fn mac(&self) -> [u8; 20] {
+        self.hmac.clone().finalize()
+    }
+
+    /// Return the current HMAC-SHA-1 tag formatted as a lowercase hexadecimal string.
+    pub fn mac_hex(&self) -> String {
+        self.hmac.clone().finalize_hex()
+    }
+
+    /// Verify whether the accumulated HMAC-SHA-1 matches an expected tag in constant time.
+    pub fn verify(&self, expected_tag: &[u8]) -> bool {
+        self.hmac.verify(expected_tag)
+    }
+
+    /// Verify whether the accumulated HMAC-SHA-1 matches an expected hex string in constant time.
+    pub fn verify_hex(&self, expected_hex: &str) -> bool {
+        self.hmac.verify_hex(expected_hex)
+    }
+
+    /// Return the total number of bytes written through this adapter.
+    pub fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+
+    /// Obtain a reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Obtain a mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap this adapter, returning `(inner_writer, final_mac, bytes_written)`.
+    pub fn into_parts(self) -> (W, [u8; 20], usize) {
+        let mac = self.hmac.finalize();
+        (self.inner, mac, self.bytes_written)
+    }
+
+    /// Unwrap this adapter, returning `(inner_writer, hex_mac, bytes_written)`.
+    pub fn into_parts_hex(self) -> (W, String, usize) {
+        let (inner, mac, bytes) = self.into_parts();
+        (inner, to_hex(&mac), bytes)
+    }
+
+    /// Unwrap this adapter, returning the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for HmacSha1Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hmac.update(&buf[..n]);
+        self.bytes_written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A [`Read`] adapter that computes the HMAC-SHA-1 tag of everything read
+/// from the wrapped reader, forwarding data unchanged to the caller.
+///
+/// # Examples
+/// ```rust
+/// use std::io::Read;
+/// use ifa_stdlib::crypto::{HmacSha1Reader, hmac_sha1_hex};
+///
+/// let key = b"secret-key";
+/// let message = b"authenticated streaming payload";
+/// let mut reader = HmacSha1Reader::new(message.as_slice(), key);
+/// let mut buf = Vec::new();
+/// reader.read_to_end(&mut buf).unwrap();
+///
+/// assert_eq!(buf, message);
+/// assert!(reader.verify_hex(&hmac_sha1_hex(key, message)));
+/// ```
+#[derive(Clone, Debug)]
+pub struct HmacSha1Reader<R: Read> {
+    inner: R,
+    hmac: HmacSha1,
+    bytes_read: usize,
+}
+
+impl<R: Read> HmacSha1Reader<R> {
+    /// Wrap `reader` and initialize an HMAC-SHA-1 authenticator with `key`.
+    pub fn new(reader: R, key: &[u8]) -> Self {
+        Self {
+            inner: reader,
+            hmac: HmacSha1::new(key),
+            bytes_read: 0,
+        }
+    }
+
+    /// Return the current HMAC-SHA-1 tag over all bytes read so far.
+    pub fn mac(&self) -> [u8; 20] {
+        self.hmac.clone().finalize()
+    }
+
+    /// Return the current HMAC-SHA-1 tag formatted as a lowercase hexadecimal string.
+    pub fn mac_hex(&self) -> String {
+        self.hmac.clone().finalize_hex()
+    }
+
+    /// Verify whether the accumulated HMAC-SHA-1 matches an expected tag in constant time.
+    pub fn verify(&self, expected_tag: &[u8]) -> bool {
+        self.hmac.verify(expected_tag)
+    }
+
+    /// Verify whether the accumulated HMAC-SHA-1 matches an expected hex string in constant time.
+    pub fn verify_hex(&self, expected_hex: &str) -> bool {
+        self.hmac.verify_hex(expected_hex)
+    }
+
+    /// Return the total number of bytes read through this adapter.
+    pub fn bytes_read(&self) -> usize {
+        self.bytes_read
+    }
+
+    /// Obtain a reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Obtain a mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap this adapter, returning `(inner_reader, final_mac, bytes_read)`.
+    pub fn into_parts(self) -> (R, [u8; 20], usize) {
+        let mac = self.hmac.finalize();
+        (self.inner, mac, self.bytes_read)
+    }
+
+    /// Unwrap this adapter, returning `(inner_reader, hex_mac, bytes_read)`.
+    pub fn into_parts_hex(self) -> (R, String, usize) {
+        let (inner, mac, bytes) = self.into_parts();
+        (inner, to_hex(&mac), bytes)
+    }
+
+    /// Unwrap this adapter, returning the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for HmacSha1Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.hmac.update(&buf[..n]);
+            self.bytes_read += n;
+        }
+        Ok(n)
+    }
 }
 
 /// Generate HMAC-Based One-Time Password (HOTP) per RFC 4226.
@@ -1844,6 +2327,255 @@ mod tests {
         assert_eq!(hex_r, expected_hex);
 
         let reader4 = Sha1Reader::new(message.as_slice());
+        let _ = reader4.into_inner();
+    }
+
+    #[test]
+    fn test_hex_codecs_and_constant_time_eq_hex() {
+        let original = b"Hello, IFA Cryptography & Hex!";
+        let encoded = hex_encode(original);
+        assert_eq!(
+            encoded,
+            "48656c6c6f2c204946412043727970746f67726170687920262048657821"
+        );
+
+        let decoded = hex_decode(&encoded).unwrap();
+        assert_eq!(decoded.as_slice(), original);
+
+        // Uppercase decode
+        let upper_encoded = encoded.to_ascii_uppercase();
+        let decoded_upper = hex_decode(&upper_encoded).unwrap();
+        assert_eq!(decoded_upper.as_slice(), original);
+
+        // Constant time eq hex
+        assert!(constant_time_eq_hex(original, &encoded));
+        assert!(constant_time_eq_hex(original, &upper_encoded));
+        assert!(!constant_time_eq_hex(original, "1234"));
+        assert!(!constant_time_eq_hex(original, "invalid hex string!"));
+
+        // Invalid length
+        assert!(hex_decode("123").is_err());
+        // Invalid chars
+        assert!(hex_decode("zz").is_err());
+    }
+
+    #[test]
+    fn test_hmac_sha256_verification_and_streaming() {
+        use std::io::{Read, Write};
+
+        let key = b"super-secret-key-for-hmac";
+        let message = b"The quick brown fox jumps over the lazy dog";
+        let expected_mac = hmac_sha256(key, message);
+        let expected_hex = hmac_sha256_hex(key, message);
+
+        // Verification helpers
+        assert!(hmac_sha256_verify(key, message, &expected_mac));
+        assert!(hmac_sha256_verify_hex(key, message, &expected_hex));
+        assert!(hmac_sha256_verify_hex(
+            key,
+            message,
+            &expected_hex.to_ascii_uppercase()
+        ));
+        assert!(!hmac_sha256_verify(key, message, &[0u8; 32]));
+        assert!(!hmac_sha256_verify_hex(
+            key,
+            message,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+
+        // HmacSha256 instance verify
+        let mut hmac = HmacSha256::new(key);
+        hmac.update(message);
+        assert!(hmac.verify(&expected_mac));
+        assert!(hmac.verify_hex(&expected_hex));
+
+        // HmacSha256Writer
+        let mut sink = Vec::new();
+        let mut writer = HmacSha256Writer::new(&mut sink, key);
+        assert_eq!(writer.bytes_written(), 0);
+        assert_eq!(writer.get_ref().len(), 0);
+        writer.get_mut().reserve(16);
+
+        for chunk in message.chunks(7) {
+            let n = writer.write(chunk).unwrap();
+            assert_eq!(n, chunk.len());
+        }
+        writer.flush().unwrap();
+
+        assert_eq!(writer.bytes_written(), message.len());
+        assert_eq!(writer.mac(), expected_mac);
+        assert_eq!(writer.mac_hex(), expected_hex);
+        assert!(writer.verify(&expected_mac));
+        assert!(writer.verify_hex(&expected_hex));
+        assert_eq!(sink.as_slice(), message);
+
+        // into_parts & into_parts_hex & into_inner
+        let sink2 = Vec::new();
+        let mut writer2 = HmacSha256Writer::new(sink2, key);
+        writer2.write_all(message).unwrap();
+        let (out_sink, out_mac, n_written) = writer2.into_parts();
+        assert_eq!(out_sink.as_slice(), message);
+        assert_eq!(out_mac, expected_mac);
+        assert_eq!(n_written, message.len());
+
+        let sink3 = Vec::new();
+        let mut writer3 = HmacSha256Writer::new(sink3, key);
+        writer3.write_all(message).unwrap();
+        let (_, hex_out, _) = writer3.into_parts_hex();
+        assert_eq!(hex_out, expected_hex);
+
+        let writer4 = HmacSha256Writer::new(Vec::new(), key);
+        let _ = writer4.into_inner();
+
+        // HmacSha256Reader
+        let mut reader = HmacSha256Reader::new(message.as_slice(), key);
+        assert_eq!(reader.bytes_read(), 0);
+        assert_eq!(reader.get_ref().len(), message.len());
+        let _ = reader.get_mut();
+
+        let mut read_buf = Vec::new();
+        let mut temp = [0u8; 9];
+        loop {
+            let n = reader.read(&mut temp).unwrap();
+            if n == 0 {
+                break;
+            }
+            read_buf.extend_from_slice(&temp[..n]);
+        }
+
+        assert_eq!(read_buf.as_slice(), message);
+        assert_eq!(reader.bytes_read(), message.len());
+        assert_eq!(reader.mac(), expected_mac);
+        assert_eq!(reader.mac_hex(), expected_hex);
+        assert!(reader.verify(&expected_mac));
+        assert!(reader.verify_hex(&expected_hex));
+
+        // reader into_parts & into_parts_hex & into_inner
+        let reader2 = HmacSha256Reader::new(message.as_slice(), key);
+        let mut drain = Vec::new();
+        let mut reader2 = reader2;
+        reader2.read_to_end(&mut drain).unwrap();
+        let (inner_r, mac_r, n_read) = reader2.into_parts();
+        assert_eq!(inner_r.len(), 0);
+        assert_eq!(mac_r, expected_mac);
+        assert_eq!(n_read, message.len());
+
+        let mut reader3 = HmacSha256Reader::new(message.as_slice(), key);
+        reader3.read_to_end(&mut drain).unwrap();
+        let (_, hex_r, _) = reader3.into_parts_hex();
+        assert_eq!(hex_r, expected_hex);
+
+        let reader4 = HmacSha256Reader::new(message.as_slice(), key);
+        let _ = reader4.into_inner();
+    }
+
+    #[test]
+    fn test_hmac_sha1_verification_and_streaming() {
+        use std::io::{Read, Write};
+
+        let key = b"super-secret-key-for-hmac-sha1";
+        let message = b"The quick brown fox jumps over the lazy dog";
+        let expected_mac = hmac_sha1(key, message);
+        let expected_hex = hmac_sha1_hex(key, message);
+
+        // Verification helpers
+        assert!(hmac_sha1_verify(key, message, &expected_mac));
+        assert!(hmac_sha1_verify_hex(key, message, &expected_hex));
+        assert!(hmac_sha1_verify_hex(
+            key,
+            message,
+            &expected_hex.to_ascii_uppercase()
+        ));
+        assert!(!hmac_sha1_verify(key, message, &[0u8; 20]));
+        assert!(!hmac_sha1_verify_hex(
+            key,
+            message,
+            "0000000000000000000000000000000000000000"
+        ));
+
+        // HmacSha1 instance verify
+        let mut hmac = HmacSha1::new(key);
+        hmac.update(message);
+        assert!(hmac.verify(&expected_mac));
+        assert!(hmac.verify_hex(&expected_hex));
+
+        // HmacSha1Writer
+        let mut sink = Vec::new();
+        let mut writer = HmacSha1Writer::new(&mut sink, key);
+        assert_eq!(writer.bytes_written(), 0);
+        assert_eq!(writer.get_ref().len(), 0);
+        writer.get_mut().reserve(16);
+
+        for chunk in message.chunks(7) {
+            let n = writer.write(chunk).unwrap();
+            assert_eq!(n, chunk.len());
+        }
+        writer.flush().unwrap();
+
+        assert_eq!(writer.bytes_written(), message.len());
+        assert_eq!(writer.mac(), expected_mac);
+        assert_eq!(writer.mac_hex(), expected_hex);
+        assert!(writer.verify(&expected_mac));
+        assert!(writer.verify_hex(&expected_hex));
+        assert_eq!(sink.as_slice(), message);
+
+        // into_parts & into_parts_hex & into_inner
+        let sink2 = Vec::new();
+        let mut writer2 = HmacSha1Writer::new(sink2, key);
+        writer2.write_all(message).unwrap();
+        let (out_sink, out_mac, n_written) = writer2.into_parts();
+        assert_eq!(out_sink.as_slice(), message);
+        assert_eq!(out_mac, expected_mac);
+        assert_eq!(n_written, message.len());
+
+        let sink3 = Vec::new();
+        let mut writer3 = HmacSha1Writer::new(sink3, key);
+        writer3.write_all(message).unwrap();
+        let (_, hex_out, _) = writer3.into_parts_hex();
+        assert_eq!(hex_out, expected_hex);
+
+        let writer4 = HmacSha1Writer::new(Vec::new(), key);
+        let _ = writer4.into_inner();
+
+        // HmacSha1Reader
+        let mut reader = HmacSha1Reader::new(message.as_slice(), key);
+        assert_eq!(reader.bytes_read(), 0);
+        assert_eq!(reader.get_ref().len(), message.len());
+        let _ = reader.get_mut();
+
+        let mut read_buf = Vec::new();
+        let mut temp = [0u8; 8];
+        loop {
+            let n = reader.read(&mut temp).unwrap();
+            if n == 0 {
+                break;
+            }
+            read_buf.extend_from_slice(&temp[..n]);
+        }
+
+        assert_eq!(read_buf.as_slice(), message);
+        assert_eq!(reader.bytes_read(), message.len());
+        assert_eq!(reader.mac(), expected_mac);
+        assert_eq!(reader.mac_hex(), expected_hex);
+        assert!(reader.verify(&expected_mac));
+        assert!(reader.verify_hex(&expected_hex));
+
+        // reader into_parts & into_parts_hex & into_inner
+        let reader2 = HmacSha1Reader::new(message.as_slice(), key);
+        let mut drain = Vec::new();
+        let mut reader2 = reader2;
+        reader2.read_to_end(&mut drain).unwrap();
+        let (inner_r, mac_r, n_read) = reader2.into_parts();
+        assert_eq!(inner_r.len(), 0);
+        assert_eq!(mac_r, expected_mac);
+        assert_eq!(n_read, message.len());
+
+        let mut reader3 = HmacSha1Reader::new(message.as_slice(), key);
+        reader3.read_to_end(&mut drain).unwrap();
+        let (_, hex_r, _) = reader3.into_parts_hex();
+        assert_eq!(hex_r, expected_hex);
+
+        let reader4 = HmacSha1Reader::new(message.as_slice(), key);
         let _ = reader4.into_inner();
     }
 }
