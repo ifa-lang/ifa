@@ -463,7 +463,8 @@ impl HttpRequest {
     /// Set HTTP Bearer token Authentication header (RFC 6750).
     /// Format: `Authorization: Bearer <token>`
     pub fn with_bearer_auth(mut self, token: &str) -> Self {
-        self.headers.set("Authorization", format!("Bearer {}", token.trim()));
+        self.headers
+            .set("Authorization", format!("Bearer {}", token.trim()));
         self
     }
 
@@ -2257,7 +2258,11 @@ impl Url {
 
     /// Retrieve the relative path and query string suitable for HTTP request lines (e.g., `/path?query`).
     pub fn request_target(&self) -> String {
-        let p = if self.path.is_empty() { "/" } else { &self.path };
+        let p = if self.path.is_empty() {
+            "/"
+        } else {
+            &self.path
+        };
         if let Some(ref q) = self.query {
             format!("{}?{}", p, q)
         } else {
@@ -2285,7 +2290,10 @@ impl Url {
         if !found {
             pairs.push((key.to_string(), value.to_string()));
         }
-        let ref_pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let ref_pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         self.query = Some(format_form_urlencoded(&ref_pairs));
     }
 
@@ -5997,9 +6005,15 @@ mod tests {
         let mut mod_url = Url::parse("https://example.com/api/data?foo=bar").unwrap();
         assert_eq!(mod_url.request_target(), "/api/data?foo=bar");
         mod_url.set_query_param("limit", "10");
-        assert_eq!(mod_url.query_map().get("limit").map(|s| s.as_str()), Some("10"));
+        assert_eq!(
+            mod_url.query_map().get("limit").map(|s| s.as_str()),
+            Some("10")
+        );
         let chained = mod_url.with_query_param("foo", "baz");
-        assert_eq!(chained.query_map().get("foo").map(|s| s.as_str()), Some("baz"));
+        assert_eq!(
+            chained.query_map().get("foo").map(|s| s.as_str()),
+            Some("baz")
+        );
     }
 
     #[test]
