@@ -4821,3 +4821,592 @@ mod hex_tests {
         assert_eq!(out, b"\xca\xfe");
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Base64 streaming adapters
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Standard Base64 alphabet (RFC 4648 §4).
+const B64_ENC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Encode raw bytes as Base64 on-the-fly, writing the encoded characters to
+/// the underlying [`Write`] sink.
+///
+/// Data is buffered in 3-byte groups; call [`flush`][Base64Writer::flush] (or
+/// drop the writer) to emit any trailing partial group with the required `=`
+/// padding.
+///
+/// # Example
+/// ```ignore
+/// let mut buf = Vec::new();
+/// let mut w = Base64Writer::new(&mut buf);
+/// w.write_all(b"Man").unwrap();
+/// w.flush().unwrap();
+/// assert_eq!(&buf, b"TWFu");
+/// ```
+pub struct Base64Writer<W: Write> {
+    inner: Option<W>,
+    /// Partial 3-byte group accumulated across [`write`] calls.
+    pending: [u8; 3],
+    pending_len: usize,
+}
+
+impl<W: Write> Base64Writer<W> {
+    /// Wrap `writer` in a Base64 encoder.
+    pub fn new(writer: W) -> Self {
+        Self {
+            inner: Some(writer),
+            pending: [0u8; 3],
+            pending_len: 0,
+        }
+    }
+
+    /// Return a reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        self.inner.as_ref().unwrap()
+    }
+
+    /// Return a mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        self.inner.as_mut().unwrap()
+    }
+
+    /// Flush any pending partial group with `=` padding and return the inner writer.
+    pub fn into_inner(mut self) -> io::Result<W> {
+        self.flush_pending()?;
+        Ok(self.inner.take().unwrap())
+    }
+
+    fn encode_chunk(b0: u8, b1: u8, b2: u8) -> [u8; 4] {
+        [
+            B64_ENC[(b0 >> 2) as usize],
+            B64_ENC[(((b0 & 3) << 4) | (b1 >> 4)) as usize],
+            B64_ENC[(((b1 & 15) << 2) | (b2 >> 6)) as usize],
+            B64_ENC[(b2 & 63) as usize],
+        ]
+    }
+
+    fn flush_pending(&mut self) -> io::Result<()> {
+        let inner = match self.inner.as_mut() {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        match self.pending_len {
+            0 => {}
+            1 => {
+                let b0 = self.pending[0];
+                let encoded = [
+                    B64_ENC[(b0 >> 2) as usize],
+                    B64_ENC[((b0 & 3) << 4) as usize],
+                    b'=',
+                    b'=',
+                ];
+                inner.write_all(&encoded)?;
+                self.pending_len = 0;
+            }
+            2 => {
+                let b0 = self.pending[0];
+                let b1 = self.pending[1];
+                let encoded = [
+                    B64_ENC[(b0 >> 2) as usize],
+                    B64_ENC[(((b0 & 3) << 4) | (b1 >> 4)) as usize],
+                    B64_ENC[((b1 & 15) << 2) as usize],
+                    b'=',
+                ];
+                inner.write_all(&encoded)?;
+                self.pending_len = 0;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for Base64Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut pos = 0usize;
+
+        // Fill the pending partial group first.
+        while self.pending_len < 3 && pos < buf.len() {
+            self.pending[self.pending_len] = buf[pos];
+            self.pending_len += 1;
+            pos += 1;
+        }
+
+        if self.pending_len == 3 {
+            let enc = Self::encode_chunk(self.pending[0], self.pending[1], self.pending[2]);
+            self.inner.as_mut().unwrap().write_all(&enc)?;
+            self.pending_len = 0;
+        }
+
+        // Process remaining complete 3-byte groups.
+        while pos + 3 <= buf.len() {
+            let enc = Self::encode_chunk(buf[pos], buf[pos + 1], buf[pos + 2]);
+            self.inner.as_mut().unwrap().write_all(&enc)?;
+            pos += 3;
+        }
+
+        // Store leftover bytes in pending.
+        while pos < buf.len() {
+            self.pending[self.pending_len] = buf[pos];
+            self.pending_len += 1;
+            pos += 1;
+        }
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_pending()?;
+        self.inner.as_mut().unwrap().flush()
+    }
+}
+
+impl<W: Write> Drop for Base64Writer<W> {
+    fn drop(&mut self) {
+        let _ = self.flush_pending();
+    }
+}
+
+/// Convenience constructor — equivalent to [`Base64Writer::new`].
+pub fn base64_writer<W: Write>(writer: W) -> Base64Writer<W> {
+    Base64Writer::new(writer)
+}
+
+// ── Decode table ─────────────────────────────────────────────────────────────
+
+/// 256-entry decode table: maps an ASCII byte to its 6-bit value, or `0xFF`
+/// for invalid / padding characters.
+const B64_DEC: [u8; 256] = {
+    let mut t = [0xFFu8; 256];
+    let mut i = 0u8;
+    // 'A'..='Z' → 0..25
+    while i < 26 {
+        t[(b'A' + i) as usize] = i;
+        i += 1;
+    }
+    i = 0;
+    // 'a'..='z' → 26..51
+    while i < 26 {
+        t[(b'a' + i) as usize] = 26 + i;
+        i += 1;
+    }
+    i = 0;
+    // '0'..='9' → 52..61
+    while i < 10 {
+        t[(b'0' + i) as usize] = 52 + i;
+        i += 1;
+    }
+    t[b'+' as usize] = 62;
+    t[b'/' as usize] = 63;
+    t
+};
+
+/// Decode Base64-encoded bytes from an underlying [`Read`] source, producing
+/// raw binary output on the fly.
+///
+/// Whitespace in the source is silently skipped (tolerant of line-wrapped
+/// encodings). `=` padding characters are consumed but do not produce output.
+///
+/// # Example
+/// ```ignore
+/// let mut r = Base64Reader::new(b"TWFu".as_ref());
+/// let mut out = Vec::new();
+/// r.read_to_end(&mut out).unwrap();
+/// assert_eq!(out, b"Man");
+/// ```
+pub struct Base64Reader<R: Read> {
+    inner: R,
+    /// Up to 3 decoded bytes ready for the next [`read`] call.
+    decoded_buf: [u8; 3],
+    decoded_start: usize,
+    decoded_end: usize,
+    /// Whether the underlying stream is exhausted.
+    eof: bool,
+}
+
+impl<R: Read> Base64Reader<R> {
+    /// Wrap `reader` in a Base64 decoder.
+    pub fn new(reader: R) -> Self {
+        Self {
+            inner: reader,
+            decoded_buf: [0u8; 3],
+            decoded_start: 0,
+            decoded_end: 0,
+            eof: false,
+        }
+    }
+
+    /// Return a reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Return a mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Consume the reader and return the inner source.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    /// Read the next 4 Base64 characters (skipping whitespace), decode them,
+    /// and store the result in `decoded_buf`.  Returns the number of decoded
+    /// bytes (0, 1, 2, or 3), or `None` on clean EOF.
+    fn fill_decoded(&mut self) -> io::Result<Option<usize>> {
+        if self.eof {
+            return Ok(None);
+        }
+
+        // Collect exactly 4 non-whitespace, non-null bytes.
+        let mut group = [0u8; 4];
+        let mut collected = 0usize;
+
+        loop {
+            let mut byte = [0u8; 1];
+            match self.inner.read(&mut byte) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(_) => {
+                    let b = byte[0];
+                    if b.is_ascii_whitespace() {
+                        continue;
+                    }
+                    if b == b'=' {
+                        // Padding — consume but don't add to group.
+                        // Collect remaining padding/whitespace silently.
+                        loop {
+                            match self.inner.read(&mut byte) {
+                                Ok(0) => break,
+                                Ok(_) => {
+                                    if !byte[0].is_ascii_whitespace() && byte[0] != b'=' {
+                                        // Unexpected non-padding character after padding.
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "unexpected data after Base64 padding",
+                                        ));
+                                    }
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        self.eof = true;
+                        break;
+                    }
+                    group[collected] = b;
+                    collected += 1;
+                    if collected == 4 {
+                        break;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if collected == 0 {
+            return Ok(None);
+        }
+
+        // Decode the group.
+        let decode = |b: u8| -> io::Result<u8> {
+            let v = B64_DEC[b as usize];
+            if v == 0xFF {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid Base64 character: {}", b as char),
+                ))
+            } else {
+                Ok(v)
+            }
+        };
+
+        let c0 = decode(group[0])?;
+        let decoded_len = match collected {
+            4 => {
+                let c1 = decode(group[1])?;
+                let c2 = decode(group[2])?;
+                let c3 = decode(group[3])?;
+                self.decoded_buf[0] = (c0 << 2) | (c1 >> 4);
+                self.decoded_buf[1] = ((c1 & 15) << 4) | (c2 >> 2);
+                self.decoded_buf[2] = ((c2 & 3) << 6) | c3;
+                3
+            }
+            3 => {
+                let c1 = decode(group[1])?;
+                let c2 = decode(group[2])?;
+                self.decoded_buf[0] = (c0 << 2) | (c1 >> 4);
+                self.decoded_buf[1] = ((c1 & 15) << 4) | (c2 >> 2);
+                2
+            }
+            2 => {
+                let c1 = decode(group[1])?;
+                self.decoded_buf[0] = (c0 << 2) | (c1 >> 4);
+                1
+            }
+            1 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "incomplete Base64 group (1 character)",
+                ));
+            }
+            _ => unreachable!(),
+        };
+
+        self.decoded_start = 0;
+        self.decoded_end = decoded_len;
+        Ok(Some(decoded_len))
+    }
+}
+
+impl<R: Read> Read for Base64Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        // Drain any already-decoded bytes first.
+        if self.decoded_start < self.decoded_end {
+            let available = self.decoded_end - self.decoded_start;
+            let to_copy = available.min(buf.len());
+            buf[..to_copy].copy_from_slice(
+                &self.decoded_buf[self.decoded_start..self.decoded_start + to_copy],
+            );
+            self.decoded_start += to_copy;
+            return Ok(to_copy);
+        }
+
+        // Decode the next group.
+        match self.fill_decoded()? {
+            None => Ok(0), // EOF
+            Some(_) => {
+                let available = self.decoded_end - self.decoded_start;
+                let to_copy = available.min(buf.len());
+                buf[..to_copy].copy_from_slice(
+                    &self.decoded_buf[self.decoded_start..self.decoded_start + to_copy],
+                );
+                self.decoded_start += to_copy;
+                Ok(to_copy)
+            }
+        }
+    }
+}
+
+/// Convenience constructor — equivalent to [`Base64Reader::new`].
+pub fn base64_reader<R: Read>(reader: R) -> Base64Reader<R> {
+    Base64Reader::new(reader)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod base64_streaming_tests {
+    use super::*;
+
+    // ── Writer ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn b64_writer_empty() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Base64Writer::new(&mut buf);
+            w.flush().unwrap();
+        }
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn b64_writer_one_byte() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Base64Writer::new(&mut buf);
+            w.write_all(b"M").unwrap();
+            w.flush().unwrap();
+        }
+        assert_eq!(&buf, b"TQ==");
+    }
+
+    #[test]
+    fn b64_writer_two_bytes() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Base64Writer::new(&mut buf);
+            w.write_all(b"Ma").unwrap();
+            w.flush().unwrap();
+        }
+        assert_eq!(&buf, b"TWE=");
+    }
+
+    #[test]
+    fn b64_writer_three_bytes() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Base64Writer::new(&mut buf);
+            w.write_all(b"Man").unwrap();
+            w.flush().unwrap();
+        }
+        assert_eq!(&buf, b"TWFu");
+    }
+
+    #[test]
+    fn b64_writer_longer() {
+        // RFC 4648 test vector: "Many hands make light work."
+        let mut buf = Vec::new();
+        {
+            let mut w = Base64Writer::new(&mut buf);
+            w.write_all(b"Many hands make light work.").unwrap();
+            w.flush().unwrap();
+        }
+        assert_eq!(&buf, b"TWFueSBoYW5kcyBtYWtlIGxpZ2h0IHdvcmsu");
+    }
+
+    #[test]
+    fn b64_writer_chunked_writes() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Base64Writer::new(&mut buf);
+            // Write byte-by-byte to stress the pending buffer logic.
+            for b in b"Man" {
+                w.write_all(std::slice::from_ref(b)).unwrap();
+            }
+            w.flush().unwrap();
+        }
+        assert_eq!(&buf, b"TWFu");
+    }
+
+    #[test]
+    fn b64_writer_into_inner() {
+        let mut buf = Vec::new();
+        {
+            let w = Base64Writer::new(&mut buf);
+            w.into_inner().unwrap();
+        }
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn b64_writer_into_inner_pending() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Base64Writer::new(&mut buf);
+            w.write_all(b"M").unwrap();
+            w.into_inner().unwrap();
+        }
+        assert_eq!(&buf, b"TQ==");
+    }
+
+    // ── Reader ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn b64_reader_empty() {
+        let mut r = Base64Reader::new(b"".as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn b64_reader_one_byte() {
+        let mut r = Base64Reader::new(b"TQ==".as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"M");
+    }
+
+    #[test]
+    fn b64_reader_two_bytes() {
+        let mut r = Base64Reader::new(b"TWE=".as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"Ma");
+    }
+
+    #[test]
+    fn b64_reader_three_bytes() {
+        let mut r = Base64Reader::new(b"TWFu".as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"Man");
+    }
+
+    #[test]
+    fn b64_reader_longer() {
+        let mut r = Base64Reader::new(b"TWFueSBoYW5kcyBtYWtlIGxpZ2h0IHdvcmsu".as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"Many hands make light work.");
+    }
+
+    #[test]
+    fn b64_reader_whitespace_tolerant() {
+        // Line-wrapped Base64 (MIME style).
+        let encoded = b"TWFu\neSBo\r\nYW5k";
+        let mut r = Base64Reader::new(encoded.as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"Many hand");
+    }
+
+    #[test]
+    fn b64_reader_invalid_char() {
+        let mut r = Base64Reader::new(b"TW!u".as_ref());
+        let mut out = Vec::new();
+        let err = r.read_to_end(&mut out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ── Round-trip ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn b64_roundtrip_all_bytes() {
+        let payload: Vec<u8> = (0u8..=255u8).collect();
+
+        let mut encoded = Vec::new();
+        {
+            let mut w = Base64Writer::new(&mut encoded);
+            w.write_all(&payload).unwrap();
+            w.flush().unwrap();
+        }
+
+        let mut decoded = Vec::new();
+        Base64Reader::new(encoded.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn b64_roundtrip_empty() {
+        let mut encoded = Vec::new();
+        {
+            Base64Writer::new(&mut encoded).flush().unwrap();
+        }
+        let mut decoded = Vec::new();
+        Base64Reader::new(encoded.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn b64_writer_constructor_shorthand() {
+        let mut buf = Vec::new();
+        {
+            let mut w = base64_writer(&mut buf);
+            w.write_all(b"Man").unwrap();
+            w.flush().unwrap();
+        }
+        assert_eq!(&buf, b"TWFu");
+    }
+
+    #[test]
+    fn b64_reader_constructor_shorthand() {
+        let mut r = base64_reader(b"TWFu".as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"Man");
+    }
+}
