@@ -1651,6 +1651,249 @@ pub fn pbkdf2_hmac_sha256_hex(
     to_hex(&derived)
 }
 
+/// Verify a PBKDF2-HMAC-SHA256 derived key against an expected key in constant time.
+pub fn pbkdf2_hmac_sha256_verify(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    expected_key: &[u8],
+) -> bool {
+    let derived = pbkdf2_hmac_sha256(password, salt, iterations, expected_key.len());
+    constant_time_eq(&derived, expected_key)
+}
+
+/// Verify a PBKDF2-HMAC-SHA256 derived key against expected hex-encoded key in constant time.
+pub fn pbkdf2_hmac_sha256_verify_hex(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    expected_hex: &str,
+) -> bool {
+    let expected = match hex_decode(expected_hex) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let derived = pbkdf2_hmac_sha256(password, salt, iterations, expected.len());
+    constant_time_eq(&derived, &expected)
+}
+
+/// Key derivation using PBKDF2 with HMAC-SHA1 according to RFC 2898 / RFC 6070.
+pub fn pbkdf2_hmac_sha1(password: &[u8], salt: &[u8], iterations: u32, key_len: usize) -> Vec<u8> {
+    if iterations == 0 || key_len == 0 {
+        return Vec::new();
+    }
+    let mut derived = Vec::with_capacity(key_len);
+    let mut block_index: u32 = 1;
+
+    while derived.len() < key_len {
+        let mut msg = Vec::with_capacity(salt.len() + 4);
+        msg.extend_from_slice(salt);
+        msg.extend_from_slice(&block_index.to_be_bytes());
+
+        let mut u = hmac_sha1(password, &msg);
+        let mut t = u;
+
+        for _ in 1..iterations {
+            u = hmac_sha1(password, &u);
+            for i in 0..20 {
+                t[i] ^= u[i];
+            }
+        }
+
+        let needed = key_len - derived.len();
+        if needed < 20 {
+            derived.extend_from_slice(&t[..needed]);
+        } else {
+            derived.extend_from_slice(&t);
+        }
+
+        block_index += 1;
+    }
+
+    derived
+}
+
+/// Compute PBKDF2-HMAC-SHA1 and return lowercase hex string.
+pub fn pbkdf2_hmac_sha1_hex(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    key_len: usize,
+) -> String {
+    let derived = pbkdf2_hmac_sha1(password, salt, iterations, key_len);
+    to_hex(&derived)
+}
+
+/// Verify a PBKDF2-HMAC-SHA1 derived key against an expected key in constant time.
+pub fn pbkdf2_hmac_sha1_verify(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    expected_key: &[u8],
+) -> bool {
+    let derived = pbkdf2_hmac_sha1(password, salt, iterations, expected_key.len());
+    constant_time_eq(&derived, expected_key)
+}
+
+/// Verify a PBKDF2-HMAC-SHA1 derived key against expected hex-encoded key in constant time.
+pub fn pbkdf2_hmac_sha1_verify_hex(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    expected_hex: &str,
+) -> bool {
+    let expected = match hex_decode(expected_hex) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let derived = pbkdf2_hmac_sha1(password, salt, iterations, expected.len());
+    constant_time_eq(&derived, &expected)
+}
+
+/// HKDF-Extract step per RFC 5869 using HMAC-SHA256.
+///
+/// Extracts a pseudorandom key (PRK) of 32 bytes from input key material `ikm` and optional `salt`.
+/// If `salt` is `None` or empty, a string of 32 zero bytes is used as specified in RFC 5869.
+pub fn hkdf_sha256_extract(salt: Option<&[u8]>, ikm: &[u8]) -> [u8; 32] {
+    let zeros = [0u8; 32];
+    let actual_salt = match salt {
+        Some(s) if !s.is_empty() => s,
+        _ => &zeros,
+    };
+    hmac_sha256(actual_salt, ikm)
+}
+
+/// HKDF-Expand step per RFC 5869 using HMAC-SHA256.
+///
+/// Expands the pseudorandom key `prk` to produce output keying material (OKM) of length `okm_len`.
+/// Returns an error if `okm_len > 255 * 32` (8160 bytes).
+pub fn hkdf_sha256_expand(prk: &[u8], info: &[u8], okm_len: usize) -> Result<Vec<u8>, String> {
+    const HASH_LEN: usize = 32;
+    if okm_len > 255 * HASH_LEN {
+        return Err(format!(
+            "Requested length {} exceeds maximum HKDF-SHA256 output length {}",
+            okm_len,
+            255 * HASH_LEN
+        ));
+    }
+    if okm_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let n = okm_len.div_ceil(HASH_LEN);
+    let mut okm = Vec::with_capacity(okm_len);
+    let mut t = Vec::new();
+
+    for i in 1..=n {
+        let mut hmac = HmacSha256::new(prk);
+        hmac.update(&t);
+        hmac.update(info);
+        hmac.update(&[i as u8]);
+        let step_mac = hmac.finalize();
+        t.clear();
+        t.extend_from_slice(&step_mac);
+
+        let to_take = std::cmp::min(HASH_LEN, okm_len - okm.len());
+        okm.extend_from_slice(&t[..to_take]);
+    }
+
+    Ok(okm)
+}
+
+/// Perform HKDF-SHA256 (Extract then Expand) per RFC 5869.
+pub fn hkdf_sha256(
+    salt: Option<&[u8]>,
+    ikm: &[u8],
+    info: &[u8],
+    okm_len: usize,
+) -> Result<Vec<u8>, String> {
+    let prk = hkdf_sha256_extract(salt, ikm);
+    hkdf_sha256_expand(&prk, info, okm_len)
+}
+
+/// Perform HKDF-SHA256 and return lowercase hex string.
+pub fn hkdf_sha256_hex(
+    salt: Option<&[u8]>,
+    ikm: &[u8],
+    info: &[u8],
+    okm_len: usize,
+) -> Result<String, String> {
+    let okm = hkdf_sha256(salt, ikm, info, okm_len)?;
+    Ok(to_hex(&okm))
+}
+
+/// HKDF-Extract step per RFC 5869 using HMAC-SHA1.
+///
+/// Extracts a pseudorandom key (PRK) of 20 bytes from input key material `ikm` and optional `salt`.
+/// If `salt` is `None` or empty, a string of 20 zero bytes is used as specified in RFC 5869.
+pub fn hkdf_sha1_extract(salt: Option<&[u8]>, ikm: &[u8]) -> [u8; 20] {
+    let zeros = [0u8; 20];
+    let actual_salt = match salt {
+        Some(s) if !s.is_empty() => s,
+        _ => &zeros,
+    };
+    hmac_sha1(actual_salt, ikm)
+}
+
+/// HKDF-Expand step per RFC 5869 using HMAC-SHA1.
+///
+/// Expands the pseudorandom key `prk` to produce output keying material (OKM) of length `okm_len`.
+/// Returns an error if `okm_len > 255 * 20` (5100 bytes).
+pub fn hkdf_sha1_expand(prk: &[u8], info: &[u8], okm_len: usize) -> Result<Vec<u8>, String> {
+    const HASH_LEN: usize = 20;
+    if okm_len > 255 * HASH_LEN {
+        return Err(format!(
+            "Requested length {} exceeds maximum HKDF-SHA1 output length {}",
+            okm_len,
+            255 * HASH_LEN
+        ));
+    }
+    if okm_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let n = okm_len.div_ceil(HASH_LEN);
+    let mut okm = Vec::with_capacity(okm_len);
+    let mut t = Vec::new();
+
+    for i in 1..=n {
+        let mut hmac = HmacSha1::new(prk);
+        hmac.update(&t);
+        hmac.update(info);
+        hmac.update(&[i as u8]);
+        let step_mac = hmac.finalize();
+        t.clear();
+        t.extend_from_slice(&step_mac);
+
+        let to_take = std::cmp::min(HASH_LEN, okm_len - okm.len());
+        okm.extend_from_slice(&t[..to_take]);
+    }
+
+    Ok(okm)
+}
+
+/// Perform HKDF-SHA1 (Extract then Expand) per RFC 5869.
+pub fn hkdf_sha1(
+    salt: Option<&[u8]>,
+    ikm: &[u8],
+    info: &[u8],
+    okm_len: usize,
+) -> Result<Vec<u8>, String> {
+    let prk = hkdf_sha1_extract(salt, ikm);
+    hkdf_sha1_expand(&prk, info, okm_len)
+}
+
+/// Perform HKDF-SHA1 and return lowercase hex string.
+pub fn hkdf_sha1_hex(
+    salt: Option<&[u8]>,
+    ikm: &[u8],
+    info: &[u8],
+    okm_len: usize,
+) -> Result<String, String> {
+    let okm = hkdf_sha1(salt, ikm, info, okm_len)?;
+    Ok(to_hex(&okm))
+}
+
 /// JWT claims representing standard RFC 7519 registered claims and arbitrary custom fields.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct JwtClaims {
@@ -2577,5 +2820,207 @@ mod tests {
 
         let reader4 = HmacSha1Reader::new(message.as_slice(), key);
         let _ = reader4.into_inner();
+    }
+
+    #[test]
+    fn test_pbkdf2_hmac_sha256_verification() {
+        let password = b"my-secret-password";
+        let salt = b"salt1234";
+        let iterations = 100;
+        let derived = pbkdf2_hmac_sha256(password, salt, iterations, 32);
+        let derived_hex = pbkdf2_hmac_sha256_hex(password, salt, iterations, 32);
+
+        assert!(pbkdf2_hmac_sha256_verify(
+            password, salt, iterations, &derived
+        ));
+        assert!(pbkdf2_hmac_sha256_verify_hex(
+            password,
+            salt,
+            iterations,
+            &derived_hex
+        ));
+
+        // Wrong password / wrong salt / wrong iterations
+        assert!(!pbkdf2_hmac_sha256_verify(
+            b"wrong", salt, iterations, &derived
+        ));
+        assert!(!pbkdf2_hmac_sha256_verify(
+            password,
+            b"wrong_salt",
+            iterations,
+            &derived
+        ));
+        assert!(!pbkdf2_hmac_sha256_verify(password, salt, 99, &derived));
+        assert!(!pbkdf2_hmac_sha256_verify_hex(
+            password, salt, iterations, "deadbeef"
+        ));
+        assert!(!pbkdf2_hmac_sha256_verify_hex(
+            password, salt, iterations, "not-hex!"
+        ));
+    }
+
+    #[test]
+    fn test_rfc6070_pbkdf2_hmac_sha1() {
+        // RFC 6070 Test 1
+        let p = b"password";
+        let s = b"salt";
+        assert_eq!(
+            pbkdf2_hmac_sha1_hex(p, s, 1, 20),
+            "0c60c80f961f0e71f3a9b524af6012062fe037a6"
+        );
+        assert!(pbkdf2_hmac_sha1_verify_hex(
+            p,
+            s,
+            1,
+            "0c60c80f961f0e71f3a9b524af6012062fe037a6"
+        ));
+
+        // RFC 6070 Test 2
+        assert_eq!(
+            pbkdf2_hmac_sha1_hex(p, s, 2, 20),
+            "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957"
+        );
+        assert!(pbkdf2_hmac_sha1_verify_hex(
+            p,
+            s,
+            2,
+            "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957"
+        ));
+
+        // RFC 6070 Test 3 (4096 iterations)
+        assert_eq!(
+            pbkdf2_hmac_sha1_hex(p, s, 4096, 20),
+            "4b007901b765489abead49d926f721d065a429c1"
+        );
+
+        // RFC 6070 Test 4
+        let p4 = b"passwordPASSWORDpassword";
+        let s4 = b"saltSALTsaltSALTsaltSALTsaltSALTsalt";
+        assert_eq!(
+            pbkdf2_hmac_sha1_hex(p4, s4, 4096, 25),
+            "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038"
+        );
+
+        // Edge cases
+        assert_eq!(pbkdf2_hmac_sha1(p, s, 0, 20), Vec::<u8>::new());
+        assert_eq!(pbkdf2_hmac_sha1(p, s, 1, 0), Vec::<u8>::new());
+        assert!(!pbkdf2_hmac_sha1_verify(
+            b"bad",
+            s,
+            1,
+            &hex_decode("0c60c80f961f0e71f3a9b524af6012062fe037a6").unwrap()
+        ));
+        assert!(!pbkdf2_hmac_sha1_verify_hex(p, s, 1, "invalid_hex!"));
+    }
+
+    #[test]
+    fn test_rfc5869_hkdf_sha256_vectors() {
+        // RFC 5869 Test Case 1
+        let ikm = [0x0bu8; 22];
+        let salt = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+        ];
+        let info = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9];
+        let prk = hkdf_sha256_extract(Some(&salt), &ikm);
+        assert_eq!(
+            hex_encode(&prk),
+            "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
+        );
+
+        let okm = hkdf_sha256_expand(&prk, &info, 42).unwrap();
+        assert_eq!(
+            hex_encode(&okm),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        );
+
+        let direct = hkdf_sha256(Some(&salt), &ikm, &info, 42).unwrap();
+        assert_eq!(okm, direct);
+        assert_eq!(
+            hkdf_sha256_hex(Some(&salt), &ikm, &info, 42).unwrap(),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        );
+
+        // RFC 5869 Test Case 2 (80 bytes IKM, 80 bytes salt, 80 bytes info, L=82)
+        let ikm2: Vec<u8> = (0x00..=0x4f).collect();
+        let salt2: Vec<u8> = (0x60..=0xaf).collect();
+        let info2: Vec<u8> = (0xb0..=0xff).collect();
+        let prk2 = hkdf_sha256_extract(Some(&salt2), &ikm2);
+        assert_eq!(
+            hex_encode(&prk2),
+            "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244"
+        );
+        let okm2 = hkdf_sha256_expand(&prk2, &info2, 82).unwrap();
+        assert_eq!(
+            hex_encode(&okm2),
+            "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87"
+        );
+
+        // RFC 5869 Test Case 3 (zero-length salt and info)
+        let ikm3 = [0x0bu8; 22];
+        let prk3_none = hkdf_sha256_extract(None, &ikm3);
+        let prk3_empty = hkdf_sha256_extract(Some(&[]), &ikm3);
+        assert_eq!(
+            hex_encode(&prk3_none),
+            "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04"
+        );
+        assert_eq!(prk3_none, prk3_empty);
+
+        let okm3 = hkdf_sha256_expand(&prk3_none, &[], 42).unwrap();
+        assert_eq!(
+            hex_encode(&okm3),
+            "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"
+        );
+
+        // Error cases: length exceeding 255 * HashLen
+        assert!(hkdf_sha256_expand(&prk, &info, 255 * 32 + 1).is_err());
+        assert_eq!(
+            hkdf_sha256_expand(&prk, &info, 0).unwrap(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn test_rfc5869_hkdf_sha1_vectors() {
+        // RFC 5869 Test Case 4
+        let ikm = [0x0bu8; 11];
+        let salt = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+        ];
+        let info = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9];
+        let prk = hkdf_sha1_extract(Some(&salt), &ikm);
+        assert_eq!(hex_encode(&prk), "9b6c18c432a7bf8f0e71c8eb88f4b30baa2ba243");
+
+        let okm = hkdf_sha1_expand(&prk, &info, 42).unwrap();
+        assert_eq!(
+            hex_encode(&okm),
+            "085a01ea1b10f36933068b56efa5ad81a4f14b822f5b091568a9cdd4f155fda2c22e422478d305f3f896"
+        );
+
+        let direct = hkdf_sha1(Some(&salt), &ikm, &info, 42).unwrap();
+        assert_eq!(okm, direct);
+        assert_eq!(
+            hkdf_sha1_hex(Some(&salt), &ikm, &info, 42).unwrap(),
+            "085a01ea1b10f36933068b56efa5ad81a4f14b822f5b091568a9cdd4f155fda2c22e422478d305f3f896"
+        );
+
+        // RFC 5869 Test Case 7 (zero-length salt and info)
+        let ikm7 = [0x0cu8; 22];
+        let prk7_none = hkdf_sha1_extract(None, &ikm7);
+        let prk7_empty = hkdf_sha1_extract(Some(&[]), &ikm7);
+        assert_eq!(
+            hex_encode(&prk7_none),
+            "2adccada18779e7c2077ad2eb19d3f3e731385dd"
+        );
+        assert_eq!(prk7_none, prk7_empty);
+
+        let okm7 = hkdf_sha1_expand(&prk7_none, &[], 42).unwrap();
+        assert_eq!(
+            hex_encode(&okm7),
+            "2c91117204d745f3500d636a62f64f0ab3bae548aa53d423b0d1f27ebba6f5e5673a081d70cce7acfc48"
+        );
+
+        // Error cases: length exceeding 255 * HashLen
+        assert!(hkdf_sha1_expand(&prk, &info, 255 * 20 + 1).is_err());
+        assert_eq!(hkdf_sha1_expand(&prk, &info, 0).unwrap(), Vec::<u8>::new());
     }
 }

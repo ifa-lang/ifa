@@ -17,12 +17,15 @@ pub mod sys;
 pub use collections::{BinaryHeap, ByteBuffer, Deque, List, Map, Set, StringBuilder};
 pub use crypto::{
     base64_decode, base64_encode, base64url_decode, base64url_encode, blake3, blake3_hex,
-    constant_time_eq, constant_time_eq_hex, hex_decode, hex_encode, hmac_sha1, hmac_sha1_hex,
-    hmac_sha1_verify, hmac_sha1_verify_hex, hmac_sha256, hmac_sha256_hex, hmac_sha256_verify,
-    hmac_sha256_verify_hex, hotp, pbkdf2_hmac_sha256, pbkdf2_hmac_sha256_hex, sha1, sha1_hex,
-    sha256, sha256_hex, totp, totp_verify, websocket_accept_key, HmacSha1, HmacSha1Reader,
-    HmacSha1Writer, HmacSha256, HmacSha256Reader, HmacSha256Writer, Jwt, JwtClaims, JwtError, Sha1,
-    Sha1Reader, Sha1Writer, Sha256, Sha256Reader, Sha256Writer,
+    constant_time_eq, constant_time_eq_hex, hex_decode, hex_encode, hkdf_sha1, hkdf_sha1_expand,
+    hkdf_sha1_extract, hkdf_sha1_hex, hkdf_sha256, hkdf_sha256_expand, hkdf_sha256_extract,
+    hkdf_sha256_hex, hmac_sha1, hmac_sha1_hex, hmac_sha1_verify, hmac_sha1_verify_hex, hmac_sha256,
+    hmac_sha256_hex, hmac_sha256_verify, hmac_sha256_verify_hex, hotp, pbkdf2_hmac_sha1,
+    pbkdf2_hmac_sha1_hex, pbkdf2_hmac_sha1_verify, pbkdf2_hmac_sha1_verify_hex, pbkdf2_hmac_sha256,
+    pbkdf2_hmac_sha256_hex, pbkdf2_hmac_sha256_verify, pbkdf2_hmac_sha256_verify_hex, sha1,
+    sha1_hex, sha256, sha256_hex, totp, totp_verify, websocket_accept_key, HmacSha1,
+    HmacSha1Reader, HmacSha1Writer, HmacSha256, HmacSha256Reader, HmacSha256Writer, Jwt, JwtClaims,
+    JwtError, Sha1, Sha1Reader, Sha1Writer, Sha256, Sha256Reader, Sha256Writer,
 };
 pub use csv::{
     decode as decode_csv, decode_with_options as decode_csv_with_options, encode as encode_csv,
@@ -1125,5 +1128,43 @@ mod tests {
         );
         assert_eq!(reader.read_frame().unwrap(), None);
         assert_eq!(reader.frames_read(), 2);
+    }
+
+    #[test]
+    fn test_crypto_pbkdf2_and_hkdf_reexports() {
+        // PBKDF2 HMAC-SHA256 verification
+        assert!(pbkdf2_hmac_sha256_verify_hex(
+            b"password",
+            b"salt",
+            1,
+            "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+        ));
+
+        // PBKDF2 HMAC-SHA1 verification
+        assert!(pbkdf2_hmac_sha1_verify_hex(
+            b"password",
+            b"salt",
+            1,
+            "0c60c80f961f0e71f3a9b524af6012062fe037a6"
+        ));
+
+        // HKDF-SHA256
+        let ikm = [0x0bu8; 22];
+        let salt = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+        ];
+        let info = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9];
+        let okm_hex = hkdf_sha256_hex(Some(&salt), &ikm, &info, 42).unwrap();
+        assert_eq!(
+            okm_hex,
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        );
+
+        // HKDF-SHA1
+        let okm1_hex = hkdf_sha1_hex(Some(&salt), &ikm[..11], &info, 42).unwrap();
+        assert_eq!(
+            okm1_hex,
+            "085a01ea1b10f36933068b56efa5ad81a4f14b822f5b091568a9cdd4f155fda2c22e422478d305f3f896"
+        );
     }
 }
