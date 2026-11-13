@@ -2088,6 +2088,422 @@ impl<W: Write> Write for SuffixWriter<W> {
     }
 }
 
+/// Encoding and byte width of length prefix for framed streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LengthFieldKind {
+    /// 1 byte prefix (payloads up to 255 bytes).
+    U8,
+    /// 2 bytes big-endian prefix (payloads up to 65,535 bytes).
+    U16Be,
+    /// 2 bytes little-endian prefix (payloads up to 65,535 bytes).
+    U16Le,
+    /// 4 bytes big-endian prefix (standard network byte order, payloads up to 4 GiB).
+    U32Be,
+    /// 4 bytes little-endian prefix (payloads up to 4 GiB).
+    U32Le,
+    /// 8 bytes big-endian prefix (payloads up to 64-bit address space).
+    U64Be,
+    /// 8 bytes little-endian prefix (payloads up to 64-bit address space).
+    U64Le,
+}
+
+impl LengthFieldKind {
+    /// Size of the length prefix in bytes.
+    pub const fn header_len(self) -> usize {
+        match self {
+            Self::U8 => 1,
+            Self::U16Be | Self::U16Le => 2,
+            Self::U32Be | Self::U32Le => 4,
+            Self::U64Be | Self::U64Le => 8,
+        }
+    }
+
+    /// Maximum payload length supported by this length encoding.
+    pub const fn max_length(self) -> usize {
+        match self {
+            Self::U8 => u8::MAX as usize,
+            Self::U16Be | Self::U16Le => u16::MAX as usize,
+            Self::U32Be | Self::U32Le => u32::MAX as usize,
+            Self::U64Be | Self::U64Le => usize::MAX,
+        }
+    }
+
+    /// Encode the length into the destination slice. Returns number of header bytes written.
+    pub fn encode_len(self, len: usize, buf: &mut [u8]) -> io::Result<usize> {
+        let needed = self.header_len();
+        if buf.len() < needed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "buffer too small for frame length prefix",
+            ));
+        }
+        match self {
+            Self::U8 => {
+                if len > u8::MAX as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("payload length {} exceeds u8 maximum ({})", len, u8::MAX),
+                    ));
+                }
+                buf[0] = len as u8;
+            }
+            Self::U16Be => {
+                if len > u16::MAX as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("payload length {} exceeds u16 maximum ({})", len, u16::MAX),
+                    ));
+                }
+                buf[..2].copy_from_slice(&(len as u16).to_be_bytes());
+            }
+            Self::U16Le => {
+                if len > u16::MAX as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("payload length {} exceeds u16 maximum ({})", len, u16::MAX),
+                    ));
+                }
+                buf[..2].copy_from_slice(&(len as u16).to_le_bytes());
+            }
+            Self::U32Be => {
+                if len > u32::MAX as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("payload length {} exceeds u32 maximum ({})", len, u32::MAX),
+                    ));
+                }
+                buf[..4].copy_from_slice(&(len as u32).to_be_bytes());
+            }
+            Self::U32Le => {
+                if len > u32::MAX as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("payload length {} exceeds u32 maximum ({})", len, u32::MAX),
+                    ));
+                }
+                buf[..4].copy_from_slice(&(len as u32).to_le_bytes());
+            }
+            Self::U64Be => {
+                buf[..8].copy_from_slice(&(len as u64).to_be_bytes());
+            }
+            Self::U64Le => {
+                buf[..8].copy_from_slice(&(len as u64).to_le_bytes());
+            }
+        }
+        Ok(needed)
+    }
+
+    /// Decode the length from an exact slice matching `header_len()`.
+    pub fn decode_len(self, bytes: &[u8]) -> usize {
+        match self {
+            Self::U8 => bytes[0] as usize,
+            Self::U16Be => u16::from_be_bytes([bytes[0], bytes[1]]) as usize,
+            Self::U16Le => u16::from_le_bytes([bytes[0], bytes[1]]) as usize,
+            Self::U32Be => u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize,
+            Self::U32Le => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize,
+            Self::U64Be => {
+                let val = u64::from_be_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]);
+                val.min(usize::MAX as u64) as usize
+            }
+            Self::U64Le => {
+                let val = u64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]);
+                val.min(usize::MAX as u64) as usize
+            }
+        }
+    }
+}
+
+/// Stream writer that prefixes each payload with its byte length according to a `LengthFieldKind`.
+#[derive(Debug, Clone)]
+pub struct FramedWriter<W: Write> {
+    inner: W,
+    field_kind: LengthFieldKind,
+    frames_written: u64,
+    bytes_written: u64,
+}
+
+impl<W: Write> FramedWriter<W> {
+    /// Create a new `FramedWriter` with standard 4-byte big-endian length prefix.
+    pub fn new(writer: W) -> Self {
+        Self::with_length_field(writer, LengthFieldKind::U32Be)
+    }
+
+    /// Create a new `FramedWriter` with the specified length field encoding.
+    pub fn with_length_field(writer: W, field_kind: LengthFieldKind) -> Self {
+        Self {
+            inner: writer,
+            field_kind,
+            frames_written: 0,
+            bytes_written: 0,
+        }
+    }
+
+    /// Return the length field kind.
+    pub fn length_field(&self) -> LengthFieldKind {
+        self.field_kind
+    }
+
+    /// Total number of complete frames written.
+    pub fn frames_written(&self) -> u64 {
+        self.frames_written
+    }
+
+    /// Total number of bytes written (including length prefixes and payloads).
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    /// Write a frame payload prefixed by its encoded length.
+    pub fn write_frame(&mut self, payload: &[u8]) -> io::Result<()> {
+        let mut header = [0u8; 8];
+        let hlen = self.field_kind.encode_len(payload.len(), &mut header)?;
+        self.inner.write_all(&header[..hlen])?;
+        if !payload.is_empty() {
+            self.inner.write_all(payload)?;
+        }
+        self.frames_written += 1;
+        self.bytes_written += (hlen + payload.len()) as u64;
+        Ok(())
+    }
+
+    /// Write a UTF-8 string frame.
+    pub fn write_frame_str(&mut self, text: &str) -> io::Result<()> {
+        self.write_frame(text.as_bytes())
+    }
+
+    /// Flush the underlying writer.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+
+    /// Reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    /// Consume this writer, returning the inner writer, field kind, frames written, and bytes written.
+    pub fn into_parts(self) -> (W, LengthFieldKind, u64, u64) {
+        (
+            self.inner,
+            self.field_kind,
+            self.frames_written,
+            self.bytes_written,
+        )
+    }
+}
+
+/// Helper function to create a new `FramedWriter` with standard 4-byte big-endian framing.
+pub fn framed_writer<W: Write>(writer: W) -> FramedWriter<W> {
+    FramedWriter::new(writer)
+}
+
+/// Default maximum frame size allowed (16 MiB) to guard against unbounded memory allocation.
+pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+/// Stream reader that unpacks length-delimited frames according to a `LengthFieldKind`.
+#[derive(Debug, Clone)]
+pub struct FramedReader<R: Read> {
+    inner: R,
+    field_kind: LengthFieldKind,
+    max_frame_size: usize,
+    frames_read: u64,
+}
+
+impl<R: Read> FramedReader<R> {
+    /// Create a new `FramedReader` with standard 4-byte big-endian length prefix and 16 MiB max frame size.
+    pub fn new(reader: R) -> Self {
+        Self::with_options(reader, LengthFieldKind::U32Be, DEFAULT_MAX_FRAME_SIZE)
+    }
+
+    /// Create a new `FramedReader` with specified length field encoding and maximum frame size.
+    pub fn with_options(reader: R, field_kind: LengthFieldKind, max_frame_size: usize) -> Self {
+        Self {
+            inner: reader,
+            field_kind,
+            max_frame_size: max_frame_size.max(1),
+            frames_read: 0,
+        }
+    }
+
+    /// Configured length field encoding.
+    pub fn length_field(&self) -> LengthFieldKind {
+        self.field_kind
+    }
+
+    /// Configured maximum payload size in bytes.
+    pub fn max_frame_size(&self) -> usize {
+        self.max_frame_size
+    }
+
+    /// Set a new maximum payload size in bytes (at least 1 byte).
+    pub fn set_max_frame_size(&mut self, max: usize) {
+        self.max_frame_size = max.max(1);
+    }
+
+    /// Number of frames successfully read so far.
+    pub fn frames_read(&self) -> u64 {
+        self.frames_read
+    }
+
+    /// Read the next frame payload into the provided reusable buffer.
+    ///
+    /// Clears `buf` before reading.
+    /// Returns `Ok(Some(bytes_read))` or `Ok(None)` on clean EOF before any header bytes are read.
+    /// Returns `Err(UnexpectedEof)` if EOF occurs midway through reading the header or payload.
+    /// Returns `Err(InvalidData)` if the header indicates a frame larger than `max_frame_size`.
+    pub fn read_frame_buf(&mut self, buf: &mut Vec<u8>) -> io::Result<Option<usize>> {
+        buf.clear();
+        let hlen = self.field_kind.header_len();
+        let mut header = [0u8; 8];
+        let mut header_read = 0;
+
+        while header_read < hlen {
+            let n = self.inner.read(&mut header[header_read..hlen])?;
+            if n == 0 {
+                if header_read == 0 {
+                    return Ok(None);
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "incomplete length prefix: read {} of {} bytes",
+                            header_read, hlen
+                        ),
+                    ));
+                }
+            }
+            header_read += n;
+        }
+
+        let payload_len = self.field_kind.decode_len(&header[..hlen]);
+        if payload_len > self.max_frame_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "frame payload length {} exceeds configured maximum {}",
+                    payload_len, self.max_frame_size
+                ),
+            ));
+        }
+
+        buf.resize(payload_len, 0);
+        if payload_len > 0 {
+            self.inner.read_exact(buf)?;
+        }
+
+        self.frames_read += 1;
+        Ok(Some(payload_len))
+    }
+
+    /// Read the next complete frame from the stream into a new `Vec<u8>`.
+    ///
+    /// Returns `Ok(None)` on clean EOF before any header byte is read.
+    pub fn read_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut buf = Vec::new();
+        match self.read_frame_buf(&mut buf)? {
+            Some(_) => Ok(Some(buf)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the next frame and parse it as a UTF-8 string.
+    pub fn read_frame_to_string(&mut self) -> io::Result<Option<String>> {
+        match self.read_frame()? {
+            Some(bytes) => String::from_utf8(bytes).map(Some).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid UTF-8 in frame: {}", e),
+                )
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// Convert this `FramedReader` into an iterator yielding frame byte buffers.
+    pub fn into_frames(self) -> FramedIter<R> {
+        FramedIter { reader: self }
+    }
+
+    /// Reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    /// Consume this reader, returning inner reader, field kind, max frame size, and frames read.
+    pub fn into_parts(self) -> (R, LengthFieldKind, usize, u64) {
+        (
+            self.inner,
+            self.field_kind,
+            self.max_frame_size,
+            self.frames_read,
+        )
+    }
+}
+
+/// Helper function to create a new `FramedReader` with standard 4-byte big-endian framing.
+pub fn framed_reader<R: Read>(reader: R) -> FramedReader<R> {
+    FramedReader::new(reader)
+}
+
+/// Iterator over frames produced by a `FramedReader`.
+#[derive(Debug)]
+pub struct FramedIter<R: Read> {
+    reader: FramedReader<R>,
+}
+
+impl<R: Read> FramedIter<R> {
+    /// Reference to the underlying framed reader.
+    pub fn get_ref(&self) -> &FramedReader<R> {
+        &self.reader
+    }
+
+    /// Mutable reference to the underlying framed reader.
+    pub fn get_mut(&mut self) -> &mut FramedReader<R> {
+        &mut self.reader
+    }
+
+    /// Unwrap the inner `FramedReader`.
+    pub fn into_inner(self) -> FramedReader<R> {
+        self.reader
+    }
+}
+
+impl<R: Read> Iterator for FramedIter<R> {
+    type Item = io::Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.reader.read_frame() {
+            Ok(Some(frame)) => Some(Ok(frame)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2879,5 +3295,245 @@ mod tests {
 
         let sw5 = suffix_writer(Vec::new(), b"xyz".to_vec());
         let _inner5 = sw5.into_inner();
+    }
+
+    #[test]
+    fn test_length_field_kind_properties_and_encoding() {
+        assert_eq!(LengthFieldKind::U8.header_len(), 1);
+        assert_eq!(LengthFieldKind::U16Be.header_len(), 2);
+        assert_eq!(LengthFieldKind::U16Le.header_len(), 2);
+        assert_eq!(LengthFieldKind::U32Be.header_len(), 4);
+        assert_eq!(LengthFieldKind::U32Le.header_len(), 4);
+        assert_eq!(LengthFieldKind::U64Be.header_len(), 8);
+        assert_eq!(LengthFieldKind::U64Le.header_len(), 8);
+
+        assert_eq!(LengthFieldKind::U8.max_length(), 255);
+        assert_eq!(LengthFieldKind::U16Be.max_length(), 65535);
+        assert_eq!(LengthFieldKind::U16Le.max_length(), 65535);
+        assert_eq!(LengthFieldKind::U32Be.max_length(), u32::MAX as usize);
+
+        let mut buf = [0u8; 8];
+
+        // U8 roundtrip
+        let n = LengthFieldKind::U8.encode_len(42, &mut buf).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(LengthFieldKind::U8.decode_len(&buf[..1]), 42);
+
+        // U8 overflow
+        assert!(LengthFieldKind::U8.encode_len(256, &mut buf).is_err());
+
+        // U16Be & U16Le roundtrip
+        let n = LengthFieldKind::U16Be.encode_len(1234, &mut buf).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(LengthFieldKind::U16Be.decode_len(&buf[..2]), 1234);
+
+        let n = LengthFieldKind::U16Le.encode_len(1234, &mut buf).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(LengthFieldKind::U16Le.decode_len(&buf[..2]), 1234);
+
+        // U16 overflow
+        assert!(LengthFieldKind::U16Be.encode_len(65536, &mut buf).is_err());
+        assert!(LengthFieldKind::U16Le.encode_len(65536, &mut buf).is_err());
+
+        // U32Be & U32Le roundtrip
+        let n = LengthFieldKind::U32Be
+            .encode_len(100_000, &mut buf)
+            .unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(LengthFieldKind::U32Be.decode_len(&buf[..4]), 100_000);
+
+        let n = LengthFieldKind::U32Le
+            .encode_len(100_000, &mut buf)
+            .unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(LengthFieldKind::U32Le.decode_len(&buf[..4]), 100_000);
+
+        // U64Be & U64Le roundtrip
+        let n = LengthFieldKind::U64Be
+            .encode_len(999_999_999, &mut buf)
+            .unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(LengthFieldKind::U64Be.decode_len(&buf[..8]), 999_999_999);
+
+        let n = LengthFieldKind::U64Le
+            .encode_len(999_999_999, &mut buf)
+            .unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(LengthFieldKind::U64Le.decode_len(&buf[..8]), 999_999_999);
+
+        // Buffer too small error
+        let mut small_buf = [0u8; 1];
+        assert!(LengthFieldKind::U32Be
+            .encode_len(10, &mut small_buf)
+            .is_err());
+    }
+
+    #[test]
+    fn test_framed_writer_reader_roundtrip_default_u32be() {
+        let mut wire = Vec::new();
+        let mut writer = framed_writer(&mut wire);
+        assert_eq!(writer.length_field(), LengthFieldKind::U32Be);
+        assert_eq!(writer.frames_written(), 0);
+        assert_eq!(writer.bytes_written(), 0);
+
+        writer.write_frame(b"frame 1").unwrap();
+        writer.write_frame(b"").unwrap(); // empty payload frame
+        writer.write_frame(b"frame three with more data!").unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(writer.frames_written(), 3);
+        // Header sizes: 4 bytes each * 3 frames = 12 bytes. Payloads: 7 + 0 + 27 = 34. Total: 46.
+        assert_eq!(writer.bytes_written(), 46);
+        assert_eq!(wire.len(), 46);
+
+        let mut reader = framed_reader(wire.as_slice());
+        assert_eq!(reader.length_field(), LengthFieldKind::U32Be);
+        assert_eq!(reader.frames_read(), 0);
+
+        let f1 = reader.read_frame().unwrap();
+        assert_eq!(f1, Some(b"frame 1".to_vec()));
+        assert_eq!(reader.frames_read(), 1);
+
+        let f2 = reader.read_frame().unwrap();
+        assert_eq!(f2, Some(Vec::new()));
+        assert_eq!(reader.frames_read(), 2);
+
+        let f3 = reader.read_frame().unwrap();
+        assert_eq!(f3, Some(b"frame three with more data!".to_vec()));
+        assert_eq!(reader.frames_read(), 3);
+
+        // EOF clean
+        let eof = reader.read_frame().unwrap();
+        assert_eq!(eof, None);
+        assert_eq!(reader.frames_read(), 3);
+    }
+
+    #[test]
+    fn test_framed_writer_reader_strings_and_other_kinds() {
+        // Test U16Le with string frames
+        let mut wire = Vec::new();
+        let mut writer = FramedWriter::with_length_field(&mut wire, LengthFieldKind::U16Le);
+        assert_eq!(writer.length_field(), LengthFieldKind::U16Le);
+
+        writer.write_frame_str("bonjour").unwrap();
+        writer.write_frame_str("à bientôt").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.frames_written(), 2);
+
+        let mut reader = FramedReader::with_options(wire.as_slice(), LengthFieldKind::U16Le, 1024);
+        let s1 = reader.read_frame_to_string().unwrap();
+        assert_eq!(s1.as_deref(), Some("bonjour"));
+
+        let s2 = reader.read_frame_to_string().unwrap();
+        assert_eq!(s2.as_deref(), Some("à bientôt"));
+
+        let s3 = reader.read_frame_to_string().unwrap();
+        assert_eq!(s3, None);
+    }
+
+    #[test]
+    fn test_framed_reader_into_frames_iterator() {
+        let mut wire = Vec::new();
+        let mut writer = FramedWriter::with_length_field(&mut wire, LengthFieldKind::U8);
+        writer.write_frame(b"one").unwrap();
+        writer.write_frame(b"two").unwrap();
+        writer.write_frame(b"three").unwrap();
+
+        let reader = FramedReader::with_options(wire.as_slice(), LengthFieldKind::U8, 255);
+        let mut iter = reader.into_frames();
+
+        let frames: Vec<Vec<u8>> = iter.by_ref().map(|res| res.expect("valid frame")).collect();
+        assert_eq!(
+            frames,
+            vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+        );
+
+        // Inner reader inspection from iter
+        assert_eq!(iter.get_ref().frames_read(), 3);
+        iter.get_mut();
+        let inner_reader = iter.into_inner();
+        assert_eq!(inner_reader.frames_read(), 3);
+    }
+
+    #[test]
+    fn test_framed_reader_reusable_buffer() {
+        let mut wire = Vec::new();
+        let mut writer = framed_writer(&mut wire);
+        writer.write_frame(b"reusable payload 1").unwrap();
+        writer.write_frame(b"p2").unwrap();
+
+        let mut reader = framed_reader(wire.as_slice());
+        let mut reusable = Vec::new();
+
+        let n1 = reader.read_frame_buf(&mut reusable).unwrap();
+        assert_eq!(n1, Some(18));
+        assert_eq!(reusable.as_slice(), b"reusable payload 1");
+
+        let n2 = reader.read_frame_buf(&mut reusable).unwrap();
+        assert_eq!(n2, Some(2));
+        assert_eq!(reusable.as_slice(), b"p2");
+
+        let n3 = reader.read_frame_buf(&mut reusable).unwrap();
+        assert_eq!(n3, None);
+    }
+
+    #[test]
+    fn test_framed_reader_error_conditions() {
+        // 1. Incomplete length prefix
+        let incomplete_header = [0x00, 0x00]; // 2 bytes instead of 4 for U32Be
+        let mut reader = framed_reader(&incomplete_header[..]);
+        let err = reader.read_frame().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        // 2. Incomplete payload
+        let mut incomplete_payload = vec![0x00, 0x00, 0x00, 0x10]; // 16 bytes expected
+        incomplete_payload.extend_from_slice(b"1234"); // only 4 bytes provided
+        let mut reader2 = framed_reader(&incomplete_payload[..]);
+        let err2 = reader2.read_frame().unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::UnexpectedEof);
+
+        // 3. Exceeded max frame size
+        let mut big_header = vec![0x00, 0x00, 0x00, 0x64]; // 100 bytes length prefix
+        big_header.resize(104, 0xAA);
+        let mut reader3 = FramedReader::with_options(&big_header[..], LengthFieldKind::U32Be, 50);
+        let err3 = reader3.read_frame().unwrap_err();
+        assert_eq!(err3.kind(), io::ErrorKind::InvalidData);
+        assert!(err3.to_string().contains("exceeds configured maximum"));
+
+        // 4. Invalid UTF-8 in read_frame_to_string
+        let mut invalid_utf8_wire = Vec::new();
+        let mut writer = framed_writer(&mut invalid_utf8_wire);
+        writer.write_frame(&[0xFF, 0xFE, 0xFD]).unwrap();
+        let mut reader4 = framed_reader(invalid_utf8_wire.as_slice());
+        let err4 = reader4.read_frame_to_string().unwrap_err();
+        assert_eq!(err4.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_framed_reader_writer_inspectors_and_into_parts() {
+        let mut buf = Vec::new();
+        let mut writer = framed_writer(&mut buf);
+        writer.write_frame(b"ping").unwrap();
+        assert_eq!(writer.get_ref().len(), 8);
+        writer.get_mut();
+        let (_inner, kind, frames, bytes) = writer.into_parts();
+        assert_eq!(kind, LengthFieldKind::U32Be);
+        assert_eq!(frames, 1);
+        assert_eq!(bytes, 8);
+
+        let mut reader = framed_reader(buf.as_slice());
+        assert_eq!(reader.max_frame_size(), DEFAULT_MAX_FRAME_SIZE);
+        reader.set_max_frame_size(1024);
+        assert_eq!(reader.max_frame_size(), 1024);
+        reader.read_frame().unwrap();
+        reader.get_mut();
+        assert_eq!(reader.get_ref().len(), 0); // all 8 bytes consumed from slice
+        let (_inner, kind, max_size, frames) = reader.into_parts();
+        assert_eq!(kind, LengthFieldKind::U32Be);
+        assert_eq!(max_size, 1024);
+        assert_eq!(frames, 1);
+
+        let r2 = framed_reader(buf.as_slice());
+        let _inner2 = r2.into_inner();
     }
 }
