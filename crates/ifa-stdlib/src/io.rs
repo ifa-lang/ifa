@@ -1888,6 +1888,206 @@ impl<W: Write> Write for PrefixWriter<W> {
     }
 }
 
+/// Reader wrapper that reads completely from an underlying reader and then appends a suffix.
+#[derive(Debug, Clone)]
+pub struct SuffixedReader<R: Read> {
+    inner: R,
+    suffix: Vec<u8>,
+    suffix_pos: usize,
+    inner_done: bool,
+}
+
+impl<R: Read> SuffixedReader<R> {
+    /// Create a new `SuffixedReader` that appends `suffix` bytes after `inner` reaches EOF.
+    pub fn new(inner: R, suffix: Vec<u8>) -> Self {
+        Self {
+            inner,
+            suffix,
+            suffix_pos: 0,
+            inner_done: false,
+        }
+    }
+
+    /// Access the suffix bytes.
+    pub fn suffix(&self) -> &[u8] {
+        &self.suffix
+    }
+
+    /// Total length of the suffix buffer in bytes.
+    pub fn suffix_len(&self) -> usize {
+        self.suffix.len()
+    }
+
+    /// Number of remaining suffix bytes waiting to be read.
+    pub fn suffix_remaining(&self) -> usize {
+        self.suffix.len().saturating_sub(self.suffix_pos)
+    }
+
+    /// Whether the underlying reader has reached EOF.
+    pub fn is_inner_exhausted(&self) -> bool {
+        self.inner_done
+    }
+
+    /// Reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Unwrap the underlying reader, discarding remaining suffix.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    /// Unwrap the components: inner reader, suffix bytes, and current suffix position.
+    pub fn into_parts(self) -> (R, Vec<u8>, usize) {
+        (self.inner, self.suffix, self.suffix_pos)
+    }
+}
+
+/// Helper function to create a new `SuffixedReader`.
+pub fn suffixed<R: Read>(reader: R, suffix: Vec<u8>) -> SuffixedReader<R> {
+    SuffixedReader::new(reader, suffix)
+}
+
+impl<R: Read> Read for SuffixedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if !self.inner_done {
+            let n = self.inner.read(buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            self.inner_done = true;
+        }
+
+        if self.suffix_pos < self.suffix.len() {
+            let available = self.suffix.len() - self.suffix_pos;
+            let to_read = available.min(buf.len());
+            buf[..to_read]
+                .copy_from_slice(&self.suffix[self.suffix_pos..self.suffix_pos + to_read]);
+            self.suffix_pos += to_read;
+            Ok(to_read)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
+impl<R: Read + BufRead> BufRead for SuffixedReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if !self.inner_done {
+            let n = self.inner.fill_buf()?.len();
+            if n > 0 {
+                return self.inner.fill_buf();
+            }
+            self.inner_done = true;
+        }
+        Ok(&self.suffix[self.suffix_pos..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        if !self.inner_done {
+            self.inner.consume(amt);
+        } else {
+            self.suffix_pos = (self.suffix_pos + amt).min(self.suffix.len());
+        }
+    }
+}
+
+/// Writer wrapper that writes data to the underlying stream and guarantees a suffix is appended upon completion.
+#[derive(Debug, Clone)]
+pub struct SuffixWriter<W: Write> {
+    inner: W,
+    suffix: Vec<u8>,
+    suffix_written: bool,
+}
+
+impl<W: Write> SuffixWriter<W> {
+    /// Create a new `SuffixWriter` that will append `suffix` on completion.
+    pub fn new(inner: W, suffix: Vec<u8>) -> Self {
+        Self {
+            inner,
+            suffix,
+            suffix_written: false,
+        }
+    }
+
+    /// The suffix bytes to be written.
+    pub fn suffix(&self) -> &[u8] {
+        &self.suffix
+    }
+
+    /// Whether the suffix has already been written to the underlying stream.
+    pub fn is_suffix_written(&self) -> bool {
+        self.suffix_written
+    }
+
+    /// Explicitly ensure the suffix has been written to the underlying writer.
+    pub fn write_suffix(&mut self) -> io::Result<()> {
+        if !self.suffix_written {
+            if !self.suffix.is_empty() {
+                self.inner.write_all(&self.suffix)?;
+            }
+            self.suffix_written = true;
+        }
+        Ok(())
+    }
+
+    /// Finish writing by ensuring the suffix is written, flushing, and returning the underlying writer.
+    pub fn finish(mut self) -> io::Result<W> {
+        self.write_suffix()?;
+        self.inner.flush()?;
+        Ok(self.inner)
+    }
+
+    /// Reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Consume this wrapper, returning the underlying writer without forcing suffix write.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    /// Consume this wrapper, returning the underlying writer, suffix and completion status.
+    pub fn into_parts(self) -> (W, Vec<u8>, bool) {
+        (self.inner, self.suffix, self.suffix_written)
+    }
+}
+
+/// Helper function to create a new `SuffixWriter`.
+pub fn suffix_writer<W: Write>(writer: W, suffix: Vec<u8>) -> SuffixWriter<W> {
+    SuffixWriter::new(writer, suffix)
+}
+
+impl<W: Write> Write for SuffixWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.suffix_written {
+            return Err(io::Error::other(
+                "cannot write data after suffix has already been written",
+            ));
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2541,5 +2741,143 @@ mod tests {
         assert_eq!(pw3.get_ref(), b"PREFIX");
         let inner = pw3.into_inner();
         assert_eq!(inner, b"PREFIX");
+    }
+
+    #[test]
+    fn test_suffixed_reader() {
+        let data = b"hello";
+        let suffix = b" world!";
+        let mut sr = suffixed(&data[..], suffix.to_vec());
+        assert_eq!(sr.suffix(), b" world!");
+        assert_eq!(sr.suffix_len(), 7);
+        assert_eq!(sr.suffix_remaining(), 7);
+        assert!(!sr.is_inner_exhausted());
+        assert_eq!(sr.get_ref(), &&data[..]);
+
+        let mut out = Vec::new();
+        sr.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"hello world!");
+        assert!(sr.is_inner_exhausted());
+        assert_eq!(sr.suffix_remaining(), 0);
+
+        // Subsequent read returns 0 (EOF)
+        let mut buf = [0u8; 4];
+        assert_eq!(sr.read(&mut buf).unwrap(), 0);
+
+        // Chunked read across inner / suffix boundary
+        let mut sr2 = suffixed(&b"ABC"[..], b"DEF".to_vec());
+        let mut chunk = [0u8; 2];
+        assert_eq!(sr2.read(&mut chunk).unwrap(), 2);
+        assert_eq!(&chunk, b"AB");
+        assert_eq!(sr2.read(&mut chunk).unwrap(), 1);
+        assert_eq!(&chunk[..1], b"C");
+        assert!(!sr2.is_inner_exhausted());
+
+        // Now inner is exhausted, next read reads from suffix
+        assert_eq!(sr2.read(&mut chunk).unwrap(), 2);
+        assert_eq!(&chunk, b"DE");
+        assert!(sr2.is_inner_exhausted());
+        assert_eq!(sr2.suffix_remaining(), 1);
+        assert_eq!(sr2.read(&mut chunk).unwrap(), 1);
+        assert_eq!(&chunk[..1], b"F");
+        assert_eq!(sr2.read(&mut chunk).unwrap(), 0);
+
+        // Empty inner
+        let mut sr_empty_inner = suffixed(&b""[..], b"tail".to_vec());
+        let mut out2 = Vec::new();
+        sr_empty_inner.read_to_end(&mut out2).unwrap();
+        assert_eq!(out2, b"tail");
+
+        // Empty suffix
+        let mut sr_empty_suffix = suffixed(&b"head"[..], Vec::new());
+        let mut out3 = Vec::new();
+        sr_empty_suffix.read_to_end(&mut out3).unwrap();
+        assert_eq!(out3, b"head");
+
+        // Both empty
+        let mut sr_both_empty = suffixed(&b""[..], Vec::new());
+        assert_eq!(sr_both_empty.read(&mut chunk).unwrap(), 0);
+
+        // BufRead testing
+        let lines_data = b"line 1\nline 2";
+        let mut sr_buf = suffixed(BufferedReader::new(&lines_data[..]), b"\nline 3\n".to_vec());
+        let mut l1 = String::new();
+        sr_buf.read_line(&mut l1).unwrap();
+        assert_eq!(l1, "line 1\n");
+        let mut l2 = String::new();
+        sr_buf.read_line(&mut l2).unwrap();
+        assert_eq!(l2, "line 2\n");
+        let mut l3 = String::new();
+        sr_buf.read_line(&mut l3).unwrap();
+        assert_eq!(l3, "line 3\n");
+        let mut l4 = String::new();
+        let bytes = sr_buf.read_line(&mut l4).unwrap();
+        assert_eq!(bytes, 0);
+
+        // Inspect and mut access
+        let mut sr3 = suffixed(&b"foo"[..], b"bar".to_vec());
+        sr3.get_mut();
+        let (inner, sfx, pos) = sr3.into_parts();
+        assert_eq!(inner, &b"foo"[..]);
+        assert_eq!(sfx, b"bar");
+        assert_eq!(pos, 0);
+
+        let sr4 = suffixed(&b"x"[..], b"y".to_vec());
+        let _inner = sr4.into_inner();
+    }
+
+    #[test]
+    fn test_suffix_writer() {
+        let mut out = Vec::new();
+        let mut sw = suffix_writer(&mut out, b"</root>".to_vec());
+        assert_eq!(sw.suffix(), b"</root>");
+        assert!(!sw.is_suffix_written());
+        assert_eq!(sw.get_ref().len(), 0);
+
+        sw.write_all(b"<root>").unwrap();
+        sw.write_all(b"<item/>").unwrap();
+        assert!(!sw.is_suffix_written());
+        sw.flush().unwrap();
+        assert_eq!(sw.get_ref().as_slice(), b"<root><item/>");
+
+        // finish() writes suffix and flushes
+        let inner = sw.finish().unwrap();
+        assert_eq!(inner.as_slice(), b"<root><item/></root>");
+
+        // Explicit write_suffix() and write-after-suffix prevention
+        let mut out2 = Vec::new();
+        let mut sw2 = suffix_writer(&mut out2, b"END".to_vec());
+        sw2.write_all(b"START:").unwrap();
+        sw2.write_suffix().unwrap();
+        assert!(sw2.is_suffix_written());
+        assert_eq!(sw2.get_ref().as_slice(), b"START:END");
+
+        // Calling write after suffix_written should return an error
+        let err = sw2.write(b"extra").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+
+        // Multiple calls to write_suffix are idempotent
+        sw2.write_suffix().unwrap();
+        assert_eq!(sw2.get_ref().as_slice(), b"START:END");
+
+        // Finish after write_suffix already called
+        let inner2 = sw2.finish().unwrap();
+        assert_eq!(inner2.as_slice(), b"START:END");
+
+        // Empty suffix
+        let sw3 = suffix_writer(Vec::new(), Vec::new());
+        let inner3 = sw3.finish().unwrap();
+        assert!(inner3.is_empty());
+
+        // into_parts & get_mut
+        let mut sw4 = suffix_writer(Vec::new(), b"abc".to_vec());
+        sw4.get_mut();
+        let (buf, sfx, written) = sw4.into_parts();
+        assert!(buf.is_empty());
+        assert_eq!(sfx, b"abc");
+        assert!(!written);
+
+        let sw5 = suffix_writer(Vec::new(), b"xyz".to_vec());
+        let _inner5 = sw5.into_inner();
     }
 }
