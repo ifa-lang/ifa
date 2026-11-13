@@ -4467,3 +4467,354 @@ mod tests {
         assert_eq!(out, payload);
     }
 }
+
+// ─── Hex encoding / decoding I/O adapters ────────────────────────────────────
+
+const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
+/// Decodes a nibble (hex digit) to its 4-bit value.
+/// Returns `None` for non-hex characters.
+#[inline]
+fn nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// A `Write` adapter that hex-encodes every byte written to it.
+///
+/// Each input byte is converted into two lowercase hex ASCII characters
+/// (`00`–`ff`) and forwarded to the underlying writer.
+///
+/// # Example
+/// ```ignore
+/// let mut buf = Vec::new();
+/// let mut w = HexWriter::new(&mut buf);
+/// w.write_all(b"\xde\xad\xbe\xef").unwrap();
+/// assert_eq!(&buf, b"deadbeef");
+/// ```
+pub struct HexWriter<W: Write> {
+    inner: W,
+}
+
+impl<W: Write> HexWriter<W> {
+    /// Creates a new `HexWriter` wrapping `inner`.
+    pub fn new(inner: W) -> Self {
+        Self { inner }
+    }
+
+    /// Consumes the adapter and returns the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    /// Returns a shared reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Returns a mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+}
+
+impl<W: Write> Write for HexWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut tmp = [0u8; 2];
+        for &byte in buf {
+            tmp[0] = HEX_LOWER[(byte >> 4) as usize];
+            tmp[1] = HEX_LOWER[(byte & 0x0f) as usize];
+            self.inner.write_all(&tmp)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Constructor shorthand for [`HexWriter`].
+pub fn hex_writer<W: Write>(writer: W) -> HexWriter<W> {
+    HexWriter::new(writer)
+}
+
+/// A `Read` adapter that hex-decodes a hex-encoded byte stream on-the-fly.
+///
+/// The underlying reader must supply an even number of ASCII hex characters.
+/// Any non-hex character causes an `InvalidData` error. Whitespace is **not**
+/// skipped; use an upstream filter if needed.
+///
+/// # Example
+/// ```ignore
+/// let src = b"deadbeef";
+/// let mut r = HexReader::new(src.as_ref());
+/// let mut out = Vec::new();
+/// r.read_to_end(&mut out).unwrap();
+/// assert_eq!(out, b"\xde\xad\xbe\xef");
+/// ```
+pub struct HexReader<R: Read> {
+    inner: R,
+    /// Buffered nibble from a previous read (high nibble awaiting its pair).
+    pending: Option<u8>,
+}
+
+impl<R: Read> HexReader<R> {
+    /// Creates a new `HexReader` wrapping `inner`.
+    pub fn new(inner: R) -> Self {
+        Self { inner, pending: None }
+    }
+
+    /// Consumes the adapter and returns the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    /// Returns a shared reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Returns a mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+}
+
+impl<R: Read> Read for HexReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut produced = 0;
+        while produced < buf.len() {
+            // We need two hex digits to produce one byte.
+            let hi = match self.pending.take() {
+                Some(v) => v,
+                None => {
+                    let mut raw = [0u8; 1];
+                    match self.inner.read(&mut raw)? {
+                        0 => break, // EOF
+                        _ => match nibble(raw[0]) {
+                            Some(v) => v,
+                            None => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "HexReader: invalid hex digit",
+                                ))
+                            }
+                        },
+                    }
+                }
+            };
+            // Read the low nibble.
+            let mut raw = [0u8; 1];
+            match self.inner.read(&mut raw)? {
+                0 => {
+                    // Odd number of hex digits — store high nibble as pending
+                    // and report what we have so far. Next call will error.
+                    self.pending = Some(hi);
+                    break;
+                }
+                _ => match nibble(raw[0]) {
+                    Some(lo) => {
+                        buf[produced] = (hi << 4) | lo;
+                        produced += 1;
+                    }
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "HexReader: invalid hex digit",
+                        ))
+                    }
+                },
+            }
+        }
+        Ok(produced)
+    }
+}
+
+/// Constructor shorthand for [`HexReader`].
+pub fn hex_reader<R: Read>(reader: R) -> HexReader<R> {
+    HexReader::new(reader)
+}
+
+#[cfg(test)]
+mod hex_tests {
+    use super::*;
+
+    // ── HexWriter ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hex_writer_empty() {
+        let mut buf = Vec::new();
+        let mut w = HexWriter::new(&mut buf);
+        w.write_all(b"").unwrap();
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn hex_writer_single_byte() {
+        let mut buf = Vec::new();
+        let mut w = HexWriter::new(&mut buf);
+        w.write_all(b"\xff").unwrap();
+        assert_eq!(&buf, b"ff");
+    }
+
+    #[test]
+    fn hex_writer_known_sequence() {
+        let mut buf = Vec::new();
+        let mut w = HexWriter::new(&mut buf);
+        w.write_all(b"\xde\xad\xbe\xef").unwrap();
+        assert_eq!(&buf, b"deadbeef");
+    }
+
+    #[test]
+    fn hex_writer_all_zero() {
+        let mut buf = Vec::new();
+        let mut w = HexWriter::new(&mut buf);
+        w.write_all(&[0x00; 4]).unwrap();
+        assert_eq!(&buf, b"00000000");
+    }
+
+    #[test]
+    fn hex_writer_ascii_text() {
+        let mut buf = Vec::new();
+        let mut w = HexWriter::new(&mut buf);
+        w.write_all(b"AB").unwrap();
+        // 'A' = 0x41, 'B' = 0x42
+        assert_eq!(&buf, b"4142");
+    }
+
+    #[test]
+    fn hex_writer_into_inner() {
+        let mut buf = Vec::new();
+        {
+            let mut w = HexWriter::new(&mut buf);
+            w.write_all(b"\x01\x02").unwrap();
+        }
+        assert_eq!(&buf, b"0102");
+    }
+
+    #[test]
+    fn hex_writer_multiple_writes() {
+        let mut buf = Vec::new();
+        let mut w = HexWriter::new(&mut buf);
+        w.write_all(b"\x0a").unwrap();
+        w.write_all(b"\x0b\x0c").unwrap();
+        assert_eq!(&buf, b"0a0b0c");
+    }
+
+    // ── HexReader ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hex_reader_empty() {
+        let mut r = HexReader::new(b"".as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn hex_reader_known_sequence() {
+        let mut r = HexReader::new(b"deadbeef".as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"\xde\xad\xbe\xef");
+    }
+
+    #[test]
+    fn hex_reader_uppercase() {
+        let mut r = HexReader::new(b"DEADBEEF".as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"\xde\xad\xbe\xef");
+    }
+
+    #[test]
+    fn hex_reader_mixed_case() {
+        let mut r = HexReader::new(b"DeAdBeEf".as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"\xde\xad\xbe\xef");
+    }
+
+    #[test]
+    fn hex_reader_all_zeros() {
+        let mut r = HexReader::new(b"00000000".as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, &[0u8; 4]);
+    }
+
+    #[test]
+    fn hex_reader_all_ff() {
+        let mut r = HexReader::new(b"ffffffff".as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, &[0xffu8; 4]);
+    }
+
+    #[test]
+    fn hex_reader_invalid_char() {
+        let mut r = HexReader::new(b"zz".as_ref());
+        let mut out = Vec::new();
+        let err = r.read_to_end(&mut out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn hex_reader_invalid_low_nibble() {
+        let mut r = HexReader::new(b"0g".as_ref());
+        let mut out = Vec::new();
+        let err = r.read_to_end(&mut out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ── Round-trip ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn hex_roundtrip_arbitrary() {
+        let payload: Vec<u8> = (0u8..=255u8).collect();
+        let mut encoded = Vec::new();
+        HexWriter::new(&mut encoded).write_all(&payload).unwrap();
+        assert_eq!(encoded.len(), 512);
+
+        let mut decoded = Vec::new();
+        HexReader::new(encoded.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn hex_roundtrip_empty() {
+        let mut encoded = Vec::new();
+        HexWriter::new(&mut encoded).write_all(b"").unwrap();
+        let mut decoded = Vec::new();
+        HexReader::new(encoded.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn hex_writer_constructor_shorthand() {
+        let mut buf = Vec::new();
+        let mut w = hex_writer(&mut buf);
+        w.write_all(b"\xca\xfe").unwrap();
+        assert_eq!(&buf, b"cafe");
+    }
+
+    #[test]
+    fn hex_reader_constructor_shorthand() {
+        let mut r = hex_reader(b"cafe".as_ref());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"\xca\xfe");
+    }
+}

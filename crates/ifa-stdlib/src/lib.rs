@@ -74,7 +74,8 @@ pub use io::{
     FramedWriter, LengthFieldKind, LimitedReader, LimitedWriter, LineWriter, MemoryStream,
     MultiReader, MultiWriter, PadWriter, PrefixWriter, PrefixedReader, PushbackReader,
     RepeatReader, SinkWriter, SkipReader, SuffixWriter, SuffixedReader, TeeReader, TeeWriter,
-    DEFAULT_MAX_DELIMITED_RECORD_SIZE, DEFAULT_MAX_FRAME_SIZE,
+    DEFAULT_MAX_DELIMITED_RECORD_SIZE, DEFAULT_MAX_FRAME_SIZE, HexReader, HexWriter, hex_reader,
+    hex_writer,
 };
 pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};
 pub use json::{
