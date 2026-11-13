@@ -16,7 +16,7 @@ pub mod sys;
 
 pub use collections::{
     BinaryHeap, BitSet, BitSetError, BitSetIter, ByteBuffer, CycleError, Deque, DiGraph,
-    DirectedGraph, DisjointSet, Eviction, List, LruCache, Map, Set, StringBuilder,
+    DirectedGraph, DisjointSet, Eviction, List, LruCache, Map, Set, StringBuilder, Trie, TrieSet,
 };
 pub use crypto::{
     base64_decode, base64_encode, base64url_decode, base64url_encode, blake3, blake3_hex,
@@ -1623,5 +1623,179 @@ mod tests {
         assert!(g2.is_empty());
         assert_eq!(g2.node_count(), 0);
         assert_eq!(g2.edge_count(), 0);
+    }
+
+    #[test]
+    fn test_collections_trie() {
+        let mut trie: Trie<usize> = Trie::new();
+        assert!(trie.is_empty());
+        assert_eq!(trie.len(), 0);
+        assert!(!trie.starts_with(""));
+        assert_eq!(trie.get("test"), None);
+
+        // Insertion
+        assert_eq!(trie.insert("app", 1), None);
+        assert_eq!(trie.insert("apple", 2), None);
+        assert_eq!(trie.insert("application", 3), None);
+        assert_eq!(trie.insert("apply", 4), None);
+        assert_eq!(trie.insert("banana", 5), None);
+        assert_eq!(trie.len(), 5);
+        assert!(!trie.is_empty());
+
+        // Overwrite
+        assert_eq!(trie.insert("app", 10), Some(1));
+        assert_eq!(trie.len(), 5);
+
+        // Lookup & Indexing
+        assert_eq!(trie.get("app"), Some(&10));
+        assert_eq!(trie.get("apple"), Some(&2));
+        assert_eq!(trie.get("appl"), None); // intermediate node without value
+        assert_eq!(trie["application"], 3);
+        assert!(trie.contains_key("apply"));
+        assert!(!trie.contains_key("orange"));
+
+        // Mutation via get_mut
+        if let Some(v) = trie.get_mut("apple") {
+            *v += 100;
+        }
+        assert_eq!(trie.get("apple"), Some(&102));
+
+        // starts_with
+        assert!(trie.starts_with(""));
+        assert!(trie.starts_with("app"));
+        assert!(trie.starts_with("appl"));
+        assert!(trie.starts_with("banana"));
+        assert!(!trie.starts_with("band"));
+        assert!(!trie.starts_with("zoo"));
+
+        // Longest prefix match
+        assert_eq!(trie.longest_prefix("applesauce"), Some(("apple", &102)));
+        assert_eq!(
+            trie.longest_prefix("application_data"),
+            Some(("application", &3))
+        );
+        assert_eq!(trie.longest_prefix("app"), Some(("app", &10)));
+        assert_eq!(trie.longest_prefix("ap"), None);
+        assert_eq!(trie.longest_prefix("ban"), None);
+        assert_eq!(trie.longest_prefix("bananas"), Some(("banana", &5)));
+        assert_eq!(trie.longest_prefix_value("applesauce"), Some(&102));
+        assert_eq!(trie.longest_prefix_value("unknown"), None);
+
+        // Predictive search / Autocomplete (deterministic order)
+        let app_matches = trie.predictive_search("app");
+        let app_keys: Vec<String> = app_matches.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(app_keys, vec!["app", "apple", "application", "apply"]);
+
+        let keys_all = trie.keys();
+        assert_eq!(
+            keys_all,
+            vec!["app", "apple", "application", "apply", "banana"]
+        );
+
+        // Subtrie extraction
+        let sub = trie.subtrie("appl").expect("subtrie must exist");
+        assert_eq!(sub.len(), 3); // "e" (from apple), "ication" (from application), "y" (from apply)
+        assert_eq!(sub.get("e"), Some(&102));
+        assert_eq!(sub.get("ication"), Some(&3));
+        assert_eq!(sub.get("y"), Some(&4));
+        assert_eq!(sub.get("other"), None);
+
+        // Removal & Node pruning
+        assert_eq!(trie.remove("apply"), Some(4));
+        assert_eq!(trie.len(), 4);
+        assert_eq!(trie.get("apply"), None);
+        assert!(trie.contains_key("apple")); // apple must still exist
+
+        assert_eq!(trie.remove("nonexistent"), None);
+        assert_eq!(trie.len(), 4);
+
+        assert_eq!(trie.remove("app"), Some(10));
+        assert_eq!(trie.len(), 3);
+        assert_eq!(trie.get("app"), None);
+        assert!(trie.contains_key("apple")); // children still preserved
+
+        // Unicode support
+        let mut unicode_trie = Trie::new();
+        unicode_trie.insert("café", "coffee");
+        unicode_trie.insert("cafétéria", "cafeteria");
+        unicode_trie.insert("caffè", "italian coffee");
+        unicode_trie.insert("🦀", "crab");
+        unicode_trie.insert("🦀🦀", "two crabs");
+
+        assert_eq!(unicode_trie.len(), 5);
+        assert_eq!(unicode_trie.get("café"), Some(&"coffee"));
+        assert_eq!(
+            unicode_trie.longest_prefix("cafétéria grande"),
+            Some(("cafétéria", &"cafeteria"))
+        );
+        assert_eq!(
+            unicode_trie.longest_prefix("🦀🦀🦀"),
+            Some(("🦀🦀", &"two crabs"))
+        );
+        assert_eq!(
+            unicode_trie.keys_with_prefix("caf"),
+            vec!["caffè", "café", "cafétéria"]
+        );
+        assert_eq!(
+            unicode_trie.keys_with_prefix("café"),
+            vec!["café", "cafétéria"]
+        );
+
+        // FromIterator & Extend
+        let mut from_iter_trie: Trie<i32> = Trie::from_iter(vec![("x", 10), ("y", 20)]);
+        assert_eq!(from_iter_trie.len(), 2);
+        from_iter_trie.extend(vec![("z".to_string(), 30)]);
+        assert_eq!(from_iter_trie.len(), 3);
+        assert_eq!(from_iter_trie["z"], 30);
+
+        // Clear
+        from_iter_trie.clear();
+        assert!(from_iter_trie.is_empty());
+        assert_eq!(from_iter_trie.len(), 0);
+    }
+
+    #[test]
+    fn test_collections_trie_set() {
+        let mut set = TrieSet::new();
+        assert!(set.is_empty());
+        assert_eq!(set.len(), 0);
+
+        assert!(set.insert("hello"));
+        assert!(set.insert("world"));
+        assert!(set.insert("help"));
+        assert!(!set.insert("hello")); // duplicate
+        assert_eq!(set.len(), 3);
+
+        assert!(set.contains("hello"));
+        assert!(set.contains("help"));
+        assert!(!set.contains("hel"));
+
+        assert!(set.starts_with("he"));
+        assert!(!set.starts_with("woa"));
+
+        assert_eq!(set.longest_prefix("helper function"), Some("help"));
+        assert_eq!(set.longest_prefix("worldwide"), Some("world"));
+        assert_eq!(set.longest_prefix("nothing"), None);
+
+        assert_eq!(set.keys_with_prefix("hel"), vec!["hello", "help"]);
+        assert_eq!(set.keys(), vec!["hello", "help", "world"]);
+
+        assert!(set.remove("help"));
+        assert!(!set.remove("help"));
+        assert_eq!(set.len(), 2);
+        assert!(!set.contains("help"));
+        assert!(set.contains("hello"));
+
+        let set2 = TrieSet::from_iter(vec!["alpha", "beta", "gamma"]);
+        assert_eq!(set2.len(), 3);
+        assert!(set2.contains("alpha"));
+
+        let mut set3 = TrieSet::from_iter(vec!["one".to_string()]);
+        set3.extend(vec!["two".to_string()]);
+        set3.extend(vec!["three"]);
+        assert_eq!(set3.len(), 3);
+
+        set3.clear();
+        assert!(set3.is_empty());
     }
 }

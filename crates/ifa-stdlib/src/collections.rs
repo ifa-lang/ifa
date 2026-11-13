@@ -13,6 +13,8 @@
 //! - `BitSet`: Compact, deterministic bit vector for set operations and compiler dataflow analysis.
 //! - `DisjointSet<T>`: Deterministic Union-Find forest with path compression and union by rank.
 //! - `DirectedGraph<N, E>`: Deterministic directed graph for dependency resolution, DAG scheduling and SCC.
+//! - `Trie<V>`: Deterministic prefix tree for ordered string indexing, predictive search and prefix matching.
+//! - `TrieSet`: Deterministic prefix-based unique string set with autocompletion and longest-prefix resolution.
 
 use std::collections::{btree_map, btree_set, BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -2844,6 +2846,415 @@ impl<N: Ord + Clone> Extend<(N, N)> for DirectedGraph<N, ()> {
     fn extend<I: IntoIterator<Item = (N, N)>>(&mut self, iter: I) {
         for (u, v) in iter {
             self.add_edge(u, v, ());
+        }
+    }
+}
+
+/// Deterministic Prefix Tree (Trie) for associative string prefix indexing and lookup.
+///
+/// Uses deterministic lexicographical branching with `BTreeMap` ensuring bit-for-bit
+/// reproducible traversal order. Supports prefix-matching, longest-prefix lookup,
+/// predictive search (autocompletion), and subtree extraction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trie<V> {
+    root: TrieNode<V>,
+    len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrieNode<V> {
+    value: Option<V>,
+    children: BTreeMap<char, TrieNode<V>>,
+}
+
+impl<V> Default for TrieNode<V> {
+    fn default() -> Self {
+        Self {
+            value: None,
+            children: BTreeMap::new(),
+        }
+    }
+}
+
+impl<V> TrieNode<V> {
+    fn count_items(&self) -> usize {
+        let current = if self.value.is_some() { 1 } else { 0 };
+        current
+            + self
+                .children
+                .values()
+                .map(|c| c.count_items())
+                .sum::<usize>()
+    }
+}
+
+impl<V> Default for Trie<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<V> Trie<V> {
+    /// Create a new, empty prefix tree.
+    pub fn new() -> Self {
+        Self {
+            root: TrieNode::default(),
+            len: 0,
+        }
+    }
+
+    /// Return the number of stored key-value pairs.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Check if the prefix tree contains no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Remove all entries from the prefix tree.
+    pub fn clear(&mut self) {
+        self.root.children.clear();
+        self.root.value = None;
+        self.len = 0;
+    }
+
+    /// Insert a key-value pair, returning the old value if the key was already present.
+    pub fn insert(&mut self, key: &str, value: V) -> Option<V> {
+        let mut node = &mut self.root;
+        for c in key.chars() {
+            node = node.children.entry(c).or_default();
+        }
+        let old = node.value.replace(value);
+        if old.is_none() {
+            self.len += 1;
+        }
+        old
+    }
+
+    /// Retrieve an immutable reference to the value associated with `key`.
+    pub fn get(&self, key: &str) -> Option<&V> {
+        let mut node = &self.root;
+        for c in key.chars() {
+            node = node.children.get(&c)?;
+        }
+        node.value.as_ref()
+    }
+
+    /// Retrieve a mutable reference to the value associated with `key`.
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut V> {
+        let mut node = &mut self.root;
+        for c in key.chars() {
+            node = node.children.get_mut(&c)?;
+        }
+        node.value.as_mut()
+    }
+
+    /// Check if the trie contains an entry for `key`.
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// Remove a key and its associated value, returning the removed value.
+    ///
+    /// Automatically prunes any unreferenced intermediate nodes to prevent memory leaks.
+    pub fn remove(&mut self, key: &str) -> Option<V> {
+        fn remove_node<V>(
+            node: &mut TrieNode<V>,
+            mut chars: std::str::Chars<'_>,
+        ) -> (Option<V>, bool) {
+            if let Some(c) = chars.next() {
+                if let Some(child) = node.children.get_mut(&c) {
+                    let (val, prune) = remove_node(child, chars);
+                    if prune {
+                        node.children.remove(&c);
+                    }
+                    let should_prune = node.value.is_none() && node.children.is_empty();
+                    (val, should_prune)
+                } else {
+                    (None, false)
+                }
+            } else {
+                let old = node.value.take();
+                let should_prune = node.value.is_none() && node.children.is_empty();
+                (old, should_prune)
+            }
+        }
+
+        let (old, _) = remove_node(&mut self.root, key.chars());
+        if old.is_some() {
+            self.len -= 1;
+        }
+        old
+    }
+
+    /// Check if any key in the trie begins with `prefix`.
+    pub fn starts_with(&self, prefix: &str) -> bool {
+        if prefix.is_empty() {
+            return !self.is_empty();
+        }
+        let mut node = &self.root;
+        for c in prefix.chars() {
+            match node.children.get(&c) {
+                Some(next) => node = next,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Find the longest key in the trie that is a prefix of `text`.
+    ///
+    /// Returns `Some((matching_prefix, &value))` or `None` if no prefix matches.
+    pub fn longest_prefix<'a>(&self, text: &'a str) -> Option<(&'a str, &V)> {
+        let mut best: Option<(&'a str, &V)> = None;
+        let mut node = &self.root;
+        if let Some(ref val) = node.value {
+            best = Some((&text[..0], val));
+        }
+        for (idx, c) in text.char_indices() {
+            match node.children.get(&c) {
+                Some(next) => {
+                    node = next;
+                    if let Some(ref val) = node.value {
+                        let end_idx = idx + c.len_utf8();
+                        best = Some((&text[..end_idx], val));
+                    }
+                }
+                None => break,
+            }
+        }
+        best
+    }
+
+    /// Find the value associated with the longest prefix of `text`.
+    pub fn longest_prefix_value(&self, text: &str) -> Option<&V> {
+        self.longest_prefix(text).map(|(_, v)| v)
+    }
+
+    /// Return all key-value entries starting with `prefix` in deterministic lexicographical order.
+    pub fn predictive_search(&self, prefix: &str) -> Vec<(String, &V)> {
+        let mut node = &self.root;
+        for c in prefix.chars() {
+            match node.children.get(&c) {
+                Some(next) => node = next,
+                None => return Vec::new(),
+            }
+        }
+        let mut results = Vec::new();
+        let mut current_key = prefix.to_string();
+        Self::collect_entries(node, &mut current_key, &mut results);
+        results
+    }
+
+    fn collect_entries<'a>(
+        node: &'a TrieNode<V>,
+        current: &mut String,
+        results: &mut Vec<(String, &'a V)>,
+    ) {
+        if let Some(ref val) = node.value {
+            results.push((current.clone(), val));
+        }
+        for (&c, child) in &node.children {
+            current.push(c);
+            Self::collect_entries(child, current, results);
+            current.pop();
+        }
+    }
+
+    /// Return all keys starting with `prefix` in deterministic lexicographical order.
+    pub fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+        self.predictive_search(prefix)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    /// Return all values whose keys start with `prefix` in deterministic lexicographical order.
+    pub fn values_with_prefix(&self, prefix: &str) -> Vec<&V> {
+        self.predictive_search(prefix)
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    /// Return all keys stored in the trie in deterministic lexicographical order.
+    pub fn keys(&self) -> Vec<String> {
+        self.keys_with_prefix("")
+    }
+
+    /// Return all values stored in the trie in deterministic lexicographical order.
+    pub fn values(&self) -> Vec<&V> {
+        self.values_with_prefix("")
+    }
+
+    /// Return all key-value pairs stored in the trie in deterministic lexicographical order.
+    pub fn entries(&self) -> Vec<(String, &V)> {
+        self.predictive_search("")
+    }
+
+    /// Extract a cloned subtrie rooted at `prefix`.
+    ///
+    /// The resulting trie's keys are relative to the subtree root (prefix is stripped).
+    pub fn subtrie(&self, prefix: &str) -> Option<Self>
+    where
+        V: Clone,
+    {
+        let mut node = &self.root;
+        for c in prefix.chars() {
+            node = node.children.get(&c)?;
+        }
+        let cloned_root = node.clone();
+        let len = cloned_root.count_items();
+        Some(Self {
+            root: cloned_root,
+            len,
+        })
+    }
+}
+
+impl<V> Index<&str> for Trie<V> {
+    type Output = V;
+    fn index(&self, key: &str) -> &Self::Output {
+        self.get(key).expect("no entry found for key")
+    }
+}
+
+impl<'a, V> FromIterator<(&'a str, V)> for Trie<V> {
+    fn from_iter<I: IntoIterator<Item = (&'a str, V)>>(iter: I) -> Self {
+        let mut trie = Self::new();
+        for (k, v) in iter {
+            trie.insert(k, v);
+        }
+        trie
+    }
+}
+
+impl<V> FromIterator<(String, V)> for Trie<V> {
+    fn from_iter<I: IntoIterator<Item = (String, V)>>(iter: I) -> Self {
+        let mut trie = Self::new();
+        for (k, v) in iter {
+            trie.insert(&k, v);
+        }
+        trie
+    }
+}
+
+impl<'a, V> Extend<(&'a str, V)> for Trie<V> {
+    fn extend<I: IntoIterator<Item = (&'a str, V)>>(&mut self, iter: I) {
+        for (k, v) in iter {
+            self.insert(k, v);
+        }
+    }
+}
+
+impl<V> Extend<(String, V)> for Trie<V> {
+    fn extend<I: IntoIterator<Item = (String, V)>>(&mut self, iter: I) {
+        for (k, v) in iter {
+            self.insert(&k, v);
+        }
+    }
+}
+
+/// Deterministic unique string set backed by a Prefix Tree (`Trie`).
+///
+/// Guarantees lexicographical ordering, deterministic autocomplete / prefix matching,
+/// and efficient prefix-based query operations.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TrieSet {
+    inner: Trie<()>,
+}
+
+impl TrieSet {
+    /// Create an empty trie set.
+    pub fn new() -> Self {
+        Self { inner: Trie::new() }
+    }
+
+    /// Return number of distinct keys in the set.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Check if the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Clear all keys from the set.
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    /// Insert a key into the set. Returns `true` if the key was not already present.
+    pub fn insert(&mut self, key: &str) -> bool {
+        self.inner.insert(key, ()).is_none()
+    }
+
+    /// Check if the set contains the given key.
+    pub fn contains(&self, key: &str) -> bool {
+        self.inner.contains_key(key)
+    }
+
+    /// Remove a key from the set. Returns `true` if the key was present.
+    pub fn remove(&mut self, key: &str) -> bool {
+        self.inner.remove(key).is_some()
+    }
+
+    /// Check if any key in the set starts with `prefix`.
+    pub fn starts_with(&self, prefix: &str) -> bool {
+        self.inner.starts_with(prefix)
+    }
+
+    /// Return the longest key in the set that is a prefix of `text`.
+    pub fn longest_prefix<'a>(&self, text: &'a str) -> Option<&'a str> {
+        self.inner.longest_prefix(text).map(|(s, _)| s)
+    }
+
+    /// Return all keys starting with `prefix` in deterministic lexicographical order.
+    pub fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+        self.inner.keys_with_prefix(prefix)
+    }
+
+    /// Return all keys in the set in deterministic lexicographical order.
+    pub fn keys(&self) -> Vec<String> {
+        self.inner.keys()
+    }
+}
+
+impl<'a> FromIterator<&'a str> for TrieSet {
+    fn from_iter<I: IntoIterator<Item = &'a str>>(iter: I) -> Self {
+        let mut set = Self::new();
+        for s in iter {
+            set.insert(s);
+        }
+        set
+    }
+}
+
+impl FromIterator<String> for TrieSet {
+    fn from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
+        let mut set = Self::new();
+        for s in iter {
+            set.insert(&s);
+        }
+        set
+    }
+}
+
+impl<'a> Extend<&'a str> for TrieSet {
+    fn extend<I: IntoIterator<Item = &'a str>>(&mut self, iter: I) {
+        for s in iter {
+            self.insert(s);
+        }
+    }
+}
+
+impl Extend<String> for TrieSet {
+    fn extend<I: IntoIterator<Item = String>>(&mut self, iter: I) {
+        for s in iter {
+            self.insert(&s);
         }
     }
 }
