@@ -462,6 +462,17 @@ impl JsonValue {
     pub fn create_patch(&self, target: &JsonValue) -> JsonValue {
         create_patch(self, target)
     }
+
+    /// Query values matching a JSONPath expression (RFC 9535 subset: root, properties, wildcards, slices, recursive descent, filters).
+    pub fn query<'a>(&'a self, path: &str) -> Result<Vec<&'a JsonValue>, String> {
+        let segments = parse_jsonpath(path)?;
+        Ok(execute_jsonpath(self, &segments))
+    }
+
+    /// Alias for `query` adhering to JSONPath terminology.
+    pub fn jsonpath<'a>(&'a self, path: &str) -> Result<Vec<&'a JsonValue>, String> {
+        self.query(path)
+    }
 }
 
 /// Decode a JSON Pointer reference token according to RFC 6901 (`~1` -> `/`, `~0` -> `~`).
@@ -1131,12 +1142,16 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_bool(&mut self) -> Result<JsonValue, String> {
-        if self.expect_str("true").is_ok() {
-            Ok(JsonValue::Bool(true))
-        } else if self.expect_str("false").is_ok() {
-            Ok(JsonValue::Bool(false))
-        } else {
-            Err(format!("Expected boolean at offset {}", self.cursor))
+        match self.peek() {
+            Some('t') => {
+                self.expect_str("true")?;
+                Ok(JsonValue::Bool(true))
+            }
+            Some('f') => {
+                self.expect_str("false")?;
+                Ok(JsonValue::Bool(false))
+            }
+            _ => Err(format!("Expected boolean at offset {}", self.cursor)),
         }
     }
 
@@ -1300,6 +1315,606 @@ impl<'a> JsonParser<'a> {
         }
         Ok(())
     }
+}
+
+/// An operation or predicate in a JSONPath filter expression `[?(...)]`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterOp {
+    Exists,
+    Equal(JsonValue),
+    NotEqual(JsonValue),
+    GreaterThan(f64),
+    GreaterThanOrEqual(f64),
+    LessThan(f64),
+    LessThanOrEqual(f64),
+}
+
+/// A filter predicate evaluated against JSON objects or values in JSONPath queries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterPredicate {
+    pub path: String,
+    pub op: FilterOp,
+}
+
+/// A parsed segment of a JSONPath query expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PathSegment {
+    /// Dot notation or bracketed key (e.g. `.name` or `['name']`).
+    Property(String),
+    /// Wildcard selector `.*` or `[*]`.
+    Wildcard,
+    /// Bracketed integer index (e.g. `[0]` or `[-1]`).
+    Index(i64),
+    /// Array slice selector `[start:end:step]` with optional step.
+    Slice {
+        start: Option<i64>,
+        end: Option<i64>,
+        step: Option<i64>,
+    },
+    /// Recursive descent for a specific key (e.g. `..name`).
+    RecursiveDescent(String),
+    /// Recursive descent wildcard (e.g. `..*`).
+    RecursiveWildcard,
+    /// Filter expression (e.g. `[?(@.age > 18)]`).
+    Filter(FilterPredicate),
+}
+
+/// Parse a JSONPath query expression into structured segments.
+pub fn parse_jsonpath(path: &str) -> Result<Vec<PathSegment>, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut segments = Vec::new();
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut i = 0;
+
+    // Optional leading '$'
+    if i < chars.len() && chars[i] == '$' {
+        i += 1;
+    }
+
+    while i < chars.len() {
+        if chars[i] == '.' {
+            i += 1;
+            if i < chars.len() && chars[i] == '.' {
+                // Recursive descent '..'
+                i += 1;
+                if i < chars.len() && chars[i] == '*' {
+                    i += 1;
+                    segments.push(PathSegment::RecursiveWildcard);
+                } else if i < chars.len() && chars[i] == '[' {
+                    segments.push(PathSegment::RecursiveWildcard);
+                } else {
+                    let start = i;
+                    while i < chars.len() && chars[i] != '.' && chars[i] != '[' {
+                        i += 1;
+                    }
+                    let key: String = chars[start..i].iter().collect();
+                    if !key.is_empty() {
+                        segments.push(PathSegment::RecursiveDescent(key));
+                    }
+                }
+            } else if i < chars.len() && chars[i] == '*' {
+                i += 1;
+                segments.push(PathSegment::Wildcard);
+            } else {
+                let start = i;
+                while i < chars.len() && chars[i] != '.' && chars[i] != '[' {
+                    i += 1;
+                }
+                let key: String = chars[start..i].iter().collect();
+                if !key.is_empty() {
+                    segments.push(PathSegment::Property(key));
+                }
+            }
+        } else if chars[i] == '[' {
+            i += 1;
+            let mut depth = 1;
+            let start = i;
+            let mut in_single_quote = false;
+            let mut in_double_quote = false;
+
+            while i < chars.len() && depth > 0 {
+                let c = chars[i];
+                if c == '\'' && !in_double_quote {
+                    in_single_quote = !in_single_quote;
+                } else if c == '"' && !in_single_quote {
+                    in_double_quote = !in_double_quote;
+                } else if !in_single_quote && !in_double_quote {
+                    if c == '[' {
+                        depth += 1;
+                    } else if c == ']' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                i += 1;
+            }
+
+            if depth != 0 {
+                return Err("Unclosed bracket in JSONPath expression".to_string());
+            }
+
+            let inner: String = chars[start..i].iter().collect();
+            i += 1; // skip closing ']'
+            let inner_trimmed = inner.trim();
+
+            if inner_trimmed == "*" {
+                segments.push(PathSegment::Wildcard);
+            } else if inner_trimmed.starts_with("?(") && inner_trimmed.ends_with(')') {
+                let filter_expr = &inner_trimmed[2..inner_trimmed.len() - 1];
+                let pred = parse_filter_expression(filter_expr)?;
+                segments.push(PathSegment::Filter(pred));
+            } else if inner_trimmed.contains(':') {
+                let slice_seg = parse_slice_segment(inner_trimmed)?;
+                segments.push(slice_seg);
+            } else if (inner_trimmed.starts_with('\'') && inner_trimmed.ends_with('\''))
+                || (inner_trimmed.starts_with('"') && inner_trimmed.ends_with('"'))
+            {
+                if inner_trimmed.len() >= 2 {
+                    let prop = &inner_trimmed[1..inner_trimmed.len() - 1];
+                    segments.push(PathSegment::Property(prop.to_string()));
+                } else {
+                    segments.push(PathSegment::Property(String::new()));
+                }
+            } else if let Ok(idx) = inner_trimmed.parse::<i64>() {
+                segments.push(PathSegment::Index(idx));
+            } else {
+                segments.push(PathSegment::Property(inner_trimmed.to_string()));
+            }
+        } else {
+            let start = i;
+            while i < chars.len() && chars[i] != '.' && chars[i] != '[' {
+                i += 1;
+            }
+            let key: String = chars[start..i].iter().collect();
+            if !key.is_empty() {
+                segments.push(PathSegment::Property(key));
+            }
+        }
+    }
+
+    Ok(segments)
+}
+
+fn parse_slice_segment(slice_str: &str) -> Result<PathSegment, String> {
+    let parts: Vec<&str> = slice_str.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return Err(format!("Invalid slice syntax '{}'", slice_str));
+    }
+
+    let parse_opt = |s: &str| -> Result<Option<i64>, String> {
+        let t = s.trim();
+        if t.is_empty() {
+            Ok(None)
+        } else {
+            t.parse::<i64>().map(Some).map_err(|e| e.to_string())
+        }
+    };
+
+    let start = parse_opt(parts[0])?;
+    let end = parse_opt(parts[1])?;
+    let step = if parts.len() == 3 {
+        parse_opt(parts[2])?
+    } else {
+        None
+    };
+
+    Ok(PathSegment::Slice { start, end, step })
+}
+
+fn find_filter_operator(expr: &str) -> Option<(usize, &'static str)> {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+        } else if c == '"' && !in_single {
+            in_double = !in_double;
+        } else if !in_single && !in_double {
+            if i + 1 < chars.len() {
+                let pair: String = chars[i..=i + 1].iter().collect();
+                if pair == "==" {
+                    return Some((i, "=="));
+                } else if pair == "!=" {
+                    return Some((i, "!="));
+                } else if pair == ">=" {
+                    return Some((i, ">="));
+                } else if pair == "<=" {
+                    return Some((i, "<="));
+                }
+            }
+            if c == '>' {
+                return Some((i, ">"));
+            } else if c == '<' {
+                return Some((i, "<"));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_filter_expression(expr: &str) -> Result<FilterPredicate, String> {
+    let expr = expr.trim();
+    if let Some((pos, op_str)) = find_filter_operator(expr) {
+        let lhs = expr[..pos].trim();
+        let rhs = expr[pos + op_str.len()..].trim();
+
+        let clean_path = lhs
+            .trim_start_matches('@')
+            .trim_start_matches('.')
+            .trim_matches(|c| c == '\'' || c == '"' || c == '[' || c == ']')
+            .to_string();
+
+        let val_res = parse_filter_rhs_value(rhs);
+        let op = match op_str {
+            "==" => FilterOp::Equal(val_res),
+            "!=" => FilterOp::NotEqual(val_res),
+            ">=" => {
+                let num = val_res.as_f64().unwrap_or(0.0);
+                FilterOp::GreaterThanOrEqual(num)
+            }
+            "<=" => {
+                let num = val_res.as_f64().unwrap_or(0.0);
+                FilterOp::LessThanOrEqual(num)
+            }
+            ">" => {
+                let num = val_res.as_f64().unwrap_or(0.0);
+                FilterOp::GreaterThan(num)
+            }
+            "<" => {
+                let num = val_res.as_f64().unwrap_or(0.0);
+                FilterOp::LessThan(num)
+            }
+            _ => unreachable!(),
+        };
+
+        return Ok(FilterPredicate {
+            path: clean_path,
+            op,
+        });
+    }
+
+    let clean_path = expr
+        .trim_start_matches('@')
+        .trim_start_matches('.')
+        .trim_matches(|c| c == '\'' || c == '"' || c == '[' || c == ']')
+        .to_string();
+
+    Ok(FilterPredicate {
+        path: clean_path,
+        op: FilterOp::Exists,
+    })
+}
+
+fn parse_filter_rhs_value(rhs: &str) -> JsonValue {
+    let t = rhs.trim();
+    if t == "true" {
+        JsonValue::Bool(true)
+    } else if t == "false" {
+        JsonValue::Bool(false)
+    } else if t == "null" {
+        JsonValue::Null
+    } else if (t.starts_with('\'') && t.ends_with('\'')) || (t.starts_with('"') && t.ends_with('"'))
+    {
+        if t.len() >= 2 {
+            JsonValue::String(t[1..t.len() - 1].to_string())
+        } else {
+            JsonValue::String(String::new())
+        }
+    } else if let Ok(n) = t.parse::<f64>() {
+        JsonValue::Number(n)
+    } else {
+        JsonValue::String(t.to_string())
+    }
+}
+
+fn resolve_index(idx: i64, len: usize) -> Option<usize> {
+    if idx >= 0 {
+        let u = idx as usize;
+        if u < len {
+            Some(u)
+        } else {
+            None
+        }
+    } else {
+        let neg = (-idx) as usize;
+        if neg <= len && neg > 0 {
+            Some(len - neg)
+        } else {
+            None
+        }
+    }
+}
+
+fn evaluate_slice(
+    arr: &[JsonValue],
+    start: Option<i64>,
+    end: Option<i64>,
+    step: Option<i64>,
+) -> Vec<&JsonValue> {
+    let step = step.unwrap_or(1);
+    if step == 0 {
+        return Vec::new();
+    }
+    let len = arr.len() as i64;
+    if len == 0 {
+        return Vec::new();
+    }
+
+    let (s, e) = if step > 0 {
+        let s = match start {
+            Some(mut val) => {
+                if val < 0 {
+                    val += len;
+                }
+                val.clamp(0, len)
+            }
+            None => 0,
+        };
+        let e = match end {
+            Some(mut val) => {
+                if val < 0 {
+                    val += len;
+                }
+                val.clamp(0, len)
+            }
+            None => len,
+        };
+        (s, e)
+    } else {
+        let s = match start {
+            Some(mut val) => {
+                if val < 0 {
+                    val += len;
+                }
+                val.clamp(0, len - 1)
+            }
+            None => len - 1,
+        };
+        let e = match end {
+            Some(mut val) => {
+                if val < 0 {
+                    val += len;
+                }
+                val.clamp(-1, len - 1)
+            }
+            None => -1,
+        };
+        (s, e)
+    };
+
+    let mut result = Vec::new();
+    if step > 0 {
+        let mut i = s;
+        while i < e {
+            result.push(&arr[i as usize]);
+            i += step;
+        }
+    } else {
+        let mut i = s;
+        while i > e {
+            result.push(&arr[i as usize]);
+            i += step;
+        }
+    }
+    result
+}
+
+fn collect_recursive_descent<'a>(
+    node: &'a JsonValue,
+    target_key: &str,
+    out: &mut Vec<&'a JsonValue>,
+) {
+    match node {
+        JsonValue::Object(map) => {
+            for (k, v) in map {
+                if k == target_key {
+                    out.push(v);
+                }
+                collect_recursive_descent(v, target_key, out);
+            }
+        }
+        JsonValue::Array(arr) => {
+            for item in arr {
+                collect_recursive_descent(item, target_key, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_recursive_wildcard<'a>(node: &'a JsonValue, out: &mut Vec<&'a JsonValue>) {
+    match node {
+        JsonValue::Object(map) => {
+            for v in map.values() {
+                out.push(v);
+                collect_recursive_wildcard(v, out);
+            }
+        }
+        JsonValue::Array(arr) => {
+            for item in arr {
+                out.push(item);
+                collect_recursive_wildcard(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_filter_target<'a>(item: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
+    let clean = path.trim_start_matches('@').trim_start_matches('.').trim();
+    if clean.is_empty() {
+        return Some(item);
+    }
+    let mut current = item;
+    for part in clean.split('.') {
+        let part = part.trim_matches(|c| c == '\'' || c == '"' || c == '[' || c == ']');
+        if part.is_empty() {
+            continue;
+        }
+        match current {
+            JsonValue::Object(map) => {
+                current = map.get(part)?;
+            }
+            JsonValue::Array(arr) => {
+                if let Ok(idx) = part.parse::<usize>() {
+                    current = arr.get(idx)?;
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+fn evaluate_filter(item: &JsonValue, pred: &FilterPredicate) -> bool {
+    let target = resolve_filter_target(item, &pred.path);
+    match &pred.op {
+        FilterOp::Exists => match target {
+            Some(JsonValue::Null) | None => false,
+            Some(JsonValue::Bool(b)) => *b,
+            Some(_) => true,
+        },
+        FilterOp::Equal(expected) => target == Some(expected),
+        FilterOp::NotEqual(expected) => target != Some(expected),
+        FilterOp::GreaterThan(threshold) => {
+            if let Some(JsonValue::Number(n)) = target {
+                *n > *threshold
+            } else {
+                false
+            }
+        }
+        FilterOp::GreaterThanOrEqual(threshold) => {
+            if let Some(JsonValue::Number(n)) = target {
+                *n >= *threshold
+            } else {
+                false
+            }
+        }
+        FilterOp::LessThan(threshold) => {
+            if let Some(JsonValue::Number(n)) = target {
+                *n < *threshold
+            } else {
+                false
+            }
+        }
+        FilterOp::LessThanOrEqual(threshold) => {
+            if let Some(JsonValue::Number(n)) = target {
+                *n <= *threshold
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Execute parsed JSONPath segments on a root `JsonValue` returning matching references.
+pub fn execute_jsonpath<'a>(root: &'a JsonValue, segments: &[PathSegment]) -> Vec<&'a JsonValue> {
+    let mut current = vec![root];
+
+    for seg in segments {
+        let mut next = Vec::new();
+        match seg {
+            PathSegment::Property(key) => {
+                for node in current {
+                    if let JsonValue::Object(map) = node {
+                        if let Some(val) = map.get(key) {
+                            next.push(val);
+                        }
+                    }
+                }
+            }
+            PathSegment::Wildcard => {
+                for node in current {
+                    match node {
+                        JsonValue::Object(map) => {
+                            for val in map.values() {
+                                next.push(val);
+                            }
+                        }
+                        JsonValue::Array(arr) => {
+                            for item in arr {
+                                next.push(item);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            PathSegment::Index(idx) => {
+                for node in current {
+                    if let JsonValue::Array(arr) = node {
+                        if let Some(u) = resolve_index(*idx, arr.len()) {
+                            next.push(&arr[u]);
+                        }
+                    }
+                }
+            }
+            PathSegment::Slice { start, end, step } => {
+                for node in current {
+                    if let JsonValue::Array(arr) = node {
+                        let sliced = evaluate_slice(arr, *start, *end, *step);
+                        next.extend(sliced);
+                    }
+                }
+            }
+            PathSegment::RecursiveDescent(key) => {
+                for node in current {
+                    collect_recursive_descent(node, key, &mut next);
+                }
+            }
+            PathSegment::RecursiveWildcard => {
+                for node in current {
+                    collect_recursive_wildcard(node, &mut next);
+                }
+            }
+            PathSegment::Filter(pred) => {
+                for node in current {
+                    match node {
+                        JsonValue::Array(arr) => {
+                            for item in arr {
+                                if evaluate_filter(item, pred) {
+                                    next.push(item);
+                                }
+                            }
+                        }
+                        JsonValue::Object(map) => {
+                            for val in map.values() {
+                                if evaluate_filter(val, pred) {
+                                    next.push(val);
+                                }
+                            }
+                        }
+                        _ => {
+                            if evaluate_filter(node, pred) {
+                                next.push(node);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        current = next;
+    }
+
+    current
+}
+
+/// Query values in a JSON document matching a JSONPath expression.
+pub fn query<'a>(doc: &'a JsonValue, path: &str) -> Result<Vec<&'a JsonValue>, String> {
+    doc.query(path)
 }
 
 #[cfg(test)]
@@ -1572,5 +2187,123 @@ mod tests {
         assert_eq!(ops_method, diff(&source, &target));
         let patch_method = source.create_patch(&target);
         assert_eq!(patch_method, patch_doc);
+    }
+
+    #[test]
+    fn test_jsonpath_queries() {
+        let sample = r#"{
+            "store": {
+                "book": [
+                    {
+                        "category": "reference",
+                        "author": "Nigel Rees",
+                        "title": "Sayings of the Century",
+                        "price": 8.95,
+                        "in_stock": true
+                    },
+                    {
+                        "category": "fiction",
+                        "author": "Evelyn Waugh",
+                        "title": "Sword of Honour",
+                        "price": 12.99,
+                        "in_stock": false
+                    },
+                    {
+                        "category": "fiction",
+                        "author": "Herman Melville",
+                        "title": "Moby Dick",
+                        "isbn": "0-553-21311-3",
+                        "price": 8.99,
+                        "in_stock": true
+                    },
+                    {
+                        "category": "fiction",
+                        "author": "J. R. R. Tolkien",
+                        "title": "The Lord of the Rings",
+                        "isbn": "0-395-19395-8",
+                        "price": 22.99,
+                        "in_stock": true
+                    }
+                ],
+                "bicycle": {
+                    "color": "red",
+                    "price": 19.95
+                }
+            },
+            "numbers": [0, 1, 2, 3, 4, 5]
+        }"#;
+
+        let doc = decode(sample).expect("decode sample json");
+
+        // 1. Direct and bracket property access
+        let books = doc.query("$.store.book").unwrap();
+        assert_eq!(books.len(), 1);
+        assert!(books[0].is_array());
+
+        let bike_color = doc.query("$['store']['bicycle']['color']").unwrap();
+        assert_eq!(bike_color.len(), 1);
+        assert_eq!(bike_color[0].as_str(), Some("red"));
+
+        // 2. Wildcard array elements
+        let authors = doc.query("$.store.book[*].author").unwrap();
+        assert_eq!(authors.len(), 4);
+        assert_eq!(authors[0].as_str(), Some("Nigel Rees"));
+        assert_eq!(authors[3].as_str(), Some("J. R. R. Tolkien"));
+
+        // 3. Recursive descent
+        let all_prices = doc.query("$..price").unwrap();
+        assert_eq!(all_prices.len(), 5); // 4 books + 1 bicycle
+
+        let all_authors = doc.query("$..author").unwrap();
+        assert_eq!(all_authors.len(), 4);
+
+        // 4. Indexing (positive and negative)
+        let first_book = doc.query("$.store.book[0].title").unwrap();
+        assert_eq!(first_book[0].as_str(), Some("Sayings of the Century"));
+
+        let last_book = doc.query("$.store.book[-1].title").unwrap();
+        assert_eq!(last_book[0].as_str(), Some("The Lord of the Rings"));
+
+        // 5. Slices
+        let slice_first_two = doc.query("$.numbers[:2]").unwrap();
+        assert_eq!(slice_first_two.len(), 2);
+        assert_eq!(slice_first_two[0].as_i64(), Some(0));
+        assert_eq!(slice_first_two[1].as_i64(), Some(1));
+
+        let slice_step = doc.query("$.numbers[::2]").unwrap();
+        assert_eq!(slice_step.len(), 3); // 0, 2, 4
+        assert_eq!(slice_step[0].as_i64(), Some(0));
+        assert_eq!(slice_step[1].as_i64(), Some(2));
+        assert_eq!(slice_step[2].as_i64(), Some(4));
+
+        let slice_rev = doc.query("$.numbers[::-1]").unwrap();
+        assert_eq!(slice_rev.len(), 6);
+        assert_eq!(slice_rev[0].as_i64(), Some(5));
+        assert_eq!(slice_rev[5].as_i64(), Some(0));
+
+        // 6. Filter expressions
+        let cheap_books = doc.query("$.store.book[?(@.price < 10.0)].title").unwrap();
+        assert_eq!(cheap_books.len(), 2);
+        assert_eq!(cheap_books[0].as_str(), Some("Sayings of the Century"));
+        assert_eq!(cheap_books[1].as_str(), Some("Moby Dick"));
+
+        let fiction_books = doc
+            .query("$.store.book[?(@.category == 'fiction')].title")
+            .unwrap();
+        assert_eq!(fiction_books.len(), 3);
+
+        let non_fiction = doc
+            .query("$.store.book[?(@.category != 'fiction')].title")
+            .unwrap();
+        assert_eq!(non_fiction.len(), 1);
+        assert_eq!(non_fiction[0].as_str(), Some("Sayings of the Century"));
+
+        let in_stock_books = doc.query("$.store.book[?(@.in_stock)].title").unwrap();
+        assert_eq!(in_stock_books.len(), 3);
+
+        // 7. Free function query
+        let q_res = query(&doc, "$.store.bicycle.price").unwrap();
+        assert_eq!(q_res.len(), 1);
+        assert_eq!(q_res[0].as_f64(), Some(19.95));
     }
 }

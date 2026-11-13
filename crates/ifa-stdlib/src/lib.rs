@@ -72,7 +72,8 @@ pub use iter::{all, any, filter, find, fold, for_each, map, partition, reduce};
 pub use json::{
     create_merge_patch, create_patch as create_json_patch, decode as decode_json,
     diff as diff_json, encode as encode_json, encode_pretty as encode_json_pretty,
-    parse_patch as parse_json_patch, JsonValue, PatchOperation,
+    execute_jsonpath, parse_jsonpath, parse_patch as parse_json_patch, query as query_jsonpath,
+    FilterOp, FilterPredicate, JsonValue, PatchOperation, PathSegment,
 };
 pub use net::{
     lookup_mime_type, AsyncTcpListener, AsyncTcpStream, AsyncTimer, AsyncUdpSocket,
