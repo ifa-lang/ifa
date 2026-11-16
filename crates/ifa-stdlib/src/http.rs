@@ -6683,7 +6683,8 @@ mod tests {
         // 1. Direct encoding and decoding unit tests
         let chunks: [&[u8]; 3] = [b"Hello, ", b"world of ", b"colorless chunked streaming!"];
         let encoded = encode_chunked(&chunks);
-        let expected_wire = "7\r\nHello, \r\n9\r\nworld of \r\n1C\r\ncolorless chunked streaming!\r\n0\r\n\r\n";
+        let expected_wire =
+            "7\r\nHello, \r\n9\r\nworld of \r\n1C\r\ncolorless chunked streaming!\r\n0\r\n\r\n";
         assert_eq!(String::from_utf8_lossy(&encoded), expected_wire);
 
         let (decoded, consumed, trailers) =
@@ -6732,7 +6733,11 @@ mod tests {
         server.get("/stream", |_req| {
             HttpResponse::ok()
                 .header("Content-Type", "text/plain")
-                .chunked_body(&[b"chunk-1: welcome\n", b"chunk-2: to ifa\n", b"chunk-3: streams\n"])
+                .chunked_body(&[
+                    b"chunk-1: welcome\n",
+                    b"chunk-2: to ifa\n",
+                    b"chunk-3: streams\n",
+                ])
         });
 
         // Also test server receiving chunked request from client
@@ -6747,7 +6752,9 @@ mod tests {
         let client = HttpClient::new();
 
         // GET chunked response
-        let resp = client.get("127.0.0.1", port, "/stream").expect("GET chunked");
+        let resp = client
+            .get("127.0.0.1", port, "/stream")
+            .expect("GET chunked");
         assert_eq!(resp.status, HttpStatus::OK);
         assert_eq!(
             resp.body_str().unwrap(),
