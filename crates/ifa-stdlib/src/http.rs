@@ -6504,7 +6504,8 @@ mod tests {
         assert!(metrics.total_duration >= metrics.request_duration);
 
         // 2. Structured Url request with metrics
-        let target_url = Url::parse(&format!("http://127.0.0.1:{}/healthz", port)).expect("Valid url");
+        let target_url =
+            Url::parse(&format!("http://127.0.0.1:{}/healthz", port)).expect("Valid url");
         let mut req_url = HttpRequest::new(HttpMethod::Get, "/healthz");
         let (resp_url, metrics_url) = client
             .send_url_with_metrics(&mut req_url, &target_url)
