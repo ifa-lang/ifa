@@ -2529,6 +2529,138 @@ impl AsyncWsConnection {
             }
         }
     }
+
+    /// Perform an asynchronous RFC 6455 client handshake over an `AsyncTcpStream`.
+    /// Sends the HTTP Upgrade request, awaits and verifies the HTTP 101 Switching Protocols response.
+    pub fn client_handshake(
+        mut stream: AsyncTcpStream,
+        host: &str,
+        port: u16,
+        path: &str,
+        client_key: &str,
+    ) -> io::Result<Self> {
+        let expected_accept = crate::crypto::websocket_accept_key(client_key);
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: {}:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            path, host, port, client_key
+        );
+
+        stream.write_all(req.as_bytes())?;
+
+        let mut demux = WsDemux::new();
+        let mut spins = 0;
+
+        loop {
+            let mut chunk = [0u8; 1024];
+            match stream.try_read(&mut chunk) {
+                Ok(Some(n)) if n > 0 => {
+                    demux.push_bytes(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&demux.buffer);
+                    if let Some(idx) = text.find("\r\n\r\n") {
+                        let header_part = &text[..idx];
+                        if !header_part.contains("101 Switching Protocols")
+                            || !header_part.contains(&expected_accept)
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "WebSocket handshake rejected by server",
+                            ));
+                        }
+                        demux.buffer.drain(..idx + 4);
+                        return Ok(Self {
+                            stream,
+                            demux,
+                            is_client: true,
+                            is_closed: false,
+                        });
+                    }
+                }
+                Ok(Some(0)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Server closed connection during WebSocket handshake",
+                    ));
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+
+            spins += 1;
+            if spins < 16 {
+                std::hint::spin_loop();
+            } else {
+                GLOBAL_SCHEDULER.yield_now();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Perform an asynchronous RFC 6455 server handshake over an `AsyncTcpStream`.
+    /// Reads client HTTP Upgrade request, validates `Sec-WebSocket-Key`, sends 101 Switching Protocols,
+    /// and returns the active `AsyncWsConnection`.
+    pub fn server_handshake(mut stream: AsyncTcpStream) -> io::Result<Self> {
+        let mut demux = WsDemux::new();
+        let mut spins = 0;
+
+        loop {
+            let mut chunk = [0u8; 1024];
+            match stream.try_read(&mut chunk) {
+                Ok(Some(n)) if n > 0 => {
+                    demux.push_bytes(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&demux.buffer);
+                    if let Some(header_end) = text.find("\r\n\r\n") {
+                        let header_part = &text[..header_end];
+                        let mut key: Option<String> = None;
+                        for line in header_part.lines() {
+                            if line.to_ascii_lowercase().starts_with("sec-websocket-key:") {
+                                if let Some(orig_idx) = line.find(':') {
+                                    key = Some(line[orig_idx + 1..].trim().to_string());
+                                }
+                            }
+                        }
+
+                        let client_key = key.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Missing Sec-WebSocket-Key in HTTP Upgrade request",
+                            )
+                        })?;
+
+                        let accept = crate::crypto::websocket_accept_key(&client_key);
+                        let response = format!(
+                            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                            accept
+                        );
+                        stream.write_all(response.as_bytes())?;
+
+                        demux.buffer.drain(..header_end + 4);
+                        return Ok(Self {
+                            stream,
+                            demux,
+                            is_client: false,
+                            is_closed: false,
+                        });
+                    }
+                }
+                Ok(Some(0)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Client closed connection during WebSocket handshake",
+                    ));
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+
+            spins += 1;
+            if spins < 16 {
+                std::hint::spin_loop();
+            } else {
+                GLOBAL_SCHEDULER.yield_now();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
 }
 
 /// Token Bucket Rate Limiter for network request throttling and DoS mitigation.
@@ -3076,6 +3208,65 @@ mod tests {
                 assert_eq!(reason, "Clean shutdown");
             }
             other => panic!("Expected close message, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_async_ws_handshake_roundtrip() {
+        use ifa_runtime::reactor::AsyncTcpListener;
+
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let client_key = "dGhlIHNhbXBsZSBub25jZQ==";
+
+        GLOBAL_SCHEDULER.spawn(move || {
+            let stream = AsyncTcpStream::connect(addr).expect("connect client");
+            let mut client = AsyncWsConnection::client_handshake(
+                stream,
+                "127.0.0.1",
+                addr.port(),
+                "/chat",
+                client_key,
+            )
+            .expect("client handshake failed");
+
+            client
+                .send_text("HANDSHAKE_HELLO_FROM_CLIENT")
+                .expect("send text");
+            let reply = client.recv_message().expect("recv reply");
+            assert_eq!(
+                reply,
+                WsMessage::Text("HANDSHAKE_ACK_FROM_SERVER".to_string())
+            );
+
+            client
+                .send_close(1000, "Normal")
+                .expect("client send close");
+        });
+
+        let mut server = loop {
+            if let Ok(Some((stream, _))) = listener.try_accept() {
+                break AsyncWsConnection::server_handshake(stream)
+                    .expect("server handshake failed");
+            }
+            GLOBAL_SCHEDULER.yield_now();
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        let msg = server.recv_message().expect("server recv message");
+        assert_eq!(
+            msg,
+            WsMessage::Text("HANDSHAKE_HELLO_FROM_CLIENT".to_string())
+        );
+
+        server
+            .send_text("HANDSHAKE_ACK_FROM_SERVER")
+            .expect("server reply text");
+
+        let close_msg = server.recv_message().expect("server recv close");
+        match close_msg {
+            WsMessage::Close(code, _) => assert_eq!(code, Some(1000)),
+            other => panic!("Expected close, got {:?}", other),
         }
     }
 
