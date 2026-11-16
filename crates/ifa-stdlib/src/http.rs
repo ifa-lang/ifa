@@ -634,7 +634,9 @@ impl GzipStreamDecoder {
                 return Ok(Vec::new()); // Wait for full base header
             }
             if self.buffer[0] != 0x1F || self.buffer[1] != 0x8B || self.buffer[2] != 8 {
-                return Err("Invalid Gzip magic numbers or unsupported compression method".to_string());
+                return Err(
+                    "Invalid Gzip magic numbers or unsupported compression method".to_string(),
+                );
             }
             self.flg = self.buffer[3];
             let mut pos = 10;
@@ -703,7 +705,10 @@ impl GzipStreamDecoder {
             let btype = (header >> 1) & 3;
 
             if btype != 0 {
-                return Err(format!("Unsupported deflate compression block type: {}", btype));
+                return Err(format!(
+                    "Unsupported deflate compression block type: {}",
+                    btype
+                ));
             }
 
             if cur + 5 > self.buffer.len() {
@@ -3018,7 +3023,9 @@ impl HttpClient {
             .map(HttpCacheDirectives::parse)
             .unwrap_or_default();
 
-        if !resp_cc.no_store && (server_resp.status == HttpStatus::OK || server_resp.status == HttpStatus::CREATED) {
+        if !resp_cc.no_store
+            && (server_resp.status == HttpStatus::OK || server_resp.status == HttpStatus::CREATED)
+        {
             let entry = HttpCacheEntry::new(&cache_key, &server_resp, now);
             cache.insert(&cache_key, entry);
         }
@@ -4753,7 +4760,9 @@ impl HttpCacheEntry {
 
         let expires_at = if let Some(cc) = response.headers.get("cache-control") {
             let directives = HttpCacheDirectives::parse(cc);
-            directives.max_age.map(|sec| response_time + Duration::from_secs(sec))
+            directives
+                .max_age
+                .map(|sec| response_time + Duration::from_secs(sec))
         } else if let Some(exp) = response.headers.get("expires") {
             parse_http_date(exp)
         } else {
@@ -4795,7 +4804,10 @@ impl HttpCacheEntry {
         for (k, v) in not_modified_resp.headers.iter() {
             let lower = k.to_ascii_lowercase();
             // End-to-end headers that can be refreshed on 304
-            if matches!(lower.as_str(), "date" | "expires" | "cache-control" | "etag" | "last-modified" | "vary") {
+            if matches!(
+                lower.as_str(),
+                "date" | "expires" | "cache-control" | "etag" | "last-modified" | "vary"
+            ) {
                 self.headers.set(k, v);
             }
         }
@@ -4807,7 +4819,9 @@ impl HttpCacheEntry {
         }
         if let Some(cc) = not_modified_resp.headers.get("cache-control") {
             let directives = HttpCacheDirectives::parse(cc);
-            self.expires_at = directives.max_age.map(|sec| response_time + Duration::from_secs(sec));
+            self.expires_at = directives
+                .max_age
+                .map(|sec| response_time + Duration::from_secs(sec));
         } else if let Some(exp) = not_modified_resp.headers.get("expires") {
             self.expires_at = parse_http_date(exp);
         }
@@ -6586,7 +6600,8 @@ mod tests {
         assert!(!req_ius_conflict.if_unmodified_since(resource_time));
 
         // 8. HTTP Cache-Control Directives & Entry (RFC 7234)
-        let cc_header = "public, max-age=3600, s-maxage=7200, must-revalidate, stale-while-revalidate=60";
+        let cc_header =
+            "public, max-age=3600, s-maxage=7200, must-revalidate, stale-while-revalidate=60";
         let cc = HttpCacheDirectives::parse(cc_header);
         assert!(cc.is_public);
         assert!(!cc.is_private);
