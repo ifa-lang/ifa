@@ -3,6 +3,91 @@ use crate::json::{self, JsonValue};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Encode byte slices into an HTTP/1.1 chunked transfer stream (RFC 7230 §4.1).
+/// Each non-empty chunk is serialized as `<hex-len>\r\n<data>\r\n`.
+/// A terminating `0\r\n\r\n` chunk is appended.
+pub fn encode_chunked(chunks: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for chunk in chunks {
+        if !chunk.is_empty() {
+            out.extend_from_slice(format!("{:X}\r\n", chunk.len()).as_bytes());
+            out.extend_from_slice(chunk);
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    out.extend_from_slice(b"0\r\n\r\n");
+    out
+}
+
+/// Decode an HTTP/1.1 chunked transfer encoded stream (RFC 7230 §4.1).
+/// Returns `Ok((decoded_body, bytes_consumed, trailers))` if complete chunked stream is read,
+/// or `Err("Incomplete chunked body")` if the buffer is incomplete,
+/// or `Err(...)` on syntax error.
+pub fn decode_chunked_stream(raw: &[u8]) -> Result<(Vec<u8>, usize, HttpHeaders), String> {
+    let mut body = Vec::new();
+    let mut offset = 0;
+    let mut trailers = HttpHeaders::new();
+
+    loop {
+        let crlf_pos = raw[offset..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| "Incomplete chunked body".to_string())?;
+
+        let line_bytes = &raw[offset..offset + crlf_pos];
+        let line_str = std::str::from_utf8(line_bytes)
+            .map_err(|e| format!("Invalid UTF-8 in chunk size: {}", e))?;
+
+        let size_str = line_str.split(';').next().unwrap_or("").trim();
+        let chunk_size = usize::from_str_radix(size_str, 16)
+            .map_err(|e| format!("Invalid hex chunk size '{}': {}", size_str, e))?;
+
+        let chunk_data_start = offset + crlf_pos + 2;
+
+        if chunk_size == 0 {
+            let remaining = &raw[chunk_data_start..];
+            let trailer_end = remaining
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .ok_or_else(|| "Incomplete chunked body".to_string())?;
+
+            if trailer_end == 0 {
+                let total_consumed = chunk_data_start + 2;
+                return Ok((body, total_consumed, trailers));
+            }
+
+            let full_trailer_end = remaining
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .ok_or_else(|| "Incomplete chunked body".to_string())?;
+
+            let trailer_str = std::str::from_utf8(&remaining[..full_trailer_end])
+                .map_err(|e| format!("Invalid UTF-8 in chunk trailers: {}", e))?;
+
+            for tline in trailer_str.split("\r\n") {
+                if let Some((k, v)) = tline.split_once(':') {
+                    trailers.append(k.trim(), v.trim());
+                }
+            }
+
+            let total_consumed = chunk_data_start + full_trailer_end + 4;
+            return Ok((body, total_consumed, trailers));
+        }
+
+        let chunk_data_end = chunk_data_start + chunk_size;
+        if raw.len() < chunk_data_end + 2 {
+            return Err("Incomplete chunked body".to_string());
+        }
+
+        if &raw[chunk_data_end..chunk_data_end + 2] != b"\r\n" {
+            return Err("Missing CRLF after chunk data".to_string());
+        }
+
+        body.extend_from_slice(&raw[chunk_data_start..chunk_data_end]);
+        offset = chunk_data_end + 2;
+    }
+}
+
 /// Standard HTTP Methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
@@ -171,6 +256,16 @@ impl HttpHeaders {
 
     pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
         self.raw_entries.iter().map(|(k, v)| (k, v))
+    }
+
+    /// Check if headers map is empty.
+    pub fn is_empty(&self) -> bool {
+        self.headers.is_empty()
+    }
+
+    /// Number of distinct header keys.
+    pub fn len(&self) -> usize {
+        self.headers.len()
     }
 }
 
@@ -884,6 +979,14 @@ impl HttpResponse {
         }
     }
 
+    /// Set a chunked body from a list of data slices and set Transfer-Encoding: chunked.
+    pub fn chunked_body(mut self, chunks: &[&[u8]]) -> Self {
+        self.headers.set("Transfer-Encoding", "chunked");
+        self.headers.remove("Content-Length");
+        self.body = encode_chunked(chunks);
+        self
+    }
+
     /// Parse HTTP Response from raw wire bytes.
     pub fn parse_from_wire(raw: &[u8]) -> Result<(Self, usize), String> {
         let header_end = raw
@@ -909,6 +1012,28 @@ impl HttpResponse {
         }
 
         let body_start = header_end + 4;
+
+        let is_chunked = headers
+            .get("transfer-encoding")
+            .map(|te| te.to_ascii_lowercase().contains("chunked"))
+            .unwrap_or(false);
+
+        if is_chunked {
+            let (body, consumed, trailers) = decode_chunked_stream(&raw[body_start..])?;
+            for (k, v) in trailers.iter() {
+                headers.append(k, v);
+            }
+            let total_size = body_start + consumed;
+            return Ok((
+                Self {
+                    status: HttpStatus(code),
+                    headers,
+                    body,
+                },
+                total_size,
+            ));
+        }
+
         let content_length = headers
             .get("content-length")
             .and_then(|v| v.parse::<usize>().ok())
@@ -979,6 +1104,31 @@ impl HttpRequest {
         }
 
         let body_start = header_end + 4;
+
+        let is_chunked = headers
+            .get("transfer-encoding")
+            .map(|te| te.to_ascii_lowercase().contains("chunked"))
+            .unwrap_or(false);
+
+        if is_chunked {
+            let (body, consumed, trailers) = decode_chunked_stream(&raw[body_start..])?;
+            for (k, v) in trailers.iter() {
+                headers.append(k, v);
+            }
+            let total_size = body_start + consumed;
+            return Ok((
+                Self {
+                    method,
+                    path: path.to_string(),
+                    headers,
+                    body,
+                    path_params: BTreeMap::new(),
+                    context: BTreeMap::new(),
+                },
+                total_size,
+            ));
+        }
+
         let content_length = headers
             .get("content-length")
             .and_then(|v| v.parse::<usize>().ok())
@@ -1021,6 +1171,14 @@ impl HttpRequest {
     pub fn form_urlencoded(&self) -> Result<HashMap<String, String>, String> {
         let s = self.body_str().map_err(|e| format!("UTF-8 error: {}", e))?;
         Ok(parse_form_urlencoded(s))
+    }
+
+    /// Set a chunked body from a list of data slices and set Transfer-Encoding: chunked.
+    pub fn chunked_body(mut self, chunks: &[&[u8]]) -> Self {
+        self.headers.set("Transfer-Encoding", "chunked");
+        self.headers.remove("Content-Length");
+        self.body = encode_chunked(chunks);
+        self
     }
 
     /// Set form-urlencoded body and appropriate Content-Type header.
@@ -6518,5 +6676,92 @@ mod tests {
         // 3. Timeout behavior verification
         let timeout_client = HttpClient::new().with_timeout(Duration::from_nanos(1));
         assert_eq!(timeout_client.timeout, Some(Duration::from_nanos(1)));
+    }
+
+    #[test]
+    fn test_chunked_transfer_encoding_roundtrip_and_streaming() {
+        // 1. Direct encoding and decoding unit tests
+        let chunks: [&[u8]; 3] = [b"Hello, ", b"world of ", b"colorless chunked streaming!"];
+        let encoded = encode_chunked(&chunks);
+        let expected_wire = "7\r\nHello, \r\n9\r\nworld of \r\n1C\r\ncolorless chunked streaming!\r\n0\r\n\r\n";
+        assert_eq!(String::from_utf8_lossy(&encoded), expected_wire);
+
+        let (decoded, consumed, trailers) =
+            decode_chunked_stream(&encoded).expect("Chunked stream decode failed");
+        assert_eq!(
+            String::from_utf8_lossy(&decoded),
+            "Hello, world of colorless chunked streaming!"
+        );
+        assert_eq!(consumed, encoded.len());
+        assert!(trailers.is_empty());
+
+        // 2. Incomplete chunk stream test
+        let partial = &encoded[..15];
+        assert_eq!(
+            decode_chunked_stream(partial).unwrap_err(),
+            "Incomplete chunked body"
+        );
+
+        // 3. Chunked transfer with trailers
+        let wire_with_trailers = b"5\r\nhello\r\n0\r\nExpires: Wed, 21 Oct 2026 07:28:00 GMT\r\nX-Checksum: abc123\r\n\r\n";
+        let (body_tr, consumed_tr, trailers_tr) =
+            decode_chunked_stream(wire_with_trailers).expect("Chunked with trailers failed");
+        assert_eq!(body_tr, b"hello");
+        assert_eq!(consumed_tr, wire_with_trailers.len());
+        assert_eq!(
+            trailers_tr.get("Expires"),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT")
+        );
+        assert_eq!(trailers_tr.get("X-Checksum"), Some("abc123"));
+
+        // 4. HttpRequest and HttpResponse parse_from_wire with chunked Transfer-Encoding
+        let raw_req = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n6\r\npedia \r\n0\r\n\r\n";
+        let (req_parsed, req_consumed) =
+            HttpRequest::parse_from_wire(raw_req).expect("Parse chunked request");
+        assert_eq!(req_consumed, raw_req.len());
+        assert_eq!(req_parsed.body_str().unwrap(), "Wikipedia ");
+
+        let raw_resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nServer: IFA\r\n\r\n4\r\nData\r\n0\r\n\r\n";
+        let (resp_parsed, resp_consumed) =
+            HttpResponse::parse_from_wire(raw_resp).expect("Parse chunked response");
+        assert_eq!(resp_consumed, raw_resp.len());
+        assert_eq!(resp_parsed.body_str().unwrap(), "Data");
+
+        // 5. Integration test: HttpServer sending chunked response to HttpClient
+        let mut server = HttpServer::new(0);
+        server.get("/stream", |_req| {
+            HttpResponse::ok()
+                .header("Content-Type", "text/plain")
+                .chunked_body(&[b"chunk-1: welcome\n", b"chunk-2: to ifa\n", b"chunk-3: streams\n"])
+        });
+
+        // Also test server receiving chunked request from client
+        server.post("/chunked-receiver", |req| {
+            let received = req.body_str().unwrap_or("");
+            HttpResponse::ok().text(format!("received:{}", received))
+        });
+
+        let bound = server.listen_background().expect("Server listen failed");
+        let port = bound.port();
+
+        let client = HttpClient::new();
+
+        // GET chunked response
+        let resp = client.get("127.0.0.1", port, "/stream").expect("GET chunked");
+        assert_eq!(resp.status, HttpStatus::OK);
+        assert_eq!(
+            resp.body_str().unwrap(),
+            "chunk-1: welcome\nchunk-2: to ifa\nchunk-3: streams\n"
+        );
+
+        // POST chunked request
+        let post_req = HttpRequest::new(HttpMethod::Post, "/chunked-receiver")
+            .header("Host", "127.0.0.1")
+            .chunked_body(&[b"alpha-", b"beta-", b"gamma"]);
+        let post_resp = client
+            .send(&post_req, "127.0.0.1", port)
+            .expect("POST chunked request failed");
+        assert_eq!(post_resp.status, HttpStatus::OK);
+        assert_eq!(post_resp.body_str().unwrap(), "received:alpha-beta-gamma");
     }
 }
