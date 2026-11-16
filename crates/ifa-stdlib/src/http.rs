@@ -304,7 +304,13 @@ impl ContentEncoding {
 
 /// Compute standard IEEE 802.3 CRC32 checksum.
 pub fn http_crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
+    let mut crc = 0xFFFF_FFFF;
+    crc = http_crc32_update(crc, data);
+    !crc
+}
+
+/// Update running CRC32 value with additional data bytes.
+pub fn http_crc32_update(mut crc: u32, data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= byte as u32;
         for _ in 0..8 {
@@ -315,7 +321,7 @@ pub fn http_crc32(data: &[u8]) -> u32 {
             }
         }
     }
-    !crc
+    crc
 }
 
 /// Compress arbitrary byte payload into RFC 1951 Deflate non-compressed blocks (BTYPE 00).
@@ -485,6 +491,306 @@ pub fn decompress_gzip(gz: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     Ok(decompressed)
+}
+
+/// Streaming Gzip encoder that produces RFC 1952 byte stream chunks on the fly.
+/// Useful for large response streaming or chunked compression.
+#[derive(Debug, Clone)]
+pub struct GzipStreamEncoder {
+    header_written: bool,
+    crc: u32,
+    total_uncompressed_len: u64,
+    finished: bool,
+}
+
+impl Default for GzipStreamEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GzipStreamEncoder {
+    pub fn new() -> Self {
+        Self {
+            header_written: false,
+            crc: 0,
+            total_uncompressed_len: 0,
+            finished: false,
+        }
+    }
+
+    /// Feed uncompressed data chunk and retrieve compressed output bytes.
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if self.finished {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if !self.header_written {
+            // 10-byte Gzip header: ID1=0x1F, ID2=0x8B, CM=8, FLG=0, MTIME=0, XFL=0, OS=255
+            out.extend_from_slice(&[0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 255]);
+            self.header_written = true;
+        }
+
+        if !chunk.is_empty() {
+            // Update CRC32 with polynomial 0xEDB88320
+            let running = !self.crc;
+            let updated = http_crc32_update(running, chunk);
+            self.crc = !updated;
+            self.total_uncompressed_len += chunk.len() as u64;
+
+            // Stream chunk as non-final Deflate uncompressed blocks (BFINAL=0, BTYPE=00)
+            let mut pos = 0;
+            while pos < chunk.len() {
+                let mut blk_len = chunk.len() - pos;
+                if blk_len > 32768 {
+                    blk_len = 32768;
+                }
+                out.push(0); // BFINAL=0, BTYPE=00
+                out.push((blk_len & 0xFF) as u8);
+                out.push(((blk_len >> 8) & 0xFF) as u8);
+                let nlen = (65535 - blk_len) as u16;
+                out.push((nlen & 0xFF) as u8);
+                out.push(((nlen >> 8) & 0xFF) as u8);
+                out.extend_from_slice(&chunk[pos..pos + blk_len]);
+                pos += blk_len;
+            }
+        }
+
+        out
+    }
+
+    /// Finish the stream by writing the final empty deflate block and 8-byte trailer.
+    pub fn finish(&mut self) -> Vec<u8> {
+        if self.finished {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if !self.header_written {
+            out.extend_from_slice(&[0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 255]);
+            self.header_written = true;
+        }
+
+        // Final empty Deflate block: BFINAL=1, BTYPE=00, LEN=0, NLEN=0xFFFF
+        out.push(1);
+        out.extend_from_slice(&[0, 0, 255, 255]);
+
+        // 8-byte trailer: CRC32 (4 bytes LE) + ISIZE (4 bytes LE)
+        out.extend_from_slice(&self.crc.to_le_bytes());
+        let isize = (self.total_uncompressed_len & 0xFFFF_FFFF) as u32;
+        out.extend_from_slice(&isize.to_le_bytes());
+
+        self.finished = true;
+        out
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+}
+
+/// Streaming Gzip decoder that accepts chunks of compressed gzip stream
+/// and produces decompressed bytes incrementally.
+#[derive(Debug, Clone)]
+pub struct GzipStreamDecoder {
+    buffer: Vec<u8>,
+    header_parsed: bool,
+    header_offset: usize,
+    flg: u8,
+    crc: u32,
+    total_uncompressed_len: u64,
+    finished: bool,
+}
+
+impl Default for GzipStreamDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GzipStreamDecoder {
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            header_parsed: false,
+            header_offset: 0,
+            flg: 0,
+            crc: 0,
+            total_uncompressed_len: 0,
+            finished: false,
+        }
+    }
+
+    /// Feed compressed bytes into the decoder and return any newly decompressed data.
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<u8>, String> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        self.buffer.extend_from_slice(chunk);
+        let mut decompressed_out = Vec::new();
+
+        // 1. Try to parse Gzip header if not done yet
+        if !self.header_parsed {
+            if self.buffer.len() < 10 {
+                return Ok(Vec::new()); // Wait for full base header
+            }
+            if self.buffer[0] != 0x1F || self.buffer[1] != 0x8B || self.buffer[2] != 8 {
+                return Err("Invalid Gzip magic numbers or unsupported compression method".to_string());
+            }
+            self.flg = self.buffer[3];
+            let mut pos = 10;
+
+            // FEXTRA
+            if (self.flg & 4) != 0 {
+                if self.buffer.len() < pos + 2 {
+                    return Ok(Vec::new());
+                }
+                let xlen = (self.buffer[pos] as usize) | ((self.buffer[pos + 1] as usize) << 8);
+                if self.buffer.len() < pos + 2 + xlen {
+                    return Ok(Vec::new());
+                }
+                pos += 2 + xlen;
+            }
+
+            // FNAME
+            if (self.flg & 8) != 0 {
+                let mut found = false;
+                while pos < self.buffer.len() {
+                    if self.buffer[pos] == 0 {
+                        pos += 1;
+                        found = true;
+                        break;
+                    }
+                    pos += 1;
+                }
+                if !found {
+                    return Ok(Vec::new());
+                }
+            }
+
+            // FCOMMENT
+            if (self.flg & 16) != 0 {
+                let mut found = false;
+                while pos < self.buffer.len() {
+                    if self.buffer[pos] == 0 {
+                        pos += 1;
+                        found = true;
+                        break;
+                    }
+                    pos += 1;
+                }
+                if !found {
+                    return Ok(Vec::new());
+                }
+            }
+
+            // FHCRC
+            if (self.flg & 2) != 0 {
+                if self.buffer.len() < pos + 2 {
+                    return Ok(Vec::new());
+                }
+                pos += 2;
+            }
+
+            self.header_offset = pos;
+            self.header_parsed = true;
+        }
+
+        // 2. Decode deflate blocks incrementally
+        let mut cur = self.header_offset;
+        while cur < self.buffer.len() {
+            let header = self.buffer[cur];
+            let is_final = header & 1;
+            let btype = (header >> 1) & 3;
+
+            if btype != 0 {
+                return Err(format!("Unsupported deflate compression block type: {}", btype));
+            }
+
+            if cur + 5 > self.buffer.len() {
+                // Not enough bytes to read block header
+                break;
+            }
+
+            let len = (self.buffer[cur + 1] as u16) | ((self.buffer[cur + 2] as u16) << 8);
+            let nlen = (self.buffer[cur + 3] as u16) | ((self.buffer[cur + 4] as u16) << 8);
+
+            if (len ^ nlen) != 0xFFFF {
+                return Err("Corrupted uncompressed block length integrity".to_string());
+            }
+
+            let block_len = len as usize;
+            let block_end = cur + 5 + block_len;
+
+            if block_end > self.buffer.len() {
+                // Incomplete block data, wait for next feed
+                break;
+            }
+
+            if is_final == 1 {
+                // Check if the 8-byte trailer is also present in self.buffer
+                if block_end + 8 > self.buffer.len() {
+                    // Trailer not fully received yet, wait for next feed
+                    break;
+                }
+            }
+
+            let block_data = &self.buffer[cur + 5..block_end];
+            // Update CRC
+            let running = !self.crc;
+            let updated = http_crc32_update(running, block_data);
+            self.crc = !updated;
+            self.total_uncompressed_len += block_len as u64;
+
+            decompressed_out.extend_from_slice(block_data);
+            cur = block_end;
+
+            if is_final == 1 {
+                let expected_crc = u32::from_le_bytes([
+                    self.buffer[cur],
+                    self.buffer[cur + 1],
+                    self.buffer[cur + 2],
+                    self.buffer[cur + 3],
+                ]);
+                let expected_isize = u32::from_le_bytes([
+                    self.buffer[cur + 4],
+                    self.buffer[cur + 5],
+                    self.buffer[cur + 6],
+                    self.buffer[cur + 7],
+                ]);
+
+                if expected_crc != self.crc {
+                    return Err(format!(
+                        "Gzip CRC32 checksum mismatch: expected {:#010X}, computed {:#010X}",
+                        expected_crc, self.crc
+                    ));
+                }
+
+                let actual_isize = (self.total_uncompressed_len & 0xFFFF_FFFF) as u32;
+                if expected_isize != actual_isize {
+                    return Err(format!(
+                        "Gzip ISIZE mismatch: expected {}, got {}",
+                        expected_isize, actual_isize
+                    ));
+                }
+
+                self.finished = true;
+                cur += 8;
+                break;
+            }
+        }
+
+        // Drain consumed bytes from buffer up to cur
+        if cur > 0 {
+            self.buffer.drain(..cur);
+            self.header_offset = 0;
+        }
+
+        Ok(decompressed_out)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
 }
 
 /// Incoming or outgoing HTTP Request message.
@@ -6930,5 +7236,35 @@ mod tests {
         assert_eq!(responses[1].body_str().unwrap(), "two");
         assert_eq!(responses[2].status, HttpStatus::OK);
         assert_eq!(responses[2].body_str().unwrap(), "three");
+    }
+
+    #[test]
+    fn test_gzip_streaming_encoder_and_decoder() {
+        let mut encoder = GzipStreamEncoder::new();
+        let mut decoder = GzipStreamDecoder::new();
+
+        let part1 = b"Hello, ";
+        let part2 = b"colorless streaming ";
+        let part3 = b"gzip fibers in IFA!";
+
+        let mut compressed_wire = Vec::new();
+        compressed_wire.extend_from_slice(&encoder.feed(part1));
+        compressed_wire.extend_from_slice(&encoder.feed(part2));
+        compressed_wire.extend_from_slice(&encoder.feed(part3));
+        compressed_wire.extend_from_slice(&encoder.finish());
+        assert!(encoder.is_finished());
+
+        // Decompress via streaming decoder in small fragments (e.g. 5 bytes each)
+        let mut decompressed = Vec::new();
+        for chunk in compressed_wire.chunks(5) {
+            let out = decoder.feed(chunk).expect("Feed failed");
+            decompressed.extend_from_slice(&out);
+        }
+
+        assert!(decoder.is_finished());
+        assert_eq!(
+            String::from_utf8(decompressed).unwrap(),
+            "Hello, colorless streaming gzip fibers in IFA!"
+        );
     }
 }
