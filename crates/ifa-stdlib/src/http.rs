@@ -468,6 +468,14 @@ impl HttpRequest {
         self
     }
 
+    /// Set an API Key header or custom header.
+    /// If header_name is None, defaults to "X-API-Key".
+    pub fn with_api_key(mut self, key: &str, header_name: Option<&str>) -> Self {
+        let name = header_name.unwrap_or("X-API-Key");
+        self.headers.set(name, key.trim());
+        self
+    }
+
     pub fn body(mut self, body: Vec<u8>) -> Self {
         self.headers.set("Content-Length", body.len().to_string());
         self.body = body;
@@ -1052,6 +1060,12 @@ impl HttpRequest {
     /// Returns Some(token) if format is "Bearer <token>".
     pub fn bearer_token(&self) -> Option<String> {
         self.authorization().and_then(parse_bearer_token)
+    }
+
+    /// Extract API Key from request headers (defaults to "X-API-Key" or custom header name).
+    pub fn api_key(&self, header_name: Option<&str>) -> Option<&str> {
+        let name = header_name.unwrap_or("x-api-key");
+        self.headers.get(name)
     }
 
     /// Verify Bearer token as an HS256 JWT (RFC 7519), returning validated claims.
@@ -6042,5 +6056,16 @@ mod tests {
             req2.bearer_token(),
             Some("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.xyz".to_string())
         );
+
+        // API Key builder and extraction (default header and custom header)
+        let req3 = HttpRequest::new(HttpMethod::Get, "/api/v1/data")
+            .with_api_key("secret-api-key-123", None);
+        assert_eq!(req3.api_key(None), Some("secret-api-key-123"));
+        assert_eq!(req3.headers.get("x-api-key"), Some("secret-api-key-123"));
+
+        let req4 = HttpRequest::new(HttpMethod::Get, "/api/v1/custom")
+            .with_api_key("custom-key-999", Some("X-Custom-Auth"));
+        assert_eq!(req4.api_key(Some("x-custom-auth")), Some("custom-key-999"));
+        assert_eq!(req4.headers.get("X-Custom-Auth"), Some("custom-key-999"));
     }
 }
