@@ -476,6 +476,29 @@ impl HttpRequest {
         self
     }
 
+    /// Set an individual Cookie header value (RFC 6265) or append if other cookies already exist.
+    pub fn with_cookie(mut self, name: &str, value: &str) -> Self {
+        let pair = format!("{}={}", name.trim(), value.trim());
+        if let Some(existing) = self.headers.get("Cookie") {
+            let combined = format!("{}; {}", existing, pair);
+            self.headers.set("Cookie", combined);
+        } else {
+            self.headers.set("Cookie", pair);
+        }
+        self
+    }
+
+    /// Set Cookie header directly from an RFC 6265 `Cookie` instance.
+    pub fn with_cookie_obj(self, cookie: &Cookie) -> Self {
+        self.with_cookie(&cookie.name, &cookie.value)
+    }
+
+    /// Set Cookie header from an RFC 6265 `CookieJar`.
+    pub fn with_cookie_jar(mut self, jar: &CookieJar) -> Self {
+        jar.apply_to_request(&mut self);
+        self
+    }
+
     pub fn body(mut self, body: Vec<u8>) -> Self {
         self.headers.set("Content-Length", body.len().to_string());
         self.body = body;
@@ -2626,6 +2649,11 @@ impl CookieJar {
     /// Count of currently valid (non-expired) cookies.
     pub fn len(&self) -> usize {
         self.cookies.values().filter(|c| !c.is_expired()).count()
+    }
+
+    /// Return all active, non-expired cookies.
+    pub fn all(&self) -> Vec<&Cookie> {
+        self.cookies.values().filter(|c| !c.is_expired()).collect()
     }
 
     /// Returns true if no valid cookies exist.
@@ -6067,5 +6095,26 @@ mod tests {
             .with_api_key("custom-key-999", Some("X-Custom-Auth"));
         assert_eq!(req4.api_key(Some("x-custom-auth")), Some("custom-key-999"));
         assert_eq!(req4.headers.get("X-Custom-Auth"), Some("custom-key-999"));
+
+        // Cookie request builders and jar integration
+        let req5 = HttpRequest::new(HttpMethod::Get, "/api/v1/profile")
+            .with_cookie("session_id", "sess-555")
+            .with_cookie("theme", "midnight");
+        assert_eq!(
+            req5.headers.get("cookie"),
+            Some("session_id=sess-555; theme=midnight")
+        );
+        let cookies5 = req5.cookies();
+        assert_eq!(cookies5.get("session_id"), Some(&"sess-555".to_string()));
+        assert_eq!(cookies5.get("theme"), Some(&"midnight".to_string()));
+        assert_eq!(req5.cookie("session_id"), Some("sess-555".to_string()));
+
+        let mut jar = CookieJar::new();
+        jar.add(Cookie::new("sid", "abc"));
+        jar.add(Cookie::new("tracker", "xyz"));
+        assert_eq!(jar.all().len(), 2);
+        let req6 = HttpRequest::new(HttpMethod::Get, "/api/v1/checkout").with_cookie_jar(&jar);
+        assert_eq!(req6.cookie("sid"), Some("abc".to_string()));
+        assert_eq!(req6.cookie("tracker"), Some("xyz".to_string()));
     }
 }
