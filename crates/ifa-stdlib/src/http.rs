@@ -1913,8 +1913,11 @@ impl HttpServer {
     }
 }
 
-/// Read an HTTP response from an async TCP stream over colorless fibers.
-pub fn read_http_response(stream: &mut AsyncTcpStream) -> io::Result<HttpResponse> {
+/// Read an HTTP response from an async TCP stream over colorless fibers with configurable timeout.
+pub fn read_http_response_with_timeout(
+    stream: &mut AsyncTcpStream,
+    timeout: Duration,
+) -> io::Result<HttpResponse> {
     let mut buf = vec![0u8; 16384];
     let mut total_read = 0;
     let mut spins = 0;
@@ -1949,7 +1952,7 @@ pub fn read_http_response(stream: &mut AsyncTcpStream) -> io::Result<HttpRespons
                 if spins < 32 {
                     std::hint::spin_loop();
                 } else {
-                    if start.elapsed() > Duration::from_secs(15) {
+                    if start.elapsed() > timeout {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "HTTP response timed out waiting for data",
@@ -1961,6 +1964,11 @@ pub fn read_http_response(stream: &mut AsyncTcpStream) -> io::Result<HttpRespons
             }
         }
     }
+}
+
+/// Read an HTTP response from an async TCP stream over colorless fibers (default 15s timeout).
+pub fn read_http_response(stream: &mut AsyncTcpStream) -> io::Result<HttpResponse> {
+    read_http_response_with_timeout(stream, Duration::from_secs(15))
 }
 
 /// Determine whether an HTTP request or response permits socket reuse under RFC 7230 Keep-Alive rules.
@@ -1990,24 +1998,111 @@ pub fn http_should_keep_alive(status_code: u16, headers: &HttpHeaders) -> bool {
     false
 }
 
+/// Latency and timing metrics collected during an HTTP request-response cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpMetrics {
+    /// Latency elapsed during TCP handshake / connection establishment.
+    pub connect_duration: Duration,
+    /// Latency elapsed sending request wire bytes and awaiting the full response.
+    pub request_duration: Duration,
+    /// Total end-to-end latency.
+    pub total_duration: Duration,
+    /// Number of bytes transmitted in the request frame.
+    pub bytes_sent: usize,
+    /// Number of bytes received in the response body.
+    pub bytes_received: usize,
+}
+
+impl Default for HttpMetrics {
+    fn default() -> Self {
+        Self {
+            connect_duration: Duration::ZERO,
+            request_duration: Duration::ZERO,
+            total_duration: Duration::ZERO,
+            bytes_sent: 0,
+            bytes_received: 0,
+        }
+    }
+}
+
 /// Asynchronous non-blocking HTTP client running over colorless fibers.
-pub struct HttpClient;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpClient {
+    /// Optional application read/response timeout.
+    pub timeout: Option<Duration>,
+    /// Last recorded request-response latency and transfer metrics.
+    pub metrics: Option<HttpMetrics>,
+}
 
 impl HttpClient {
     pub fn new() -> Self {
-        Self
+        Self {
+            timeout: None,
+            metrics: None,
+        }
+    }
+
+    /// Set an application timeout for network operations.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Retrieve the most recently recorded execution metrics.
+    pub fn last_metrics(&self) -> Option<&HttpMetrics> {
+        self.metrics.as_ref()
     }
 
     /// Send an HTTP request to host and port over an async TCP stream.
     pub fn send(&self, req: &HttpRequest, host: &str, port: u16) -> io::Result<HttpResponse> {
+        let (resp, _) = self.send_with_metrics(req, host, port)?;
+        Ok(resp)
+    }
+
+    /// Send an HTTP request to host and port over an async TCP stream, recording execution metrics.
+    pub fn send_with_metrics(
+        &self,
+        req: &HttpRequest,
+        host: &str,
+        port: u16,
+    ) -> io::Result<(HttpResponse, HttpMetrics)> {
+        let t0 = Instant::now();
         let mut stream = AsyncTcpStream::connect(format!("{}:{}", host, port))?;
+        let connect_duration = t0.elapsed();
+
+        let t_req = Instant::now();
         let wire = req.to_wire_bytes();
+        let bytes_sent = wire.len();
         stream.write_all(&wire)?;
-        read_http_response(&mut stream)
+
+        let timeout = self.timeout.unwrap_or(Duration::from_secs(15));
+        let resp = read_http_response_with_timeout(&mut stream, timeout)?;
+        let request_duration = t_req.elapsed();
+        let total_duration = t0.elapsed();
+
+        let metrics = HttpMetrics {
+            connect_duration,
+            request_duration,
+            total_duration,
+            bytes_sent,
+            bytes_received: resp.body.len(),
+        };
+
+        Ok((resp, metrics))
     }
 
     /// Send an HTTP request targeted at a structured `Url`.
     pub fn send_url(&self, req: &mut HttpRequest, url: &Url) -> io::Result<HttpResponse> {
+        let (resp, _) = self.send_url_with_metrics(req, url)?;
+        Ok(resp)
+    }
+
+    /// Send an HTTP request targeted at a structured `Url`, recording execution metrics.
+    pub fn send_url_with_metrics(
+        &self,
+        req: &mut HttpRequest,
+        url: &Url,
+    ) -> io::Result<(HttpResponse, HttpMetrics)> {
         if url.host.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2026,7 +2121,7 @@ impl HttpClient {
         // Align request target with URL's path and query
         req.path = url.request_target();
 
-        self.send(req, &url.host, port)
+        self.send_with_metrics(req, &url.host, port)
     }
 
     /// Execute a non-blocking GET request targeting a structured `Url`.
@@ -6377,5 +6472,50 @@ mod tests {
         assert!(!resp200.status.is_redirection());
         assert!(!resp200.is_redirection());
         assert_eq!(resp200.location(), None);
+    }
+
+    #[test]
+    fn test_client_timeouts_and_metrics() {
+        let mut server = HttpServer::new(0);
+        server.get("/healthz", |_req| {
+            HttpResponse::ok()
+                .header("Content-Type", "application/json")
+                .text("{\"status\":\"healthy\",\"server_time\":1700000000}")
+        });
+
+        let bound = server.listen_background().expect("Server listen failed");
+        let port = bound.port();
+
+        // 1. Client with configuration and metrics
+        let client = HttpClient::new().with_timeout(Duration::from_secs(5));
+        assert_eq!(client.timeout, Some(Duration::from_secs(5)));
+
+        let req = HttpRequest::new(HttpMethod::Get, "/healthz");
+        let (resp, metrics) = client
+            .send_with_metrics(&req, "127.0.0.1", port)
+            .expect("Request with metrics failed");
+
+        assert_eq!(resp.status, HttpStatus::OK);
+        assert!(metrics.bytes_sent > 0);
+        assert!(metrics.bytes_received > 0);
+        assert_eq!(metrics.bytes_received, resp.body.len());
+        assert!(metrics.connect_duration <= Duration::from_secs(2));
+        assert!(metrics.request_duration <= Duration::from_secs(2));
+        assert!(metrics.total_duration >= metrics.request_duration);
+
+        // 2. Structured Url request with metrics
+        let target_url = Url::parse(&format!("http://127.0.0.1:{}/healthz", port)).expect("Valid url");
+        let mut req_url = HttpRequest::new(HttpMethod::Get, "/healthz");
+        let (resp_url, metrics_url) = client
+            .send_url_with_metrics(&mut req_url, &target_url)
+            .expect("URL request with metrics failed");
+
+        assert_eq!(resp_url.status, HttpStatus::OK);
+        assert!(metrics_url.bytes_sent > 0);
+        assert_eq!(metrics_url.bytes_received, resp_url.body.len());
+
+        // 3. Timeout behavior verification
+        let timeout_client = HttpClient::new().with_timeout(Duration::from_nanos(1));
+        assert_eq!(timeout_client.timeout, Some(Duration::from_nanos(1)));
     }
 }
