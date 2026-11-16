@@ -2923,6 +2923,110 @@ impl HttpClient {
             return Ok(resp);
         }
     }
+
+    /// Send an HTTP request with automatic transparent caching and revalidation (RFC 7234).
+    ///
+    /// - For non-cacheable methods (e.g. POST, PUT, DELETE), request is forwarded and can invalidate cached URI.
+    /// - For cacheable methods (GET, HEAD):
+    ///   - If a fresh cached response exists and request doesn't forbid it (no-cache), cached response is returned directly (Cache-Hit).
+    ///   - If a stale response exists with ETag or Last-Modified, conditional request headers (If-None-Match, If-Modified-Since) are added.
+    ///   - If server responds with 304 Not Modified, cached entry is refreshed and returned with cached body.
+    ///   - If server responds with 200 OK and cacheable Cache-Control headers, response is stored in cache.
+    pub fn send_cached(
+        &self,
+        req: &mut HttpRequest,
+        host: &str,
+        port: u16,
+        cache: &mut HttpCache,
+    ) -> io::Result<HttpResponse> {
+        let uri = req.path.clone();
+        let cache_key = format!("{}:{} {}", host, port, uri);
+        let now = SystemTime::now();
+
+        // RFC 7234: Only GET and HEAD requests are generally cached
+        if req.method != HttpMethod::Get && req.method != HttpMethod::Head {
+            // Unsafe methods invalidate cached entry for this URI (RFC 7234 section 4.4)
+            cache.remove(&cache_key);
+            return self.send(req, host, port);
+        }
+
+        // Check client request Cache-Control
+        let req_cc = req
+            .headers
+            .get("cache-control")
+            .map(HttpCacheDirectives::parse)
+            .unwrap_or_default();
+
+        if req_cc.no_store {
+            return self.send(req, host, port);
+        }
+
+        // Check if existing cache entry is available
+        if let Some(entry) = cache.get(&cache_key) {
+            let is_fresh = entry.is_fresh(now);
+            if is_fresh && !req_cc.no_cache {
+                let mut resp = entry.to_response();
+                resp.headers.set("X-Cache", "HIT");
+                return Ok(resp);
+            }
+
+            // Stale or revalidation required: send conditional request
+            let mut cond_req = req.clone();
+            if let Some(ref etag) = entry.etag {
+                cond_req.headers.set("If-None-Match", etag.as_str());
+            }
+            if let Some(ref lm) = entry.last_modified {
+                cond_req.headers.set("If-Modified-Since", lm.as_str());
+            }
+
+            let server_resp = self.send(&cond_req, host, port)?;
+
+            if server_resp.status == HttpStatus::NOT_MODIFIED {
+                // 304 Not Modified: refresh cached entry headers and return cached payload
+                if let Some(entry_mut) = cache.get_mut(&cache_key) {
+                    entry_mut.update_from_304(&server_resp, now);
+                    let mut fresh_resp = entry_mut.to_response();
+                    fresh_resp.headers.set("X-Cache", "REVALIDATED");
+                    return Ok(fresh_resp);
+                }
+            } else if server_resp.status == HttpStatus::OK {
+                // Server returned fresh 200 OK: check if cacheable
+                let resp_cc = server_resp
+                    .headers
+                    .get("cache-control")
+                    .map(HttpCacheDirectives::parse)
+                    .unwrap_or_default();
+
+                if !resp_cc.no_store {
+                    let entry = HttpCacheEntry::new(&cache_key, &server_resp, now);
+                    cache.insert(&cache_key, entry);
+                }
+                let mut out_resp = server_resp;
+                out_resp.headers.set("X-Cache", "MISS");
+                return Ok(out_resp);
+            } else {
+                return Ok(server_resp);
+            }
+        }
+
+        // Cache miss: forward request to upstream server
+        let server_resp = self.send(req, host, port)?;
+
+        let resp_cc = server_resp
+            .headers
+            .get("cache-control")
+            .map(HttpCacheDirectives::parse)
+            .unwrap_or_default();
+
+        if !resp_cc.no_store && (server_resp.status == HttpStatus::OK || server_resp.status == HttpStatus::CREATED) {
+            let entry = HttpCacheEntry::new(&cache_key, &server_resp, now);
+            cache.insert(&cache_key, entry);
+        }
+
+        let mut out_resp = server_resp;
+        out_resp.headers.set("X-Cache", "MISS");
+        Ok(out_resp)
+    }
 }
 
 impl Default for HttpClient {
@@ -4683,6 +4787,86 @@ impl HttpCacheEntry {
         resp.headers = self.headers.clone();
         resp.body = self.body.clone();
         resp
+    }
+
+    /// Update this cache entry from a 304 Not Modified response (RFC 7234 section 4.3.4).
+    pub fn update_from_304(&mut self, not_modified_resp: &HttpResponse, response_time: SystemTime) {
+        self.response_time = response_time;
+        for (k, v) in not_modified_resp.headers.iter() {
+            let lower = k.to_ascii_lowercase();
+            // End-to-end headers that can be refreshed on 304
+            if matches!(lower.as_str(), "date" | "expires" | "cache-control" | "etag" | "last-modified" | "vary") {
+                self.headers.set(k, v);
+            }
+        }
+        if let Some(etag) = not_modified_resp.headers.get("etag") {
+            self.etag = Some(etag.to_string());
+        }
+        if let Some(last_modified) = not_modified_resp.headers.get("last-modified") {
+            self.last_modified = Some(last_modified.to_string());
+        }
+        if let Some(cc) = not_modified_resp.headers.get("cache-control") {
+            let directives = HttpCacheDirectives::parse(cc);
+            self.expires_at = directives.max_age.map(|sec| response_time + Duration::from_secs(sec));
+        } else if let Some(exp) = not_modified_resp.headers.get("expires") {
+            self.expires_at = parse_http_date(exp);
+        }
+    }
+}
+
+/// In-memory cache storage for HTTP responses implementing RFC 7234 validation rules.
+#[derive(Debug, Clone, Default)]
+pub struct HttpCache {
+    entries: HashMap<String, HttpCacheEntry>,
+}
+
+impl HttpCache {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Retrieve a cache entry by cache key (typically "METHOD uri" or "uri").
+    pub fn get(&self, key: &str) -> Option<&HttpCacheEntry> {
+        self.entries.get(key)
+    }
+
+    /// Retrieve a mutable cache entry by cache key.
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut HttpCacheEntry> {
+        self.entries.get_mut(key)
+    }
+
+    /// Insert or replace a cache entry.
+    pub fn insert(&mut self, key: impl Into<String>, entry: HttpCacheEntry) {
+        self.entries.insert(key.into(), entry);
+    }
+
+    /// Invalidate/remove an entry from cache.
+    pub fn remove(&mut self, key: &str) -> Option<HttpCacheEntry> {
+        self.entries.remove(key)
+    }
+
+    /// Invalidate all cached entries.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Number of cached entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Check if cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Purge expired cache entries according to timestamp `now`.
+    pub fn purge_expired(&mut self, now: SystemTime) -> usize {
+        let initial_len = self.entries.len();
+        self.entries.retain(|_, entry| entry.is_fresh(now));
+        initial_len - self.entries.len()
     }
 }
 
@@ -7719,5 +7903,66 @@ mod tests {
             String::from_utf8(decompressed).unwrap(),
             "Hello, colorless streaming gzip fibers in IFA!"
         );
+    }
+
+    #[test]
+    fn test_http_client_transparent_caching_and_revalidation() {
+        let mut server = HttpServer::new(0);
+        let etag_val = "\"etag-12345\"";
+
+        server.get("/cache/data", move |req| {
+            if let Some(inm) = req.headers.get("if-none-match") {
+                if inm == etag_val {
+                    return HttpResponse::new(HttpStatus::NOT_MODIFIED)
+                        .header("ETag", etag_val)
+                        .header("Cache-Control", "max-age=60");
+                }
+            }
+            HttpResponse::ok()
+                .header("ETag", etag_val)
+                .header("Cache-Control", "max-age=60")
+                .text("real cached payload")
+        });
+
+        let bound = server.listen_background().expect("Server listen failed");
+        let port = bound.port();
+
+        let client = HttpClient::new();
+        let mut cache = HttpCache::new();
+
+        // 1. Initial request -> Cache MISS, saved into HttpCache
+        let mut req1 = HttpRequest::new(HttpMethod::Get, "/cache/data")
+            .header("Host", "127.0.0.1")
+            .header("Connection", "close");
+        let resp1 = client
+            .send_cached(&mut req1, "127.0.0.1", port, &mut cache)
+            .expect("Req 1 failed");
+        assert_eq!(resp1.status, HttpStatus::OK);
+        assert_eq!(resp1.headers.get("x-cache"), Some("MISS"));
+        assert_eq!(resp1.body_str().unwrap(), "real cached payload");
+        assert_eq!(cache.len(), 1);
+
+        // 2. Immediate second request -> Cache HIT (fresh, no network roundtrip to handler)
+        let mut req2 = HttpRequest::new(HttpMethod::Get, "/cache/data")
+            .header("Host", "127.0.0.1")
+            .header("Connection", "close");
+        let resp2 = client
+            .send_cached(&mut req2, "127.0.0.1", port, &mut cache)
+            .expect("Req 2 failed");
+        assert_eq!(resp2.status, HttpStatus::OK);
+        assert_eq!(resp2.headers.get("x-cache"), Some("HIT"));
+        assert_eq!(resp2.body_str().unwrap(), "real cached payload");
+
+        // 3. Forced revalidation with Cache-Control: no-cache -> Sends If-None-Match, server replies 304, client returns REVALIDATED
+        let mut req3 = HttpRequest::new(HttpMethod::Get, "/cache/data")
+            .header("Host", "127.0.0.1")
+            .header("Cache-Control", "no-cache")
+            .header("Connection", "close");
+        let resp3 = client
+            .send_cached(&mut req3, "127.0.0.1", port, &mut cache)
+            .expect("Req 3 failed");
+        assert_eq!(resp3.status, HttpStatus::OK);
+        assert_eq!(resp3.headers.get("x-cache"), Some("REVALIDATED"));
+        assert_eq!(resp3.body_str().unwrap(), "real cached payload");
     }
 }
