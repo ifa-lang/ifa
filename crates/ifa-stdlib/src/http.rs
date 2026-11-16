@@ -6352,30 +6352,30 @@ mod tests {
         // 2. HTTP Status redirect helpers
         let resp301 = HttpResponse::moved_permanently("/new-path");
         assert_eq!(resp301.status, HttpStatus::MOVED_PERMANENTLY);
-        assert_eq!(resp301.status.is_redirection(), true);
-        assert_eq!(resp301.is_redirection(), true);
+        assert!(resp301.status.is_redirection());
+        assert!(resp301.is_redirection());
         assert_eq!(resp301.location(), Some("/new-path"));
 
         let resp302 = HttpResponse::found("/temporary");
         assert_eq!(resp302.status, HttpStatus::FOUND);
-        assert_eq!(resp302.is_redirection(), true);
+        assert!(resp302.is_redirection());
         assert_eq!(resp302.location(), Some("/temporary"));
 
         let resp303 = HttpResponse::see_other("/other");
         assert_eq!(resp303.status, HttpStatus::SEE_OTHER);
-        assert_eq!(resp303.is_redirection(), true);
+        assert!(resp303.is_redirection());
 
         let resp307 = HttpResponse::temporary_redirect("/temp-redirect");
         assert_eq!(resp307.status, HttpStatus::TEMPORARY_REDIRECT);
-        assert_eq!(resp307.is_redirection(), true);
+        assert!(resp307.is_redirection());
 
         let resp308 = HttpResponse::permanent_redirect("/perm-redirect");
         assert_eq!(resp308.status, HttpStatus::PERMANENT_REDIRECT);
-        assert_eq!(resp308.is_redirection(), true);
+        assert!(resp308.is_redirection());
 
         let resp200 = HttpResponse::ok();
-        assert_eq!(resp200.status.is_redirection(), false);
-        assert_eq!(resp200.is_redirection(), false);
+        assert!(!resp200.status.is_redirection());
+        assert!(!resp200.is_redirection());
         assert_eq!(resp200.location(), None);
     }
 }
