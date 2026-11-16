@@ -1062,6 +1062,18 @@ impl HttpResponse {
         self
     }
 
+    /// Set Last-Modified header with standard RFC 7231 / RFC 1123 HTTP date.
+    pub fn last_modified(mut self, time: SystemTime) -> Self {
+        self.headers.set("Last-Modified", format_http_date(time));
+        self
+    }
+
+    /// Set Cache-Control header directives (e.g. "public, max-age=3600, must-revalidate").
+    pub fn cache_control(mut self, directives: &str) -> Self {
+        self.headers.set("Cache-Control", directives);
+        self
+    }
+
     pub fn header(mut self, key: &str, val: &str) -> Self {
         self.headers.set(key, val);
         self
@@ -1662,6 +1674,56 @@ impl HttpRequest {
             .get("if-match")
             .map(|val| matches_if_match(current_etag, val))
             .unwrap_or(true)
+    }
+
+    /// Evaluate If-Modified-Since header against last modified timestamp (RFC 7232 §3.3).
+    /// Returns true if the resource has NOT been modified since the given timestamp
+    /// (i.e. client cache is fresh, server should respond 304 Not Modified).
+    pub fn if_modified_since(&self, last_modified: SystemTime) -> bool {
+        let header_val = match self.headers.get("if-modified-since") {
+            Some(v) => v,
+            None => return false,
+        };
+        let client_time = match parse_http_date(header_val) {
+            Some(t) => t,
+            None => return false,
+        };
+        // If last_modified <= client_time (accounting for 1-second RFC 7231 resolution),
+        // then the resource has not been modified.
+        let lm_secs = last_modified
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let ct_secs = client_time
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        lm_secs <= ct_secs
+    }
+
+    /// Evaluate If-Unmodified-Since header against last modified timestamp (RFC 7232 §3.4).
+    /// Returns true if the resource has NOT been modified (operation is allowed to proceed).
+    /// If the resource was modified since the provided date, returns false (412 Precondition Failed).
+    pub fn if_unmodified_since(&self, last_modified: SystemTime) -> bool {
+        let header_val = match self.headers.get("if-unmodified-since") {
+            Some(v) => v,
+            None => return true,
+        };
+        let client_time = match parse_http_date(header_val) {
+            Some(t) => t,
+            None => return true, // If date is malformed, ignore precondition per RFC
+        };
+        let lm_secs = last_modified
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let ct_secs = client_time
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        lm_secs <= ct_secs
     }
 
     /// Check whether request is an RFC 6455 WebSocket handshake upgrade request.
@@ -4298,6 +4360,333 @@ impl CorsConfig {
 }
 
 // ============================================================================
+// HTTP Date (RFC 7231 / RFC 1123) Formatting and Parsing
+// ============================================================================
+
+const DAYS_SHORT: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+const MONTHS_SHORT: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const DAYS_PER_MONTH: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+fn is_leap_year(year: u32) -> bool {
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+}
+
+fn month_days(year: u32, month: usize) -> u32 {
+    if month == 1 && is_leap_year(year) {
+        29
+    } else {
+        DAYS_PER_MONTH[month]
+    }
+}
+
+/// Format a `SystemTime` as an RFC 7231 / RFC 1123 IMF-fixdate string (e.g. "Sun, 06 Nov 1994 08:49:37 GMT").
+pub fn format_http_date(time: SystemTime) -> String {
+    let secs = time
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let day_of_week = ((secs / 86400) % 7) as usize; // 0 = Thu 1970-01-01
+    let weekday_str = DAYS_SHORT[day_of_week];
+
+    let mut days_remaining = (secs / 86400) as u32;
+    let day_seconds = (secs % 86400) as u32;
+    let hour = day_seconds / 3600;
+    let minute = (day_seconds % 3600) / 60;
+    let second = day_seconds % 60;
+
+    let mut year = 1970u32;
+    loop {
+        let year_days = if is_leap_year(year) { 366 } else { 365 };
+        if days_remaining < year_days {
+            break;
+        }
+        days_remaining -= year_days;
+        year += 1;
+    }
+
+    let mut month = 0usize;
+    loop {
+        let m_days = month_days(year, month);
+        if days_remaining < m_days {
+            break;
+        }
+        days_remaining -= m_days;
+        month += 1;
+    }
+    let day = days_remaining + 1;
+    let month_str = MONTHS_SHORT[month];
+
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        weekday_str, day, month_str, year, hour, minute, second
+    )
+}
+
+/// Parse an RFC 7231 / RFC 1123 IMF-fixdate string into a `SystemTime`.
+/// Accepts "Sun, 06 Nov 1994 08:49:37 GMT". Returns None if parsing fails.
+pub fn parse_http_date(date_str: &str) -> Option<SystemTime> {
+    let trimmed = date_str.trim();
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    // Expected format: ["Sun,", "06", "Nov", "1994", "08:49:37", "GMT"]
+    if parts.len() != 6 {
+        return None;
+    }
+    if !parts[5].eq_ignore_ascii_case("GMT") && !parts[5].eq_ignore_ascii_case("UTC") {
+        return None;
+    }
+
+    let day: u32 = parts[1].parse().ok()?;
+    let month_name = parts[2];
+    let month = MONTHS_SHORT
+        .iter()
+        .position(|&m| m.eq_ignore_ascii_case(month_name))?;
+    let year: u32 = parts[3].parse().ok()?;
+
+    if !(1970..=2200).contains(&year) {
+        return None;
+    }
+    if day < 1 || day > month_days(year, month) {
+        return None;
+    }
+
+    let time_parts: Vec<&str> = parts[4].split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let hour: u32 = time_parts[0].parse().ok()?;
+    let minute: u32 = time_parts[1].parse().ok()?;
+    let second: u32 = time_parts[2].parse().ok()?;
+
+    if hour >= 24 || minute >= 60 || second >= 60 {
+        return None;
+    }
+
+    let mut days = 0u64;
+    for y in 1970..year {
+        days += if is_leap_year(y) { 366 } else { 365 };
+    }
+    for m in 0..month {
+        days += month_days(year, m) as u64;
+    }
+    days += (day - 1) as u64;
+
+    let total_secs = days * 86400 + (hour as u64) * 3600 + (minute as u64) * 60 + (second as u64);
+    Some(UNIX_EPOCH + Duration::from_secs(total_secs))
+}
+
+// ============================================================================
+// HTTP Cache-Control Directive Parser (RFC 7234)
+// ============================================================================
+
+/// Parsed HTTP Cache-Control directives for clients, servers, and intermediaries.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HttpCacheDirectives {
+    pub no_cache: bool,
+    pub no_store: bool,
+    pub no_transform: bool,
+    pub only_if_cached: bool,
+    pub must_revalidate: bool,
+    pub proxy_revalidate: bool,
+    pub must_understand: bool,
+    pub is_public: bool,
+    pub is_private: bool,
+    pub immutable: bool,
+    pub max_age: Option<u64>,
+    pub s_maxage: Option<u64>,
+    pub max_stale: Option<Option<u64>>, // Some(None) means any age stale; Some(Some(s)) max delta
+    pub min_fresh: Option<u64>,
+    pub stale_while_revalidate: Option<u64>,
+    pub stale_if_error: Option<u64>,
+}
+
+impl HttpCacheDirectives {
+    /// Parse a Cache-Control header string (comma-separated directives).
+    pub fn parse(header_val: &str) -> Self {
+        let mut d = Self::default();
+        for directive in header_val.split(',') {
+            let item = directive.trim();
+            if item.is_empty() {
+                continue;
+            }
+
+            let mut kv = item.splitn(2, '=');
+            let name = kv.next().unwrap_or("").trim().to_ascii_lowercase();
+            let val = kv.next().map(|v| v.trim().trim_matches('"'));
+
+            match name.as_str() {
+                "no-cache" => d.no_cache = true,
+                "no-store" => d.no_store = true,
+                "no-transform" => d.no_transform = true,
+                "only-if-cached" => d.only_if_cached = true,
+                "must-revalidate" => d.must_revalidate = true,
+                "proxy-revalidate" => d.proxy_revalidate = true,
+                "must-understand" => d.must_understand = true,
+                "public" => d.is_public = true,
+                "private" => d.is_private = true,
+                "immutable" => d.immutable = true,
+                "max-age" => {
+                    if let Some(v) = val {
+                        d.max_age = v.parse::<u64>().ok();
+                    }
+                }
+                "s-maxage" => {
+                    if let Some(v) = val {
+                        d.s_maxage = v.parse::<u64>().ok();
+                    }
+                }
+                "max-stale" => {
+                    if let Some(v) = val {
+                        d.max_stale = Some(v.parse::<u64>().ok());
+                    } else {
+                        d.max_stale = Some(None);
+                    }
+                }
+                "min-fresh" => {
+                    if let Some(v) = val {
+                        d.min_fresh = v.parse::<u64>().ok();
+                    }
+                }
+                "stale-while-revalidate" => {
+                    if let Some(v) = val {
+                        d.stale_while_revalidate = v.parse::<u64>().ok();
+                    }
+                }
+                "stale-if-error" => {
+                    if let Some(v) = val {
+                        d.stale_if_error = v.parse::<u64>().ok();
+                    }
+                }
+                _ => {}
+            }
+        }
+        d
+    }
+
+    /// Check if resource can be stored in a shared or private cache.
+    pub fn is_cacheable(&self) -> bool {
+        !self.no_store
+    }
+
+    /// Serialize directives back to standard Cache-Control header string.
+    pub fn to_header_value(&self) -> String {
+        let mut parts = Vec::new();
+        if self.is_public {
+            parts.push("public".to_string());
+        }
+        if self.is_private {
+            parts.push("private".to_string());
+        }
+        if self.no_cache {
+            parts.push("no-cache".to_string());
+        }
+        if self.no_store {
+            parts.push("no-store".to_string());
+        }
+        if self.no_transform {
+            parts.push("no-transform".to_string());
+        }
+        if self.must_revalidate {
+            parts.push("must-revalidate".to_string());
+        }
+        if self.proxy_revalidate {
+            parts.push("proxy-revalidate".to_string());
+        }
+        if self.immutable {
+            parts.push("immutable".to_string());
+        }
+        if let Some(max_age) = self.max_age {
+            parts.push(format!("max-age={}", max_age));
+        }
+        if let Some(s_maxage) = self.s_maxage {
+            parts.push(format!("s-maxage={}", s_maxage));
+        }
+        if let Some(max_stale) = self.max_stale {
+            if let Some(delta) = max_stale {
+                parts.push(format!("max-stale={}", delta));
+            } else {
+                parts.push("max-stale".to_string());
+            }
+        }
+        if let Some(min_fresh) = self.min_fresh {
+            parts.push(format!("min-fresh={}", min_fresh));
+        }
+        if let Some(swr) = self.stale_while_revalidate {
+            parts.push(format!("stale-while-revalidate={}", swr));
+        }
+        if let Some(sie) = self.stale_if_error {
+            parts.push(format!("stale-if-error={}", sie));
+        }
+
+        parts.join(", ")
+    }
+}
+
+// ============================================================================
+// HTTP Cache Entry & Client Cache Storage (RFC 7234)
+// ============================================================================
+
+/// In-memory cache entry for cached HTTP responses.
+#[derive(Debug, Clone)]
+pub struct HttpCacheEntry {
+    pub key: String,
+    pub status: HttpStatus,
+    pub headers: HttpHeaders,
+    pub body: Vec<u8>,
+    pub response_time: SystemTime,
+    pub expires_at: Option<SystemTime>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+impl HttpCacheEntry {
+    /// Create a cache entry from an HTTP response and URI key.
+    pub fn new(key: impl Into<String>, response: &HttpResponse, response_time: SystemTime) -> Self {
+        let etag = response.headers.get("etag").map(|s| s.to_string());
+        let last_modified = response.headers.get("last-modified").map(|s| s.to_string());
+
+        let expires_at = if let Some(cc) = response.headers.get("cache-control") {
+            let directives = HttpCacheDirectives::parse(cc);
+            directives.max_age.map(|sec| response_time + Duration::from_secs(sec))
+        } else if let Some(exp) = response.headers.get("expires") {
+            parse_http_date(exp)
+        } else {
+            None
+        };
+
+        Self {
+            key: key.into(),
+            status: response.status,
+            headers: response.headers.clone(),
+            body: response.body.clone(),
+            response_time,
+            expires_at,
+            etag,
+            last_modified,
+        }
+    }
+
+    /// Check if this cached entry is fresh at time `now`.
+    pub fn is_fresh(&self, now: SystemTime) -> bool {
+        if let Some(exp) = self.expires_at {
+            now < exp
+        } else {
+            false
+        }
+    }
+
+    /// Reconstruct an HttpResponse from this cache entry.
+    pub fn to_response(&self) -> HttpResponse {
+        let mut resp = HttpResponse::new(self.status);
+        resp.headers = self.headers.clone();
+        resp.body = self.body.clone();
+        resp
+    }
+}
+
+// ============================================================================
 // HTTP ETag & Conditional Requests (RFC 7232)
 // ============================================================================
 
@@ -5976,6 +6365,70 @@ mod tests {
         let not_mod = HttpResponse::not_modified(Some(&strong_etag));
         assert_eq!(not_mod.status, HttpStatus::NOT_MODIFIED);
         assert_eq!(not_mod.headers.get("etag"), Some(strong_etag.as_str()));
+
+        // 7. HTTP Date (RFC 7231 / RFC 1123) Formatting and Parsing
+        let test_epoch = UNIX_EPOCH + Duration::from_secs(784111777); // Sun, 06 Nov 1994 08:49:37 GMT
+        let formatted_date = format_http_date(test_epoch);
+        assert_eq!(formatted_date, "Sun, 06 Nov 1994 08:49:37 GMT");
+
+        let parsed_date = parse_http_date(&formatted_date).expect("HTTP date parse failed");
+        assert_eq!(
+            parsed_date.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            784111777
+        );
+
+        // If-Modified-Since and If-Unmodified-Since conditional handling
+        let resource_time = test_epoch;
+        let future_time = test_epoch + Duration::from_secs(3600);
+        let past_time = test_epoch - Duration::from_secs(3600);
+
+        // Client has cache from future_time -> resource (test_epoch) NOT modified
+        let req_ims_fresh = HttpRequest::new(HttpMethod::Get, "/doc")
+            .header("If-Modified-Since", &format_http_date(future_time));
+        assert!(req_ims_fresh.if_modified_since(resource_time));
+
+        // Client has cache from past_time -> resource (test_epoch) HAS been modified
+        let req_ims_stale = HttpRequest::new(HttpMethod::Get, "/doc")
+            .header("If-Modified-Since", &format_http_date(past_time));
+        assert!(!req_ims_stale.if_modified_since(resource_time));
+
+        // If-Unmodified-Since (e.g. for safe conditional PUT / DELETE)
+        let req_ius_ok = HttpRequest::new(HttpMethod::Put, "/doc")
+            .header("If-Unmodified-Since", &format_http_date(future_time));
+        assert!(req_ius_ok.if_unmodified_since(resource_time));
+
+        let req_ius_conflict = HttpRequest::new(HttpMethod::Put, "/doc")
+            .header("If-Unmodified-Since", &format_http_date(past_time));
+        assert!(!req_ius_conflict.if_unmodified_since(resource_time));
+
+        // 8. HTTP Cache-Control Directives & Entry (RFC 7234)
+        let cc_header = "public, max-age=3600, s-maxage=7200, must-revalidate, stale-while-revalidate=60";
+        let cc = HttpCacheDirectives::parse(cc_header);
+        assert!(cc.is_public);
+        assert!(!cc.is_private);
+        assert!(!cc.no_cache);
+        assert!(cc.is_cacheable());
+        assert_eq!(cc.max_age, Some(3600));
+        assert_eq!(cc.s_maxage, Some(7200));
+        assert!(cc.must_revalidate);
+        assert_eq!(cc.stale_while_revalidate, Some(60));
+
+        let resp_with_cache = HttpResponse::ok()
+            .cache_control(cc_header)
+            .etag(&strong_etag)
+            .last_modified(test_epoch)
+            .text("cached payload");
+
+        let entry = HttpCacheEntry::new("/api/cached", &resp_with_cache, test_epoch);
+        assert_eq!(entry.key, "/api/cached");
+        assert_eq!(entry.etag, Some(strong_etag));
+        assert_eq!(entry.last_modified, Some(formatted_date));
+        assert!(entry.is_fresh(test_epoch + Duration::from_secs(1800)));
+        assert!(!entry.is_fresh(test_epoch + Duration::from_secs(3601)));
+
+        let reconstructed = entry.to_response();
+        assert_eq!(reconstructed.status, HttpStatus::OK);
+        assert_eq!(reconstructed.body_str().unwrap(), "cached payload");
     }
 
     #[test]
