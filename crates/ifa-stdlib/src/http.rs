@@ -1036,15 +1036,23 @@ impl HttpResponse {
 
         let content_length = headers
             .get("content-length")
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(raw.len().saturating_sub(body_start));
+            .and_then(|v| v.parse::<usize>().ok());
 
-        let total_size = body_start + content_length;
-        if raw.len() < total_size {
-            return Err("Incomplete HTTP body".to_string());
-        }
+        let (body, total_size) = match content_length {
+            Some(cl) => {
+                let total_size = body_start + cl;
+                if raw.len() < total_size {
+                    return Err("Incomplete HTTP body".to_string());
+                }
+                (raw[body_start..total_size].to_vec(), total_size)
+            }
+            None => {
+                // Without Content-Length or chunked transfer-encoding, the body spans
+                // the remainder of the currently available payload until EOF.
+                (raw[body_start..].to_vec(), raw.len())
+            }
+        };
 
-        let body = raw[body_start..total_size].to_vec();
         Ok((
             Self {
                 status: HttpStatus(code),
@@ -2129,6 +2137,92 @@ pub fn read_http_response(stream: &mut AsyncTcpStream) -> io::Result<HttpRespons
     read_http_response_with_timeout(stream, Duration::from_secs(15))
 }
 
+/// Read multiple sequential HTTP responses from an async TCP stream (e.g. for HTTP/1.1 pipelining).
+/// Continues reading until `expected_count` responses are parsed or until timeout occurs.
+pub fn read_http_responses_pipelined(
+    stream: &mut AsyncTcpStream,
+    expected_count: usize,
+    timeout: Duration,
+) -> io::Result<Vec<HttpResponse>> {
+    let mut responses = Vec::with_capacity(expected_count);
+    let mut buf = vec![0u8; 16384];
+    let mut total_read = 0;
+    let mut spins = 0;
+    let start = Instant::now();
+
+    while responses.len() < expected_count {
+        // Try parsing existing buffered data before reading more
+        let mut consumed_any = false;
+        while total_read > 0 {
+            match HttpResponse::parse_from_wire(&buf[..total_read]) {
+                Ok((resp, consumed)) => {
+                    responses.push(resp);
+                    buf.copy_within(consumed..total_read, 0);
+                    total_read -= consumed;
+                    consumed_any = true;
+                    if responses.len() == expected_count {
+                        return Ok(responses);
+                    }
+                }
+                Err(_) => {
+                    // Need more bytes to complete next response
+                    break;
+                }
+            }
+        }
+
+        if responses.len() == expected_count {
+            return Ok(responses);
+        }
+
+        if total_read == buf.len() {
+            buf.resize(buf.len() * 2, 0);
+        }
+
+        match stream.try_read(&mut buf[total_read..]) {
+            Ok(Some(0)) => {
+                // Connection closed by peer
+                if responses.len() == expected_count {
+                    return Ok(responses);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "Connection closed by server before receiving all pipelined responses (got {} of {})",
+                        responses.len(),
+                        expected_count
+                    ),
+                ));
+            }
+            Ok(Some(n)) => {
+                total_read += n;
+                spins = 0;
+            }
+            Ok(None) | Err(_) => {
+                spins += 1;
+                if spins < 32 && !consumed_any {
+                    std::hint::spin_loop();
+                } else {
+                    if start.elapsed() > timeout {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "HTTP pipelined response timed out (got {} of {})",
+                                responses.len(),
+                                expected_count
+                            ),
+                        ));
+                    }
+                    GLOBAL_SCHEDULER.yield_now();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    Ok(responses)
+}
+
 /// Determine whether an HTTP request or response permits socket reuse under RFC 7230 Keep-Alive rules.
 pub fn http_should_keep_alive(status_code: u16, headers: &HttpHeaders) -> bool {
     if let Some(conn) = headers.get("connection") {
@@ -2247,6 +2341,41 @@ impl HttpClient {
         };
 
         Ok((resp, metrics))
+    }
+
+    /// Send multiple HTTP requests sequentially over a single TCP connection using HTTP/1.1 pipelining (RFC 7230).
+    /// All requests are written to the wire consecutively before reading responses back in the exact same order.
+    pub fn send_pipelined(
+        &self,
+        requests: &[HttpRequest],
+        host: &str,
+        port: u16,
+    ) -> io::Result<Vec<HttpResponse>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stream = AsyncTcpStream::connect(format!("{}:{}", host, port))?;
+
+        // Concatenate all wire requests into a single buffer
+        let mut wire_batch = Vec::new();
+        for (idx, req) in requests.iter().enumerate() {
+            let mut req_wire = req.clone();
+            // Automatically ensure Connection header conforms to keep-alive except possibly the last one
+            if req_wire.headers.get("Connection").is_none() {
+                if idx + 1 < requests.len() {
+                    req_wire.headers.set("Connection", "keep-alive");
+                } else {
+                    req_wire.headers.set("Connection", "close");
+                }
+            }
+            wire_batch.extend_from_slice(&req_wire.to_wire_bytes());
+        }
+
+        stream.write_all(&wire_batch)?;
+
+        let timeout = self.timeout.unwrap_or(Duration::from_secs(15));
+        read_http_responses_pipelined(&mut stream, requests.len(), timeout)
     }
 
     /// Send an HTTP request targeted at a structured `Url`.
@@ -6770,5 +6899,36 @@ mod tests {
             .expect("POST chunked request failed");
         assert_eq!(post_resp.status, HttpStatus::OK);
         assert_eq!(post_resp.body_str().unwrap(), "received:alpha-beta-gamma");
+    }
+
+    #[test]
+    fn test_http_pipelining() {
+        let mut server = HttpServer::new(0);
+        server.get("/pipe/1", |_req| HttpResponse::ok().text("one"));
+        server.get("/pipe/2", |_req| HttpResponse::ok().text("two"));
+        server.get("/pipe/3", |_req| HttpResponse::ok().text("three"));
+
+        let bound = server.listen_background().expect("Server listen failed");
+        let port = bound.port();
+
+        let client = HttpClient::new();
+
+        let requests = vec![
+            HttpRequest::new(HttpMethod::Get, "/pipe/1").header("Host", "127.0.0.1"),
+            HttpRequest::new(HttpMethod::Get, "/pipe/2").header("Host", "127.0.0.1"),
+            HttpRequest::new(HttpMethod::Get, "/pipe/3").header("Host", "127.0.0.1"),
+        ];
+
+        let responses = client
+            .send_pipelined(&requests, "127.0.0.1", port)
+            .expect("Pipelined requests failed");
+
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0].status, HttpStatus::OK);
+        assert_eq!(responses[0].body_str().unwrap(), "one");
+        assert_eq!(responses[1].status, HttpStatus::OK);
+        assert_eq!(responses[1].body_str().unwrap(), "two");
+        assert_eq!(responses[2].status, HttpStatus::OK);
+        assert_eq!(responses[2].body_str().unwrap(), "three");
     }
 }
