@@ -54,7 +54,12 @@ impl HttpStatus {
     pub const OK: HttpStatus = HttpStatus(200);
     pub const CREATED: HttpStatus = HttpStatus(201);
     pub const NO_CONTENT: HttpStatus = HttpStatus(204);
+    pub const MOVED_PERMANENTLY: HttpStatus = HttpStatus(301);
+    pub const FOUND: HttpStatus = HttpStatus(302);
+    pub const SEE_OTHER: HttpStatus = HttpStatus(303);
     pub const NOT_MODIFIED: HttpStatus = HttpStatus(304);
+    pub const TEMPORARY_REDIRECT: HttpStatus = HttpStatus(307);
+    pub const PERMANENT_REDIRECT: HttpStatus = HttpStatus(308);
     pub const BAD_REQUEST: HttpStatus = HttpStatus(400);
     pub const UNAUTHORIZED: HttpStatus = HttpStatus(401);
     pub const FORBIDDEN: HttpStatus = HttpStatus(403);
@@ -69,12 +74,22 @@ impl HttpStatus {
         self.0
     }
 
+    /// Check whether the status represents a redirection (3xx).
+    pub fn is_redirection(&self) -> bool {
+        self.0 >= 300 && self.0 < 400
+    }
+
     pub fn reason_phrase(&self) -> &'static str {
         match self.0 {
             200 => "OK",
             201 => "Created",
             204 => "No Content",
+            301 => "Moved Permanently",
+            302 => "Found",
+            303 => "See Other",
             304 => "Not Modified",
+            307 => "Temporary Redirect",
+            308 => "Permanent Redirect",
             400 => "Bad Request",
             401 => "Unauthorized",
             403 => "Forbidden",
@@ -585,6 +600,31 @@ impl HttpResponse {
         Self::new(HttpStatus::NO_CONTENT)
     }
 
+    /// Create a 301 Moved Permanently redirect response with Location header.
+    pub fn moved_permanently(location: &str) -> Self {
+        Self::new(HttpStatus::MOVED_PERMANENTLY).header("Location", location)
+    }
+
+    /// Create a 302 Found redirect response with Location header.
+    pub fn found(location: &str) -> Self {
+        Self::new(HttpStatus::FOUND).header("Location", location)
+    }
+
+    /// Create a 303 See Other redirect response with Location header.
+    pub fn see_other(location: &str) -> Self {
+        Self::new(HttpStatus::SEE_OTHER).header("Location", location)
+    }
+
+    /// Create a 307 Temporary Redirect response with Location header.
+    pub fn temporary_redirect(location: &str) -> Self {
+        Self::new(HttpStatus::TEMPORARY_REDIRECT).header("Location", location)
+    }
+
+    /// Create a 308 Permanent Redirect response with Location header.
+    pub fn permanent_redirect(location: &str) -> Self {
+        Self::new(HttpStatus::PERMANENT_REDIRECT).header("Location", location)
+    }
+
     pub fn not_modified(etag_str: Option<&str>) -> Self {
         let mut resp = Self::new(HttpStatus::NOT_MODIFIED);
         if let Some(etag) = etag_str {
@@ -706,6 +746,16 @@ impl HttpResponse {
             .into_iter()
             .filter_map(Cookie::parse_set_cookie)
             .collect()
+    }
+
+    /// Check if this response is a redirection status (3xx).
+    pub fn is_redirection(&self) -> bool {
+        self.status.is_redirection()
+    }
+
+    /// Retrieve the target location URL for redirects if present.
+    pub fn location(&self) -> Option<&str> {
+        self.headers.get("Location")
     }
 
     /// Create an HTTP Response initialized for Server-Sent Events (SSE).
@@ -2044,6 +2094,85 @@ impl HttpClient {
         cookie_jar.store_from_response(&resp);
         Ok(resp)
     }
+
+    /// Send an HTTP request targeted at a structured `Url`, automatically following redirects up to `max_redirects`.
+    /// When following redirects:
+    /// - 301, 302: rewrites method to GET and clears body if original method was POST (RFC 7231 / browser convention)
+    /// - 303 (See Other): always rewrites method to GET and clears body
+    /// - 307, 308: preserves method and body
+    /// - Cross-origin redirects strip sensitive Authorization headers to prevent token leakage.
+    pub fn send_url_following_redirects(
+        &self,
+        req: &HttpRequest,
+        url: &Url,
+        max_redirects: usize,
+    ) -> io::Result<HttpResponse> {
+        let mut current_url = url.clone();
+        let mut current_req = req.clone();
+        let mut redirects_followed = 0;
+
+        loop {
+            let resp = self.send_url(&mut current_req, &current_url)?;
+
+            if resp.is_redirection() {
+                if let Some(loc_header) = resp.location() {
+                    if redirects_followed >= max_redirects {
+                        return Err(io::Error::other(format!(
+                            "Too many redirects (max: {})",
+                            max_redirects
+                        )));
+                    }
+
+                    let next_url = current_url.join(loc_header).map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Invalid redirect Location URL: {}", e),
+                        )
+                    })?;
+
+                    // Check for cross-origin redirect
+                    let is_cross_origin = !current_url.host.eq_ignore_ascii_case(&next_url.host)
+                        || current_url.port != next_url.port
+                        || !current_url.scheme.eq_ignore_ascii_case(&next_url.scheme);
+
+                    if is_cross_origin {
+                        current_req.headers.remove("authorization");
+                        current_req.headers.remove("cookie");
+                    }
+
+                    // Adjust method and body according to RFC specs
+                    match resp.status {
+                        HttpStatus::SEE_OTHER => {
+                            current_req.method = HttpMethod::Get;
+                            current_req.body.clear();
+                            current_req.headers.remove("content-length");
+                            current_req.headers.remove("content-type");
+                        }
+                        HttpStatus::MOVED_PERMANENTLY | HttpStatus::FOUND => {
+                            if current_req.method == HttpMethod::Post {
+                                current_req.method = HttpMethod::Get;
+                                current_req.body.clear();
+                                current_req.headers.remove("content-length");
+                                current_req.headers.remove("content-type");
+                            }
+                        }
+                        HttpStatus::TEMPORARY_REDIRECT | HttpStatus::PERMANENT_REDIRECT => {
+                            // Retain method and body unchanged
+                        }
+                        _ => {}
+                    }
+
+                    // Reset Host header to match next URL's host
+                    current_req.headers.set("Host", next_url.host.as_str());
+                    current_url = next_url;
+                    redirects_followed += 1;
+                    continue;
+                }
+            }
+
+            return Ok(resp);
+        }
+    }
 }
 
 impl Default for HttpClient {
@@ -2373,6 +2502,80 @@ impl Url {
             out.push_str(f);
         }
         out
+    }
+
+    /// Resolve a relative or absolute URL reference against this base URL (RFC 3986 Section 5).
+    pub fn join(&self, reference: &str) -> Result<Self, String> {
+        let ref_trimmed = reference.trim();
+        if ref_trimmed.is_empty() {
+            return Ok(self.clone());
+        }
+
+        // 1. If reference contains scheme, parse directly as absolute URL
+        if ref_trimmed.contains("://") {
+            return Self::parse(ref_trimmed);
+        }
+
+        // 2. Protocol-relative URL ("//other-host/path")
+        if let Some(rest) = ref_trimmed.strip_prefix("//") {
+            let full = format!("{}:{}", self.scheme, rest);
+            return Self::parse(&full);
+        }
+
+        let mut target = self.clone();
+
+        // 3. Extract fragment if present (#...)
+        let (without_frag, frag) = if let Some((before_f, f)) = ref_trimmed.split_once('#') {
+            (before_f, Some(f.to_string()))
+        } else {
+            (ref_trimmed, None)
+        };
+        target.fragment = frag;
+
+        // 4. Extract query if present (?...)
+        let (path_part, query) = if let Some((before_q, q)) = without_frag.split_once('?') {
+            (before_q, Some(q.to_string()))
+        } else {
+            (without_frag, None)
+        };
+        target.query = query;
+
+        // 5. Resolve path
+        if path_part.is_empty() {
+            // Keep base path
+            return Ok(target);
+        }
+
+        if path_part.starts_with('/') {
+            // Absolute path against host
+            target.path = path_part.to_string();
+        } else {
+            // Relative path: resolve against base directory
+            let base_dir = match self.path.rfind('/') {
+                Some(idx) => &self.path[..=idx],
+                None => "/",
+            };
+            let mut segments: Vec<&str> = base_dir.split('/').filter(|s| !s.is_empty()).collect();
+            for seg in path_part.split('/') {
+                match seg {
+                    "" | "." => {}
+                    ".." => {
+                        segments.pop();
+                    }
+                    other => {
+                        segments.push(other);
+                    }
+                }
+            }
+            let mut resolved_path = String::from("/");
+            resolved_path.push_str(&segments.join("/"));
+            if path_part.ends_with('/') && !resolved_path.ends_with('/') {
+                resolved_path.push('/');
+            }
+            target.path = resolved_path;
+        }
+
+        Ok(target)
     }
 }
 
@@ -6116,5 +6319,63 @@ mod tests {
         let req6 = HttpRequest::new(HttpMethod::Get, "/api/v1/checkout").with_cookie_jar(&jar);
         assert_eq!(req6.cookie("sid"), Some("abc".to_string()));
         assert_eq!(req6.cookie("tracker"), Some("xyz".to_string()));
+    }
+
+    #[test]
+    fn test_redirect_handling_and_url_join() {
+        let base = Url::parse("https://example.com/api/v1/users/").expect("base url");
+
+        // 1. Join relative paths
+        let joined1 = base.join("profile").expect("join profile");
+        assert_eq!(
+            joined1.to_uri_string(),
+            "https://example.com/api/v1/users/profile"
+        );
+
+        let joined_parent = base.join("../items?sort=name").expect("join parent");
+        assert_eq!(
+            joined_parent.to_uri_string(),
+            "https://example.com/api/v1/items?sort=name"
+        );
+
+        let joined_root = base.join("/login").expect("join root");
+        assert_eq!(joined_root.to_uri_string(), "https://example.com/login");
+
+        let joined_absolute = base
+            .join("http://other.org:8080/landing")
+            .expect("join absolute");
+        assert_eq!(
+            joined_absolute.to_uri_string(),
+            "http://other.org:8080/landing"
+        );
+
+        // 2. HTTP Status redirect helpers
+        let resp301 = HttpResponse::moved_permanently("/new-path");
+        assert_eq!(resp301.status, HttpStatus::MOVED_PERMANENTLY);
+        assert_eq!(resp301.status.is_redirection(), true);
+        assert_eq!(resp301.is_redirection(), true);
+        assert_eq!(resp301.location(), Some("/new-path"));
+
+        let resp302 = HttpResponse::found("/temporary");
+        assert_eq!(resp302.status, HttpStatus::FOUND);
+        assert_eq!(resp302.is_redirection(), true);
+        assert_eq!(resp302.location(), Some("/temporary"));
+
+        let resp303 = HttpResponse::see_other("/other");
+        assert_eq!(resp303.status, HttpStatus::SEE_OTHER);
+        assert_eq!(resp303.is_redirection(), true);
+
+        let resp307 = HttpResponse::temporary_redirect("/temp-redirect");
+        assert_eq!(resp307.status, HttpStatus::TEMPORARY_REDIRECT);
+        assert_eq!(resp307.is_redirection(), true);
+
+        let resp308 = HttpResponse::permanent_redirect("/perm-redirect");
+        assert_eq!(resp308.status, HttpStatus::PERMANENT_REDIRECT);
+        assert_eq!(resp308.is_redirection(), true);
+
+        let resp200 = HttpResponse::ok();
+        assert_eq!(resp200.status.is_redirection(), false);
+        assert_eq!(resp200.is_redirection(), false);
+        assert_eq!(resp200.location(), None);
     }
 }
