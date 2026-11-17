@@ -1228,7 +1228,9 @@ pub fn hpack_encode_string_custom(s: &[u8], out: &mut Vec<u8>, use_huffman: bool
 }
 
 /// Decode an octet string (RFC 7541 Section 5.2), supporting both raw and Huffman strings.
-pub fn hpack_decode_string(bytes: &[u8]) -> Result<(std::borrow::Cow<'_, [u8]>, usize), FastHttpError> {
+pub fn hpack_decode_string(
+    bytes: &[u8],
+) -> Result<(std::borrow::Cow<'_, [u8]>, usize), FastHttpError> {
     if bytes.is_empty() {
         return Err(FastHttpError::Incomplete);
     }
@@ -1374,7 +1376,11 @@ impl HpackContext {
     }
 
     /// Encode a list of headers into an HPACK byte block with optional Huffman compression.
-    pub fn encode_headers_with_options(&mut self, headers: &[(&str, &str)], use_huffman: bool) -> Vec<u8> {
+    pub fn encode_headers_with_options(
+        &mut self,
+        headers: &[(&str, &str)],
+        use_huffman: bool,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         for &(name, value) in headers {
             let mut matched_idx = None;
@@ -1420,7 +1426,11 @@ impl HpackContext {
             } else {
                 // 3. Literal Header Field with Incremental Indexing — New Name: 01000000
                 out.push(0x40);
-                hpack_encode_string_custom(name.to_ascii_lowercase().as_bytes(), &mut out, use_huffman);
+                hpack_encode_string_custom(
+                    name.to_ascii_lowercase().as_bytes(),
+                    &mut out,
+                    use_huffman,
+                );
                 hpack_encode_string_custom(value.as_bytes(), &mut out, use_huffman);
                 self.add_dynamic_entry(name.to_ascii_lowercase(), value.to_string());
             }
@@ -2186,7 +2196,9 @@ mod http2_tests {
         ];
 
         let encoded_huffman = enc.encode_headers_with_options(&headers, true);
-        let decoded = dec.decode_headers(&encoded_huffman).expect("decode huffman headers");
+        let decoded = dec
+            .decode_headers(&encoded_huffman)
+            .expect("decode huffman headers");
 
         assert_eq!(decoded.len(), headers.len());
         for (i, &(orig_name, orig_val)) in headers.iter().enumerate() {

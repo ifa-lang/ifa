@@ -5743,8 +5743,8 @@ pub fn benchmark_http2_pool_performance(
         let mut server_conn = None;
         for _ in 0..100 {
             if let Ok(Some((stream, _))) = listener.try_accept() {
-                let h2 = AsyncHttp2Connection::server_handshake(stream)
-                    .expect("server h2 handshake");
+                let h2 =
+                    AsyncHttp2Connection::server_handshake(stream).expect("server h2 handshake");
                 server_conn = Some(h2);
                 break;
             }
@@ -5784,8 +5784,8 @@ pub fn benchmark_http2_pool_performance(
         }
     });
 
-    let pool = AsyncHttp2Pool::new("127.0.0.1", port, pool_capacity)
-        .with_max_concurrent_streams(100);
+    let pool =
+        AsyncHttp2Pool::new("127.0.0.1", port, pool_capacity).with_max_concurrent_streams(100);
 
     let mut completed_requests: usize = 0;
     let mut error_count: usize = 0;
