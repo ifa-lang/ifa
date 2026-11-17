@@ -1089,12 +1089,15 @@ impl Http2Frame {
             Http2Frame::WindowUpdate { .. } => 13,
             Http2Frame::Continuation { header_block, .. } => 9 + header_block.len(),
             Http2Frame::PushPromise { header_block, .. } => 13 + header_block.len(),
-            Http2Frame::PriorityUpdate { priority_field_value, .. } => {
-                13 + priority_field_value.len()
-            }
-            Http2Frame::AltSvc { origin, alt_svc_field_value, .. } => {
-                11 + origin.len() + alt_svc_field_value.len()
-            }
+            Http2Frame::PriorityUpdate {
+                priority_field_value,
+                ..
+            } => 13 + priority_field_value.len(),
+            Http2Frame::AltSvc {
+                origin,
+                alt_svc_field_value,
+                ..
+            } => 11 + origin.len() + alt_svc_field_value.len(),
             Http2Frame::Unknown { payload, .. } => 9 + payload.len(),
         };
 
@@ -1108,8 +1111,17 @@ impl Http2Frame {
                 end_stream,
                 data,
             } => {
-                let flags = if *end_stream { Self::FLAG_END_STREAM } else { 0 };
-                let header = Http2FrameHeader::new(data.len() as u32, Http2FrameType::Data, flags, *stream_id);
+                let flags = if *end_stream {
+                    Self::FLAG_END_STREAM
+                } else {
+                    0
+                };
+                let header = Http2FrameHeader::new(
+                    data.len() as u32,
+                    Http2FrameType::Data,
+                    flags,
+                    *stream_id,
+                );
                 dst[..9].copy_from_slice(&header.encode());
                 dst[9..9 + data.len()].copy_from_slice(data);
             }
@@ -1120,9 +1132,18 @@ impl Http2Frame {
                 header_block,
             } => {
                 let mut flags = 0;
-                if *end_stream { flags |= Self::FLAG_END_STREAM; }
-                if *end_headers { flags |= Self::FLAG_END_HEADERS; }
-                let header = Http2FrameHeader::new(header_block.len() as u32, Http2FrameType::Headers, flags, *stream_id);
+                if *end_stream {
+                    flags |= Self::FLAG_END_STREAM;
+                }
+                if *end_headers {
+                    flags |= Self::FLAG_END_HEADERS;
+                }
+                let header = Http2FrameHeader::new(
+                    header_block.len() as u32,
+                    Http2FrameType::Headers,
+                    flags,
+                    *stream_id,
+                );
                 dst[..9].copy_from_slice(&header.encode());
                 dst[9..9 + header_block.len()].copy_from_slice(header_block);
             }
@@ -1134,7 +1155,8 @@ impl Http2Frame {
             } => {
                 let header = Http2FrameHeader::new(5, Http2FrameType::Priority, 0, *stream_id);
                 dst[..9].copy_from_slice(&header.encode());
-                let dep = (if *exclusive { 0x8000_0000 } else { 0 }) | (*stream_dependency & 0x7FFF_FFFF);
+                let dep =
+                    (if *exclusive { 0x8000_0000 } else { 0 }) | (*stream_dependency & 0x7FFF_FFFF);
                 dst[9..13].copy_from_slice(&dep.to_be_bytes());
                 dst[13] = *weight;
             }
@@ -1194,7 +1216,11 @@ impl Http2Frame {
                 end_headers,
                 header_block,
             } => {
-                let flags = if *end_headers { Self::FLAG_END_HEADERS } else { 0 };
+                let flags = if *end_headers {
+                    Self::FLAG_END_HEADERS
+                } else {
+                    0
+                };
                 let header = Http2FrameHeader::new(
                     header_block.len() as u32,
                     Http2FrameType::Continuation,
@@ -1210,7 +1236,11 @@ impl Http2Frame {
                 end_headers,
                 header_block,
             } => {
-                let flags = if *end_headers { Self::FLAG_END_HEADERS } else { 0 };
+                let flags = if *end_headers {
+                    Self::FLAG_END_HEADERS
+                } else {
+                    0
+                };
                 let payload_len = 4 + header_block.len();
                 let header = Http2FrameHeader::new(
                     payload_len as u32,
@@ -1228,7 +1258,8 @@ impl Http2Frame {
             } => {
                 let bytes = priority_field_value.as_bytes();
                 let payload_len = 4 + bytes.len();
-                let header = Http2FrameHeader::new(payload_len as u32, Http2FrameType::PriorityUpdate, 0, 0);
+                let header =
+                    Http2FrameHeader::new(payload_len as u32, Http2FrameType::PriorityUpdate, 0, 0);
                 dst[..9].copy_from_slice(&header.encode());
                 dst[9..13].copy_from_slice(&(*prioritized_stream_id & 0x7FFF_FFFF).to_be_bytes());
                 dst[13..13 + bytes.len()].copy_from_slice(bytes);
@@ -1875,7 +1906,11 @@ impl HpackContext {
         }
         // If entry already exists and LRU is enabled, move/update to front
         if self.eviction_policy == HpackEvictionPolicy::Lru {
-            if let Some(pos) = self.dynamic_table.iter().position(|(n, v)| n == &name && v == &value) {
+            if let Some(pos) = self
+                .dynamic_table
+                .iter()
+                .position(|(n, v)| n == &name && v == &value)
+            {
                 self.dynamic_table.remove(pos);
             }
         }
@@ -1985,14 +2020,18 @@ impl HpackContext {
                 // Indexed Header Field (RFC 7541 Section 6.1)
                 let (idx, consumed) = hpack_decode_integer(&bytes[offset..], 7)?;
                 offset += consumed;
-                let (name, val) = self.get_and_touch_entry(idx).ok_or(FastHttpError::InvalidHeader)?;
+                let (name, val) = self
+                    .get_and_touch_entry(idx)
+                    .ok_or(FastHttpError::InvalidHeader)?;
                 out.push((name, val));
             } else if (b & 0x40) != 0 {
                 // Literal Header Field with Incremental Indexing (RFC 7541 Section 6.2.1)
                 let (idx, consumed) = hpack_decode_integer(&bytes[offset..], 6)?;
                 offset += consumed;
                 let name = if idx != 0 {
-                    let (n, _) = self.get_and_touch_entry(idx).ok_or(FastHttpError::InvalidHeader)?;
+                    let (n, _) = self
+                        .get_and_touch_entry(idx)
+                        .ok_or(FastHttpError::InvalidHeader)?;
                     n
                 } else {
                     let (raw_str, consumed_str) = Self::decode_string_raw(&bytes[offset..])?;
@@ -2016,7 +2055,9 @@ impl HpackContext {
                 let (idx, consumed) = hpack_decode_integer(&bytes[offset..], 4)?;
                 offset += consumed;
                 let name = if idx != 0 {
-                    let (n, _) = self.get_and_touch_entry(idx).ok_or(FastHttpError::InvalidHeader)?;
+                    let (n, _) = self
+                        .get_and_touch_entry(idx)
+                        .ok_or(FastHttpError::InvalidHeader)?;
                     n
                 } else {
                     let (raw_str, consumed_str) = Self::decode_string_raw(&bytes[offset..])?;
@@ -2184,14 +2225,22 @@ impl Http2Session {
 
     /// Apply dynamic renegotiation of flow control window sizes at session level (stream ID 0)
     /// or stream level (stream ID > 0), returning the resulting new window size.
-    pub fn update_window_size(&mut self, stream_id: u32, increment: u32) -> Result<i32, FastHttpError> {
+    pub fn update_window_size(
+        &mut self,
+        stream_id: u32,
+        increment: u32,
+    ) -> Result<i32, FastHttpError> {
         if stream_id == 0 {
-            let new_win = self.connection_window_size.checked_add(increment as i32)
+            let new_win = self
+                .connection_window_size
+                .checked_add(increment as i32)
                 .ok_or(FastHttpError::InvalidHeader)?;
             self.connection_window_size = new_win;
             Ok(new_win)
         } else if let Some(stream) = self.streams.get_mut(&stream_id) {
-            let new_win = stream.window_size.checked_add(increment as i32)
+            let new_win = stream
+                .window_size
+                .checked_add(increment as i32)
                 .ok_or(FastHttpError::InvalidHeader)?;
             stream.window_size = new_win;
             Ok(new_win)
@@ -3441,7 +3490,9 @@ mod http2_tests {
             }],
         };
 
-        let ack = session.handle_frame(&settings_frame).expect("handle settings frame");
+        let ack = session
+            .handle_frame(&settings_frame)
+            .expect("handle settings frame");
         assert!(matches!(ack, Some(Http2Frame::Settings { ack: true, .. })));
 
         assert_eq!(session.initial_stream_window_size, 131072);
@@ -3449,10 +3500,14 @@ mod http2_tests {
         assert_eq!(session.streams.get(&stream2).unwrap().window_size, 131072);
 
         // Test dynamic window update renegotiation at session and stream levels
-        let conn_win = session.update_window_size(0, 1000).expect("update session window");
+        let conn_win = session
+            .update_window_size(0, 1000)
+            .expect("update session window");
         assert_eq!(conn_win, 65535 + 1000);
 
-        let stream1_win = session.update_window_size(stream1, 500).expect("update stream window");
+        let stream1_win = session
+            .update_window_size(stream1, 500)
+            .expect("update stream window");
         assert_eq!(stream1_win, 131072 + 500);
 
         // Verify newly opened streams receive the updated initial window size
@@ -3496,7 +3551,7 @@ mod http2_tests {
         fifo_ctx.add_dynamic_entry("k1".to_string(), "v1".to_string());
         fifo_ctx.add_dynamic_entry("k2".to_string(), "v2".to_string());
         let _ = fifo_ctx.get_and_touch_entry(63); // Touch k1 in FIFO mode
-        // In FIFO mode, touching does not reorder
+                                                  // In FIFO mode, touching does not reorder
         assert_eq!(fifo_ctx.dynamic_table[0].0, "k2");
         assert_eq!(fifo_ctx.dynamic_table[1].0, "k1");
         fifo_ctx.add_dynamic_entry("k3".to_string(), "v3".to_string());
