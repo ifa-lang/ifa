@@ -8170,6 +8170,8 @@ mod tests {
                             )
                             .expect("send response");
                         let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                        // Give client time to read response frames before socket closes
+                        std::thread::sleep(Duration::from_millis(50));
                         break;
                     }
                 }
