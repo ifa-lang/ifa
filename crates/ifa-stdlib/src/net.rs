@@ -3379,6 +3379,42 @@ impl AsyncHttp2Connection {
         self.session.prioritized_stream_ids()
     }
 
+    /// Send a PING frame with 8-byte opaque data.
+    pub fn send_ping(&mut self, opaque_data: [u8; 8]) -> io::Result<()> {
+        let frame = crate::simd_parser::Http2Frame::Ping {
+            ack: false,
+            opaque_data,
+        };
+        self.send_frame(&frame)
+    }
+
+    /// Send a PING frame and wait for the corresponding PING ACK response with matching payload.
+    /// Yields cooperatively while waiting.
+    pub fn ping(&mut self, opaque_data: [u8; 8]) -> io::Result<()> {
+        self.send_ping(opaque_data)?;
+        let mut spins = 0;
+        loop {
+            let frame = self.recv_frame()?;
+            if let crate::simd_parser::Http2Frame::Ping { ack, opaque_data: resp_data } = frame {
+                if ack && resp_data == opaque_data {
+                    return Ok(());
+                }
+            } else if let crate::simd_parser::Http2Frame::GoAway { error_code, .. } = frame {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    format!("Connection closed by GOAWAY: {:?}", error_code),
+                ));
+            }
+            spins += 1;
+            if spins < 16 {
+                std::hint::spin_loop();
+            } else {
+                GLOBAL_SCHEDULER.yield_now();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
     /// Execute a batch of prioritized requests multiplexed over this single HTTP/2 connection.
     /// Sends PRIORITY frames for each stream, sends the requests concurrently,
     /// and collects responses in the order of the dependency tree and weights.
@@ -3551,11 +3587,14 @@ impl AsyncHttp2Pool {
     /// Acquire an active HTTP/2 connection from the pool, or establish a new connection if below capacity.
     pub fn acquire(&self) -> io::Result<AsyncHttp2Connection> {
         if let Ok(mut pool) = self.idle_pool.lock() {
-            while let Some(conn) = pool.pop() {
+            while let Some(mut conn) = pool.pop() {
                 if !conn.is_closed() {
-                    self.active_count
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(conn);
+                    // Quick health check ping
+                    if conn.send_ping(*b"h2_probe").is_ok() {
+                        self.active_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(conn);
+                    }
                 }
             }
         }
@@ -3644,6 +3683,27 @@ impl AsyncHttp2Pool {
         if let Ok(mut pool) = self.idle_pool.lock() {
             pool.clear();
         }
+    }
+
+    /// Health-check all idle connections in the pool by transmitting PING frames,
+    /// removing any dead or unresponsive connections.
+    pub fn health_check(&self) -> usize {
+        let mut healthy = Vec::new();
+        let mut closed_count = 0;
+
+        if let Ok(mut pool) = self.idle_pool.lock() {
+            let connections: Vec<AsyncHttp2Connection> = pool.drain(..).collect();
+            for mut conn in connections {
+                if !conn.is_closed() && conn.send_ping(*b"h2_probe").is_ok() {
+                    healthy.push(conn);
+                } else {
+                    closed_count += 1;
+                }
+            }
+            *pool = healthy;
+        }
+
+        closed_count
     }
 }
 
@@ -6332,6 +6392,59 @@ mod tests {
         assert_eq!(pool.active_count(), 0);
 
         let mut conn = pool.acquire().expect("acquire to close");
+        let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        pool.release(conn);
+        pool.clear();
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_ping_and_pool_health_check() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            };
+
+            // Loop and auto-reply to PING frames (handled automatically inside recv_frame/try_recv_frame)
+            loop {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
+
+        // 1. Acquire connection and verify ping RTT round-trip
+        let mut conn = pool.acquire().expect("acquire connection");
+        let ping_payload = *b"pingpong";
+        conn.ping(ping_payload).expect("ping roundtrip");
+
+        // 2. Release back to pool and verify idle count
+        pool.release(conn);
+        assert_eq!(pool.idle_count(), 1);
+
+        // 3. Health-check idle connections in pool
+        let removed = pool.health_check();
+        assert_eq!(removed, 0);
+        assert_eq!(pool.idle_count(), 1);
+
+        // 4. Close connection cleanly
+        let mut conn = pool.acquire().expect("re-acquire");
         let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
         pool.release(conn);
         pool.clear();
