@@ -2823,7 +2823,11 @@ impl SseDecoder {
             }
 
             // A valid SSE event must have at least data, comment, or event name
-            if !data_lines.is_empty() || !comment_lines.is_empty() || event_name.is_some() || id.is_some() {
+            if !data_lines.is_empty()
+                || !comment_lines.is_empty()
+                || event_name.is_some()
+                || id.is_some()
+            {
                 let data = data_lines.join("\n");
                 let comment = if !comment_lines.is_empty() {
                     Some(comment_lines.join("\n"))
@@ -3987,24 +3991,15 @@ mod tests {
             let stream = AsyncTcpStream::connect(addr).expect("connect client");
             let mut client = AsyncSseClient::new(stream);
 
-            let ev1 = client
-                .read_event()
-                .expect("read 1")
-                .expect("some event 1");
+            let ev1 = client.read_event().expect("read 1").expect("some event 1");
             assert_eq!(ev1.data, "ready");
             assert_eq!(ev1.id.as_deref(), Some("msg-1"));
             assert_eq!(client.last_event_id(), Some("msg-1"));
 
-            let ev2 = client
-                .read_event()
-                .expect("read 2")
-                .expect("some event 2");
+            let ev2 = client.read_event().expect("read 2").expect("some event 2");
             assert_eq!(ev2.comment.as_deref(), Some("ping"));
 
-            let ev3 = client
-                .read_event()
-                .expect("read 3")
-                .expect("some event 3");
+            let ev3 = client.read_event().expect("read 3").expect("some event 3");
             assert_eq!(ev3.event.as_deref(), Some("telemetry"));
             assert_eq!(ev3.data, "sensor update payload");
             assert_eq!(ev3.id.as_deref(), Some("msg-2"));
