@@ -3864,6 +3864,8 @@ pub struct Http2PoolStats {
     pub last_goaway_error: Option<crate::simd_parser::Http2ErrorCode>,
     /// Last negotiated ALPN protocol observed during TLS connection handshake, if any.
     pub last_alpn_negotiated: Option<AlpnProtocol>,
+    /// Total number of idle connections evicted by TTL expiration or capacity bounds.
+    pub evicted_connections: usize,
 }
 
 impl Http2PoolStats {
@@ -3880,6 +3882,12 @@ impl Http2PoolStats {
     }
 }
 
+/// An idle pooled HTTP/2 connection paired with the timestamp at which it became idle.
+struct PooledConnectionEntry {
+    conn: AsyncHttp2Connection,
+    idle_since: std::time::Instant,
+}
+
 /// Transparently manages connection pooling, multiplexing limits, idle connection reuse,
 /// and multiplexed request execution across shared or pooled HTTP/2 connections.
 pub struct AsyncHttp2Pool {
@@ -3887,8 +3895,10 @@ pub struct AsyncHttp2Pool {
     port: u16,
     max_connections: usize,
     max_concurrent_streams_per_conn: usize,
-    idle_pool: std::sync::Mutex<Vec<AsyncHttp2Connection>>,
+    idle_ttl: Option<std::time::Duration>,
+    idle_pool: std::sync::Mutex<Vec<PooledConnectionEntry>>,
     active_count: std::sync::atomic::AtomicUsize,
+    evicted_count: std::sync::atomic::AtomicUsize,
     last_goaway_error: std::sync::Mutex<Option<crate::simd_parser::Http2ErrorCode>>,
     last_alpn_negotiated: std::sync::Mutex<Option<AlpnProtocol>>,
     tls_config: Option<TlsConfig>,
@@ -3907,14 +3917,23 @@ impl AsyncHttp2Pool {
             port,
             max_connections: max_connections.max(1),
             max_concurrent_streams_per_conn: Self::DEFAULT_MAX_STREAMS,
+            idle_ttl: None,
             idle_pool: std::sync::Mutex::new(Vec::new()),
             active_count: std::sync::atomic::AtomicUsize::new(0),
+            evicted_count: std::sync::atomic::AtomicUsize::new(0),
             last_goaway_error: std::sync::Mutex::new(None),
             last_alpn_negotiated: std::sync::Mutex::new(None),
             tls_config: None,
             request_interceptors: Vec::new(),
             response_interceptors: Vec::new(),
         }
+    }
+
+    /// Configure an idle connection TTL (Time-To-Live).
+    /// Connections that have remained idle longer than `ttl` will be discarded upon checkout or sweep.
+    pub fn with_idle_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.idle_ttl = Some(ttl);
+        self
     }
 
     /// Configure TLS/ALPN negotiation configuration for connections established by this pool.
@@ -4005,6 +4024,12 @@ impl AsyncHttp2Pool {
         self.active_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Total count of idle connections evicted by TTL or capacity bounds.
+    pub fn evicted_count(&self) -> usize {
+        self.evicted_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Snapshot the current runtime metrics and diagnostic telemetry of the pool.
     pub fn stats(&self) -> Http2PoolStats {
         Http2PoolStats {
@@ -4014,13 +4039,27 @@ impl AsyncHttp2Pool {
             max_concurrent_streams_per_conn: self.max_concurrent_streams_per_conn,
             last_goaway_error: self.last_goaway_error(),
             last_alpn_negotiated: self.last_alpn_negotiated(),
+            evicted_connections: self.evicted_count(),
         }
     }
 
     /// Acquire an active HTTP/2 connection from the pool, or establish a new connection if below capacity.
+    ///
+    /// Idle connections are reused in LRU/MRU order (most recently used popped first),
+    /// and any connections exceeding `idle_ttl` or found dead/closed/GOAWAY are evicted.
     pub fn acquire(&self) -> io::Result<AsyncHttp2Connection> {
+        let now = std::time::Instant::now();
         if let Ok(mut pool) = self.idle_pool.lock() {
-            while let Some(mut conn) = pool.pop() {
+            while let Some(entry) = pool.pop() {
+                let mut conn = entry.conn;
+                // Check TTL expiration
+                if let Some(ttl) = self.idle_ttl {
+                    if now.duration_since(entry.idle_since) > ttl {
+                        self.evicted_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                }
                 // If the connection was already marked closed or received a GOAWAY, record error and discard it
                 if let Some((_, err, _)) = conn.last_received_goaway() {
                     if let Ok(mut last_err) = self.last_goaway_error.lock() {
@@ -4068,7 +4107,10 @@ impl AsyncHttp2Pool {
                 if !proto.supports_multiplexing() {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
-                        format!("ALPN negotiated non-HTTP/2 protocol ({}) in HTTP/2 pool", proto),
+                        format!(
+                            "ALPN negotiated non-HTTP/2 protocol ({}) in HTTP/2 pool",
+                            proto
+                        ),
                     ));
                 }
             } else {
@@ -4107,9 +4149,16 @@ impl AsyncHttp2Pool {
 
         if !conn.is_closed() {
             if let Ok(mut pool) = self.idle_pool.lock() {
-                if pool.len() < self.max_connections {
-                    pool.push(conn);
+                // Evict oldest (LRU, index 0) if at capacity bound before inserting new idle entry
+                while pool.len() >= self.max_connections {
+                    pool.remove(0);
+                    self.evicted_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                pool.push(PooledConnectionEntry {
+                    conn,
+                    idle_since: std::time::Instant::now(),
+                });
             }
         }
     }
@@ -4208,8 +4257,10 @@ impl AsyncHttp2Pool {
     /// Gracefully shutdown all pooled idle connections by sending GOAWAY frames.
     pub fn shutdown(&self) {
         if let Ok(mut pool) = self.idle_pool.lock() {
-            for mut conn in pool.drain(..) {
-                let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+            for mut entry in pool.drain(..) {
+                let _ = entry
+                    .conn
+                    .send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
             }
         }
     }
@@ -4218,9 +4269,11 @@ impl AsyncHttp2Pool {
     /// draining in-flight streams up to `timeout_ms` per connection.
     pub fn drain_and_shutdown(&self, timeout_ms: u64) {
         if let Ok(mut pool) = self.idle_pool.lock() {
-            for mut conn in pool.drain(..) {
-                let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
-                let _ = conn.drain_graceful(timeout_ms);
+            for mut entry in pool.drain(..) {
+                let _ = entry
+                    .conn
+                    .send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                let _ = entry.conn.drain_graceful(timeout_ms);
             }
         }
     }
@@ -4232,19 +4285,19 @@ impl AsyncHttp2Pool {
         let mut closed_count = 0;
 
         if let Ok(mut pool) = self.idle_pool.lock() {
-            let connections: Vec<AsyncHttp2Connection> = pool.drain(..).collect();
-            for mut conn in connections {
+            let entries: Vec<PooledConnectionEntry> = pool.drain(..).collect();
+            for mut entry in entries {
                 // Check if any frame (e.g. GOAWAY) arrived on wire
-                let _ = conn.try_recv_frame();
-                if let Some((_, err, _)) = conn.last_received_goaway() {
+                let _ = entry.conn.try_recv_frame();
+                if let Some((_, err, _)) = entry.conn.last_received_goaway() {
                     if let Ok(mut last_err) = self.last_goaway_error.lock() {
                         *last_err = Some(err);
                     }
                     closed_count += 1;
                     continue;
                 }
-                if !conn.is_closed() && conn.send_ping(*b"h2_probe").is_ok() {
-                    healthy.push(conn);
+                if !entry.conn.is_closed() && entry.conn.send_ping(*b"h2_probe").is_ok() {
+                    healthy.push(entry);
                 } else {
                     closed_count += 1;
                 }
@@ -4253,6 +4306,35 @@ impl AsyncHttp2Pool {
         }
 
         closed_count
+    }
+
+    /// Sweep and evict any idle connections whose idle duration exceeds `ttl` (or configured pool `idle_ttl`).
+    /// Returns the number of connections evicted during the sweep.
+    pub fn sweep_idle_connections(&self, custom_ttl: Option<std::time::Duration>) -> usize {
+        let ttl_to_use = custom_ttl.or(self.idle_ttl);
+        let Some(ttl) = ttl_to_use else {
+            return 0;
+        };
+
+        let now = std::time::Instant::now();
+        let mut evicted = 0;
+        if let Ok(mut pool) = self.idle_pool.lock() {
+            let mut retained = Vec::with_capacity(pool.len());
+            for entry in pool.drain(..) {
+                if now.duration_since(entry.idle_since) > ttl {
+                    evicted += 1;
+                } else {
+                    retained.push(entry);
+                }
+            }
+            *pool = retained;
+        }
+
+        if evicted > 0 {
+            self.evicted_count
+                .fetch_add(evicted, std::sync::atomic::Ordering::Relaxed);
+        }
+        evicted
     }
 
     /// Retrieve the most recently observed HTTP/2 GOAWAY error code received across pooled connections.
@@ -8212,7 +8294,8 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let (tcp_stream, _) = listener.accept().expect("accept");
             let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async");
-            let mut server = AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
             while let Ok(frame) = server.recv_frame() {
                 if let crate::simd_parser::Http2Frame::Headers {
                     stream_id,
@@ -8237,11 +8320,12 @@ mod tests {
         });
 
         // 1. With default HTTP/2 ALPN config -> negotiated protocol is recorded as Http2
-        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2)
-            .with_tls_config(TlsConfig::default());
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2).with_tls_config(TlsConfig::default());
         assert_eq!(pool.last_alpn_negotiated(), None);
 
-        let resp = pool.execute_request("GET", "/alpn-test", &[], None).expect("request");
+        let resp = pool
+            .execute_request("GET", "/alpn-test", &[], None)
+            .expect("request");
         assert_eq!(resp.status.0, 200);
         assert_eq!(pool.last_alpn_negotiated(), Some(AlpnProtocol::Http2));
         assert_eq!(pool.stats().last_alpn_negotiated, Some(AlpnProtocol::Http2));
@@ -8252,8 +8336,8 @@ mod tests {
         let listener2 = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener 2");
         let port2 = listener2.local_addr().expect("local addr 2").port();
 
-        let pool_h11 = AsyncHttp2Pool::new("127.0.0.1", port2, 2)
-            .with_tls_config(TlsConfig::http11_only());
+        let pool_h11 =
+            AsyncHttp2Pool::new("127.0.0.1", port2, 2).with_tls_config(TlsConfig::http11_only());
         match pool_h11.acquire() {
             Ok(_) => panic!("expected acquire to fail on http11-only ALPN config"),
             Err(err) => {
@@ -8350,6 +8434,88 @@ mod tests {
         assert_eq!(resp.headers.get("x-post-processed"), Some("yes"));
         assert_eq!(pool.active_count(), 0);
         assert_eq!(pool.idle_count(), 0);
+    }
+
+    #[test]
+    fn test_async_http2_pool_lru_and_ttl_eviction() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            // Server thread: accept connections, perform handshake, then handle incoming frames
+            while let Ok((tcp_stream, _)) = listener.accept() {
+                let async_stream = match AsyncTcpStream::from_std(tcp_stream) {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut server = match AsyncHttp2Connection::server_handshake(async_stream) {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                while let Ok(frame) = server.recv_frame() {
+                    if let crate::simd_parser::Http2Frame::Ping { ack, opaque_data } = frame {
+                        if !ack {
+                            let _ = server.send_frame(&crate::simd_parser::Http2Frame::Ping {
+                                ack: true,
+                                opaque_data,
+                            });
+                        }
+                    } else if let crate::simd_parser::Http2Frame::GoAway { .. } = frame {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // 1. Test LRU capacity bound eviction: max_connections = 2
+        let pool =
+            AsyncHttp2Pool::new("127.0.0.1", port, 2).with_idle_ttl(Duration::from_millis(50));
+
+        let conn1 = pool.acquire().expect("acquire 1");
+        let conn2 = pool.acquire().expect("acquire 2");
+
+        assert_eq!(pool.active_count(), 2);
+        assert_eq!(pool.idle_count(), 0);
+        assert_eq!(pool.evicted_count(), 0);
+
+        pool.release(conn1);
+        pool.release(conn2);
+
+        assert_eq!(pool.active_count(), 0);
+        assert_eq!(pool.idle_count(), 2);
+
+        // 2. Test manual sweep before TTL expires: 0 evicted
+        let swept = pool.sweep_idle_connections(Some(Duration::from_secs(10)));
+        assert_eq!(swept, 0);
+        assert_eq!(pool.idle_count(), 2);
+
+        // 3. Wait for TTL to expire (50 ms) and test sweep_idle_connections
+        std::thread::sleep(Duration::from_millis(70));
+        let swept = pool.sweep_idle_connections(None);
+        assert_eq!(swept, 2);
+        assert_eq!(pool.idle_count(), 0);
+        assert_eq!(pool.evicted_count(), 2);
+        assert_eq!(pool.stats().evicted_connections, 2);
+
+        // 4. Test LRU eviction when releasing more than max_connections:
+        // Establish 2 connections, release them, then establish a 3rd and release it
+        let c1 = pool.acquire().expect("acquire fresh 1");
+        let c2 = pool.acquire().expect("acquire fresh 2");
+        pool.release(c1);
+        pool.release(c2);
+        assert_eq!(pool.idle_count(), 2);
+
+        let initial_evicted = pool.evicted_count();
+        let c3 = AsyncHttp2Connection::client_handshake(
+            AsyncTcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect"),
+        )
+        .expect("client handshake");
+        pool.release(c3); // pool capacity is 2 -> LRU (oldest) evicted!
+        assert_eq!(pool.idle_count(), 2);
+        assert_eq!(pool.evicted_count(), initial_evicted + 1);
+
+        pool.shutdown();
+        let _ = handle;
     }
 
     #[test]
