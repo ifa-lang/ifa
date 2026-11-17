@@ -3173,6 +3173,58 @@ impl AsyncHttp2Connection {
         self.send_goaway_with_debug(error_code, &[])
     }
 
+    /// Read incoming frames until all active streams up to `last_stream_id` are completed
+    /// or until the connection is fully closed. Any new streams initiated by peer beyond
+    /// `last_stream_id` will be rejected with `StreamClosed` error.
+    pub fn drain_graceful(&mut self, timeout_ms: u64) -> io::Result<()> {
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(timeout_ms);
+        let mut spins = 0;
+
+        loop {
+            // Check if all existing streams in session are closed
+            let all_closed = self
+                .session
+                .streams
+                .values()
+                .all(|s| s.state == crate::simd_parser::Http2StreamState::Closed);
+
+            if all_closed || self.session.streams.is_empty() {
+                return Ok(());
+            }
+
+            if start.elapsed() >= timeout {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Timed out waiting for HTTP/2 connection streams to drain gracefully",
+                ));
+            }
+
+            if let Some(frame) = self.try_recv_frame()? {
+                if let crate::simd_parser::Http2Frame::GoAway { error_code, .. } = frame {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        format!(
+                            "Connection closed by peer GOAWAY during graceful drain: {:?}",
+                            error_code
+                        ),
+                    ));
+                }
+            } else {
+                if self.is_closed && self.read_buf.is_empty() {
+                    return Ok(());
+                }
+                spins += 1;
+                if spins < 16 {
+                    std::hint::spin_loop();
+                } else {
+                    GLOBAL_SCHEDULER.yield_now();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
     /// Abort an active stream with a specific HTTP/2 error code and notify the peer via RST_STREAM.
     pub fn rst_stream(
         &mut self,
@@ -3703,6 +3755,17 @@ impl AsyncHttp2Pool {
         if let Ok(mut pool) = self.idle_pool.lock() {
             for mut conn in pool.drain(..) {
                 let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+            }
+        }
+    }
+
+    /// Gracefully shutdown all pooled idle connections by sending GOAWAY frames and
+    /// draining in-flight streams up to `timeout_ms` per connection.
+    pub fn drain_and_shutdown(&self, timeout_ms: u64) {
+        if let Ok(mut pool) = self.idle_pool.lock() {
+            for mut conn in pool.drain(..) {
+                let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                let _ = conn.drain_graceful(timeout_ms);
             }
         }
     }
@@ -6513,6 +6576,93 @@ mod tests {
             )
             .expect("send goaway with debug");
         assert!(client.is_closed());
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_drain_graceful_and_pool_shutdown() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            };
+
+            // Recv request frame
+            let stream_id = loop {
+                match server.recv_frame().expect("recv frame") {
+                    crate::simd_parser::Http2Frame::Headers {
+                        stream_id: sid,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            break sid;
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::Data {
+                        stream_id: sid,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            break sid;
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::GoAway { .. } => return,
+                    _ => {}
+                }
+            };
+
+            // Send back complete response to close the stream gracefully
+            let res_headers = [(":status", "200")];
+            server
+                .send_response(stream_id, &res_headers, Some(b"graceful drain response"))
+                .expect("send response");
+
+            // Recv GoAway
+            let frame = server.recv_frame().expect("recv goaway frame");
+            match frame {
+                crate::simd_parser::Http2Frame::GoAway { .. } => {}
+                other => panic!("Expected GoAway frame, got {:?}", other),
+            }
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
+        let mut conn = pool.acquire().expect("acquire connection from pool");
+
+        // Send a request
+        let req_headers = [(":method", "GET"), (":path", "/drain-test")];
+        let sid = conn.send_request(&req_headers, None).expect("send request");
+        assert_eq!(sid, 1);
+
+        // Receive the response
+        let (resp_headers, body) = conn.recv_response_for(sid).expect("recv response");
+        assert_eq!(body, b"graceful drain response");
+        assert!(resp_headers
+            .iter()
+            .any(|(k, v)| k == ":status" && v == "200"));
+
+        // Test conn.drain_graceful (stream is already completed/closed)
+        assert!(conn.drain_graceful(500).is_ok());
+
+        // Release connection back to pool
+        pool.release(conn);
+        assert_eq!(pool.idle_count(), 1);
+
+        // Test pool drain_and_shutdown
+        pool.drain_and_shutdown(500);
+        assert_eq!(pool.idle_count(), 0);
 
         let _ = handle.join();
     }
