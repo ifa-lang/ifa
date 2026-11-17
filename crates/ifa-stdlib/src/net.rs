@@ -3946,6 +3946,7 @@ pub struct AsyncHttp2Pool {
     tls_config: Option<TlsConfig>,
     request_interceptors: Vec<Http2RequestInterceptor>,
     response_interceptors: Vec<Http2ResponseInterceptor>,
+    alt_svc_routes: std::sync::Mutex<std::collections::HashMap<String, Vec<crate::simd_parser::AltSvcRoute>>>,
 }
 
 impl AsyncHttp2Pool {
@@ -3968,6 +3969,7 @@ impl AsyncHttp2Pool {
             tls_config: None,
             request_interceptors: Vec::new(),
             response_interceptors: Vec::new(),
+            alt_svc_routes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -4182,6 +4184,15 @@ impl AsyncHttp2Pool {
         // Check if any pending frames on wire indicate GOAWAY
         let _ = conn.try_recv_frame();
 
+        // Harvest any Alt-Svc routes discovered on the connection's session
+        if !conn.session.alt_svc_routes.is_empty() {
+            if let Ok(mut pool_routes) = self.alt_svc_routes.lock() {
+                for (origin, routes) in &conn.session.alt_svc_routes {
+                    pool_routes.insert(origin.clone(), routes.clone());
+                }
+            }
+        }
+
         if let Some((_, err, _)) = conn.last_received_goaway() {
             if let Ok(mut last_err) = self.last_goaway_error.lock() {
                 *last_err = Some(err);
@@ -4274,6 +4285,18 @@ impl AsyncHttp2Pool {
         let result = conn.request(&client_req.method, &client_req.path, &header_refs, body_ref);
         match result {
             Ok(mut resp) => {
+                // If response contains an "alt-svc" header, automatically record routes on pool
+                if let Some(alt_svc_val) = resp.headers.get("alt-svc") {
+                    let routes = crate::simd_parser::AltSvcRoute::parse_header_value(alt_svc_val);
+                    let origin = format!("{}:{}", self.host, self.port);
+                    if let Ok(mut pool_routes) = self.alt_svc_routes.lock() {
+                        if routes.is_empty() && alt_svc_val.trim().eq_ignore_ascii_case("clear") {
+                            pool_routes.remove(&origin);
+                        } else if !routes.is_empty() {
+                            pool_routes.insert(origin, routes);
+                        }
+                    }
+                }
                 self.release(conn);
                 for resp_interceptor in &self.response_interceptors {
                     resp_interceptor(&client_req, &mut resp);
@@ -4407,6 +4430,40 @@ impl AsyncHttp2Pool {
     pub fn clear_alpn_negotiated(&self) {
         if let Ok(mut slot) = self.last_alpn_negotiated.lock() {
             *slot = None;
+        }
+    }
+
+    /// Retrieve advertised Alt-Svc routes discovered for a given origin (or default pool origin).
+    pub fn get_alt_svc_routes(&self, origin: Option<&str>) -> Vec<crate::simd_parser::AltSvcRoute> {
+        let key = origin
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{}:{}", self.host, self.port));
+        self.alt_svc_routes
+            .lock()
+            .ok()
+            .and_then(|routes| routes.get(&key).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Explicitly record or update alternative service routes for a given origin.
+    pub fn record_alt_svc_routes(
+        &self,
+        origin: impl Into<String>,
+        routes: Vec<crate::simd_parser::AltSvcRoute>,
+    ) {
+        if let Ok(mut map) = self.alt_svc_routes.lock() {
+            if routes.is_empty() {
+                map.remove(&origin.into());
+            } else {
+                map.insert(origin.into(), routes);
+            }
+        }
+    }
+
+    /// Clear all alternative service routes registered on the pool.
+    pub fn clear_alt_svc_routes(&self) {
+        if let Ok(mut map) = self.alt_svc_routes.lock() {
+            map.clear();
         }
     }
 
@@ -8818,6 +8875,90 @@ mod tests {
 
         pool.shutdown();
         let _ = handle;
+    }
+
+    #[test]
+    fn test_async_http2_pool_altsvc_routes_harvesting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let (tcp_stream, _) = listener.accept().expect("accept connection");
+            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+
+            while let Ok(frame) = server.recv_frame() {
+                if let crate::simd_parser::Http2Frame::Headers {
+                    stream_id,
+                    end_stream,
+                    ..
+                } = frame
+                {
+                    if end_stream {
+                        // Advertise HTTP/3 alternative service via Alt-Svc response header
+                        server
+                            .send_response(
+                                stream_id,
+                                &[
+                                    (":status", "200"),
+                                    ("alt-svc", "h3=\":50443\"; ma=86400; persist=1"),
+                                ],
+                                Some(b"alt-svc-ack"),
+                            )
+                            .expect("send response with alt-svc");
+                        let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                        std::thread::sleep(Duration::from_millis(50));
+                        break;
+                    }
+                }
+            }
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
+
+        // Before request: no Alt-Svc routes known
+        assert!(pool.get_alt_svc_routes(None).is_empty());
+
+        let resp = pool
+            .execute_request("GET", "/test-altsvc", &[], None)
+            .expect("execute request");
+
+        assert_eq!(resp.status.0, 200);
+        assert_eq!(resp.body, b"alt-svc-ack");
+
+        // After request: pool harvested Alt-Svc header and parsed routes
+        let routes = pool.get_alt_svc_routes(None);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].protocol_id, "h3");
+        assert_eq!(routes[0].port, 50443);
+        assert_eq!(routes[0].max_age, 86400);
+        assert!(routes[0].persist);
+
+        // Explicit clear / update test
+        pool.clear_alt_svc_routes();
+        assert!(pool.get_alt_svc_routes(None).is_empty());
+
+        // Test ALTSVC frame harvesting via connection release
+        let mut conn = pool.acquire().expect("acquire fresh connection");
+        // Inject an ALTSVC frame into connection session
+        let altsvc_frame = crate::simd_parser::Http2Frame::AltSvc {
+            stream_id: 0,
+            origin: "https://example.org".to_string(),
+            alt_svc_field_value: "h3=\":443\"; ma=3600".to_string(),
+        };
+        conn.session.handle_frame(&altsvc_frame).expect("handle frame");
+        pool.release(conn);
+
+        // Verify pool harvested routes from connection session
+        let org_routes = pool.get_alt_svc_routes(Some("https://example.org"));
+        assert_eq!(org_routes.len(), 1);
+        assert_eq!(org_routes[0].protocol_id, "h3");
+        assert_eq!(org_routes[0].port, 443);
+        assert_eq!(org_routes[0].max_age, 3600);
+
+        pool.shutdown();
+        let _ = handle.join();
     }
 
     #[test]
