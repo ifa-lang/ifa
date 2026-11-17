@@ -7109,11 +7109,7 @@ mod tests {
             let mut server =
                 AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
 
-            loop {
-                let frame = match server.recv_frame() {
-                    Ok(f) => f,
-                    Err(_) => break,
-                };
+            while let Ok(frame) = server.recv_frame() {
                 if let crate::simd_parser::Http2Frame::Headers {
                     stream_id,
                     end_stream,
@@ -7156,11 +7152,7 @@ mod tests {
                 let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
                 let mut server =
                     AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
-                loop {
-                    let frame = match server.recv_frame() {
-                        Ok(f) => f,
-                        Err(_) => break,
-                    };
+                while let Ok(frame) = server.recv_frame() {
                     if let crate::simd_parser::Http2Frame::Headers {
                         stream_id,
                         end_stream,
