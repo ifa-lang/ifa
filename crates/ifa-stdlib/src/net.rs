@@ -3491,6 +3491,11 @@ impl AsyncHttp2Connection {
             let frame_stream_id = match &frame {
                 crate::simd_parser::Http2Frame::Headers { stream_id, .. } => *stream_id,
                 crate::simd_parser::Http2Frame::Data { stream_id, .. } => *stream_id,
+                crate::simd_parser::Http2Frame::WindowUpdate { .. } => {
+                    // Replenished window credit: attempt to flush any pending outbound scheduled data
+                    let _ = self.flush_scheduled_outbound_data(true);
+                    0
+                }
                 crate::simd_parser::Http2Frame::RstStream {
                     stream_id,
                     error_code,
@@ -3757,6 +3762,7 @@ impl AsyncHttp2Connection {
         let mut has_rfc9218 = false;
 
         // 1. Dispatch requests and transmit PRIORITY / PRIORITY_UPDATE frames
+        let mut has_pending_scheduled_data = false;
         for req in &requests {
             let mut pseudo_headers = vec![
                 (":method", req.method.as_str()),
@@ -3767,7 +3773,19 @@ impl AsyncHttp2Connection {
                 pseudo_headers.push((k.as_str(), v.as_str()));
             }
 
-            let stream_id = self.send_request(&pseudo_headers, req.body.as_deref())?;
+            let has_body = req.body.as_ref().is_some_and(|b| !b.is_empty());
+            let stream_id = self.session.open_stream();
+            let headers_frame = self
+                .session
+                .create_headers_frame(stream_id, &pseudo_headers, !has_body);
+            self.send_frame(&headers_frame)?;
+
+            if let Some(data) = req.body.as_deref() {
+                if !data.is_empty() {
+                    self.session.queue_outbound_data(stream_id, data);
+                    has_pending_scheduled_data = true;
+                }
+            }
 
             if let Some(p) = req.rfc9218_priority {
                 has_rfc9218 = true;
@@ -3777,6 +3795,11 @@ impl AsyncHttp2Connection {
             }
 
             stream_mappings.push(stream_id);
+        }
+
+        // Flush outbound data frames scheduled according to priority & flow control
+        if has_pending_scheduled_data {
+            self.flush_scheduled_outbound_data(true)?;
         }
 
         // 2. Order stream collection according to RFC 9218 urgency or RFC 7540 priority tree
@@ -8354,6 +8377,115 @@ mod tests {
         );
 
         // Connection was released back into pool
+        assert_eq!(pool.idle_count(), 1);
+        assert_eq!(pool.active_count(), 0);
+
+        let mut conn = pool.acquire().expect("acquire to close");
+        let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        pool.release(conn);
+        pool.clear();
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_prioritized_batch_with_body_scheduler() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            };
+
+            let mut received_bodies: std::collections::HashMap<u32, Vec<u8>> =
+                std::collections::HashMap::new();
+            let mut responded = 0;
+            while responded < 2 {
+                match server.recv_frame().expect("server recv frame") {
+                    crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            let resp_headers = [(":status", "200")];
+                            server
+                                .send_response(stream_id, &resp_headers, Some(b"done"))
+                                .expect("send response");
+                            responded += 1;
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::Data {
+                        stream_id,
+                        data,
+                        end_stream,
+                    } => {
+                        received_bodies
+                            .entry(stream_id)
+                            .or_default()
+                            .extend_from_slice(&data);
+                        if end_stream {
+                            let resp_headers = [(":status", "200")];
+                            let resp_body = format!("received-{}", received_bodies[&stream_id].len());
+                            server
+                                .send_response(stream_id, &resp_headers, Some(resp_body.as_bytes()))
+                                .expect("send response");
+                            responded += 1;
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::PriorityUpdate { .. } => {}
+                    crate::simd_parser::Http2Frame::Priority { .. } => {}
+                    crate::simd_parser::Http2Frame::GoAway { .. } => break,
+                    _ => {}
+                }
+            }
+
+            loop {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
+
+        let payload1 = vec![b'X'; 5000];
+        let payload2 = vec![b'Y'; 8000];
+
+        let batch = vec![
+            Http2PrioritizedRequest::new("POST", "/upload-1")
+                .with_body(payload1.clone())
+                .with_rfc9218_priority(3, true),
+            Http2PrioritizedRequest::new("POST", "/upload-2")
+                .with_body(payload2.clone())
+                .with_rfc9218_priority(1, false),
+        ];
+
+        let results = pool
+            .execute_prioritized_batch(batch)
+            .expect("execute prioritized batch with body scheduler");
+
+        assert_eq!(results.len(), 2);
+        // Stream with priority u=1 (stream 3) should be received first
+        assert_eq!(results[0].0, 3);
+        assert_eq!(results[0].1.as_ref().unwrap().body, b"received-8000");
+
+        // Stream with priority u=3 (stream 1) should be received second
+        assert_eq!(results[1].0, 1);
+        assert_eq!(results[1].1.as_ref().unwrap().body, b"received-5000");
+
         assert_eq!(pool.idle_count(), 1);
         assert_eq!(pool.active_count(), 0);
 
