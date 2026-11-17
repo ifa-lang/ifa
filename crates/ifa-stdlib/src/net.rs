@@ -3708,6 +3708,53 @@ impl Http2PrioritizedRequest {
     }
 }
 
+/// Representation of an outgoing request passed through HTTP/2 interceptors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Http2ClientRequest {
+    /// HTTP method (e.g., "GET", "POST").
+    pub method: String,
+    /// Request target path and query (e.g., "/api/data?q=1").
+    pub path: String,
+    /// List of HTTP headers as (name, value) pairs.
+    pub headers: Vec<(String, String)>,
+    /// Optional binary body payload.
+    pub body: Option<Vec<u8>>,
+}
+
+impl Http2ClientRequest {
+    /// Create a new client request with method and path.
+    pub fn new(method: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            method: method.into(),
+            path: path.into(),
+            headers: Vec::new(),
+            body: None,
+        }
+    }
+
+    /// Add a request header.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Set binary payload body.
+    pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = Some(body.into());
+        self
+    }
+}
+
+/// HTTP/2 request interceptor invoked before dispatching a request to the server.
+/// Can modify headers/body, or return `Some(HttpResponse)` to short-circuit without network I/O.
+pub type Http2RequestInterceptor =
+    std::sync::Arc<dyn Fn(&mut Http2ClientRequest) -> Option<crate::http::HttpResponse> + Send + Sync>;
+
+/// HTTP/2 response interceptor invoked after receiving a response from the server.
+/// Can inspect or mutate response status, headers, or body.
+pub type Http2ResponseInterceptor =
+    std::sync::Arc<dyn Fn(&Http2ClientRequest, &mut crate::http::HttpResponse) + Send + Sync>;
+
 /// Instantaneous diagnostic telemetry and runtime metrics for an [`AsyncHttp2Pool`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Http2PoolStats {
@@ -3747,6 +3794,8 @@ pub struct AsyncHttp2Pool {
     idle_pool: std::sync::Mutex<Vec<AsyncHttp2Connection>>,
     active_count: std::sync::atomic::AtomicUsize,
     last_goaway_error: std::sync::Mutex<Option<crate::simd_parser::Http2ErrorCode>>,
+    request_interceptors: Vec<Http2RequestInterceptor>,
+    response_interceptors: Vec<Http2ResponseInterceptor>,
 }
 
 impl AsyncHttp2Pool {
@@ -3763,7 +3812,75 @@ impl AsyncHttp2Pool {
             idle_pool: std::sync::Mutex::new(Vec::new()),
             active_count: std::sync::atomic::AtomicUsize::new(0),
             last_goaway_error: std::sync::Mutex::new(None),
+            request_interceptors: Vec::new(),
+            response_interceptors: Vec::new(),
         }
+    }
+
+    /// Register a request interceptor / middleware executed prior to dispatching each HTTP/2 request.
+    /// Interceptors run in the order they were registered.
+    pub fn with_request_interceptor(
+        mut self,
+        interceptor: impl Fn(&mut Http2ClientRequest) -> Option<crate::http::HttpResponse>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.request_interceptors
+            .push(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    /// Register a response interceptor / middleware executed after receiving a response.
+    /// Interceptors run in the order they were registered.
+    pub fn with_response_interceptor(
+        mut self,
+        interceptor: impl Fn(&Http2ClientRequest, &mut crate::http::HttpResponse)
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.response_interceptors
+            .push(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    /// Add a request interceptor to an existing pool instance.
+    pub fn add_request_interceptor(
+        &mut self,
+        interceptor: impl Fn(&mut Http2ClientRequest) -> Option<crate::http::HttpResponse>
+            + Send
+            + Sync
+            + 'static,
+    ) -> &mut Self {
+        self.request_interceptors
+            .push(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    /// Add a response interceptor to an existing pool instance.
+    pub fn add_response_interceptor(
+        &mut self,
+        interceptor: impl Fn(&Http2ClientRequest, &mut crate::http::HttpResponse)
+            + Send
+            + Sync
+            + 'static,
+    ) -> &mut Self {
+        self.response_interceptors
+            .push(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    /// Number of registered request interceptors.
+    #[inline]
+    pub fn request_interceptor_count(&self) -> usize {
+        self.request_interceptors.len()
+    }
+
+    /// Number of registered response interceptors.
+    #[inline]
+    pub fn response_interceptor_count(&self) -> usize {
+        self.response_interceptors.len()
     }
 
     /// Configure maximum concurrent multiplexed streams per connection.
@@ -3895,6 +4012,12 @@ impl AsyncHttp2Pool {
     }
 
     /// Execute an HTTP/2 request transparently using a pooled connection, returning the connection to the pool.
+    ///
+    /// If request interceptors are registered on the pool, they are executed in order.
+    /// If an interceptor returns `Some(HttpResponse)`, the network call is short-circuited
+    /// and that response is returned immediately (still running any registered response interceptors).
+    ///
+    /// Any registered response interceptors are executed on the resulting response before returning.
     pub fn execute_request(
         &self,
         method: &str,
@@ -3902,11 +4025,40 @@ impl AsyncHttp2Pool {
         headers: &[(&str, &str)],
         body: Option<&[u8]>,
     ) -> io::Result<crate::http::HttpResponse> {
+        let mut client_req = Http2ClientRequest::new(method, path);
+        for &(k, v) in headers {
+            client_req = client_req.with_header(k, v);
+        }
+        if let Some(b) = body {
+            client_req = client_req.with_body(b);
+        }
+
+        // Run request interceptors
+        for interceptor in &self.request_interceptors {
+            if let Some(mut short_circuit_resp) = interceptor(&mut client_req) {
+                // Run response interceptors on short-circuited response
+                for resp_interceptor in &self.response_interceptors {
+                    resp_interceptor(&client_req, &mut short_circuit_resp);
+                }
+                return Ok(short_circuit_resp);
+            }
+        }
+
         let mut conn = self.acquire()?;
-        let result = conn.request(method, path, headers, body);
+        let header_refs: Vec<(&str, &str)> = client_req
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let body_ref = client_req.body.as_deref();
+
+        let result = conn.request(&client_req.method, &client_req.path, &header_refs, body_ref);
         match result {
-            Ok(resp) => {
+            Ok(mut resp) => {
                 self.release(conn);
+                for resp_interceptor in &self.response_interceptors {
+                    resp_interceptor(&client_req, &mut resp);
+                }
                 Ok(resp)
             }
             Err(e) => {
@@ -7490,6 +7642,92 @@ mod tests {
         assert_eq!(stats.last_goaway_error, None);
         assert_eq!(stats.total_connections(), 0);
         assert!(!stats.is_exhausted());
+    }
+
+    #[test]
+    fn test_async_http2_pool_interceptors() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let (tcp_stream, _) = listener.accept().expect("accept connection");
+            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+
+            while let Ok(frame) = server.recv_frame() {
+                if let crate::simd_parser::Http2Frame::Headers {
+                    stream_id,
+                    end_stream,
+                    ..
+                } = frame
+                {
+                    if end_stream {
+                        server
+                            .send_response(
+                                stream_id,
+                                &[(":status", "200"), ("x-server", "h2-test")],
+                                Some(b"server-payload"),
+                            )
+                            .expect("send response");
+                        let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Test request & response mutation interceptors
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2)
+            .with_request_interceptor(|req| {
+                req.headers.push(("x-custom-auth".to_string(), "token-123".to_string()));
+                None // Do not short-circuit
+            })
+            .with_response_interceptor(|_req, resp| {
+                resp.headers.set("x-intercepted", "true");
+            });
+
+        assert_eq!(pool.request_interceptor_count(), 1);
+        assert_eq!(pool.response_interceptor_count(), 1);
+
+        let resp = pool
+            .execute_request("GET", "/test-interceptor", &[], None)
+            .expect("execute request with interceptors");
+
+        assert_eq!(resp.status.0, 200);
+        assert_eq!(resp.body, b"server-payload");
+        assert_eq!(resp.headers.get("x-intercepted"), Some("true"));
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_interceptor_short_circuit() {
+        // Without any server running, a short-circuiting interceptor should return immediately without connecting
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 65530, 2)
+            .with_request_interceptor(|req| {
+                if req.path == "/cached" {
+                    let mut cached = crate::http::HttpResponse::new(crate::http::HttpStatus(200));
+                    cached.body = b"cached-body".to_vec();
+                    cached.headers.set("x-cache", "HIT");
+                    return Some(cached);
+                }
+                None
+            })
+            .with_response_interceptor(|_req, resp| {
+                resp.headers.set("x-post-processed", "yes");
+            });
+
+        let resp = pool
+            .execute_request("GET", "/cached", &[], None)
+            .expect("short-circuit should not fail on network");
+
+        assert_eq!(resp.status.0, 200);
+        assert_eq!(resp.body, b"cached-body");
+        assert_eq!(resp.headers.get("x-cache"), Some("HIT"));
+        assert_eq!(resp.headers.get("x-post-processed"), Some("yes"));
+        assert_eq!(pool.active_count(), 0);
+        assert_eq!(pool.idle_count(), 0);
     }
 }
 
