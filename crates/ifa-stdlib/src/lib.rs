@@ -121,7 +121,9 @@ pub use process::{
 };
 pub use simd_parser::{
     find_byte_vectorized, find_crlf_vectorized, parse_http_request_fast, parse_http_response_fast,
-    FastHttpError, FastHttpRequest, FastHttpResponse, Http2FrameHeader, Http2FrameType,
+    FastHttpError, FastHttpRequest, FastHttpResponse, HpackContext, Http2ErrorCode, Http2Frame,
+    Http2FrameHeader, Http2FrameType, Http2Session, Http2Setting, Http2SettingId, Http2Stream,
+    Http2StreamState, HPACK_STATIC_TABLE,
 };
 pub use sync::{
     bounded, channel, AtomicFlag, AtomicInt, Receiver, RingBuffer, Select, Sender, WaitGroup,
