@@ -3017,6 +3017,36 @@ impl AsyncHttp2Connection {
         Ok(())
     }
 
+    /// Stream an uncompressed or streaming body dynamically using `GzipStreamEncoder`
+    /// over one or multiple chunked DATA frames, automatically setting gzip framing.
+    pub fn send_streaming_gzip_chunk(
+        &mut self,
+        stream_id: u32,
+        encoder: &mut crate::http::GzipStreamEncoder,
+        chunk: &[u8],
+        end_stream: bool,
+    ) -> io::Result<()> {
+        let mut compressed = encoder.feed(chunk);
+        if end_stream {
+            compressed.extend_from_slice(&encoder.finish());
+        }
+        if !compressed.is_empty() || end_stream {
+            self.send_data(stream_id, &compressed, end_stream)?;
+        }
+        Ok(())
+    }
+
+    /// Progressively decompress a stream's incoming raw DATA frame chunks using `GzipStreamDecoder`.
+    pub fn decompress_stream_chunk(
+        &self,
+        decoder: &mut crate::http::GzipStreamDecoder,
+        chunk: &[u8],
+    ) -> io::Result<Vec<u8>> {
+        decoder
+            .feed(chunk)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
     /// Non-blocking attempt to read and decode the next frame from the stream.
     /// Automatically handles Ping (replies with Pong) and Settings frames (replies with ACK).
     pub fn try_recv_frame(&mut self) -> io::Result<Option<crate::simd_parser::Http2Frame>> {
@@ -3285,6 +3315,12 @@ impl AsyncHttp2Connection {
         let mut resp = crate::http::HttpResponse::new(crate::http::HttpStatus(status_code));
         resp.headers = resp_headers;
         resp.body = raw_body;
+
+        // Transparent stream-level decompression if content-encoding is gzip or deflate
+        if let Ok(decompressed) = resp.decompress_body() {
+            resp.body = decompressed;
+        }
+
         Ok(resp)
     }
 
@@ -5983,6 +6019,78 @@ mod tests {
 
         let prioritized = client.prioritized_streams();
         assert!(prioritized.contains(&3));
+
+        let _ = client.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_streaming_compression() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            };
+
+            // Wait for incoming HEADERS frame on stream 1
+            let stream_id = loop {
+                match server.recv_frame().expect("server recv frame") {
+                    crate::simd_parser::Http2Frame::Headers {
+                        stream_id: sid,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            break sid;
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::GoAway { .. } => return,
+                    _ => {}
+                }
+            };
+
+            // Send response headers indicating gzip encoding
+            let resp_headers = [(":status", "200"), ("content-encoding", "gzip")];
+            let h_frame = server
+                .session
+                .create_headers_frame(stream_id, &resp_headers, false);
+            server.send_frame(&h_frame).expect("send headers");
+
+            // Stream response chunks compressed with GzipStreamEncoder
+            let mut encoder = crate::http::GzipStreamEncoder::new();
+            server
+                .send_streaming_gzip_chunk(stream_id, &mut encoder, b"hello streaming ", false)
+                .expect("send chunk 1");
+            server
+                .send_streaming_gzip_chunk(stream_id, &mut encoder, b"http2 compression!", true)
+                .expect("send chunk 2 final");
+
+            let _ = server.recv_frame();
+            let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        });
+
+        let client_stream =
+            AsyncTcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect client");
+        let mut client =
+            AsyncHttp2Connection::client_handshake(client_stream).expect("client handshake");
+
+        // High-level request should automatically decode stream-level gzip
+        let resp = client
+            .request("GET", "/compressed-stream", &[], None)
+            .expect("h2 request");
+
+        assert_eq!(resp.status.0, 200);
+        assert_eq!(resp.body, b"hello streaming http2 compression!");
 
         let _ = client.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
         let _ = handle.join();
