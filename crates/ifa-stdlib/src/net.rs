@@ -1663,6 +1663,10 @@ impl WsMessage {
     }
 }
 
+/// Default maximum retained capacity for stream demux and frame decode buffers (64 KiB).
+/// Buffers exceeding this size after draining are shrunk to prevent unbounded memory retention.
+pub const DEFAULT_MAX_RETAINED_BUFFER_CAPACITY: usize = 65536;
+
 /// Streaming RFC 6455 frame demultiplexer and fragmented message reassembler.
 #[derive(Debug, Default, Clone)]
 pub struct WsDemux {
@@ -1690,6 +1694,9 @@ impl WsDemux {
     pub fn poll_frame(&mut self) -> Option<WsFrame> {
         if let Some((frame, consumed)) = WsFrame::decode(&self.buffer) {
             self.buffer.drain(..consumed);
+            if self.buffer.is_empty() && self.buffer.capacity() > DEFAULT_MAX_RETAINED_BUFFER_CAPACITY {
+                self.buffer.shrink_to(DEFAULT_MAX_RETAINED_BUFFER_CAPACITY);
+            }
             Some(frame)
         } else {
             None
@@ -3222,6 +3229,9 @@ impl AsyncHttp2Connection {
 
         // Drain the parsed frame from read buffer
         self.read_buf.drain(..total_frame_len);
+        if self.read_buf.is_empty() && self.read_buf.capacity() > DEFAULT_MAX_RETAINED_BUFFER_CAPACITY {
+            self.read_buf.shrink_to(DEFAULT_MAX_RETAINED_BUFFER_CAPACITY);
+        }
 
         // If the frame is GOAWAY, mark the connection as closed
         if let crate::simd_parser::Http2Frame::GoAway { .. } = &frame {
@@ -4415,6 +4425,9 @@ impl SseDecoder {
         if let Some((idx, delim_len)) = end_idx {
             let block = self.buffer[..idx].to_string();
             self.buffer.drain(..idx + delim_len);
+            if self.buffer.is_empty() && self.buffer.capacity() > DEFAULT_MAX_RETAINED_BUFFER_CAPACITY {
+                self.buffer.shrink_to(DEFAULT_MAX_RETAINED_BUFFER_CAPACITY);
+            }
 
             let mut event_name: Option<String> = None;
             let mut data_lines = Vec::new();
@@ -8528,5 +8541,38 @@ mod cookie_tests {
     fn test_parse_http_date_invalid() {
         assert!(parse_http_date("not a date").is_none());
         assert!(parse_http_date("").is_none());
+    }
+
+    // ── Buffer Memory Reclaim Optimization ────────────────────────────────────
+
+    #[test]
+    fn test_ws_demux_buffer_reclaim_optimization() {
+        let mut demux = WsDemux::new();
+        // Allocate large capacity exceeding threshold (e.g. 128 KiB)
+        demux.buffer.reserve(131072);
+        assert!(demux.buffer.capacity() >= 131072);
+
+        // Feed a frame
+        let f = WsFrame::text("reclaim_test", false, None);
+        demux.push_bytes(&f.encode());
+
+        // Polling the frame consumes it completely and triggers shrink_to
+        let polled = demux.poll_frame().expect("polled frame");
+        assert_eq!(polled.payload, b"reclaim_test");
+        assert!(demux.buffer.is_empty());
+        assert!(demux.buffer.capacity() <= DEFAULT_MAX_RETAINED_BUFFER_CAPACITY * 2);
+    }
+
+    #[test]
+    fn test_sse_decoder_buffer_reclaim_optimization() {
+        let mut decoder = SseDecoder::new();
+        decoder.buffer.reserve(131072);
+        assert!(decoder.buffer.capacity() >= 131072);
+
+        decoder.push_str("data: message\n\n");
+        let ev = decoder.next_event().expect("next event");
+        assert_eq!(ev.data, "message");
+        assert!(decoder.buffer.is_empty());
+        assert!(decoder.buffer.capacity() <= DEFAULT_MAX_RETAINED_BUFFER_CAPACITY * 2);
     }
 }
