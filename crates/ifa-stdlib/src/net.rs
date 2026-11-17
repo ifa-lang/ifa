@@ -3107,6 +3107,99 @@ impl AsyncHttp2Connection {
         self.is_closed = true;
         res
     }
+
+    /// Read incoming frames until the response for `target_stream_id` is fully received (headers and optional body).
+    /// Returns the decoded headers and payload data.
+    #[allow(clippy::type_complexity)]
+    pub fn recv_response_for(
+        &mut self,
+        target_stream_id: u32,
+    ) -> io::Result<(Vec<(String, String)>, Vec<u8>)> {
+        loop {
+            // Check if stream in session is already half-closed-remote or closed and has received headers
+            if let Some(stream) = self.session.streams.get(&target_stream_id) {
+                if stream.state == crate::simd_parser::Http2StreamState::HalfClosedRemote
+                    || stream.state == crate::simd_parser::Http2StreamState::Closed
+                {
+                    return Ok((
+                        stream.received_headers.clone(),
+                        stream.received_data.clone(),
+                    ));
+                }
+            }
+
+            let frame = self.recv_frame()?;
+            let frame_stream_id = match &frame {
+                crate::simd_parser::Http2Frame::Headers { stream_id, .. } => *stream_id,
+                crate::simd_parser::Http2Frame::Data { stream_id, .. } => *stream_id,
+                crate::simd_parser::Http2Frame::RstStream {
+                    stream_id,
+                    error_code,
+                } => {
+                    if *stream_id == target_stream_id {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            format!("Stream {} reset with error {:?}", stream_id, error_code),
+                        ));
+                    }
+                    *stream_id
+                }
+                crate::simd_parser::Http2Frame::GoAway { error_code, .. } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        format!("Connection closed by GOAWAY: {:?}", error_code),
+                    ));
+                }
+                _ => 0,
+            };
+
+            if frame_stream_id == target_stream_id {
+                if let Some(stream) = self.session.streams.get(&target_stream_id) {
+                    if stream.state == crate::simd_parser::Http2StreamState::HalfClosedRemote
+                        || stream.state == crate::simd_parser::Http2StreamState::Closed
+                    {
+                        return Ok((
+                            stream.received_headers.clone(),
+                            stream.received_data.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// High-level method: Send an HTTP request and await the full HTTP response.
+    pub fn request(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> io::Result<crate::http::HttpResponse> {
+        let mut pseudo_headers = vec![(":method", method), (":path", path), (":scheme", "http")];
+        pseudo_headers.extend_from_slice(headers);
+
+        let stream_id = self.send_request(&pseudo_headers, body)?;
+        let (raw_headers, raw_body) = self.recv_response_for(stream_id)?;
+
+        let mut status_code = 200u16;
+        let mut resp_headers = crate::http::HttpHeaders::new();
+
+        for (k, v) in raw_headers {
+            if k == ":status" {
+                if let Ok(code) = v.parse::<u16>() {
+                    status_code = code;
+                }
+            } else if !k.starts_with(':') {
+                resp_headers.set(k, v);
+            }
+        }
+
+        let mut resp = crate::http::HttpResponse::new(crate::http::HttpStatus(status_code));
+        resp.headers = resp_headers;
+        resp.body = raw_body;
+        Ok(resp)
+    }
 }
 
 /// Token Bucket Rate Limiter for network request throttling and DoS mitigation.
@@ -5147,6 +5240,75 @@ mod tests {
         } else {
             panic!("Expected incoming Ping from server");
         }
+
+        handle.join().expect("server thread finished");
+    }
+
+    #[test]
+    fn test_http2_high_level_request_api() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let handle = std::thread::spawn(move || {
+            let (std_stream, _) = listener.accept().expect("accept connection");
+            std_stream.set_nonblocking(true).expect("set nonblocking");
+            let stream = AsyncTcpStream::from_std(std_stream).expect("async tcp stream");
+
+            let mut server =
+                AsyncHttp2Connection::server_handshake(stream).expect("server h2 handshake");
+
+            // Accept frames and serve response
+            loop {
+                let frame = server.recv_frame().expect("server recv frame");
+                match frame {
+                    crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            let res_headers = vec![
+                                (":status", "200"),
+                                ("content-type", "application/json"),
+                                ("server", "ifa-http2"),
+                            ];
+                            server
+                                .send_response(
+                                    stream_id,
+                                    &res_headers,
+                                    Some(b"{\"status\":\"ok\",\"h2\":true}"),
+                                )
+                                .expect("server send response");
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::GoAway { .. } => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let stream = AsyncTcpStream::connect(addr).expect("client connect");
+        let mut client =
+            AsyncHttp2Connection::client_handshake(stream).expect("client h2 handshake");
+
+        // High-level request
+        let resp = client
+            .request(
+                "GET",
+                "/api/v1/health",
+                &[("accept", "application/json")],
+                None,
+            )
+            .expect("client request");
+
+        assert_eq!(resp.status.0, 200);
+        assert_eq!(resp.headers.get("content-type"), Some("application/json"));
+        assert_eq!(resp.headers.get("server"), Some("ifa-http2"));
+        assert_eq!(resp.body_str().unwrap(), "{\"status\":\"ok\",\"h2\":true}");
+
+        client
+            .send_goaway(crate::simd_parser::Http2ErrorCode::NoError)
+            .expect("client send goaway");
 
         handle.join().expect("server thread finished");
     }
