@@ -8836,3 +8836,612 @@ mod cookie_tests {
         assert!(tcp_res.total_time_ms > 0.0);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TLS / ALPN — Automatic HTTP/1.1 vs HTTP/2 Protocol Negotiation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Application-layer protocols advertised / negotiated over ALPN (RFC 7301).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AlpnProtocol {
+    /// HTTP/2 over TLS (`h2`).
+    Http2,
+    /// HTTP/1.1 over TLS (`http/1.1`).
+    Http11,
+    /// HTTP/1.0 (`http/1.0`).
+    Http10,
+    /// Unknown / unsupported protocol identifier.
+    Unknown,
+}
+
+impl AlpnProtocol {
+    /// Canonical ALPN wire-format identifier (RFC 7301 §3.1).
+    pub fn as_wire_id(&self) -> &'static [u8] {
+        match self {
+            AlpnProtocol::Http2 => b"h2",
+            AlpnProtocol::Http11 => b"http/1.1",
+            AlpnProtocol::Http10 => b"http/1.0",
+            AlpnProtocol::Unknown => b"",
+        }
+    }
+
+    /// Parse a raw ALPN wire identifier into the enum variant.
+    pub fn from_wire_id(id: &[u8]) -> Self {
+        match id {
+            b"h2" => AlpnProtocol::Http2,
+            b"http/1.1" => AlpnProtocol::Http11,
+            b"http/1.0" => AlpnProtocol::Http10,
+            _ => AlpnProtocol::Unknown,
+        }
+    }
+
+    /// Whether this protocol supports multiplexed streams (HTTP/2+).
+    #[inline]
+    pub fn supports_multiplexing(&self) -> bool {
+        matches!(self, AlpnProtocol::Http2)
+    }
+}
+
+impl std::fmt::Display for AlpnProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AlpnProtocol::Http2 => f.write_str("h2"),
+            AlpnProtocol::Http11 => f.write_str("http/1.1"),
+            AlpnProtocol::Http10 => f.write_str("http/1.0"),
+            AlpnProtocol::Unknown => f.write_str("<unknown>"),
+        }
+    }
+}
+
+// ── TLS ClientHello ALPN Extension Decoder ───────────────────────────────────
+
+/// TLS record content-type constants (RFC 5246 §6.2.1).
+mod tls_const {
+    pub const HANDSHAKE: u8 = 0x16;
+    pub const CLIENT_HELLO: u8 = 0x01;
+    pub const EXT_ALPN: u16 = 0x0010;
+}
+
+/// Outcome of a TLS ClientHello ALPN parse attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlpnParseResult {
+    /// ALPN extension found; contains the list of protocols advertised by the client.
+    Protocols(Vec<AlpnProtocol>),
+    /// TLS ClientHello contained no ALPN extension.
+    NoExtension,
+    /// Buffer too short or malformed — need more bytes.
+    Incomplete,
+    /// Buffer does not begin with a TLS ClientHello record.
+    NotClientHello,
+}
+
+/// Parse the ALPN extension from a raw TLS ClientHello record byte slice.
+///
+/// The slice must start at the first byte of a TLS record (content-type byte).
+/// Returns the list of `AlpnProtocol` values the client advertises, in order.
+///
+/// # Wire format (abbreviated)
+/// ```text
+/// TLS record header  : content_type(1) + version(2) + length(2)
+/// Handshake header   : msg_type(1) + length(3)
+/// ClientHello        : version(2) + random(32) + session_id(1+n)
+///                    + cipher_suites(2+2n) + compression(1+n)
+///                    + extensions_total_len(2) + [ext_type(2) + ext_len(2) + ext_data]*
+/// ALPN extension (0x0010):
+///   ext_data         : alpn_list_len(2) + [proto_len(1) + proto_id(n)]*
+/// ```
+pub fn parse_alpn_from_client_hello(buf: &[u8]) -> AlpnParseResult {
+    // Minimum: 5 (record hdr) + 4 (handshake hdr) + 2 (version) + 32 (random) = 43 bytes
+    if buf.len() < 43 {
+        return AlpnParseResult::Incomplete;
+    }
+
+    // TLS record header
+    if buf[0] != tls_const::HANDSHAKE {
+        return AlpnParseResult::NotClientHello;
+    }
+    let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+    if buf.len() < 5 + record_len {
+        return AlpnParseResult::Incomplete;
+    }
+
+    let hs = &buf[5..5 + record_len];
+    if hs.is_empty() || hs[0] != tls_const::CLIENT_HELLO {
+        return AlpnParseResult::NotClientHello;
+    }
+
+    // Handshake body starts after msg_type(1) + length(3)
+    if hs.len() < 4 {
+        return AlpnParseResult::Incomplete;
+    }
+    let body = &hs[4..];
+
+    // Skip: version(2) + random(32)
+    let mut pos = 34usize;
+    if body.len() < pos + 1 {
+        return AlpnParseResult::Incomplete;
+    }
+    // Session ID
+    let sid_len = body[pos] as usize;
+    pos += 1 + sid_len;
+    // Cipher suites
+    if body.len() < pos + 2 {
+        return AlpnParseResult::Incomplete;
+    }
+    let cs_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+    pos += 2 + cs_len;
+    // Compression methods
+    if body.len() < pos + 1 {
+        return AlpnParseResult::Incomplete;
+    }
+    let comp_len = body[pos] as usize;
+    pos += 1 + comp_len;
+
+    // Extensions
+    if body.len() < pos + 2 {
+        return AlpnParseResult::NoExtension;
+    }
+    let ext_total = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+    pos += 2;
+    let ext_end = pos + ext_total;
+    if body.len() < ext_end {
+        return AlpnParseResult::Incomplete;
+    }
+
+    while pos + 4 <= ext_end {
+        let ext_type = u16::from_be_bytes([body[pos], body[pos + 1]]);
+        let ext_len = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
+        pos += 4;
+        if pos + ext_len > ext_end {
+            break;
+        }
+        if ext_type == tls_const::EXT_ALPN {
+            let ext_data = &body[pos..pos + ext_len];
+            return decode_alpn_extension(ext_data);
+        }
+        pos += ext_len;
+    }
+    AlpnParseResult::NoExtension
+}
+
+fn decode_alpn_extension(data: &[u8]) -> AlpnParseResult {
+    if data.len() < 2 {
+        return AlpnParseResult::Incomplete;
+    }
+    let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    if data.len() < 2 + list_len {
+        return AlpnParseResult::Incomplete;
+    }
+    let list = &data[2..2 + list_len];
+    let mut protocols = Vec::new();
+    let mut i = 0;
+    while i < list.len() {
+        let plen = list[i] as usize;
+        i += 1;
+        if i + plen > list.len() {
+            break;
+        }
+        protocols.push(AlpnProtocol::from_wire_id(&list[i..i + plen]));
+        i += plen;
+    }
+    AlpnParseResult::Protocols(protocols)
+}
+
+// ── TLS/ALPN Negotiation Configuration ───────────────────────────────────────
+
+/// Priority-ordered list of protocols a server is willing to serve.
+/// The first match against the client's preference list wins (server preference).
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    /// Protocols the server supports, in descending priority order.
+    pub server_protocols: Vec<AlpnProtocol>,
+    /// Whether to fall back to HTTP/1.1 when the client sends no ALPN extension.
+    pub fallback_to_http11: bool,
+}
+
+impl Default for TlsConfig {
+    /// Default: prefer HTTP/2, accept HTTP/1.1, enable fallback.
+    fn default() -> Self {
+        Self {
+            server_protocols: vec![AlpnProtocol::Http2, AlpnProtocol::Http11],
+            fallback_to_http11: true,
+        }
+    }
+}
+
+impl TlsConfig {
+    /// Create a configuration that only accepts HTTP/2 (`h2`).
+    pub fn http2_only() -> Self {
+        Self {
+            server_protocols: vec![AlpnProtocol::Http2],
+            fallback_to_http11: false,
+        }
+    }
+
+    /// Create a configuration that only accepts HTTP/1.1.
+    pub fn http11_only() -> Self {
+        Self {
+            server_protocols: vec![AlpnProtocol::Http11],
+            fallback_to_http11: true,
+        }
+    }
+
+    /// Build the ALPN extension bytes that a **client** would send, encoding
+    /// the protocol list from `server_protocols` in wire format (RFC 7301 §3.1).
+    ///
+    /// Layout: `[total_list_len(2)] [proto_len(1) proto_bytes]*`
+    pub fn encode_alpn_extension(&self) -> Vec<u8> {
+        let mut inner: Vec<u8> = Vec::new();
+        for proto in &self.server_protocols {
+            let id = proto.as_wire_id();
+            if id.is_empty() {
+                continue;
+            }
+            inner.push(id.len() as u8);
+            inner.extend_from_slice(id);
+        }
+        let mut out = Vec::with_capacity(2 + inner.len());
+        let len = inner.len() as u16;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend(inner);
+        out
+    }
+}
+
+// ── ALPN Negotiator ───────────────────────────────────────────────────────────
+
+/// Result of an ALPN negotiation attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NegotiatedProtocol {
+    /// A mutually supported protocol was selected.
+    Selected(AlpnProtocol),
+    /// No common protocol found; connection should be rejected (RFC 7301 §3.2).
+    NoMatch,
+    /// Client sent no ALPN extension; fallback applied per `TlsConfig`.
+    Fallback(AlpnProtocol),
+}
+
+impl NegotiatedProtocol {
+    /// Return the selected protocol, regardless of whether it was negotiated or fell back.
+    pub fn protocol(&self) -> Option<AlpnProtocol> {
+        match self {
+            NegotiatedProtocol::Selected(p) | NegotiatedProtocol::Fallback(p) => Some(*p),
+            NegotiatedProtocol::NoMatch => None,
+        }
+    }
+
+    /// Whether the connection should proceed (a protocol was selected).
+    pub fn is_accepted(&self) -> bool {
+        self.protocol().is_some()
+    }
+}
+
+/// Stateless ALPN negotiator: matches client-offered protocols against server configuration.
+///
+/// Used by TLS termination code to determine which HTTP version to serve before the
+/// first application byte is exchanged.
+pub struct AlpnNegotiator {
+    config: TlsConfig,
+}
+
+impl AlpnNegotiator {
+    /// Create a negotiator from a [`TlsConfig`].
+    pub fn new(config: TlsConfig) -> Self {
+        Self { config }
+    }
+
+    /// Negotiate given a list of protocols offered by the client (from ALPN extension).
+    ///
+    /// Uses **server-preference** ordering: iterates `server_protocols` and picks the
+    /// first one that also appears in `client_protocols`.
+    pub fn negotiate(&self, client_protocols: &[AlpnProtocol]) -> NegotiatedProtocol {
+        for server_proto in &self.config.server_protocols {
+            if client_protocols.contains(server_proto) {
+                return NegotiatedProtocol::Selected(*server_proto);
+            }
+        }
+        NegotiatedProtocol::NoMatch
+    }
+
+    /// Negotiate directly from a raw TLS ClientHello byte slice.
+    ///
+    /// - If ALPN extension is present → runs `negotiate()`.
+    /// - If no ALPN extension → applies `fallback_to_http11` policy.
+    /// - If the buffer is incomplete/malformed → returns `Err` with a description.
+    pub fn negotiate_from_client_hello(&self, buf: &[u8]) -> Result<NegotiatedProtocol, String> {
+        match parse_alpn_from_client_hello(buf) {
+            AlpnParseResult::Protocols(protos) => Ok(self.negotiate(&protos)),
+            AlpnParseResult::NoExtension => {
+                if self.config.fallback_to_http11 {
+                    Ok(NegotiatedProtocol::Fallback(AlpnProtocol::Http11))
+                } else {
+                    Ok(NegotiatedProtocol::NoMatch)
+                }
+            }
+            AlpnParseResult::Incomplete => Err("TLS ClientHello buffer is incomplete".into()),
+            AlpnParseResult::NotClientHello => {
+                Err("Buffer does not start with a TLS ClientHello record".into())
+            }
+        }
+    }
+
+    /// Encode the server's ALPN extension bytes for use in a TLS ServerHello.
+    pub fn server_alpn_extension(&self) -> Vec<u8> {
+        self.config.encode_alpn_extension()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TLS/ALPN — Tests
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tls_alpn_tests {
+    use super::*;
+
+    // ── AlpnProtocol ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_alpn_protocol_wire_round_trip() {
+        for proto in [AlpnProtocol::Http2, AlpnProtocol::Http11, AlpnProtocol::Http10] {
+            assert_eq!(AlpnProtocol::from_wire_id(proto.as_wire_id()), proto);
+        }
+    }
+
+    #[test]
+    fn test_alpn_protocol_unknown_wire_id() {
+        assert_eq!(AlpnProtocol::from_wire_id(b"h3"), AlpnProtocol::Unknown);
+        assert_eq!(AlpnProtocol::from_wire_id(b""), AlpnProtocol::Unknown);
+    }
+
+    #[test]
+    fn test_alpn_protocol_display() {
+        assert_eq!(AlpnProtocol::Http2.to_string(), "h2");
+        assert_eq!(AlpnProtocol::Http11.to_string(), "http/1.1");
+        assert_eq!(AlpnProtocol::Http10.to_string(), "http/1.0");
+        assert_eq!(AlpnProtocol::Unknown.to_string(), "<unknown>");
+    }
+
+    #[test]
+    fn test_alpn_protocol_supports_multiplexing() {
+        assert!(AlpnProtocol::Http2.supports_multiplexing());
+        assert!(!AlpnProtocol::Http11.supports_multiplexing());
+        assert!(!AlpnProtocol::Http10.supports_multiplexing());
+    }
+
+    // ── TlsConfig ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_tls_config_default_prefers_http2() {
+        let cfg = TlsConfig::default();
+        assert_eq!(cfg.server_protocols[0], AlpnProtocol::Http2);
+        assert!(cfg.fallback_to_http11);
+    }
+
+    #[test]
+    fn test_tls_config_encode_alpn_extension_http2_only() {
+        let cfg = TlsConfig::http2_only();
+        let ext = cfg.encode_alpn_extension();
+        // list_len(2) + proto_len(1) + "h2"(2) = 5 bytes
+        assert_eq!(ext.len(), 5);
+        // first 2 bytes = length of list = 3
+        let list_len = u16::from_be_bytes([ext[0], ext[1]]);
+        assert_eq!(list_len, 3);
+        // proto_len byte
+        assert_eq!(ext[2], 2);
+        assert_eq!(&ext[3..5], b"h2");
+    }
+
+    #[test]
+    fn test_tls_config_encode_alpn_extension_http11_then_h2() {
+        let cfg = TlsConfig {
+            server_protocols: vec![AlpnProtocol::Http11, AlpnProtocol::Http2],
+            fallback_to_http11: true,
+        };
+        let ext = cfg.encode_alpn_extension();
+        // "http/1.1" = 8 bytes  → entry = 1+8 = 9
+        // "h2"       = 2 bytes  → entry = 1+2 = 3
+        // list total = 12; header = 2 → ext = 14 bytes
+        assert_eq!(ext.len(), 14);
+        let list_len = u16::from_be_bytes([ext[0], ext[1]]);
+        assert_eq!(list_len, 12);
+    }
+
+    // ── AlpnNegotiator — direct protocol list ─────────────────────────────────
+
+    #[test]
+    fn test_negotiator_selects_server_preferred_protocol() {
+        let neg = AlpnNegotiator::new(TlsConfig::default());
+        // Client offers both; server prefers h2 → h2 wins
+        let result = neg.negotiate(&[AlpnProtocol::Http11, AlpnProtocol::Http2]);
+        assert_eq!(result, NegotiatedProtocol::Selected(AlpnProtocol::Http2));
+        assert!(result.is_accepted());
+        assert_eq!(result.protocol(), Some(AlpnProtocol::Http2));
+    }
+
+    #[test]
+    fn test_negotiator_no_match_returns_no_match() {
+        let neg = AlpnNegotiator::new(TlsConfig::http2_only());
+        let result = neg.negotiate(&[AlpnProtocol::Http11]);
+        assert_eq!(result, NegotiatedProtocol::NoMatch);
+        assert!(!result.is_accepted());
+        assert_eq!(result.protocol(), None);
+    }
+
+    #[test]
+    fn test_negotiator_http11_client_matches_http11_server() {
+        let neg = AlpnNegotiator::new(TlsConfig::http11_only());
+        let result = neg.negotiate(&[AlpnProtocol::Http11]);
+        assert_eq!(result, NegotiatedProtocol::Selected(AlpnProtocol::Http11));
+    }
+
+    #[test]
+    fn test_negotiator_empty_client_list_returns_no_match() {
+        let neg = AlpnNegotiator::new(TlsConfig::default());
+        let result = neg.negotiate(&[]);
+        assert_eq!(result, NegotiatedProtocol::NoMatch);
+    }
+
+    // ── AlpnNegotiator — fallback policy ─────────────────────────────────────
+
+    #[test]
+    fn test_negotiator_fallback_enabled_when_no_alpn_extension() {
+        // Craft a minimal ClientHello with NO extensions
+        let hello = build_minimal_client_hello(None);
+        let neg = AlpnNegotiator::new(TlsConfig::default()); // fallback = true
+        let result = neg.negotiate_from_client_hello(&hello).unwrap();
+        assert_eq!(result, NegotiatedProtocol::Fallback(AlpnProtocol::Http11));
+        assert!(result.is_accepted());
+    }
+
+    #[test]
+    fn test_negotiator_fallback_disabled_returns_no_match() {
+        let hello = build_minimal_client_hello(None);
+        let neg = AlpnNegotiator::new(TlsConfig {
+            server_protocols: vec![AlpnProtocol::Http2],
+            fallback_to_http11: false,
+        });
+        let result = neg.negotiate_from_client_hello(&hello).unwrap();
+        assert_eq!(result, NegotiatedProtocol::NoMatch);
+    }
+
+    // ── AlpnNegotiator — from raw ClientHello with ALPN extension ────────────
+
+    #[test]
+    fn test_negotiator_selects_h2_from_client_hello_with_alpn() {
+        let alpn_ext = build_alpn_extension(&[b"h2", b"http/1.1"]);
+        let hello = build_minimal_client_hello(Some(&alpn_ext));
+        let neg = AlpnNegotiator::new(TlsConfig::default());
+        let result = neg.negotiate_from_client_hello(&hello).unwrap();
+        assert_eq!(result, NegotiatedProtocol::Selected(AlpnProtocol::Http2));
+    }
+
+    #[test]
+    fn test_negotiator_no_match_from_client_hello_unsupported_protocols() {
+        let alpn_ext = build_alpn_extension(&[b"h3", b"spdy/3.1"]);
+        let hello = build_minimal_client_hello(Some(&alpn_ext));
+        let neg = AlpnNegotiator::new(TlsConfig::default());
+        let result = neg.negotiate_from_client_hello(&hello).unwrap();
+        assert_eq!(result, NegotiatedProtocol::NoMatch);
+    }
+
+    #[test]
+    fn test_negotiator_incomplete_buffer_returns_error() {
+        let neg = AlpnNegotiator::new(TlsConfig::default());
+        let result = neg.negotiate_from_client_hello(&[0x16, 0x03, 0x03]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("incomplete"));
+    }
+
+    #[test]
+    fn test_negotiator_non_tls_buffer_returns_error() {
+        let neg = AlpnNegotiator::new(TlsConfig::default());
+        let buf = vec![0x47u8; 60]; // 'G' — HTTP plaintext
+        let result = neg.negotiate_from_client_hello(&buf);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("ClientHello"));
+    }
+
+    // ── parse_alpn_from_client_hello — edge cases ────────────────────────────
+
+    #[test]
+    fn test_parse_alpn_too_short_is_incomplete() {
+        assert_eq!(parse_alpn_from_client_hello(&[]), AlpnParseResult::Incomplete);
+        assert_eq!(
+            parse_alpn_from_client_hello(&[0x16, 0x03, 0x03]),
+            AlpnParseResult::Incomplete
+        );
+    }
+
+    #[test]
+    fn test_parse_alpn_not_handshake_record() {
+        let mut buf = vec![0u8; 60];
+        buf[0] = 0x15; // alert record type
+        assert_eq!(
+            parse_alpn_from_client_hello(&buf),
+            AlpnParseResult::NotClientHello
+        );
+    }
+
+    #[test]
+    fn test_parse_alpn_multiple_protocols_decoded() {
+        let alpn_ext = build_alpn_extension(&[b"h2", b"http/1.1", b"http/1.0"]);
+        let hello = build_minimal_client_hello(Some(&alpn_ext));
+        match parse_alpn_from_client_hello(&hello) {
+            AlpnParseResult::Protocols(p) => {
+                assert_eq!(p.len(), 3);
+                assert_eq!(p[0], AlpnProtocol::Http2);
+                assert_eq!(p[1], AlpnProtocol::Http11);
+                assert_eq!(p[2], AlpnProtocol::Http10);
+            }
+            other => panic!("Expected Protocols, got {:?}", other),
+        }
+    }
+
+    // ── Helpers for building synthetic TLS ClientHello buffers ────────────────
+
+    /// Build the raw bytes of an ALPN extension value (the ext_data portion).
+    fn build_alpn_extension(protos: &[&[u8]]) -> Vec<u8> {
+        let mut inner: Vec<u8> = Vec::new();
+        for p in protos {
+            inner.push(p.len() as u8);
+            inner.extend_from_slice(p);
+        }
+        let mut out = Vec::with_capacity(2 + inner.len());
+        let list_len = inner.len() as u16;
+        out.extend_from_slice(&list_len.to_be_bytes());
+        out.extend(inner);
+        out
+    }
+
+    /// Build a minimal but parseable TLS ClientHello record.
+    ///
+    /// `alpn_ext` is the raw ALPN extension *value* bytes; if `None`, the
+    /// extensions block will be empty (no ALPN extension).
+    fn build_minimal_client_hello(alpn_ext: Option<&[u8]>) -> Vec<u8> {
+        // ── ClientHello body ──────────────────────────────────────────────────
+        let mut body: Vec<u8> = Vec::new();
+        // version: TLS 1.2 (0x03, 0x03)
+        body.extend_from_slice(&[0x03, 0x03]);
+        // random: 32 bytes
+        body.extend_from_slice(&[0xABu8; 32]);
+        // session_id: empty (len=0)
+        body.push(0x00);
+        // cipher_suites: one suite (len=2, suite=TLS_AES_128_GCM_SHA256)
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        // compression: 1 method (null)
+        body.extend_from_slice(&[0x01, 0x00]);
+
+        // extensions
+        let mut exts: Vec<u8> = Vec::new();
+        if let Some(alpn) = alpn_ext {
+            // ext_type=ALPN (0x0010), ext_len, ext_data
+            exts.extend_from_slice(&[0x00, 0x10]);
+            let ext_len = alpn.len() as u16;
+            exts.extend_from_slice(&ext_len.to_be_bytes());
+            exts.extend_from_slice(alpn);
+        }
+        // extensions total length
+        let exts_len = exts.len() as u16;
+        body.extend_from_slice(&exts_len.to_be_bytes());
+        body.extend(exts);
+
+        // ── Handshake header ─────────────────────────────────────────────────
+        let mut hs: Vec<u8> = Vec::new();
+        hs.push(tls_const::CLIENT_HELLO); // msg_type
+        // length: 3 bytes big-endian
+        let body_len = body.len() as u32;
+        hs.push(((body_len >> 16) & 0xFF) as u8);
+        hs.push(((body_len >> 8) & 0xFF) as u8);
+        hs.push((body_len & 0xFF) as u8);
+        hs.extend(body);
+
+        // ── TLS record header ─────────────────────────────────────────────────
+        let mut record: Vec<u8> = Vec::new();
+        record.push(tls_const::HANDSHAKE); // content_type
+        record.extend_from_slice(&[0x03, 0x03]); // version
+        let hs_len = hs.len() as u16;
+        record.extend_from_slice(&hs_len.to_be_bytes()); // record length
+        record.extend(hs);
+        record
+    }
+}
