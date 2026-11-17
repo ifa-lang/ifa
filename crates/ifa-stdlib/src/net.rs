@@ -3601,6 +3601,28 @@ impl AsyncHttp2Connection {
         self.session.prioritized_stream_ids()
     }
 
+    /// Retrieve active stream IDs sorted under RFC 9218 extensible priority order
+    /// (urgency ascending 0..=7, then stream ID ascending for fair round-robin).
+    pub fn prioritized_streams_rfc9218(&self) -> Vec<u32> {
+        self.session.prioritized_stream_ids_rfc9218()
+    }
+
+    /// Set stream RFC 9218 priority parameters and transmit a `PRIORITY_UPDATE` frame (RFC 9218).
+    pub fn set_priority_update(
+        &mut self,
+        stream_id: u32,
+        priority: crate::simd_parser::PriorityParameters,
+    ) -> io::Result<()> {
+        let frame = crate::simd_parser::Http2Frame::PriorityUpdate {
+            prioritized_stream_id: stream_id,
+            priority_field_value: priority.serialize(),
+        };
+        self.send_frame(&frame)?;
+        self.session
+            .set_stream_priority_parameters(stream_id, priority);
+        Ok(())
+    }
+
     /// Send a PING frame with 8-byte opaque data.
     pub fn send_ping(&mut self, opaque_data: [u8; 8]) -> io::Result<()> {
         let frame = crate::simd_parser::Http2Frame::Ping {
@@ -3642,15 +3664,16 @@ impl AsyncHttp2Connection {
     }
 
     /// Execute a batch of prioritized requests multiplexed over this single HTTP/2 connection.
-    /// Sends PRIORITY frames for each stream, sends the requests concurrently,
-    /// and collects responses in the order of the dependency tree and weights.
+    /// Sends PRIORITY or PRIORITY_UPDATE frames for each stream, sends the requests concurrently,
+    /// and collects responses in the order of the dependency tree and weights (or RFC 9218 urgency tiers).
     pub fn execute_prioritized_batch(
         &mut self,
         requests: Vec<Http2PrioritizedRequest>,
     ) -> io::Result<Vec<(u32, io::Result<crate::http::HttpResponse>)>> {
         let mut stream_mappings = Vec::new();
+        let mut has_rfc9218 = false;
 
-        // 1. Dispatch requests and transmit PRIORITY frames
+        // 1. Dispatch requests and transmit PRIORITY / PRIORITY_UPDATE frames
         for req in &requests {
             let mut pseudo_headers = vec![
                 (":method", req.method.as_str()),
@@ -3663,15 +3686,22 @@ impl AsyncHttp2Connection {
 
             let stream_id = self.send_request(&pseudo_headers, req.body.as_deref())?;
 
-            if req.stream_dependency != 0 || req.weight != 16 || req.exclusive {
+            if let Some(p) = req.rfc9218_priority {
+                has_rfc9218 = true;
+                self.set_priority_update(stream_id, p)?;
+            } else if req.stream_dependency != 0 || req.weight != 16 || req.exclusive {
                 self.set_priority(stream_id, req.stream_dependency, req.weight, req.exclusive)?;
             }
 
             stream_mappings.push(stream_id);
         }
 
-        // 2. Order stream collection according to RFC 7540 priority tree
-        let prioritized_order = self.prioritized_streams();
+        // 2. Order stream collection according to RFC 9218 urgency or RFC 7540 priority tree
+        let prioritized_order = if has_rfc9218 {
+            self.prioritized_streams_rfc9218()
+        } else {
+            self.prioritized_streams()
+        };
         let mut ordered_streams = Vec::new();
         for &sid in &prioritized_order {
             if stream_mappings.contains(&sid) {
@@ -3764,6 +3794,8 @@ pub struct Http2PrioritizedRequest {
     pub weight: u8,
     /// Exclusive dependency flag
     pub exclusive: bool,
+    /// RFC 9218 Priority parameters (urgency 0..=7, incremental flag)
+    pub rfc9218_priority: Option<crate::simd_parser::PriorityParameters>,
 }
 
 impl Http2PrioritizedRequest {
@@ -3777,6 +3809,7 @@ impl Http2PrioritizedRequest {
             stream_dependency: 0,
             weight: 16,
             exclusive: false,
+            rfc9218_priority: None,
         }
     }
 
@@ -3797,6 +3830,15 @@ impl Http2PrioritizedRequest {
         self.stream_dependency = stream_dependency;
         self.weight = weight;
         self.exclusive = exclusive;
+        self
+    }
+
+    /// Set RFC 9218 priority parameters (urgency 0..=7 and incremental boolean).
+    pub fn with_rfc9218_priority(mut self, urgency: u8, incremental: bool) -> Self {
+        self.rfc9218_priority = Some(crate::simd_parser::PriorityParameters::new(
+            urgency,
+            incremental,
+        ));
         self
     }
 }
@@ -7699,6 +7741,104 @@ mod tests {
 
         assert_eq!(second.0, 1);
         assert_eq!(second.1.as_ref().unwrap().body, b"response-stream-1");
+
+        // Connection was released back into pool
+        assert_eq!(pool.idle_count(), 1);
+        assert_eq!(pool.active_count(), 0);
+
+        let mut conn = pool.acquire().expect("acquire to close");
+        let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        pool.release(conn);
+        pool.clear();
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_prioritized_batch_rfc9218() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            };
+
+            // Respond to three requests: stream 1, 3, 5
+            let mut responded = 0;
+            while responded < 3 {
+                match server.recv_frame().expect("server recv frame") {
+                    crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            let resp_headers = [(":status", "200")];
+                            let body_text = format!("resp-urgency-stream-{}", stream_id);
+                            server
+                                .send_response(stream_id, &resp_headers, Some(body_text.as_bytes()))
+                                .expect("send response");
+                            responded += 1;
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::PriorityUpdate { .. } => {}
+                    crate::simd_parser::Http2Frame::Priority { .. } => {}
+                    crate::simd_parser::Http2Frame::GoAway { .. } => break,
+                    _ => {}
+                }
+            }
+
+            loop {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
+
+        // Stream 1 (u=6 background), Stream 3 (u=0 critical urgent), Stream 5 (u=2 intermediate)
+        let batch = vec![
+            Http2PrioritizedRequest::new("GET", "/bg-task").with_rfc9218_priority(6, false),
+            Http2PrioritizedRequest::new("GET", "/critical-doc").with_rfc9218_priority(0, true),
+            Http2PrioritizedRequest::new("GET", "/script").with_rfc9218_priority(2, true),
+        ];
+
+        let results = pool
+            .execute_prioritized_batch(batch)
+            .expect("execute prioritized batch rfc9218");
+
+        assert_eq!(results.len(), 3);
+        // Order must be: stream 3 (u=0), stream 5 (u=2), stream 1 (u=6)
+        assert_eq!(results[0].0, 3);
+        assert_eq!(
+            results[0].1.as_ref().unwrap().body,
+            b"resp-urgency-stream-3"
+        );
+
+        assert_eq!(results[1].0, 5);
+        assert_eq!(
+            results[1].1.as_ref().unwrap().body,
+            b"resp-urgency-stream-5"
+        );
+
+        assert_eq!(results[2].0, 1);
+        assert_eq!(
+            results[2].1.as_ref().unwrap().body,
+            b"resp-urgency-stream-1"
+        );
 
         // Connection was released back into pool
         assert_eq!(pool.idle_count(), 1);
