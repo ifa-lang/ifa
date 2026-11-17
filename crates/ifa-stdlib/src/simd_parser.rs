@@ -363,7 +363,7 @@ mod tests {
 // -----------------------------------------------------------------------------
 
 /// HTTP/2 Error Codes (RFC 7540 Section 7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Http2ErrorCode {
     NoError,
     ProtocolError,
@@ -380,6 +380,47 @@ pub enum Http2ErrorCode {
     InadequateSecurity,
     Http11Required,
     Unknown(u32),
+}
+
+impl Http2ErrorCode {
+    /// Human-readable standard name of the RFC 7540 error code.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Http2ErrorCode::NoError => "NO_ERROR",
+            Http2ErrorCode::ProtocolError => "PROTOCOL_ERROR",
+            Http2ErrorCode::InternalError => "INTERNAL_ERROR",
+            Http2ErrorCode::FlowControlError => "FLOW_CONTROL_ERROR",
+            Http2ErrorCode::SettingsTimeout => "SETTINGS_TIMEOUT",
+            Http2ErrorCode::StreamClosed => "STREAM_CLOSED",
+            Http2ErrorCode::FrameSizeError => "FRAME_SIZE_ERROR",
+            Http2ErrorCode::RefusedStream => "REFUSED_STREAM",
+            Http2ErrorCode::Cancel => "CANCEL",
+            Http2ErrorCode::CompressionError => "COMPRESSION_ERROR",
+            Http2ErrorCode::ConnectError => "CONNECT_ERROR",
+            Http2ErrorCode::EnhanceYourCalm => "ENHANCE_YOUR_CALM",
+            Http2ErrorCode::InadequateSecurity => "INADEQUATE_SECURITY",
+            Http2ErrorCode::Http11Required => "HTTP_1_1_REQUIRED",
+            Http2ErrorCode::Unknown(_) => "UNKNOWN_ERROR",
+        }
+    }
+
+    /// Whether this error code represents a graceful or non-fatal termination condition.
+    pub fn is_graceful(&self) -> bool {
+        matches!(self, Http2ErrorCode::NoError)
+    }
+
+    /// Whether this error indicates that a client should back off or slow down (RFC 7540 §7).
+    pub fn is_rate_limit_or_calm(&self) -> bool {
+        matches!(self, Http2ErrorCode::EnhanceYourCalm)
+    }
+
+    /// Whether this error code indicates the request can be retried safely on a new connection.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Http2ErrorCode::NoError | Http2ErrorCode::RefusedStream | Http2ErrorCode::Cancel
+        )
+    }
 }
 
 impl From<u32> for Http2ErrorCode {
@@ -1283,6 +1324,7 @@ pub struct Http2Session {
     pub hpack_decoder: HpackContext,
     pub connection_window_size: i32,
     pub initial_stream_window_size: i32,
+    pub last_received_goaway: Option<(u32, Http2ErrorCode, Vec<u8>)>,
 }
 
 impl Http2Session {
@@ -1310,6 +1352,7 @@ impl Http2Session {
             hpack_decoder: HpackContext::default(),
             connection_window_size: Self::DEFAULT_INITIAL_WINDOW_SIZE,
             initial_stream_window_size: Self::DEFAULT_INITIAL_WINDOW_SIZE,
+            last_received_goaway: None,
         }
     }
 
@@ -1746,6 +1789,24 @@ impl Http2Session {
                 weight,
             } => {
                 self.set_stream_priority(*stream_id, *stream_dependency, *weight, *exclusive);
+                Ok(None)
+            }
+            Http2Frame::GoAway {
+                last_stream_id,
+                error_code,
+                debug_data,
+            } => {
+                self.last_received_goaway =
+                    Some((*last_stream_id, *error_code, debug_data.clone()));
+                // Mark any active streams above last_stream_id as closed/refused
+                for (id, stream) in self.streams.iter_mut() {
+                    if *id > *last_stream_id
+                        && stream.state != Http2StreamState::Closed
+                    {
+                        stream.state = Http2StreamState::Closed;
+                        stream.reset_error = Some(Http2ErrorCode::RefusedStream);
+                    }
+                }
                 Ok(None)
             }
             _ => Ok(None),

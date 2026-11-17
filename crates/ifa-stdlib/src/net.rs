@@ -3099,6 +3099,11 @@ impl AsyncHttp2Connection {
         // Drain the parsed frame from read buffer
         self.read_buf.drain(..total_frame_len);
 
+        // If the frame is GOAWAY, mark the connection as closed
+        if let crate::simd_parser::Http2Frame::GoAway { .. } = &frame {
+            self.is_closed = true;
+        }
+
         // Update internal session state
         match self.session.handle_frame(&frame) {
             Ok(Some(auto_reply)) => {
@@ -3171,6 +3176,16 @@ impl AsyncHttp2Connection {
         error_code: crate::simd_parser::Http2ErrorCode,
     ) -> io::Result<()> {
         self.send_goaway_with_debug(error_code, &[])
+    }
+
+    /// Retrieve the GOAWAY information received from peer, if any (last_stream_id, error_code, debug_data).
+    pub fn last_received_goaway(
+        &self,
+    ) -> Option<(u32, crate::simd_parser::Http2ErrorCode, &[u8])> {
+        self.session
+            .last_received_goaway
+            .as_ref()
+            .map(|(sid, err, dbg)| (*sid, *err, dbg.as_slice()))
     }
 
     /// Read incoming frames until all active streams up to `last_stream_id` are completed
@@ -3705,13 +3720,20 @@ impl AsyncHttp2Pool {
     pub fn acquire(&self) -> io::Result<AsyncHttp2Connection> {
         if let Ok(mut pool) = self.idle_pool.lock() {
             while let Some(mut conn) = pool.pop() {
-                if !conn.is_closed() {
-                    // Quick health check ping
-                    if conn.send_ping(*b"h2_probe").is_ok() {
-                        self.active_count
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Ok(conn);
-                    }
+                // If the connection was already marked closed or received a GOAWAY, discard it
+                if conn.is_closed() || conn.last_received_goaway().is_some() {
+                    continue;
+                }
+                // Drain any pending buffered frames (e.g. late GOAWAY or SETTINGS)
+                let _ = conn.try_recv_frame();
+                if conn.is_closed() || conn.last_received_goaway().is_some() {
+                    continue;
+                }
+                // Quick health check ping
+                if conn.send_ping(*b"h2_probe").is_ok() {
+                    self.active_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(conn);
                 }
             }
         }
@@ -3733,11 +3755,15 @@ impl AsyncHttp2Pool {
     }
 
     /// Return an HTTP/2 connection back to the pool if healthy and within capacity.
-    pub fn release(&self, conn: AsyncHttp2Connection) {
+    /// Connections marked as closed or having received a peer GOAWAY are automatically discarded.
+    pub fn release(&self, mut conn: AsyncHttp2Connection) {
         self.active_count
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
-        if !conn.is_closed() {
+        // Check if any pending frames on wire indicate GOAWAY
+        let _ = conn.try_recv_frame();
+
+        if !conn.is_closed() && conn.last_received_goaway().is_none() {
             if let Ok(mut pool) = self.idle_pool.lock() {
                 if pool.len() < self.max_connections {
                     pool.push(conn);
@@ -3823,7 +3849,7 @@ impl AsyncHttp2Pool {
     }
 
     /// Health-check all idle connections in the pool by transmitting PING frames,
-    /// removing any dead or unresponsive connections.
+    /// removing any dead, closed, or GOAWAY-received connections.
     pub fn health_check(&self) -> usize {
         let mut healthy = Vec::new();
         let mut closed_count = 0;
@@ -3831,7 +3857,12 @@ impl AsyncHttp2Pool {
         if let Ok(mut pool) = self.idle_pool.lock() {
             let connections: Vec<AsyncHttp2Connection> = pool.drain(..).collect();
             for mut conn in connections {
-                if !conn.is_closed() && conn.send_ping(*b"h2_probe").is_ok() {
+                // Check if any frame (e.g. GOAWAY) arrived on wire
+                let _ = conn.try_recv_frame();
+                if !conn.is_closed()
+                    && conn.last_received_goaway().is_none()
+                    && conn.send_ping(*b"h2_probe").is_ok()
+                {
                     healthy.push(conn);
                 } else {
                     closed_count += 1;
@@ -6655,22 +6686,14 @@ mod tests {
                 match server.recv_frame().expect("recv frame") {
                     crate::simd_parser::Http2Frame::Headers {
                         stream_id: sid,
-                        end_stream,
+                        end_stream: true,
                         ..
-                    } => {
-                        if end_stream {
-                            break sid;
-                        }
-                    }
+                    } => break sid,
                     crate::simd_parser::Http2Frame::Data {
                         stream_id: sid,
-                        end_stream,
+                        end_stream: true,
                         ..
-                    } => {
-                        if end_stream {
-                            break sid;
-                        }
-                    }
+                    } => break sid,
                     crate::simd_parser::Http2Frame::GoAway { .. } => return,
                     _ => {}
                 }
@@ -6768,7 +6791,7 @@ mod tests {
         });
 
         // Client connects and performs handshake
-        let client_stream = AsyncTcpStream::connect(&format!("127.0.0.1:{}", port))
+        let client_stream = AsyncTcpStream::connect(format!("127.0.0.1:{}", port))
             .expect("connect to server");
         let mut client = AsyncHttp2Connection::client_handshake(client_stream)
             .expect("client handshake");
@@ -6818,22 +6841,14 @@ mod tests {
                 match server.recv_frame().expect("recv frame") {
                     crate::simd_parser::Http2Frame::Headers {
                         stream_id: sid,
-                        end_stream,
+                        end_stream: true,
                         ..
-                    } => {
-                        if end_stream {
-                            break sid;
-                        }
-                    }
+                    } => break sid,
                     crate::simd_parser::Http2Frame::Data {
                         stream_id: sid,
-                        end_stream,
+                        end_stream: true,
                         ..
-                    } => {
-                        if end_stream {
-                            break sid;
-                        }
-                    }
+                    } => break sid,
                     _ => {}
                 }
             };
@@ -6865,7 +6880,7 @@ mod tests {
         });
 
         let client_stream =
-            AsyncTcpStream::connect(&format!("127.0.0.1:{}", port)).expect("connect to server");
+            AsyncTcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect to server");
         let mut client =
             AsyncHttp2Connection::client_handshake(client_stream).expect("client handshake");
 
@@ -6886,6 +6901,82 @@ mod tests {
         assert!(trailers
             .iter()
             .any(|(k, v)| k == "x-checksum-sha256" && v == "abcdef0123456789"));
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_goaway_handling() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let (tcp_stream, _) = listener.accept().expect("accept connection");
+            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+
+            // Wait for request
+            let req_stream_id;
+            loop {
+                let frame = server.recv_frame().expect("recv frame");
+                if let crate::simd_parser::Http2Frame::Headers {
+                    stream_id,
+                    end_stream,
+                    ..
+                } = frame
+                {
+                    if end_stream {
+                        req_stream_id = stream_id;
+                        break;
+                    }
+                }
+            }
+
+            // Send 200 response
+            server
+                .send_response(req_stream_id, &[(":status", "200")], Some(b"first ok"))
+                .expect("send response");
+
+            // Server initiates GOAWAY with EnhanceYourCalm (rate limit warning)
+            server
+                .send_goaway_with_debug(
+                    crate::simd_parser::Http2ErrorCode::EnhanceYourCalm,
+                    b"rate limit exceeded",
+                )
+                .expect("send goaway");
+
+            // Keep alive briefly
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
+        assert_eq!(pool.idle_count(), 0);
+
+        // 1. Acquire connection, send request and get response
+        let mut conn = pool.acquire().expect("acquire connection");
+        let sid = conn
+            .send_request(&[(":method", "GET"), (":path", "/hello")], None)
+            .expect("send request");
+        let (_, body) = conn.recv_response_for(sid).expect("recv response");
+        assert_eq!(body, b"first ok");
+
+        // Release connection back to pool (at this point server sends GOAWAY)
+        // Wait tiny bit for GOAWAY packet to arrive on socket
+        std::thread::sleep(Duration::from_millis(60));
+
+        pool.release(conn);
+
+        // Since connection received GOAWAY, pool.release should detect it and drop it, OR
+        // pool.health_check() should filter it out, OR next acquire should discard it.
+        // Let's verify health_check or acquire:
+        if pool.idle_count() > 0 {
+            let dead = pool.health_check();
+            assert_eq!(dead, 1);
+            assert_eq!(pool.idle_count(), 0);
+        } else {
+            assert_eq!(pool.idle_count(), 0);
+        }
 
         let _ = handle.join();
     }
