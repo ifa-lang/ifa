@@ -3965,9 +3965,7 @@ impl AsyncHttp2Pool {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            io::Error::other("HTTP/2 retry exhausted")
-        }))
+        Err(last_err.unwrap_or_else(|| io::Error::other("HTTP/2 retry exhausted")))
     }
 }
 
@@ -7124,15 +7122,10 @@ mod tests {
                 {
                     if end_stream {
                         server
-                            .send_response(
-                                stream_id,
-                                &[(":status", "200")],
-                                Some(b"retry-ok"),
-                            )
+                            .send_response(stream_id, &[(":status", "200")], Some(b"retry-ok"))
                             .expect("send response");
                         // Graceful GOAWAY so pool release discards cleanly
-                        let _ = server
-                            .send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                        let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
                         break;
                     }
                 }
@@ -7160,10 +7153,9 @@ mod tests {
         let handle = std::thread::spawn(move || {
             // First connection: respond then send fatal GOAWAY
             if let Ok((tcp_stream, _)) = listener.accept() {
-                let async_stream =
-                    AsyncTcpStream::from_std(tcp_stream).expect("async stream");
-                let mut server = AsyncHttp2Connection::server_handshake(async_stream)
-                    .expect("server handshake");
+                let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+                let mut server =
+                    AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
                 loop {
                     let frame = match server.recv_frame() {
                         Ok(f) => f,
@@ -7177,17 +7169,11 @@ mod tests {
                     {
                         if end_stream {
                             server
-                                .send_response(
-                                    stream_id,
-                                    &[(":status", "200")],
-                                    Some(b"seed"),
-                                )
+                                .send_response(stream_id, &[(":status", "200")], Some(b"seed"))
                                 .ok();
                             // Send fatal protocol error GOAWAY
                             server
-                                .send_goaway(
-                                    crate::simd_parser::Http2ErrorCode::ProtocolError,
-                                )
+                                .send_goaway(crate::simd_parser::Http2ErrorCode::ProtocolError)
                                 .ok();
                             break;
                         }
