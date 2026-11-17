@@ -3122,6 +3122,19 @@ impl AsyncHttp2Connection {
         self.session.streams.get(&stream_id).map(|s| s.window_size)
     }
 
+    /// Update connection-level or stream-level flow control window with an explicit increment
+    /// and transmit a corresponding `WINDOW_UPDATE` frame to the peer.
+    pub fn send_window_update(&mut self, stream_id: u32, increment: u32) -> io::Result<i32> {
+        let frame = crate::simd_parser::Http2Frame::WindowUpdate {
+            stream_id,
+            window_size_increment: increment,
+        };
+        self.send_frame(&frame)?;
+        self.session
+            .update_window_size(stream_id, increment)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}", e)))
+    }
+
     /// Initiate an HTTP/2 request on a newly opened stream.
     pub fn send_request(
         &mut self,

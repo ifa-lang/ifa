@@ -2128,6 +2128,24 @@ impl Http2Session {
         stream_id
     }
 
+    /// Apply dynamic renegotiation of flow control window sizes at session level (stream ID 0)
+    /// or stream level (stream ID > 0), returning the resulting new window size.
+    pub fn update_window_size(&mut self, stream_id: u32, increment: u32) -> Result<i32, FastHttpError> {
+        if stream_id == 0 {
+            let new_win = self.connection_window_size.checked_add(increment as i32)
+                .ok_or(FastHttpError::InvalidHeader)?;
+            self.connection_window_size = new_win;
+            Ok(new_win)
+        } else if let Some(stream) = self.streams.get_mut(&stream_id) {
+            let new_win = stream.window_size.checked_add(increment as i32)
+                .ok_or(FastHttpError::InvalidHeader)?;
+            stream.window_size = new_win;
+            Ok(new_win)
+        } else {
+            Err(FastHttpError::InvalidHeader)
+        }
+    }
+
     /// Available outbound credit for a given stream taking into account both connection-level
     /// and stream-level flow control windows.
     pub fn outbound_window_available(&self, stream_id: u32) -> i32 {
@@ -2475,7 +2493,15 @@ impl Http2Session {
                 if !*ack {
                     for s in settings {
                         if s.id == Http2SettingId::InitialWindowSize {
-                            self.initial_stream_window_size = s.value as i32;
+                            let new_initial_window = s.value as i32;
+                            let delta = new_initial_window - self.initial_stream_window_size;
+                            self.initial_stream_window_size = new_initial_window;
+                            // RFC 7540 Section 6.9.2: adjust flow-control window of all active streams
+                            for stream in self.streams.values_mut() {
+                                if stream.state != Http2StreamState::Closed {
+                                    stream.window_size += delta;
+                                }
+                            }
                         }
                     }
                     self.peer_settings = settings.clone();
@@ -3340,5 +3366,43 @@ mod http2_tests {
             .handle_frame(&clear_frame)
             .expect("handle clear frame");
         assert!(!session.alt_svc_routes.contains_key("https://example.com"));
+    }
+
+    #[test]
+    fn test_initial_window_size_delta_update() {
+        let mut session = Http2Session::new(false);
+        let stream1 = session.open_stream();
+        let stream2 = session.open_stream();
+
+        // Initial default window sizes
+        assert_eq!(session.streams.get(&stream1).unwrap().window_size, 65535);
+        assert_eq!(session.streams.get(&stream2).unwrap().window_size, 65535);
+
+        // Receive SETTINGS with InitialWindowSize = 131072 (delta = +65537)
+        let settings_frame = Http2Frame::Settings {
+            ack: false,
+            settings: vec![Http2Setting {
+                id: Http2SettingId::InitialWindowSize,
+                value: 131072,
+            }],
+        };
+
+        let ack = session.handle_frame(&settings_frame).expect("handle settings frame");
+        assert!(matches!(ack, Some(Http2Frame::Settings { ack: true, .. })));
+
+        assert_eq!(session.initial_stream_window_size, 131072);
+        assert_eq!(session.streams.get(&stream1).unwrap().window_size, 131072);
+        assert_eq!(session.streams.get(&stream2).unwrap().window_size, 131072);
+
+        // Test dynamic window update renegotiation at session and stream levels
+        let conn_win = session.update_window_size(0, 1000).expect("update session window");
+        assert_eq!(conn_win, 65535 + 1000);
+
+        let stream1_win = session.update_window_size(stream1, 500).expect("update stream window");
+        assert_eq!(stream1_win, 131072 + 500);
+
+        // Verify newly opened streams receive the updated initial window size
+        let stream3 = session.open_stream();
+        assert_eq!(session.streams.get(&stream3).unwrap().window_size, 131072);
     }
 }
