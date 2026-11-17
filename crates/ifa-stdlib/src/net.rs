@@ -2961,7 +2961,9 @@ impl AsyncHttp2Connection {
     ) -> io::Result<u32> {
         let has_body = body.is_some_and(|b| !b.is_empty());
         let stream_id = self.session.open_stream();
-        let headers_frame = self.session.create_headers_frame(stream_id, headers, !has_body);
+        let headers_frame = self
+            .session
+            .create_headers_frame(stream_id, headers, !has_body);
         self.send_frame(&headers_frame)?;
 
         if let Some(data) = body {
@@ -2982,7 +2984,9 @@ impl AsyncHttp2Connection {
         body: Option<&[u8]>,
     ) -> io::Result<()> {
         let has_body = body.is_some_and(|b| !b.is_empty());
-        let headers_frame = self.session.create_headers_frame(stream_id, headers, !has_body);
+        let headers_frame = self
+            .session
+            .create_headers_frame(stream_id, headers, !has_body);
         self.send_frame(&headers_frame)?;
 
         if let Some(data) = body {
@@ -3026,7 +3030,8 @@ impl AsyncHttp2Connection {
             None => return Ok(None),
         };
 
-        let total_frame_len = crate::simd_parser::Http2FrameHeader::HEADER_SIZE + header.length as usize;
+        let total_frame_len =
+            crate::simd_parser::Http2FrameHeader::HEADER_SIZE + header.length as usize;
         if self.read_buf.len() < total_frame_len {
             return Ok(None);
         }
@@ -3088,7 +3093,10 @@ impl AsyncHttp2Connection {
     }
 
     /// Gracefully close connection by sending a GOAWAY frame.
-    pub fn send_goaway(&mut self, error_code: crate::simd_parser::Http2ErrorCode) -> io::Result<()> {
+    pub fn send_goaway(
+        &mut self,
+        error_code: crate::simd_parser::Http2ErrorCode,
+    ) -> io::Result<()> {
         let last_id = self.session.next_stream_id.saturating_sub(2);
         let goaway = crate::simd_parser::Http2Frame::GoAway {
             last_stream_id: last_id,
@@ -5053,15 +5061,23 @@ mod tests {
 
         // Client connects and performs handshake
         let stream = AsyncTcpStream::connect(addr).expect("client connect");
-        let mut client = AsyncHttp2Connection::client_handshake(stream)
-            .expect("client h2 handshake");
+        let mut client =
+            AsyncHttp2Connection::client_handshake(stream).expect("client h2 handshake");
 
         // Client receives server SETTINGS and automatically replies with ACK
         let frame1 = client.recv_frame().expect("client recv server settings");
-        let frame2 = client.recv_frame().expect("client recv server settings ack");
+        let frame2 = client
+            .recv_frame()
+            .expect("client recv server settings ack");
         // One of them is Settings { ack: false, .. } and the other is Settings { ack: true, .. }
-        assert!(matches!(frame1, crate::simd_parser::Http2Frame::Settings { .. }));
-        assert!(matches!(frame2, crate::simd_parser::Http2Frame::Settings { .. }));
+        assert!(matches!(
+            frame1,
+            crate::simd_parser::Http2Frame::Settings { .. }
+        ));
+        assert!(matches!(
+            frame2,
+            crate::simd_parser::Http2Frame::Settings { .. }
+        ));
 
         // Request 1: GET /api/status (Headers only, end_stream=true)
         let get_headers = vec![
@@ -5080,11 +5096,17 @@ mod tests {
         if let crate::simd_parser::Http2Frame::Headers { stream_id, .. } = resp_headers_frame {
             assert_eq!(stream_id, 1);
         } else {
-            panic!("Expected Headers frame for stream 1, got {:?}", resp_headers_frame);
+            panic!(
+                "Expected Headers frame for stream 1, got {:?}",
+                resp_headers_frame
+            );
         }
 
         let resp_data_frame = client.recv_frame().expect("client recv resp data");
-        if let crate::simd_parser::Http2Frame::Data { stream_id, data, .. } = resp_data_frame {
+        if let crate::simd_parser::Http2Frame::Data {
+            stream_id, data, ..
+        } = resp_data_frame
+        {
             assert_eq!(stream_id, 1);
             assert_eq!(data, b"hello h2 response");
         } else {
@@ -5112,7 +5134,10 @@ mod tests {
         }
 
         let resp2_data_frame = client.recv_frame().expect("client recv resp2 data");
-        if let crate::simd_parser::Http2Frame::Data { stream_id, data, .. } = resp2_data_frame {
+        if let crate::simd_parser::Http2Frame::Data {
+            stream_id, data, ..
+        } = resp2_data_frame
+        {
             assert_eq!(stream_id, 3);
             assert_eq!(data, b"received payload");
         } else {
