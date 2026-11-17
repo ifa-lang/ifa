@@ -2314,6 +2314,8 @@ pub struct AsyncWsConnection {
     demux: WsDemux,
     is_client: bool,
     is_closed: bool,
+    /// Sec-WebSocket-Protocol negotiated during handshake, if any.
+    pub subprotocol: Option<String>,
 }
 
 impl AsyncWsConnection {
@@ -2324,6 +2326,7 @@ impl AsyncWsConnection {
             demux: WsDemux::new(),
             is_client,
             is_closed: false,
+            subprotocol: None,
         }
     }
 
@@ -2535,16 +2538,33 @@ impl AsyncWsConnection {
     /// Perform an asynchronous RFC 6455 client handshake over an `AsyncTcpStream`.
     /// Sends the HTTP Upgrade request, awaits and verifies the HTTP 101 Switching Protocols response.
     pub fn client_handshake(
-        mut stream: AsyncTcpStream,
+        stream: AsyncTcpStream,
         host: &str,
         port: u16,
         path: &str,
         client_key: &str,
     ) -> io::Result<Self> {
+        Self::client_handshake_with_protocols(stream, host, port, path, client_key, &[])
+    }
+
+    /// Perform an asynchronous RFC 6455 client handshake with optional subprotocols (Sec-WebSocket-Protocol).
+    pub fn client_handshake_with_protocols(
+        mut stream: AsyncTcpStream,
+        host: &str,
+        port: u16,
+        path: &str,
+        client_key: &str,
+        protocols: &[&str],
+    ) -> io::Result<Self> {
         let expected_accept = crate::crypto::websocket_accept_key(client_key);
+        let proto_header = if !protocols.is_empty() {
+            format!("Sec-WebSocket-Protocol: {}\r\n", protocols.join(", "))
+        } else {
+            String::new()
+        };
         let req = format!(
-            "GET {} HTTP/1.1\r\nHost: {}:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n",
-            path, host, port, client_key
+            "GET {} HTTP/1.1\r\nHost: {}:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n{}\r\n",
+            path, host, port, client_key, proto_header
         );
 
         stream.write_all(req.as_bytes())?;
@@ -2568,12 +2588,27 @@ impl AsyncWsConnection {
                                 "WebSocket handshake rejected by server",
                             ));
                         }
+
+                        // Parse negotiated subprotocol if present in response
+                        let mut negotiated_proto = None;
+                        for line in header_part.lines() {
+                            if line
+                                .to_ascii_lowercase()
+                                .starts_with("sec-websocket-protocol:")
+                            {
+                                if let Some(sep) = line.find(':') {
+                                    negotiated_proto = Some(line[sep + 1..].trim().to_string());
+                                }
+                            }
+                        }
+
                         demux.buffer.drain(..idx + 4);
                         return Ok(Self {
                             stream,
                             demux,
                             is_client: true,
                             is_closed: false,
+                            subprotocol: negotiated_proto,
                         });
                     }
                 }
@@ -2600,7 +2635,18 @@ impl AsyncWsConnection {
     /// Perform an asynchronous RFC 6455 server handshake over an `AsyncTcpStream`.
     /// Reads client HTTP Upgrade request, validates `Sec-WebSocket-Key`, sends 101 Switching Protocols,
     /// and returns the active `AsyncWsConnection`.
-    pub fn server_handshake(mut stream: AsyncTcpStream) -> io::Result<Self> {
+    pub fn server_handshake(stream: AsyncTcpStream) -> io::Result<Self> {
+        Self::server_handshake_with_negotiator(stream, |_| None)
+    }
+
+    /// Perform an asynchronous RFC 6455 server handshake selecting a subprotocol from offered client protocols.
+    pub fn server_handshake_with_negotiator<F>(
+        mut stream: AsyncTcpStream,
+        negotiator: F,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(&[String]) -> Option<String>,
+    {
         let mut demux = WsDemux::new();
         let mut spins = 0;
 
@@ -2613,10 +2659,23 @@ impl AsyncWsConnection {
                     if let Some(header_end) = text.find("\r\n\r\n") {
                         let header_part = &text[..header_end];
                         let mut key: Option<String> = None;
+                        let mut client_protocols = Vec::new();
+
                         for line in header_part.lines() {
-                            if line.to_ascii_lowercase().starts_with("sec-websocket-key:") {
+                            let lower = line.to_ascii_lowercase();
+                            if lower.starts_with("sec-websocket-key:") {
                                 if let Some(orig_idx) = line.find(':') {
                                     key = Some(line[orig_idx + 1..].trim().to_string());
+                                }
+                            } else if lower.starts_with("sec-websocket-protocol:") {
+                                if let Some(orig_idx) = line.find(':') {
+                                    let raw_protos = &line[orig_idx + 1..];
+                                    for proto in raw_protos.split(',') {
+                                        let p = proto.trim();
+                                        if !p.is_empty() {
+                                            client_protocols.push(p.to_string());
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2628,10 +2687,18 @@ impl AsyncWsConnection {
                             )
                         })?;
 
+                        let chosen_proto = negotiator(&client_protocols);
+                        let proto_header = match &chosen_proto {
+                            Some(ref proto) => {
+                                format!("Sec-WebSocket-Protocol: {}\r\n", proto)
+                            }
+                            None => String::new(),
+                        };
+
                         let accept = crate::crypto::websocket_accept_key(&client_key);
                         let response = format!(
-                            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
-                            accept
+                            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n{}\r\n",
+                            accept, proto_header
                         );
                         stream.write_all(response.as_bytes())?;
 
@@ -2641,6 +2708,7 @@ impl AsyncWsConnection {
                             demux,
                             is_client: false,
                             is_closed: false,
+                            subprotocol: chosen_proto,
                         });
                     }
                 }
@@ -2661,6 +2729,112 @@ impl AsyncWsConnection {
                 GLOBAL_SCHEDULER.yield_now();
                 std::thread::sleep(Duration::from_millis(1));
             }
+        }
+    }
+}
+
+/// A connection pool for reusable asynchronous WebSocket client connections.
+/// Manages connection limits, idle connection reuse, health check pings and subprotocol grouping.
+pub struct AsyncWsPool {
+    host: String,
+    port: u16,
+    path: String,
+    protocols: Vec<String>,
+    max_connections: usize,
+    idle_pool: std::sync::Mutex<Vec<AsyncWsConnection>>,
+    active_count: std::sync::atomic::AtomicUsize,
+}
+
+impl AsyncWsPool {
+    /// Create a new WebSocket client connection pool.
+    pub fn new(
+        host: impl Into<String>,
+        port: u16,
+        path: impl Into<String>,
+        protocols: Vec<String>,
+        max_connections: usize,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            path: path.into(),
+            protocols,
+            max_connections: max_connections.max(1),
+            idle_pool: std::sync::Mutex::new(Vec::new()),
+            active_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Number of currently idle pooled connections.
+    pub fn idle_count(&self) -> usize {
+        self.idle_pool.lock().map(|p| p.len()).unwrap_or(0)
+    }
+
+    /// Total count of active (checked-out or connecting) connections.
+    pub fn active_count(&self) -> usize {
+        self.active_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Check out an active WebSocket connection from the pool, or establish a new one if below max_connections.
+    pub fn acquire(&self) -> io::Result<AsyncWsConnection> {
+        // Try to pop an existing healthy connection
+        if let Ok(mut pool) = self.idle_pool.lock() {
+            while let Some(mut conn) = pool.pop() {
+                if !conn.is_closed() {
+                    // Quick health check ping
+                    if conn.send_ping(b"pool_probe").is_ok() {
+                        self.active_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(conn);
+                    }
+                }
+            }
+        }
+
+        let current = self.active_count.load(std::sync::atomic::Ordering::Relaxed);
+        if current >= self.max_connections {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "WebSocket connection pool capacity exhausted",
+            ));
+        }
+
+        // Connect new connection
+        let stream = AsyncTcpStream::connect(format!("{}:{}", self.host, self.port))?;
+        let proto_refs: Vec<&str> = self.protocols.iter().map(|s| s.as_str()).collect();
+        let client_key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let conn = AsyncWsConnection::client_handshake_with_protocols(
+            stream,
+            &self.host,
+            self.port,
+            &self.path,
+            client_key,
+            &proto_refs,
+        )?;
+
+        self.active_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(conn)
+    }
+
+    /// Return a connection back to the pool if healthy and space is available.
+    pub fn release(&self, conn: AsyncWsConnection) {
+        self.active_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+        if !conn.is_closed() {
+            if let Ok(mut pool) = self.idle_pool.lock() {
+                if pool.len() < self.max_connections {
+                    pool.push(conn);
+                }
+            }
+        }
+    }
+
+    /// Clear all idle connections in the pool.
+    pub fn clear(&self) {
+        if let Ok(mut pool) = self.idle_pool.lock() {
+            pool.clear();
         }
     }
 }
@@ -4448,5 +4622,92 @@ mod tests {
         assert!(hub.unregister(sid2));
         assert_eq!(hub.session_count(), 0);
         assert_eq!(hub.topic_count(), 0);
+    }
+
+    #[test]
+    fn test_async_ws_subprotocol_negotiation_and_pool() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        // Spawn server thread/fiber handling handshakes with protocol negotiation
+        GLOBAL_SCHEDULER.spawn(move || {
+            let mut accepted = 0;
+            while accepted < 2 {
+                if let Ok(Some((stream, _))) = listener.try_accept() {
+                    let mut server = AsyncWsConnection::server_handshake_with_negotiator(
+                        stream,
+                        |client_protos| {
+                            // Negotiate protocol: prefer "v2.chat" over "v1.chat"
+                            if client_protos.contains(&"v2.chat".to_string()) {
+                                Some("v2.chat".to_string())
+                            } else if client_protos.contains(&"v1.chat".to_string()) {
+                                Some("v1.chat".to_string())
+                            } else {
+                                None
+                            }
+                        },
+                    )
+                    .expect("server handshake");
+
+                    assert_eq!(server.subprotocol.as_deref(), Some("v2.chat"));
+
+                    // Respond to ping / echo message
+                    let msg = server.recv_message().expect("recv client msg");
+                    match msg {
+                        WsMessage::Text(t) => {
+                            server
+                                .send_text(&format!("ACK:{}", t))
+                                .expect("server send");
+                        }
+                        _ => {}
+                    }
+                    accepted += 1;
+                }
+                GLOBAL_SCHEDULER.yield_now();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        // Test connection pool
+        let pool = AsyncWsPool::new(
+            "127.0.0.1",
+            addr.port(),
+            "/chat",
+            vec!["v1.chat".to_string(), "v2.chat".to_string()],
+            2,
+        );
+
+        assert_eq!(pool.idle_count(), 0);
+        assert_eq!(pool.active_count(), 0);
+
+        // Acquire connection 1
+        let mut conn1 = pool.acquire().expect("acquire ws conn1");
+        assert_eq!(conn1.subprotocol.as_deref(), Some("v2.chat"));
+        assert_eq!(pool.active_count(), 1);
+
+        conn1.send_text("hello_pool").expect("send ws");
+        let reply = conn1.recv_message().expect("recv reply");
+        match reply {
+            WsMessage::Text(t) => assert_eq!(t, "ACK:hello_pool"),
+            _ => panic!("Expected text response"),
+        }
+
+        // Release connection 1 back to pool
+        pool.release(conn1);
+        assert_eq!(pool.idle_count(), 1);
+        assert_eq!(pool.active_count(), 0);
+
+        // Re-acquire from pool (reuses idle connection)
+        let conn_reused = pool.acquire().expect("re-acquire ws conn");
+        assert_eq!(pool.idle_count(), 0);
+        assert_eq!(pool.active_count(), 1);
+        assert_eq!(conn_reused.subprotocol.as_deref(), Some("v2.chat"));
+
+        pool.release(conn_reused);
+        assert_eq!(pool.idle_count(), 1);
+        assert_eq!(pool.active_count(), 0);
+
+        pool.clear();
+        assert_eq!(pool.idle_count(), 0);
     }
 }
