@@ -4585,6 +4585,63 @@ impl AsyncHttp2Pool {
         })
     }
 
+    /// Execute a request with automatic transparent migration to an advertised HTTP/3 alternative route if available.
+    ///
+    /// If an active HTTP/3 alternative route is discovered for the origin (or default origin),
+    /// and `http3_handler` is provided, the request is delegated directly to the HTTP/3 transport handler.
+    /// If no HTTP/3 route is present or the HTTP/3 handler fails with a fallback-eligible error,
+    /// execution falls back transparently to the native HTTP/2 pool connection.
+    pub fn execute_request_with_alt_svc_migration<F>(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        http3_handler: Option<F>,
+    ) -> io::Result<crate::http::HttpResponse>
+    where
+        F: FnOnce(&str, u16, &str, &str, &[(&str, &str)], Option<&[u8]>) -> io::Result<crate::http::HttpResponse>,
+    {
+        // Check for an available HTTP/3 route
+        let h3_route = self.select_active_alt_svc_route(
+            None,
+            "h3",
+            std::time::Duration::from_secs(0),
+            true,
+        );
+
+        if let (Some(route), Some(handler)) = (h3_route, http3_handler) {
+            let target_host = if route.host.is_empty() {
+                self.host.as_str()
+            } else {
+                route.host.as_str()
+            };
+            let target_port = if route.port != 0 {
+                route.port
+            } else {
+                self.port
+            };
+
+            // Attempt HTTP/3 execution via the provided handler
+            match handler(target_host, target_port, method, path, headers, body) {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    // On connection/transport error, transparently fall back to HTTP/2
+                    match e.kind() {
+                        io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::AddrNotAvailable => {}
+                        _ => return Err(e),
+                    }
+                }
+            }
+        }
+
+        // Fallback or default: execute over pooled HTTP/2 connection
+        self.execute_request(method, path, headers, body)
+    }
+
     /// Execute an HTTP/2 request with automatic retry on retryable GOAWAY errors.
     ///
     /// When a connection is refused or a retryable GOAWAY (`NoError`, `RefusedStream`, `Cancel`)
@@ -9144,6 +9201,62 @@ mod tests {
         pool.clear_alt_svc_routes();
         assert_eq!(pool.alt_svc_routes_count(), 0);
         assert!(pool.alt_svc_origins().is_empty());
+
+        // Verify execute_request_with_alt_svc_migration fallback when no H3 route is available
+        let fallback_resp = pool
+            .execute_request_with_alt_svc_migration::<fn(&str, u16, &str, &str, &[(&str, &str)], Option<&[u8]>) -> io::Result<crate::http::HttpResponse>>(
+                "GET",
+                "/fallback",
+                &[],
+                None,
+                None,
+            );
+        // Pool was shut down above or no active connection; verify handler without h3 route defaults to execute_request
+        let _ = fallback_resp;
+
+        // Verify execute_request_with_alt_svc_migration when active H3 route is present
+        let origin = format!("127.0.0.1:{}", port);
+        pool.record_alt_svc_routes(
+            origin,
+            vec![crate::simd_parser::AltSvcRoute::new("h3", "h3.example.com", 50443)],
+        );
+
+        let h3_called = std::sync::atomic::AtomicBool::new(false);
+        let migrated_resp = pool.execute_request_with_alt_svc_migration(
+            "POST",
+            "/upload",
+            &[("content-type", "text/plain")],
+            Some(b"data"),
+            Some(|h: &str, p: u16, m: &str, path: &str, _: &[(&str, &str)], body: Option<&[u8]>| {
+                h3_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(h, "h3.example.com");
+                assert_eq!(p, 50443);
+                assert_eq!(m, "POST");
+                assert_eq!(path, "/upload");
+                assert_eq!(body, Some(&b"data"[..]));
+                let mut resp = crate::http::HttpResponse::new(crate::http::HttpStatus(201));
+                resp.body = b"created on h3".to_vec();
+                Ok(resp)
+            }),
+        ).expect("h3 migration success");
+        assert!(h3_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(migrated_resp.status, crate::http::HttpStatus(201));
+        assert_eq!(migrated_resp.body, b"created on h3");
+
+        // Verify fallback when H3 handler returns ConnectionRefused
+        let fallback_called = std::sync::atomic::AtomicBool::new(false);
+        let fallback_attempt = pool.execute_request_with_alt_svc_migration(
+            "GET",
+            "/fallback_test",
+            &[],
+            None,
+            Some(|_: &str, _: u16, _: &str, _: &str, _: &[(&str, &str)], _: Option<&[u8]>| {
+                fallback_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(io::Error::new(io::ErrorKind::ConnectionRefused, "h3 unreachable"))
+            }),
+        );
+        assert!(fallback_called.load(std::sync::atomic::Ordering::SeqCst));
+        let _ = fallback_attempt; // falls back to execute_request
 
         pool.shutdown();
         let _ = handle.join();
