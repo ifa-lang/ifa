@@ -1,11 +1,13 @@
 //! Non-blocking networking, TCP stream management, and multi-connection server (`std::net`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener,
     TcpStream as StdTcpStream, ToSocketAddrs, UdpSocket as StdUdpSocket,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -2948,6 +2950,342 @@ impl AsyncSseServer {
     }
 }
 
+/// Unique identifier for a session registered in `EventHub`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionId(pub u64);
+
+/// Message payload that can be published to topic channels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HubMessage {
+    /// Text message.
+    Text(String),
+    /// Binary data.
+    Binary(Vec<u8>),
+    /// Server-Sent Event representation.
+    Sse(SseEvent),
+}
+
+impl HubMessage {
+    pub fn text(s: impl Into<String>) -> Self {
+        HubMessage::Text(s.into())
+    }
+
+    pub fn binary(b: impl Into<Vec<u8>>) -> Self {
+        HubMessage::Binary(b.into())
+    }
+
+    pub fn sse(event: SseEvent) -> Self {
+        HubMessage::Sse(event)
+    }
+
+    /// Return bytes suitable for raw stream or SSE transmission.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            HubMessage::Text(s) => s.as_bytes().to_vec(),
+            HubMessage::Binary(b) => b.clone(),
+            HubMessage::Sse(evt) => evt.to_wire_string().into_bytes(),
+        }
+    }
+}
+
+/// Outgoing sink for a registered pub/sub session.
+pub enum SessionSink {
+    /// An asynchronous TCP writer half (`AsyncTcpWriteHalf`).
+    Tcp(AsyncTcpWriteHalf),
+    /// Raw `AsyncTcpStream` clone.
+    Stream(AsyncTcpStream),
+    /// WebSocket connection.
+    Ws(AsyncWsConnection),
+    /// Server-Sent Events output.
+    Sse(AsyncSseServer),
+}
+
+impl SessionSink {
+    /// Deliver a `HubMessage` to this sink.
+    pub fn deliver(&mut self, msg: &HubMessage) -> io::Result<()> {
+        match self {
+            SessionSink::Tcp(w) => {
+                let bytes = msg.to_bytes();
+                w.write_all(&bytes)?;
+                w.flush()
+            }
+            SessionSink::Stream(s) => {
+                let bytes = msg.to_bytes();
+                s.write_all(&bytes)?;
+                s.flush()
+            }
+            SessionSink::Ws(ws) => match msg {
+                HubMessage::Text(t) => ws.send_text(t),
+                HubMessage::Binary(b) => ws.send_binary(b),
+                HubMessage::Sse(evt) => ws.send_text(&evt.to_wire_string()),
+            },
+            SessionSink::Sse(sse) => match msg {
+                HubMessage::Sse(evt) => sse.send_event(evt),
+                HubMessage::Text(t) => sse.send_data(t),
+                HubMessage::Binary(b) => {
+                    let hex = format!("hex:{}", crate::crypto::hex_encode(b));
+                    sse.send_data(&hex)
+                }
+            },
+        }
+    }
+}
+
+struct SessionEntry {
+    sink: Mutex<SessionSink>,
+    topics: RwLock<HashSet<String>>,
+}
+
+/// In-memory pub/sub broker and channel multiplexer across active sessions.
+///
+/// Supports subscribing sessions to topic channels, broadcasting messages,
+/// unicast delivery to specific sessions, and auto-cleanup of disconnected sessions.
+#[derive(Clone)]
+pub struct EventHub {
+    next_id: Arc<AtomicU64>,
+    sessions: Arc<RwLock<HashMap<SessionId, Arc<SessionEntry>>>>,
+    topics: Arc<RwLock<HashMap<String, HashSet<SessionId>>>>,
+}
+
+impl Default for EventHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventHub {
+    /// Create a new, empty pub/sub broker.
+    pub fn new() -> Self {
+        Self {
+            next_id: Arc::new(AtomicU64::new(1)),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            topics: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Register a new session with an initial sink and optional initial topics.
+    pub fn register(&self, sink: SessionSink, initial_topics: &[&str]) -> SessionId {
+        let id = SessionId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let mut topic_set = HashSet::new();
+        for &t in initial_topics {
+            topic_set.insert(t.to_string());
+        }
+
+        let entry = Arc::new(SessionEntry {
+            sink: Mutex::new(sink),
+            topics: RwLock::new(topic_set),
+        });
+
+        {
+            let mut sessions = self.sessions.write().unwrap();
+            sessions.insert(id, Arc::clone(&entry));
+        }
+
+        {
+            let mut topics = self.topics.write().unwrap();
+            for &t in initial_topics {
+                topics.entry(t.to_string()).or_default().insert(id);
+            }
+        }
+
+        id
+    }
+
+    /// Unregister a session and remove it from all subscribed topics.
+    pub fn unregister(&self, session_id: SessionId) -> bool {
+        let entry = {
+            let mut sessions = self.sessions.write().unwrap();
+            sessions.remove(&session_id)
+        };
+
+        if let Some(entry) = entry {
+            let subscribed_topics = {
+                let guard = entry.topics.read().unwrap();
+                guard.clone()
+            };
+
+            let mut topics = self.topics.write().unwrap();
+            for topic in subscribed_topics {
+                if let Some(set) = topics.get_mut(&topic) {
+                    set.remove(&session_id);
+                    if set.is_empty() {
+                        topics.remove(&topic);
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Subscribe an existing session to a topic channel.
+    pub fn subscribe(&self, session_id: SessionId, topic: &str) -> bool {
+        let entry = {
+            let sessions = self.sessions.read().unwrap();
+            sessions.get(&session_id).cloned()
+        };
+
+        if let Some(entry) = entry {
+            {
+                let mut topics_guard = entry.topics.write().unwrap();
+                topics_guard.insert(topic.to_string());
+            }
+            {
+                let mut topics = self.topics.write().unwrap();
+                topics
+                    .entry(topic.to_string())
+                    .or_default()
+                    .insert(session_id);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Unsubscribe an existing session from a topic channel.
+    pub fn unsubscribe(&self, session_id: SessionId, topic: &str) -> bool {
+        let entry = {
+            let sessions = self.sessions.read().unwrap();
+            sessions.get(&session_id).cloned()
+        };
+
+        if let Some(entry) = entry {
+            {
+                let mut topics_guard = entry.topics.write().unwrap();
+                topics_guard.remove(topic);
+            }
+            {
+                let mut topics = self.topics.write().unwrap();
+                if let Some(set) = topics.get_mut(topic) {
+                    set.remove(&session_id);
+                    if set.is_empty() {
+                        topics.remove(topic);
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if a session is subscribed to a topic.
+    pub fn is_subscribed(&self, session_id: SessionId, topic: &str) -> bool {
+        let sessions = self.sessions.read().unwrap();
+        if let Some(entry) = sessions.get(&session_id) {
+            let guard = entry.topics.read().unwrap();
+            guard.contains(topic)
+        } else {
+            false
+        }
+    }
+
+    /// Return all active sessions subscribed to a given topic.
+    pub fn subscribers(&self, topic: &str) -> Vec<SessionId> {
+        let topics = self.topics.read().unwrap();
+        topics
+            .get(topic)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Total number of active sessions.
+    pub fn session_count(&self) -> usize {
+        self.sessions.read().unwrap().len()
+    }
+
+    /// Total number of active topics with at least one subscriber.
+    pub fn topic_count(&self) -> usize {
+        self.topics.read().unwrap().len()
+    }
+
+    /// Publish a message to all active sessions subscribed to a topic.
+    /// Returns the number of successful deliveries. Disconnected sessions returning EPIPE or EOF are pruned.
+    pub fn publish(&self, topic: &str, message: &HubMessage) -> usize {
+        let target_sessions: Vec<SessionId> = {
+            let topics = self.topics.read().unwrap();
+            match topics.get(topic) {
+                Some(set) => set.iter().copied().collect(),
+                None => return 0,
+            }
+        };
+
+        let mut delivered = 0;
+        let mut failed = Vec::new();
+
+        for sid in target_sessions {
+            let entry = {
+                let sessions = self.sessions.read().unwrap();
+                sessions.get(&sid).cloned()
+            };
+
+            if let Some(entry) = entry {
+                let mut sink = entry.sink.lock().unwrap();
+                if sink.deliver(message).is_ok() {
+                    delivered += 1;
+                } else {
+                    failed.push(sid);
+                }
+            }
+        }
+
+        for sid in failed {
+            self.unregister(sid);
+        }
+
+        delivered
+    }
+
+    /// Send a message directly to a specific session (unicast).
+    pub fn send_to(&self, session_id: SessionId, message: &HubMessage) -> io::Result<()> {
+        let entry = {
+            let sessions = self.sessions.read().unwrap();
+            sessions
+                .get(&session_id)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "session not found"))?
+        };
+
+        let mut sink = entry.sink.lock().unwrap();
+        sink.deliver(message)
+    }
+
+    /// Broadcast a message to every active session regardless of subscribed topics.
+    pub fn broadcast_all(&self, message: &HubMessage) -> usize {
+        let all_sessions: Vec<SessionId> = {
+            let sessions = self.sessions.read().unwrap();
+            sessions.keys().copied().collect()
+        };
+
+        let mut delivered = 0;
+        let mut failed = Vec::new();
+
+        for sid in all_sessions {
+            let entry = {
+                let sessions = self.sessions.read().unwrap();
+                sessions.get(&sid).cloned()
+            };
+
+            if let Some(entry) = entry {
+                let mut sink = entry.sink.lock().unwrap();
+                if sink.deliver(message).is_ok() {
+                    delivered += 1;
+                } else {
+                    failed.push(sid);
+                }
+            }
+        }
+
+        for sid in failed {
+            self.unregister(sid);
+        }
+
+        delivered
+    }
+}
+
 /// Resolves a host name to a list of IP addresses.
 ///
 /// If `host` already represents an IP address, returns that single address.
@@ -4025,5 +4363,90 @@ mod tests {
                     .with_id("msg-2"),
             )
             .expect("send event 2");
+    }
+
+    #[test]
+    fn test_event_hub_pub_sub_and_channel_multiplexing() {
+        let hub = EventHub::new();
+        assert_eq!(hub.session_count(), 0);
+        assert_eq!(hub.topic_count(), 0);
+
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        // Spawn 2 client fibers
+        GLOBAL_SCHEDULER.spawn(move || {
+            let mut stream1 = AsyncTcpStream::connect(addr).expect("client 1 connect");
+            let mut buf = [0u8; 128];
+            let n = stream1.read(&mut buf).expect("client 1 read");
+            assert_eq!(&buf[..n], b"market_feed:alert1\n");
+        });
+
+        GLOBAL_SCHEDULER.spawn(move || {
+            let stream2 = AsyncTcpStream::connect(addr).expect("client 2 connect");
+            let mut client_sse = AsyncSseClient::new(stream2);
+            let event = client_sse
+                .read_event()
+                .expect("read sse")
+                .expect("some event");
+            assert_eq!(event.data, "trade_ticker");
+            assert_eq!(event.event.as_deref(), Some("ticker"));
+        });
+
+        // Accept connection 1 -> Plain TCP sink subscribed to "market"
+        let s1 = loop {
+            if let Ok(Some((stream, _))) = listener.try_accept() {
+                break stream;
+            }
+            GLOBAL_SCHEDULER.yield_now();
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let sid1 = hub.register(SessionSink::Stream(s1), &["market"]);
+
+        // Accept connection 2 -> SSE server sink subscribed to "ticker"
+        let s2 = loop {
+            if let Ok(Some((stream, _))) = listener.try_accept() {
+                break AsyncSseServer::init_response(stream).expect("init sse response");
+            }
+            GLOBAL_SCHEDULER.yield_now();
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let sid2 = hub.register(SessionSink::Sse(s2), &["ticker"]);
+
+        assert_eq!(hub.session_count(), 2);
+        assert_eq!(hub.topic_count(), 2);
+        assert!(hub.is_subscribed(sid1, "market"));
+        assert!(hub.is_subscribed(sid2, "ticker"));
+        assert!(!hub.is_subscribed(sid1, "ticker"));
+
+        // Subscribe sid1 to "all" as well
+        assert!(hub.subscribe(sid1, "all"));
+        assert!(hub.is_subscribed(sid1, "all"));
+        assert_eq!(hub.subscribers("all"), vec![sid1]);
+
+        // Publish to "market" -> sid1 gets text
+        let delivered_market = hub.publish("market", &HubMessage::text("market_feed:alert1\n"));
+        assert_eq!(delivered_market, 1);
+
+        // Publish to "ticker" -> sid2 gets SSE event
+        let delivered_ticker = hub.publish(
+            "ticker",
+            &HubMessage::sse(SseEvent::new("trade_ticker").with_event("ticker")),
+        );
+        assert_eq!(delivered_ticker, 1);
+
+        // Unsubscribe & unregister
+        assert!(hub.unsubscribe(sid1, "all"));
+        assert!(!hub.is_subscribed(sid1, "all"));
+        assert_eq!(hub.topic_count(), 2);
+
+        assert!(hub.unregister(sid1));
+        assert_eq!(hub.session_count(), 1);
+        assert_eq!(hub.subscribers("market").len(), 0);
+        assert_eq!(hub.topic_count(), 1);
+
+        assert!(hub.unregister(sid2));
+        assert_eq!(hub.session_count(), 0);
+        assert_eq!(hub.topic_count(), 0);
     }
 }
