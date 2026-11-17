@@ -5005,38 +5005,34 @@ mod tests {
                 match frame {
                     crate::simd_parser::Http2Frame::Headers {
                         stream_id,
-                        end_stream,
+                        end_stream: true,
                         ..
                     } => {
-                        if end_stream {
-                            // Send response
-                            let res_headers = vec![
-                                (":status", "200"),
-                                ("content-type", "text/plain"),
-                                ("server", "ifa-http2"),
-                            ];
-                            server
-                                .send_response(stream_id, &res_headers, Some(b"hello h2 response"))
-                                .expect("server send response");
-                            received_requests += 1;
-                        }
+                        // Send response
+                        let res_headers = vec![
+                            (":status", "200"),
+                            ("content-type", "text/plain"),
+                            ("server", "ifa-http2"),
+                        ];
+                        server
+                            .send_response(stream_id, &res_headers, Some(b"hello h2 response"))
+                            .expect("server send response");
+                        received_requests += 1;
                     }
                     crate::simd_parser::Http2Frame::Data {
                         stream_id,
-                        end_stream,
+                        end_stream: true,
                         data,
                     } => {
-                        if end_stream {
-                            assert_eq!(data, b"client h2 payload");
-                            let res_headers = vec![
-                                (":status", "201"),
-                                ("content-type", "application/octet-stream"),
-                            ];
-                            server
-                                .send_response(stream_id, &res_headers, Some(b"received payload"))
-                                .expect("server send post response");
-                            received_requests += 1;
-                        }
+                        assert_eq!(data, b"client h2 payload");
+                        let res_headers = vec![
+                            (":status", "201"),
+                            ("content-type", "application/octet-stream"),
+                        ];
+                        server
+                            .send_response(stream_id, &res_headers, Some(b"received payload"))
+                            .expect("server send post response");
+                        received_requests += 1;
                     }
                     _ => {}
                 }
