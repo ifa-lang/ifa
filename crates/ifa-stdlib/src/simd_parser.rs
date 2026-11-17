@@ -414,6 +414,18 @@ impl Http2ErrorCode {
         matches!(self, Http2ErrorCode::EnhanceYourCalm)
     }
 
+    /// Whether this error code represents a fatal protocol violation or stream/compression corruption.
+    pub fn is_fatal_protocol_violation(&self) -> bool {
+        matches!(
+            self,
+            Http2ErrorCode::ProtocolError
+                | Http2ErrorCode::FrameSizeError
+                | Http2ErrorCode::CompressionError
+                | Http2ErrorCode::InadequateSecurity
+                | Http2ErrorCode::Http11Required
+        )
+    }
+
     /// Whether this error code indicates the request can be retried safely on a new connection.
     pub fn is_retryable(&self) -> bool {
         matches!(
@@ -2048,5 +2060,27 @@ mod http2_tests {
             .expect("handle priority frame");
         assert_eq!(session.streams.get(&3).unwrap().stream_dependency, 0);
         assert_eq!(session.streams.get(&3).unwrap().weight, 50);
+    }
+
+    #[test]
+    fn test_http2_extended_error_codes_classification() {
+        assert!(Http2ErrorCode::NoError.is_graceful());
+        assert!(!Http2ErrorCode::InternalError.is_graceful());
+
+        assert!(Http2ErrorCode::EnhanceYourCalm.is_rate_limit_or_calm());
+        assert!(!Http2ErrorCode::NoError.is_rate_limit_or_calm());
+
+        assert!(Http2ErrorCode::ProtocolError.is_fatal_protocol_violation());
+        assert!(Http2ErrorCode::FrameSizeError.is_fatal_protocol_violation());
+        assert!(Http2ErrorCode::CompressionError.is_fatal_protocol_violation());
+        assert!(Http2ErrorCode::InadequateSecurity.is_fatal_protocol_violation());
+        assert!(Http2ErrorCode::Http11Required.is_fatal_protocol_violation());
+        assert!(!Http2ErrorCode::NoError.is_fatal_protocol_violation());
+        assert!(!Http2ErrorCode::RefusedStream.is_fatal_protocol_violation());
+
+        assert!(Http2ErrorCode::NoError.is_retryable());
+        assert!(Http2ErrorCode::RefusedStream.is_retryable());
+        assert!(Http2ErrorCode::Cancel.is_retryable());
+        assert!(!Http2ErrorCode::ProtocolError.is_retryable());
     }
 }

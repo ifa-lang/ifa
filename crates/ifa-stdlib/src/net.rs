@@ -3670,6 +3670,7 @@ pub struct AsyncHttp2Pool {
     max_concurrent_streams_per_conn: usize,
     idle_pool: std::sync::Mutex<Vec<AsyncHttp2Connection>>,
     active_count: std::sync::atomic::AtomicUsize,
+    last_goaway_error: std::sync::Mutex<Option<crate::simd_parser::Http2ErrorCode>>,
 }
 
 impl AsyncHttp2Pool {
@@ -3685,6 +3686,7 @@ impl AsyncHttp2Pool {
             max_concurrent_streams_per_conn: Self::DEFAULT_MAX_STREAMS,
             idle_pool: std::sync::Mutex::new(Vec::new()),
             active_count: std::sync::atomic::AtomicUsize::new(0),
+            last_goaway_error: std::sync::Mutex::new(None),
         }
     }
 
@@ -3708,13 +3710,25 @@ impl AsyncHttp2Pool {
     pub fn acquire(&self) -> io::Result<AsyncHttp2Connection> {
         if let Ok(mut pool) = self.idle_pool.lock() {
             while let Some(mut conn) = pool.pop() {
-                // If the connection was already marked closed or received a GOAWAY, discard it
-                if conn.is_closed() || conn.last_received_goaway().is_some() {
+                // If the connection was already marked closed or received a GOAWAY, record error and discard it
+                if let Some((_, err, _)) = conn.last_received_goaway() {
+                    if let Ok(mut last_err) = self.last_goaway_error.lock() {
+                        *last_err = Some(err);
+                    }
+                    continue;
+                }
+                if conn.is_closed() {
                     continue;
                 }
                 // Drain any pending buffered frames (e.g. late GOAWAY or SETTINGS)
                 let _ = conn.try_recv_frame();
-                if conn.is_closed() || conn.last_received_goaway().is_some() {
+                if let Some((_, err, _)) = conn.last_received_goaway() {
+                    if let Ok(mut last_err) = self.last_goaway_error.lock() {
+                        *last_err = Some(err);
+                    }
+                    continue;
+                }
+                if conn.is_closed() {
                     continue;
                 }
                 // Quick health check ping
@@ -3743,7 +3757,8 @@ impl AsyncHttp2Pool {
     }
 
     /// Return an HTTP/2 connection back to the pool if healthy and within capacity.
-    /// Connections marked as closed or having received a peer GOAWAY are automatically discarded.
+    /// Connections marked as closed or having received a peer GOAWAY are automatically discarded,
+    /// with any GOAWAY error recorded on the pool.
     pub fn release(&self, mut conn: AsyncHttp2Connection) {
         self.active_count
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -3751,7 +3766,14 @@ impl AsyncHttp2Pool {
         // Check if any pending frames on wire indicate GOAWAY
         let _ = conn.try_recv_frame();
 
-        if !conn.is_closed() && conn.last_received_goaway().is_none() {
+        if let Some((_, err, _)) = conn.last_received_goaway() {
+            if let Ok(mut last_err) = self.last_goaway_error.lock() {
+                *last_err = Some(err);
+            }
+            return;
+        }
+
+        if !conn.is_closed() {
             if let Ok(mut pool) = self.idle_pool.lock() {
                 if pool.len() < self.max_connections {
                     pool.push(conn);
@@ -3837,7 +3859,7 @@ impl AsyncHttp2Pool {
     }
 
     /// Health-check all idle connections in the pool by transmitting PING frames,
-    /// removing any dead, closed, or GOAWAY-received connections.
+    /// removing any dead, closed, or GOAWAY-received connections and recording errors.
     pub fn health_check(&self) -> usize {
         let mut healthy = Vec::new();
         let mut closed_count = 0;
@@ -3847,10 +3869,14 @@ impl AsyncHttp2Pool {
             for mut conn in connections {
                 // Check if any frame (e.g. GOAWAY) arrived on wire
                 let _ = conn.try_recv_frame();
-                if !conn.is_closed()
-                    && conn.last_received_goaway().is_none()
-                    && conn.send_ping(*b"h2_probe").is_ok()
-                {
+                if let Some((_, err, _)) = conn.last_received_goaway() {
+                    if let Ok(mut last_err) = self.last_goaway_error.lock() {
+                        *last_err = Some(err);
+                    }
+                    closed_count += 1;
+                    continue;
+                }
+                if !conn.is_closed() && conn.send_ping(*b"h2_probe").is_ok() {
                     healthy.push(conn);
                 } else {
                     closed_count += 1;
@@ -3860,6 +3886,18 @@ impl AsyncHttp2Pool {
         }
 
         closed_count
+    }
+
+    /// Retrieve the most recently observed HTTP/2 GOAWAY error code received across pooled connections.
+    pub fn last_goaway_error(&self) -> Option<crate::simd_parser::Http2ErrorCode> {
+        self.last_goaway_error.lock().ok().and_then(|g| *g)
+    }
+
+    /// Reset or clear the recorded last GOAWAY error code.
+    pub fn clear_goaway_error(&self) {
+        if let Ok(mut g) = self.last_goaway_error.lock() {
+            *g = None;
+        }
     }
 }
 
@@ -6981,6 +7019,12 @@ mod tests {
         } else {
             assert_eq!(pool.idle_count(), 0);
         }
+        assert_eq!(
+            pool.last_goaway_error(),
+            Some(crate::simd_parser::Http2ErrorCode::EnhanceYourCalm)
+        );
+        pool.clear_goaway_error();
+        assert_eq!(pool.last_goaway_error(), None);
 
         let _ = handle.join();
     }
