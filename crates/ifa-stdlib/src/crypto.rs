@@ -2186,6 +2186,30 @@ impl Uuid {
     /// Nil UUID (00000000-0000-0000-0000-000000000000).
     pub const NIL: Self = Self([0u8; 16]);
 
+    /// Standard Namespace DNS UUID (6ba7b810-9dad-11d1-80b4-00c04fd430c8) RFC 4122.
+    pub const NAMESPACE_DNS: Self = Self([
+        0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30,
+        0xc8,
+    ]);
+
+    /// Standard Namespace URL UUID (6ba7b811-9dad-11d1-80b4-00c04fd430c8) RFC 4122.
+    pub const NAMESPACE_URL: Self = Self([
+        0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30,
+        0xc8,
+    ]);
+
+    /// Standard Namespace OID UUID (6ba7b812-9dad-11d1-80b4-00c04fd430c8) RFC 4122.
+    pub const NAMESPACE_OID: Self = Self([
+        0x6b, 0xa7, 0xb8, 0x12, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30,
+        0xc8,
+    ]);
+
+    /// Standard Namespace X500 UUID (6ba7b814-9dad-11d1-80b4-00c04fd430c8) RFC 4122.
+    pub const NAMESPACE_X500: Self = Self([
+        0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30,
+        0xc8,
+    ]);
+
     /// Returns the Nil UUID.
     pub const fn nil() -> Self {
         Self::NIL
@@ -2234,6 +2258,29 @@ impl Uuid {
     /// Generates a new random Version 4 UUID according to RFC 4122, panicking on entropy failure.
     pub fn v4() -> Self {
         Self::new_v4().expect("Failed to generate secure random UUID v4")
+    }
+
+    /// Generates a Version 5 UUID (SHA-1 name-based) according to RFC 4122.
+    ///
+    /// Computes SHA-1(namespace_bytes || name_bytes), sets version 5 and RFC 4122 variant bits.
+    pub fn new_v5(namespace: &Uuid, name: &[u8]) -> Self {
+        let mut hasher = Sha1::new();
+        hasher.update(namespace.as_bytes());
+        hasher.update(name);
+        let digest = hasher.finalize();
+
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        // Set version 5: bits 4-7 of octet 6 to 0101_2 (0x50)
+        bytes[6] = (bytes[6] & 0x0f) | 0x50;
+        // Set variant RFC 4122: bits 6-7 of octet 8 to 10_2 (0x80)
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Self(bytes)
+    }
+
+    /// Generates a Version 5 UUID using a string name according to RFC 4122.
+    pub fn v5(namespace: &Uuid, name: &str) -> Self {
+        Self::new_v5(namespace, name.as_bytes())
     }
 
     /// Formats the UUID as a canonical hyphenated string (8-4-4-4-12 lowercase hex characters).
@@ -3363,5 +3410,27 @@ mod tests {
             Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430cz"),
             Err(UuidError::InvalidCharacter('z'))
         ));
+    }
+
+    #[test]
+    fn test_uuid_v5_rfc4122_test_vectors() {
+        // RFC 4122 Appendix B test vector for name "www.widgets.com" with NAMESPACE_DNS
+        // Expected canonical UUID v5: 21f7f8de-8051-5b89-8680-0195ef798b6a
+        let u = Uuid::v5(&Uuid::NAMESPACE_DNS, "www.widgets.com");
+        assert_eq!(u.to_string(), "21f7f8de-8051-5b89-8680-0195ef798b6a");
+        assert_eq!(u.version(), Some(5));
+
+        // Determinism test: same inputs produce same output
+        let u2 = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"www.widgets.com");
+        assert_eq!(u, u2);
+
+        // Different names produce different UUIDs
+        let u3 = Uuid::v5(&Uuid::NAMESPACE_DNS, "other.widgets.com");
+        assert_ne!(u, u3);
+        assert_eq!(u3.version(), Some(5));
+
+        // Namespaces test
+        let u_url = Uuid::v5(&Uuid::NAMESPACE_URL, "https://example.com");
+        assert_eq!(u_url.version(), Some(5));
     }
 }
