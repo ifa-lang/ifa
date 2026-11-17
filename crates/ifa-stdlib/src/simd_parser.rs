@@ -1245,6 +1245,7 @@ pub struct Http2Stream {
     pub state: Http2StreamState,
     pub window_size: i32,
     pub received_headers: Vec<(String, String)>,
+    pub received_trailers: Vec<(String, String)>,
     pub received_data: Vec<u8>,
     pub reset_error: Option<Http2ErrorCode>,
     pub stream_dependency: u32,
@@ -1259,6 +1260,7 @@ impl Http2Stream {
             state: Http2StreamState::Idle,
             window_size: initial_window_size,
             received_headers: Vec::new(),
+            received_trailers: Vec::new(),
             received_data: Vec::new(),
             reset_error: None,
             stream_dependency: 0,
@@ -1427,6 +1429,33 @@ impl Http2Session {
         Http2Frame::Headers {
             stream_id,
             end_stream,
+            end_headers: true,
+            header_block,
+        }
+    }
+
+    /// Create and encode a trailing HEADERS frame for a stream (RFC 7540 Section 8.1.2.6).
+    /// Trailers MUST end the stream (`END_STREAM` flag set) and contain no pseudo-headers.
+    pub fn create_trailers_frame(
+        &mut self,
+        stream_id: u32,
+        trailers: &[(&str, &str)],
+    ) -> Http2Frame {
+        let header_block = self.hpack_encoder.encode_headers(trailers);
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            match stream.state {
+                Http2StreamState::Open => {
+                    stream.state = Http2StreamState::HalfClosedLocal;
+                }
+                Http2StreamState::HalfClosedRemote => {
+                    stream.state = Http2StreamState::Closed;
+                }
+                _ => {}
+            }
+        }
+        Http2Frame::Headers {
+            stream_id,
+            end_stream: true,
             end_headers: true,
             header_block,
         }
@@ -1606,7 +1635,18 @@ impl Http2Session {
                     .streams
                     .entry(*stream_id)
                     .or_insert_with(|| Http2Stream::new(*stream_id, initial_win));
-                stream.received_headers.extend(decoded);
+
+                // RFC 7540 Section 8.1.2.6: Trailers are HEADERS delivered after the initial HEADERS block
+                // Note: For ReservedRemote streams (server push promises), the first HEADERS frame represents
+                // the server's response headers rather than trailers.
+                if stream.state == Http2StreamState::ReservedRemote {
+                    stream.received_headers = decoded;
+                } else if !stream.received_headers.is_empty() {
+                    stream.received_trailers.extend(decoded);
+                } else {
+                    stream.received_headers.extend(decoded);
+                }
+
                 match stream.state {
                     Http2StreamState::Idle => {
                         stream.state = if *end_stream {

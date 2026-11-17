@@ -3373,6 +3373,15 @@ impl AsyncHttp2Connection {
             }
         }
 
+        // If trailers were received for this stream, also append them to response headers
+        if let Some(trailers) = self.get_trailers(stream_id) {
+            for (k, v) in trailers {
+                if !k.starts_with(':') {
+                    resp_headers.append(k, v);
+                }
+            }
+        }
+
         let mut resp = crate::http::HttpResponse::new(crate::http::HttpStatus(status_code));
         resp.headers = resp_headers;
         resp.body = raw_body;
@@ -3575,6 +3584,24 @@ impl AsyncHttp2Connection {
         id: crate::simd_parser::Http2SettingId,
     ) -> Option<u32> {
         self.session.get_local_setting(id)
+    }
+
+    /// Send trailing headers (Trailers) on an open stream, terminating the stream (RFC 7540 Section 8.1.2.6).
+    pub fn send_trailers(
+        &mut self,
+        stream_id: u32,
+        trailers: &[(&str, &str)],
+    ) -> io::Result<()> {
+        let frame = self.session.create_trailers_frame(stream_id, trailers);
+        self.send_frame(&frame)
+    }
+
+    /// Retrieve decoded trailing headers (Trailers) received on a stream, if any.
+    pub fn get_trailers(&self, stream_id: u32) -> Option<Vec<(String, String)>> {
+        self.session
+            .streams
+            .get(&stream_id)
+            .map(|s| s.received_trailers.clone())
     }
 }
 
@@ -6655,11 +6682,15 @@ mod tests {
                 .send_response(stream_id, &res_headers, Some(b"graceful drain response"))
                 .expect("send response");
 
-            // Recv GoAway
-            let frame = server.recv_frame().expect("recv goaway frame");
-            match frame {
-                crate::simd_parser::Http2Frame::GoAway { .. } => {}
-                other => panic!("Expected GoAway frame, got {:?}", other),
+            // Recv GoAway (ignoring any late Settings ACK or Pings)
+            loop {
+                let frame = server.recv_frame().expect("recv frame");
+                match frame {
+                    crate::simd_parser::Http2Frame::GoAway { .. } => break,
+                    crate::simd_parser::Http2Frame::Settings { .. }
+                    | crate::simd_parser::Http2Frame::Ping { .. } => continue,
+                    other => panic!("Expected GoAway frame, got {:?}", other),
+                }
             }
         });
 
@@ -6732,6 +6763,8 @@ mod tests {
             if let crate::simd_parser::Http2Frame::Settings { ack, .. } = ack_frame {
                 assert!(ack);
             }
+            // Keep connection open until client finishes
+            std::thread::sleep(Duration::from_millis(50));
         });
 
         // Client connects and performs handshake
@@ -6765,6 +6798,94 @@ mod tests {
             client.get_peer_setting(crate::simd_parser::Http2SettingId::HeaderTableSize),
             Some(8192)
         );
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_trailers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let (std_stream, _) = listener.accept().expect("accept connection");
+            let stream = AsyncTcpStream::from_std(std_stream).expect("async stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(stream).expect("server handshake");
+
+            // Recv request
+            let stream_id = loop {
+                match server.recv_frame().expect("recv frame") {
+                    crate::simd_parser::Http2Frame::Headers {
+                        stream_id: sid,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            break sid;
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::Data {
+                        stream_id: sid,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            break sid;
+                        }
+                    }
+                    _ => {}
+                }
+            };
+
+            // Send initial response HEADERS with end_stream = false
+            let headers_frame = server.session.create_headers_frame(
+                stream_id,
+                &[(":status", "200"), ("content-type", "text/plain")],
+                false,
+            );
+            server.send_frame(&headers_frame).expect("send headers");
+
+            // Send DATA with end_stream = false
+            server
+                .send_data(stream_id, b"chunked stream data with trailers", false)
+                .expect("send data");
+
+            // Send trailing HEADERS (trailers) with end_stream = true
+            let trailers = [
+                ("grpc-status", "0"),
+                ("x-checksum-sha256", "abcdef0123456789"),
+            ];
+            server
+                .send_trailers(stream_id, &trailers)
+                .expect("send trailers");
+
+            // Keep alive briefly for client to receive
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let client_stream =
+            AsyncTcpStream::connect(&format!("127.0.0.1:{}", port)).expect("connect to server");
+        let mut client =
+            AsyncHttp2Connection::client_handshake(client_stream).expect("client handshake");
+
+        // Send GET request
+        let req_headers = [(":method", "GET"), (":path", "/stream-with-trailers")];
+        let sid = client.send_request(&req_headers, None).expect("send request");
+        assert_eq!(sid, 1);
+
+        // Receive response
+        let (resp_headers, body) = client.recv_response_for(sid).expect("recv response");
+        assert_eq!(body, b"chunked stream data with trailers");
+        assert!(resp_headers.iter().any(|(k, v)| k == ":status" && v == "200"));
+
+        // Verify trailers were captured in get_trailers
+        let trailers = client.get_trailers(sid).expect("trailers recorded");
+        assert_eq!(trailers.len(), 2);
+        assert!(trailers.iter().any(|(k, v)| k == "grpc-status" && v == "0"));
+        assert!(trailers
+            .iter()
+            .any(|(k, v)| k == "x-checksum-sha256" && v == "abcdef0123456789"));
 
         let _ = handle.join();
     }
