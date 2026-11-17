@@ -1528,6 +1528,10 @@ pub struct Http2Stream {
     pub exclusive: bool,
     /// Extensible Prioritization Scheme (RFC 9218) parameters
     pub priority_params: PriorityParameters,
+    /// Inbound flow control window size allocated by the local peer for this stream
+    pub local_window_size: i32,
+    /// Target inbound flow control window capacity (adapted dynamically based on traffic / priority)
+    pub target_local_window_size: i32,
 }
 
 impl Http2Stream {
@@ -1544,6 +1548,8 @@ impl Http2Stream {
             weight: 16,
             exclusive: false,
             priority_params: PriorityParameters::default(),
+            local_window_size: initial_window_size,
+            target_local_window_size: initial_window_size,
         }
     }
 }
@@ -1676,6 +1682,69 @@ impl Http2Session {
                 let increment = (target_stream_win - stream.window_size) as u32;
                 if increment > 0 {
                     stream.window_size += increment as i32;
+                    updates.push(Http2Frame::WindowUpdate {
+                        stream_id: *stream_id,
+                        window_size_increment: increment,
+                    });
+                }
+            }
+        }
+
+        updates
+    }
+
+    /// Dynamically adjust stream target inbound flow control window capacity (RFC 7540 / RFC 9218).
+    /// Highly prioritized streams (urgency 0..2) or streams with high traffic throughput
+    /// are granted larger windows to maximize multiplexing throughput without head-of-line blocking.
+    pub fn adapt_stream_flow_control_window(&mut self, stream_id: u32, target_window_size: i32) {
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            let clamped_target = target_window_size.clamp(1024, 0x7FFF_FFFF);
+            stream.target_local_window_size = clamped_target;
+        }
+    }
+
+    /// Automatically evaluate and adapt inbound flow control windows across all active streams
+    /// based on RFC 9218 urgency and stream activity, emitting `WINDOW_UPDATE` frames as necessary.
+    pub fn adapt_and_replenish_inbound_windows(&mut self) -> Vec<Http2Frame> {
+        let mut updates = Vec::new();
+
+        // 1. Connection-level replenish if below half default initial window
+        let conn_threshold = Self::DEFAULT_INITIAL_WINDOW_SIZE / 2;
+        if self.connection_window_size < conn_threshold {
+            let increment =
+                (Self::DEFAULT_INITIAL_WINDOW_SIZE - self.connection_window_size) as u32;
+            if increment > 0 {
+                self.connection_window_size += increment as i32;
+                updates.push(Http2Frame::WindowUpdate {
+                    stream_id: 0,
+                    window_size_increment: increment,
+                });
+            }
+        }
+
+        // 2. Stream-level adaptive replenishment
+        for (stream_id, stream) in self.streams.iter_mut() {
+            // Apply dynamic target window adaptation based on urgency if available
+            // Urgency 0-1: 4x default window (256 KB)
+            // Urgency 2-3: 2x default window (128 KB)
+            // Urgency 4-7: 1x default window (64 KB)
+            let adaptive_target = match stream.priority_params.urgency {
+                0..=1 => Self::DEFAULT_INITIAL_WINDOW_SIZE * 4,
+                2..=3 => Self::DEFAULT_INITIAL_WINDOW_SIZE * 2,
+                _ => Self::DEFAULT_INITIAL_WINDOW_SIZE,
+            };
+            if adaptive_target > stream.target_local_window_size {
+                stream.target_local_window_size = adaptive_target;
+            }
+
+            let threshold = stream.target_local_window_size / 2;
+            let is_inbound_active = stream.state == Http2StreamState::Open
+                || stream.state == Http2StreamState::HalfClosedLocal;
+
+            if is_inbound_active && stream.local_window_size < threshold {
+                let increment = (stream.target_local_window_size - stream.local_window_size) as u32;
+                if increment > 0 {
+                    stream.local_window_size += increment as i32;
                     updates.push(Http2Frame::WindowUpdate {
                         stream_id: *stream_id,
                         window_size_increment: increment,
@@ -2008,6 +2077,7 @@ impl Http2Session {
                     .or_insert_with(|| Http2Stream::new(*stream_id, initial_win));
                 stream.received_data.extend_from_slice(data);
                 stream.window_size -= data.len() as i32;
+                stream.local_window_size -= data.len() as i32;
                 self.connection_window_size -= data.len() as i32;
 
                 if *end_stream {
@@ -2538,5 +2608,127 @@ mod http2_tests {
         let stream = session.streams.get(&9).expect("stream 9 exists");
         assert_eq!(stream.priority_params.urgency, 2);
         assert!(stream.priority_params.incremental);
+    }
+
+    #[test]
+    fn test_server_bidirectional_multiplexing_and_dynamic_flow_control() {
+        // Create server session
+        let mut server = Http2Session::new(true);
+
+        // 1. Client opens stream 1 with urgency 1 (high priority)
+        let mut enc = HpackContext::default();
+        let client_headers = enc.encode_headers(&[
+            (":method", "POST"),
+            (":path", "/api/upload"),
+            (":scheme", "https"),
+            ("priority", "u=1"),
+        ]);
+        let headers_frame = Http2Frame::Headers {
+            stream_id: 1,
+            end_stream: false,
+            end_headers: true,
+            header_block: client_headers,
+        };
+        server
+            .handle_frame(&headers_frame)
+            .expect("server receives headers");
+
+        // Verify stream state is Open on server
+        let stream1 = server.streams.get(&1).expect("stream 1 created");
+        assert_eq!(stream1.state, Http2StreamState::Open);
+        assert_eq!(stream1.priority_params.urgency, 1);
+
+        // Client sends 40 KB of DATA
+        let chunk_40k = vec![0x42u8; 40_000];
+        let data_frame = Http2Frame::Data {
+            stream_id: 1,
+            end_stream: false,
+            data: chunk_40k,
+        };
+        server
+            .handle_frame(&data_frame)
+            .expect("server receives 40KB data");
+
+        // Verify window decreased
+        let stream1 = server.streams.get(&1).expect("stream 1");
+        assert_eq!(stream1.received_data.len(), 40_000);
+        assert_eq!(
+            stream1.local_window_size,
+            Http2Session::DEFAULT_INITIAL_WINDOW_SIZE - 40_000
+        );
+
+        // Evaluate dynamic window adaptation
+        let window_updates = server.adapt_and_replenish_inbound_windows();
+        assert!(
+            !window_updates.is_empty(),
+            "Should generate WINDOW_UPDATE frames"
+        );
+
+        // Urgency 1 stream should have target adapted to 4x (256 KB = 262140)
+        let stream1 = server.streams.get(&1).expect("stream 1");
+        assert_eq!(
+            stream1.target_local_window_size,
+            Http2Session::DEFAULT_INITIAL_WINDOW_SIZE * 4
+        );
+
+        // Server responds bidirectionally on stream 1
+        let resp_frame = server.create_headers_frame(
+            1,
+            &[(":status", "200"), ("content-type", "application/json")],
+            false,
+        );
+        match resp_frame {
+            Http2Frame::Headers {
+                stream_id,
+                end_stream,
+                ..
+            } => {
+                assert_eq!(stream_id, 1);
+                assert!(!end_stream);
+            }
+            _ => panic!("Expected headers frame"),
+        }
+
+        // Server sends response DATA closing stream
+        let resp_data = server.create_data_frame(1, b"{\"status\":\"ok\"}", true);
+        match resp_data {
+            Http2Frame::Data {
+                stream_id,
+                end_stream,
+                data,
+            } => {
+                assert_eq!(stream_id, 1);
+                assert!(end_stream);
+                assert_eq!(data, b"{\"status\":\"ok\"}");
+            }
+            _ => panic!("Expected data frame"),
+        }
+
+        // Server also initiates server-push stream 2 for /api/upload/meta
+        let push_promise = server.create_push_promise(
+            1,
+            2,
+            &[
+                (":method", "GET"),
+                (":path", "/api/upload/meta"),
+                (":scheme", "https"),
+            ],
+        );
+        match push_promise {
+            Http2Frame::PushPromise {
+                stream_id,
+                promised_stream_id,
+                ..
+            } => {
+                assert_eq!(stream_id, 1);
+                assert_eq!(promised_stream_id, 2);
+            }
+            _ => panic!("Expected push promise"),
+        }
+        assert!(server.streams.contains_key(&2));
+        assert_eq!(
+            server.streams.get(&2).unwrap().state,
+            Http2StreamState::ReservedLocal
+        );
     }
 }
