@@ -4492,6 +4492,22 @@ impl AsyncHttp2Pool {
         }
     }
 
+    /// Retrieve the total number of alternative service routes registered across all origins in this pool.
+    pub fn alt_svc_routes_count(&self) -> usize {
+        self.alt_svc_routes
+            .lock()
+            .map(|map| map.values().map(|r| r.len()).sum())
+            .unwrap_or(0)
+    }
+
+    /// Retrieve the list of all origins that have alternative service routes registered in this pool.
+    pub fn alt_svc_origins(&self) -> Vec<String> {
+        self.alt_svc_routes
+            .lock()
+            .map(|map| map.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Select the highest priority or first alternative service route matching a specific protocol
     /// (e.g. "h3" or "h2") for the given origin (or default pool origin).
     pub fn select_alt_svc_route(
@@ -9098,6 +9114,36 @@ mod tests {
         assert!(pool
             .get_alt_svc_routes(Some("https://example.org"))
             .is_empty());
+
+        // Verify alt_svc_routes_count and alt_svc_origins helpers
+        assert_eq!(pool.alt_svc_routes_count(), 0);
+        assert!(pool.alt_svc_origins().is_empty());
+
+        pool.record_alt_svc_routes(
+            "https://test1.example.com",
+            vec![crate::simd_parser::AltSvcRoute::new("h3", "", 443)],
+        );
+        pool.record_alt_svc_routes(
+            "https://test2.example.com",
+            vec![
+                crate::simd_parser::AltSvcRoute::new("h3", "", 443),
+                crate::simd_parser::AltSvcRoute::new("h2", "alt.example.com", 8443),
+            ],
+        );
+        assert_eq!(pool.alt_svc_routes_count(), 3);
+        let mut origins = pool.alt_svc_origins();
+        origins.sort();
+        assert_eq!(
+            origins,
+            vec![
+                "https://test1.example.com".to_string(),
+                "https://test2.example.com".to_string()
+            ]
+        );
+
+        pool.clear_alt_svc_routes();
+        assert_eq!(pool.alt_svc_routes_count(), 0);
+        assert!(pool.alt_svc_origins().is_empty());
 
         pool.shutdown();
         let _ = handle.join();
