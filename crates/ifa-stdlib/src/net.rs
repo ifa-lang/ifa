@@ -2733,6 +2733,39 @@ impl AsyncWsConnection {
     }
 }
 
+/// Instantaneous diagnostic telemetry and runtime metrics for an [`AsyncWsPool`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WsPoolStats {
+    /// Target host name or IP address.
+    pub host: String,
+    /// Target destination port.
+    pub port: u16,
+    /// Requested target WebSocket path.
+    pub path: String,
+    /// Number of connections currently idle and available in the pool.
+    pub idle_connections: usize,
+    /// Number of connections actively in use or establishing.
+    pub active_connections: usize,
+    /// Maximum configured connection limit for this pool.
+    pub max_connections: usize,
+    /// Configured subprotocols negotiated by this pool.
+    pub protocols: Vec<String>,
+}
+
+impl WsPoolStats {
+    /// Whether the pool is currently running at its maximum configured connection capacity.
+    #[inline]
+    pub fn is_exhausted(&self) -> bool {
+        self.active_connections >= self.max_connections
+    }
+
+    /// Total number of connections tracked by the pool (idle + active in-use).
+    #[inline]
+    pub fn total_connections(&self) -> usize {
+        self.idle_connections + self.active_connections
+    }
+}
+
 /// A connection pool for reusable asynchronous WebSocket client connections.
 /// Manages connection limits, idle connection reuse, health check pings and subprotocol grouping.
 pub struct AsyncWsPool {
@@ -2773,6 +2806,19 @@ impl AsyncWsPool {
     /// Total count of active (checked-out or connecting) connections.
     pub fn active_count(&self) -> usize {
         self.active_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Snapshot the current runtime metrics and diagnostic telemetry of the WebSocket pool.
+    pub fn stats(&self) -> WsPoolStats {
+        WsPoolStats {
+            host: self.host.clone(),
+            port: self.port,
+            path: self.path.clone(),
+            idle_connections: self.idle_count(),
+            active_connections: self.active_count(),
+            max_connections: self.max_connections,
+            protocols: self.protocols.clone(),
+        }
     }
 
     /// Check out an active WebSocket connection from the pool, or establish a new one if below max_connections.
@@ -5877,6 +5923,18 @@ mod tests {
 
         pool.clear();
         assert_eq!(pool.idle_count(), 0);
+
+        // Verify diagnostic stats telemetry
+        let stats = pool.stats();
+        assert_eq!(stats.host, "127.0.0.1");
+        assert_eq!(stats.port, addr.port());
+        assert_eq!(stats.path, "/chat");
+        assert_eq!(stats.idle_connections, 0);
+        assert_eq!(stats.active_connections, 0);
+        assert_eq!(stats.max_connections, 2);
+        assert_eq!(stats.protocols, vec!["v1.chat".to_string(), "v2.chat".to_string()]);
+        assert_eq!(stats.total_connections(), 0);
+        assert!(!stats.is_exhausted());
     }
 
     #[test]
