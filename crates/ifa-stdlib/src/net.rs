@@ -3661,6 +3661,36 @@ impl Http2PrioritizedRequest {
         self
     }
 }
+
+/// Instantaneous diagnostic telemetry and runtime metrics for an [`AsyncHttp2Pool`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Http2PoolStats {
+    /// Number of connections currently idle and available in the pool.
+    pub idle_connections: usize,
+    /// Number of connections actively in use or establishing.
+    pub active_connections: usize,
+    /// Maximum configured connection limit for this pool.
+    pub max_connections: usize,
+    /// Maximum concurrent multiplexed streams per connection.
+    pub max_concurrent_streams_per_conn: usize,
+    /// Most recent GOAWAY error code observed across connections in this pool, if any.
+    pub last_goaway_error: Option<crate::simd_parser::Http2ErrorCode>,
+}
+
+impl Http2PoolStats {
+    /// Whether the pool is currently running at its maximum configured connection capacity.
+    #[inline]
+    pub fn is_exhausted(&self) -> bool {
+        self.active_connections >= self.max_connections
+    }
+
+    /// Total number of connections tracked by the pool (idle + active in-use).
+    #[inline]
+    pub fn total_connections(&self) -> usize {
+        self.idle_connections + self.active_connections
+    }
+}
+
 /// Transparently manages connection pooling, multiplexing limits, idle connection reuse,
 /// and multiplexed request execution across shared or pooled HTTP/2 connections.
 pub struct AsyncHttp2Pool {
@@ -3704,6 +3734,17 @@ impl AsyncHttp2Pool {
     /// Total count of active (checked-out or connecting) connections.
     pub fn active_count(&self) -> usize {
         self.active_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Snapshot the current runtime metrics and diagnostic telemetry of the pool.
+    pub fn stats(&self) -> Http2PoolStats {
+        Http2PoolStats {
+            idle_connections: self.idle_count(),
+            active_connections: self.active_count(),
+            max_connections: self.max_connections,
+            max_concurrent_streams_per_conn: self.max_concurrent_streams_per_conn,
+            last_goaway_error: self.last_goaway_error(),
+        }
     }
 
     /// Acquire an active HTTP/2 connection from the pool, or establish a new connection if below capacity.
@@ -7205,6 +7246,20 @@ mod tests {
         );
 
         let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_stats_telemetry() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 8080, 5).with_max_concurrent_streams(50);
+        let stats = pool.stats();
+
+        assert_eq!(stats.idle_connections, 0);
+        assert_eq!(stats.active_connections, 0);
+        assert_eq!(stats.max_connections, 5);
+        assert_eq!(stats.max_concurrent_streams_per_conn, 50);
+        assert_eq!(stats.last_goaway_error, None);
+        assert_eq!(stats.total_connections(), 0);
+        assert!(!stats.is_exhausted());
     }
 }
 
