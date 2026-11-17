@@ -3623,6 +3623,30 @@ impl AsyncHttp2Connection {
         Ok(())
     }
 
+    /// Transmit an RFC 7838 `ALTSVC` frame to announce alternative service routes to peer.
+    ///
+    /// For origin-level alternative service advertisements, `stream_id` MUST be 0
+    /// and `origin` specifies the origin URI. For stream-level advertisements,
+    /// `stream_id` specifies the request stream and `origin` SHOULD be empty.
+    pub fn send_alt_svc(
+        &mut self,
+        stream_id: u32,
+        origin: &str,
+        routes: &[crate::simd_parser::AltSvcRoute],
+    ) -> io::Result<()> {
+        let alt_svc_field_value = routes
+            .iter()
+            .map(|r| r.serialize())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let frame = crate::simd_parser::Http2Frame::AltSvc {
+            stream_id,
+            origin: origin.to_string(),
+            alt_svc_field_value,
+        };
+        self.send_frame(&frame)
+    }
+
     /// Send a PING frame with 8-byte opaque data.
     pub fn send_ping(&mut self, opaque_data: [u8; 8]) -> io::Result<()> {
         let frame = crate::simd_parser::Http2Frame::Ping {
@@ -9076,6 +9100,85 @@ mod tests {
             .is_empty());
 
         pool.shutdown();
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_send_alt_svc_frame_wire_transmission() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let (tcp_stream, _) = listener.accept().expect("accept connection");
+            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+
+            // Server announces HTTP/3 and HTTP/2 alternative services via send_alt_svc
+            let routes = vec![
+                crate::simd_parser::AltSvcRoute::new("h3", "", 443)
+                    .with_max_age(86400)
+                    .with_persist(true),
+                crate::simd_parser::AltSvcRoute::new("h2", "alt.example.com", 8443)
+                    .with_max_age(3600),
+            ];
+            server
+                .send_alt_svc(0, "https://example.com", &routes)
+                .expect("server send alt_svc");
+
+            // Wait for client to receive and send a goaway before shutting down
+            let _ = server.recv_frame();
+            let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        });
+
+        let stream =
+            AsyncTcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect client");
+        let mut client = AsyncHttp2Connection::client_handshake(stream).expect("client handshake");
+
+        // First frame is server's initial SETTINGS frame
+        let first_frame = client.recv_frame().expect("receive server settings");
+        assert!(matches!(first_frame, crate::simd_parser::Http2Frame::Settings { .. }));
+
+        // Next frame is the ALTSVC frame transmitted over the wire
+        let frame = client.recv_frame().expect("receive alt_svc frame");
+        if let crate::simd_parser::Http2Frame::AltSvc {
+            stream_id,
+            origin,
+            alt_svc_field_value,
+        } = frame
+        {
+            assert_eq!(stream_id, 0);
+            assert_eq!(origin, "https://example.com");
+            assert!(alt_svc_field_value.contains("h3=\":443\""));
+            assert!(alt_svc_field_value.contains("alt.example.com:8443"));
+
+            // Feed frame into client session
+            client
+                .session
+                .handle_frame(&crate::simd_parser::Http2Frame::AltSvc {
+                    stream_id,
+                    origin: origin.clone(),
+                    alt_svc_field_value,
+                })
+                .expect("handle frame in session");
+
+            let cached = client
+                .session
+                .alt_svc_routes
+                .get("https://example.com")
+                .expect("cached routes");
+            assert_eq!(cached.len(), 2);
+            assert_eq!(cached[0].protocol_id, "h3");
+            assert_eq!(cached[0].port, 443);
+            assert!(cached[0].persist);
+            assert_eq!(cached[1].protocol_id, "h2");
+            assert_eq!(cached[1].host, "alt.example.com");
+            assert_eq!(cached[1].port, 8443);
+        } else {
+            panic!("Expected AltSvc frame over wire, got: {:?}", frame);
+        }
+
+        let _ = client.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
         let _ = handle.join();
     }
 
