@@ -2762,7 +2762,8 @@ impl Http2Session {
     }
 
     /// Schedule and allocate outbound DATA frames fairly across active streams based on
-    /// their RFC 9218 urgency (0 highest .. 7 lowest), incremental flags, and flow control windows.
+    /// their RFC 9218 urgency (0 highest .. 7 lowest), incremental flags (fair sharing / round-robin
+    /// for same-urgency incremental streams vs sequential for non-incremental), and flow control windows.
     /// Returns a list of generated Http2Frame::Data frames respecting connection and stream window limits.
     pub fn schedule_outbound_data(
         &mut self,
@@ -2776,49 +2777,155 @@ impl Http2Session {
 
         let max_frame = std::cmp::max(16384, max_frame_size);
 
-        // Group active streams that have pending data by urgency
-        let prioritized_ids = self.prioritized_stream_ids_rfc9218();
+        // Group active streams that have pending data by urgency tier (0 to 7)
+        let mut streams_by_urgency: [Vec<u32>; 8] = Default::default();
+        for (&stream_id, buf) in pending_data.iter() {
+            if buf.is_empty() {
+                continue;
+            }
+            if let Some(stream) = self.streams.get(&stream_id) {
+                if stream.state == Http2StreamState::Open
+                    || stream.state == Http2StreamState::HalfClosedRemote
+                {
+                    let u = stream.priority_params.urgency.min(7) as usize;
+                    streams_by_urgency[u].push(stream_id);
+                }
+            }
+        }
 
-        for stream_id in prioritized_ids {
+        // Iterate through urgency levels from 0 (highest) to 7 (lowest)
+        for urgency_tier in streams_by_urgency.iter_mut() {
             if self.connection_window_size <= 0 {
                 break;
             }
-
-            let stream_win = match self.streams.get(&stream_id) {
-                Some(s)
-                    if s.state == Http2StreamState::Open
-                        || s.state == Http2StreamState::HalfClosedRemote =>
-                {
-                    s.window_size
-                }
-                _ => continue,
-            };
-
-            if stream_win <= 0 {
+            if urgency_tier.is_empty() {
                 continue;
             }
 
-            let available_credit = std::cmp::min(self.connection_window_size, stream_win) as usize;
-            if available_credit == 0 {
-                continue;
+            // Stable sort by stream_id ascending
+            urgency_tier.sort_unstable();
+
+            // Split into non-incremental (sequential) and incremental (interleaved round-robin)
+            let mut non_incremental = Vec::new();
+            let mut incremental = Vec::new();
+            for &stream_id in urgency_tier.iter() {
+                let is_inc = self
+                    .streams
+                    .get(&stream_id)
+                    .map(|s| s.priority_params.incremental)
+                    .unwrap_or(false);
+                if is_inc {
+                    incremental.push(stream_id);
+                } else {
+                    non_incremental.push(stream_id);
+                }
             }
 
-            if let Some(buf) = pending_data.get_mut(&stream_id) {
-                if buf.is_empty() {
-                    continue;
+            // 1. Process non-incremental streams sequentially in this tier
+            for stream_id in non_incremental {
+                if self.connection_window_size <= 0 {
+                    break;
                 }
 
-                let chunk_size =
-                    std::cmp::min(buf.len(), std::cmp::min(available_credit, max_frame));
-                if chunk_size == 0 {
-                    continue;
+                while let Some(buf) = pending_data.get_mut(&stream_id) {
+                    if buf.is_empty() || self.connection_window_size <= 0 {
+                        break;
+                    }
+
+                    let stream_win = match self.streams.get(&stream_id) {
+                        Some(s)
+                            if s.state == Http2StreamState::Open
+                                || s.state == Http2StreamState::HalfClosedRemote =>
+                        {
+                            s.window_size
+                        }
+                        _ => break,
+                    };
+                    if stream_win <= 0 {
+                        break;
+                    }
+
+                    let available_credit =
+                        std::cmp::min(self.connection_window_size, stream_win) as usize;
+                    if available_credit == 0 {
+                        break;
+                    }
+
+                    let chunk_size =
+                        std::cmp::min(buf.len(), std::cmp::min(available_credit, max_frame));
+                    if chunk_size == 0 {
+                        break;
+                    }
+
+                    let chunk = buf.drain(..chunk_size).collect::<Vec<u8>>();
+                    let end_stream = buf.is_empty();
+
+                    let frame = self.create_data_frame(stream_id, &chunk, end_stream);
+                    frames.push(frame);
                 }
+            }
 
-                let chunk = buf.drain(..chunk_size).collect::<Vec<u8>>();
-                let end_stream = buf.is_empty();
+            // 2. Process incremental streams with round-robin fair queuing (WFQ)
+            // RFC 9218: "If the incremental parameter is true, data SHOULD be sent
+            // interleaved with data from other streams of the same urgency."
+            if !incremental.is_empty() {
+                loop {
+                    if self.connection_window_size <= 0 {
+                        break;
+                    }
 
-                let frame = self.create_data_frame(stream_id, &chunk, end_stream);
-                frames.push(frame);
+                    let mut any_sent_in_round = false;
+                    for &stream_id in &incremental {
+                        if self.connection_window_size <= 0 {
+                            break;
+                        }
+
+                        let stream_win = match self.streams.get(&stream_id) {
+                            Some(s)
+                                if s.state == Http2StreamState::Open
+                                    || s.state == Http2StreamState::HalfClosedRemote =>
+                            {
+                                s.window_size
+                            }
+                            _ => continue,
+                        };
+                        if stream_win <= 0 {
+                            continue;
+                        }
+
+                        let available_credit =
+                            std::cmp::min(self.connection_window_size, stream_win) as usize;
+                        if available_credit == 0 {
+                            continue;
+                        }
+
+                        if let Some(buf) = pending_data.get_mut(&stream_id) {
+                            if buf.is_empty() {
+                                continue;
+                            }
+
+                            // In round-robin for incremental streams, emit up to max_frame per round
+                            let chunk_size = std::cmp::min(
+                                buf.len(),
+                                std::cmp::min(available_credit, max_frame),
+                            );
+                            if chunk_size == 0 {
+                                continue;
+                            }
+
+                            let chunk = buf.drain(..chunk_size).collect::<Vec<u8>>();
+                            let end_stream = buf.is_empty();
+
+                            let frame = self.create_data_frame(stream_id, &chunk, end_stream);
+                            frames.push(frame);
+                            any_sent_in_round = true;
+                        }
+                    }
+
+                    if !any_sent_in_round {
+                        break;
+                    }
+                }
             }
         }
 
@@ -3962,6 +4069,79 @@ mod http2_tests {
                 assert!(*end_stream);
             }
             _ => panic!("Expected Data frame for stream 5"),
+        }
+
+        assert!(pending.values().all(|b| b.is_empty()));
+    }
+
+    #[test]
+    fn test_schedule_outbound_data_incremental_interleaving() {
+        let mut session = Http2Session::new(false);
+        // Ensure connection window has plenty of credit (e.g. 128KB)
+        session.connection_window_size = 131072;
+
+        // Both stream 1 and stream 3 have the same urgency (urgency 2), but incremental = true
+        let mut s1 = Http2Stream::new(1, 65535);
+        s1.state = Http2StreamState::Open;
+        let mut s3 = Http2Stream::new(3, 65535);
+        s3.state = Http2StreamState::Open;
+
+        session.streams.insert(1, s1);
+        session.streams.insert(3, s3);
+
+        session.set_stream_priority_parameters(
+            1,
+            PriorityParameters {
+                urgency: 2,
+                incremental: true,
+            },
+        );
+        session.set_stream_priority_parameters(
+            3,
+            PriorityParameters {
+                urgency: 2,
+                incremental: true,
+            },
+        );
+
+        let mut pending = std::collections::HashMap::new();
+        // Give each stream 32KB of data
+        pending.insert(1, vec![1u8; 32768]);
+        pending.insert(3, vec![3u8; 32768]);
+
+        // Max frame size = 16384 (16KB)
+        // With incremental interleaving, frames should alternate between stream 1 and stream 3!
+        // Round 1: stream 1 chunk 1 (16KB), stream 3 chunk 1 (16KB)
+        // Round 2: stream 1 chunk 2 (16KB, end_stream), stream 3 chunk 2 (16KB, end_stream)
+        let frames = session.schedule_outbound_data(&mut pending, 16384);
+        assert_eq!(frames.len(), 4);
+
+        let stream_sequence: Vec<u32> = frames
+            .iter()
+            .map(|f| match f {
+                Http2Frame::Data { stream_id, .. } => *stream_id,
+                _ => panic!("Expected Data frame"),
+            })
+            .collect();
+
+        assert_eq!(stream_sequence, vec![1, 3, 1, 3]);
+
+        // Check end_stream flags
+        match &frames[0] {
+            Http2Frame::Data { end_stream, .. } => assert!(!*end_stream),
+            _ => panic!(),
+        }
+        match &frames[1] {
+            Http2Frame::Data { end_stream, .. } => assert!(!*end_stream),
+            _ => panic!(),
+        }
+        match &frames[2] {
+            Http2Frame::Data { end_stream, .. } => assert!(*end_stream),
+            _ => panic!(),
+        }
+        match &frames[3] {
+            Http2Frame::Data { end_stream, .. } => assert!(*end_stream),
+            _ => panic!(),
         }
 
         assert!(pending.values().all(|b| b.is_empty()));
