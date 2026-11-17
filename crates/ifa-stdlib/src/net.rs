@@ -2745,6 +2745,205 @@ pub fn lookup_mime_type(extension: &str) -> &'static str {
     }
 }
 
+pub use crate::http::SseEvent;
+
+/// Server-Sent Events (SSE) incremental stream decoder / parser.
+/// Parses incoming continuous chunks of `text/event-stream` data into discrete `SseEvent` messages.
+#[derive(Debug, Default, Clone)]
+pub struct SseDecoder {
+    buffer: String,
+    last_event_id: Option<String>,
+}
+
+impl SseDecoder {
+    /// Create a new SSE decoder.
+    pub fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            last_event_id: None,
+        }
+    }
+
+    /// Get the most recently observed `id:` field (Last-Event-ID).
+    pub fn last_event_id(&self) -> Option<&str> {
+        self.last_event_id.as_deref()
+    }
+
+    /// Ingest a string chunk into the decoder buffer.
+    pub fn push_str(&mut self, chunk: &str) {
+        self.buffer.push_str(chunk);
+    }
+
+    /// Ingest raw bytes (interpreted as UTF-8 lossy) into the decoder buffer.
+    pub fn push_bytes(&mut self, bytes: &[u8]) {
+        self.buffer.push_str(&String::from_utf8_lossy(bytes));
+    }
+
+    /// Extract and decode the next complete `SseEvent` if available in the buffer.
+    pub fn next_event(&mut self) -> Option<SseEvent> {
+        // SSE blocks are delimited by two consecutive newlines ("\n\n" or "\r\n\r\n")
+        let end_idx = if let Some(idx) = self.buffer.find("\r\n\r\n") {
+            Some((idx, 4))
+        } else {
+            self.buffer.find("\n\n").map(|idx| (idx, 2))
+        };
+
+        if let Some((idx, delim_len)) = end_idx {
+            let block = self.buffer[..idx].to_string();
+            self.buffer.drain(..idx + delim_len);
+
+            let mut event_name: Option<String> = None;
+            let mut data_lines = Vec::new();
+            let mut id: Option<String> = None;
+            let mut retry: Option<u64> = None;
+            let mut comment_lines = Vec::new();
+
+            for line in block.lines() {
+                let trimmed_line = line.trim_end_matches('\r');
+                if trimmed_line.is_empty() {
+                    continue;
+                }
+
+                if let Some(stripped) = trimmed_line.strip_prefix(':') {
+                    // Comment line
+                    comment_lines.push(stripped.trim_start().to_string());
+                } else if let Some(stripped) = trimmed_line.strip_prefix("event:") {
+                    event_name = Some(stripped.trim_start().to_string());
+                } else if let Some(stripped) = trimmed_line.strip_prefix("data:") {
+                    data_lines.push(stripped.trim_start().to_string());
+                } else if let Some(stripped) = trimmed_line.strip_prefix("id:") {
+                    let parsed_id = stripped.trim_start().to_string();
+                    self.last_event_id = Some(parsed_id.clone());
+                    id = Some(parsed_id);
+                } else if let Some(stripped) = trimmed_line.strip_prefix("retry:") {
+                    if let Ok(ms) = stripped.trim_start().parse::<u64>() {
+                        retry = Some(ms);
+                    }
+                }
+            }
+
+            // A valid SSE event must have at least data, comment, or event name
+            if !data_lines.is_empty() || !comment_lines.is_empty() || event_name.is_some() || id.is_some() {
+                let data = data_lines.join("\n");
+                let comment = if !comment_lines.is_empty() {
+                    Some(comment_lines.join("\n"))
+                } else {
+                    None
+                };
+
+                return Some(SseEvent {
+                    event: event_name,
+                    data,
+                    id,
+                    retry,
+                    comment,
+                });
+            }
+        }
+
+        None
+    }
+}
+
+/// Asynchronous Server-Sent Events (SSE) Client over colorless fibers (`AsyncTcpStream`).
+pub struct AsyncSseClient {
+    stream: AsyncTcpStream,
+    decoder: SseDecoder,
+}
+
+impl AsyncSseClient {
+    /// Create an `AsyncSseClient` wrapping an established `AsyncTcpStream`.
+    pub fn new(stream: AsyncTcpStream) -> Self {
+        Self {
+            stream,
+            decoder: SseDecoder::new(),
+        }
+    }
+
+    /// Read next `SseEvent` cooperatively without blocking the operating system thread.
+    pub fn read_event(&mut self) -> io::Result<Option<SseEvent>> {
+        let mut spins = 0;
+        let mut chunk = [0u8; 1024];
+
+        loop {
+            if let Some(event) = self.decoder.next_event() {
+                return Ok(Some(event));
+            }
+
+            match self.stream.try_read(&mut chunk) {
+                Ok(Some(n)) if n > 0 => {
+                    self.decoder.push_bytes(&chunk[..n]);
+                    spins = 0;
+                    if let Some(event) = self.decoder.next_event() {
+                        return Ok(Some(event));
+                    }
+                }
+                Ok(Some(0)) => {
+                    // Stream closed; check if trailing event exists
+                    return Ok(self.decoder.next_event());
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+
+            spins += 1;
+            if spins < 16 {
+                std::hint::spin_loop();
+            } else {
+                GLOBAL_SCHEDULER.yield_now();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Return the last known event ID seen on this connection.
+    pub fn last_event_id(&self) -> Option<&str> {
+        self.decoder.last_event_id()
+    }
+}
+
+/// Asynchronous Server-Sent Events (SSE) Server stream over colorless fibers (`AsyncTcpStream`).
+pub struct AsyncSseServer {
+    stream: AsyncTcpStream,
+}
+
+impl AsyncSseServer {
+    /// Initialize an HTTP response for SSE streaming (`text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`).
+    pub fn init_response(mut stream: AsyncTcpStream) -> io::Result<Self> {
+        let response_headers = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: text/event-stream\r\n",
+            "Cache-Control: no-cache\r\n",
+            "Connection: keep-alive\r\n",
+            "X-Accel-Buffering: no\r\n",
+            "\r\n"
+        );
+        stream.write_all(response_headers.as_bytes())?;
+        Ok(Self { stream })
+    }
+
+    /// Wrap an existing stream already initialized with headers.
+    pub fn from_raw_stream(stream: AsyncTcpStream) -> Self {
+        Self { stream }
+    }
+
+    /// Send an `SseEvent` to the client.
+    pub fn send_event(&mut self, event: &SseEvent) -> io::Result<()> {
+        let payload = event.to_wire_string();
+        self.stream.write_all(payload.as_bytes())
+    }
+
+    /// Send a keep-alive comment heartbeat `: ping\n\n`.
+    pub fn send_heartbeat(&mut self) -> io::Result<()> {
+        self.stream.write_all(b": ping\n\n")
+    }
+
+    /// Send raw text data as a default event.
+    pub fn send_data(&mut self, data: &str) -> io::Result<()> {
+        self.send_event(&SseEvent::new(data))
+    }
+}
+
 /// Resolves a host name to a list of IP addresses.
 ///
 /// If `host` already represents an IP address, returns that single address.
@@ -3735,5 +3934,101 @@ mod tests {
         let addrs = resolve_socket_addrs("127.0.0.1:8080").expect("resolve socket addrs");
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].port(), 8080);
+    }
+
+    #[test]
+    fn test_sse_wire_formatting_and_decoding() {
+        // 1. Serialization
+        let event = SseEvent::new("hello world")
+            .with_event("greet")
+            .with_id("42")
+            .with_retry(5000)
+            .with_comment("heartbeat ping");
+
+        let wire = event.to_wire_string();
+        assert!(wire.contains(": heartbeat ping\n"));
+        assert!(wire.contains("event: greet\n"));
+        assert!(wire.contains("id: 42\n"));
+        assert!(wire.contains("retry: 5000\n"));
+        assert!(wire.contains("data: hello world\n\n"));
+
+        // 2. Multi-line data decoding
+        let multi_event = SseEvent::new("line1\nline2\nline3").with_id("evt-101");
+        let wire_multi = multi_event.to_wire_string();
+        assert!(wire_multi.contains("data: line1\ndata: line2\ndata: line3\n\n"));
+
+        // 3. Decoding chunks with SseDecoder
+        let mut decoder = SseDecoder::new();
+        decoder.push_str(&wire);
+        decoder.push_str(&wire_multi);
+
+        let parsed1 = decoder.next_event().expect("first event");
+        assert_eq!(parsed1.event.as_deref(), Some("greet"));
+        assert_eq!(parsed1.data, "hello world");
+        assert_eq!(parsed1.id.as_deref(), Some("42"));
+        assert_eq!(parsed1.retry, Some(5000));
+        assert_eq!(parsed1.comment.as_deref(), Some("heartbeat ping"));
+        assert_eq!(decoder.last_event_id(), Some("42"));
+
+        let parsed2 = decoder.next_event().expect("second event");
+        assert_eq!(parsed2.id.as_deref(), Some("evt-101"));
+        assert_eq!(parsed2.data, "line1\nline2\nline3");
+        assert_eq!(decoder.last_event_id(), Some("evt-101"));
+
+        assert!(decoder.next_event().is_none());
+    }
+
+    #[test]
+    fn test_async_sse_client_and_server_streaming() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("port");
+
+        GLOBAL_SCHEDULER.spawn(move || {
+            let stream = AsyncTcpStream::connect(addr).expect("connect client");
+            let mut client = AsyncSseClient::new(stream);
+
+            let ev1 = client
+                .read_event()
+                .expect("read 1")
+                .expect("some event 1");
+            assert_eq!(ev1.data, "ready");
+            assert_eq!(ev1.id.as_deref(), Some("msg-1"));
+            assert_eq!(client.last_event_id(), Some("msg-1"));
+
+            let ev2 = client
+                .read_event()
+                .expect("read 2")
+                .expect("some event 2");
+            assert_eq!(ev2.comment.as_deref(), Some("ping"));
+
+            let ev3 = client
+                .read_event()
+                .expect("read 3")
+                .expect("some event 3");
+            assert_eq!(ev3.event.as_deref(), Some("telemetry"));
+            assert_eq!(ev3.data, "sensor update payload");
+            assert_eq!(ev3.id.as_deref(), Some("msg-2"));
+            assert_eq!(client.last_event_id(), Some("msg-2"));
+        });
+
+        let mut server = loop {
+            if let Ok(Some((stream, _))) = listener.try_accept() {
+                break AsyncSseServer::init_response(stream).expect("init response");
+            }
+            GLOBAL_SCHEDULER.yield_now();
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        server
+            .send_event(&SseEvent::new("ready").with_id("msg-1"))
+            .expect("send event 1");
+        server.send_heartbeat().expect("heartbeat");
+        server
+            .send_event(
+                &SseEvent::new("sensor update payload")
+                    .with_event("telemetry")
+                    .with_id("msg-2"),
+            )
+            .expect("send event 2");
     }
 }
