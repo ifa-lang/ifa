@@ -1243,6 +1243,47 @@ impl Http2Session {
         stream_id
     }
 
+    /// Check if flow control windows need updating (stream-level and connection-level)
+    /// and generate WINDOW_UPDATE frames when window sizes drop below a replenishment threshold.
+    pub fn replenish_flow_control_windows(&mut self) -> Vec<Http2Frame> {
+        let mut updates = Vec::new();
+        let replenish_threshold = Self::DEFAULT_INITIAL_WINDOW_SIZE / 2;
+
+        // Check connection-level window
+        if self.connection_window_size < replenish_threshold {
+            let increment = (Self::DEFAULT_INITIAL_WINDOW_SIZE - self.connection_window_size) as u32;
+            if increment > 0 {
+                self.connection_window_size += increment as i32;
+                updates.push(Http2Frame::WindowUpdate {
+                    stream_id: 0,
+                    window_size_increment: increment,
+                });
+            }
+        }
+
+        // Check stream-level windows for active streams
+        let target_stream_win = self.initial_stream_window_size;
+        let stream_threshold = target_stream_win / 2;
+
+        for (stream_id, stream) in self.streams.iter_mut() {
+            if (stream.state == Http2StreamState::Open
+                || stream.state == Http2StreamState::HalfClosedLocal)
+                && stream.window_size < stream_threshold
+            {
+                let increment = (target_stream_win - stream.window_size) as u32;
+                if increment > 0 {
+                    stream.window_size += increment as i32;
+                    updates.push(Http2Frame::WindowUpdate {
+                        stream_id: *stream_id,
+                        window_size_increment: increment,
+                    });
+                }
+            }
+        }
+
+        updates
+    }
+
     /// Create and encode a HEADERS frame for a stream.
     pub fn create_headers_frame(
         &mut self,

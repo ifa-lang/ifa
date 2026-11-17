@@ -2953,6 +2953,31 @@ impl AsyncHttp2Connection {
         self.stream.write_all(&wire)
     }
 
+    /// Send a DATA frame on an existing stream with active flow control chunking (max 16384 bytes).
+    pub fn send_data(
+        &mut self,
+        stream_id: u32,
+        data: &[u8],
+        end_stream: bool,
+    ) -> io::Result<()> {
+        const MAX_FRAME_SIZE: usize = 16384;
+        if data.is_empty() {
+            let frame = self.session.create_data_frame(stream_id, &[], end_stream);
+            return self.send_frame(&frame);
+        }
+
+        let mut offset = 0;
+        while offset < data.len() {
+            let chunk_len = std::cmp::min(data.len() - offset, MAX_FRAME_SIZE);
+            let is_last = end_stream && (offset + chunk_len == data.len());
+            let chunk = &data[offset..offset + chunk_len];
+            let frame = self.session.create_data_frame(stream_id, chunk, is_last);
+            self.send_frame(&frame)?;
+            offset += chunk_len;
+        }
+        Ok(())
+    }
+
     /// Initiate an HTTP/2 request on a newly opened stream.
     pub fn send_request(
         &mut self,
@@ -2968,8 +2993,7 @@ impl AsyncHttp2Connection {
 
         if let Some(data) = body {
             if !data.is_empty() {
-                let data_frame = self.session.create_data_frame(stream_id, data, true);
-                self.send_frame(&data_frame)?;
+                self.send_data(stream_id, data, true)?;
             }
         }
 
@@ -2991,8 +3015,7 @@ impl AsyncHttp2Connection {
 
         if let Some(data) = body {
             if !data.is_empty() {
-                let data_frame = self.session.create_data_frame(stream_id, data, true);
-                self.send_frame(&data_frame)?;
+                self.send_data(stream_id, data, true)?;
             }
         }
 
@@ -3064,6 +3087,14 @@ impl AsyncHttp2Connection {
                     format!("HTTP/2 session protocol error: {:?}", e),
                 ));
             }
+        }
+
+        // Active flow control window replenishment:
+        // When received DATA frames consume connection or stream windows below threshold,
+        // send WINDOW_UPDATE frames proactively.
+        let flow_updates = self.session.replenish_flow_control_windows();
+        for update_frame in flow_updates {
+            self.send_frame(&update_frame)?;
         }
 
         Ok(Some(frame))
@@ -5305,6 +5336,66 @@ mod tests {
         assert_eq!(resp.headers.get("content-type"), Some("application/json"));
         assert_eq!(resp.headers.get("server"), Some("ifa-http2"));
         assert_eq!(resp.body_str().unwrap(), "{\"status\":\"ok\",\"h2\":true}");
+
+        client
+            .send_goaway(crate::simd_parser::Http2ErrorCode::NoError)
+            .expect("client send goaway");
+
+        handle.join().expect("server thread finished");
+    }
+
+    #[test]
+    fn test_async_http2_flow_control_large_payload() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        // Large payload: 70,000 bytes (exceeds default initial window size 65535 bytes)
+        let large_payload = vec![b'X'; 70000];
+        let expected_payload = large_payload.clone();
+
+        let handle = std::thread::spawn(move || {
+            let (std_stream, _) = listener.accept().expect("accept connection");
+            std_stream.set_nonblocking(true).expect("set nonblocking");
+            let stream = AsyncTcpStream::from_std(std_stream).expect("async tcp stream");
+
+            let mut server =
+                AsyncHttp2Connection::server_handshake(stream).expect("server h2 handshake");
+
+            loop {
+                let frame = server.recv_frame().expect("server recv frame");
+                match frame {
+                    crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            let res_headers = vec![
+                                (":status", "200"),
+                                ("content-type", "application/octet-stream"),
+                            ];
+                            server
+                                .send_response(stream_id, &res_headers, Some(&large_payload))
+                                .expect("server send large response");
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::GoAway { .. } => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let stream = AsyncTcpStream::connect(addr).expect("client connect");
+        let mut client =
+            AsyncHttp2Connection::client_handshake(stream).expect("client h2 handshake");
+
+        let resp = client
+            .request("GET", "/large-data", &[], None)
+            .expect("client request large data");
+
+        assert_eq!(resp.status.0, 200);
+        assert_eq!(resp.body.len(), 70000);
+        assert_eq!(resp.body, expected_payload);
 
         client
             .send_goaway(crate::simd_parser::Http2ErrorCode::NoError)
