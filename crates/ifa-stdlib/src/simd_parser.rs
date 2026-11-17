@@ -1066,6 +1066,216 @@ impl Http2Frame {
         }
     }
 
+    /// Serialize this frame into a caller-supplied pre-allocated destination buffer
+    /// without any heap allocations.
+    ///
+    /// Returns `Ok(bytes_written)` if `dst` has enough capacity, or `Err(FastHttpError::Incomplete)`
+    /// if the buffer is too small.
+    pub fn encode_to_slice(&self, dst: &mut [u8]) -> Result<usize, FastHttpError> {
+        let total_len = match self {
+            Http2Frame::Data { data, .. } => 9 + data.len(),
+            Http2Frame::Headers { header_block, .. } => 9 + header_block.len(),
+            Http2Frame::Priority { .. } => 14,
+            Http2Frame::RstStream { .. } => 13,
+            Http2Frame::Settings { ack, settings } => {
+                if *ack {
+                    9
+                } else {
+                    9 + settings.len() * 6
+                }
+            }
+            Http2Frame::Ping { .. } => 17,
+            Http2Frame::GoAway { debug_data, .. } => 17 + debug_data.len(),
+            Http2Frame::WindowUpdate { .. } => 13,
+            Http2Frame::Continuation { header_block, .. } => 9 + header_block.len(),
+            Http2Frame::PushPromise { header_block, .. } => 13 + header_block.len(),
+            Http2Frame::PriorityUpdate { priority_field_value, .. } => {
+                13 + priority_field_value.len()
+            }
+            Http2Frame::AltSvc { origin, alt_svc_field_value, .. } => {
+                11 + origin.len() + alt_svc_field_value.len()
+            }
+            Http2Frame::Unknown { payload, .. } => 9 + payload.len(),
+        };
+
+        if dst.len() < total_len {
+            return Err(FastHttpError::Incomplete);
+        }
+
+        match self {
+            Http2Frame::Data {
+                stream_id,
+                end_stream,
+                data,
+            } => {
+                let flags = if *end_stream { Self::FLAG_END_STREAM } else { 0 };
+                let header = Http2FrameHeader::new(data.len() as u32, Http2FrameType::Data, flags, *stream_id);
+                dst[..9].copy_from_slice(&header.encode());
+                dst[9..9 + data.len()].copy_from_slice(data);
+            }
+            Http2Frame::Headers {
+                stream_id,
+                end_stream,
+                end_headers,
+                header_block,
+            } => {
+                let mut flags = 0;
+                if *end_stream { flags |= Self::FLAG_END_STREAM; }
+                if *end_headers { flags |= Self::FLAG_END_HEADERS; }
+                let header = Http2FrameHeader::new(header_block.len() as u32, Http2FrameType::Headers, flags, *stream_id);
+                dst[..9].copy_from_slice(&header.encode());
+                dst[9..9 + header_block.len()].copy_from_slice(header_block);
+            }
+            Http2Frame::Priority {
+                stream_id,
+                exclusive,
+                stream_dependency,
+                weight,
+            } => {
+                let header = Http2FrameHeader::new(5, Http2FrameType::Priority, 0, *stream_id);
+                dst[..9].copy_from_slice(&header.encode());
+                let dep = (if *exclusive { 0x8000_0000 } else { 0 }) | (*stream_dependency & 0x7FFF_FFFF);
+                dst[9..13].copy_from_slice(&dep.to_be_bytes());
+                dst[13] = *weight;
+            }
+            Http2Frame::RstStream {
+                stream_id,
+                error_code,
+            } => {
+                let header = Http2FrameHeader::new(4, Http2FrameType::RstStream, 0, *stream_id);
+                dst[..9].copy_from_slice(&header.encode());
+                let err_raw: u32 = (*error_code).into();
+                dst[9..13].copy_from_slice(&err_raw.to_be_bytes());
+            }
+            Http2Frame::Settings { ack, settings } => {
+                let flags = if *ack { Self::FLAG_ACK } else { 0 };
+                let payload_len = if *ack { 0 } else { (settings.len() * 6) as u32 };
+                let header = Http2FrameHeader::new(payload_len, Http2FrameType::Settings, flags, 0);
+                dst[..9].copy_from_slice(&header.encode());
+                if !*ack {
+                    let mut offset = 9;
+                    for setting in settings {
+                        let id_raw: u16 = setting.id.into();
+                        dst[offset..offset + 2].copy_from_slice(&id_raw.to_be_bytes());
+                        dst[offset + 2..offset + 6].copy_from_slice(&setting.value.to_be_bytes());
+                        offset += 6;
+                    }
+                }
+            }
+            Http2Frame::Ping { ack, opaque_data } => {
+                let flags = if *ack { Self::FLAG_ACK } else { 0 };
+                let header = Http2FrameHeader::new(8, Http2FrameType::Ping, flags, 0);
+                dst[..9].copy_from_slice(&header.encode());
+                dst[9..17].copy_from_slice(opaque_data);
+            }
+            Http2Frame::GoAway {
+                last_stream_id,
+                error_code,
+                debug_data,
+            } => {
+                let payload_len = 8 + debug_data.len() as u32;
+                let header = Http2FrameHeader::new(payload_len, Http2FrameType::GoAway, 0, 0);
+                dst[..9].copy_from_slice(&header.encode());
+                dst[9..13].copy_from_slice(&(last_stream_id & 0x7FFF_FFFF).to_be_bytes());
+                let err_raw: u32 = (*error_code).into();
+                dst[13..17].copy_from_slice(&err_raw.to_be_bytes());
+                dst[17..17 + debug_data.len()].copy_from_slice(debug_data);
+            }
+            Http2Frame::WindowUpdate {
+                stream_id,
+                window_size_increment,
+            } => {
+                let header = Http2FrameHeader::new(4, Http2FrameType::WindowUpdate, 0, *stream_id);
+                dst[..9].copy_from_slice(&header.encode());
+                dst[9..13].copy_from_slice(&(window_size_increment & 0x7FFF_FFFF).to_be_bytes());
+            }
+            Http2Frame::Continuation {
+                stream_id,
+                end_headers,
+                header_block,
+            } => {
+                let flags = if *end_headers { Self::FLAG_END_HEADERS } else { 0 };
+                let header = Http2FrameHeader::new(
+                    header_block.len() as u32,
+                    Http2FrameType::Continuation,
+                    flags,
+                    *stream_id,
+                );
+                dst[..9].copy_from_slice(&header.encode());
+                dst[9..9 + header_block.len()].copy_from_slice(header_block);
+            }
+            Http2Frame::PushPromise {
+                stream_id,
+                promised_stream_id,
+                end_headers,
+                header_block,
+            } => {
+                let flags = if *end_headers { Self::FLAG_END_HEADERS } else { 0 };
+                let payload_len = 4 + header_block.len();
+                let header = Http2FrameHeader::new(
+                    payload_len as u32,
+                    Http2FrameType::PushPromise,
+                    flags,
+                    *stream_id,
+                );
+                dst[..9].copy_from_slice(&header.encode());
+                dst[9..13].copy_from_slice(&(*promised_stream_id & 0x7FFF_FFFF).to_be_bytes());
+                dst[13..13 + header_block.len()].copy_from_slice(header_block);
+            }
+            Http2Frame::PriorityUpdate {
+                prioritized_stream_id,
+                priority_field_value,
+            } => {
+                let bytes = priority_field_value.as_bytes();
+                let payload_len = 4 + bytes.len();
+                let header = Http2FrameHeader::new(payload_len as u32, Http2FrameType::PriorityUpdate, 0, 0);
+                dst[..9].copy_from_slice(&header.encode());
+                dst[9..13].copy_from_slice(&(*prioritized_stream_id & 0x7FFF_FFFF).to_be_bytes());
+                dst[13..13 + bytes.len()].copy_from_slice(bytes);
+            }
+            Http2Frame::AltSvc {
+                stream_id,
+                origin,
+                alt_svc_field_value,
+            } => {
+                let origin_bytes = origin.as_bytes();
+                let alt_svc_bytes = alt_svc_field_value.as_bytes();
+                let origin_len = origin_bytes.len() as u16;
+                let payload_len = 2 + origin_bytes.len() + alt_svc_bytes.len();
+                let header = Http2FrameHeader::new(
+                    payload_len as u32,
+                    Http2FrameType::AltSvc,
+                    0,
+                    *stream_id & 0x7FFF_FFFF,
+                );
+                dst[..9].copy_from_slice(&header.encode());
+                dst[9..11].copy_from_slice(&origin_len.to_be_bytes());
+                dst[11..11 + origin_bytes.len()].copy_from_slice(origin_bytes);
+                let alt_off = 11 + origin_bytes.len();
+                dst[alt_off..alt_off + alt_svc_bytes.len()].copy_from_slice(alt_svc_bytes);
+            }
+            Http2Frame::Unknown { header, payload } => {
+                dst[..9].copy_from_slice(&header.encode());
+                dst[9..9 + payload.len()].copy_from_slice(payload);
+            }
+        }
+
+        Ok(total_len)
+    }
+
+    /// Check if this frame is a lightweight control frame (PING, SETTINGS, WINDOW_UPDATE, RST_STREAM, PRIORITY).
+    pub fn is_control_frame(&self) -> bool {
+        matches!(
+            self,
+            Http2Frame::Ping { .. }
+                | Http2Frame::Settings { .. }
+                | Http2Frame::WindowUpdate { .. }
+                | Http2Frame::RstStream { .. }
+                | Http2Frame::Priority { .. }
+                | Http2Frame::PriorityUpdate { .. }
+        )
+    }
+
     /// Decode an HTTP/2 frame from header and payload bytes.
     pub fn decode(header: &Http2FrameHeader, payload: &[u8]) -> Result<Self, FastHttpError> {
         if payload.len() < header.length as usize {

@@ -2900,6 +2900,7 @@ pub struct AsyncHttp2Connection {
     pub stream: AsyncTcpStream,
     pub session: crate::simd_parser::Http2Session,
     read_buf: Vec<u8>,
+    ctrl_ring_buf: [u8; 1024],
     is_closed: bool,
 }
 
@@ -2910,6 +2911,7 @@ impl AsyncHttp2Connection {
             stream,
             session: crate::simd_parser::Http2Session::new(is_server),
             read_buf: Vec::with_capacity(8192),
+            ctrl_ring_buf: [0u8; 1024],
             is_closed: false,
         }
     }
@@ -2936,6 +2938,7 @@ impl AsyncHttp2Connection {
             stream,
             session,
             read_buf: Vec::with_capacity(8192),
+            ctrl_ring_buf: [0u8; 1024],
             is_closed: false,
         })
     }
@@ -2992,11 +2995,16 @@ impl AsyncHttp2Connection {
             stream,
             session,
             read_buf: Vec::with_capacity(8192),
+            ctrl_ring_buf: [0u8; 1024],
             is_closed: false,
         })
     }
 
     /// Send an HTTP/2 frame over the connection.
+    ///
+    /// Optimizes control frames (PING, SETTINGS, WINDOW_UPDATE, RST_STREAM, PRIORITY)
+    /// by serializing them directly into a pre-allocated internal scratch ring buffer
+    /// without any dynamic heap allocation.
     pub fn send_frame(&mut self, frame: &crate::simd_parser::Http2Frame) -> io::Result<()> {
         if self.is_closed {
             return Err(io::Error::new(
@@ -3004,6 +3012,14 @@ impl AsyncHttp2Connection {
                 "HTTP/2 connection is closed",
             ));
         }
+
+        // Zero-allocation path for control frames using pre-allocated buffer
+        if frame.is_control_frame() {
+            if let Ok(written) = frame.encode_to_slice(&mut self.ctrl_ring_buf) {
+                return self.stream.write_all(&self.ctrl_ring_buf[..written]);
+            }
+        }
+
         let wire = frame.encode();
         self.stream.write_all(&wire)
     }
@@ -9408,6 +9424,44 @@ mod tests {
         assert_eq!(resp_body, b"large-data-ack");
 
         let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_control_frame_ring_buffer_zero_alloc() {
+        let ping_frame = crate::simd_parser::Http2Frame::Ping {
+            ack: true,
+            opaque_data: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        assert!(ping_frame.is_control_frame());
+
+        let mut ring_buf = [0u8; 64];
+        let written = ping_frame
+            .encode_to_slice(&mut ring_buf)
+            .expect("encode ping to slice");
+        assert_eq!(written, 17);
+        assert_eq!(&ring_buf[..written], &ping_frame.encode());
+
+        let win_frame = crate::simd_parser::Http2Frame::WindowUpdate {
+            stream_id: 3,
+            window_size_increment: 4096,
+        };
+        assert!(win_frame.is_control_frame());
+        let written_win = win_frame
+            .encode_to_slice(&mut ring_buf)
+            .expect("encode window update to slice");
+        assert_eq!(written_win, 13);
+        assert_eq!(&ring_buf[..written_win], &win_frame.encode());
+
+        let rst_frame = crate::simd_parser::Http2Frame::RstStream {
+            stream_id: 5,
+            error_code: crate::simd_parser::Http2ErrorCode::Cancel,
+        };
+        assert!(rst_frame.is_control_frame());
+        let written_rst = rst_frame
+            .encode_to_slice(&mut ring_buf)
+            .expect("encode rst to slice");
+        assert_eq!(written_rst, 13);
+        assert_eq!(&ring_buf[..written_rst], &rst_frame.encode());
     }
 }
 
