@@ -1409,6 +1409,17 @@ impl Http2Session {
         stream_id
     }
 
+    /// Available outbound credit for a given stream taking into account both connection-level
+    /// and stream-level flow control windows.
+    pub fn outbound_window_available(&self, stream_id: u32) -> i32 {
+        let stream_win = self
+            .streams
+            .get(&stream_id)
+            .map(|s| s.window_size)
+            .unwrap_or(0);
+        std::cmp::min(self.connection_window_size, stream_win)
+    }
+
     /// Check if flow control windows need updating (stream-level and connection-level)
     /// and generate WINDOW_UPDATE frames when window sizes drop below a replenishment threshold.
     pub fn replenish_flow_control_windows(&mut self) -> Vec<Http2Frame> {

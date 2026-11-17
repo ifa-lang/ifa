@@ -2999,7 +2999,8 @@ impl AsyncHttp2Connection {
         self.stream.write_all(&wire)
     }
 
-    /// Send a DATA frame on an existing stream with active flow control chunking (max 16384 bytes).
+    /// Send a DATA frame on an existing stream with active flow control chunking (max 16384 bytes)
+    /// and adaptive backpressure waiting when flow control windows are exhausted.
     pub fn send_data(&mut self, stream_id: u32, data: &[u8], end_stream: bool) -> io::Result<()> {
         const MAX_FRAME_SIZE: usize = 16384;
         if data.is_empty() {
@@ -3008,15 +3009,92 @@ impl AsyncHttp2Connection {
         }
 
         let mut offset = 0;
+        let mut spins = 0;
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(30);
+
         while offset < data.len() {
-            let chunk_len = std::cmp::min(data.len() - offset, MAX_FRAME_SIZE);
+            // Check available outbound flow control credit
+            let avail = self.session.outbound_window_available(stream_id);
+            if avail <= 0 {
+                // Window exhausted: process incoming frames to receive WINDOW_UPDATE
+                if start.elapsed() >= timeout {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "Timed out waiting for HTTP/2 flow control window on stream {}",
+                            stream_id
+                        ),
+                    ));
+                }
+
+                if let Some(frame) = self.try_recv_frame()? {
+                    if let crate::simd_parser::Http2Frame::RstStream {
+                        stream_id: rst_id,
+                        error_code,
+                    } = frame
+                    {
+                        if rst_id == stream_id {
+                            return Err(io::Error::new(
+                                io::ErrorKind::ConnectionReset,
+                                format!("Stream {} reset by peer: {:?}", stream_id, error_code),
+                            ));
+                        }
+                    } else if let crate::simd_parser::Http2Frame::GoAway { error_code, .. } = frame
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            format!("Connection closed by GOAWAY: {:?}", error_code),
+                        ));
+                    }
+                    spins = 0;
+                } else {
+                    if self.is_closed && self.read_buf.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "HTTP/2 connection closed while waiting for flow control credit",
+                        ));
+                    }
+                    spins += 1;
+                    if spins < 16 {
+                        std::hint::spin_loop();
+                    } else {
+                        GLOBAL_SCHEDULER.yield_now();
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                continue;
+            }
+
+            // Transmit at most the available credit and at most MAX_FRAME_SIZE
+            let max_allowed = std::cmp::min(avail as usize, MAX_FRAME_SIZE);
+            let remaining = data.len() - offset;
+            let chunk_len = std::cmp::min(remaining, max_allowed);
             let is_last = end_stream && (offset + chunk_len == data.len());
             let chunk = &data[offset..offset + chunk_len];
+
             let frame = self.session.create_data_frame(stream_id, chunk, is_last);
             self.send_frame(&frame)?;
             offset += chunk_len;
+            spins = 0;
         }
         Ok(())
+    }
+
+    /// Available outbound flow control credit for a given stream taking into account
+    /// both stream-level and connection-level flow control windows.
+    pub fn outbound_window_available(&self, stream_id: u32) -> i32 {
+        self.session.outbound_window_available(stream_id)
+    }
+
+    /// Return current connection-level flow control window size.
+    pub fn connection_window_size(&self) -> i32 {
+        self.session.connection_window_size
+    }
+
+    /// Return current stream-level flow control window size if the stream exists.
+    pub fn stream_window_size(&self, stream_id: u32) -> Option<i32> {
+        self.session.streams.get(&stream_id).map(|s| s.window_size)
     }
 
     /// Initiate an HTTP/2 request on a newly opened stream.
@@ -7733,6 +7811,75 @@ mod tests {
         assert_eq!(resp.headers.get("x-post-processed"), Some("yes"));
         assert_eq!(pool.active_count(), 0);
         assert_eq!(pool.idle_count(), 0);
+    }
+
+    #[test]
+    fn test_async_http2_backpressure_flow_control() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let (tcp_stream, _) = listener.accept().expect("accept connection");
+            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+
+            let mut received_bytes = 0;
+            while let Ok(frame) = server.recv_frame() {
+                match frame {
+                    crate::simd_parser::Http2Frame::Data {
+                        stream_id,
+                        end_stream,
+                        data,
+                    } => {
+                        received_bytes += data.len();
+                        if end_stream {
+                            server
+                                .send_response(
+                                    stream_id,
+                                    &[(":status", "200")],
+                                    Some(b"large-data-ack"),
+                                )
+                                .expect("send response");
+                            let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                            break;
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::Headers { .. } => {}
+                    _ => {}
+                }
+            }
+            assert_eq!(received_bytes, 70_000);
+        });
+
+        let stream =
+            AsyncTcpStream::connect(&format!("127.0.0.1:{}", port)).expect("connect client");
+        let mut client = AsyncHttp2Connection::client_handshake(stream).expect("client handshake");
+
+        // Send a 70 KB payload across stream (larger than standard initial window of 65535 bytes)
+        // This exercises flow control chunking, window depletion, WINDOW_UPDATE reception and backpressure unblocking.
+        let large_payload = vec![0x42u8; 70_000];
+        let stream_id = client
+            .send_request(&[(":method", "POST"), (":path", "/upload")], None)
+            .expect("send request headers");
+
+        assert!(client.outbound_window_available(stream_id) > 0);
+        assert_eq!(client.stream_window_size(stream_id), Some(65535));
+        assert_eq!(client.connection_window_size(), 65535);
+
+        client
+            .send_data(stream_id, &large_payload, true)
+            .expect("send data with backpressure");
+
+        let (resp_headers, resp_body) = client
+            .recv_response_for(stream_id)
+            .expect("receive response");
+        assert!(resp_headers
+            .iter()
+            .any(|(k, v)| k == ":status" && v == "200"));
+        assert_eq!(resp_body, b"large-data-ack");
+
+        let _ = handle.join();
     }
 }
 
