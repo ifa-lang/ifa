@@ -19,6 +19,8 @@ pub enum Http2FrameType {
     GoAway = 0x7,
     WindowUpdate = 0x8,
     Continuation = 0x9,
+    /// RFC 9218 Extensible Prioritization Scheme frame type for HTTP/2
+    PriorityUpdate = 0x10,
     Unknown(u8),
 }
 
@@ -35,6 +37,7 @@ impl From<u8> for Http2FrameType {
             0x7 => Http2FrameType::GoAway,
             0x8 => Http2FrameType::WindowUpdate,
             0x9 => Http2FrameType::Continuation,
+            0x10 => Http2FrameType::PriorityUpdate,
             other => Http2FrameType::Unknown(other),
         }
     }
@@ -53,6 +56,7 @@ impl From<Http2FrameType> for u8 {
             Http2FrameType::GoAway => 0x7,
             Http2FrameType::WindowUpdate => 0x8,
             Http2FrameType::Continuation => 0x9,
+            Http2FrameType::PriorityUpdate => 0x10,
             Http2FrameType::Unknown(u) => u,
         }
     }
@@ -488,6 +492,8 @@ pub enum Http2SettingId {
     InitialWindowSize,
     MaxFrameSize,
     MaxHeaderListSize,
+    /// RFC 9218: SETTINGS_ENABLE_CONNECT_PROTOCOL or SETTINGS parameter (0x10 / etc.)
+    NoRfc7540Priorities,
     Unknown(u16),
 }
 
@@ -500,6 +506,7 @@ impl From<u16> for Http2SettingId {
             0x4 => Http2SettingId::InitialWindowSize,
             0x5 => Http2SettingId::MaxFrameSize,
             0x6 => Http2SettingId::MaxHeaderListSize,
+            0x9 => Http2SettingId::NoRfc7540Priorities,
             other => Http2SettingId::Unknown(other),
         }
     }
@@ -514,7 +521,87 @@ impl From<Http2SettingId> for u16 {
             Http2SettingId::InitialWindowSize => 0x4,
             Http2SettingId::MaxFrameSize => 0x5,
             Http2SettingId::MaxHeaderListSize => 0x6,
+            Http2SettingId::NoRfc7540Priorities => 0x9,
             Http2SettingId::Unknown(other) => other,
+        }
+    }
+}
+
+/// HTTP Extensible Prioritization Scheme (RFC 9218) Priority Parameters.
+/// Contains urgency `u` in 0..=7 (default 3) and incremental boolean flag `i` (default false).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriorityParameters {
+    /// Urgency: 0 is highest priority, 7 is lowest priority. Default is 3.
+    pub urgency: u8,
+    /// Incremental: false means responses should be sent sequentially; true means interleaved.
+    pub incremental: bool,
+}
+
+impl Default for PriorityParameters {
+    fn default() -> Self {
+        Self {
+            urgency: 3,
+            incremental: false,
+        }
+    }
+}
+
+impl PriorityParameters {
+    /// Create a new `PriorityParameters` with validated urgency clamped to 0..=7.
+    pub fn new(urgency: u8, incremental: bool) -> Self {
+        Self {
+            urgency: urgency.min(7),
+            incremental,
+        }
+    }
+
+    /// Parse RFC 9218 Priority structured field value (e.g. `u=1, i`, `u=5`, `i=?1`, `i`).
+    pub fn parse(field_value: &str) -> Self {
+        let mut urgency = 3u8;
+        let mut incremental = false;
+
+        for part in field_value.split(',') {
+            let item = part.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if let Some(eq_pos) = item.find('=') {
+                let (key, val) = item.split_at(eq_pos);
+                let key = key.trim();
+                let val = val[1..].trim();
+                if key.eq_ignore_ascii_case("u") {
+                    if let Ok(u) = val.parse::<u8>() {
+                        if u <= 7 {
+                            urgency = u;
+                        }
+                    }
+                } else if key.eq_ignore_ascii_case("i") {
+                    if val == "?1" || val.eq_ignore_ascii_case("true") {
+                        incremental = true;
+                    } else if val == "?0" || val.eq_ignore_ascii_case("false") {
+                        incremental = false;
+                    }
+                }
+            } else {
+                // Boolean item without explicit value (e.g. `i`)
+                if item.eq_ignore_ascii_case("i") {
+                    incremental = true;
+                }
+            }
+        }
+
+        Self {
+            urgency,
+            incremental,
+        }
+    }
+
+    /// Serialize to RFC 9218 structured field string value (e.g. `u=1, i`).
+    pub fn serialize(&self) -> String {
+        if self.incremental {
+            format!("u={}, i", self.urgency)
+        } else {
+            format!("u={}", self.urgency)
         }
     }
 }
@@ -577,6 +664,11 @@ pub enum Http2Frame {
         promised_stream_id: u32,
         end_headers: bool,
         header_block: Vec<u8>,
+    },
+    /// RFC 9218 PRIORITY_UPDATE frame (Type 0x10) updating priority of a prioritized stream.
+    PriorityUpdate {
+        prioritized_stream_id: u32,
+        priority_field_value: String,
     },
     Unknown {
         header: Http2FrameHeader,
@@ -757,6 +849,21 @@ impl Http2Frame {
                 out.extend_from_slice(&header.encode());
                 out.extend_from_slice(&(*promised_stream_id & 0x7FFF_FFFF).to_be_bytes());
                 out.extend_from_slice(header_block);
+                out
+            }
+            Http2Frame::PriorityUpdate {
+                prioritized_stream_id,
+                priority_field_value,
+            } => {
+                let bytes = priority_field_value.as_bytes();
+                let payload_len = 4 + bytes.len();
+                // RFC 9218: PRIORITY_UPDATE frames MUST be sent on stream 0
+                let header =
+                    Http2FrameHeader::new(payload_len as u32, Http2FrameType::PriorityUpdate, 0, 0);
+                let mut out = Vec::with_capacity(9 + payload_len);
+                out.extend_from_slice(&header.encode());
+                out.extend_from_slice(&(*prioritized_stream_id & 0x7FFF_FFFF).to_be_bytes());
+                out.extend_from_slice(bytes);
                 out
             }
             Http2Frame::Unknown { header, payload } => {
@@ -949,6 +1056,25 @@ impl Http2Frame {
                     promised_stream_id,
                     end_headers,
                     header_block,
+                })
+            }
+            Http2FrameType::PriorityUpdate => {
+                // RFC 9218 Section 4.2:
+                // A PRIORITY_UPDATE frame with length less than 4 octets MUST be treated as a connection error of type FRAME_SIZE_ERROR.
+                // A PRIORITY_UPDATE frame on a stream other than stream 0 MUST be treated as a connection error of type PROTOCOL_ERROR.
+                if header.stream_id != 0 {
+                    return Err(FastHttpError::InvalidRequestLine);
+                }
+                if payload.len() < 4 {
+                    return Err(FastHttpError::InvalidRequestLine);
+                }
+                let prioritized_stream_id =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+                        & 0x7FFF_FFFF;
+                let priority_field_value = String::from_utf8_lossy(&payload[4..]).into_owned();
+                Ok(Http2Frame::PriorityUpdate {
+                    prioritized_stream_id,
+                    priority_field_value,
                 })
             }
             _ => Ok(Http2Frame::Unknown {
@@ -1304,6 +1430,8 @@ pub struct Http2Stream {
     pub stream_dependency: u32,
     pub weight: u8,
     pub exclusive: bool,
+    /// Extensible Prioritization Scheme (RFC 9218) parameters
+    pub priority_params: PriorityParameters,
 }
 
 impl Http2Stream {
@@ -1319,6 +1447,7 @@ impl Http2Stream {
             stream_dependency: 0,
             weight: 16,
             exclusive: false,
+            priority_params: PriorityParameters::default(),
         }
     }
 }
@@ -1623,6 +1752,32 @@ impl Http2Session {
         stream.exclusive = exclusive;
     }
 
+    /// Set or update RFC 9218 priority parameters for a stream.
+    pub fn set_stream_priority_parameters(&mut self, stream_id: u32, priority: PriorityParameters) {
+        let initial_win = self.initial_stream_window_size;
+        let stream = self
+            .streams
+            .entry(stream_id)
+            .or_insert_with(|| Http2Stream::new(stream_id, initial_win));
+        stream.priority_params = priority;
+    }
+
+    /// Compute streams prioritized under RFC 9218 Extensible Prioritization Scheme.
+    /// Ordered by:
+    /// 1. Urgency ascending (0 is highest urgency, 7 is lowest)
+    /// 2. Stream ID ascending (for fair scheduling within the same urgency tier)
+    pub fn prioritized_stream_ids_rfc9218(&self) -> Vec<u32> {
+        let mut streams_info: Vec<(u32, u8)> = self
+            .streams
+            .iter()
+            .map(|(&id, s)| (id, s.priority_params.urgency))
+            .collect();
+
+        // Urgency ascending (0 before 7), then ID ascending
+        streams_info.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        streams_info.into_iter().map(|(id, _)| id).collect()
+    }
+
     /// Compute streams in priority order, resolving dependencies and weighting.
     /// Returns stream IDs sorted by dependency tree depth then relative weight descending.
     pub fn prioritized_stream_ids(&self) -> Vec<u32> {
@@ -1706,11 +1861,18 @@ impl Http2Session {
                 // Note: For ReservedRemote streams (server push promises), the first HEADERS frame represents
                 // the server's response headers rather than trailers.
                 if stream.state == Http2StreamState::ReservedRemote {
-                    stream.received_headers = decoded;
+                    stream.received_headers = decoded.clone();
                 } else if !stream.received_headers.is_empty() {
-                    stream.received_trailers.extend(decoded);
+                    stream.received_trailers.extend(decoded.clone());
                 } else {
-                    stream.received_headers.extend(decoded);
+                    stream.received_headers.extend(decoded.clone());
+                }
+
+                // Check for RFC 9218 `priority` header field
+                for (name, val) in &decoded {
+                    if name.eq_ignore_ascii_case("priority") {
+                        stream.priority_params = PriorityParameters::parse(val);
+                    }
                 }
 
                 match stream.state {
@@ -1812,6 +1974,14 @@ impl Http2Session {
                 weight,
             } => {
                 self.set_stream_priority(*stream_id, *stream_dependency, *weight, *exclusive);
+                Ok(None)
+            }
+            Http2Frame::PriorityUpdate {
+                prioritized_stream_id,
+                priority_field_value,
+            } => {
+                let params = PriorityParameters::parse(priority_field_value);
+                self.set_stream_priority_parameters(*prioritized_stream_id, params);
                 Ok(None)
             }
             Http2Frame::GoAway {
@@ -2093,5 +2263,134 @@ mod http2_tests {
         assert!(Http2ErrorCode::RefusedStream.is_retryable());
         assert!(Http2ErrorCode::Cancel.is_retryable());
         assert!(!Http2ErrorCode::ProtocolError.is_retryable());
+    }
+
+    #[test]
+    fn test_rfc9218_priority_parameters_parsing_and_serialization() {
+        // Defaults
+        let default_params = PriorityParameters::default();
+        assert_eq!(default_params.urgency, 3);
+        assert!(!default_params.incremental);
+        assert_eq!(default_params.serialize(), "u=3");
+
+        // Parse standard formats
+        let p1 = PriorityParameters::parse("u=1, i");
+        assert_eq!(p1.urgency, 1);
+        assert!(p1.incremental);
+        assert_eq!(p1.serialize(), "u=1, i");
+
+        let p2 = PriorityParameters::parse("u=5");
+        assert_eq!(p2.urgency, 5);
+        assert!(!p2.incremental);
+        assert_eq!(p2.serialize(), "u=5");
+
+        let p3 = PriorityParameters::parse("i=?1, u=0");
+        assert_eq!(p3.urgency, 0);
+        assert!(p3.incremental);
+
+        let p4 = PriorityParameters::parse("i=?0, u=7");
+        assert_eq!(p4.urgency, 7);
+        assert!(!p4.incremental);
+
+        // Clamping & fallback: urgency > 7 ignored/clamped
+        let p5 = PriorityParameters::parse("u=9");
+        assert_eq!(p5.urgency, 3); // invalid urgency ignored, default maintained
+
+        let p_clamp = PriorityParameters::new(9, true);
+        assert_eq!(p_clamp.urgency, 7);
+    }
+
+    #[test]
+    fn test_rfc9218_priority_update_frame_encode_decode() {
+        let frame = Http2Frame::PriorityUpdate {
+            prioritized_stream_id: 5,
+            priority_field_value: "u=2, i".to_string(),
+        };
+
+        let encoded = frame.encode();
+        assert_eq!(encoded.len(), 9 + 4 + 6); // header + 4 bytes stream id + 6 bytes payload
+
+        // Frame header check
+        let header = Http2FrameHeader::decode(&encoded[..9]).expect("decode header");
+        assert_eq!(header.length, 10);
+        assert_eq!(header.frame_type, Http2FrameType::PriorityUpdate);
+        assert_eq!(header.stream_id, 0); // must be sent on stream 0
+
+        // Frame body check
+        let decoded = Http2Frame::decode(&header, &encoded[9..]).expect("decode frame");
+        match decoded {
+            Http2Frame::PriorityUpdate {
+                prioritized_stream_id,
+                priority_field_value,
+            } => {
+                assert_eq!(prioritized_stream_id, 5);
+                assert_eq!(priority_field_value, "u=2, i");
+            }
+            _ => panic!("Expected PriorityUpdate frame"),
+        }
+    }
+
+    #[test]
+    fn test_rfc9218_session_priority_update_and_scheduling() {
+        let mut session = Http2Session::new(true);
+
+        // Receive PRIORITY_UPDATE frame for stream 3 (urgency 6)
+        let pu1 = Http2Frame::PriorityUpdate {
+            prioritized_stream_id: 3,
+            priority_field_value: "u=6".to_string(),
+        };
+        session.handle_frame(&pu1).expect("handle pu1");
+
+        // Receive PRIORITY_UPDATE frame for stream 5 (urgency 1, incremental)
+        let pu2 = Http2Frame::PriorityUpdate {
+            prioritized_stream_id: 5,
+            priority_field_value: "u=1, i".to_string(),
+        };
+        session.handle_frame(&pu2).expect("handle pu2");
+
+        // Receive PRIORITY_UPDATE frame for stream 1 (urgency 3)
+        let pu3 = Http2Frame::PriorityUpdate {
+            prioritized_stream_id: 1,
+            priority_field_value: "u=3".to_string(),
+        };
+        session.handle_frame(&pu3).expect("handle pu3");
+
+        // Priority order under RFC 9218: stream 5 (u=1), stream 1 (u=3), stream 3 (u=6)
+        assert_eq!(session.prioritized_stream_ids_rfc9218(), vec![5, 1, 3]);
+
+        // Dynamically update stream 3 to urgency 0 (highest urgency)
+        let pu_override = Http2Frame::PriorityUpdate {
+            prioritized_stream_id: 3,
+            priority_field_value: "u=0".to_string(),
+        };
+        session
+            .handle_frame(&pu_override)
+            .expect("handle pu_override");
+
+        assert_eq!(session.prioritized_stream_ids_rfc9218(), vec![3, 5, 1]);
+    }
+
+    #[test]
+    fn test_rfc9218_headers_priority_field_auto_extraction() {
+        let mut session = Http2Session::new(true);
+
+        // Encode a HEADERS frame with "priority: u=2, i"
+        let mut enc = HpackContext::default();
+        let header_block = enc.encode_headers(&[(":status", "200"), ("priority", "u=2, i")]);
+
+        let headers_frame = Http2Frame::Headers {
+            stream_id: 9,
+            end_stream: false,
+            end_headers: true,
+            header_block,
+        };
+
+        session
+            .handle_frame(&headers_frame)
+            .expect("handle headers");
+
+        let stream = session.streams.get(&9).expect("stream 9 exists");
+        assert_eq!(stream.priority_params.urgency, 2);
+        assert!(stream.priority_params.incremental);
     }
 }
