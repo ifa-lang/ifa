@@ -2775,9 +2775,172 @@ impl Http2Session {
     }
 
     /// Schedule and allocate outbound DATA frames using the session's internal `pending_outbound_data` buffer.
-    pub fn schedule_pending_outbound_data(&mut self, max_frame_size: usize) -> Vec<Http2Frame> {
+    ///
+    /// If `end_stream` is true, the final frame for each fully drained stream will have `end_stream = true`.
+    /// If false, frames are scheduled with `end_stream = false` allowing subsequent data to be queued and scheduled.
+    pub fn schedule_pending_outbound_data(
+        &mut self,
+        max_frame_size: usize,
+        end_stream: bool,
+    ) -> Vec<Http2Frame> {
         let mut pending = std::mem::take(&mut self.pending_outbound_data);
-        let frames = self.schedule_outbound_data(&mut pending, max_frame_size);
+        let mut frames = Vec::new();
+        if self.connection_window_size <= 0 || pending.is_empty() {
+            self.pending_outbound_data = pending;
+            return frames;
+        }
+
+        let max_frame = std::cmp::max(16384, max_frame_size);
+
+        // Group active streams that have pending data by urgency tier (0 to 7)
+        let mut streams_by_urgency: [Vec<u32>; 8] = Default::default();
+        for (&stream_id, buf) in pending.iter() {
+            if buf.is_empty() {
+                continue;
+            }
+            if let Some(stream) = self.streams.get(&stream_id) {
+                if stream.state == Http2StreamState::Open
+                    || stream.state == Http2StreamState::HalfClosedRemote
+                {
+                    let u = stream.priority_params.urgency.min(7) as usize;
+                    streams_by_urgency[u].push(stream_id);
+                }
+            }
+        }
+
+        for urgency_tier in streams_by_urgency.iter_mut() {
+            if self.connection_window_size <= 0 {
+                break;
+            }
+            if urgency_tier.is_empty() {
+                continue;
+            }
+
+            urgency_tier.sort_unstable();
+
+            let mut non_incremental = Vec::new();
+            let mut incremental = Vec::new();
+            for &stream_id in urgency_tier.iter() {
+                let is_inc = self
+                    .streams
+                    .get(&stream_id)
+                    .map(|s| s.priority_params.incremental)
+                    .unwrap_or(false);
+                if is_inc {
+                    incremental.push(stream_id);
+                } else {
+                    non_incremental.push(stream_id);
+                }
+            }
+
+            // 1. Non-incremental streams
+            for stream_id in non_incremental {
+                if self.connection_window_size <= 0 {
+                    break;
+                }
+
+                while let Some(buf) = pending.get_mut(&stream_id) {
+                    if buf.is_empty() || self.connection_window_size <= 0 {
+                        break;
+                    }
+
+                    let stream_win = match self.streams.get(&stream_id) {
+                        Some(s)
+                            if s.state == Http2StreamState::Open
+                                || s.state == Http2StreamState::HalfClosedRemote =>
+                        {
+                            s.window_size
+                        }
+                        _ => break,
+                    };
+                    if stream_win <= 0 {
+                        break;
+                    }
+
+                    let available_credit =
+                        std::cmp::min(self.connection_window_size, stream_win) as usize;
+                    if available_credit == 0 {
+                        break;
+                    }
+
+                    let chunk_size =
+                        std::cmp::min(buf.len(), std::cmp::min(available_credit, max_frame));
+                    if chunk_size == 0 {
+                        break;
+                    }
+
+                    let chunk = buf.drain(..chunk_size).collect::<Vec<u8>>();
+                    let is_last = end_stream && buf.is_empty();
+
+                    let frame = self.create_data_frame(stream_id, &chunk, is_last);
+                    frames.push(frame);
+                }
+            }
+
+            // 2. Incremental streams
+            if !incremental.is_empty() {
+                loop {
+                    if self.connection_window_size <= 0 {
+                        break;
+                    }
+
+                    let mut any_sent_in_round = false;
+                    for &stream_id in &incremental {
+                        if self.connection_window_size <= 0 {
+                            break;
+                        }
+
+                        let stream_win = match self.streams.get(&stream_id) {
+                            Some(s)
+                                if s.state == Http2StreamState::Open
+                                    || s.state == Http2StreamState::HalfClosedRemote =>
+                            {
+                                s.window_size
+                            }
+                            _ => continue,
+                        };
+                        if stream_win <= 0 {
+                            continue;
+                        }
+
+                        let available_credit =
+                            std::cmp::min(self.connection_window_size, stream_win) as usize;
+                        if available_credit == 0 {
+                            continue;
+                        }
+
+                        if let Some(buf) = pending.get_mut(&stream_id) {
+                            if buf.is_empty() {
+                                continue;
+                            }
+
+                            let weight_ratio = self
+                                .streams
+                                .get(&stream_id)
+                                .map(|s| s.weight as usize)
+                                .unwrap_or(16);
+                            let quantum = (1024 * weight_ratio / 16).clamp(512, max_frame);
+                            let chunk_size =
+                                std::cmp::min(buf.len(), std::cmp::min(available_credit, quantum));
+
+                            if chunk_size > 0 {
+                                let chunk = buf.drain(..chunk_size).collect::<Vec<u8>>();
+                                let is_last = end_stream && buf.is_empty();
+
+                                let frame = self.create_data_frame(stream_id, &chunk, is_last);
+                                frames.push(frame);
+                                any_sent_in_round = true;
+                            }
+                        }
+                    }
+
+                    if !any_sent_in_round {
+                        break;
+                    }
+                }
+            }
+        }
+
         pending.retain(|_, v| !v.is_empty());
         self.pending_outbound_data = pending;
         frames

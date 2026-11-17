@@ -3716,6 +3716,36 @@ impl AsyncHttp2Connection {
         }
     }
 
+    /// Flushes queued outbound stream data by scheduling DATA frames via the HTTP/2 session's
+    /// priority scheduler (RFC 9218 & dependency weights) and transmitting them over the wire.
+    ///
+    /// If `end_stream` is true, the final transmitted DATA frame for fully-drained streams marks `end_stream`.
+    /// Returns the number of DATA frames transmitted.
+    pub fn flush_scheduled_outbound_data(&mut self, end_stream: bool) -> io::Result<usize> {
+        let frames = self
+            .session
+            .schedule_pending_outbound_data(16384, end_stream);
+        let count = frames.len();
+        for frame in &frames {
+            self.send_frame(frame)?;
+        }
+        Ok(count)
+    }
+
+    /// Queue outbound body data for a stream and immediately schedule/flush as many DATA frames
+    /// as permitted by the stream and connection flow control windows and RFC 9218 priority.
+    ///
+    /// Returns the number of frames transmitted. Any un-transmitted bytes remain queued in the session.
+    pub fn send_queued_data(
+        &mut self,
+        stream_id: u32,
+        data: &[u8],
+        end_stream: bool,
+    ) -> io::Result<usize> {
+        self.session.queue_outbound_data(stream_id, data);
+        self.flush_scheduled_outbound_data(end_stream)
+    }
+
     /// Execute a batch of prioritized requests multiplexed over this single HTTP/2 connection.
     /// Sends PRIORITY or PRIORITY_UPDATE frames for each stream, sends the requests concurrently,
     /// and collects responses in the order of the dependency tree and weights (or RFC 9218 urgency tiers).
@@ -7603,6 +7633,63 @@ mod tests {
             .expect("client send goaway");
 
         handle.join().expect("server thread finished");
+    }
+
+    #[test]
+    fn test_http2_send_queued_data_and_flush() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let handle = std::thread::spawn(move || {
+            let (std_stream, _) = listener.accept().expect("accept connection");
+            std_stream.set_nonblocking(true).expect("set nonblocking");
+            let stream = AsyncTcpStream::from_std(std_stream).expect("async tcp stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(stream).expect("server h2 handshake");
+
+            let mut received_bytes = Vec::new();
+            loop {
+                let frame = server.recv_frame().expect("server recv frame");
+                match frame {
+                    crate::simd_parser::Http2Frame::Data { data, .. } => {
+                        received_bytes.extend_from_slice(&data);
+                    }
+                    crate::simd_parser::Http2Frame::GoAway { .. } => break,
+                    _ => {}
+                }
+            }
+            received_bytes
+        });
+
+        let stream = AsyncTcpStream::connect(addr).expect("client connect");
+        let mut client =
+            AsyncHttp2Connection::client_handshake(stream).expect("client h2 handshake");
+
+        // Open stream
+        let stream_id = client.session.open_stream();
+        let headers_frame = client
+            .session
+            .create_headers_frame(stream_id, &[(":method", "POST"), (":path", "/upload")], false);
+        client.send_frame(&headers_frame).expect("send headers");
+
+        // Send queued data using priority/flow-control scheduler
+        let chunk1 = vec![b'A'; 2048];
+        let sent1 = client.send_queued_data(stream_id, &chunk1, false).expect("send queued 1");
+        assert!(sent1 >= 1);
+
+        let chunk2 = vec![b'B'; 4096];
+        client.session.queue_outbound_data(stream_id, &chunk2);
+        let sent2 = client.flush_scheduled_outbound_data(true).expect("flush queued 2");
+        assert!(sent2 >= 1);
+
+        client
+            .send_goaway(crate::simd_parser::Http2ErrorCode::NoError)
+            .expect("client goaway");
+
+        let server_received = handle.join().expect("server thread finish");
+        assert_eq!(server_received.len(), 2048 + 4096);
+        assert_eq!(&server_received[..2048], chunk1.as_slice());
+        assert_eq!(&server_received[2048..], chunk2.as_slice());
     }
 
     #[test]
