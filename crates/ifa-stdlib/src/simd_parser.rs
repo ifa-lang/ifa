@@ -1179,6 +1179,7 @@ pub struct Http2Stream {
     pub window_size: i32,
     pub received_headers: Vec<(String, String)>,
     pub received_data: Vec<u8>,
+    pub reset_error: Option<Http2ErrorCode>,
 }
 
 impl Http2Stream {
@@ -1189,6 +1190,7 @@ impl Http2Stream {
             window_size: initial_window_size,
             received_headers: Vec::new(),
             received_data: Vec::new(),
+            reset_error: None,
         }
     }
 }
@@ -1341,6 +1343,22 @@ impl Http2Session {
         }
     }
 
+    /// Create and encode a RST_STREAM frame to abort an active stream with an error code.
+    pub fn reset_stream(
+        &mut self,
+        stream_id: u32,
+        error_code: Http2ErrorCode,
+    ) -> Http2Frame {
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.state = Http2StreamState::Closed;
+            stream.reset_error = Some(error_code);
+        }
+        Http2Frame::RstStream {
+            stream_id,
+            error_code,
+        }
+    }
+
     /// Process an incoming decoded frame.
     pub fn handle_frame(
         &mut self,
@@ -1442,10 +1460,11 @@ impl Http2Session {
             }
             Http2Frame::RstStream {
                 stream_id,
-                error_code: _,
+                error_code,
             } => {
                 if let Some(stream) = self.streams.get_mut(stream_id) {
                     stream.state = Http2StreamState::Closed;
+                    stream.reset_error = Some(*error_code);
                 }
                 Ok(None)
             }

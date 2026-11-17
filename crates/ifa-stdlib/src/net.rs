@@ -3134,6 +3134,67 @@ impl AsyncHttp2Connection {
         res
     }
 
+    /// Abort an active stream with a specific HTTP/2 error code and notify the peer via RST_STREAM.
+    pub fn rst_stream(
+        &mut self,
+        stream_id: u32,
+        error_code: crate::simd_parser::Http2ErrorCode,
+    ) -> io::Result<()> {
+        let frame = self.session.reset_stream(stream_id, error_code);
+        self.send_frame(&frame)
+    }
+
+    /// Read incoming frames until the target stream is fully closed or reset, draining and discarding remaining frames.
+    pub fn drain_stream(&mut self, target_stream_id: u32) -> io::Result<()> {
+        let mut spins = 0;
+        loop {
+            if let Some(stream) = self.session.streams.get(&target_stream_id) {
+                if stream.state == crate::simd_parser::Http2StreamState::Closed {
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
+            }
+
+            if let Some(frame) = self.try_recv_frame()? {
+                let frame_stream_id = match &frame {
+                    crate::simd_parser::Http2Frame::Headers { stream_id, .. } => *stream_id,
+                    crate::simd_parser::Http2Frame::Data { stream_id, .. } => *stream_id,
+                    crate::simd_parser::Http2Frame::RstStream { stream_id, .. } => *stream_id,
+                    crate::simd_parser::Http2Frame::GoAway { error_code, .. } => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            format!("Connection closed by GOAWAY: {:?}", error_code),
+                        ));
+                    }
+                    _ => 0,
+                };
+
+                if frame_stream_id == target_stream_id {
+                    if let Some(stream) = self.session.streams.get(&target_stream_id) {
+                        if stream.state == crate::simd_parser::Http2StreamState::Closed {
+                            return Ok(());
+                        }
+                    }
+                }
+            } else {
+                if self.is_closed && self.read_buf.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "HTTP/2 connection is closed during drain",
+                    ));
+                }
+                spins += 1;
+                if spins < 16 {
+                    std::hint::spin_loop();
+                } else {
+                    GLOBAL_SCHEDULER.yield_now();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
     /// Read incoming frames until the response for `target_stream_id` is fully received (headers and optional body).
     /// Returns the decoded headers and payload data.
     #[allow(clippy::type_complexity)]
@@ -5331,6 +5392,111 @@ mod tests {
         assert_eq!(resp.headers.get("content-type"), Some("application/json"));
         assert_eq!(resp.headers.get("server"), Some("ifa-http2"));
         assert_eq!(resp.body_str().unwrap(), "{\"status\":\"ok\",\"h2\":true}");
+
+        client
+            .send_goaway(crate::simd_parser::Http2ErrorCode::NoError)
+            .expect("client send goaway");
+
+        handle.join().expect("server thread finished");
+    }
+
+    #[test]
+    fn test_async_http2_rst_stream_and_drain() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let handle = std::thread::spawn(move || {
+            let (std_stream, _) = listener.accept().expect("accept connection");
+            std_stream.set_nonblocking(true).expect("set nonblocking");
+            let stream = AsyncTcpStream::from_std(std_stream).expect("async tcp stream");
+
+            let mut server =
+                AsyncHttp2Connection::server_handshake(stream).expect("server h2 handshake");
+
+            // Server receives frames
+            loop {
+                let frame = server.recv_frame().expect("server recv frame");
+                match frame {
+                    crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            // If stream_id == 1, server resets it with RefusedStream
+                            if stream_id == 1 {
+                                server
+                                    .rst_stream(
+                                        stream_id,
+                                        crate::simd_parser::Http2ErrorCode::RefusedStream,
+                                    )
+                                    .expect("server send rst_stream");
+                            } else {
+                                let res_headers = vec![(":status", "200")];
+                                server
+                                    .send_response(stream_id, &res_headers, Some(b"ok stream 3"))
+                                    .expect("server send response");
+                            }
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::RstStream { stream_id, error_code } => {
+                        assert_eq!(error_code, crate::simd_parser::Http2ErrorCode::Cancel);
+                        assert_eq!(stream_id, 5);
+                        break;
+                    }
+                    crate::simd_parser::Http2Frame::GoAway { .. } => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let stream = AsyncTcpStream::connect(addr).expect("client connect");
+        let mut client =
+            AsyncHttp2Connection::client_handshake(stream).expect("client h2 handshake");
+
+        // 1. Client initiates stream 1
+        let s1 = client
+            .send_request(&[(":method", "GET"), (":path", "/aborted")], None)
+            .expect("send req 1");
+        assert_eq!(s1, 1);
+
+        // Client attempts to recv response for stream 1, which will be reset by server
+        let err = client.recv_response_for(s1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        assert!(err.to_string().contains("RefusedStream"));
+
+        // Check that session stream state is Closed
+        let stream_info = client.session.streams.get(&s1).unwrap();
+        assert_eq!(stream_info.state, crate::simd_parser::Http2StreamState::Closed);
+        assert_eq!(
+            stream_info.reset_error,
+            Some(crate::simd_parser::Http2ErrorCode::RefusedStream)
+        );
+
+        // 2. Client initiates stream 3, which succeeds normally (proving connection multiplexing intact)
+        let s3 = client
+            .send_request(&[(":method", "GET"), (":path", "/normal")], None)
+            .expect("send req 3");
+        assert_eq!(s3, 3);
+
+        let (_headers3, body3) = client.recv_response_for(s3).expect("recv resp 3");
+        assert_eq!(body3, b"ok stream 3");
+
+        // 3. Client actively cancels stream 5 and drains it
+        let s5 = client
+            .send_request(&[(":method", "POST"), (":path", "/cancel-me")], None)
+            .expect("send req 5");
+        assert_eq!(s5, 5);
+
+        client
+            .rst_stream(s5, crate::simd_parser::Http2ErrorCode::Cancel)
+            .expect("client send rst_stream");
+        client.drain_stream(s5).expect("client drain stream");
+
+        assert_eq!(
+            client.session.streams.get(&s5).unwrap().state,
+            crate::simd_parser::Http2StreamState::Closed
+        );
 
         client
             .send_goaway(crate::simd_parser::Http2ErrorCode::NoError)
