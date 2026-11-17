@@ -4242,10 +4242,38 @@ impl SseDecoder {
     }
 }
 
+/// Snapshot statistics and telemetry for an `AsyncSseClient` session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseClientStats {
+    /// Number of discrete events successfully decoded and yielded to the client.
+    pub events_received: u64,
+    /// Total raw bytes ingested from the TCP transport.
+    pub bytes_received: u64,
+    /// Last known event ID dispatched or tracked on this connection, if any.
+    pub last_event_id: Option<String>,
+    /// Number of bytes currently unparsed in the decoder buffer.
+    pub buffered_bytes: usize,
+}
+
+/// Snapshot statistics and telemetry for an `AsyncSseServer` session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseServerStats {
+    /// Total events sent to the client.
+    pub events_sent: u64,
+    /// Total heartbeat comment frames sent.
+    pub heartbeats_sent: u64,
+    /// Total wire bytes transmitted over the TCP stream.
+    pub bytes_sent: u64,
+    /// Last event ID transmitted, if any.
+    pub last_event_id: Option<String>,
+}
+
 /// Asynchronous Server-Sent Events (SSE) Client over colorless fibers (`AsyncTcpStream`).
 pub struct AsyncSseClient {
     stream: AsyncTcpStream,
     decoder: SseDecoder,
+    events_received: u64,
+    bytes_received: u64,
 }
 
 impl AsyncSseClient {
@@ -4254,6 +4282,8 @@ impl AsyncSseClient {
         Self {
             stream,
             decoder: SseDecoder::new(),
+            events_received: 0,
+            bytes_received: 0,
         }
     }
 
@@ -4264,20 +4294,27 @@ impl AsyncSseClient {
 
         loop {
             if let Some(event) = self.decoder.next_event() {
+                self.events_received += 1;
                 return Ok(Some(event));
             }
 
             match self.stream.try_read(&mut chunk) {
                 Ok(Some(n)) if n > 0 => {
+                    self.bytes_received += n as u64;
                     self.decoder.push_bytes(&chunk[..n]);
                     spins = 0;
                     if let Some(event) = self.decoder.next_event() {
+                        self.events_received += 1;
                         return Ok(Some(event));
                     }
                 }
                 Ok(Some(0)) => {
                     // Stream closed; check if trailing event exists
-                    return Ok(self.decoder.next_event());
+                    let trailing = self.decoder.next_event();
+                    if trailing.is_some() {
+                        self.events_received += 1;
+                    }
+                    return Ok(trailing);
                 }
                 Ok(Some(_)) | Ok(None) => {}
                 Err(e) => return Err(e),
@@ -4297,11 +4334,50 @@ impl AsyncSseClient {
     pub fn last_event_id(&self) -> Option<&str> {
         self.decoder.last_event_id()
     }
+
+    /// Number of bytes currently pending in the unparsed decoder buffer.
+    pub fn buffered_bytes(&self) -> usize {
+        self.decoder.buffer.len()
+    }
+
+    /// Number of events successfully received and dispatched.
+    pub fn events_received(&self) -> u64 {
+        self.events_received
+    }
+
+    /// Total number of raw stream bytes received from the network.
+    pub fn bytes_received(&self) -> u64 {
+        self.bytes_received
+    }
+
+    /// Returns a telemetry snapshot of client metrics.
+    pub fn stats(&self) -> SseClientStats {
+        SseClientStats {
+            events_received: self.events_received,
+            bytes_received: self.bytes_received,
+            last_event_id: self.decoder.last_event_id.clone(),
+            buffered_bytes: self.buffered_bytes(),
+        }
+    }
+
+    /// Return local socket address if available.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.local_addr()
+    }
+
+    /// Return remote peer address if available.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.peer_addr()
+    }
 }
 
 /// Asynchronous Server-Sent Events (SSE) Server stream over colorless fibers (`AsyncTcpStream`).
 pub struct AsyncSseServer {
     stream: AsyncTcpStream,
+    events_sent: u64,
+    heartbeats_sent: u64,
+    bytes_sent: u64,
+    last_event_id: Option<String>,
 }
 
 impl AsyncSseServer {
@@ -4316,28 +4392,92 @@ impl AsyncSseServer {
             "\r\n"
         );
         stream.write_all(response_headers.as_bytes())?;
-        Ok(Self { stream })
+        let bytes_sent = response_headers.len() as u64;
+        Ok(Self {
+            stream,
+            events_sent: 0,
+            heartbeats_sent: 0,
+            bytes_sent,
+            last_event_id: None,
+        })
     }
 
     /// Wrap an existing stream already initialized with headers.
     pub fn from_raw_stream(stream: AsyncTcpStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            events_sent: 0,
+            heartbeats_sent: 0,
+            bytes_sent: 0,
+            last_event_id: None,
+        }
     }
 
     /// Send an `SseEvent` to the client.
     pub fn send_event(&mut self, event: &SseEvent) -> io::Result<()> {
         let payload = event.to_wire_string();
-        self.stream.write_all(payload.as_bytes())
+        let bytes = payload.as_bytes();
+        self.stream.write_all(bytes)?;
+        self.bytes_sent += bytes.len() as u64;
+        self.events_sent += 1;
+        if let Some(ref id) = event.id {
+            self.last_event_id = Some(id.clone());
+        }
+        Ok(())
     }
 
     /// Send a keep-alive comment heartbeat `: ping\n\n`.
     pub fn send_heartbeat(&mut self) -> io::Result<()> {
-        self.stream.write_all(b": ping\n\n")
+        let ping_bytes = b": ping\n\n";
+        self.stream.write_all(ping_bytes)?;
+        self.bytes_sent += ping_bytes.len() as u64;
+        self.heartbeats_sent += 1;
+        Ok(())
     }
 
     /// Send raw text data as a default event.
     pub fn send_data(&mut self, data: &str) -> io::Result<()> {
         self.send_event(&SseEvent::new(data))
+    }
+
+    /// Return total events dispatched to client.
+    pub fn events_sent(&self) -> u64 {
+        self.events_sent
+    }
+
+    /// Return total heartbeats sent to client.
+    pub fn heartbeats_sent(&self) -> u64 {
+        self.heartbeats_sent
+    }
+
+    /// Return total bytes transmitted over wire.
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent
+    }
+
+    /// Return last event ID transmitted if any.
+    pub fn last_event_id(&self) -> Option<&str> {
+        self.last_event_id.as_deref()
+    }
+
+    /// Returns a telemetry snapshot of server metrics.
+    pub fn stats(&self) -> SseServerStats {
+        SseServerStats {
+            events_sent: self.events_sent,
+            heartbeats_sent: self.heartbeats_sent,
+            bytes_sent: self.bytes_sent,
+            last_event_id: self.last_event_id.clone(),
+        }
+    }
+
+    /// Return local socket address if available.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.local_addr()
+    }
+
+    /// Return remote peer address if available.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.peer_addr()
     }
 }
 
@@ -5719,20 +5859,33 @@ mod tests {
         GLOBAL_SCHEDULER.spawn(move || {
             let stream = AsyncTcpStream::connect(addr).expect("connect client");
             let mut client = AsyncSseClient::new(stream);
+            assert_eq!(client.events_received(), 0);
+            assert_eq!(client.bytes_received(), 0);
 
             let ev1 = client.read_event().expect("read 1").expect("some event 1");
             assert_eq!(ev1.data, "ready");
             assert_eq!(ev1.id.as_deref(), Some("msg-1"));
             assert_eq!(client.last_event_id(), Some("msg-1"));
+            assert_eq!(client.events_received(), 1);
+            assert!(client.bytes_received() > 0);
 
             let ev2 = client.read_event().expect("read 2").expect("some event 2");
             assert_eq!(ev2.comment.as_deref(), Some("ping"));
+            assert_eq!(client.events_received(), 2);
 
             let ev3 = client.read_event().expect("read 3").expect("some event 3");
             assert_eq!(ev3.event.as_deref(), Some("telemetry"));
             assert_eq!(ev3.data, "sensor update payload");
             assert_eq!(ev3.id.as_deref(), Some("msg-2"));
             assert_eq!(client.last_event_id(), Some("msg-2"));
+            assert_eq!(client.events_received(), 3);
+
+            let stats = client.stats();
+            assert_eq!(stats.events_received, 3);
+            assert_eq!(stats.last_event_id.as_deref(), Some("msg-2"));
+            assert!(stats.bytes_received > 0);
+            assert!(client.local_addr().is_ok());
+            assert!(client.peer_addr().is_ok());
         });
 
         let mut server = loop {
@@ -5743,10 +5896,21 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
 
+        assert_eq!(server.events_sent(), 0);
+        assert_eq!(server.heartbeats_sent(), 0);
+        assert!(server.bytes_sent() > 0); // response headers sent
+        assert!(server.local_addr().is_ok());
+        assert!(server.peer_addr().is_ok());
+
         server
             .send_event(&SseEvent::new("ready").with_id("msg-1"))
             .expect("send event 1");
+        assert_eq!(server.events_sent(), 1);
+        assert_eq!(server.last_event_id(), Some("msg-1"));
+
         server.send_heartbeat().expect("heartbeat");
+        assert_eq!(server.heartbeats_sent(), 1);
+
         server
             .send_event(
                 &SseEvent::new("sensor update payload")
@@ -5754,6 +5918,14 @@ mod tests {
                     .with_id("msg-2"),
             )
             .expect("send event 2");
+        assert_eq!(server.events_sent(), 2);
+        assert_eq!(server.last_event_id(), Some("msg-2"));
+
+        let server_stats = server.stats();
+        assert_eq!(server_stats.events_sent, 2);
+        assert_eq!(server_stats.heartbeats_sent, 1);
+        assert_eq!(server_stats.last_event_id.as_deref(), Some("msg-2"));
+        assert!(server_stats.bytes_sent > 0);
     }
 
     #[test]
