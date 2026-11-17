@@ -3404,7 +3404,11 @@ impl AsyncHttp2Connection {
         let mut spins = 0;
         loop {
             let frame = self.recv_frame()?;
-            if let crate::simd_parser::Http2Frame::Ping { ack, opaque_data: resp_data } = frame {
+            if let crate::simd_parser::Http2Frame::Ping {
+                ack,
+                opaque_data: resp_data,
+            } = frame
+            {
                 if ack && resp_data == opaque_data {
                     return Ok(());
                 }
@@ -6394,16 +6398,10 @@ mod tests {
         let second = &results[1];
 
         assert_eq!(first.0, 3);
-        assert_eq!(
-            first.1.as_ref().unwrap().body,
-            b"response-stream-3"
-        );
+        assert_eq!(first.1.as_ref().unwrap().body, b"response-stream-3");
 
         assert_eq!(second.0, 1);
-        assert_eq!(
-            second.1.as_ref().unwrap().body,
-            b"response-stream-1"
-        );
+        assert_eq!(second.1.as_ref().unwrap().body, b"response-stream-1");
 
         // Connection was released back into pool
         assert_eq!(pool.idle_count(), 1);
@@ -6493,7 +6491,10 @@ mod tests {
                     error_code,
                     debug_data,
                 } => {
-                    assert_eq!(error_code, crate::simd_parser::Http2ErrorCode::InternalError);
+                    assert_eq!(
+                        error_code,
+                        crate::simd_parser::Http2ErrorCode::InternalError
+                    );
                     assert_eq!(&debug_data[..], b"fatal connection degradation");
                     assert_eq!(last_stream_id, 0);
                 }
@@ -6501,7 +6502,8 @@ mod tests {
             }
         });
 
-        let stream = AsyncTcpStream::connect(&format!("127.0.0.1:{}", port)).expect("connect client");
+        let stream =
+            AsyncTcpStream::connect(&format!("127.0.0.1:{}", port)).expect("connect client");
         let mut client = AsyncHttp2Connection::client_handshake(stream).expect("client handshake");
 
         client

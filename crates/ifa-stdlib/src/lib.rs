@@ -110,8 +110,8 @@ pub use net::{
     lookup_mime_type, resolve_host, resolve_host_v4, resolve_host_v6, resolve_socket_addrs,
     AsyncHttp2Connection, AsyncHttp2Pool, AsyncSseClient, AsyncSseServer, AsyncTcpListener,
     AsyncTcpStream, AsyncTimer, AsyncUdpSocket, AsyncWsConnection, AsyncWsPool, BufferedTcpStream,
-    ConnectionInfo, Datagram, EventHub, Http2PrioritizedRequest, HubMessage, SessionId, SessionSink,
-    SocketConfig, SseDecoder, TcpListener as NetTcpListener, TcpListener, TcpServer,
+    ConnectionInfo, Datagram, EventHub, Http2PrioritizedRequest, HubMessage, SessionId,
+    SessionSink, SocketConfig, SseDecoder, TcpListener as NetTcpListener, TcpListener, TcpServer,
     TcpStream as NetTcpStream, TcpStream, TokenBucket, UdpSocket as NetUdpSocket, UdpSocket,
     WsClient, WsDemux, WsFrame, WsMessage, WsOpcode, WsServer, WsSession,
 };
