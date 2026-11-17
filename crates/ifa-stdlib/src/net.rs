@@ -5355,6 +5355,169 @@ pub fn benchmark_tcp_throughput(
     })
 }
 
+/// Statistics and telemetry collected from an endurance stress benchmark run over async TCP streams.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsyncTcpEnduranceResult {
+    /// Identifier or benchmark name.
+    pub name: String,
+    /// Number of concurrent async worker threads/tasks.
+    pub concurrent_conns: usize,
+    /// Total successful ping-pong echo cycles across all connections.
+    pub total_cycles: usize,
+    /// Total bytes transmitted over all connections.
+    pub total_bytes_transferred: usize,
+    /// Duration of the test in milliseconds.
+    pub duration_ms: f64,
+    /// Throughput in operations (request/response cycles) per second.
+    pub ops_per_sec: f64,
+    /// Bandwidth throughput in Megabytes per second (MB/s).
+    pub throughput_mb_per_sec: f64,
+    /// Average round-trip latency in nanoseconds.
+    pub avg_latency_ns: f64,
+    /// Count of transmission or connection errors encountered (must be 0 for resilient runs).
+    pub error_count: usize,
+}
+
+/// Runs a multithreaded endurance and throughput stress benchmark for `AsyncTcpStream` under concurrent load.
+///
+/// Spawns an echo server listening via non-blocking TCP socket, and creates `concurrent_conns` worker
+/// threads that each establish an `AsyncTcpStream`, continuously streaming `payload_size` bytes back and forth
+/// for `cycles_per_conn` iterations.
+pub fn benchmark_async_tcp_endurance(
+    concurrent_conns: usize,
+    cycles_per_conn: usize,
+    payload_size: usize,
+) -> io::Result<AsyncTcpEnduranceResult> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let payload = vec![0x5Au8; payload_size.max(1)];
+
+    let _total_expected_cycles = concurrent_conns * cycles_per_conn;
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let server_running = running.clone();
+
+    // Multithreaded echo server
+    let server_handle = std::thread::spawn(move || {
+        let mut conn_handles = Vec::new();
+        while server_running.load(std::sync::atomic::Ordering::Relaxed) {
+            listener.set_nonblocking(true).ok();
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let handle = std::thread::spawn(move || {
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            match stream.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    if stream.write_all(&buf[..n]).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                    std::thread::yield_now();
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+                    conn_handles.push(handle);
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => break,
+            }
+        }
+        for h in conn_handles {
+            let _ = h.join();
+        }
+    });
+
+    let errors_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let completed_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let start = std::time::Instant::now();
+    let mut client_handles = Vec::new();
+
+    for _ in 0..concurrent_conns {
+        let p = payload.clone();
+        let errs = errors_counter.clone();
+        let compl = completed_counter.clone();
+        let h = std::thread::spawn(move || {
+            let mut client_stream = match AsyncTcpStream::connect(addr) {
+                Ok(s) => s,
+                Err(_) => {
+                    errs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            };
+            let mut echo_buf = vec![0u8; p.len()];
+            for _ in 0..cycles_per_conn {
+                if client_stream.write_all(&p).is_err() {
+                    errs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                if client_stream.read_exact(&mut echo_buf).is_err() {
+                    errs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                if echo_buf != p {
+                    errs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                compl.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        client_handles.push(h);
+    }
+
+    for h in client_handles {
+        let _ = h.join();
+    }
+
+    let elapsed = start.elapsed();
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    // Unblock accept loop
+    let _ = std::net::TcpStream::connect(addr);
+    let _ = server_handle.join();
+
+    let total_cycles = completed_counter.load(std::sync::atomic::Ordering::Relaxed);
+    let error_count = errors_counter.load(std::sync::atomic::Ordering::Relaxed);
+    let duration_ms = elapsed.as_secs_f64() * 1000.0;
+    let duration_secs = elapsed.as_secs_f64();
+    let total_bytes_transferred = total_cycles * payload_size * 2; // bidirectional (sent + received)
+
+    let ops_per_sec = if duration_secs > 0.0 {
+        (total_cycles as f64) / duration_secs
+    } else {
+        0.0
+    };
+    let throughput_mb_per_sec = if duration_secs > 0.0 {
+        ((total_bytes_transferred as f64) / (1024.0 * 1024.0)) / duration_secs
+    } else {
+        0.0
+    };
+    let avg_latency_ns = if total_cycles > 0 {
+        (elapsed.as_nanos() as f64) / (total_cycles as f64)
+    } else {
+        0.0
+    };
+
+    Ok(AsyncTcpEnduranceResult {
+        name: format!(
+            "async_tcp_endurance_{}conns_{}cycles_{}bytes",
+            concurrent_conns, cycles_per_conn, payload_size
+        ),
+        concurrent_conns,
+        total_cycles,
+        total_bytes_transferred,
+        duration_ms,
+        ops_per_sec,
+        throughput_mb_per_sec,
+        avg_latency_ns,
+        error_count,
+    })
+}
+
 /// Executes the full suite of in-memory network primitive micro-benchmarks and returns a unified report.
 pub fn run_net_benchmark_suite(iterations_per_test: usize) -> NetBenchmarkReport {
     let start = std::time::Instant::now();
@@ -8834,6 +8997,16 @@ mod cookie_tests {
         assert_eq!(tcp_res.iterations, 200);
         assert!(tcp_res.ops_per_sec > 0.0);
         assert!(tcp_res.total_time_ms > 0.0);
+
+        // Multithreaded endurance and throughput stress benchmark for AsyncTcpStream
+        let endurance_res =
+            benchmark_async_tcp_endurance(4, 30, 256).expect("async tcp endurance benchmark");
+        assert_eq!(endurance_res.concurrent_conns, 4);
+        assert_eq!(endurance_res.total_cycles, 120);
+        assert_eq!(endurance_res.error_count, 0);
+        assert!(endurance_res.ops_per_sec > 0.0);
+        assert!(endurance_res.throughput_mb_per_sec >= 0.0);
+        assert!(endurance_res.total_bytes_transferred == 120 * 256 * 2);
     }
 }
 
