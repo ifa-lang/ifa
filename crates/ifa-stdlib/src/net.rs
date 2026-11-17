@@ -9182,7 +9182,11 @@ mod tls_alpn_tests {
 
     #[test]
     fn test_alpn_protocol_wire_round_trip() {
-        for proto in [AlpnProtocol::Http2, AlpnProtocol::Http11, AlpnProtocol::Http10] {
+        for proto in [
+            AlpnProtocol::Http2,
+            AlpnProtocol::Http11,
+            AlpnProtocol::Http10,
+        ] {
             assert_eq!(AlpnProtocol::from_wire_id(proto.as_wire_id()), proto);
         }
     }
@@ -9345,7 +9349,10 @@ mod tls_alpn_tests {
 
     #[test]
     fn test_parse_alpn_too_short_is_incomplete() {
-        assert_eq!(parse_alpn_from_client_hello(&[]), AlpnParseResult::Incomplete);
+        assert_eq!(
+            parse_alpn_from_client_hello(&[]),
+            AlpnParseResult::Incomplete
+        );
         assert_eq!(
             parse_alpn_from_client_hello(&[0x16, 0x03, 0x03]),
             AlpnParseResult::Incomplete
@@ -9428,7 +9435,7 @@ mod tls_alpn_tests {
         // ── Handshake header ─────────────────────────────────────────────────
         let mut hs: Vec<u8> = Vec::new();
         hs.push(tls_const::CLIENT_HELLO); // msg_type
-        // length: 3 bytes big-endian
+                                          // length: 3 bytes big-endian
         let body_len = body.len() as u32;
         hs.push(((body_len >> 16) & 0xFF) as u8);
         hs.push(((body_len >> 8) & 0xFF) as u8);
