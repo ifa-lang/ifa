@@ -1733,11 +1733,23 @@ pub const HPACK_STATIC_TABLE: &[(&str, &str)] = &[
     ("www-authenticate", ""),
 ];
 
+/// Dynamic table eviction policy for HPACK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HpackEvictionPolicy {
+    /// Standard FIFO eviction (RFC 7541: oldest inserted entry evicted first).
+    Fifo,
+    /// LRU eviction: entries accessed during encoding or decoding are refreshed,
+    /// and the least recently referenced dynamic header is evicted first when table capacity is exceeded.
+    Lru,
+}
+
 /// HPACK Header Encoder / Decoder with Dynamic Table (RFC 7541) and Literal Cache.
 #[derive(Debug, Clone)]
 pub struct HpackContext {
     pub max_table_size: usize,
     pub dynamic_table: Vec<(String, String)>,
+    /// Eviction policy governing the dynamic table (default: Fifo as per RFC 7541).
+    pub eviction_policy: HpackEvictionPolicy,
     /// Cache of frequently decoded literal strings to avoid repeated allocation and decoding.
     pub literal_cache: Vec<(Vec<u8>, String)>,
     pub max_literal_cache_size: usize,
@@ -1756,11 +1768,23 @@ impl HpackContext {
         Self {
             max_table_size,
             dynamic_table: Vec::new(),
+            eviction_policy: HpackEvictionPolicy::Fifo,
             literal_cache: Vec::new(),
             max_literal_cache_size: 64,
             literal_cache_hits: 0,
             literal_cache_misses: 0,
         }
+    }
+
+    /// Set the dynamic table eviction policy (e.g. Fifo or Lru).
+    pub fn with_eviction_policy(mut self, policy: HpackEvictionPolicy) -> Self {
+        self.eviction_policy = policy;
+        self
+    }
+
+    /// Set the dynamic table eviction policy mutably.
+    pub fn set_eviction_policy(&mut self, policy: HpackEvictionPolicy) {
+        self.eviction_policy = policy;
     }
 
     /// Configure the maximum number of entries cached for literal string representations.
@@ -1818,12 +1842,42 @@ impl HpackContext {
         }
     }
 
-    /// Add an entry to the dynamic table with FIFO eviction.
+    /// Retrieve an entry by 1-based index and touch it if LRU eviction policy is active.
+    pub fn get_and_touch_entry(&mut self, index: usize) -> Option<(String, String)> {
+        if index == 0 {
+            return None;
+        }
+        if index <= HPACK_STATIC_TABLE.len() {
+            let (n, v) = HPACK_STATIC_TABLE[index - 1];
+            Some((n.to_string(), v.to_string()))
+        } else {
+            let dyn_idx = index - HPACK_STATIC_TABLE.len() - 1;
+            if dyn_idx < self.dynamic_table.len() {
+                if self.eviction_policy == HpackEvictionPolicy::Lru && dyn_idx > 0 {
+                    let entry = self.dynamic_table.remove(dyn_idx);
+                    self.dynamic_table.insert(0, entry);
+                    Some(self.dynamic_table[0].clone())
+                } else {
+                    Some(self.dynamic_table[dyn_idx].clone())
+                }
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Add an entry to the dynamic table with configurable eviction (FIFO or LRU).
     pub fn add_dynamic_entry(&mut self, name: String, value: String) {
         let entry_size = name.len() + value.len() + 32;
         if entry_size > self.max_table_size {
             self.dynamic_table.clear();
             return;
+        }
+        // If entry already exists and LRU is enabled, move/update to front
+        if self.eviction_policy == HpackEvictionPolicy::Lru {
+            if let Some(pos) = self.dynamic_table.iter().position(|(n, v)| n == &name && v == &value) {
+                self.dynamic_table.remove(pos);
+            }
         }
         self.dynamic_table.insert(0, (name, value));
         let mut cur_size: usize = self
@@ -1931,15 +1985,15 @@ impl HpackContext {
                 // Indexed Header Field (RFC 7541 Section 6.1)
                 let (idx, consumed) = hpack_decode_integer(&bytes[offset..], 7)?;
                 offset += consumed;
-                let (name, val) = self.get_entry(idx).ok_or(FastHttpError::InvalidHeader)?;
-                out.push((name.to_string(), val.to_string()));
+                let (name, val) = self.get_and_touch_entry(idx).ok_or(FastHttpError::InvalidHeader)?;
+                out.push((name, val));
             } else if (b & 0x40) != 0 {
                 // Literal Header Field with Incremental Indexing (RFC 7541 Section 6.2.1)
                 let (idx, consumed) = hpack_decode_integer(&bytes[offset..], 6)?;
                 offset += consumed;
                 let name = if idx != 0 {
-                    let (n, _) = self.get_entry(idx).ok_or(FastHttpError::InvalidHeader)?;
-                    n.to_string()
+                    let (n, _) = self.get_and_touch_entry(idx).ok_or(FastHttpError::InvalidHeader)?;
+                    n
                 } else {
                     let (raw_str, consumed_str) = Self::decode_string_raw(&bytes[offset..])?;
                     let s = self.get_or_decode_literal(raw_str)?;
@@ -1962,8 +2016,8 @@ impl HpackContext {
                 let (idx, consumed) = hpack_decode_integer(&bytes[offset..], 4)?;
                 offset += consumed;
                 let name = if idx != 0 {
-                    let (n, _) = self.get_entry(idx).ok_or(FastHttpError::InvalidHeader)?;
-                    n.to_string()
+                    let (n, _) = self.get_and_touch_entry(idx).ok_or(FastHttpError::InvalidHeader)?;
+                    n
                 } else {
                     let (raw_str, consumed_str) = Self::decode_string_raw(&bytes[offset..])?;
                     let s = self.get_or_decode_literal(raw_str)?;
@@ -3404,5 +3458,51 @@ mod http2_tests {
         // Verify newly opened streams receive the updated initial window size
         let stream3 = session.open_stream();
         assert_eq!(session.streams.get(&stream3).unwrap().window_size, 131072);
+    }
+
+    #[test]
+    fn test_hpack_lru_eviction_policy() {
+        // Create an HPACK context with capacity limited to fit roughly 2 entries.
+        // Each entry consumes: name.len() + value.len() + 32 bytes.
+        // "k1": "v1" -> 2 + 2 + 32 = 36 bytes.
+        // Max table size 75 allows holding 2 entries (72 bytes), but a 3rd will evict.
+        let mut ctx = HpackContext::new(75).with_eviction_policy(HpackEvictionPolicy::Lru);
+        assert_eq!(ctx.eviction_policy, HpackEvictionPolicy::Lru);
+
+        ctx.add_dynamic_entry("k1".to_string(), "v1".to_string());
+        ctx.add_dynamic_entry("k2".to_string(), "v2".to_string());
+        assert_eq!(ctx.dynamic_table.len(), 2);
+        assert_eq!(ctx.dynamic_table[0].0, "k2");
+        assert_eq!(ctx.dynamic_table[1].0, "k1");
+
+        // Touch entry "k1" via get_and_touch_entry.
+        // Static table length is 61, so k2 is index 62, k1 is index 63.
+        let touched = ctx.get_and_touch_entry(63).expect("find k1");
+        assert_eq!(touched.0, "k1");
+        assert_eq!(touched.1, "v1");
+
+        // Because of LRU, "k1" is now at index 0 (index 62), and "k2" is at index 1 (index 63).
+        assert_eq!(ctx.dynamic_table[0].0, "k1");
+        assert_eq!(ctx.dynamic_table[1].0, "k2");
+
+        // Add 3rd entry "k3" -> 36 bytes. Exceeds 75 bytes, so the LRU entry ("k2") is evicted.
+        ctx.add_dynamic_entry("k3".to_string(), "v3".to_string());
+        assert_eq!(ctx.dynamic_table.len(), 2);
+        assert_eq!(ctx.dynamic_table[0].0, "k3");
+        assert_eq!(ctx.dynamic_table[1].0, "k1");
+
+        // Verify FIFO behavior as contrast
+        let mut fifo_ctx = HpackContext::new(75).with_eviction_policy(HpackEvictionPolicy::Fifo);
+        fifo_ctx.add_dynamic_entry("k1".to_string(), "v1".to_string());
+        fifo_ctx.add_dynamic_entry("k2".to_string(), "v2".to_string());
+        let _ = fifo_ctx.get_and_touch_entry(63); // Touch k1 in FIFO mode
+        // In FIFO mode, touching does not reorder
+        assert_eq!(fifo_ctx.dynamic_table[0].0, "k2");
+        assert_eq!(fifo_ctx.dynamic_table[1].0, "k1");
+        fifo_ctx.add_dynamic_entry("k3".to_string(), "v3".to_string());
+        // Oldest entry "k1" evicted first in FIFO
+        assert_eq!(fifo_ctx.dynamic_table.len(), 2);
+        assert_eq!(fifo_ctx.dynamic_table[0].0, "k3");
+        assert_eq!(fifo_ctx.dynamic_table[1].0, "k2");
     }
 }
