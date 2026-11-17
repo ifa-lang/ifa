@@ -2761,6 +2761,70 @@ impl Http2Session {
         streams_info.into_iter().map(|(id, _, _)| id).collect()
     }
 
+    /// Schedule and allocate outbound DATA frames fairly across active streams based on
+    /// their RFC 9218 urgency (0 highest .. 7 lowest), incremental flags, and flow control windows.
+    /// Returns a list of generated Http2Frame::Data frames respecting connection and stream window limits.
+    pub fn schedule_outbound_data(
+        &mut self,
+        pending_data: &mut std::collections::HashMap<u32, Vec<u8>>,
+        max_frame_size: usize,
+    ) -> Vec<Http2Frame> {
+        let mut frames = Vec::new();
+        if self.connection_window_size <= 0 || pending_data.is_empty() {
+            return frames;
+        }
+
+        let max_frame = std::cmp::max(16384, max_frame_size);
+
+        // Group active streams that have pending data by urgency
+        let prioritized_ids = self.prioritized_stream_ids_rfc9218();
+
+        for stream_id in prioritized_ids {
+            if self.connection_window_size <= 0 {
+                break;
+            }
+
+            let stream_win = match self.streams.get(&stream_id) {
+                Some(s)
+                    if s.state == Http2StreamState::Open
+                        || s.state == Http2StreamState::HalfClosedRemote =>
+                {
+                    s.window_size
+                }
+                _ => continue,
+            };
+
+            if stream_win <= 0 {
+                continue;
+            }
+
+            let available_credit = std::cmp::min(self.connection_window_size, stream_win) as usize;
+            if available_credit == 0 {
+                continue;
+            }
+
+            if let Some(buf) = pending_data.get_mut(&stream_id) {
+                if buf.is_empty() {
+                    continue;
+                }
+
+                let chunk_size =
+                    std::cmp::min(buf.len(), std::cmp::min(available_credit, max_frame));
+                if chunk_size == 0 {
+                    continue;
+                }
+
+                let chunk = buf.drain(..chunk_size).collect::<Vec<u8>>();
+                let end_stream = buf.is_empty();
+
+                let frame = self.create_data_frame(stream_id, &chunk, end_stream);
+                frames.push(frame);
+            }
+        }
+
+        frames
+    }
+
     /// Process an incoming decoded frame.
     pub fn handle_frame(
         &mut self,
@@ -3812,5 +3876,94 @@ mod http2_tests {
             _ => panic!("Expected WindowUpdate frame"),
         }
         assert_eq!(session.connection_window_size, 750_000);
+    }
+
+    #[test]
+    fn test_schedule_outbound_data_rfc9218_priority() {
+        let mut session = Http2Session::new(false);
+        // Create 3 open streams: stream 1 (urgency 3), stream 3 (urgency 0 - critical), stream 5 (urgency 6)
+        let mut s1 = Http2Stream::new(1, 65535);
+        s1.state = Http2StreamState::Open;
+        let mut s3 = Http2Stream::new(3, 65535);
+        s3.state = Http2StreamState::Open;
+        let mut s5 = Http2Stream::new(5, 65535);
+        s5.state = Http2StreamState::Open;
+
+        session.streams.insert(1, s1);
+        session.streams.insert(3, s3);
+        session.streams.insert(5, s5);
+
+        session.set_stream_priority_parameters(
+            1,
+            PriorityParameters {
+                urgency: 3,
+                incremental: false,
+            },
+        );
+        session.set_stream_priority_parameters(
+            3,
+            PriorityParameters {
+                urgency: 0,
+                incremental: false,
+            },
+        );
+        session.set_stream_priority_parameters(
+            5,
+            PriorityParameters {
+                urgency: 6,
+                incremental: false,
+            },
+        );
+
+        let mut pending = std::collections::HashMap::new();
+        pending.insert(1, vec![1u8; 100]);
+        pending.insert(3, vec![3u8; 200]);
+        pending.insert(5, vec![5u8; 300]);
+
+        // Connection window initially 65535
+        let frames = session.schedule_outbound_data(&mut pending, 16384);
+        assert_eq!(frames.len(), 3);
+
+        // Frame order must respect urgency: stream 3 (urgency 0) first, then stream 1 (urgency 3), then stream 5 (urgency 6)
+        match &frames[0] {
+            Http2Frame::Data {
+                stream_id,
+                data,
+                end_stream,
+            } => {
+                assert_eq!(*stream_id, 3);
+                assert_eq!(data.len(), 200);
+                assert!(*end_stream);
+            }
+            _ => panic!("Expected Data frame for stream 3"),
+        }
+
+        match &frames[1] {
+            Http2Frame::Data {
+                stream_id,
+                data,
+                end_stream,
+            } => {
+                assert_eq!(*stream_id, 1);
+                assert_eq!(data.len(), 100);
+                assert!(*end_stream);
+            }
+            _ => panic!("Expected Data frame for stream 1"),
+        }
+
+        match &frames[2] {
+            Http2Frame::Data {
+                stream_id,
+                data,
+                end_stream,
+            } => {
+                assert_eq!(*stream_id, 5);
+                assert_eq!(data.len(), 300);
+                assert!(*end_stream);
+            }
+            _ => panic!("Expected Data frame for stream 5"),
+        }
+
+        assert!(pending.values().all(|b| b.is_empty()));
     }
 }
