@@ -1774,6 +1774,150 @@ pub enum HpackEvictionPolicy {
     Lru,
 }
 
+/// HPACK compression telemetry metrics tracking header savings and compression efficiency.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HpackTelemetry {
+    /// Total count of headers passed for encoding.
+    pub total_headers: usize,
+    /// Total bytes of raw (uncompressed) header names and values.
+    pub raw_bytes: usize,
+    /// Total bytes produced after HPACK encoding.
+    pub compressed_bytes: usize,
+    /// Number of header fields served directly from static table index (1-byte overhead).
+    pub static_table_hits: usize,
+    /// Number of header fields served directly from dynamic table index.
+    pub dynamic_table_hits: usize,
+    /// Number of header literals emitted with Huffman encoding.
+    pub huffman_encoded_literals: usize,
+}
+
+impl HpackTelemetry {
+    /// Compression ratio: compressed bytes divided by raw bytes.
+    /// E.g. 0.40 indicates headers compressed to 40% of their raw size.
+    pub fn compression_ratio(&self) -> f64 {
+        if self.raw_bytes == 0 {
+            1.0
+        } else {
+            self.compressed_bytes as f64 / self.raw_bytes as f64
+        }
+    }
+
+    /// Savings percentage: (1.0 - compression_ratio) * 100.
+    /// E.g. 60.0% means HPACK saved 60% of wire traffic compared to uncompressed HTTP/1.1 headers.
+    pub fn savings_percentage(&self) -> f64 {
+        if self.raw_bytes == 0 {
+            0.0
+        } else {
+            (1.0 - self.compression_ratio()) * 100.0
+        }
+    }
+}
+
+/// Adaptive flow control parameters based on estimated bandwidth and round-trip time (RTT).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdaptiveFlowControlConfig {
+    /// Minimum connection window allowed (default: 64 KB).
+    pub min_connection_window: i32,
+    /// Maximum connection window allowed (default: 16 MB).
+    pub max_connection_window: i32,
+    /// Target bandwidth-delay product (BDP) multiplier headroom (default: 1.5).
+    pub bdp_headroom: f64,
+}
+
+impl Default for AdaptiveFlowControlConfig {
+    fn default() -> Self {
+        Self {
+            min_connection_window: 65535,
+            max_connection_window: 16 * 1024 * 1024,
+            bdp_headroom: 1.5,
+        }
+    }
+}
+
+/// Adaptive flow control estimator maintaining smoothed RTT and bandwidth metrics.
+#[derive(Debug, Clone)]
+pub struct AdaptiveFlowController {
+    pub config: AdaptiveFlowControlConfig,
+    /// Smoothed round-trip time in microseconds (SRTT).
+    pub smoothed_rtt_us: Option<u64>,
+    /// Estimated bandwidth in bytes per second.
+    pub estimated_bandwidth_bps: Option<u64>,
+    /// Last target connection window calculated from BDP.
+    pub target_connection_window: i32,
+    /// Last ping sequence sent timestamp for RTT measurement.
+    pub pending_ping_timestamp: Option<(u64, std::time::Instant)>,
+}
+
+impl Default for AdaptiveFlowController {
+    fn default() -> Self {
+        Self::new(AdaptiveFlowControlConfig::default())
+    }
+}
+
+impl AdaptiveFlowController {
+    pub fn new(config: AdaptiveFlowControlConfig) -> Self {
+        let initial_win = config.min_connection_window;
+        Self {
+            config,
+            smoothed_rtt_us: None,
+            estimated_bandwidth_bps: None,
+            target_connection_window: initial_win,
+            pending_ping_timestamp: None,
+        }
+    }
+
+    /// Record a round-trip time sample in microseconds and update smoothed RTT (RFC 6298 EWMA).
+    pub fn record_rtt_sample(&mut self, sample_rtt_us: u64) {
+        match self.smoothed_rtt_us {
+            None => self.smoothed_rtt_us = Some(sample_rtt_us),
+            Some(srtt) => {
+                // EWMA: srtt = 7/8 * srtt + 1/8 * sample
+                let new_srtt = (srtt * 7 + sample_rtt_us) / 8;
+                self.smoothed_rtt_us = Some(new_srtt);
+            }
+        }
+        self.recompute_target_window();
+    }
+
+    /// Record an observed bandwidth sample in bytes per second.
+    pub fn record_bandwidth_sample(
+        &mut self,
+        bytes_transferred: usize,
+        duration: std::time::Duration,
+    ) {
+        let dur_secs = duration.as_secs_f64();
+        if dur_secs > 0.0 {
+            let sample_bps = (bytes_transferred as f64 / dur_secs) as u64;
+            match self.estimated_bandwidth_bps {
+                None => self.estimated_bandwidth_bps = Some(sample_bps),
+                Some(prev_bps) => {
+                    // EWMA with 3/4 weight on historical
+                    let new_bps = (prev_bps * 3 + sample_bps) / 4;
+                    self.estimated_bandwidth_bps = Some(new_bps);
+                }
+            }
+            self.recompute_target_window();
+        }
+    }
+
+    /// Recompute the optimal Bandwidth-Delay Product (BDP) window size.
+    pub fn recompute_target_window(&mut self) -> i32 {
+        if let (Some(rtt_us), Some(bps)) = (self.smoothed_rtt_us, self.estimated_bandwidth_bps) {
+            let rtt_secs = rtt_us as f64 / 1_000_000.0;
+            let bdp_bytes = bps as f64 * rtt_secs;
+            let target_with_headroom = (bdp_bytes * self.config.bdp_headroom) as i32;
+            let clamped = target_with_headroom.clamp(
+                self.config.min_connection_window,
+                self.config.max_connection_window,
+            );
+            self.target_connection_window = clamped;
+            clamped
+        } else {
+            self.target_connection_window
+        }
+    }
+}
+
 /// HPACK Header Encoder / Decoder with Dynamic Table (RFC 7541) and Literal Cache.
 #[derive(Debug, Clone)]
 pub struct HpackContext {
@@ -1786,6 +1930,8 @@ pub struct HpackContext {
     pub max_literal_cache_size: usize,
     pub literal_cache_hits: usize,
     pub literal_cache_misses: usize,
+    /// Telemetry metrics tracking compression ratio and table hits.
+    pub telemetry: HpackTelemetry,
 }
 
 impl Default for HpackContext {
@@ -1804,6 +1950,7 @@ impl HpackContext {
             max_literal_cache_size: 64,
             literal_cache_hits: 0,
             literal_cache_misses: 0,
+            telemetry: HpackTelemetry::default(),
         }
     }
 
@@ -1939,7 +2086,13 @@ impl HpackContext {
         use_huffman: bool,
     ) -> Vec<u8> {
         let mut out = Vec::new();
+        let initial_len = out.len();
+        let mut raw_bytes_count = 0;
+
         for &(name, value) in headers {
+            raw_bytes_count += name.len() + value.len() + 4; // approximate raw HTTP/1.1 ": \r\n"
+            self.telemetry.total_headers += 1;
+
             let mut matched_idx = None;
             let mut matched_name_idx = None;
 
@@ -1974,14 +2127,25 @@ impl HpackContext {
 
             if let Some(idx) = matched_idx {
                 // 1. Indexed Header Field (RFC 7541 Section 6.1): 1xxxxxxx
+                if idx <= HPACK_STATIC_TABLE.len() {
+                    self.telemetry.static_table_hits += 1;
+                } else {
+                    self.telemetry.dynamic_table_hits += 1;
+                }
                 hpack_encode_integer(idx, 7, 0x80, &mut out);
             } else if let Some(name_idx) = matched_name_idx {
                 // 2. Literal Header Field with Incremental Indexing — Indexed Name (RFC 7541 Section 6.2.1): 01xxxxxx
+                if use_huffman {
+                    self.telemetry.huffman_encoded_literals += 1;
+                }
                 hpack_encode_integer(name_idx, 6, 0x40, &mut out);
                 hpack_encode_string_custom(value.as_bytes(), &mut out, use_huffman);
                 self.add_dynamic_entry(name.to_ascii_lowercase(), value.to_string());
             } else {
                 // 3. Literal Header Field with Incremental Indexing — New Name: 01000000
+                if use_huffman {
+                    self.telemetry.huffman_encoded_literals += 2;
+                }
                 out.push(0x40);
                 hpack_encode_string_custom(
                     name.to_ascii_lowercase().as_bytes(),
@@ -1992,6 +2156,10 @@ impl HpackContext {
                 self.add_dynamic_entry(name.to_ascii_lowercase(), value.to_string());
             }
         }
+
+        self.telemetry.raw_bytes += raw_bytes_count;
+        self.telemetry.compressed_bytes += out.len() - initial_len;
+
         out
     }
 
@@ -2150,6 +2318,8 @@ pub struct Http2Session {
     /// RFC 7838 alternative services advertised by peer.
     /// Maps origin string (or empty for current origin) to list of available routes.
     pub alt_svc_routes: std::collections::HashMap<String, Vec<AltSvcRoute>>,
+    /// Adaptive flow controller optimizing connection and stream windows based on RTT and bandwidth.
+    pub adaptive_flow_controller: AdaptiveFlowController,
 }
 
 impl Http2Session {
@@ -2179,6 +2349,7 @@ impl Http2Session {
             initial_stream_window_size: Self::DEFAULT_INITIAL_WINDOW_SIZE,
             last_received_goaway: None,
             alt_svc_routes: std::collections::HashMap::new(),
+            adaptive_flow_controller: AdaptiveFlowController::default(),
         }
     }
 
@@ -2313,15 +2484,19 @@ impl Http2Session {
     }
 
     /// Automatically evaluate and adapt inbound flow control windows across all active streams
-    /// based on RFC 9218 urgency and stream activity, emitting `WINDOW_UPDATE` frames as necessary.
+    /// based on RFC 9218 urgency, estimated bandwidth-delay product (BDP), and stream activity,
+    /// emitting `WINDOW_UPDATE` frames as necessary.
     pub fn adapt_and_replenish_inbound_windows(&mut self) -> Vec<Http2Frame> {
         let mut updates = Vec::new();
 
-        // 1. Connection-level replenish if below half default initial window
-        let conn_threshold = Self::DEFAULT_INITIAL_WINDOW_SIZE / 2;
+        // 1. Connection-level replenish using BDP adaptive target window if greater than default
+        let target_conn_win = std::cmp::max(
+            Self::DEFAULT_INITIAL_WINDOW_SIZE,
+            self.adaptive_flow_controller.target_connection_window,
+        );
+        let conn_threshold = target_conn_win / 2;
         if self.connection_window_size < conn_threshold {
-            let increment =
-                (Self::DEFAULT_INITIAL_WINDOW_SIZE - self.connection_window_size) as u32;
+            let increment = (target_conn_win - self.connection_window_size) as u32;
             if increment > 0 {
                 self.connection_window_size += increment as i32;
                 updates.push(Http2Frame::WindowUpdate {
@@ -2623,6 +2798,18 @@ impl Http2Session {
                         ack: true,
                         opaque_data: *opaque_data,
                     }));
+                } else {
+                    // Pong received: calculate RTT if matching pending ping
+                    let seq = u64::from_be_bytes(*opaque_data);
+                    if let Some((pending_seq, start_instant)) =
+                        self.adaptive_flow_controller.pending_ping_timestamp
+                    {
+                        if pending_seq == seq {
+                            let elapsed_us = start_instant.elapsed().as_micros() as u64;
+                            self.adaptive_flow_controller.record_rtt_sample(elapsed_us);
+                            self.adaptive_flow_controller.pending_ping_timestamp = None;
+                        }
+                    }
                 }
                 Ok(None)
             }
@@ -3559,5 +3746,71 @@ mod http2_tests {
         assert_eq!(fifo_ctx.dynamic_table.len(), 2);
         assert_eq!(fifo_ctx.dynamic_table[0].0, "k3");
         assert_eq!(fifo_ctx.dynamic_table[1].0, "k2");
+    }
+
+    #[test]
+    fn test_hpack_compression_telemetry_metrics() {
+        let mut ctx = HpackContext::default();
+        let headers = [
+            (":method", "GET"),
+            (":path", "/index.html"),
+            (":scheme", "https"),
+            (":authority", "example.com"),
+            ("user-agent", "IFA/1.0"),
+            ("accept", "application/json"),
+        ];
+
+        let encoded = ctx.encode_headers_with_options(&headers, true);
+        assert!(!encoded.is_empty());
+
+        let telem = ctx.telemetry;
+        assert_eq!(telem.total_headers, 6);
+        assert!(telem.raw_bytes > 0);
+        assert!(telem.compressed_bytes > 0);
+        assert!(telem.static_table_hits >= 3); // :method GET, :path /index.html, :scheme https
+        assert!(telem.compression_ratio() < 1.0);
+        assert!(telem.savings_percentage() > 0.0);
+    }
+
+    #[test]
+    fn test_adaptive_flow_control_bdp_estimation() {
+        let mut session = Http2Session::new(false);
+        assert_eq!(session.connection_window_size, 65535);
+
+        // Record RTT sample: 50 ms = 50,000 us
+        session.adaptive_flow_controller.record_rtt_sample(50_000);
+        assert_eq!(
+            session.adaptive_flow_controller.smoothed_rtt_us,
+            Some(50_000)
+        );
+
+        // Record Bandwidth sample: 10 MB/s (10,000,000 bytes over 1 second)
+        session
+            .adaptive_flow_controller
+            .record_bandwidth_sample(10_000_000, std::time::Duration::from_secs(1));
+        assert_eq!(
+            session.adaptive_flow_controller.estimated_bandwidth_bps,
+            Some(10_000_000)
+        );
+
+        // BDP = 10,000,000 * 0.050s = 500,000 bytes. With 1.5 headroom = 750,000 bytes.
+        let target_win = session.adaptive_flow_controller.target_connection_window;
+        assert_eq!(target_win, 750_000);
+
+        // Replenish inbound windows should emit connection WINDOW_UPDATE adapting to high BDP
+        session.connection_window_size = 100_000; // below 750_000 / 2 = 375_000
+        let updates = session.adapt_and_replenish_inbound_windows();
+        assert!(!updates.is_empty());
+        match &updates[0] {
+            Http2Frame::WindowUpdate {
+                stream_id,
+                window_size_increment,
+            } => {
+                assert_eq!(*stream_id, 0);
+                assert_eq!(*window_size_increment, 650_000); // 750,000 - 100,000
+            }
+            _ => panic!("Expected WindowUpdate frame"),
+        }
+        assert_eq!(session.connection_window_size, 750_000);
     }
 }
