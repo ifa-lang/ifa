@@ -2954,12 +2954,7 @@ impl AsyncHttp2Connection {
     }
 
     /// Send a DATA frame on an existing stream with active flow control chunking (max 16384 bytes).
-    pub fn send_data(
-        &mut self,
-        stream_id: u32,
-        data: &[u8],
-        end_stream: bool,
-    ) -> io::Result<()> {
+    pub fn send_data(&mut self, stream_id: u32, data: &[u8], end_stream: bool) -> io::Result<()> {
         const MAX_FRAME_SIZE: usize = 16384;
         if data.is_empty() {
             let frame = self.session.create_data_frame(stream_id, &[], end_stream);

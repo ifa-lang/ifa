@@ -1251,7 +1251,8 @@ impl Http2Session {
 
         // Check connection-level window
         if self.connection_window_size < replenish_threshold {
-            let increment = (Self::DEFAULT_INITIAL_WINDOW_SIZE - self.connection_window_size) as u32;
+            let increment =
+                (Self::DEFAULT_INITIAL_WINDOW_SIZE - self.connection_window_size) as u32;
             if increment > 0 {
                 self.connection_window_size += increment as i32;
                 updates.push(Http2Frame::WindowUpdate {
