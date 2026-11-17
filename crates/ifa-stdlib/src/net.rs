@@ -2839,6 +2839,268 @@ impl AsyncWsPool {
     }
 }
 
+/// Asynchronous HTTP/2 Connection running over an `AsyncTcpStream` on colorless fibers.
+/// Handles preface negotiation, frame buffering, multiplexing, and bidirectional streams.
+pub struct AsyncHttp2Connection {
+    pub stream: AsyncTcpStream,
+    pub session: crate::simd_parser::Http2Session,
+    read_buf: Vec<u8>,
+    is_closed: bool,
+}
+
+impl AsyncHttp2Connection {
+    /// Create a new `AsyncHttp2Connection` wrapping an active `AsyncTcpStream`.
+    pub fn new(stream: AsyncTcpStream, is_server: bool) -> Self {
+        Self {
+            stream,
+            session: crate::simd_parser::Http2Session::new(is_server),
+            read_buf: Vec::with_capacity(8192),
+            is_closed: false,
+        }
+    }
+
+    /// Whether this HTTP/2 connection is closed.
+    pub fn is_closed(&self) -> bool {
+        self.is_closed
+    }
+
+    /// Perform HTTP/2 client handshake: sends client connection preface and initial SETTINGS frame.
+    pub fn client_handshake(mut stream: AsyncTcpStream) -> io::Result<Self> {
+        // 1. Send client preface
+        stream.write_all(crate::simd_parser::Http2Session::CLIENT_PREFACE)?;
+
+        // 2. Send initial SETTINGS frame
+        let session = crate::simd_parser::Http2Session::new(false);
+        let settings_frame = crate::simd_parser::Http2Frame::Settings {
+            ack: false,
+            settings: session.local_settings.clone(),
+        };
+        stream.write_all(&settings_frame.encode())?;
+
+        Ok(Self {
+            stream,
+            session,
+            read_buf: Vec::with_capacity(8192),
+            is_closed: false,
+        })
+    }
+
+    /// Perform HTTP/2 server handshake: validates client preface and sends server SETTINGS frame.
+    pub fn server_handshake(mut stream: AsyncTcpStream) -> io::Result<Self> {
+        // Read client preface (24 bytes)
+        let preface_len = crate::simd_parser::Http2Session::CLIENT_PREFACE.len();
+        let mut preface_buf = vec![0u8; preface_len];
+        let mut read = 0;
+        let mut spins = 0;
+
+        while read < preface_len {
+            match stream.try_read(&mut preface_buf[read..]) {
+                Ok(Some(n)) if n > 0 => {
+                    read += n;
+                    spins = 0;
+                }
+                Ok(Some(0)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Client closed before completing HTTP/2 preface",
+                    ));
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    spins += 1;
+                    if spins < 16 {
+                        std::hint::spin_loop();
+                    } else {
+                        GLOBAL_SCHEDULER.yield_now();
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if preface_buf != crate::simd_parser::Http2Session::CLIENT_PREFACE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid HTTP/2 client preface",
+            ));
+        }
+
+        // Send server SETTINGS frame
+        let session = crate::simd_parser::Http2Session::new(true);
+        let settings_frame = crate::simd_parser::Http2Frame::Settings {
+            ack: false,
+            settings: session.local_settings.clone(),
+        };
+        stream.write_all(&settings_frame.encode())?;
+
+        Ok(Self {
+            stream,
+            session,
+            read_buf: Vec::with_capacity(8192),
+            is_closed: false,
+        })
+    }
+
+    /// Send an HTTP/2 frame over the connection.
+    pub fn send_frame(&mut self, frame: &crate::simd_parser::Http2Frame) -> io::Result<()> {
+        if self.is_closed {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "HTTP/2 connection is closed",
+            ));
+        }
+        let wire = frame.encode();
+        self.stream.write_all(&wire)
+    }
+
+    /// Initiate an HTTP/2 request on a newly opened stream.
+    pub fn send_request(
+        &mut self,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> io::Result<u32> {
+        let has_body = body.is_some_and(|b| !b.is_empty());
+        let stream_id = self.session.open_stream();
+        let headers_frame = self.session.create_headers_frame(stream_id, headers, !has_body);
+        self.send_frame(&headers_frame)?;
+
+        if let Some(data) = body {
+            if !data.is_empty() {
+                let data_frame = self.session.create_data_frame(stream_id, data, true);
+                self.send_frame(&data_frame)?;
+            }
+        }
+
+        Ok(stream_id)
+    }
+
+    /// Send an HTTP/2 response on an existing stream.
+    pub fn send_response(
+        &mut self,
+        stream_id: u32,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> io::Result<()> {
+        let has_body = body.is_some_and(|b| !b.is_empty());
+        let headers_frame = self.session.create_headers_frame(stream_id, headers, !has_body);
+        self.send_frame(&headers_frame)?;
+
+        if let Some(data) = body {
+            if !data.is_empty() {
+                let data_frame = self.session.create_data_frame(stream_id, data, true);
+                self.send_frame(&data_frame)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Non-blocking attempt to read and decode the next frame from the stream.
+    /// Automatically handles Ping (replies with Pong) and Settings frames (replies with ACK).
+    pub fn try_recv_frame(&mut self) -> io::Result<Option<crate::simd_parser::Http2Frame>> {
+        let mut buf = [0u8; 4096];
+        match self.stream.try_read(&mut buf) {
+            Ok(Some(n)) if n > 0 => {
+                self.read_buf.extend_from_slice(&buf[..n]);
+            }
+            Ok(Some(0)) => {
+                self.is_closed = true;
+                if self.read_buf.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "HTTP/2 connection closed by peer",
+                    ));
+                }
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Check if full frame header (9 bytes) is available
+        if self.read_buf.len() < crate::simd_parser::Http2FrameHeader::HEADER_SIZE {
+            return Ok(None);
+        }
+
+        let header = match crate::simd_parser::Http2FrameHeader::decode(&self.read_buf[..9]) {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+
+        let total_frame_len = crate::simd_parser::Http2FrameHeader::HEADER_SIZE + header.length as usize;
+        if self.read_buf.len() < total_frame_len {
+            return Ok(None);
+        }
+
+        // We have the complete frame
+        let payload = &self.read_buf[9..total_frame_len];
+        let frame = match crate::simd_parser::Http2Frame::decode(&header, payload) {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to parse HTTP/2 frame: {:?}", e),
+                ));
+            }
+        };
+
+        // Drain the parsed frame from read buffer
+        self.read_buf.drain(..total_frame_len);
+
+        // Update internal session state
+        match self.session.handle_frame(&frame) {
+            Ok(Some(auto_reply)) => {
+                // E.g. Settings ACK or Ping Pong ACK
+                self.send_frame(&auto_reply)?;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("HTTP/2 session protocol error: {:?}", e),
+                ));
+            }
+        }
+
+        Ok(Some(frame))
+    }
+
+    /// Asynchronously wait for the next frame, yielding colorless fibers cooperatively.
+    pub fn recv_frame(&mut self) -> io::Result<crate::simd_parser::Http2Frame> {
+        let mut spins = 0;
+        loop {
+            if let Some(frame) = self.try_recv_frame()? {
+                return Ok(frame);
+            }
+            if self.is_closed && self.read_buf.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "HTTP/2 connection is closed",
+                ));
+            }
+            spins += 1;
+            if spins < 16 {
+                std::hint::spin_loop();
+            } else {
+                GLOBAL_SCHEDULER.yield_now();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Gracefully close connection by sending a GOAWAY frame.
+    pub fn send_goaway(&mut self, error_code: crate::simd_parser::Http2ErrorCode) -> io::Result<()> {
+        let last_id = self.session.next_stream_id.saturating_sub(2);
+        let goaway = crate::simd_parser::Http2Frame::GoAway {
+            last_stream_id: last_id,
+            error_code,
+            debug_data: Vec::new(),
+        };
+        let res = self.send_frame(&goaway);
+        self.is_closed = true;
+        res
+    }
+}
+
 /// Token Bucket Rate Limiter for network request throttling and DoS mitigation.
 #[derive(Debug, Clone)]
 pub struct TokenBucket {
@@ -4706,5 +4968,165 @@ mod tests {
 
         pool.clear();
         assert_eq!(pool.idle_count(), 0);
+    }
+
+    #[test]
+    fn test_async_http2_handshake_and_bidirectional_streams() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind http2 listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let handle = std::thread::spawn(move || {
+            let mut server_conn = None;
+            for _ in 0..100 {
+                if let Ok(Some((stream, _))) = listener.try_accept() {
+                    let h2 = AsyncHttp2Connection::server_handshake(stream)
+                        .expect("server h2 handshake");
+                    server_conn = Some(h2);
+                    break;
+                }
+                GLOBAL_SCHEDULER.yield_now();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            let mut server = server_conn.expect("accepted http2 connection");
+
+            // Server receives frames
+            let mut received_requests = 0;
+            while received_requests < 2 {
+                let frame = server.recv_frame().expect("server recv frame");
+                match frame {
+                    crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            // Send response
+                            let res_headers = vec![
+                                (":status", "200"),
+                                ("content-type", "text/plain"),
+                                ("server", "ifa-http2"),
+                            ];
+                            server
+                                .send_response(stream_id, &res_headers, Some(b"hello h2 response"))
+                                .expect("server send response");
+                            received_requests += 1;
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::Data {
+                        stream_id,
+                        end_stream,
+                        data,
+                    } => {
+                        if end_stream {
+                            assert_eq!(data, b"client h2 payload");
+                            let res_headers = vec![
+                                (":status", "201"),
+                                ("content-type", "application/octet-stream"),
+                            ];
+                            server
+                                .send_response(stream_id, &res_headers, Some(b"received payload"))
+                                .expect("server send post response");
+                            received_requests += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Server sends Ping
+            let ping = crate::simd_parser::Http2Frame::Ping {
+                ack: false,
+                opaque_data: [1, 2, 3, 4, 5, 6, 7, 8],
+            };
+            server.send_frame(&ping).expect("server send ping");
+
+            // Receive Ping ACK
+            let ack_frame = server.recv_frame().expect("server recv ping ack");
+            if let crate::simd_parser::Http2Frame::Ping { ack, opaque_data } = ack_frame {
+                assert!(ack);
+                assert_eq!(opaque_data, [1, 2, 3, 4, 5, 6, 7, 8]);
+            } else {
+                panic!("Expected Ping ACK");
+            }
+        });
+
+        // Client connects and performs handshake
+        let stream = AsyncTcpStream::connect(addr).expect("client connect");
+        let mut client = AsyncHttp2Connection::client_handshake(stream)
+            .expect("client h2 handshake");
+
+        // Client receives server SETTINGS and automatically replies with ACK
+        let frame1 = client.recv_frame().expect("client recv server settings");
+        let frame2 = client.recv_frame().expect("client recv server settings ack");
+        // One of them is Settings { ack: false, .. } and the other is Settings { ack: true, .. }
+        assert!(matches!(frame1, crate::simd_parser::Http2Frame::Settings { .. }));
+        assert!(matches!(frame2, crate::simd_parser::Http2Frame::Settings { .. }));
+
+        // Request 1: GET /api/status (Headers only, end_stream=true)
+        let get_headers = vec![
+            (":method", "GET"),
+            (":path", "/api/status"),
+            (":scheme", "https"),
+            (":authority", "localhost"),
+        ];
+        let stream1 = client
+            .send_request(&get_headers, None)
+            .expect("client send get request");
+        assert_eq!(stream1, 1);
+
+        // Receive response for stream 1
+        let resp_headers_frame = client.recv_frame().expect("client recv resp headers");
+        if let crate::simd_parser::Http2Frame::Headers { stream_id, .. } = resp_headers_frame {
+            assert_eq!(stream_id, 1);
+        } else {
+            panic!("Expected Headers frame for stream 1, got {:?}", resp_headers_frame);
+        }
+
+        let resp_data_frame = client.recv_frame().expect("client recv resp data");
+        if let crate::simd_parser::Http2Frame::Data { stream_id, data, .. } = resp_data_frame {
+            assert_eq!(stream_id, 1);
+            assert_eq!(data, b"hello h2 response");
+        } else {
+            panic!("Expected Data frame for stream 1");
+        }
+
+        // Request 2: POST /api/submit (Headers + Data)
+        let post_headers = vec![
+            (":method", "POST"),
+            (":path", "/api/submit"),
+            (":scheme", "https"),
+            (":authority", "localhost"),
+        ];
+        let stream2 = client
+            .send_request(&post_headers, Some(b"client h2 payload"))
+            .expect("client send post request");
+        assert_eq!(stream2, 3);
+
+        // Receive response for stream 2
+        let resp2_headers_frame = client.recv_frame().expect("client recv resp2 headers");
+        if let crate::simd_parser::Http2Frame::Headers { stream_id, .. } = resp2_headers_frame {
+            assert_eq!(stream_id, 3);
+        } else {
+            panic!("Expected Headers frame for stream 2");
+        }
+
+        let resp2_data_frame = client.recv_frame().expect("client recv resp2 data");
+        if let crate::simd_parser::Http2Frame::Data { stream_id, data, .. } = resp2_data_frame {
+            assert_eq!(stream_id, 3);
+            assert_eq!(data, b"received payload");
+        } else {
+            panic!("Expected Data frame for stream 2");
+        }
+
+        // Handle server Ping (try_recv_frame/recv_frame auto replies with Pong)
+        let ping_frame = client.recv_frame().expect("client recv server ping");
+        if let crate::simd_parser::Http2Frame::Ping { ack, .. } = ping_frame {
+            assert!(!ack);
+        } else {
+            panic!("Expected incoming Ping from server");
+        }
+
+        handle.join().expect("server thread finished");
     }
 }
