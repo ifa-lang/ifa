@@ -3287,6 +3287,36 @@ impl AsyncHttp2Connection {
         resp.body = raw_body;
         Ok(resp)
     }
+
+    /// Server push: send a PUSH_PROMISE frame on an associated client stream to reserve a promised stream id,
+    /// then send the promised response headers and optional body on the promised stream.
+    pub fn push_promise(
+        &mut self,
+        associated_stream_id: u32,
+        promised_request_headers: &[(&str, &str)],
+        promised_response_headers: &[(&str, &str)],
+        promised_body: Option<&[u8]>,
+    ) -> io::Result<u32> {
+        let promised_stream_id = self.session.open_stream();
+        let frame = self.session.create_push_promise(
+            associated_stream_id,
+            promised_stream_id,
+            promised_request_headers,
+        );
+        self.send_frame(&frame)?;
+
+        self.send_response(promised_stream_id, promised_response_headers, promised_body)?;
+
+        Ok(promised_stream_id)
+    }
+
+    /// Get all promised request headers for a given stream ID.
+    pub fn get_push_promise_request(
+        &self,
+        promised_stream_id: u32,
+    ) -> Option<&Vec<(String, String)>> {
+        self.session.push_promises.get(&promised_stream_id)
+    }
 }
 
 /// Token Bucket Rate Limiter for network request throttling and DoS mitigation.
@@ -5439,7 +5469,10 @@ mod tests {
                             }
                         }
                     }
-                    crate::simd_parser::Http2Frame::RstStream { stream_id, error_code } => {
+                    crate::simd_parser::Http2Frame::RstStream {
+                        stream_id,
+                        error_code,
+                    } => {
                         assert_eq!(error_code, crate::simd_parser::Http2ErrorCode::Cancel);
                         assert_eq!(stream_id, 5);
                         break;
@@ -5467,7 +5500,10 @@ mod tests {
 
         // Check that session stream state is Closed
         let stream_info = client.session.streams.get(&s1).unwrap();
-        assert_eq!(stream_info.state, crate::simd_parser::Http2StreamState::Closed);
+        assert_eq!(
+            stream_info.state,
+            crate::simd_parser::Http2StreamState::Closed
+        );
         assert_eq!(
             stream_info.reset_error,
             Some(crate::simd_parser::Http2ErrorCode::RefusedStream)
@@ -5557,6 +5593,101 @@ mod tests {
         assert_eq!(resp.status.0, 200);
         assert_eq!(resp.body.len(), 70000);
         assert_eq!(resp.body, expected_payload);
+
+        client
+            .send_goaway(crate::simd_parser::Http2ErrorCode::NoError)
+            .expect("client send goaway");
+
+        handle.join().expect("server thread finished");
+    }
+
+    #[test]
+    fn test_async_http2_push_promise() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let handle = std::thread::spawn(move || {
+            let (std_stream, _) = listener.accept().expect("accept connection");
+            std_stream.set_nonblocking(true).expect("set nonblocking");
+            let stream = AsyncTcpStream::from_std(std_stream).expect("async tcp stream");
+
+            let mut server =
+                AsyncHttp2Connection::server_handshake(stream).expect("server h2 handshake");
+
+            loop {
+                let frame = server.recv_frame().expect("server recv frame");
+                match frame {
+                    crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            // 1. Send push promise for /style.css on promised stream
+                            let push_req_headers = vec![
+                                (":method", "GET"),
+                                (":path", "/style.css"),
+                                (":scheme", "http"),
+                            ];
+                            let push_res_headers =
+                                vec![(":status", "200"), ("content-type", "text/css")];
+                            let push_body = b"body { background: #000; }";
+
+                            let promised_id = server
+                                .push_promise(
+                                    stream_id,
+                                    &push_req_headers,
+                                    &push_res_headers,
+                                    Some(push_body),
+                                )
+                                .expect("server push promise");
+                            assert_eq!(promised_id, 2);
+
+                            // 2. Send main response for stream_id
+                            let res_headers =
+                                vec![(":status", "200"), ("content-type", "text/html")];
+                            let main_body = b"<html><head><link rel=\"stylesheet\" href=\"/style.css\"></head></html>";
+                            server
+                                .send_response(stream_id, &res_headers, Some(main_body))
+                                .expect("server send response");
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::GoAway { .. } => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let stream = AsyncTcpStream::connect(addr).expect("client connect");
+        let mut client =
+            AsyncHttp2Connection::client_handshake(stream).expect("client h2 handshake");
+
+        // Client sends main request
+        let resp = client
+            .request("GET", "/index.html", &[], None)
+            .expect("client request main index");
+
+        assert_eq!(resp.status.0, 200);
+        assert!(resp.body.starts_with(b"<html>"));
+
+        // Verify that the promised stream (id = 2) was registered in push_promises cache
+        let promised_req = client
+            .get_push_promise_request(2)
+            .expect("promised request found");
+        let path_header = promised_req
+            .iter()
+            .find(|(k, _)| k == ":path")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(path_header, Some("/style.css"));
+
+        // Receive the promised response from stream 2
+        let (p_headers, p_body) = client.recv_response_for(2).expect("recv promised response");
+        let status = p_headers
+            .iter()
+            .find(|(k, _)| k == ":status")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(status, Some("200"));
+        assert_eq!(p_body, b"body { background: #000; }");
 
         client
             .send_goaway(crate::simd_parser::Http2ErrorCode::NoError)

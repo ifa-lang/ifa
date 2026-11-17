@@ -519,6 +519,12 @@ pub enum Http2Frame {
         end_headers: bool,
         header_block: Vec<u8>,
     },
+    PushPromise {
+        stream_id: u32,
+        promised_stream_id: u32,
+        end_headers: bool,
+        header_block: Vec<u8>,
+    },
     Unknown {
         header: Http2FrameHeader,
         payload: Vec<u8>,
@@ -676,6 +682,30 @@ impl Http2Frame {
                 out.extend_from_slice(header_block);
                 out
             }
+            Http2Frame::PushPromise {
+                stream_id,
+                promised_stream_id,
+                end_headers,
+                header_block,
+            } => {
+                let flags = if *end_headers {
+                    Self::FLAG_END_HEADERS
+                } else {
+                    0
+                };
+                let payload_len = 4 + header_block.len();
+                let header = Http2FrameHeader::new(
+                    payload_len as u32,
+                    Http2FrameType::PushPromise,
+                    flags,
+                    *stream_id,
+                );
+                let mut out = Vec::with_capacity(9 + payload_len);
+                out.extend_from_slice(&header.encode());
+                out.extend_from_slice(&(*promised_stream_id & 0x7FFF_FFFF).to_be_bytes());
+                out.extend_from_slice(header_block);
+                out
+            }
             Http2Frame::Unknown { header, payload } => {
                 let mut out = Vec::with_capacity(9 + payload.len());
                 out.extend_from_slice(&header.encode());
@@ -829,6 +859,43 @@ impl Http2Frame {
                     stream_id: header.stream_id,
                     end_headers,
                     header_block: payload.to_vec(),
+                })
+            }
+            Http2FrameType::PushPromise => {
+                if payload.len() < 4 {
+                    return Err(FastHttpError::InvalidRequestLine);
+                }
+                let mut offset = 0;
+                let pad_len = if (header.flags & Self::FLAG_PADDED) != 0 {
+                    if payload.is_empty() {
+                        return Err(FastHttpError::InvalidHeader);
+                    }
+                    let p = payload[0] as usize;
+                    offset += 1;
+                    p
+                } else {
+                    0
+                };
+                if offset + 4 > payload.len() {
+                    return Err(FastHttpError::InvalidRequestLine);
+                }
+                let promised_stream_id = u32::from_be_bytes([
+                    payload[offset],
+                    payload[offset + 1],
+                    payload[offset + 2],
+                    payload[offset + 3],
+                ]) & 0x7FFF_FFFF;
+                offset += 4;
+                if offset + pad_len > payload.len() {
+                    return Err(FastHttpError::InvalidHeader);
+                }
+                let header_block = payload[offset..payload.len() - pad_len].to_vec();
+                let end_headers = (header.flags & Self::FLAG_END_HEADERS) != 0;
+                Ok(Http2Frame::PushPromise {
+                    stream_id: header.stream_id,
+                    promised_stream_id,
+                    end_headers,
+                    header_block,
                 })
             }
             _ => Ok(Http2Frame::Unknown {
@@ -1203,6 +1270,7 @@ pub struct Http2Session {
     pub peer_settings: Vec<Http2Setting>,
     pub local_settings: Vec<Http2Setting>,
     pub streams: std::collections::HashMap<u32, Http2Stream>,
+    pub push_promises: std::collections::HashMap<u32, Vec<(String, String)>>,
     pub hpack_encoder: HpackContext,
     pub hpack_decoder: HpackContext,
     pub connection_window_size: i32,
@@ -1229,6 +1297,7 @@ impl Http2Session {
                 },
             ],
             streams: std::collections::HashMap::new(),
+            push_promises: std::collections::HashMap::new(),
             hpack_encoder: HpackContext::default(),
             hpack_decoder: HpackContext::default(),
             connection_window_size: Self::DEFAULT_INITIAL_WINDOW_SIZE,
@@ -1304,6 +1373,13 @@ impl Http2Session {
                         Http2StreamState::Open
                     };
                 }
+                Http2StreamState::ReservedLocal => {
+                    stream.state = if end_stream {
+                        Http2StreamState::Closed
+                    } else {
+                        Http2StreamState::HalfClosedRemote
+                    };
+                }
                 Http2StreamState::Open if end_stream => {
                     stream.state = Http2StreamState::HalfClosedLocal;
                 }
@@ -1344,11 +1420,7 @@ impl Http2Session {
     }
 
     /// Create and encode a RST_STREAM frame to abort an active stream with an error code.
-    pub fn reset_stream(
-        &mut self,
-        stream_id: u32,
-        error_code: Http2ErrorCode,
-    ) -> Http2Frame {
+    pub fn reset_stream(&mut self, stream_id: u32, error_code: Http2ErrorCode) -> Http2Frame {
         if let Some(stream) = self.streams.get_mut(&stream_id) {
             stream.state = Http2StreamState::Closed;
             stream.reset_error = Some(error_code);
@@ -1356,6 +1428,33 @@ impl Http2Session {
         Http2Frame::RstStream {
             stream_id,
             error_code,
+        }
+    }
+
+    /// Create and encode a PUSH_PROMISE frame to notify peer of an impending server push stream.
+    pub fn create_push_promise(
+        &mut self,
+        associated_stream_id: u32,
+        promised_stream_id: u32,
+        headers: &[(&str, &str)],
+    ) -> Http2Frame {
+        let header_block = self.hpack_encoder.encode_headers(headers);
+        let mut promised_stream =
+            Http2Stream::new(promised_stream_id, self.initial_stream_window_size);
+        promised_stream.state = Http2StreamState::ReservedLocal;
+        self.streams.insert(promised_stream_id, promised_stream);
+
+        let owned_headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        self.push_promises.insert(promised_stream_id, owned_headers);
+
+        Http2Frame::PushPromise {
+            stream_id: associated_stream_id,
+            promised_stream_id,
+            end_headers: true,
+            header_block,
         }
     }
 
@@ -1412,6 +1511,13 @@ impl Http2Session {
                             Http2StreamState::Open
                         };
                     }
+                    Http2StreamState::ReservedRemote => {
+                        stream.state = if *end_stream {
+                            Http2StreamState::HalfClosedRemote
+                        } else {
+                            Http2StreamState::HalfClosedLocal
+                        };
+                    }
                     Http2StreamState::Open if *end_stream => {
                         stream.state = Http2StreamState::HalfClosedRemote;
                     }
@@ -1438,11 +1544,16 @@ impl Http2Session {
 
                 if *end_stream {
                     match stream.state {
-                        Http2StreamState::Open => stream.state = Http2StreamState::HalfClosedRemote,
-                        Http2StreamState::HalfClosedLocal => {
-                            stream.state = Http2StreamState::Closed
+                        Http2StreamState::Open | Http2StreamState::HalfClosedLocal => {
+                            stream.state = if stream.state == Http2StreamState::HalfClosedLocal {
+                                Http2StreamState::Closed
+                            } else {
+                                Http2StreamState::HalfClosedRemote
+                            };
                         }
-                        _ => {}
+                        _ => {
+                            stream.state = Http2StreamState::Closed;
+                        }
                     }
                 }
                 Ok(None)
@@ -1466,6 +1577,22 @@ impl Http2Session {
                     stream.state = Http2StreamState::Closed;
                     stream.reset_error = Some(*error_code);
                 }
+                Ok(None)
+            }
+            Http2Frame::PushPromise {
+                stream_id: _,
+                promised_stream_id,
+                end_headers: _,
+                header_block,
+            } => {
+                let decoded_headers = self.hpack_decoder.decode_headers(header_block)?;
+                let mut stream =
+                    Http2Stream::new(*promised_stream_id, self.initial_stream_window_size);
+                stream.state = Http2StreamState::ReservedRemote;
+                stream.received_headers = decoded_headers.clone();
+                self.streams.insert(*promised_stream_id, stream);
+                self.push_promises
+                    .insert(*promised_stream_id, decoded_headers);
                 Ok(None)
             }
             _ => Ok(None),
@@ -1613,6 +1740,56 @@ mod http2_tests {
             assert_eq!(opaque_data, [1, 2, 3, 4, 5, 6, 7, 8]);
         } else {
             panic!("Expected ping ack");
+        }
+    }
+
+    #[test]
+    fn test_http2_push_promise_frame_roundtrip() {
+        let mut enc = HpackContext::default();
+        let mut dec = HpackContext::default();
+
+        let req_headers = vec![
+            (":method", "GET"),
+            (":path", "/main.js"),
+            (":scheme", "https"),
+            (":authority", "example.com"),
+        ];
+        let header_block = enc.encode_headers(&req_headers);
+
+        let frame = Http2Frame::PushPromise {
+            stream_id: 1,
+            promised_stream_id: 2,
+            end_headers: true,
+            header_block: header_block.clone(),
+        };
+
+        let wire = frame.encode();
+        assert_eq!(wire.len(), 9 + 4 + header_block.len());
+
+        let hdr = Http2FrameHeader::decode(&wire[..9]).expect("decode push promise header");
+        assert_eq!(hdr.frame_type, Http2FrameType::PushPromise);
+        assert_eq!(hdr.stream_id, 1);
+        assert_eq!(hdr.flags, Http2Frame::FLAG_END_HEADERS);
+
+        let decoded_frame =
+            Http2Frame::decode(&hdr, &wire[9..]).expect("decode push promise frame");
+        if let Http2Frame::PushPromise {
+            stream_id,
+            promised_stream_id,
+            end_headers,
+            header_block: dec_block,
+        } = decoded_frame
+        {
+            assert_eq!(stream_id, 1);
+            assert_eq!(promised_stream_id, 2);
+            assert!(end_headers);
+            let decoded_headers = dec
+                .decode_headers(&dec_block)
+                .expect("decode promised headers");
+            assert_eq!(decoded_headers.len(), 4);
+            assert_eq!(decoded_headers[1].1, "/main.js");
+        } else {
+            panic!("Expected PushPromise frame");
         }
     }
 }
