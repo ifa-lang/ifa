@@ -3179,9 +3179,7 @@ impl AsyncHttp2Connection {
     }
 
     /// Retrieve the GOAWAY information received from peer, if any (last_stream_id, error_code, debug_data).
-    pub fn last_received_goaway(
-        &self,
-    ) -> Option<(u32, crate::simd_parser::Http2ErrorCode, &[u8])> {
+    pub fn last_received_goaway(&self) -> Option<(u32, crate::simd_parser::Http2ErrorCode, &[u8])> {
         self.session
             .last_received_goaway
             .as_ref()
@@ -3586,27 +3584,17 @@ impl AsyncHttp2Connection {
     }
 
     /// Retrieve a peer setting value if previously received and acknowledged.
-    pub fn get_peer_setting(
-        &self,
-        id: crate::simd_parser::Http2SettingId,
-    ) -> Option<u32> {
+    pub fn get_peer_setting(&self, id: crate::simd_parser::Http2SettingId) -> Option<u32> {
         self.session.get_peer_setting(id)
     }
 
     /// Retrieve a local setting value.
-    pub fn get_local_setting(
-        &self,
-        id: crate::simd_parser::Http2SettingId,
-    ) -> Option<u32> {
+    pub fn get_local_setting(&self, id: crate::simd_parser::Http2SettingId) -> Option<u32> {
         self.session.get_local_setting(id)
     }
 
     /// Send trailing headers (Trailers) on an open stream, terminating the stream (RFC 7540 Section 8.1.2.6).
-    pub fn send_trailers(
-        &mut self,
-        stream_id: u32,
-        trailers: &[(&str, &str)],
-    ) -> io::Result<()> {
+    pub fn send_trailers(&mut self, stream_id: u32, trailers: &[(&str, &str)]) -> io::Result<()> {
         let frame = self.session.create_trailers_frame(stream_id, trailers);
         self.send_frame(&frame)
     }
@@ -6753,12 +6741,16 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept connection");
-            let mut server = AsyncHttp2Connection::server_handshake(stream).expect("server handshake");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(stream).expect("server handshake");
 
             // Server receives initial client settings during handshake or immediately after
             // Drain until initial settings frame is processed
             let frame = server.recv_frame().expect("server recv client settings");
-            assert!(matches!(frame, crate::simd_parser::Http2Frame::Settings { .. }));
+            assert!(matches!(
+                frame,
+                crate::simd_parser::Http2Frame::Settings { .. }
+            ));
 
             // Server inspects peer setting
             let max_streams = server
@@ -6791,26 +6783,34 @@ mod tests {
         });
 
         // Client connects and performs handshake
-        let client_stream = AsyncTcpStream::connect(format!("127.0.0.1:{}", port))
-            .expect("connect to server");
-        let mut client = AsyncHttp2Connection::client_handshake(client_stream)
-            .expect("client handshake");
+        let client_stream =
+            AsyncTcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect to server");
+        let mut client =
+            AsyncHttp2Connection::client_handshake(client_stream).expect("client handshake");
 
         // Client receives frames from server until updated settings are received
         // (the server sends initial settings, ACK for client's initial settings, and the updated settings)
         let mut received_updated_settings = false;
         for _ in 0..5 {
             let frame = client.recv_frame().expect("client recv frame");
-            if let crate::simd_parser::Http2Frame::Settings { ack: false, settings } = frame {
+            if let crate::simd_parser::Http2Frame::Settings {
+                ack: false,
+                settings,
+            } = frame
+            {
                 if settings.iter().any(|s| {
-                    s.id == crate::simd_parser::Http2SettingId::MaxConcurrentStreams && s.value == 250
+                    s.id == crate::simd_parser::Http2SettingId::MaxConcurrentStreams
+                        && s.value == 250
                 }) {
                     received_updated_settings = true;
                     break;
                 }
             }
         }
-        assert!(received_updated_settings, "Client should receive updated settings");
+        assert!(
+            received_updated_settings,
+            "Client should receive updated settings"
+        );
 
         // Verify client session recorded peer settings
         assert_eq!(
@@ -6886,13 +6886,17 @@ mod tests {
 
         // Send GET request
         let req_headers = [(":method", "GET"), (":path", "/stream-with-trailers")];
-        let sid = client.send_request(&req_headers, None).expect("send request");
+        let sid = client
+            .send_request(&req_headers, None)
+            .expect("send request");
         assert_eq!(sid, 1);
 
         // Receive response
         let (resp_headers, body) = client.recv_response_for(sid).expect("recv response");
         assert_eq!(body, b"chunked stream data with trailers");
-        assert!(resp_headers.iter().any(|(k, v)| k == ":status" && v == "200"));
+        assert!(resp_headers
+            .iter()
+            .any(|(k, v)| k == ":status" && v == "200"));
 
         // Verify trailers were captured in get_trailers
         let trailers = client.get_trailers(sid).expect("trailers recorded");
@@ -7162,9 +7166,18 @@ fn parse_http_date(s: &str) -> Option<u64> {
 
     let day: u64 = parts[0].parse().ok()?;
     let month: u64 = match parts[1].to_ascii_lowercase().as_str() {
-        "jan" => 1, "feb" => 2, "mar" => 3, "apr" => 4,
-        "may" => 5, "jun" => 6, "jul" => 7, "aug" => 8,
-        "sep" => 9, "oct" => 10, "nov" => 11, "dec" => 12,
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
         _ => return None,
     };
     let year: u64 = parts[2].parse().ok()?;
@@ -7246,9 +7259,7 @@ impl CookieJar {
         let applicable: Vec<&str> = jar
             .iter()
             .filter(|c| {
-                !c.is_expired(now_secs)
-                    && c.matches_domain(host)
-                    && c.matches_path(request_path)
+                !c.is_expired(now_secs) && c.matches_domain(host) && c.matches_path(request_path)
             })
             .map(|c| c.value.as_str()) // collect names separately
             .collect();
@@ -7257,9 +7268,7 @@ impl CookieJar {
         let header_parts: Vec<String> = jar
             .iter()
             .filter(|c| {
-                !c.is_expired(now_secs)
-                    && c.matches_domain(host)
-                    && c.matches_path(request_path)
+                !c.is_expired(now_secs) && c.matches_domain(host) && c.matches_path(request_path)
             })
             .map(|c| c.to_header_value())
             .collect();
@@ -7313,7 +7322,8 @@ mod cookie_tests {
 
     #[test]
     fn test_cookie_parse_full_attributes() {
-        let raw = "id=xyz; Domain=.example.com; Path=/api; Max-Age=3600; Secure; HttpOnly; SameSite=Lax";
+        let raw =
+            "id=xyz; Domain=.example.com; Path=/api; Max-Age=3600; Secure; HttpOnly; SameSite=Lax";
         let c = Cookie::parse_set_cookie(raw).unwrap();
         assert_eq!(c.name, "id");
         assert_eq!(c.value, "xyz");

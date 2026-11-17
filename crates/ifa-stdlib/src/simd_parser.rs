@@ -1800,9 +1800,7 @@ impl Http2Session {
                     Some((*last_stream_id, *error_code, debug_data.clone()));
                 // Mark any active streams above last_stream_id as closed/refused
                 for (id, stream) in self.streams.iter_mut() {
-                    if *id > *last_stream_id
-                        && stream.state != Http2StreamState::Closed
-                    {
+                    if *id > *last_stream_id && stream.state != Http2StreamState::Closed {
                         stream.state = Http2StreamState::Closed;
                         stream.reset_error = Some(Http2ErrorCode::RefusedStream);
                     }
