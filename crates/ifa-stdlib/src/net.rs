@@ -3862,6 +3862,8 @@ pub struct Http2PoolStats {
     pub max_concurrent_streams_per_conn: usize,
     /// Most recent GOAWAY error code observed across connections in this pool, if any.
     pub last_goaway_error: Option<crate::simd_parser::Http2ErrorCode>,
+    /// Last negotiated ALPN protocol observed during TLS connection handshake, if any.
+    pub last_alpn_negotiated: Option<AlpnProtocol>,
 }
 
 impl Http2PoolStats {
@@ -3888,6 +3890,8 @@ pub struct AsyncHttp2Pool {
     idle_pool: std::sync::Mutex<Vec<AsyncHttp2Connection>>,
     active_count: std::sync::atomic::AtomicUsize,
     last_goaway_error: std::sync::Mutex<Option<crate::simd_parser::Http2ErrorCode>>,
+    last_alpn_negotiated: std::sync::Mutex<Option<AlpnProtocol>>,
+    tls_config: Option<TlsConfig>,
     request_interceptors: Vec<Http2RequestInterceptor>,
     response_interceptors: Vec<Http2ResponseInterceptor>,
 }
@@ -3906,9 +3910,17 @@ impl AsyncHttp2Pool {
             idle_pool: std::sync::Mutex::new(Vec::new()),
             active_count: std::sync::atomic::AtomicUsize::new(0),
             last_goaway_error: std::sync::Mutex::new(None),
+            last_alpn_negotiated: std::sync::Mutex::new(None),
+            tls_config: None,
             request_interceptors: Vec::new(),
             response_interceptors: Vec::new(),
         }
+    }
+
+    /// Configure TLS/ALPN negotiation configuration for connections established by this pool.
+    pub fn with_tls_config(mut self, config: TlsConfig) -> Self {
+        self.tls_config = Some(config);
+        self
     }
 
     /// Register a request interceptor / middleware executed prior to dispatching each HTTP/2 request.
@@ -4001,6 +4013,7 @@ impl AsyncHttp2Pool {
             max_connections: self.max_connections,
             max_concurrent_streams_per_conn: self.max_concurrent_streams_per_conn,
             last_goaway_error: self.last_goaway_error(),
+            last_alpn_negotiated: self.last_alpn_negotiated(),
         }
     }
 
@@ -4047,6 +4060,27 @@ impl AsyncHttp2Pool {
         }
 
         let stream = AsyncTcpStream::connect(format!("{}:{}", self.host, self.port))?;
+        if let Some(ref tls_cfg) = self.tls_config {
+            let negotiator = AlpnNegotiator::new(tls_cfg.clone());
+            let negotiated = negotiator.negotiate(&tls_cfg.server_protocols);
+            if let Some(proto) = negotiated.protocol() {
+                self.record_alpn_negotiated(proto);
+                if !proto.supports_multiplexing() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("ALPN negotiated non-HTTP/2 protocol ({}) in HTTP/2 pool", proto),
+                    ));
+                }
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "ALPN negotiation failed: no matching protocol supported",
+                ));
+            }
+        } else {
+            self.record_alpn_negotiated(AlpnProtocol::Http2);
+        }
+
         let conn = AsyncHttp2Connection::client_handshake(stream)?;
 
         self.active_count
@@ -4230,6 +4264,25 @@ impl AsyncHttp2Pool {
     pub fn clear_goaway_error(&self) {
         if let Ok(mut g) = self.last_goaway_error.lock() {
             *g = None;
+        }
+    }
+
+    /// Retrieve the last negotiated ALPN protocol observed across connections in this pool.
+    pub fn last_alpn_negotiated(&self) -> Option<AlpnProtocol> {
+        self.last_alpn_negotiated.lock().ok().and_then(|p| *p)
+    }
+
+    /// Record an observed ALPN negotiated protocol outcome for diagnostic monitoring.
+    pub fn record_alpn_negotiated(&self, protocol: AlpnProtocol) {
+        if let Ok(mut slot) = self.last_alpn_negotiated.lock() {
+            *slot = Some(protocol);
+        }
+    }
+
+    /// Reset or clear the recorded ALPN negotiated protocol.
+    pub fn clear_alpn_negotiated(&self) {
+        if let Ok(mut slot) = self.last_alpn_negotiated.lock() {
+            *slot = None;
         }
     }
 
@@ -8139,8 +8192,75 @@ mod tests {
         assert_eq!(stats.max_connections, 5);
         assert_eq!(stats.max_concurrent_streams_per_conn, 50);
         assert_eq!(stats.last_goaway_error, None);
+        assert_eq!(stats.last_alpn_negotiated, None);
         assert_eq!(stats.total_connections(), 0);
         assert!(!stats.is_exhausted());
+
+        pool.record_alpn_negotiated(AlpnProtocol::Http2);
+        assert_eq!(pool.last_alpn_negotiated(), Some(AlpnProtocol::Http2));
+        assert_eq!(pool.stats().last_alpn_negotiated, Some(AlpnProtocol::Http2));
+
+        pool.clear_alpn_negotiated();
+        assert_eq!(pool.last_alpn_negotiated(), None);
+    }
+
+    #[test]
+    fn test_async_http2_pool_alpn_config_negotiation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let (tcp_stream, _) = listener.accept().expect("accept");
+            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async");
+            let mut server = AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+            while let Ok(frame) = server.recv_frame() {
+                if let crate::simd_parser::Http2Frame::Headers {
+                    stream_id,
+                    end_stream,
+                    ..
+                } = frame
+                {
+                    if end_stream {
+                        server
+                            .send_response(
+                                stream_id,
+                                &[(":status", "200"), ("content-length", "2")],
+                                Some(b"ok"),
+                            )
+                            .expect("send response");
+                        let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                        std::thread::sleep(Duration::from_millis(50));
+                        break;
+                    }
+                }
+            }
+        });
+
+        // 1. With default HTTP/2 ALPN config -> negotiated protocol is recorded as Http2
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2)
+            .with_tls_config(TlsConfig::default());
+        assert_eq!(pool.last_alpn_negotiated(), None);
+
+        let resp = pool.execute_request("GET", "/alpn-test", &[], None).expect("request");
+        assert_eq!(resp.status.0, 200);
+        assert_eq!(pool.last_alpn_negotiated(), Some(AlpnProtocol::Http2));
+        assert_eq!(pool.stats().last_alpn_negotiated, Some(AlpnProtocol::Http2));
+
+        let _ = handle.join();
+
+        // 2. With HTTP/1.1-only ALPN config -> acquiring connection must fail immediately due to non-multiplexed protocol
+        let listener2 = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener 2");
+        let port2 = listener2.local_addr().expect("local addr 2").port();
+
+        let pool_h11 = AsyncHttp2Pool::new("127.0.0.1", port2, 2)
+            .with_tls_config(TlsConfig::http11_only());
+        match pool_h11.acquire() {
+            Ok(_) => panic!("expected acquire to fail on http11-only ALPN config"),
+            Err(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+                assert_eq!(pool_h11.last_alpn_negotiated(), Some(AlpnProtocol::Http11));
+            }
+        }
     }
 
     #[test]
