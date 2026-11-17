@@ -2318,6 +2318,8 @@ pub struct Http2Session {
     /// RFC 7838 alternative services advertised by peer.
     /// Maps origin string (or empty for current origin) to list of available routes.
     pub alt_svc_routes: std::collections::HashMap<String, Vec<AltSvcRoute>>,
+    /// Queued outbound data pending transmission, mapped by stream ID.
+    pub pending_outbound_data: std::collections::HashMap<u32, Vec<u8>>,
     /// Adaptive flow controller optimizing connection and stream windows based on RTT and bandwidth.
     pub adaptive_flow_controller: AdaptiveFlowController,
 }
@@ -2349,6 +2351,7 @@ impl Http2Session {
             initial_stream_window_size: Self::DEFAULT_INITIAL_WINDOW_SIZE,
             last_received_goaway: None,
             alt_svc_routes: std::collections::HashMap::new(),
+            pending_outbound_data: std::collections::HashMap::new(),
             adaptive_flow_controller: AdaptiveFlowController::default(),
         }
     }
@@ -2631,11 +2634,13 @@ impl Http2Session {
     }
 
     /// Create and encode a RST_STREAM frame to abort an active stream with an error code.
+    /// Immediately purges any pending outbound data buffered for this stream.
     pub fn reset_stream(&mut self, stream_id: u32, error_code: Http2ErrorCode) -> Http2Frame {
         if let Some(stream) = self.streams.get_mut(&stream_id) {
             stream.state = Http2StreamState::Closed;
             stream.reset_error = Some(error_code);
         }
+        self.pending_outbound_data.remove(&stream_id);
         Http2Frame::RstStream {
             stream_id,
             error_code,
@@ -2759,6 +2764,23 @@ impl Http2Session {
         });
 
         streams_info.into_iter().map(|(id, _, _)| id).collect()
+    }
+
+    /// Queue outbound body data for a stream to be scheduled via [`schedule_outbound_data`].
+    pub fn queue_outbound_data(&mut self, stream_id: u32, data: &[u8]) {
+        self.pending_outbound_data
+            .entry(stream_id)
+            .or_default()
+            .extend_from_slice(data);
+    }
+
+    /// Schedule and allocate outbound DATA frames using the session's internal `pending_outbound_data` buffer.
+    pub fn schedule_pending_outbound_data(&mut self, max_frame_size: usize) -> Vec<Http2Frame> {
+        let mut pending = std::mem::take(&mut self.pending_outbound_data);
+        let frames = self.schedule_outbound_data(&mut pending, max_frame_size);
+        pending.retain(|_, v| !v.is_empty());
+        self.pending_outbound_data = pending;
+        frames
     }
 
     /// Schedule and allocate outbound DATA frames fairly across active streams based on
@@ -3090,6 +3112,8 @@ impl Http2Session {
                     stream.state = Http2StreamState::Closed;
                     stream.reset_error = Some(*error_code);
                 }
+                // Immediately purge any queued outbound data for the reset stream
+                self.pending_outbound_data.remove(stream_id);
                 Ok(None)
             }
             Http2Frame::PushPromise {
@@ -4145,5 +4169,44 @@ mod http2_tests {
         }
 
         assert!(pending.values().all(|b| b.is_empty()));
+    }
+
+    #[test]
+    fn test_rst_stream_purges_pending_outbound_data() {
+        let mut session = Http2Session::new(false);
+        let s1 = session.open_stream();
+        let s2 = session.open_stream();
+
+        // Queue pending outbound data for both streams
+        session.queue_outbound_data(s1, b"stream1 sensitive pending data");
+        session.queue_outbound_data(s2, b"stream2 pending data");
+
+        assert_eq!(session.pending_outbound_data.len(), 2);
+        assert!(session.pending_outbound_data.contains_key(&s1));
+        assert!(session.pending_outbound_data.contains_key(&s2));
+
+        // 1. Inbound RST_STREAM frame on s1 purges s1's pending outbound buffer immediately
+        let rst_frame = Http2Frame::RstStream {
+            stream_id: s1,
+            error_code: Http2ErrorCode::Cancel,
+        };
+        let reply = session.handle_frame(&rst_frame).expect("handle frame");
+        assert!(reply.is_none());
+
+        assert!(!session.pending_outbound_data.contains_key(&s1));
+        assert!(session.pending_outbound_data.contains_key(&s2));
+        assert_eq!(
+            session.streams.get(&s1).unwrap().state,
+            Http2StreamState::Closed
+        );
+
+        // 2. Outbound reset_stream call on s2 also purges s2's pending outbound buffer immediately
+        let _out_rst = session.reset_stream(s2, Http2ErrorCode::InternalError);
+        assert!(!session.pending_outbound_data.contains_key(&s2));
+        assert_eq!(
+            session.streams.get(&s2).unwrap().state,
+            Http2StreamState::Closed
+        );
+        assert!(session.pending_outbound_data.is_empty());
     }
 }
