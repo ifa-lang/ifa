@@ -3148,20 +3148,29 @@ impl AsyncHttp2Connection {
         }
     }
 
-    /// Gracefully close connection by sending a GOAWAY frame.
-    pub fn send_goaway(
+    /// Gracefully close connection by sending a GOAWAY frame with optional debug diagnostic data.
+    pub fn send_goaway_with_debug(
         &mut self,
         error_code: crate::simd_parser::Http2ErrorCode,
+        debug_data: &[u8],
     ) -> io::Result<()> {
         let last_id = self.session.next_stream_id.saturating_sub(2);
         let goaway = crate::simd_parser::Http2Frame::GoAway {
             last_stream_id: last_id,
             error_code,
-            debug_data: Vec::new(),
+            debug_data: debug_data.to_vec(),
         };
         let res = self.send_frame(&goaway);
         self.is_closed = true;
         res
+    }
+
+    /// Gracefully close connection by sending a GOAWAY frame.
+    pub fn send_goaway(
+        &mut self,
+        error_code: crate::simd_parser::Http2ErrorCode,
+    ) -> io::Result<()> {
+        self.send_goaway_with_debug(error_code, &[])
     }
 
     /// Abort an active stream with a specific HTTP/2 error code and notify the peer via RST_STREAM.
@@ -3682,6 +3691,15 @@ impl AsyncHttp2Pool {
     pub fn clear(&self) {
         if let Ok(mut pool) = self.idle_pool.lock() {
             pool.clear();
+        }
+    }
+
+    /// Gracefully shutdown all pooled idle connections by sending GOAWAY frames.
+    pub fn shutdown(&self) {
+        if let Ok(mut pool) = self.idle_pool.lock() {
+            for mut conn in pool.drain(..) {
+                let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+            }
         }
     }
 
@@ -6443,11 +6461,56 @@ mod tests {
         assert_eq!(removed, 0);
         assert_eq!(pool.idle_count(), 1);
 
-        // 4. Close connection cleanly
-        let mut conn = pool.acquire().expect("re-acquire");
-        let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
-        pool.release(conn);
-        pool.clear();
+        // 4. Test shutdown
+        pool.shutdown();
+        assert_eq!(pool.idle_count(), 0);
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_goaway_with_debug_payload() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            };
+
+            let frame = server.recv_frame().expect("recv goaway frame");
+            match frame {
+                crate::simd_parser::Http2Frame::GoAway {
+                    last_stream_id,
+                    error_code,
+                    debug_data,
+                } => {
+                    assert_eq!(error_code, crate::simd_parser::Http2ErrorCode::InternalError);
+                    assert_eq!(&debug_data[..], b"fatal connection degradation");
+                    assert_eq!(last_stream_id, 0);
+                }
+                other => panic!("Expected GoAway frame, got {:?}", other),
+            }
+        });
+
+        let stream = AsyncTcpStream::connect(&format!("127.0.0.1:{}", port)).expect("connect client");
+        let mut client = AsyncHttp2Connection::client_handshake(stream).expect("client handshake");
+
+        client
+            .send_goaway_with_debug(
+                crate::simd_parser::Http2ErrorCode::InternalError,
+                b"fatal connection degradation",
+            )
+            .expect("send goaway with debug");
+        assert!(client.is_closed());
 
         let _ = handle.join();
     }
