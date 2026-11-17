@@ -769,6 +769,11 @@ impl AltSvcRoute {
         }
         s
     }
+
+    /// Check if this route has expired given its received timestamp and current elapsed duration.
+    pub fn is_expired_since(&self, elapsed: std::time::Duration) -> bool {
+        elapsed.as_secs() >= self.max_age as u64
+    }
 }
 
 /// Typed HTTP/2 Frame representation.

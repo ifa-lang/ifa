@@ -4468,6 +4468,24 @@ impl AsyncHttp2Pool {
         }
     }
 
+    /// Select the highest priority or first alternative service route matching a specific protocol
+    /// (e.g. "h3" or "h2") for the given origin (or default pool origin).
+    pub fn select_alt_svc_route(
+        &self,
+        origin: Option<&str>,
+        protocol_id: &str,
+    ) -> Option<crate::simd_parser::AltSvcRoute> {
+        let routes = self.get_alt_svc_routes(origin);
+        routes
+            .into_iter()
+            .find(|r| r.protocol_id.eq_ignore_ascii_case(protocol_id))
+    }
+
+    /// Check whether an alternative HTTP/3 route is available and registered for the origin.
+    pub fn has_http3_alternative(&self, origin: Option<&str>) -> bool {
+        self.select_alt_svc_route(origin, "h3").is_some()
+    }
+
     /// Execute an HTTP/2 request with automatic retry on retryable GOAWAY errors.
     ///
     /// When a connection is refused or a retryable GOAWAY (`NoError`, `RefusedStream`, `Cancel`)
@@ -8959,6 +8977,16 @@ mod tests {
         assert_eq!(org_routes[0].protocol_id, "h3");
         assert_eq!(org_routes[0].port, 443);
         assert_eq!(org_routes[0].max_age, 3600);
+
+        // Verify select_alt_svc_route and has_http3_alternative
+        assert!(pool.has_http3_alternative(Some("https://example.org")));
+        let selected = pool
+            .select_alt_svc_route(Some("https://example.org"), "h3")
+            .expect("selected h3 route");
+        assert_eq!(selected.port, 443);
+        assert!(!selected.is_expired_since(std::time::Duration::from_secs(100)));
+        assert!(selected.is_expired_since(std::time::Duration::from_secs(4000)));
+        assert!(!pool.has_http3_alternative(Some("https://unknown.com")));
 
         pool.shutdown();
         let _ = handle.join();
