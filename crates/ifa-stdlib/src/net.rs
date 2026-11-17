@@ -3899,6 +3899,76 @@ impl AsyncHttp2Pool {
             *g = None;
         }
     }
+
+    /// Execute an HTTP/2 request with automatic retry on retryable GOAWAY errors.
+    ///
+    /// When a connection is refused or a retryable GOAWAY (`NoError`, `RefusedStream`, `Cancel`)
+    /// is detected, the method transparently establishes a fresh connection and retries the request,
+    /// up to `max_retries` additional attempts (total attempts = `max_retries + 1`).
+    ///
+    /// A fatal protocol violation (`ProtocolError`, `CompressionError`, etc.) or
+    /// a rate-limit signal (`EnhanceYourCalm`) is never retried — the error is returned immediately.
+    ///
+    /// Returns `Err` only if all attempts are exhausted or a non-retryable error is encountered.
+    pub fn execute_request_with_retry(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        max_retries: usize,
+    ) -> io::Result<crate::http::HttpResponse> {
+        let mut last_err: Option<io::Error> = None;
+        for attempt in 0..=max_retries {
+            // Before acquiring: if a fatal or rate-limit GOAWAY was recorded, bail immediately
+            if let Some(err_code) = self.last_goaway_error() {
+                if err_code.is_fatal_protocol_violation() || err_code.is_rate_limit_or_calm() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!(
+                            "HTTP/2 pool: non-retryable GOAWAY received ({})",
+                            err_code.name()
+                        ),
+                    ));
+                }
+                // Retryable GOAWAY — clear and continue
+                self.clear_goaway_error();
+            }
+
+            match self.execute_request(method, path, headers, body) {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    // Check if the error is a retryable GOAWAY
+                    let goaway_retryable = self
+                        .last_goaway_error()
+                        .map(|ec| ec.is_retryable())
+                        .unwrap_or(false);
+
+                    if !goaway_retryable && attempt == max_retries {
+                        return Err(e);
+                    }
+                    if !goaway_retryable {
+                        // Non-GOAWAY transient error (e.g. WouldBlock / connection reset)
+                        // only retry if it looks like a connectivity issue
+                        match e.kind() {
+                            io::ErrorKind::ConnectionRefused
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::TimedOut => {}
+                            _ => return Err(e),
+                        }
+                    }
+                    self.clear_goaway_error();
+                    last_err = Some(e);
+                    // Brief linear back-off: 10 ms × (attempt + 1)
+                    std::thread::sleep(std::time::Duration::from_millis(10 * (attempt as u64 + 1)));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            io::Error::other("HTTP/2 retry exhausted")
+        }))
+    }
 }
 
 /// Token Bucket Rate Limiter for network request throttling and DoS mitigation.
@@ -7025,6 +7095,136 @@ mod tests {
         );
         pool.clear_goaway_error();
         assert_eq!(pool.last_goaway_error(), None);
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_execute_with_retry_success_on_first_attempt() {
+        // Server that accepts one connection, responds 200, then cleanly closes.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let (tcp_stream, _) = listener.accept().expect("accept connection");
+            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+
+            loop {
+                let frame = match server.recv_frame() {
+                    Ok(f) => f,
+                    Err(_) => break,
+                };
+                if let crate::simd_parser::Http2Frame::Headers {
+                    stream_id,
+                    end_stream,
+                    ..
+                } = frame
+                {
+                    if end_stream {
+                        server
+                            .send_response(
+                                stream_id,
+                                &[(":status", "200")],
+                                Some(b"retry-ok"),
+                            )
+                            .expect("send response");
+                        // Graceful GOAWAY so pool release discards cleanly
+                        let _ = server
+                            .send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                        break;
+                    }
+                }
+            }
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
+        let resp = pool
+            .execute_request_with_retry("GET", "/", &[], None, 2)
+            .expect("request with retry should succeed");
+        assert_eq!(resp.status, crate::http::HttpStatus(200));
+        assert_eq!(resp.body, b"retry-ok");
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_execute_with_retry_fatal_goaway_no_retry() {
+        // A pool whose recorded GOAWAY error is fatal must refuse with no retry.
+        // We seed the error via a server that sends ProtocolError GOAWAY, then
+        // verify the pool detects it before attempting the next request.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            // First connection: respond then send fatal GOAWAY
+            if let Ok((tcp_stream, _)) = listener.accept() {
+                let async_stream =
+                    AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+                let mut server = AsyncHttp2Connection::server_handshake(async_stream)
+                    .expect("server handshake");
+                loop {
+                    let frame = match server.recv_frame() {
+                        Ok(f) => f,
+                        Err(_) => break,
+                    };
+                    if let crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    } = frame
+                    {
+                        if end_stream {
+                            server
+                                .send_response(
+                                    stream_id,
+                                    &[(":status", "200")],
+                                    Some(b"seed"),
+                                )
+                                .ok();
+                            // Send fatal protocol error GOAWAY
+                            server
+                                .send_goaway(
+                                    crate::simd_parser::Http2ErrorCode::ProtocolError,
+                                )
+                                .ok();
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(60));
+            }
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
+
+        // 1. First request succeeds, seeding the fatal GOAWAY into the pool
+        let mut conn = pool.acquire().expect("acquire");
+        let sid = conn
+            .send_request(&[(":method", "GET"), (":path", "/seed")], None)
+            .expect("send request");
+        let _ = conn.recv_response_for(sid).expect("recv response");
+        std::thread::sleep(Duration::from_millis(70));
+        pool.release(conn);
+
+        // Force health-check to flush any pending GOAWAY still buffered in socket.
+        pool.health_check();
+
+        // Pool should have recorded ProtocolError
+        assert_eq!(
+            pool.last_goaway_error(),
+            Some(crate::simd_parser::Http2ErrorCode::ProtocolError)
+        );
+
+        // 2. execute_request_with_retry must detect the fatal GOAWAY and refuse immediately
+        let result = pool.execute_request_with_retry("GET", "/", &[], None, 3);
+        assert!(result.is_err(), "fatal GOAWAY must not be retried");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("PROTOCOL_ERROR") || msg.contains("non-retryable"),
+            "error message should mention the error code: {msg}"
+        );
 
         let _ = handle.join();
     }
