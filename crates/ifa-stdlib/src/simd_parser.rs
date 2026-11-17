@@ -1912,7 +1912,9 @@ mod http2_tests {
             stream_dependency: 0,
             weight: 50,
         };
-        session.handle_frame(&priority_frame).expect("handle priority frame");
+        session
+            .handle_frame(&priority_frame)
+            .expect("handle priority frame");
         assert_eq!(session.streams.get(&3).unwrap().stream_dependency, 0);
         assert_eq!(session.streams.get(&3).unwrap().weight, 50);
     }
