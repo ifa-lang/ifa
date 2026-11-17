@@ -1247,6 +1247,9 @@ pub struct Http2Stream {
     pub received_headers: Vec<(String, String)>,
     pub received_data: Vec<u8>,
     pub reset_error: Option<Http2ErrorCode>,
+    pub stream_dependency: u32,
+    pub weight: u8,
+    pub exclusive: bool,
 }
 
 impl Http2Stream {
@@ -1258,6 +1261,9 @@ impl Http2Stream {
             received_headers: Vec::new(),
             received_data: Vec::new(),
             reset_error: None,
+            stream_dependency: 0,
+            weight: 16,
+            exclusive: false,
         }
     }
 }
@@ -1458,6 +1464,72 @@ impl Http2Session {
         }
     }
 
+    /// Set stream priority according to RFC 7540 Section 5.3.
+    /// Handles exclusive flag reparenting: if exclusive is true, the newly prioritized stream becomes
+    /// the sole direct dependency of stream_dependency, reparenting previous children under it.
+    pub fn set_stream_priority(
+        &mut self,
+        stream_id: u32,
+        stream_dependency: u32,
+        weight: u8,
+        exclusive: bool,
+    ) {
+        if stream_id == stream_dependency {
+            return;
+        }
+
+        if exclusive {
+            for (id, stream) in self.streams.iter_mut() {
+                if *id != stream_id && stream.stream_dependency == stream_dependency {
+                    stream.stream_dependency = stream_id;
+                }
+            }
+        }
+
+        let initial_win = self.initial_stream_window_size;
+        let stream = self
+            .streams
+            .entry(stream_id)
+            .or_insert_with(|| Http2Stream::new(stream_id, initial_win));
+        stream.stream_dependency = stream_dependency;
+        stream.weight = weight;
+        stream.exclusive = exclusive;
+    }
+
+    /// Compute streams in priority order, resolving dependencies and weighting.
+    /// Returns stream IDs sorted by dependency tree depth then relative weight descending.
+    pub fn prioritized_stream_ids(&self) -> Vec<u32> {
+        let mut streams_info: Vec<(u32, usize, u8)> = self
+            .streams
+            .iter()
+            .map(|(&id, s)| {
+                // Compute tree depth to root (0)
+                let mut depth = 0;
+                let mut curr = s.stream_dependency;
+                let mut visited = std::collections::HashSet::new();
+                visited.insert(id);
+                while curr != 0 && visited.insert(curr) {
+                    if let Some(parent) = self.streams.get(&curr) {
+                        depth += 1;
+                        curr = parent.stream_dependency;
+                    } else {
+                        break;
+                    }
+                }
+                (id, depth, s.weight)
+            })
+            .collect();
+
+        // Sort: primary key = depth ascending (parents scheduled first), secondary = weight descending (higher weight first), tertiary = id ascending
+        streams_info.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        streams_info.into_iter().map(|(id, _, _)| id).collect()
+    }
+
     /// Process an incoming decoded frame.
     pub fn handle_frame(
         &mut self,
@@ -1593,6 +1665,15 @@ impl Http2Session {
                 self.streams.insert(*promised_stream_id, stream);
                 self.push_promises
                     .insert(*promised_stream_id, decoded_headers);
+                Ok(None)
+            }
+            Http2Frame::Priority {
+                stream_id,
+                exclusive,
+                stream_dependency,
+                weight,
+            } => {
+                self.set_stream_priority(*stream_id, *stream_dependency, *weight, *exclusive);
                 Ok(None)
             }
             _ => Ok(None),
@@ -1791,5 +1872,48 @@ mod http2_tests {
         } else {
             panic!("Expected PushPromise frame");
         }
+    }
+
+    #[test]
+    fn test_http2_priority_tree_and_exclusive_dependency() {
+        let mut session = Http2Session::new(false);
+        // Create 3 streams
+        session.open_stream(); // id = 1
+        session.open_stream(); // id = 3
+        session.open_stream(); // id = 5
+
+        // Initially all depend on root (0) with default weight 16
+        // Set stream 1: parent = 0, weight = 30
+        // Set stream 3: parent = 0, weight = 10
+        session.set_stream_priority(1, 0, 30, false);
+        session.set_stream_priority(3, 0, 10, false);
+        session.set_stream_priority(5, 0, 20, false);
+
+        // Prioritized order at same depth should be sorted by weight descending: 1 (30), 5 (20), 3 (10)
+        assert_eq!(session.prioritized_stream_ids(), vec![1, 5, 3]);
+
+        // Now set stream 3 to depend on stream 1 (non-exclusive)
+        session.set_stream_priority(3, 1, 10, false);
+        // Stream 1 and 5 are depth 0 (weight 30 and 20), stream 3 is depth 1 (child of 1)
+        assert_eq!(session.prioritized_stream_ids(), vec![1, 5, 3]);
+
+        // Now prioritize stream 7 with exclusive = true depending on root 0
+        // Streams currently depending on 0 (1 and 5) will be reparented under stream 7!
+        session.set_stream_priority(7, 0, 40, true);
+        assert_eq!(session.streams.get(&1).unwrap().stream_dependency, 7);
+        assert_eq!(session.streams.get(&5).unwrap().stream_dependency, 7);
+        // Stream 7 is now at depth 0, 1 and 5 at depth 1, and 3 at depth 2
+        assert_eq!(session.prioritized_stream_ids(), vec![7, 1, 5, 3]);
+
+        // Test frame handling
+        let priority_frame = Http2Frame::Priority {
+            stream_id: 3,
+            exclusive: false,
+            stream_dependency: 0,
+            weight: 50,
+        };
+        session.handle_frame(&priority_frame).expect("handle priority frame");
+        assert_eq!(session.streams.get(&3).unwrap().stream_dependency, 0);
+        assert_eq!(session.streams.get(&3).unwrap().weight, 50);
     }
 }

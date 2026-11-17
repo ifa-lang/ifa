@@ -3317,6 +3317,31 @@ impl AsyncHttp2Connection {
     ) -> Option<&Vec<(String, String)>> {
         self.session.push_promises.get(&promised_stream_id)
     }
+
+    /// Set stream priority and transmit a PRIORITY frame to the peer.
+    pub fn set_priority(
+        &mut self,
+        stream_id: u32,
+        stream_dependency: u32,
+        weight: u8,
+        exclusive: bool,
+    ) -> io::Result<()> {
+        let frame = crate::simd_parser::Http2Frame::Priority {
+            stream_id,
+            exclusive,
+            stream_dependency,
+            weight,
+        };
+        self.send_frame(&frame)?;
+        self.session
+            .set_stream_priority(stream_id, stream_dependency, weight, exclusive);
+        Ok(())
+    }
+
+    /// Retrieve active stream IDs sorted in priority order (depth in dependency tree ascending, weight descending).
+    pub fn prioritized_streams(&self) -> Vec<u32> {
+        self.session.prioritized_stream_ids()
+    }
 }
 
 /// A connection pool for reusable asynchronous HTTP/2 client connections.
@@ -5903,6 +5928,63 @@ mod tests {
             .and_then(AsyncHttp2Connection::client_handshake)
             .and_then(|mut c| c.send_goaway(crate::simd_parser::Http2ErrorCode::NoError));
 
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_priority_frames() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            };
+
+            loop {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::Priority {
+                        stream_id,
+                        exclusive,
+                        stream_dependency,
+                        weight,
+                    }) => {
+                        assert_eq!(stream_id, 3);
+                        assert_eq!(stream_dependency, 1);
+                        assert_eq!(weight, 42);
+                        assert!(!exclusive);
+                        break;
+                    }
+                    Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        });
+
+        let client_stream =
+            AsyncTcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect client");
+        let mut client =
+            AsyncHttp2Connection::client_handshake(client_stream).expect("client handshake");
+
+        // Set priority for stream 3 depending on stream 1 with weight 42
+        client
+            .set_priority(3, 1, 42, false)
+            .expect("client set priority");
+
+        let prioritized = client.prioritized_streams();
+        assert!(prioritized.contains(&3));
+
+        let _ = client.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
         let _ = handle.join();
     }
 }
