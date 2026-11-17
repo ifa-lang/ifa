@@ -4486,6 +4486,65 @@ impl AsyncHttp2Pool {
         self.select_alt_svc_route(origin, "h3").is_some()
     }
 
+    /// Sweep expired alternative service routes whose age has exceeded their advertised `max_age`.
+    ///
+    /// Routes with `persist = true` can optionally be preserved across sweeps if `preserve_persisted`
+    /// is set to true.
+    ///
+    /// Returns the total count of evicted expired routes.
+    pub fn sweep_expired_alt_svc_routes(
+        &self,
+        elapsed: std::time::Duration,
+        preserve_persisted: bool,
+    ) -> usize {
+        let mut evicted = 0;
+        if let Ok(mut map) = self.alt_svc_routes.lock() {
+            let mut empty_origins = Vec::new();
+            for (origin, routes) in map.iter_mut() {
+                let initial_len = routes.len();
+                routes.retain(|r| {
+                    if preserve_persisted && r.persist {
+                        true
+                    } else {
+                        !r.is_expired_since(elapsed)
+                    }
+                });
+                evicted += initial_len - routes.len();
+                if routes.is_empty() {
+                    empty_origins.push(origin.clone());
+                }
+            }
+            for empty in empty_origins {
+                map.remove(&empty);
+            }
+        }
+        evicted
+    }
+
+    /// Select an active (non-expired) alternative service route for a given origin and protocol.
+    ///
+    /// Routes exceeding `elapsed` since advertisement are filtered out, unless `persist = true`
+    /// and `allow_persisted` is set to true.
+    pub fn select_active_alt_svc_route(
+        &self,
+        origin: Option<&str>,
+        protocol_id: &str,
+        elapsed: std::time::Duration,
+        allow_persisted: bool,
+    ) -> Option<crate::simd_parser::AltSvcRoute> {
+        let routes = self.get_alt_svc_routes(origin);
+        routes.into_iter().find(|r| {
+            if !r.protocol_id.eq_ignore_ascii_case(protocol_id) {
+                return false;
+            }
+            if allow_persisted && r.persist {
+                true
+            } else {
+                !r.is_expired_since(elapsed)
+            }
+        })
+    }
+
     /// Execute an HTTP/2 request with automatic retry on retryable GOAWAY errors.
     ///
     /// When a connection is refused or a retryable GOAWAY (`NoError`, `RefusedStream`, `Cancel`)
@@ -8987,6 +9046,34 @@ mod tests {
         assert!(!selected.is_expired_since(std::time::Duration::from_secs(100)));
         assert!(selected.is_expired_since(std::time::Duration::from_secs(4000)));
         assert!(!pool.has_http3_alternative(Some("https://unknown.com")));
+
+        // Verify select_active_alt_svc_route with elapsed duration
+        assert!(pool
+            .select_active_alt_svc_route(
+                Some("https://example.org"),
+                "h3",
+                std::time::Duration::from_secs(1000),
+                false
+            )
+            .is_some());
+        assert!(pool
+            .select_active_alt_svc_route(
+                Some("https://example.org"),
+                "h3",
+                std::time::Duration::from_secs(4000),
+                false
+            )
+            .is_none());
+
+        // Verify sweep_expired_alt_svc_routes
+        let evicted = pool.sweep_expired_alt_svc_routes(std::time::Duration::from_secs(500), false);
+        assert_eq!(evicted, 0);
+        let evicted =
+            pool.sweep_expired_alt_svc_routes(std::time::Duration::from_secs(4000), false);
+        assert_eq!(evicted, 1);
+        assert!(pool
+            .get_alt_svc_routes(Some("https://example.org"))
+            .is_empty());
 
         pool.shutdown();
         let _ = handle.join();
