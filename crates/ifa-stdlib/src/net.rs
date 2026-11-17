@@ -7853,7 +7853,7 @@ mod tests {
         });
 
         let stream =
-            AsyncTcpStream::connect(&format!("127.0.0.1:{}", port)).expect("connect client");
+            AsyncTcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect client");
         let mut client = AsyncHttp2Connection::client_handshake(stream).expect("client handshake");
 
         // Send a 70 KB payload across stream (larger than standard initial window of 65535 bytes)
