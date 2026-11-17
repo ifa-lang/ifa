@@ -3946,7 +3946,8 @@ pub struct AsyncHttp2Pool {
     tls_config: Option<TlsConfig>,
     request_interceptors: Vec<Http2RequestInterceptor>,
     response_interceptors: Vec<Http2ResponseInterceptor>,
-    alt_svc_routes: std::sync::Mutex<std::collections::HashMap<String, Vec<crate::simd_parser::AltSvcRoute>>>,
+    alt_svc_routes:
+        std::sync::Mutex<std::collections::HashMap<String, Vec<crate::simd_parser::AltSvcRoute>>>,
 }
 
 impl AsyncHttp2Pool {
@@ -8947,7 +8948,9 @@ mod tests {
             origin: "https://example.org".to_string(),
             alt_svc_field_value: "h3=\":443\"; ma=3600".to_string(),
         };
-        conn.session.handle_frame(&altsvc_frame).expect("handle frame");
+        conn.session
+            .handle_frame(&altsvc_frame)
+            .expect("handle frame");
         pool.release(conn);
 
         // Verify pool harvested routes from connection session

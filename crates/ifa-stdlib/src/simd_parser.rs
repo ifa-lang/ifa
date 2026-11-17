@@ -737,7 +737,9 @@ impl AltSvcRoute {
                             if let Ok(ma) = v.parse::<u32>() {
                                 max_age = ma;
                             }
-                        } else if k.eq_ignore_ascii_case("persist") && (v == "1" || v.eq_ignore_ascii_case("true")) {
+                        } else if k.eq_ignore_ascii_case("persist")
+                            && (v == "1" || v.eq_ignore_ascii_case("true"))
+                        {
                             persist = true;
                         }
                     }
@@ -758,7 +760,10 @@ impl AltSvcRoute {
 
     /// Serialize this route to RFC 7838 field format, e.g. `h3=":443"; ma=86400`.
     pub fn serialize(&self) -> String {
-        let mut s = format!("{}=\"{}:{}\"; ma={}", self.protocol_id, self.host, self.port, self.max_age);
+        let mut s = format!(
+            "{}=\"{}:{}\"; ma={}",
+            self.protocol_id, self.host, self.port, self.max_age
+        );
         if self.persist {
             s.push_str("; persist=1");
         }
@@ -3116,7 +3121,9 @@ mod http2_tests {
             origin: "https://example.com".to_string(),
             alt_svc_field_value: "clear".to_string(),
         };
-        session.handle_frame(&clear_frame).expect("handle clear frame");
+        session
+            .handle_frame(&clear_frame)
+            .expect("handle clear frame");
         assert!(!session.alt_svc_routes.contains_key("https://example.com"));
     }
 }
