@@ -3378,9 +3378,133 @@ impl AsyncHttp2Connection {
     pub fn prioritized_streams(&self) -> Vec<u32> {
         self.session.prioritized_stream_ids()
     }
+
+    /// Execute a batch of prioritized requests multiplexed over this single HTTP/2 connection.
+    /// Sends PRIORITY frames for each stream, sends the requests concurrently,
+    /// and collects responses in the order of the dependency tree and weights.
+    pub fn execute_prioritized_batch(
+        &mut self,
+        requests: Vec<Http2PrioritizedRequest>,
+    ) -> io::Result<Vec<(u32, io::Result<crate::http::HttpResponse>)>> {
+        let mut stream_mappings = Vec::new();
+
+        // 1. Dispatch requests and transmit PRIORITY frames
+        for req in &requests {
+            let mut pseudo_headers = vec![
+                (":method", req.method.as_str()),
+                (":path", req.path.as_str()),
+                (":scheme", "http"),
+            ];
+            for (k, v) in &req.headers {
+                pseudo_headers.push((k.as_str(), v.as_str()));
+            }
+
+            let stream_id = self.send_request(&pseudo_headers, req.body.as_deref())?;
+
+            if req.stream_dependency != 0 || req.weight != 16 || req.exclusive {
+                self.set_priority(stream_id, req.stream_dependency, req.weight, req.exclusive)?;
+            }
+
+            stream_mappings.push(stream_id);
+        }
+
+        // 2. Order stream collection according to RFC 7540 priority tree
+        let prioritized_order = self.prioritized_streams();
+        let mut ordered_streams = Vec::new();
+        for &sid in &prioritized_order {
+            if stream_mappings.contains(&sid) {
+                ordered_streams.push(sid);
+            }
+        }
+        for &sid in &stream_mappings {
+            if !ordered_streams.contains(&sid) {
+                ordered_streams.push(sid);
+            }
+        }
+
+        // 3. Receive responses in prioritized order
+        let mut results = Vec::new();
+        for sid in ordered_streams {
+            let res = self.recv_response_for(sid).map(|(raw_headers, raw_body)| {
+                let mut status_code = 200u16;
+                let mut resp_headers = crate::http::HttpHeaders::new();
+                for (k, v) in raw_headers {
+                    if k == ":status" {
+                        if let Ok(code) = v.parse::<u16>() {
+                            status_code = code;
+                        }
+                    } else if !k.starts_with(':') {
+                        resp_headers.set(k, v);
+                    }
+                }
+                let mut resp = crate::http::HttpResponse::new(crate::http::HttpStatus(status_code));
+                resp.headers = resp_headers;
+                resp.body = raw_body;
+                if let Ok(decompressed) = resp.decompress_body() {
+                    resp.body = decompressed;
+                }
+                resp
+            });
+            results.push((sid, res));
+        }
+
+        Ok(results)
+    }
 }
 
-/// A connection pool for reusable asynchronous HTTP/2 client connections.
+/// Parameters for configuring a prioritized HTTP/2 request in a multiplexed batch.
+#[derive(Debug, Clone)]
+pub struct Http2PrioritizedRequest {
+    /// HTTP Method (GET, POST, etc.)
+    pub method: String,
+    /// Request target path and query
+    pub path: String,
+    /// Additional request headers
+    pub headers: Vec<(String, String)>,
+    /// Optional request payload
+    pub body: Option<Vec<u8>>,
+    /// Stream dependency ID (0 for root)
+    pub stream_dependency: u32,
+    /// Stream weight (1 to 256, standard RFC 7540)
+    pub weight: u8,
+    /// Exclusive dependency flag
+    pub exclusive: bool,
+}
+
+impl Http2PrioritizedRequest {
+    /// Create a new prioritized request with defaults (root dependency, default weight 16).
+    pub fn new(method: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            method: method.into(),
+            path: path.into(),
+            headers: Vec::new(),
+            body: None,
+            stream_dependency: 0,
+            weight: 16,
+            exclusive: false,
+        }
+    }
+
+    /// Add a request header.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Set request body payload.
+    pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = Some(body.into());
+        self
+    }
+
+    /// Set stream dependency tree settings.
+    pub fn with_priority(mut self, stream_dependency: u32, weight: u8, exclusive: bool) -> Self {
+        self.stream_dependency = stream_dependency;
+        self.weight = weight;
+        self.exclusive = exclusive;
+        self
+    }
+}
 /// Transparently manages connection pooling, multiplexing limits, idle connection reuse,
 /// and multiplexed request execution across shared or pooled HTTP/2 connections.
 pub struct AsyncHttp2Pool {
@@ -3462,6 +3586,31 @@ impl AsyncHttp2Pool {
                 if pool.len() < self.max_connections {
                     pool.push(conn);
                 }
+            }
+        }
+    }
+
+    /// Execute a batch of prioritized requests multiplexed over an acquired pooled connection,
+    /// returning the connection to the pool after execution completes.
+    pub fn execute_prioritized_batch(
+        &self,
+        requests: Vec<Http2PrioritizedRequest>,
+    ) -> io::Result<Vec<(u32, io::Result<crate::http::HttpResponse>)>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self.acquire()?;
+        let result = conn.execute_prioritized_batch(requests);
+        match result {
+            Ok(responses) => {
+                self.release(conn);
+                Ok(responses)
+            }
+            Err(e) => {
+                self.active_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                Err(e)
             }
         }
     }
@@ -6093,6 +6242,100 @@ mod tests {
         assert_eq!(resp.body, b"hello streaming http2 compression!");
 
         let _ = client.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_prioritized_batch() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            };
+
+            // Respond to two requests: stream 1 and stream 3
+            let mut responded = 0;
+            while responded < 2 {
+                match server.recv_frame().expect("server recv frame") {
+                    crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    } => {
+                        if end_stream {
+                            let resp_headers = [(":status", "200")];
+                            let body_text = format!("response-stream-{}", stream_id);
+                            server
+                                .send_response(stream_id, &resp_headers, Some(body_text.as_bytes()))
+                                .expect("send response");
+                            responded += 1;
+                        }
+                    }
+                    crate::simd_parser::Http2Frame::Priority { .. } => {}
+                    crate::simd_parser::Http2Frame::GoAway { .. } => break,
+                    _ => {}
+                }
+            }
+
+            // Drain until GoAway or closure
+            loop {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
+
+        // Stream 1 (normal weight 16), Stream 2 in batch (configured with higher weight 128)
+        let batch = vec![
+            Http2PrioritizedRequest::new("GET", "/low-prio").with_priority(0, 10, false),
+            Http2PrioritizedRequest::new("GET", "/high-prio").with_priority(0, 200, false),
+        ];
+
+        let results = pool
+            .execute_prioritized_batch(batch)
+            .expect("execute prioritized batch");
+
+        assert_eq!(results.len(), 2);
+        // The higher weight stream (stream 3) should be received and collected first in the ordered batch
+        let first = &results[0];
+        let second = &results[1];
+
+        assert_eq!(first.0, 3);
+        assert_eq!(
+            first.1.as_ref().unwrap().body,
+            b"response-stream-3"
+        );
+
+        assert_eq!(second.0, 1);
+        assert_eq!(
+            second.1.as_ref().unwrap().body,
+            b"response-stream-1"
+        );
+
+        // Connection was released back into pool
+        assert_eq!(pool.idle_count(), 1);
+        assert_eq!(pool.active_count(), 0);
+
+        let mut conn = pool.acquire().expect("acquire to close");
+        let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        pool.release(conn);
+        pool.clear();
+
         let _ = handle.join();
     }
 }
