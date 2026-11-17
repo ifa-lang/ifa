@@ -107,15 +107,16 @@ pub use json::{
     FilterOp, FilterPredicate, JsonValue, PatchOperation, PathSegment,
 };
 pub use net::{
-    lookup_mime_type, resolve_host, resolve_host_v4, resolve_host_v6, resolve_socket_addrs,
+    benchmark_sse_parsing, benchmark_token_bucket, benchmark_websocket_framing, lookup_mime_type,
+    resolve_host, resolve_host_v4, resolve_host_v6, resolve_socket_addrs, run_net_benchmark_suite,
     AsyncHttp2Connection, AsyncHttp2Pool, AsyncSseClient, AsyncSseServer, AsyncTcpListener,
     AsyncTcpStream, AsyncTimer, AsyncUdpSocket, AsyncWsConnection, AsyncWsPool, BufferedTcpStream,
     ConnectionInfo, Datagram, EventHub, Http2ClientRequest, Http2PoolStats,
     Http2PrioritizedRequest, Http2RequestInterceptor, Http2ResponseInterceptor, HubMessage,
-    SessionId, SessionSink, SocketConfig, SseClientStats, SseDecoder, SseServerStats,
-    TcpListener as NetTcpListener, TcpListener, TcpServer, TcpStream as NetTcpStream, TcpStream,
-    TokenBucket, UdpSocket as NetUdpSocket, UdpSocket, WsClient, WsDemux, WsFrame, WsMessage,
-    WsOpcode, WsPoolStats, WsServer, WsSession,
+    NetBenchmarkReport, NetBenchmarkResult, SessionId, SessionSink, SocketConfig, SseClientStats,
+    SseDecoder, SseServerStats, TcpListener as NetTcpListener, TcpListener, TcpServer,
+    TcpStream as NetTcpStream, TcpStream, TokenBucket, UdpSocket as NetUdpSocket, UdpSocket,
+    WsClient, WsDemux, WsFrame, WsMessage, WsOpcode, WsPoolStats, WsServer, WsSession,
 };
 pub use process::{
     find_best_assembler, find_best_linker, find_system_tool, invoke_assembler, invoke_linker,

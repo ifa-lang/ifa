@@ -1694,7 +1694,9 @@ impl WsDemux {
     pub fn poll_frame(&mut self) -> Option<WsFrame> {
         if let Some((frame, consumed)) = WsFrame::decode(&self.buffer) {
             self.buffer.drain(..consumed);
-            if self.buffer.is_empty() && self.buffer.capacity() > DEFAULT_MAX_RETAINED_BUFFER_CAPACITY {
+            if self.buffer.is_empty()
+                && self.buffer.capacity() > DEFAULT_MAX_RETAINED_BUFFER_CAPACITY
+            {
                 self.buffer.shrink_to(DEFAULT_MAX_RETAINED_BUFFER_CAPACITY);
             }
             Some(frame)
@@ -3229,8 +3231,11 @@ impl AsyncHttp2Connection {
 
         // Drain the parsed frame from read buffer
         self.read_buf.drain(..total_frame_len);
-        if self.read_buf.is_empty() && self.read_buf.capacity() > DEFAULT_MAX_RETAINED_BUFFER_CAPACITY {
-            self.read_buf.shrink_to(DEFAULT_MAX_RETAINED_BUFFER_CAPACITY);
+        if self.read_buf.is_empty()
+            && self.read_buf.capacity() > DEFAULT_MAX_RETAINED_BUFFER_CAPACITY
+        {
+            self.read_buf
+                .shrink_to(DEFAULT_MAX_RETAINED_BUFFER_CAPACITY);
         }
 
         // If the frame is GOAWAY, mark the connection as closed
@@ -4425,7 +4430,9 @@ impl SseDecoder {
         if let Some((idx, delim_len)) = end_idx {
             let block = self.buffer[..idx].to_string();
             self.buffer.drain(..idx + delim_len);
-            if self.buffer.is_empty() && self.buffer.capacity() > DEFAULT_MAX_RETAINED_BUFFER_CAPACITY {
+            if self.buffer.is_empty()
+                && self.buffer.capacity() > DEFAULT_MAX_RETAINED_BUFFER_CAPACITY
+            {
                 self.buffer.shrink_to(DEFAULT_MAX_RETAINED_BUFFER_CAPACITY);
             }
 
@@ -5132,6 +5139,131 @@ pub fn resolve_socket_addrs<A: ToSocketAddrs>(addr: A) -> io::Result<Vec<SocketA
         ));
     }
     Ok(addrs)
+}
+
+// ── Profiling & Micro-Benchmarks for Network Primitives ─────────────────────
+
+/// Results and performance telemetry for network primitive micro-benchmarks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetBenchmarkResult {
+    /// Identifier or descriptive name of the benchmarked primitive.
+    pub name: String,
+    /// Total number of operations evaluated during the benchmark run.
+    pub iterations: usize,
+    /// Total duration elapsed during the measurement in milliseconds.
+    pub total_time_ms: f64,
+    /// Average execution time per individual operation in nanoseconds.
+    pub ns_per_op: f64,
+    /// Number of completed operations achieved per second.
+    pub ops_per_sec: f64,
+}
+
+/// Comprehensive benchmark report compiling network primitive throughput and latency metrics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetBenchmarkReport {
+    /// Total timestamped duration of the entire benchmark suite in milliseconds.
+    pub total_duration_ms: f64,
+    /// Collection of individual component benchmark measurements.
+    pub benchmarks: Vec<NetBenchmarkResult>,
+}
+
+/// Runs in-memory micro-benchmarks evaluating WebSocket framing and demuxing throughput.
+pub fn benchmark_websocket_framing(iterations: usize) -> NetBenchmarkResult {
+    let payload = b"Hello IFA High-Concurrency Networking Benchmark!".to_vec();
+    let frame = WsFrame::text(
+        std::str::from_utf8(&payload).unwrap(),
+        false,
+        Some([0x12, 0x34, 0x56, 0x78]),
+    );
+    let encoded = frame.encode();
+
+    let start = std::time::Instant::now();
+    let mut demux = WsDemux::new();
+
+    for _ in 0..iterations {
+        demux.push_bytes(&encoded);
+        let _ = demux.poll_frame();
+    }
+
+    let elapsed = start.elapsed();
+    let total_time_ms = elapsed.as_secs_f64() * 1000.0;
+    let ns_per_op = (elapsed.as_nanos() as f64) / (iterations as f64);
+    let ops_per_sec = (iterations as f64) / elapsed.as_secs_f64();
+
+    NetBenchmarkResult {
+        name: "websocket_frame_encode_demux".to_string(),
+        iterations,
+        total_time_ms,
+        ns_per_op,
+        ops_per_sec,
+    }
+}
+
+/// Runs in-memory micro-benchmarks evaluating SSE event encoding and stream parsing throughput.
+pub fn benchmark_sse_parsing(iterations: usize) -> NetBenchmarkResult {
+    let raw_sse =
+        "event: metric_update\nid: 9942\ndata: {\"concurrency\": 10000, \"status\": \"ok\"}\n\n";
+
+    let start = std::time::Instant::now();
+    let mut decoder = SseDecoder::new();
+
+    for _ in 0..iterations {
+        decoder.push_str(raw_sse);
+        let _ = decoder.next_event();
+    }
+
+    let elapsed = start.elapsed();
+    let total_time_ms = elapsed.as_secs_f64() * 1000.0;
+    let ns_per_op = (elapsed.as_nanos() as f64) / (iterations as f64);
+    let ops_per_sec = (iterations as f64) / elapsed.as_secs_f64();
+
+    NetBenchmarkResult {
+        name: "sse_event_stream_parsing".to_string(),
+        iterations,
+        total_time_ms,
+        ns_per_op,
+        ops_per_sec,
+    }
+}
+
+/// Runs in-memory micro-benchmarks evaluating TokenBucket rate-limiting acquisition throughput.
+pub fn benchmark_token_bucket(iterations: usize) -> NetBenchmarkResult {
+    let mut bucket = TokenBucket::new(1_000_000_000, 1_000_000_000, 1000);
+
+    let start = std::time::Instant::now();
+
+    for _ in 0..iterations {
+        let _ = bucket.try_consume(1, 1000);
+    }
+
+    let elapsed = start.elapsed();
+    let total_time_ms = elapsed.as_secs_f64() * 1000.0;
+    let ns_per_op = (elapsed.as_nanos() as f64) / (iterations as f64);
+    let ops_per_sec = (iterations as f64) / elapsed.as_secs_f64();
+
+    NetBenchmarkResult {
+        name: "token_bucket_acquisition".to_string(),
+        iterations,
+        total_time_ms,
+        ns_per_op,
+        ops_per_sec,
+    }
+}
+
+/// Executes the full suite of in-memory network primitive micro-benchmarks and returns a unified report.
+pub fn run_net_benchmark_suite(iterations_per_test: usize) -> NetBenchmarkReport {
+    let start = std::time::Instant::now();
+    let benchmarks = vec![
+        benchmark_websocket_framing(iterations_per_test),
+        benchmark_sse_parsing(iterations_per_test),
+        benchmark_token_bucket(iterations_per_test),
+    ];
+
+    let elapsed = start.elapsed();
+    NetBenchmarkReport {
+        total_duration_ms: elapsed.as_secs_f64() * 1000.0,
+        benchmarks,
+    }
 }
 
 #[cfg(test)]
@@ -8574,5 +8706,18 @@ mod cookie_tests {
         assert_eq!(ev.data, "message");
         assert!(decoder.buffer.is_empty());
         assert!(decoder.buffer.capacity() <= DEFAULT_MAX_RETAINED_BUFFER_CAPACITY * 2);
+    }
+
+    #[test]
+    fn test_network_primitive_micro_benchmarks() {
+        let report = run_net_benchmark_suite(100);
+        assert!(report.total_duration_ms >= 0.0);
+        assert_eq!(report.benchmarks.len(), 3);
+
+        for b in &report.benchmarks {
+            assert_eq!(b.iterations, 100);
+            assert!(b.ops_per_sec > 0.0);
+            assert!(b.ns_per_op > 0.0);
+        }
     }
 }
