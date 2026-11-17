@@ -107,8 +107,9 @@ pub use json::{
     FilterOp, FilterPredicate, JsonValue, PatchOperation, PathSegment,
 };
 pub use net::{
-    benchmark_sse_parsing, benchmark_token_bucket, benchmark_websocket_framing, lookup_mime_type,
-    resolve_host, resolve_host_v4, resolve_host_v6, resolve_socket_addrs, run_net_benchmark_suite,
+    benchmark_sse_parsing, benchmark_tcp_throughput, benchmark_token_bucket,
+    benchmark_websocket_framing, lookup_mime_type, resolve_host, resolve_host_v4, resolve_host_v6,
+    resolve_socket_addrs, run_net_benchmark_suite,
     AsyncHttp2Connection, AsyncHttp2Pool, AsyncSseClient, AsyncSseServer, AsyncTcpListener,
     AsyncTcpStream, AsyncTimer, AsyncUdpSocket, AsyncWsConnection, AsyncWsPool, BufferedTcpStream,
     ConnectionInfo, Datagram, EventHub, Http2ClientRequest, Http2PoolStats,

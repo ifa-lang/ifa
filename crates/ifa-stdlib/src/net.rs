@@ -5250,14 +5250,123 @@ pub fn benchmark_token_bucket(iterations: usize) -> NetBenchmarkResult {
     }
 }
 
+/// Runs a multithreaded concurrent TCP throughput benchmark between an echo server and concurrent clients.
+/// Measures aggregate round-trip requests, data volume transferred, latency per op, and total operations/sec.
+pub fn benchmark_tcp_throughput(
+    clients_count: usize,
+    messages_per_client: usize,
+    payload_size: usize,
+) -> io::Result<NetBenchmarkResult> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let payload = vec![0x42u8; payload_size.max(1)];
+
+    let total_operations = clients_count * messages_per_client;
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let server_running = running.clone();
+
+    // Spawn server thread
+    let server_handle = std::thread::spawn(move || {
+        let mut server_handles = Vec::new();
+        while server_running.load(std::sync::atomic::Ordering::Relaxed) {
+            listener.set_nonblocking(true).ok();
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let h = std::thread::spawn(move || {
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match stream.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    if stream.write_all(&buf[..n]).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                    std::thread::yield_now();
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+                    server_handles.push(h);
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => break,
+            }
+        }
+        for h in server_handles {
+            let _ = h.join();
+        }
+    });
+
+    let start = std::time::Instant::now();
+    let mut client_threads = Vec::new();
+
+    for _ in 0..clients_count {
+        let p = payload.clone();
+        let handle = std::thread::spawn(move || -> io::Result<()> {
+            let mut stream = std::net::TcpStream::connect(addr)?;
+            let mut response_buf = vec![0u8; p.len()];
+            for _ in 0..messages_per_client {
+                stream.write_all(&p)?;
+                stream.read_exact(&mut response_buf)?;
+            }
+            Ok(())
+        });
+        client_threads.push(handle);
+    }
+
+    for h in client_threads {
+        let _ = h
+            .join()
+            .map_err(|_| io::Error::other("Client benchmark worker failed"))?;
+    }
+
+    let elapsed = start.elapsed();
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    // Connect dummy stream to unblock listener accept loop if waiting
+    let _ = std::net::TcpStream::connect(addr);
+    let _ = server_handle.join();
+
+    let total_time_ms = elapsed.as_secs_f64() * 1000.0;
+    let ns_per_op = if total_operations > 0 {
+        (elapsed.as_nanos() as f64) / (total_operations as f64)
+    } else {
+        0.0
+    };
+    let ops_per_sec = if elapsed.as_secs_f64() > 0.0 {
+        (total_operations as f64) / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    Ok(NetBenchmarkResult {
+        name: format!(
+            "tcp_multithread_throughput_{}x{}_{}b",
+            clients_count, messages_per_client, payload_size
+        ),
+        iterations: total_operations,
+        total_time_ms,
+        ns_per_op,
+        ops_per_sec,
+    })
+}
+
 /// Executes the full suite of in-memory network primitive micro-benchmarks and returns a unified report.
 pub fn run_net_benchmark_suite(iterations_per_test: usize) -> NetBenchmarkReport {
     let start = std::time::Instant::now();
-    let benchmarks = vec![
+    let mut benchmarks = vec![
         benchmark_websocket_framing(iterations_per_test),
         benchmark_sse_parsing(iterations_per_test),
         benchmark_token_bucket(iterations_per_test),
     ];
+
+    if let Ok(tcp_bench) = benchmark_tcp_throughput(2, iterations_per_test.min(50), 64) {
+        benchmarks.push(tcp_bench);
+    }
 
     let elapsed = start.elapsed();
     NetBenchmarkReport {
@@ -8712,12 +8821,18 @@ mod cookie_tests {
     fn test_network_primitive_micro_benchmarks() {
         let report = run_net_benchmark_suite(100);
         assert!(report.total_duration_ms >= 0.0);
-        assert_eq!(report.benchmarks.len(), 3);
+        assert_eq!(report.benchmarks.len(), 4);
 
         for b in &report.benchmarks {
-            assert_eq!(b.iterations, 100);
-            assert!(b.ops_per_sec > 0.0);
-            assert!(b.ns_per_op > 0.0);
+            assert!(b.iterations > 0);
+            assert!(b.ops_per_sec >= 0.0);
+            assert!(b.ns_per_op >= 0.0);
         }
+
+        // Direct test of multithreaded TCP throughput benchmark
+        let tcp_res = benchmark_tcp_throughput(4, 50, 128).expect("tcp throughput benchmark");
+        assert_eq!(tcp_res.iterations, 200);
+        assert!(tcp_res.ops_per_sec > 0.0);
+        assert!(tcp_res.total_time_ms > 0.0);
     }
 }

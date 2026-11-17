@@ -180,7 +180,35 @@ assert_eq!(parsed.path, "/v1/market/tickers");
 
 ---
 
-## 6. Best Practices for IFA Systems Developers
+## 6. Profiling & Micro-Benchmarks Suite
+
+The `ifa_stdlib::net` module provides built-in throughput and latency benchmarking tools to validate networking performance under heavy loads:
+
+```rust
+use ifa_stdlib::net::{
+    benchmark_sse_parsing, benchmark_tcp_throughput, benchmark_token_bucket,
+    benchmark_websocket_framing, run_net_benchmark_suite,
+};
+
+// Execute full micro-benchmark suite (WebSocket, SSE, TokenBucket, TCP Throughput)
+let report = run_net_benchmark_suite(1_000);
+println!("Benchmark suite completed in {:.2} ms", report.total_duration_ms);
+
+for bench in &report.benchmarks {
+    println!(
+        "[{}] iterations: {}, throughput: {:.1} ops/sec, latency: {:.2} ns/op",
+        bench.name, bench.iterations, bench.ops_per_sec, bench.ns_per_op
+    );
+}
+
+// Or run dedicated concurrent TCP endurance benchmark:
+let tcp_result = benchmark_tcp_throughput(8 /* clients */, 500 /* msgs/client */, 1024 /* payload bytes */)?;
+println!("TCP Throughput: {:.1} ops/sec", tcp_result.ops_per_sec);
+```
+
+---
+
+## 7. Best Practices for IFA Systems Developers
 
 1. **Deterministic Resource Management**: Always close or return pooled connections to avoid channel capacity exhaustion.
 2. **Backpressure Awareness**: When using high-frequency SSE or WebSocket feeds, inspect `stats.utilization_rate()` periodically to throttle upstream ingestion.
