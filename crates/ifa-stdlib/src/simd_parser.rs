@@ -21,6 +21,8 @@ pub enum Http2FrameType {
     Continuation = 0x9,
     /// RFC 9218 Extensible Prioritization Scheme frame type for HTTP/2
     PriorityUpdate = 0x10,
+    /// RFC 7838 HTTP/2 ALTSVC frame type (0xa)
+    AltSvc = 0xa,
     Unknown(u8),
 }
 
@@ -37,6 +39,7 @@ impl From<u8> for Http2FrameType {
             0x7 => Http2FrameType::GoAway,
             0x8 => Http2FrameType::WindowUpdate,
             0x9 => Http2FrameType::Continuation,
+            0xa => Http2FrameType::AltSvc,
             0x10 => Http2FrameType::PriorityUpdate,
             other => Http2FrameType::Unknown(other),
         }
@@ -56,6 +59,7 @@ impl From<Http2FrameType> for u8 {
             Http2FrameType::GoAway => 0x7,
             Http2FrameType::WindowUpdate => 0x8,
             Http2FrameType::Continuation => 0x9,
+            Http2FrameType::AltSvc => 0xa,
             Http2FrameType::PriorityUpdate => 0x10,
             Http2FrameType::Unknown(u) => u,
         }
@@ -613,6 +617,155 @@ pub struct Http2Setting {
     pub value: u32,
 }
 
+/// RFC 7838 Alternative Service Descriptor (ALTSVC).
+/// Represents an alternative service route advertised by an HTTP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AltSvcRoute {
+    /// Protocol identifier (e.g., "h3", "h2", "h3-29").
+    pub protocol_id: String,
+    /// Host or IP address, optional (empty or omitted means same origin host).
+    pub host: String,
+    /// Port number of the alternative service.
+    pub port: u16,
+    /// Max-Age in seconds (default 86400 / 24 hours).
+    pub max_age: u32,
+    /// Persist flag (persist=1).
+    pub persist: bool,
+}
+
+impl AltSvcRoute {
+    pub fn new(protocol_id: impl Into<String>, host: impl Into<String>, port: u16) -> Self {
+        Self {
+            protocol_id: protocol_id.into(),
+            host: host.into(),
+            port,
+            max_age: 86400,
+            persist: false,
+        }
+    }
+
+    pub fn with_max_age(mut self, max_age: u32) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
+    pub fn with_persist(mut self, persist: bool) -> Self {
+        self.persist = persist;
+        self
+    }
+
+    /// Parse an Alt-Svc header value or field value into a list of `AltSvcRoute`.
+    /// E.g. `h3=":443"; ma=2592000, h2="alt.example.com:8443"` or `clear`.
+    pub fn parse_header_value(header_val: &str) -> Vec<Self> {
+        let trimmed = header_val.trim();
+        if trimmed.eq_ignore_ascii_case("clear") {
+            return Vec::new();
+        }
+
+        let mut routes = Vec::new();
+        // Split entries separated by comma outside quotes
+        let mut entries = Vec::new();
+        let mut in_quotes = false;
+        let mut start = 0;
+        let bytes = trimmed.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'"' {
+                in_quotes = !in_quotes;
+            } else if b == b',' && !in_quotes {
+                entries.push(&trimmed[start..i]);
+                start = i + 1;
+            }
+        }
+        if start < trimmed.len() {
+            entries.push(&trimmed[start..]);
+        }
+
+        for entry in entries {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+
+            // Split protocol and parameters (separated by '=')
+            if let Some(eq_pos) = entry.find('=') {
+                let proto = entry[..eq_pos].trim();
+                let rest = entry[eq_pos + 1..].trim();
+
+                // Extract quoted host/port or unquoted up to ';'
+                let (target, params) = if let Some(stripped) = rest.strip_prefix('"') {
+                    if let Some(end_quote) = stripped.find('"') {
+                        let target = &stripped[..end_quote];
+                        let params = &stripped[end_quote + 1..];
+                        (target, params)
+                    } else {
+                        (rest, "")
+                    }
+                } else if let Some(semi_pos) = rest.find(';') {
+                    (&rest[..semi_pos], &rest[semi_pos..])
+                } else {
+                    (rest, "")
+                };
+
+                let target = target.trim();
+                let (host, port) = if let Some(colon_pos) = target.rfind(':') {
+                    let h = &target[..colon_pos];
+                    let p_str = &target[colon_pos + 1..];
+                    let port = p_str.parse::<u16>().unwrap_or(0);
+                    (h.to_string(), port)
+                } else {
+                    ("".to_string(), 0)
+                };
+
+                if port == 0 {
+                    continue;
+                }
+
+                let mut max_age = 86400u32;
+                let mut persist = false;
+
+                // Parse parameters separated by ';'
+                for param in params.split(';') {
+                    let param = param.trim();
+                    if param.is_empty() {
+                        continue;
+                    }
+                    if let Some(param_eq) = param.find('=') {
+                        let (k, v) = param.split_at(param_eq);
+                        let k = k.trim();
+                        let v = v[1..].trim();
+                        if k.eq_ignore_ascii_case("ma") {
+                            if let Ok(ma) = v.parse::<u32>() {
+                                max_age = ma;
+                            }
+                        } else if k.eq_ignore_ascii_case("persist") && (v == "1" || v.eq_ignore_ascii_case("true")) {
+                            persist = true;
+                        }
+                    }
+                }
+
+                routes.push(Self {
+                    protocol_id: proto.to_string(),
+                    host,
+                    port,
+                    max_age,
+                    persist,
+                });
+            }
+        }
+
+        routes
+    }
+
+    /// Serialize this route to RFC 7838 field format, e.g. `h3=":443"; ma=86400`.
+    pub fn serialize(&self) -> String {
+        let mut s = format!("{}=\"{}:{}\"; ma={}", self.protocol_id, self.host, self.port, self.max_age);
+        if self.persist {
+            s.push_str("; persist=1");
+        }
+        s
+    }
+}
+
 /// Typed HTTP/2 Frame representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Http2Frame {
@@ -669,6 +822,12 @@ pub enum Http2Frame {
     PriorityUpdate {
         prioritized_stream_id: u32,
         priority_field_value: String,
+    },
+    /// RFC 7838 ALTSVC frame (Type 0xa) advertising alternative services for an origin.
+    AltSvc {
+        stream_id: u32,
+        origin: String,
+        alt_svc_field_value: String,
     },
     Unknown {
         header: Http2FrameHeader,
@@ -864,6 +1023,28 @@ impl Http2Frame {
                 out.extend_from_slice(&header.encode());
                 out.extend_from_slice(&(*prioritized_stream_id & 0x7FFF_FFFF).to_be_bytes());
                 out.extend_from_slice(bytes);
+                out
+            }
+            Http2Frame::AltSvc {
+                stream_id,
+                origin,
+                alt_svc_field_value,
+            } => {
+                let origin_bytes = origin.as_bytes();
+                let alt_svc_bytes = alt_svc_field_value.as_bytes();
+                let origin_len = origin_bytes.len() as u16;
+                let payload_len = 2 + origin_bytes.len() + alt_svc_bytes.len();
+                let header = Http2FrameHeader::new(
+                    payload_len as u32,
+                    Http2FrameType::AltSvc,
+                    0,
+                    *stream_id & 0x7FFF_FFFF,
+                );
+                let mut out = Vec::with_capacity(9 + payload_len);
+                out.extend_from_slice(&header.encode());
+                out.extend_from_slice(&origin_len.to_be_bytes());
+                out.extend_from_slice(origin_bytes);
+                out.extend_from_slice(alt_svc_bytes);
                 out
             }
             Http2Frame::Unknown { header, payload } => {
@@ -1075,6 +1256,25 @@ impl Http2Frame {
                 Ok(Http2Frame::PriorityUpdate {
                     prioritized_stream_id,
                     priority_field_value,
+                })
+            }
+            Http2FrameType::AltSvc => {
+                // RFC 7838 Section 4:
+                // An ALTSVC frame with length less than 2 octets MUST be treated as FRAME_SIZE_ERROR.
+                if payload.len() < 2 {
+                    return Err(FastHttpError::InvalidRequestLine);
+                }
+                let origin_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+                if 2 + origin_len > payload.len() {
+                    return Err(FastHttpError::InvalidRequestLine);
+                }
+                let origin = String::from_utf8_lossy(&payload[2..2 + origin_len]).into_owned();
+                let alt_svc_field_value =
+                    String::from_utf8_lossy(&payload[2 + origin_len..]).into_owned();
+                Ok(Http2Frame::AltSvc {
+                    stream_id: header.stream_id,
+                    origin,
+                    alt_svc_field_value,
                 })
             }
             _ => Ok(Http2Frame::Unknown {
@@ -1632,6 +1832,9 @@ pub struct Http2Session {
     pub connection_window_size: i32,
     pub initial_stream_window_size: i32,
     pub last_received_goaway: Option<(u32, Http2ErrorCode, Vec<u8>)>,
+    /// RFC 7838 alternative services advertised by peer.
+    /// Maps origin string (or empty for current origin) to list of available routes.
+    pub alt_svc_routes: std::collections::HashMap<String, Vec<AltSvcRoute>>,
 }
 
 impl Http2Session {
@@ -1660,6 +1863,7 @@ impl Http2Session {
             connection_window_size: Self::DEFAULT_INITIAL_WINDOW_SIZE,
             initial_stream_window_size: Self::DEFAULT_INITIAL_WINDOW_SIZE,
             last_received_goaway: None,
+            alt_svc_routes: std::collections::HashMap::new(),
         }
     }
 
@@ -2212,6 +2416,19 @@ impl Http2Session {
             } => {
                 let params = PriorityParameters::parse(priority_field_value);
                 self.set_stream_priority_parameters(*prioritized_stream_id, params);
+                Ok(None)
+            }
+            Http2Frame::AltSvc {
+                stream_id: _,
+                origin,
+                alt_svc_field_value,
+            } => {
+                let routes = AltSvcRoute::parse_header_value(alt_svc_field_value);
+                if routes.is_empty() && alt_svc_field_value.trim().eq_ignore_ascii_case("clear") {
+                    self.alt_svc_routes.remove(origin);
+                } else if !routes.is_empty() {
+                    self.alt_svc_routes.insert(origin.clone(), routes);
+                }
                 Ok(None)
             }
             Http2Frame::GoAway {
@@ -2822,5 +3039,84 @@ mod http2_tests {
             server.streams.get(&2).unwrap().state,
             Http2StreamState::ReservedLocal
         );
+    }
+
+    #[test]
+    fn test_rfc7838_altsvc_route_parsing_and_serialization() {
+        let header = "h3=\":443\"; ma=2592000; persist=1, h2=\"alt.example.com:8443\"; ma=3600";
+        let routes = AltSvcRoute::parse_header_value(header);
+        assert_eq!(routes.len(), 2);
+
+        assert_eq!(routes[0].protocol_id, "h3");
+        assert_eq!(routes[0].host, "");
+        assert_eq!(routes[0].port, 443);
+        assert_eq!(routes[0].max_age, 2592000);
+        assert!(routes[0].persist);
+
+        assert_eq!(routes[1].protocol_id, "h2");
+        assert_eq!(routes[1].host, "alt.example.com");
+        assert_eq!(routes[1].port, 8443);
+        assert_eq!(routes[1].max_age, 3600);
+        assert!(!routes[1].persist);
+
+        // Serialization
+        let serialized = routes[0].serialize();
+        assert_eq!(serialized, "h3=\":443\"; ma=2592000; persist=1");
+
+        // "clear" directive
+        let cleared = AltSvcRoute::parse_header_value("clear");
+        assert!(cleared.is_empty());
+    }
+
+    #[test]
+    fn test_rfc7838_altsvc_frame_encode_decode_and_session() {
+        let frame = Http2Frame::AltSvc {
+            stream_id: 0,
+            origin: "https://example.com".to_string(),
+            alt_svc_field_value: "h3=\":443\"; ma=86400".to_string(),
+        };
+
+        let encoded = frame.encode();
+        // origin len (2) + origin (19) + alt_svc (19) = 40 payload bytes
+        assert_eq!(encoded.len(), 9 + 40);
+
+        let header = Http2FrameHeader::decode(&encoded[..9]).expect("decode header");
+        assert_eq!(header.length, 40);
+        assert_eq!(header.frame_type, Http2FrameType::AltSvc);
+        assert_eq!(header.stream_id, 0);
+
+        let decoded = Http2Frame::decode(&header, &encoded[9..]).expect("decode frame");
+        if let Http2Frame::AltSvc {
+            stream_id,
+            origin,
+            alt_svc_field_value,
+        } = decoded
+        {
+            assert_eq!(stream_id, 0);
+            assert_eq!(origin, "https://example.com");
+            assert_eq!(alt_svc_field_value, "h3=\":443\"; ma=86400");
+        } else {
+            panic!("Expected Http2Frame::AltSvc");
+        }
+
+        // Test session processing of ALTSVC
+        let mut session = Http2Session::new(false);
+        let resp = session.handle_frame(&frame).expect("handle frame");
+        assert!(resp.is_none());
+
+        assert!(session.alt_svc_routes.contains_key("https://example.com"));
+        let routes = session.alt_svc_routes.get("https://example.com").unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].protocol_id, "h3");
+        assert_eq!(routes[0].port, 443);
+
+        // Clear routes via clear frame
+        let clear_frame = Http2Frame::AltSvc {
+            stream_id: 0,
+            origin: "https://example.com".to_string(),
+            alt_svc_field_value: "clear".to_string(),
+        };
+        session.handle_frame(&clear_frame).expect("handle clear frame");
+        assert!(!session.alt_svc_routes.contains_key("https://example.com"));
     }
 }
