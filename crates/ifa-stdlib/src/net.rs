@@ -3747,8 +3747,9 @@ impl Http2ClientRequest {
 
 /// HTTP/2 request interceptor invoked before dispatching a request to the server.
 /// Can modify headers/body, or return `Some(HttpResponse)` to short-circuit without network I/O.
-pub type Http2RequestInterceptor =
-    std::sync::Arc<dyn Fn(&mut Http2ClientRequest) -> Option<crate::http::HttpResponse> + Send + Sync>;
+pub type Http2RequestInterceptor = std::sync::Arc<
+    dyn Fn(&mut Http2ClientRequest) -> Option<crate::http::HttpResponse> + Send + Sync,
+>;
 
 /// HTTP/2 response interceptor invoked after receiving a response from the server.
 /// Can inspect or mutate response status, headers, or body.
@@ -6256,7 +6257,10 @@ mod tests {
         assert_eq!(stats.idle_connections, 0);
         assert_eq!(stats.active_connections, 0);
         assert_eq!(stats.max_connections, 2);
-        assert_eq!(stats.protocols, vec!["v1.chat".to_string(), "v2.chat".to_string()]);
+        assert_eq!(
+            stats.protocols,
+            vec!["v1.chat".to_string(), "v2.chat".to_string()]
+        );
         assert_eq!(stats.total_connections(), 0);
         assert!(!stats.is_exhausted());
     }
@@ -7680,7 +7684,8 @@ mod tests {
         // Test request & response mutation interceptors
         let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2)
             .with_request_interceptor(|req| {
-                req.headers.push(("x-custom-auth".to_string(), "token-123".to_string()));
+                req.headers
+                    .push(("x-custom-auth".to_string(), "token-123".to_string()));
                 None // Do not short-circuit
             })
             .with_response_interceptor(|_req, resp| {
