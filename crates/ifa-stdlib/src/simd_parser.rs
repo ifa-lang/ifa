@@ -1313,11 +1313,16 @@ pub const HPACK_STATIC_TABLE: &[(&str, &str)] = &[
     ("www-authenticate", ""),
 ];
 
-/// HPACK Header Encoder / Decoder with Dynamic Table (RFC 7541).
+/// HPACK Header Encoder / Decoder with Dynamic Table (RFC 7541) and Literal Cache.
 #[derive(Debug, Clone)]
 pub struct HpackContext {
     pub max_table_size: usize,
     pub dynamic_table: Vec<(String, String)>,
+    /// Cache of frequently decoded literal strings to avoid repeated allocation and decoding.
+    pub literal_cache: Vec<(Vec<u8>, String)>,
+    pub max_literal_cache_size: usize,
+    pub literal_cache_hits: usize,
+    pub literal_cache_misses: usize,
 }
 
 impl Default for HpackContext {
@@ -1331,7 +1336,50 @@ impl HpackContext {
         Self {
             max_table_size,
             dynamic_table: Vec::new(),
+            literal_cache: Vec::new(),
+            max_literal_cache_size: 64,
+            literal_cache_hits: 0,
+            literal_cache_misses: 0,
         }
+    }
+
+    /// Configure the maximum number of entries cached for literal string representations.
+    pub fn with_literal_cache_size(mut self, size: usize) -> Self {
+        self.max_literal_cache_size = size;
+        if self.literal_cache.len() > size {
+            self.literal_cache.truncate(size);
+        }
+        self
+    }
+
+    /// Retrieve or decode a literal string from the internal cache.
+    pub fn get_or_decode_literal(&mut self, raw_slice: &[u8]) -> Result<String, FastHttpError> {
+        for (i, (key, val)) in self.literal_cache.iter().enumerate() {
+            if key.as_slice() == raw_slice {
+                self.literal_cache_hits += 1;
+                let val_clone = val.clone();
+                // Move accessed entry to front (LRU)
+                if i > 0 {
+                    let entry = self.literal_cache.remove(i);
+                    self.literal_cache.insert(0, entry);
+                }
+                return Ok(val_clone);
+            }
+        }
+
+        self.literal_cache_misses += 1;
+        let (decoded_slice, _) = hpack_decode_string(raw_slice)?;
+        let decoded_str = String::from_utf8_lossy(&decoded_slice).into_owned();
+
+        if self.max_literal_cache_size > 0 {
+            if self.literal_cache.len() >= self.max_literal_cache_size {
+                self.literal_cache.pop();
+            }
+            self.literal_cache
+                .insert(0, (raw_slice.to_vec(), decoded_str.clone()));
+        }
+
+        Ok(decoded_str)
     }
 
     /// Retrieve an entry by 1-based index (RFC 7541 Section 2.3.3).
@@ -1438,6 +1486,20 @@ impl HpackContext {
         out
     }
 
+    /// Decode an octet string length and payload slice (RFC 7541 Section 5.2).
+    /// Returns the exact slice of the encoded string (including length prefix) and total consumed bytes.
+    fn decode_string_raw(bytes: &[u8]) -> Result<(&[u8], usize), FastHttpError> {
+        if bytes.is_empty() {
+            return Err(FastHttpError::Incomplete);
+        }
+        let (len, consumed) = hpack_decode_integer(bytes, 7)?;
+        if bytes.len() < consumed + len {
+            return Err(FastHttpError::Incomplete);
+        }
+        let total = consumed + len;
+        Ok((&bytes[..total], total))
+    }
+
     /// Decode an HPACK byte block into a list of (name, value) headers.
     pub fn decode_headers(&mut self, bytes: &[u8]) -> Result<Vec<(String, String)>, FastHttpError> {
         let mut out = Vec::new();
@@ -1459,13 +1521,14 @@ impl HpackContext {
                     let (n, _) = self.get_entry(idx).ok_or(FastHttpError::InvalidHeader)?;
                     n.to_string()
                 } else {
-                    let (str_slice, consumed_str) = hpack_decode_string(&bytes[offset..])?;
+                    let (raw_str, consumed_str) = Self::decode_string_raw(&bytes[offset..])?;
+                    let s = self.get_or_decode_literal(raw_str)?;
                     offset += consumed_str;
-                    String::from_utf8_lossy(&str_slice).into_owned()
+                    s
                 };
-                let (str_val, consumed_val) = hpack_decode_string(&bytes[offset..])?;
+                let (raw_val, consumed_val) = Self::decode_string_raw(&bytes[offset..])?;
+                let val = self.get_or_decode_literal(raw_val)?;
                 offset += consumed_val;
-                let val = String::from_utf8_lossy(&str_val).into_owned();
 
                 self.add_dynamic_entry(name.clone(), val.clone());
                 out.push((name, val));
@@ -1482,13 +1545,14 @@ impl HpackContext {
                     let (n, _) = self.get_entry(idx).ok_or(FastHttpError::InvalidHeader)?;
                     n.to_string()
                 } else {
-                    let (str_slice, consumed_str) = hpack_decode_string(&bytes[offset..])?;
+                    let (raw_str, consumed_str) = Self::decode_string_raw(&bytes[offset..])?;
+                    let s = self.get_or_decode_literal(raw_str)?;
                     offset += consumed_str;
-                    String::from_utf8_lossy(&str_slice).into_owned()
+                    s
                 };
-                let (str_val, consumed_val) = hpack_decode_string(&bytes[offset..])?;
+                let (raw_val, consumed_val) = Self::decode_string_raw(&bytes[offset..])?;
+                let val = self.get_or_decode_literal(raw_val)?;
                 offset += consumed_val;
-                let val = String::from_utf8_lossy(&str_val).into_owned();
                 out.push((name, val));
             }
         }
@@ -2284,6 +2348,34 @@ mod http2_tests {
             "Huffman encoded len {} should be less than plain len {}",
             encoded_huffman.len(),
             encoded_plain.len()
+        );
+    }
+
+    #[test]
+    fn test_hpack_literal_cache_hits_and_lru() {
+        let mut enc = HpackContext::default();
+        let mut dec1 = HpackContext::default().with_literal_cache_size(4);
+
+        let headers = vec![
+            ("x-custom-key", "value-alpha"),
+            ("x-custom-key-2", "value-beta"),
+        ];
+
+        let encoded = enc.encode_headers_with_options(&headers, false);
+
+        // First decode
+        let decoded1 = dec1.decode_headers(&encoded).expect("decode 1");
+        assert_eq!(decoded1.len(), 2);
+        assert!(dec1.literal_cache_misses > 0);
+        assert_eq!(dec1.literal_cache_hits, 0);
+
+        // Reset dynamic table in dec1 to force literal re-parsing without dynamic indexed hits
+        dec1.dynamic_table.clear();
+        let decoded2 = dec1.decode_headers(&encoded).expect("decode 2");
+        assert_eq!(decoded2.len(), 2);
+        assert!(
+            dec1.literal_cache_hits > 0,
+            "literal_cache_hits should have increased"
         );
     }
 
