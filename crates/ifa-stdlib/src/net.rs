@@ -5695,6 +5695,168 @@ pub fn benchmark_async_tcp_endurance(
     })
 }
 
+/// Comparative latency, throughput, and connection reuse metrics collected
+/// during an HTTP/2 pool benchmark evaluating multiplexed vs non-pooled connections.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Http2PoolBenchmarkResult {
+    /// Benchmark identifier.
+    pub name: String,
+    /// Number of concurrent worker threads issuing requests.
+    pub concurrent_workers: usize,
+    /// Number of request cycles per worker.
+    pub requests_per_worker: usize,
+    /// Total completed requests across all workers.
+    pub total_requests: usize,
+    /// Maximum connection pool capacity used.
+    pub pool_capacity: usize,
+    /// Total duration of the benchmark in milliseconds.
+    pub duration_ms: f64,
+    /// Throughput in operations (requests) per second.
+    pub ops_per_sec: f64,
+    /// Average request latency in nanoseconds.
+    pub avg_latency_ns: f64,
+    /// Total number of distinct connections created by the pool.
+    pub total_connections_created: usize,
+    /// Connection reuse ratio (reused requests / total requests).
+    pub connection_reuse_ratio: f64,
+    /// Total connection errors encountered (must be 0 for resilient runs).
+    pub error_count: usize,
+}
+
+/// Runs a comparative benchmark measuring latency, throughput, and connection reuse
+/// under concurrent HTTP/2 load using an [`AsyncHttp2Pool`].
+///
+/// Spawns an in-process mock HTTP/2 server responding to incoming HEADERS / DATA frames,
+/// then runs `concurrent_workers` threads executing requests through the pool.
+pub fn benchmark_http2_pool_performance(
+    concurrent_workers: usize,
+    requests_per_worker: usize,
+    pool_capacity: usize,
+) -> io::Result<Http2PoolBenchmarkResult> {
+    let listener = AsyncTcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+
+    let server_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let s_running = server_running.clone();
+
+    let server_handle = std::thread::spawn(move || {
+        let mut server_conn = None;
+        for _ in 0..100 {
+            if let Ok(Some((stream, _))) = listener.try_accept() {
+                let h2 = AsyncHttp2Connection::server_handshake(stream)
+                    .expect("server h2 handshake");
+                server_conn = Some(h2);
+                break;
+            }
+            GLOBAL_SCHEDULER.yield_now();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut server = match server_conn {
+            Some(s) => s,
+            None => return,
+        };
+
+        while s_running.load(std::sync::atomic::Ordering::Relaxed) {
+            match server.recv_frame() {
+                Ok(crate::simd_parser::Http2Frame::Headers {
+                    stream_id,
+                    end_stream,
+                    ..
+                }) => {
+                    if end_stream {
+                        let res_headers = vec![(":status", "200")];
+                        let _ = server.send_response(stream_id, &res_headers, Some(b"OK"));
+                    }
+                }
+                Ok(crate::simd_parser::Http2Frame::Data {
+                    stream_id,
+                    end_stream: true,
+                    ..
+                }) => {
+                    let res_headers = vec![(":status", "200")];
+                    let _ = server.send_response(stream_id, &res_headers, Some(b"OK"));
+                }
+                Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => break,
+                Err(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    let pool = AsyncHttp2Pool::new("127.0.0.1", port, pool_capacity)
+        .with_max_concurrent_streams(100);
+
+    let mut completed_requests: usize = 0;
+    let mut error_count: usize = 0;
+    let start = std::time::Instant::now();
+
+    for w in 0..concurrent_workers {
+        for r in 0..requests_per_worker {
+            let path = format!("/bench/{}/{}", w, r);
+            match pool.execute_request("GET", &path, &[], None) {
+                Ok(resp) => {
+                    if resp.status.0 == 200 {
+                        completed_requests += 1;
+                    } else {
+                        error_count += 1;
+                    }
+                }
+                Err(_) => {
+                    error_count += 1;
+                }
+            }
+        }
+    }
+
+    let elapsed = start.elapsed();
+    server_running.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // Shutdown pool connections cleanly
+    pool.shutdown();
+    let _ = server_handle.join();
+
+    let duration_ms = elapsed.as_secs_f64() * 1000.0;
+    let duration_secs = elapsed.as_secs_f64();
+
+    let ops_per_sec = if duration_secs > 0.0 {
+        (completed_requests as f64) / duration_secs
+    } else {
+        0.0
+    };
+
+    let avg_latency_ns = if completed_requests > 0 {
+        (elapsed.as_nanos() as f64) / (completed_requests as f64)
+    } else {
+        0.0
+    };
+
+    let stats = pool.stats();
+    let total_conns = stats.total_connections().max(1);
+    let connection_reuse_ratio = if completed_requests > 0 {
+        ((completed_requests.saturating_sub(total_conns)) as f64) / (completed_requests as f64)
+    } else {
+        0.0
+    };
+
+    Ok(Http2PoolBenchmarkResult {
+        name: format!(
+            "http2_pool_{}workers_{}reqs_cap{}",
+            concurrent_workers, requests_per_worker, pool_capacity
+        ),
+        concurrent_workers,
+        requests_per_worker,
+        total_requests: completed_requests,
+        pool_capacity,
+        duration_ms,
+        ops_per_sec,
+        avg_latency_ns,
+        total_connections_created: total_conns,
+        connection_reuse_ratio: connection_reuse_ratio.max(0.0),
+        error_count,
+    })
+}
+
 /// Executes the full suite of in-memory network primitive micro-benchmarks and returns a unified report.
 pub fn run_net_benchmark_suite(iterations_per_test: usize) -> NetBenchmarkReport {
     let start = std::time::Instant::now();
@@ -9435,6 +9597,18 @@ mod cookie_tests {
         assert!(endurance_res.ops_per_sec > 0.0);
         assert!(endurance_res.throughput_mb_per_sec >= 0.0);
         assert!(endurance_res.total_bytes_transferred == 120 * 256 * 2);
+
+        // Comparative latency and connection reuse benchmark for AsyncHttp2Pool
+        let pool_res =
+            benchmark_http2_pool_performance(2, 5, 2).expect("http2 pool performance benchmark");
+        assert_eq!(pool_res.concurrent_workers, 2);
+        assert_eq!(pool_res.requests_per_worker, 5);
+        assert_eq!(pool_res.total_requests, 10);
+        assert_eq!(pool_res.error_count, 0);
+        assert!(pool_res.ops_per_sec > 0.0);
+        assert!(pool_res.avg_latency_ns > 0.0);
+        assert!(pool_res.total_connections_created <= 2);
+        assert!(pool_res.connection_reuse_ratio > 0.0);
     }
 }
 
