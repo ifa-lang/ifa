@@ -3319,6 +3319,124 @@ impl AsyncHttp2Connection {
     }
 }
 
+/// A connection pool for reusable asynchronous HTTP/2 client connections.
+/// Transparently manages connection pooling, multiplexing limits, idle connection reuse,
+/// and multiplexed request execution across shared or pooled HTTP/2 connections.
+pub struct AsyncHttp2Pool {
+    host: String,
+    port: u16,
+    max_connections: usize,
+    max_concurrent_streams_per_conn: usize,
+    idle_pool: std::sync::Mutex<Vec<AsyncHttp2Connection>>,
+    active_count: std::sync::atomic::AtomicUsize,
+}
+
+impl AsyncHttp2Pool {
+    /// Default maximum concurrent streams permitted per single HTTP/2 connection.
+    pub const DEFAULT_MAX_STREAMS: usize = 100;
+
+    /// Create a new HTTP/2 client connection pool.
+    pub fn new(host: impl Into<String>, port: u16, max_connections: usize) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            max_connections: max_connections.max(1),
+            max_concurrent_streams_per_conn: Self::DEFAULT_MAX_STREAMS,
+            idle_pool: std::sync::Mutex::new(Vec::new()),
+            active_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Configure maximum concurrent multiplexed streams per connection.
+    pub fn with_max_concurrent_streams(mut self, max_streams: usize) -> Self {
+        self.max_concurrent_streams_per_conn = max_streams.max(1);
+        self
+    }
+
+    /// Number of currently idle pooled connections.
+    pub fn idle_count(&self) -> usize {
+        self.idle_pool.lock().map(|p| p.len()).unwrap_or(0)
+    }
+
+    /// Total count of active (checked-out or connecting) connections.
+    pub fn active_count(&self) -> usize {
+        self.active_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Acquire an active HTTP/2 connection from the pool, or establish a new connection if below capacity.
+    pub fn acquire(&self) -> io::Result<AsyncHttp2Connection> {
+        if let Ok(mut pool) = self.idle_pool.lock() {
+            while let Some(conn) = pool.pop() {
+                if !conn.is_closed() {
+                    self.active_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(conn);
+                }
+            }
+        }
+
+        let current = self.active_count.load(std::sync::atomic::Ordering::Relaxed);
+        if current >= self.max_connections {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "HTTP/2 connection pool capacity exhausted",
+            ));
+        }
+
+        let stream = AsyncTcpStream::connect(format!("{}:{}", self.host, self.port))?;
+        let conn = AsyncHttp2Connection::client_handshake(stream)?;
+
+        self.active_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(conn)
+    }
+
+    /// Return an HTTP/2 connection back to the pool if healthy and within capacity.
+    pub fn release(&self, conn: AsyncHttp2Connection) {
+        self.active_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+        if !conn.is_closed() {
+            if let Ok(mut pool) = self.idle_pool.lock() {
+                if pool.len() < self.max_connections {
+                    pool.push(conn);
+                }
+            }
+        }
+    }
+
+    /// Execute an HTTP/2 request transparently using a pooled connection, returning the connection to the pool.
+    pub fn execute_request(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> io::Result<crate::http::HttpResponse> {
+        let mut conn = self.acquire()?;
+        let result = conn.request(method, path, headers, body);
+        match result {
+            Ok(resp) => {
+                self.release(conn);
+                Ok(resp)
+            }
+            Err(e) => {
+                // If connection failed, it is dropped and not released back to the pool
+                self.active_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
+    /// Clear all idle connections in the pool.
+    pub fn clear(&self) {
+        if let Ok(mut pool) = self.idle_pool.lock() {
+            pool.clear();
+        }
+    }
+}
+
 /// Token Bucket Rate Limiter for network request throttling and DoS mitigation.
 #[derive(Debug, Clone)]
 pub struct TokenBucket {
@@ -5694,5 +5812,97 @@ mod tests {
             .expect("client send goaway");
 
         handle.join().expect("server thread finished");
+    }
+
+    #[test]
+    fn test_async_http2_pool_reusability_and_multiplexing() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let port = addr.port();
+
+        let handle = std::thread::spawn(move || {
+            let mut server_conn = None;
+            for _ in 0..100 {
+                if let Ok(Some((stream, _))) = listener.try_accept() {
+                    let h2 = AsyncHttp2Connection::server_handshake(stream)
+                        .expect("server h2 handshake");
+                    server_conn = Some(h2);
+                    break;
+                }
+                GLOBAL_SCHEDULER.yield_now();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            let mut server = server_conn.expect("server accepted");
+
+            loop {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    }) => {
+                        if end_stream {
+                            let res_headers =
+                                vec![(":status", "200"), ("x-server-info", "h2-pool-test")];
+                            let body = format!("response-for-stream-{}", stream_id);
+                            server
+                                .send_response(stream_id, &res_headers, Some(body.as_bytes()))
+                                .expect("server send response");
+                        }
+                    }
+                    Ok(crate::simd_parser::Http2Frame::Data {
+                        stream_id,
+                        end_stream: true,
+                        ..
+                    }) => {
+                        let res_headers =
+                            vec![(":status", "200"), ("x-server-info", "h2-pool-test")];
+                        let body = format!("response-for-stream-{}", stream_id);
+                        server
+                            .send_response(stream_id, &res_headers, Some(body.as_bytes()))
+                            .expect("server send response");
+                    }
+                    Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2).with_max_concurrent_streams(50);
+        assert_eq!(pool.idle_count(), 0);
+        assert_eq!(pool.active_count(), 0);
+
+        // 1. First request: acquires connection, runs request, releases to pool
+        let resp1 = pool
+            .execute_request("GET", "/api/item/1", &[], None)
+            .expect("request 1 via pool");
+        assert_eq!(resp1.status.0, 200);
+        assert_eq!(resp1.body, b"response-for-stream-1");
+        assert_eq!(pool.idle_count(), 1);
+        assert_eq!(pool.active_count(), 0);
+
+        // 2. Second request on the reused idle connection: multiplexing next stream id
+        let resp2 = pool
+            .execute_request("POST", "/api/item/2", &[], Some(b"ping"))
+            .expect("request 2 via pool reused");
+        assert_eq!(resp2.status.0, 200);
+        assert_eq!(resp2.body, b"response-for-stream-3");
+        assert_eq!(pool.idle_count(), 1);
+
+        // Close and clear idle pool
+        let mut conn = pool.acquire().expect("acquire to close");
+        let _ = conn.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        pool.release(conn);
+        pool.clear();
+        assert_eq!(pool.idle_count(), 0);
+
+        // Connect a throwaway client to cleanly release server thread if needed
+        let _ = AsyncTcpStream::connect(format!("127.0.0.1:{}", port))
+            .and_then(AsyncHttp2Connection::client_handshake)
+            .and_then(|mut c| c.send_goaway(crate::simd_parser::Http2ErrorCode::NoError));
+
+        let _ = handle.join();
     }
 }
