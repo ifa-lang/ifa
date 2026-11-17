@@ -1311,6 +1311,38 @@ impl Http2Session {
         }
     }
 
+    /// Get a peer setting value if negotiated.
+    pub fn get_peer_setting(&self, id: Http2SettingId) -> Option<u32> {
+        self.peer_settings
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.value)
+    }
+
+    /// Get a local setting value.
+    pub fn get_local_setting(&self, id: Http2SettingId) -> Option<u32> {
+        self.local_settings
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.value)
+    }
+
+    /// Update local settings and create an outbound non-ACK SETTINGS frame.
+    /// Also updates local flow control / header limits if relevant.
+    pub fn update_local_settings(&mut self, settings: &[Http2Setting]) -> Http2Frame {
+        for new_s in settings {
+            if let Some(existing) = self.local_settings.iter_mut().find(|s| s.id == new_s.id) {
+                existing.value = new_s.value;
+            } else {
+                self.local_settings.push(*new_s);
+            }
+        }
+        Http2Frame::Settings {
+            ack: false,
+            settings: settings.to_vec(),
+        }
+    }
+
     /// Open a new stream locally (e.g. client sending a request).
     pub fn open_stream(&mut self) -> u32 {
         let stream_id = self.next_stream_id;

@@ -3551,6 +3551,31 @@ impl AsyncHttp2Connection {
 
         Ok(results)
     }
+
+    /// Dynamically update local settings and transmit an outbound SETTINGS frame to the peer.
+    pub fn send_settings(
+        &mut self,
+        settings: &[crate::simd_parser::Http2Setting],
+    ) -> io::Result<()> {
+        let frame = self.session.update_local_settings(settings);
+        self.send_frame(&frame)
+    }
+
+    /// Retrieve a peer setting value if previously received and acknowledged.
+    pub fn get_peer_setting(
+        &self,
+        id: crate::simd_parser::Http2SettingId,
+    ) -> Option<u32> {
+        self.session.get_peer_setting(id)
+    }
+
+    /// Retrieve a local setting value.
+    pub fn get_local_setting(
+        &self,
+        id: crate::simd_parser::Http2SettingId,
+    ) -> Option<u32> {
+        self.session.get_local_setting(id)
+    }
 }
 
 /// Parameters for configuring a prioritized HTTP/2 request in a multiplexed batch.
@@ -6663,6 +6688,83 @@ mod tests {
         // Test pool drain_and_shutdown
         pool.drain_and_shutdown(500);
         assert_eq!(pool.idle_count(), 0);
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_dynamic_settings_negotiation() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept connection");
+            let mut server = AsyncHttp2Connection::server_handshake(stream).expect("server handshake");
+
+            // Server receives initial client settings during handshake or immediately after
+            // Drain until initial settings frame is processed
+            let frame = server.recv_frame().expect("server recv client settings");
+            assert!(matches!(frame, crate::simd_parser::Http2Frame::Settings { .. }));
+
+            // Server inspects peer setting
+            let max_streams = server
+                .get_peer_setting(crate::simd_parser::Http2SettingId::MaxConcurrentStreams)
+                .expect("peer max concurrent streams");
+            assert_eq!(max_streams, 100);
+
+            // Server dynamically sends custom updated settings to client
+            let new_settings = [
+                crate::simd_parser::Http2Setting {
+                    id: crate::simd_parser::Http2SettingId::MaxConcurrentStreams,
+                    value: 250,
+                },
+                crate::simd_parser::Http2Setting {
+                    id: crate::simd_parser::Http2SettingId::HeaderTableSize,
+                    value: 8192,
+                },
+            ];
+            server
+                .send_settings(&new_settings)
+                .expect("server send updated settings");
+
+            // Receive client ACK or request
+            let ack_frame = server.recv_frame().expect("recv client ack");
+            if let crate::simd_parser::Http2Frame::Settings { ack, .. } = ack_frame {
+                assert!(ack);
+            }
+        });
+
+        // Client connects and performs handshake
+        let client_stream = AsyncTcpStream::connect(&format!("127.0.0.1:{}", port))
+            .expect("connect to server");
+        let mut client = AsyncHttp2Connection::client_handshake(client_stream)
+            .expect("client handshake");
+
+        // Client receives frames from server until updated settings are received
+        // (the server sends initial settings, ACK for client's initial settings, and the updated settings)
+        let mut received_updated_settings = false;
+        for _ in 0..5 {
+            let frame = client.recv_frame().expect("client recv frame");
+            if let crate::simd_parser::Http2Frame::Settings { ack: false, settings } = frame {
+                if settings.iter().any(|s| {
+                    s.id == crate::simd_parser::Http2SettingId::MaxConcurrentStreams && s.value == 250
+                }) {
+                    received_updated_settings = true;
+                    break;
+                }
+            }
+        }
+        assert!(received_updated_settings, "Client should receive updated settings");
+
+        // Verify client session recorded peer settings
+        assert_eq!(
+            client.get_peer_setting(crate::simd_parser::Http2SettingId::MaxConcurrentStreams),
+            Some(250)
+        );
+        assert_eq!(
+            client.get_peer_setting(crate::simd_parser::Http2SettingId::HeaderTableSize),
+            Some(8192)
+        );
 
         let _ = handle.join();
     }
