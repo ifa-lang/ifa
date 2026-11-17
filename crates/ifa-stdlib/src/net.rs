@@ -4653,13 +4653,10 @@ mod tests {
 
                     // Respond to ping / echo message
                     let msg = server.recv_message().expect("recv client msg");
-                    match msg {
-                        WsMessage::Text(t) => {
-                            server
-                                .send_text(&format!("ACK:{}", t))
-                                .expect("server send");
-                        }
-                        _ => {}
+                    if let WsMessage::Text(t) = msg {
+                        server
+                            .send_text(&format!("ACK:{}", t))
+                            .expect("server send");
                     }
                     accepted += 1;
                 }
