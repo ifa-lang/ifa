@@ -11,6 +11,7 @@ pub mod json;
 pub mod net;
 pub mod process;
 pub mod simd_parser;
+pub mod hpack_huffman_table;
 pub mod sync;
 pub mod sys;
 

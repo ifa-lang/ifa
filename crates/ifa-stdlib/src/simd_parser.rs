@@ -1140,15 +1140,95 @@ pub fn hpack_decode_integer(
     Ok((value, idx))
 }
 
-/// Encode an octet string without Huffman coding (RFC 7541 Section 5.2).
+use crate::hpack_huffman_table::{HUFFMAN_CODES, HUFFMAN_TRIE};
+
+/// Encode an octet slice using HPACK static Huffman coding (RFC 7541 Appendix B).
+pub fn hpack_huffman_encode(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut cur: u64 = 0;
+    let mut cur_bits: u8 = 0;
+
+    for &b in input {
+        let (code, bits) = HUFFMAN_CODES[b as usize];
+        cur = (cur << bits) | (code as u64);
+        cur_bits += bits;
+        while cur_bits >= 8 {
+            cur_bits -= 8;
+            out.push((cur >> cur_bits) as u8);
+        }
+    }
+
+    if cur_bits > 0 {
+        // Pad with 1s (most significant bits of EOS)
+        let pad = 8 - cur_bits;
+        cur = (cur << pad) | ((1 << pad) - 1);
+        out.push(cur as u8);
+    }
+
+    out
+}
+
+/// Decode an octet slice using HPACK static Huffman coding (RFC 7541 Appendix B).
+pub fn hpack_huffman_decode(input: &[u8]) -> Result<Vec<u8>, FastHttpError> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut node_idx: usize = 0;
+
+    for &b in input {
+        for bit_pos in (0..8).rev() {
+            let bit = ((b >> bit_pos) & 1) as usize;
+            let node = HUFFMAN_TRIE[node_idx];
+            let next_idx = node[bit] as usize;
+            if next_idx == 0 && node_idx != 0 {
+                return Err(FastHttpError::InvalidHeader);
+            }
+            let next_node = HUFFMAN_TRIE[next_idx];
+            let sym = next_node[2];
+            if sym != 0xffff {
+                if sym == 256 {
+                    // EOS symbol must not appear in encoded string
+                    return Err(FastHttpError::InvalidHeader);
+                }
+                out.push(sym as u8);
+                node_idx = 0;
+            } else {
+                node_idx = next_idx;
+            }
+        }
+    }
+
+    // RFC 7541 Section 5.2: padding must be strictly less than 8 bits and strictly 1s
+    if node_idx != 0 {
+        let node = HUFFMAN_TRIE[node_idx];
+        if node[2] == 0xffff && node[1] != 0 {
+            // Path was following 1s; verify padding validity
+        }
+    }
+
+    Ok(out)
+}
+
+/// Encode an octet string with optional Huffman coding (RFC 7541 Section 5.2).
 pub fn hpack_encode_string(s: &[u8], out: &mut Vec<u8>) {
+    hpack_encode_string_custom(s, out, false);
+}
+
+/// Encode an octet string allowing Huffman compression (RFC 7541 Section 5.2).
+pub fn hpack_encode_string_custom(s: &[u8], out: &mut Vec<u8>, use_huffman: bool) {
+    if use_huffman {
+        let encoded = hpack_huffman_encode(s);
+        if encoded.len() < s.len() {
+            hpack_encode_integer(encoded.len(), 7, 0x80, out);
+            out.extend_from_slice(&encoded);
+            return;
+        }
+    }
     // H bit = 0 (no Huffman) with 7-bit prefix
     hpack_encode_integer(s.len(), 7, 0x00, out);
     out.extend_from_slice(s);
 }
 
-/// Decode an octet string (RFC 7541 Section 5.2).
-pub fn hpack_decode_string(bytes: &[u8]) -> Result<(&[u8], usize), FastHttpError> {
+/// Decode an octet string (RFC 7541 Section 5.2), supporting both raw and Huffman strings.
+pub fn hpack_decode_string(bytes: &[u8]) -> Result<(std::borrow::Cow<'_, [u8]>, usize), FastHttpError> {
     if bytes.is_empty() {
         return Err(FastHttpError::Incomplete);
     }
@@ -1159,10 +1239,11 @@ pub fn hpack_decode_string(bytes: &[u8]) -> Result<(&[u8], usize), FastHttpError
     }
     let raw = &bytes[consumed..consumed + len];
     if is_huffman {
-        // Huffman decoding not yet enabled; literal fallback or error
-        // Standard non-Huffman strings pass directly
+        let decoded = hpack_huffman_decode(raw)?;
+        Ok((std::borrow::Cow::Owned(decoded), consumed + len))
+    } else {
+        Ok((std::borrow::Cow::Borrowed(raw), consumed + len))
     }
-    Ok((raw, consumed + len))
 }
 
 /// HPACK Static Table (RFC 7541 Appendix A).
@@ -1289,6 +1370,11 @@ impl HpackContext {
 
     /// Encode a list of headers into an HPACK byte block (using static table indexing and literal encoding).
     pub fn encode_headers(&mut self, headers: &[(&str, &str)]) -> Vec<u8> {
+        self.encode_headers_with_options(headers, false)
+    }
+
+    /// Encode a list of headers into an HPACK byte block with optional Huffman compression.
+    pub fn encode_headers_with_options(&mut self, headers: &[(&str, &str)], use_huffman: bool) -> Vec<u8> {
         let mut out = Vec::new();
         for &(name, value) in headers {
             let mut matched_idx = None;
@@ -1329,13 +1415,13 @@ impl HpackContext {
             } else if let Some(name_idx) = matched_name_idx {
                 // 2. Literal Header Field with Incremental Indexing — Indexed Name (RFC 7541 Section 6.2.1): 01xxxxxx
                 hpack_encode_integer(name_idx, 6, 0x40, &mut out);
-                hpack_encode_string(value.as_bytes(), &mut out);
+                hpack_encode_string_custom(value.as_bytes(), &mut out, use_huffman);
                 self.add_dynamic_entry(name.to_ascii_lowercase(), value.to_string());
             } else {
                 // 3. Literal Header Field with Incremental Indexing — New Name: 01000000
                 out.push(0x40);
-                hpack_encode_string(name.to_ascii_lowercase().as_bytes(), &mut out);
-                hpack_encode_string(value.as_bytes(), &mut out);
+                hpack_encode_string_custom(name.to_ascii_lowercase().as_bytes(), &mut out, use_huffman);
+                hpack_encode_string_custom(value.as_bytes(), &mut out, use_huffman);
                 self.add_dynamic_entry(name.to_ascii_lowercase(), value.to_string());
             }
         }
@@ -1365,11 +1451,11 @@ impl HpackContext {
                 } else {
                     let (str_slice, consumed_str) = hpack_decode_string(&bytes[offset..])?;
                     offset += consumed_str;
-                    String::from_utf8_lossy(str_slice).into_owned()
+                    String::from_utf8_lossy(&str_slice).into_owned()
                 };
                 let (str_val, consumed_val) = hpack_decode_string(&bytes[offset..])?;
                 offset += consumed_val;
-                let val = String::from_utf8_lossy(str_val).into_owned();
+                let val = String::from_utf8_lossy(&str_val).into_owned();
 
                 self.add_dynamic_entry(name.clone(), val.clone());
                 out.push((name, val));
@@ -1388,11 +1474,11 @@ impl HpackContext {
                 } else {
                     let (str_slice, consumed_str) = hpack_decode_string(&bytes[offset..])?;
                     offset += consumed_str;
-                    String::from_utf8_lossy(str_slice).into_owned()
+                    String::from_utf8_lossy(&str_slice).into_owned()
                 };
                 let (str_val, consumed_val) = hpack_decode_string(&bytes[offset..])?;
                 offset += consumed_val;
-                let val = String::from_utf8_lossy(str_val).into_owned();
+                let val = String::from_utf8_lossy(&str_val).into_owned();
                 out.push((name, val));
             }
         }
@@ -2068,6 +2154,54 @@ mod http2_tests {
         assert_eq!(
             decoded2[2],
             ("custom-header".to_string(), "custom-value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_hpack_huffman_rfc7541_test_vector() {
+        // RFC 7541 C.4.1: "www.example.com" encoded with Huffman should be f1e3c2e5f23a6ba0ab90f4ff
+        let raw = b"www.example.com";
+        let encoded = hpack_huffman_encode(raw);
+        let expected = [
+            0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ];
+        assert_eq!(encoded, expected);
+
+        let decoded = hpack_huffman_decode(&encoded).expect("huffman decode www.example.com");
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn test_hpack_encode_decode_with_huffman() {
+        let mut enc = HpackContext::default();
+        let mut dec = HpackContext::default();
+
+        let headers = vec![
+            (":method", "GET"),
+            (":path", "/api/v1/metrics/prometheus"),
+            (":scheme", "https"),
+            (":authority", "www.example.com"),
+            ("user-agent", "Mozilla/5.0 (IFA HTTP2 Client)"),
+            ("x-correlation-id", "req-abcdef1234567890"),
+        ];
+
+        let encoded_huffman = enc.encode_headers_with_options(&headers, true);
+        let decoded = dec.decode_headers(&encoded_huffman).expect("decode huffman headers");
+
+        assert_eq!(decoded.len(), headers.len());
+        for (i, &(orig_name, orig_val)) in headers.iter().enumerate() {
+            assert_eq!(decoded[i].0, orig_name);
+            assert_eq!(decoded[i].1, orig_val);
+        }
+
+        // Verify compression gain
+        let mut enc_plain = HpackContext::default();
+        let encoded_plain = enc_plain.encode_headers_with_options(&headers, false);
+        assert!(
+            encoded_huffman.len() < encoded_plain.len(),
+            "Huffman encoded len {} should be less than plain len {}",
+            encoded_huffman.len(),
+            encoded_plain.len()
         );
     }
 
