@@ -4790,6 +4790,56 @@ impl HttpCacheEntry {
         }
     }
 
+    /// Check whether this entry is within its `stale-while-revalidate` window (RFC 5861 §3).
+    pub fn is_stale_while_revalidate(&self, now: SystemTime, client_swr: Option<u64>) -> bool {
+        if self.is_fresh(now) {
+            return false;
+        }
+        let directives = self
+            .headers
+            .get("cache-control")
+            .map(HttpCacheDirectives::parse);
+        if let Some(d) = directives {
+            if d.no_cache || d.must_revalidate || d.no_store {
+                return false;
+            }
+            let swr_secs = client_swr.or(d.stale_while_revalidate);
+            if let Some(swr) = swr_secs {
+                if let Some(exp) = self.expires_at {
+                    if let Some(limit) = exp.checked_add(Duration::from_secs(swr)) {
+                        return now <= limit;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Check whether this entry is eligible to be served upon an upstream error under `stale-if-error` (RFC 5861 §4).
+    pub fn is_stale_if_error(&self, now: SystemTime, client_sie: Option<u64>) -> bool {
+        if self.is_fresh(now) {
+            return true;
+        }
+        let directives = self
+            .headers
+            .get("cache-control")
+            .map(HttpCacheDirectives::parse);
+        if let Some(d) = directives {
+            if d.no_store || d.must_revalidate {
+                return false;
+            }
+            let sie_secs = client_sie.or(d.stale_if_error);
+            if let Some(sie) = sie_secs {
+                if let Some(exp) = self.expires_at {
+                    if let Some(limit) = exp.checked_add(Duration::from_secs(sie)) {
+                        return now <= limit;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Reconstruct an HttpResponse from this cache entry.
     pub fn to_response(&self) -> HttpResponse {
         let mut resp = HttpResponse::new(self.status);

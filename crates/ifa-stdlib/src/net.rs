@@ -4942,6 +4942,12 @@ pub struct Http2PoolStats {
     pub cache_revalidations: usize,
     /// Total number of general HTTP responses currently held in pool client cache (RFC 7234).
     pub http_cache_entries: usize,
+    /// Total count of cache hits served stale under `stale-while-revalidate` (RFC 5861 §3).
+    pub stale_hits: usize,
+    /// Total count of requests rescued from upstream failure or 5xx by `stale-if-error` (RFC 5861 §4).
+    pub stale_error_fallbacks: usize,
+    /// Total count of background revalidations completed for stale cache entries.
+    pub background_revalidations: usize,
 }
 
 impl Http2PoolStats {
@@ -5057,6 +5063,55 @@ impl Http2PushPromiseCacheEntry {
         } else {
             now <= self.response_time + default_ttl
         }
+    }
+
+    /// Check whether this entry is within its `stale-while-revalidate` window (RFC 5861 §3).
+    pub fn is_stale_while_revalidate(
+        &self,
+        now: std::time::SystemTime,
+        default_ttl: std::time::Duration,
+        client_swr: Option<u64>,
+    ) -> bool {
+        if self.directives.no_cache || self.directives.must_revalidate || self.directives.no_store {
+            return false;
+        }
+        if self.is_fresh(now, default_ttl) {
+            return false;
+        }
+        let swr_secs = client_swr.or(self.directives.stale_while_revalidate);
+        if let Some(swr) = swr_secs {
+            let expiry = self.expires_at.unwrap_or(self.response_time + default_ttl);
+            if let Some(limit) = expiry.checked_add(std::time::Duration::from_secs(swr)) {
+                return now <= limit;
+            }
+        }
+        false
+    }
+
+    /// Check whether this entry is eligible to be served upon an upstream error under `stale-if-error` (RFC 5861 §4).
+    pub fn is_stale_if_error(
+        &self,
+        now: std::time::SystemTime,
+        default_ttl: std::time::Duration,
+        client_sie: Option<u64>,
+    ) -> bool {
+        if self.directives.no_store {
+            return false;
+        }
+        if self.is_fresh(now, default_ttl) {
+            return true;
+        }
+        if self.directives.must_revalidate {
+            return false;
+        }
+        let sie_secs = client_sie.or(self.directives.stale_if_error);
+        if let Some(sie) = sie_secs {
+            let expiry = self.expires_at.unwrap_or(self.response_time + default_ttl);
+            if let Some(limit) = expiry.checked_add(std::time::Duration::from_secs(sie)) {
+                return now <= limit;
+            }
+        }
+        false
     }
 
     /// Whether this entry requires origin revalidation (RFC 7234 §4.3) before returning.
@@ -5226,6 +5281,55 @@ impl Http2PoolCacheEntry {
         }
     }
 
+    /// Check whether this entry is within its `stale-while-revalidate` window (RFC 5861 §3).
+    pub fn is_stale_while_revalidate(
+        &self,
+        now: std::time::SystemTime,
+        default_ttl: std::time::Duration,
+        client_swr: Option<u64>,
+    ) -> bool {
+        if self.directives.no_cache || self.directives.must_revalidate || self.directives.no_store {
+            return false;
+        }
+        if self.is_fresh(now, default_ttl) {
+            return false;
+        }
+        let swr_secs = client_swr.or(self.directives.stale_while_revalidate);
+        if let Some(swr) = swr_secs {
+            let expiry = self.expires_at.unwrap_or(self.response_time + default_ttl);
+            if let Some(limit) = expiry.checked_add(std::time::Duration::from_secs(swr)) {
+                return now <= limit;
+            }
+        }
+        false
+    }
+
+    /// Check whether this entry is eligible to be served upon an upstream error under `stale-if-error` (RFC 5861 §4).
+    pub fn is_stale_if_error(
+        &self,
+        now: std::time::SystemTime,
+        default_ttl: std::time::Duration,
+        client_sie: Option<u64>,
+    ) -> bool {
+        if self.directives.no_store {
+            return false;
+        }
+        if self.is_fresh(now, default_ttl) {
+            return true;
+        }
+        if self.directives.must_revalidate {
+            return false;
+        }
+        let sie_secs = client_sie.or(self.directives.stale_if_error);
+        if let Some(sie) = sie_secs {
+            let expiry = self.expires_at.unwrap_or(self.response_time + default_ttl);
+            if let Some(limit) = expiry.checked_add(std::time::Duration::from_secs(sie)) {
+                return now <= limit;
+            }
+        }
+        false
+    }
+
     /// Whether this entry requires origin revalidation (RFC 7234 §4.3) before returning.
     pub fn requires_revalidation(
         &self,
@@ -5287,6 +5391,7 @@ struct PooledConnectionEntry {
 
 /// Transparently manages connection pooling, multiplexing limits, idle connection reuse,
 /// and multiplexed request execution across shared or pooled HTTP/2 connections.
+#[derive(Clone)]
 pub struct AsyncHttp2Pool {
     host: String,
     port: u16,
@@ -5294,29 +5399,36 @@ pub struct AsyncHttp2Pool {
     max_concurrent_streams_per_conn: usize,
     max_retries: usize,
     retry_backoff: std::time::Duration,
-    retried_count: std::sync::atomic::AtomicUsize,
+    retried_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     idle_ttl: Option<std::time::Duration>,
-    idle_pool: std::sync::Mutex<Vec<PooledConnectionEntry>>,
-    active_count: std::sync::atomic::AtomicUsize,
-    evicted_count: std::sync::atomic::AtomicUsize,
-    last_goaway_error: std::sync::Mutex<Option<crate::simd_parser::Http2ErrorCode>>,
-    last_alpn_negotiated: std::sync::Mutex<Option<AlpnProtocol>>,
+    idle_pool: std::sync::Arc<std::sync::Mutex<Vec<PooledConnectionEntry>>>,
+    active_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    evicted_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    last_goaway_error: std::sync::Arc<std::sync::Mutex<Option<crate::simd_parser::Http2ErrorCode>>>,
+    last_alpn_negotiated: std::sync::Arc<std::sync::Mutex<Option<AlpnProtocol>>>,
     tls_config: Option<TlsConfig>,
     request_interceptors: Vec<Http2RequestInterceptor>,
     response_interceptors: Vec<Http2ResponseInterceptor>,
-    alt_svc_routes:
+    alt_svc_routes: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, Vec<crate::simd_parser::AltSvcRoute>>>,
+    >,
     chunk_buffer_pool: Option<Http2ChunkBufferPool>,
     auto_tune_flow_control: bool,
-    push_promise_cache:
+    push_promise_cache: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, Vec<Http2PushPromiseCacheEntry>>>,
-    enable_push_promises: bool,
-    push_promises_received: std::sync::atomic::AtomicUsize,
-    push_cache_hits: std::sync::atomic::AtomicUsize,
-    http_cache_entries:
+    >,
+    enable_push_promises: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    push_promises_received: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    push_cache_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    http_cache_entries: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, Vec<Http2PoolCacheEntry>>>,
-    enable_http_cache: bool,
-    cache_revalidations: std::sync::atomic::AtomicUsize,
+    >,
+    enable_http_cache: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cache_revalidations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stale_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stale_error_fallbacks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    background_revalidations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    revalidating_keys: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl AsyncHttp2Pool {
@@ -5332,26 +5444,38 @@ impl AsyncHttp2Pool {
             max_concurrent_streams_per_conn: Self::DEFAULT_MAX_STREAMS,
             max_retries: 0,
             retry_backoff: std::time::Duration::from_millis(10),
-            retried_count: std::sync::atomic::AtomicUsize::new(0),
+            retried_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             idle_ttl: None,
-            idle_pool: std::sync::Mutex::new(Vec::new()),
-            active_count: std::sync::atomic::AtomicUsize::new(0),
-            evicted_count: std::sync::atomic::AtomicUsize::new(0),
-            last_goaway_error: std::sync::Mutex::new(None),
-            last_alpn_negotiated: std::sync::Mutex::new(None),
+            idle_pool: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            active_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            evicted_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_goaway_error: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            last_alpn_negotiated: std::sync::Arc::new(std::sync::Mutex::new(None)),
             tls_config: None,
             request_interceptors: Vec::new(),
             response_interceptors: Vec::new(),
-            alt_svc_routes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            alt_svc_routes: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             chunk_buffer_pool: None,
             auto_tune_flow_control: false,
-            push_promise_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            enable_push_promises: true,
-            push_promises_received: std::sync::atomic::AtomicUsize::new(0),
-            push_cache_hits: std::sync::atomic::AtomicUsize::new(0),
-            http_cache_entries: std::sync::Mutex::new(std::collections::HashMap::new()),
-            enable_http_cache: false,
-            cache_revalidations: std::sync::atomic::AtomicUsize::new(0),
+            push_promise_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            enable_push_promises: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            push_promises_received: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            push_cache_hits: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            http_cache_entries: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            enable_http_cache: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cache_revalidations: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            stale_hits: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            stale_error_fallbacks: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            background_revalidations: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            revalidating_keys: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 
@@ -5373,35 +5497,41 @@ impl AsyncHttp2Pool {
     }
 
     /// Configure whether client push promise caching and automated absorption is enabled across connections in this pool.
-    pub fn with_push_promises(mut self, enabled: bool) -> Self {
-        self.enable_push_promises = enabled;
+    pub fn with_push_promises(self, enabled: bool) -> Self {
+        self.enable_push_promises
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
         self
     }
 
     /// Set whether client push promise caching and automated absorption is enabled.
-    pub fn set_enable_push_promises(&mut self, enabled: bool) {
-        self.enable_push_promises = enabled;
+    pub fn set_enable_push_promises(&self, enabled: bool) {
+        self.enable_push_promises
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether client push promise caching and automated absorption is enabled on this pool.
     pub fn push_promises_enabled(&self) -> bool {
         self.enable_push_promises
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Configure whether transparent RFC 7234 HTTP response caching and conditional revalidation is enabled.
-    pub fn with_http_cache(mut self, enabled: bool) -> Self {
-        self.enable_http_cache = enabled;
+    pub fn with_http_cache(self, enabled: bool) -> Self {
+        self.enable_http_cache
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
         self
     }
 
     /// Set whether transparent RFC 7234 HTTP response caching is enabled on this pool.
-    pub fn set_enable_http_cache(&mut self, enabled: bool) {
-        self.enable_http_cache = enabled;
+    pub fn set_enable_http_cache(&self, enabled: bool) {
+        self.enable_http_cache
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether transparent RFC 7234 HTTP response caching is enabled on this pool.
     pub fn http_cache_enabled(&self) -> bool {
         self.enable_http_cache
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Total count of successful 304 Not Modified conditional revalidations performed by the pool.
@@ -5456,7 +5586,10 @@ impl AsyncHttp2Pool {
 
     /// Ingest and validate all completed push promises received on an active connection into the pool cache.
     pub fn absorb_push_promises(&self, conn: &mut AsyncHttp2Connection) {
-        if !self.enable_push_promises {
+        if !self
+            .enable_push_promises
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return;
         }
         let completed = conn.drain_completed_push_responses();
@@ -5492,7 +5625,10 @@ impl AsyncHttp2Pool {
         method: &str,
         path: &str,
     ) -> Option<crate::http::HttpResponse> {
-        if !self.enable_push_promises {
+        if !self
+            .enable_push_promises
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return None;
         }
         let key = format!("{}:{}", method.to_ascii_uppercase(), path);
@@ -5521,7 +5657,10 @@ impl AsyncHttp2Pool {
 
     /// Check whether a matching cached push promise response currently exists in the pool cache.
     pub fn has_cached_push_response(&self, method: &str, path: &str) -> bool {
-        if !self.enable_push_promises {
+        if !self
+            .enable_push_promises
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return false;
         }
         let key = format!("{}:{}", method.to_ascii_uppercase(), path);
@@ -5683,6 +5822,23 @@ impl AsyncHttp2Pool {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Total count of cache hits served stale under `stale-while-revalidate` (RFC 5861 §3).
+    pub fn stale_hits(&self) -> usize {
+        self.stale_hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total count of requests rescued from upstream failure or 5xx by serving stale under `stale-if-error` (RFC 5861 §4).
+    pub fn stale_error_fallbacks(&self) -> usize {
+        self.stale_error_fallbacks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total count of background revalidations completed for stale cache entries.
+    pub fn background_revalidations(&self) -> usize {
+        self.background_revalidations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Snapshot the current runtime metrics and diagnostic telemetry of the pool.
     pub fn stats(&self) -> Http2PoolStats {
         Http2PoolStats {
@@ -5698,6 +5854,9 @@ impl AsyncHttp2Pool {
             push_cache_hits: self.push_cache_hits(),
             cache_revalidations: self.cache_revalidations(),
             http_cache_entries: self.http_cache_count(),
+            stale_hits: self.stale_hits(),
+            stale_error_fallbacks: self.stale_error_fallbacks(),
+            background_revalidations: self.background_revalidations(),
         }
     }
 
@@ -5742,7 +5901,10 @@ impl AsyncHttp2Pool {
                 // Quick health check ping
                 if conn.send_ping(*b"h2_probe").is_ok() {
                     conn.set_auto_tune_flow_control(self.auto_tune_flow_control);
-                    conn.set_enable_push(self.enable_push_promises);
+                    conn.set_enable_push(
+                        self.enable_push_promises
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    );
                     if let Some(ref pool) = self.chunk_buffer_pool {
                         conn.chunk_buffer_pool = Some(pool.clone());
                     }
@@ -5788,7 +5950,10 @@ impl AsyncHttp2Pool {
 
         let mut conn = AsyncHttp2Connection::client_handshake(stream)?;
         conn.set_auto_tune_flow_control(self.auto_tune_flow_control);
-        conn.set_enable_push(self.enable_push_promises);
+        conn.set_enable_push(
+            self.enable_push_promises
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         if let Some(ref pool) = self.chunk_buffer_pool {
             conn.chunk_buffer_pool = Some(pool.clone());
         }
@@ -5895,6 +6060,192 @@ impl AsyncHttp2Pool {
         self.execute_request_single(method, path, headers, body)
     }
 
+    /// Retrieve a cached response eligible for `stale-if-error` fallback (RFC 5861 §4).
+    pub fn find_stale_if_error_fallback(
+        &self,
+        key: &str,
+        client_headers: &[(String, String)],
+        now: std::time::SystemTime,
+        default_ttl: std::time::Duration,
+        client_sie: Option<u64>,
+    ) -> Option<crate::http::HttpResponse> {
+        if self
+            .enable_http_cache
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Ok(cache) = self.http_cache_entries.lock() {
+                if let Some(entries) = cache.get(key) {
+                    if let Some(entry) = entries.iter().rev().find(|e| {
+                        e.matches_request(client_headers)
+                            && e.is_stale_if_error(now, default_ttl, client_sie)
+                    }) {
+                        let mut resp = entry.response.clone();
+                        resp.headers.set("warning", "110 - \"Response is Stale\"");
+                        return Some(resp);
+                    }
+                }
+            }
+        }
+        if self
+            .enable_push_promises
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Ok(cache) = self.push_promise_cache.lock() {
+                if let Some(entries) = cache.get(key) {
+                    if let Some(entry) = entries.iter().rev().find(|e| {
+                        e.matches_request(client_headers)
+                            && e.is_stale_if_error(now, default_ttl, client_sie)
+                    }) {
+                        let mut resp = entry.response.clone();
+                        resp.headers.set("warning", "110 - \"Response is Stale\"");
+                        return Some(resp);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Spawn an asynchronous background task to revalidate a stale cache entry (RFC 5861 §3).
+    pub fn spawn_background_revalidate(
+        &self,
+        client_req: &Http2ClientRequest,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    ) {
+        let key = format!(
+            "{}:{}",
+            client_req.method.to_ascii_uppercase(),
+            client_req.path
+        );
+        if let Ok(mut in_flight) = self.revalidating_keys.lock() {
+            if !in_flight.insert(key.clone()) {
+                // Background revalidation already in-flight for this key
+                return;
+            }
+        }
+
+        let pool = self.clone();
+        let req = client_req.clone();
+        std::thread::spawn(move || {
+            let _ = pool.execute_background_revalidate(&req, etag, last_modified);
+            if let Ok(mut in_flight) = pool.revalidating_keys.lock() {
+                in_flight.remove(&key);
+            }
+        });
+    }
+
+    /// Execute a background conditional revalidation request (RFC 5861 §3) and update cache.
+    pub fn execute_background_revalidate(
+        &self,
+        client_req: &Http2ClientRequest,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    ) -> io::Result<()> {
+        let mut req = client_req.clone();
+        if let Some(tag) = etag {
+            if !req
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("if-none-match"))
+            {
+                req.headers.push(("if-none-match".to_string(), tag));
+            }
+        }
+        if let Some(lm) = last_modified {
+            if !req
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("if-modified-since"))
+            {
+                req.headers.push(("if-modified-since".to_string(), lm));
+            }
+        }
+
+        let mut conn = self.acquire()?;
+        let header_refs: Vec<(&str, &str)> = req
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let body_ref = req.body.as_deref();
+
+        let result = conn.request(&req.method, &req.path, &header_refs, body_ref);
+        match result {
+            Ok(resp) => {
+                let key = format!("{}:{}", req.method.to_ascii_uppercase(), req.path);
+                let now_update = std::time::SystemTime::now();
+
+                self.background_revalidations
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                if resp.status.0 == 304 {
+                    self.cache_revalidations
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    let mut updated = false;
+                    if self
+                        .enable_http_cache
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        if let Ok(mut cache) = self.http_cache_entries.lock() {
+                            if let Some(entries) = cache.get_mut(&key) {
+                                if let Some(pos) = entries
+                                    .iter()
+                                    .rposition(|e| e.matches_request(&req.headers))
+                                {
+                                    entries[pos].update_from_304(&resp, now_update);
+                                    updated = true;
+                                }
+                            }
+                        }
+                    }
+                    if !updated
+                        && self
+                            .enable_push_promises
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        if let Ok(mut cache) = self.push_promise_cache.lock() {
+                            if let Some(entries) = cache.get_mut(&key) {
+                                if let Some(pos) = entries
+                                    .iter()
+                                    .rposition(|e| e.matches_request(&req.headers))
+                                {
+                                    entries[pos].update_from_304(&resp, now_update);
+                                }
+                            }
+                        }
+                    }
+                } else if resp.status.0 == 200 {
+                    let entry = Http2PoolCacheEntry::new(
+                        req.method.clone(),
+                        req.path.clone(),
+                        resp.clone(),
+                    )
+                    .with_request_headers(req.headers.clone());
+                    if entry.is_cacheable() {
+                        if let Ok(mut cache) = self.http_cache_entries.lock() {
+                            let entries = cache.entry(key).or_default();
+                            if let Some(pos) =
+                                entries.iter().position(|e| e.matches_request(&req.headers))
+                            {
+                                entries[pos] = entry;
+                            } else {
+                                entries.push(entry);
+                            }
+                        }
+                    }
+                }
+                self.release(conn);
+                Ok(())
+            }
+            Err(e) => {
+                self.release(conn);
+                Err(e)
+            }
+        }
+    }
+
     /// Execute a single attempt of an HTTP/2 request using a pooled connection without retry loop.
     pub fn execute_request_single(
         &self,
@@ -5937,9 +6288,15 @@ impl AsyncHttp2Pool {
             .map(|(_, v)| crate::http::HttpCacheDirectives::parse(v));
         let client_no_cache = req_cc.as_ref().map(|cc| cc.no_cache).unwrap_or(false);
         let client_no_store = req_cc.as_ref().map(|cc| cc.no_store).unwrap_or(false);
+        let client_swr = req_cc.as_ref().and_then(|cc| cc.stale_while_revalidate);
+        let client_sie = req_cc.as_ref().and_then(|cc| cc.stale_if_error);
 
         // 1. Check proactive push promise cache first (if not client_no_store)
-        if self.enable_push_promises && !client_no_store {
+        if self
+            .enable_push_promises
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && !client_no_store
+        {
             if let Ok(mut cache) = self.push_promise_cache.lock() {
                 if let Some(entries) = cache.get_mut(&key) {
                     if let Some(pos) = entries
@@ -5960,6 +6317,24 @@ impl AsyncHttp2Pool {
                                 resp_interceptor(&client_req, &mut resp);
                             }
                             return Ok(resp);
+                        } else if !client_no_cache
+                            && entry.is_stale_while_revalidate(now_sys, default_ttl, client_swr)
+                        {
+                            entry.hit_count += 1;
+                            self.push_cache_hits
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.stale_hits
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let mut resp = entry.response.clone();
+                            resp.headers.set("warning", "110 - \"Response is Stale\"");
+                            let etag = entry.etag.clone();
+                            let lm = entry.last_modified.clone();
+                            drop(cache);
+                            self.spawn_background_revalidate(&client_req, etag, lm);
+                            for resp_interceptor in &self.response_interceptors {
+                                resp_interceptor(&client_req, &mut resp);
+                            }
+                            return Ok(resp);
                         }
                     }
                 }
@@ -5968,7 +6343,11 @@ impl AsyncHttp2Pool {
 
         // 2. Check general HTTP client cache (if enabled and not client_no_store)
         let mut cached_validator: Option<(Option<String>, Option<String>)> = None;
-        if self.enable_http_cache && !client_no_store {
+        if self
+            .enable_http_cache
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && !client_no_store
+        {
             if let Ok(mut cache) = self.http_cache_entries.lock() {
                 if let Some(entries) = cache.get_mut(&key) {
                     if let Some(pos) = entries
@@ -5986,6 +6365,24 @@ impl AsyncHttp2Pool {
                                 resp_interceptor(&client_req, &mut resp);
                             }
                             return Ok(resp);
+                        } else if !client_no_cache
+                            && entry.is_stale_while_revalidate(now_sys, default_ttl, client_swr)
+                        {
+                            entry.hit_count += 1;
+                            self.push_cache_hits
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.stale_hits
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let mut resp = entry.response.clone();
+                            resp.headers.set("warning", "110 - \"Response is Stale\"");
+                            let etag = entry.etag.clone();
+                            let lm = entry.last_modified.clone();
+                            drop(cache);
+                            self.spawn_background_revalidate(&client_req, etag, lm);
+                            for resp_interceptor in &self.response_interceptors {
+                                resp_interceptor(&client_req, &mut resp);
+                            }
+                            return Ok(resp);
                         } else if entry.can_revalidate() {
                             cached_validator =
                                 Some((entry.etag.clone(), entry.last_modified.clone()));
@@ -5996,7 +6393,12 @@ impl AsyncHttp2Pool {
         }
 
         // Also check if push promise cache has a stale entry with validators that can be revalidated
-        if cached_validator.is_none() && self.enable_push_promises && !client_no_store {
+        if cached_validator.is_none()
+            && self
+                .enable_push_promises
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && !client_no_store
+        {
             if let Ok(cache) = self.push_promise_cache.lock() {
                 if let Some(entries) = cache.get(&key) {
                     if let Some(entry) = entries
@@ -6039,17 +6441,44 @@ impl AsyncHttp2Pool {
             }
         }
 
-        let mut conn = self.acquire()?;
-        let header_refs: Vec<(&str, &str)> = client_req
-            .headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let body_ref = client_req.body.as_deref();
+        let conn_res = self.acquire();
+        let (conn_opt, result) = match conn_res {
+            Ok(mut conn) => {
+                let header_refs: Vec<(&str, &str)> = client_req
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                let body_ref = client_req.body.as_deref();
+                let r = conn.request(&client_req.method, &client_req.path, &header_refs, body_ref);
+                (Some(conn), r)
+            }
+            Err(e) => (None, Err(e)),
+        };
 
-        let result = conn.request(&client_req.method, &client_req.path, &header_refs, body_ref);
         match result {
             Ok(mut resp) => {
+                // Check if 5xx error and eligible for stale-if-error fallback
+                if resp.status.0 >= 500 && resp.status.0 <= 599 && !client_no_store {
+                    if let Some(mut fallback_resp) = self.find_stale_if_error_fallback(
+                        &key,
+                        &client_req.headers,
+                        now_sys,
+                        default_ttl,
+                        client_sie,
+                    ) {
+                        self.stale_error_fallbacks
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(conn) = conn_opt {
+                            self.release(conn);
+                        }
+                        for resp_interceptor in &self.response_interceptors {
+                            resp_interceptor(&client_req, &mut fallback_resp);
+                        }
+                        return Ok(fallback_resp);
+                    }
+                }
+
                 // If 304 Not Modified received on conditional revalidation, refresh cache and return 200 with cached body!
                 if resp.status.0 == 304 && is_revalidating {
                     self.cache_revalidations
@@ -6060,7 +6489,10 @@ impl AsyncHttp2Pool {
                     let now_update = std::time::SystemTime::now();
                     let mut resolved_resp = None;
 
-                    if self.enable_http_cache {
+                    if self
+                        .enable_http_cache
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         if let Ok(mut cache) = self.http_cache_entries.lock() {
                             if let Some(entries) = cache.get_mut(&key) {
                                 if let Some(pos) = entries
@@ -6073,7 +6505,11 @@ impl AsyncHttp2Pool {
                             }
                         }
                     }
-                    if resolved_resp.is_none() && self.enable_push_promises {
+                    if resolved_resp.is_none()
+                        && self
+                            .enable_push_promises
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         if let Ok(mut cache) = self.push_promise_cache.lock() {
                             if let Some(entries) = cache.get_mut(&key) {
                                 if let Some(pos) = entries
@@ -6088,7 +6524,9 @@ impl AsyncHttp2Pool {
                     }
 
                     if let Some(mut fresh_resp) = resolved_resp {
-                        self.release(conn);
+                        if let Some(conn) = conn_opt {
+                            self.release(conn);
+                        }
                         for resp_interceptor in &self.response_interceptors {
                             resp_interceptor(&client_req, &mut fresh_resp);
                         }
@@ -6110,7 +6548,9 @@ impl AsyncHttp2Pool {
                 }
 
                 // If response is cacheable 200 OK and http_cache is enabled, cache it
-                if self.enable_http_cache
+                if self
+                    .enable_http_cache
+                    .load(std::sync::atomic::Ordering::Relaxed)
                     && (client_req.method.eq_ignore_ascii_case("GET")
                         || client_req.method.eq_ignore_ascii_case("HEAD"))
                     && resp.status.0 == 200
@@ -6137,22 +6577,45 @@ impl AsyncHttp2Pool {
                     }
                 }
 
-                self.release(conn);
+                if let Some(conn) = conn_opt {
+                    self.release(conn);
+                }
                 for resp_interceptor in &self.response_interceptors {
                     resp_interceptor(&client_req, &mut resp);
                 }
                 Ok(resp)
             }
             Err(e) => {
-                self.absorb_push_promises(&mut conn);
-                if let Some((_, err, _)) = conn.last_received_goaway() {
-                    if let Ok(mut last_err) = self.last_goaway_error.lock() {
-                        *last_err = Some(err);
+                if !client_no_store {
+                    if let Some(mut fallback_resp) = self.find_stale_if_error_fallback(
+                        &key,
+                        &client_req.headers,
+                        now_sys,
+                        default_ttl,
+                        client_sie,
+                    ) {
+                        self.stale_error_fallbacks
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(conn) = conn_opt {
+                            self.release(conn);
+                        }
+                        for resp_interceptor in &self.response_interceptors {
+                            resp_interceptor(&client_req, &mut fallback_resp);
+                        }
+                        return Ok(fallback_resp);
                     }
                 }
-                // If connection failed, it is dropped and not released back to the pool
-                self.active_count
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(mut conn) = conn_opt {
+                    self.absorb_push_promises(&mut conn);
+                    if let Some((_, err, _)) = conn.last_received_goaway() {
+                        if let Ok(mut last_err) = self.last_goaway_error.lock() {
+                            *last_err = Some(err);
+                        }
+                    }
+                    // If connection failed, it is dropped and not released back to the pool
+                    self.active_count
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 Err(e)
             }
         }
@@ -6235,9 +6698,15 @@ impl AsyncHttp2Pool {
             .map(|(_, v)| crate::http::HttpCacheDirectives::parse(v));
         let client_no_cache = req_cc.as_ref().map(|cc| cc.no_cache).unwrap_or(false);
         let client_no_store = req_cc.as_ref().map(|cc| cc.no_store).unwrap_or(false);
+        let client_swr = req_cc.as_ref().and_then(|cc| cc.stale_while_revalidate);
+        let client_sie = req_cc.as_ref().and_then(|cc| cc.stale_if_error);
 
         // 1. Check proactive push promise cache first
-        if self.enable_push_promises && !client_no_store {
+        if self
+            .enable_push_promises
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && !client_no_store
+        {
             if let Ok(mut cache) = self.push_promise_cache.lock() {
                 if let Some(entries) = cache.get_mut(&key) {
                     if let Some(pos) = entries
@@ -6261,6 +6730,27 @@ impl AsyncHttp2Pool {
                                 resp_interceptor(&client_req, &mut resp);
                             }
                             return Ok(resp);
+                        } else if !client_no_cache
+                            && entry.is_stale_while_revalidate(now_sys, default_ttl, client_swr)
+                        {
+                            entry.hit_count += 1;
+                            self.push_cache_hits
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.stale_hits
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let mut resp = entry.response.clone();
+                            resp.headers.set("warning", "110 - \"Response is Stale\"");
+                            let etag = entry.etag.clone();
+                            let lm = entry.last_modified.clone();
+                            drop(cache);
+                            self.spawn_background_revalidate(&client_req, etag, lm);
+                            if !resp.body.is_empty() {
+                                chunk_handler(&resp.body);
+                            }
+                            for resp_interceptor in &self.response_interceptors {
+                                resp_interceptor(&client_req, &mut resp);
+                            }
+                            return Ok(resp);
                         }
                     }
                 }
@@ -6269,7 +6759,11 @@ impl AsyncHttp2Pool {
 
         // 2. Check general HTTP client cache
         let mut cached_validator: Option<(Option<String>, Option<String>)> = None;
-        if self.enable_http_cache && !client_no_store {
+        if self
+            .enable_http_cache
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && !client_no_store
+        {
             if let Ok(mut cache) = self.http_cache_entries.lock() {
                 if let Some(entries) = cache.get_mut(&key) {
                     if let Some(pos) = entries
@@ -6290,6 +6784,27 @@ impl AsyncHttp2Pool {
                                 resp_interceptor(&client_req, &mut resp);
                             }
                             return Ok(resp);
+                        } else if !client_no_cache
+                            && entry.is_stale_while_revalidate(now_sys, default_ttl, client_swr)
+                        {
+                            entry.hit_count += 1;
+                            self.push_cache_hits
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.stale_hits
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let mut resp = entry.response.clone();
+                            resp.headers.set("warning", "110 - \"Response is Stale\"");
+                            let etag = entry.etag.clone();
+                            let lm = entry.last_modified.clone();
+                            drop(cache);
+                            self.spawn_background_revalidate(&client_req, etag, lm);
+                            if !resp.body.is_empty() {
+                                chunk_handler(&resp.body);
+                            }
+                            for resp_interceptor in &self.response_interceptors {
+                                resp_interceptor(&client_req, &mut resp);
+                            }
+                            return Ok(resp);
                         } else if entry.can_revalidate() {
                             cached_validator =
                                 Some((entry.etag.clone(), entry.last_modified.clone()));
@@ -6300,7 +6815,12 @@ impl AsyncHttp2Pool {
         }
 
         // Also check if push promise cache has a stale entry with validators that can be revalidated
-        if cached_validator.is_none() && self.enable_push_promises && !client_no_store {
+        if cached_validator.is_none()
+            && self
+                .enable_push_promises
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && !client_no_store
+        {
             if let Ok(cache) = self.push_promise_cache.lock() {
                 if let Some(entries) = cache.get(&key) {
                     if let Some(entry) = entries
@@ -6343,7 +6863,32 @@ impl AsyncHttp2Pool {
             }
         }
 
-        let mut conn = self.acquire()?;
+        let mut conn = match self.acquire() {
+            Ok(c) => c,
+            Err(e) => {
+                if !client_no_store {
+                    if let Some(mut fallback_resp) = self.find_stale_if_error_fallback(
+                        &key,
+                        &client_req.headers,
+                        now_sys,
+                        default_ttl,
+                        client_sie,
+                    ) {
+                        self.stale_error_fallbacks
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if !fallback_resp.body.is_empty() {
+                            chunk_handler(&fallback_resp.body);
+                        }
+                        for resp_interceptor in &self.response_interceptors {
+                            resp_interceptor(&client_req, &mut fallback_resp);
+                        }
+                        return Ok(fallback_resp);
+                    }
+                }
+                return Err(e);
+            }
+        };
+
         let header_refs: Vec<(&str, &str)> = client_req
             .headers
             .iter()
@@ -6358,7 +6903,34 @@ impl AsyncHttp2Pool {
         ];
         pseudo_headers.extend_from_slice(&header_refs);
 
-        let stream_id = conn.send_request(&pseudo_headers, body_ref)?;
+        let stream_id = match conn.send_request(&pseudo_headers, body_ref) {
+            Ok(sid) => sid,
+            Err(e) => {
+                if !client_no_store {
+                    if let Some(mut fallback_resp) = self.find_stale_if_error_fallback(
+                        &key,
+                        &client_req.headers,
+                        now_sys,
+                        default_ttl,
+                        client_sie,
+                    ) {
+                        self.stale_error_fallbacks
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.release(conn);
+                        if !fallback_resp.body.is_empty() {
+                            chunk_handler(&fallback_resp.body);
+                        }
+                        for resp_interceptor in &self.response_interceptors {
+                            resp_interceptor(&client_req, &mut fallback_resp);
+                        }
+                        return Ok(fallback_resp);
+                    }
+                }
+                self.release(conn);
+                return Err(e);
+            }
+        };
+
         let result = conn.recv_streaming_response_with_pool(
             stream_id,
             self.chunk_buffer_pool.clone(),
@@ -6367,6 +6939,27 @@ impl AsyncHttp2Pool {
 
         match result {
             Ok(mut resp) => {
+                if resp.status.0 >= 500 && resp.status.0 <= 599 && !client_no_store {
+                    if let Some(mut fallback_resp) = self.find_stale_if_error_fallback(
+                        &key,
+                        &client_req.headers,
+                        now_sys,
+                        default_ttl,
+                        client_sie,
+                    ) {
+                        self.stale_error_fallbacks
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.release(conn);
+                        if !fallback_resp.body.is_empty() {
+                            chunk_handler(&fallback_resp.body);
+                        }
+                        for resp_interceptor in &self.response_interceptors {
+                            resp_interceptor(&client_req, &mut fallback_resp);
+                        }
+                        return Ok(fallback_resp);
+                    }
+                }
+
                 // If 304 Not Modified received on conditional revalidation, deliver cached body to handler and return 200
                 if resp.status.0 == 304 && is_revalidating {
                     self.cache_revalidations
@@ -6377,7 +6970,10 @@ impl AsyncHttp2Pool {
                     let now_update = std::time::SystemTime::now();
                     let mut resolved_resp = None;
 
-                    if self.enable_http_cache {
+                    if self
+                        .enable_http_cache
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         if let Ok(mut cache) = self.http_cache_entries.lock() {
                             if let Some(entries) = cache.get_mut(&key) {
                                 if let Some(pos) = entries
@@ -6390,7 +6986,11 @@ impl AsyncHttp2Pool {
                             }
                         }
                     }
-                    if resolved_resp.is_none() && self.enable_push_promises {
+                    if resolved_resp.is_none()
+                        && self
+                            .enable_push_promises
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         if let Ok(mut cache) = self.push_promise_cache.lock() {
                             if let Some(entries) = cache.get_mut(&key) {
                                 if let Some(pos) = entries
@@ -6429,7 +7029,9 @@ impl AsyncHttp2Pool {
                 }
 
                 // If response is cacheable 200 OK and http_cache is enabled, cache it
-                if self.enable_http_cache
+                if self
+                    .enable_http_cache
+                    .load(std::sync::atomic::Ordering::Relaxed)
                     && (client_req.method.eq_ignore_ascii_case("GET")
                         || client_req.method.eq_ignore_ascii_case("HEAD"))
                     && resp.status.0 == 200
@@ -6463,6 +7065,26 @@ impl AsyncHttp2Pool {
                 Ok(resp)
             }
             Err(e) => {
+                if !client_no_store {
+                    if let Some(mut fallback_resp) = self.find_stale_if_error_fallback(
+                        &key,
+                        &client_req.headers,
+                        now_sys,
+                        default_ttl,
+                        client_sie,
+                    ) {
+                        self.stale_error_fallbacks
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.release(conn);
+                        if !fallback_resp.body.is_empty() {
+                            chunk_handler(&fallback_resp.body);
+                        }
+                        for resp_interceptor in &self.response_interceptors {
+                            resp_interceptor(&client_req, &mut fallback_resp);
+                        }
+                        return Ok(fallback_resp);
+                    }
+                }
                 self.absorb_push_promises(&mut conn);
                 if let Some((_, err, _)) = conn.last_received_goaway() {
                     if let Ok(mut last_err) = self.last_goaway_error.lock() {
@@ -14697,6 +15319,193 @@ mod tls_alpn_tests {
         assert_eq!(resp_wild2.status.0, 200);
         assert_eq!(resp_wild2.body, b"WILD2");
         assert_eq!(pool.push_cache_hits(), 2); // Unchanged
+
+        server_handle.join().expect("server join");
+    }
+
+    #[test]
+    fn test_http2_pool_stale_while_revalidate_async_background() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server_handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => continue,
+                }
+            };
+
+            // Request 1: GET /api/swr -> Stream 1
+            let frame1 = loop {
+                if let Some(f) = server.try_recv_frame().expect("recv frame 1") {
+                    if matches!(f, crate::simd_parser::Http2Frame::Headers { .. }) {
+                        break f;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(frame1.stream_id(), 1);
+            let h1 = [
+                (":status", "200"),
+                ("etag", "\"v1-swr\""),
+                (
+                    "cache-control",
+                    "public, max-age=1, stale-while-revalidate=60",
+                ),
+            ];
+            server
+                .send_response(1, &h1, Some(b"SWR_V1"))
+                .expect("send 200 swr 1");
+
+            // Background Revalidation Request: GET /api/swr with If-None-Match: "v1-swr" -> Stream 3
+            let frame2 = loop {
+                if let Some(f) = server.try_recv_frame().expect("recv frame 2") {
+                    if matches!(f, crate::simd_parser::Http2Frame::Headers { .. }) {
+                        break f;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(frame2.stream_id(), 3);
+            let h2 = [
+                (":status", "304"),
+                ("etag", "\"v1-swr\""),
+                (
+                    "cache-control",
+                    "public, max-age=120, stale-while-revalidate=60",
+                ),
+            ];
+            server
+                .send_response(3, &h2, None)
+                .expect("send 304 swr revalidation");
+
+            for _ in 0..10 {
+                let _ = server.try_recv_frame();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2).with_http_cache(true);
+
+        // 1. Initial request -> 200 OK stored in client cache
+        let resp1 = pool
+            .execute_request("GET", "/api/swr", &[], None)
+            .expect("request 1");
+        assert_eq!(resp1.status.0, 200);
+        assert_eq!(resp1.body, b"SWR_V1");
+        assert_eq!(pool.http_cache_count(), 1);
+        assert_eq!(pool.stale_hits(), 0);
+
+        // Sleep 1.1s so max-age=1 expires and entry enters stale-while-revalidate window
+        std::thread::sleep(Duration::from_millis(1100));
+
+        // 2. Second request -> immediate stale hit (Warning: 110 header present), triggers background revalidation
+        let resp2 = pool
+            .execute_request("GET", "/api/swr", &[], None)
+            .expect("request 2 stale");
+        assert_eq!(resp2.status.0, 200);
+        assert_eq!(resp2.body, b"SWR_V1");
+        assert_eq!(
+            resp2.headers.get("warning"),
+            Some("110 - \"Response is Stale\"")
+        );
+        assert_eq!(pool.stale_hits(), 1);
+
+        // Wait up to 1000ms for background revalidation to complete
+        let start = std::time::Instant::now();
+        while pool.cache_revalidations() == 0 && start.elapsed() < Duration::from_millis(1000) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(pool.cache_revalidations(), 1);
+        assert!(pool.background_revalidations() >= 1);
+
+        server_handle.join().expect("server join");
+    }
+
+    #[test]
+    fn test_http2_pool_stale_if_error_resilience() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server_handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => continue,
+                }
+            };
+
+            // Request 1: GET /api/sie -> Stream 1
+            let frame1 = loop {
+                if let Some(f) = server.try_recv_frame().expect("recv frame 1") {
+                    if matches!(f, crate::simd_parser::Http2Frame::Headers { .. }) {
+                        break f;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(frame1.stream_id(), 1);
+            let h1 = [
+                (":status", "200"),
+                ("cache-control", "public, max-age=1, stale-if-error=120"),
+            ];
+            server
+                .send_response(1, &h1, Some(b"SIE_SAVED_DATA"))
+                .expect("send 200 sie 1");
+
+            // Request 2: GET /api/sie -> Stream 3, server replies with 500 Internal Server Error
+            let frame2 = loop {
+                if let Some(f) = server.try_recv_frame().expect("recv frame 2") {
+                    if matches!(f, crate::simd_parser::Http2Frame::Headers { .. }) {
+                        break f;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(frame2.stream_id(), 3);
+            let h2 = [(":status", "500")];
+            server
+                .send_response(3, &h2, Some(b"INTERNAL_SERVER_ERROR"))
+                .expect("send 500");
+
+            for _ in 0..10 {
+                let _ = server.try_recv_frame();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2).with_http_cache(true);
+
+        // 1. Initial request -> 200 OK stored in client cache
+        let resp1 = pool
+            .execute_request("GET", "/api/sie", &[], None)
+            .expect("request 1");
+        assert_eq!(resp1.status.0, 200);
+        assert_eq!(resp1.body, b"SIE_SAVED_DATA");
+
+        // Sleep 1.1s so max-age=1 expires
+        std::thread::sleep(Duration::from_millis(1100));
+
+        // 2. Second request hits origin 500 error, but stale-if-error rescues it!
+        let resp2 = pool
+            .execute_request("GET", "/api/sie", &[], None)
+            .expect("request 2 rescued by stale-if-error");
+        assert_eq!(resp2.status.0, 200);
+        assert_eq!(resp2.body, b"SIE_SAVED_DATA");
+        assert_eq!(
+            resp2.headers.get("warning"),
+            Some("110 - \"Response is Stale\"")
+        );
+        assert_eq!(pool.stale_error_fallbacks(), 1);
+        assert_eq!(pool.stats().stale_error_fallbacks, 1);
 
         server_handle.join().expect("server join");
     }
