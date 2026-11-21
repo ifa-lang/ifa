@@ -4355,6 +4355,173 @@ impl Http2Session {
         frames
     }
 
+    /// Schedule outbound DATA frames using **Déficit Round Robin (DRR)** weighted-fair queuing.
+    ///
+    /// Each active stream with pending data receives a per-round *quantum* proportional to its
+    /// RFC 7540 `weight` (1–256, default 16).  Any unused credit is accumulated as a *deficit*
+    /// and carried forward across rounds, guaranteeing long-term bandwidth proportional to weights
+    /// even when frames are smaller than the quantum.
+    ///
+    /// # Arguments
+    /// * `deficit_counters` – mutable map of `stream_id → accumulated deficit` (bytes).
+    ///   Pass the same map on successive calls to preserve inter-round fairness.
+    /// * `base_quantum` – bytes allocated per unit of weight per round (e.g. 1024).
+    /// * `max_frame_size` – maximum DATA payload size (clamped to ≥ 1).
+    /// * `end_stream` – if `true`, the last DATA frame for a fully-drained stream marks END_STREAM.
+    ///
+    /// Returns the generated DATA frames.
+    pub fn schedule_drr_outbound_data(
+        &mut self,
+        deficit_counters: &mut std::collections::HashMap<u32, usize>,
+        base_quantum: usize,
+        max_frame_size: usize,
+        end_stream: bool,
+    ) -> Vec<Http2Frame> {
+        let mut frames = Vec::new();
+        if self.connection_window_size <= 0 || self.pending_outbound_data.is_empty() {
+            return frames;
+        }
+
+        let max_frame = max_frame_size.max(1);
+
+        // Collect active stream IDs that have pending data, sorted for determinism
+        let mut active: Vec<u32> = self
+            .pending_outbound_data
+            .iter()
+            .filter_map(|(&sid, buf)| {
+                if buf.is_empty() {
+                    return None;
+                }
+                match self.streams.get(&sid) {
+                    Some(s)
+                        if s.state == Http2StreamState::Open
+                            || s.state == Http2StreamState::HalfClosedRemote =>
+                    {
+                        Some(sid)
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        active.sort_unstable();
+
+        if active.is_empty() {
+            return frames;
+        }
+
+        // Initialise deficit counters for new streams
+        for &sid in &active {
+            deficit_counters.entry(sid).or_insert(0);
+        }
+
+        // DRR main loop — terminate when no progress is made in a full pass
+        loop {
+            if self.connection_window_size <= 0 {
+                break;
+            }
+
+            let mut any_sent_in_round = false;
+
+            for &stream_id in &active {
+                if self.connection_window_size <= 0 {
+                    break;
+                }
+
+                let pending = self.pending_outbound_data.get(&stream_id);
+                if pending.map(|b| b.is_empty()).unwrap_or(true) {
+                    // Stream exhausted — reset deficit so it starts fresh next time
+                    deficit_counters.insert(stream_id, 0);
+                    continue;
+                }
+
+                // Accumulate quantum proportional to weight
+                let weight = self
+                    .streams
+                    .get(&stream_id)
+                    .map(|s| s.weight as usize)
+                    .unwrap_or(16)
+                    .max(1);
+                let quantum = base_quantum.saturating_mul(weight) / 16;
+                let deficit = deficit_counters.entry(stream_id).or_insert(0);
+                *deficit = deficit.saturating_add(quantum);
+
+                // Drain as many frames as the deficit and flow-control windows allow
+                loop {
+                    if *deficit == 0 || self.connection_window_size <= 0 {
+                        break;
+                    }
+
+                    let stream_win = match self.streams.get(&stream_id) {
+                        Some(s)
+                            if s.state == Http2StreamState::Open
+                                || s.state == Http2StreamState::HalfClosedRemote =>
+                        {
+                            s.window_size
+                        }
+                        _ => break,
+                    };
+                    if stream_win <= 0 {
+                        break;
+                    }
+
+                    let available_credit =
+                        (self.connection_window_size.min(stream_win) as usize).min(*deficit);
+                    if available_credit == 0 {
+                        break;
+                    }
+
+                    let buf_len = match self.pending_outbound_data.get(&stream_id) {
+                        Some(b) if !b.is_empty() => b.len(),
+                        _ => break,
+                    };
+
+                    let chunk_size = buf_len.min(available_credit).min(max_frame);
+                    if chunk_size == 0 {
+                        break;
+                    }
+
+                    let chunk: Vec<u8> = self
+                        .pending_outbound_data
+                        .get_mut(&stream_id)
+                        .map(|b| b.drain(..chunk_size).collect())
+                        .unwrap_or_default();
+
+                    let is_last = end_stream
+                        && self
+                            .pending_outbound_data
+                            .get(&stream_id)
+                            .map(|b| b.is_empty())
+                            .unwrap_or(true);
+
+                    let frame = self.create_data_frame(stream_id, &chunk, is_last);
+                    frames.push(frame);
+
+                    *deficit = deficit.saturating_sub(chunk_size);
+                    self.connection_window_size -= chunk_size as i32;
+                    if let Some(s) = self.streams.get_mut(&stream_id) {
+                        s.window_size -= chunk_size as i32;
+                    }
+
+                    any_sent_in_round = true;
+                }
+            }
+
+            // Remove exhausted streams from active list
+            active.retain(|sid| {
+                self.pending_outbound_data
+                    .get(sid)
+                    .map(|b| !b.is_empty())
+                    .unwrap_or(false)
+            });
+
+            if !any_sent_in_round || active.is_empty() {
+                break;
+            }
+        }
+
+        frames
+    }
+
     /// Process an incoming decoded frame.
     pub fn handle_frame(
         &mut self,
