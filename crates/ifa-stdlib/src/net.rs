@@ -10193,6 +10193,7 @@ mod tests {
                 if let Ok(async_stream) = AsyncTcpStream::from_std(tcp_stream) {
                     if let Ok(mut server) = AsyncHttp2Connection::server_handshake(async_stream) {
                         let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                        std::thread::sleep(Duration::from_millis(20));
                     }
                 }
             }
@@ -10204,20 +10205,19 @@ mod tests {
                         while let Ok(frame) = server.recv_frame() {
                             if let crate::simd_parser::Http2Frame::Headers {
                                 stream_id,
-                                end_stream,
+                                end_stream: true,
                                 ..
                             } = frame
                             {
-                                if end_stream {
-                                    let _ = server.send_response(
-                                        stream_id,
-                                        &[(":status", "200")],
-                                        Some(b"adaptive-retry-success"),
-                                    );
-                                    let _ = server
-                                        .send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
-                                    break;
-                                }
+                                let _ = server.send_response(
+                                    stream_id,
+                                    &[(":status", "200")],
+                                    Some(b"adaptive-retry-success"),
+                                );
+                                let _ =
+                                    server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                                std::thread::sleep(Duration::from_millis(60));
+                                break;
                             }
                         }
                     }
