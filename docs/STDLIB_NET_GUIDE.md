@@ -99,6 +99,33 @@ assert!(resp.headers.get("content-encoding").is_none());
 assert_eq!(pool.stats().decompressed_responses, 1);
 ```
 
+### Transparent HTTP/3 Renegotiation via Alt-Svc (RFC 7838)
+
+The HTTP/2 client pool automatically harvests alternative service routes advertised by servers via RFC 7838 `Alt-Svc` headers and frames. When an active HTTP/3 route (`h3`) is discovered, subsequent requests transparently renegotiate over HTTP/3 without caller intervention:
+
+```rust
+use ifa_stdlib::net::{AsyncHttp2Pool, Http3Transport};
+use std::time::Duration;
+
+let pool = AsyncHttp2Pool::new("api.example.com", 443, 8)
+    .with_http3_handler(|host, port, method, path, headers, body| {
+        // HTTP/3 / QUIC transport invocation
+        Ok(HttpResponse::new(HttpStatus(200)))
+    })
+    .with_alt_svc_quarantine_duration(Duration::from_secs(300));
+
+// 1. Initial request runs over HTTP/2 and discovers "Alt-Svc: h3=\":443\"; ma=86400"
+let resp1 = pool.execute_request("GET", "/status", &[], None)?;
+
+// 2. Subsequent requests automatically and transparently migrate to HTTP/3!
+let resp2 = pool.execute_request("GET", "/metrics", &[], None)?;
+assert_eq!(pool.h3_requests_succeeded(), 1);
+
+// 3. Resilient fallback: If HTTP/3 connection fails, the route is quarantined
+// and execution transparently falls back to pooled HTTP/2 without failing the request.
+assert_eq!(pool.h3_fallbacks(), 0);
+```
+
 ---
 
 ## 3. WebSocket Client & Pooled Multiplexing

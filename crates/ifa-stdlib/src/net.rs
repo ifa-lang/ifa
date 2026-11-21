@@ -5463,6 +5463,69 @@ impl Http2PoolCacheEntry {
     }
 }
 
+/// Progressive chunk handler closure for HTTP/3 streaming payloads.
+pub type Http3ChunkHandler<'a> = Box<dyn FnMut(&[u8]) + 'a>;
+
+/// Trait representing an HTTP/3 / QUIC transport client or executor for transparent pool renegotiation.
+pub trait Http3Transport: Send + Sync {
+    /// Execute an HTTP request over HTTP/3 / QUIC to the specified target host and UDP port.
+    fn execute_request(
+        &self,
+        host: &str,
+        port: u16,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> io::Result<crate::http::HttpResponse>;
+
+    /// Execute an HTTP request over HTTP/3 / QUIC with progressive chunk delivery.
+    /// By default, delegates to `execute_request` and delivers the received payload to `chunk_handler`.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_streaming_request(
+        &self,
+        host: &str,
+        port: u16,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        mut chunk_handler: Http3ChunkHandler<'_>,
+    ) -> io::Result<crate::http::HttpResponse> {
+        let resp = self.execute_request(host, port, method, path, headers, body)?;
+        if !resp.body.is_empty() {
+            chunk_handler(&resp.body);
+        }
+        Ok(resp)
+    }
+}
+
+impl<F> Http3Transport for F
+where
+    F: Fn(
+            &str,
+            u16,
+            &str,
+            &str,
+            &[(&str, &str)],
+            Option<&[u8]>,
+        ) -> io::Result<crate::http::HttpResponse>
+        + Send
+        + Sync,
+{
+    fn execute_request(
+        &self,
+        host: &str,
+        port: u16,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> io::Result<crate::http::HttpResponse> {
+        (self)(host, port, method, path, headers, body)
+    }
+}
+
 /// An idle pooled HTTP/2 connection paired with the timestamp at which it became idle.
 struct PooledConnectionEntry {
     conn: AsyncHttp2Connection,
@@ -5492,6 +5555,14 @@ pub struct AsyncHttp2Pool {
     alt_svc_routes: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, Vec<crate::simd_parser::AltSvcRoute>>>,
     >,
+    http3_transport: Option<std::sync::Arc<dyn Http3Transport>>,
+    enable_h3_negotiation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    quarantined_alt_svc_routes:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
+    alt_svc_quarantine_duration: std::time::Duration,
+    h3_requests_attempted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    h3_requests_succeeded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    h3_fallbacks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     chunk_buffer_pool: Option<Http2ChunkBufferPool>,
     auto_tune_flow_control: bool,
     push_promise_cache: std::sync::Arc<
@@ -5545,6 +5616,15 @@ impl AsyncHttp2Pool {
             alt_svc_routes: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            http3_transport: None,
+            enable_h3_negotiation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            quarantined_alt_svc_routes: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            alt_svc_quarantine_duration: std::time::Duration::from_secs(300),
+            h3_requests_attempted: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            h3_requests_succeeded: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            h3_fallbacks: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             chunk_buffer_pool: None,
             auto_tune_flow_control: false,
             push_promise_cache: std::sync::Arc::new(std::sync::Mutex::new(
@@ -5675,6 +5755,137 @@ impl AsyncHttp2Pool {
     pub fn decompressed_responses(&self) -> usize {
         self.decompressed_responses
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Configure an HTTP/3 / QUIC transport client for transparent Alt-Svc renegotiation.
+    /// Automatically enables HTTP/3 renegotiation on this pool.
+    pub fn with_http3_transport(mut self, transport: impl Http3Transport + 'static) -> Self {
+        self.http3_transport = Some(std::sync::Arc::new(transport));
+        self.enable_h3_negotiation
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// Convenience method to configure an HTTP/3 transport handler closure for transparent Alt-Svc renegotiation.
+    pub fn with_http3_handler<F>(self, handler: F) -> Self
+    where
+        F: Fn(
+                &str,
+                u16,
+                &str,
+                &str,
+                &[(&str, &str)],
+                Option<&[u8]>,
+            ) -> io::Result<crate::http::HttpResponse>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.with_http3_transport(handler)
+    }
+
+    /// Set or update the registered HTTP/3 transport client.
+    pub fn set_http3_transport(&mut self, transport: Option<std::sync::Arc<dyn Http3Transport>>) {
+        self.http3_transport = transport;
+    }
+
+    /// Configure whether transparent HTTP/3 renegotiation via Alt-Svc is enabled.
+    pub fn with_h3_negotiation(self, enabled: bool) -> Self {
+        self.enable_h3_negotiation
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// Set whether transparent HTTP/3 renegotiation is enabled on this pool.
+    pub fn set_enable_h3_negotiation(&self, enabled: bool) {
+        self.enable_h3_negotiation
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether transparent HTTP/3 renegotiation is enabled on this pool.
+    pub fn h3_negotiation_enabled(&self) -> bool {
+        self.enable_h3_negotiation
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Configure default quarantine duration for failed alternative service routes (RFC 7838 §2.4).
+    pub fn with_alt_svc_quarantine_duration(mut self, duration: std::time::Duration) -> Self {
+        self.alt_svc_quarantine_duration = duration;
+        self
+    }
+
+    /// Quarantine a failed alternative service route for a given duration (or default duration).
+    pub fn quarantine_alt_svc_route(&self, route_key: &str, duration: Option<std::time::Duration>) {
+        let dur = duration.unwrap_or(self.alt_svc_quarantine_duration);
+        let expiry = std::time::Instant::now() + dur;
+        if let Ok(mut map) = self.quarantined_alt_svc_routes.lock() {
+            map.insert(route_key.to_string(), expiry);
+        }
+    }
+
+    /// Check whether an alternative service route key is currently quarantined.
+    pub fn is_alt_svc_quarantined(&self, route_key: &str) -> bool {
+        if let Ok(mut map) = self.quarantined_alt_svc_routes.lock() {
+            if let Some(&expiry) = map.get(route_key) {
+                if std::time::Instant::now() >= expiry {
+                    map.remove(route_key);
+                    false
+                } else {
+                    true
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Clear all active alternative service route quarantines.
+    pub fn clear_alt_svc_quarantines(&self) {
+        if let Ok(mut map) = self.quarantined_alt_svc_routes.lock() {
+            map.clear();
+        }
+    }
+
+    /// Total count of currently active quarantined alternative service routes.
+    pub fn quarantined_alt_svc_routes_count(&self) -> usize {
+        if let Ok(mut map) = self.quarantined_alt_svc_routes.lock() {
+            let now = std::time::Instant::now();
+            map.retain(|_, &mut exp| exp > now);
+            map.len()
+        } else {
+            0
+        }
+    }
+
+    /// Sweep expired alternative service route quarantines.
+    pub fn sweep_expired_alt_svc_quarantines(&self) -> usize {
+        if let Ok(mut map) = self.quarantined_alt_svc_routes.lock() {
+            let now = std::time::Instant::now();
+            let initial = map.len();
+            map.retain(|_, &mut exp| exp > now);
+            initial - map.len()
+        } else {
+            0
+        }
+    }
+
+    /// Total count of HTTP/3 migration requests attempted via Alt-Svc.
+    pub fn h3_requests_attempted(&self) -> usize {
+        self.h3_requests_attempted
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total count of HTTP/3 migration requests that succeeded.
+    pub fn h3_requests_succeeded(&self) -> usize {
+        self.h3_requests_succeeded
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total count of failed HTTP/3 attempts that transparently fell back to HTTP/2.
+    pub fn h3_fallbacks(&self) -> usize {
+        self.h3_fallbacks.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Total count of successful 304 Not Modified conditional revalidations performed by the pool.
@@ -6825,6 +7036,161 @@ impl AsyncHttp2Pool {
             }
         }
 
+        // --- Transparent HTTP/3 renegotiation check via Alt-Svc (RFC 7838) ---
+        if self.h3_negotiation_enabled() {
+            if let Some(ref transport) = self.http3_transport {
+                if let Some(route) = self.select_active_unquarantined_alt_svc_route(
+                    None,
+                    "h3",
+                    std::time::Duration::from_secs(0),
+                    true,
+                ) {
+                    let target_host = if route.host.is_empty() {
+                        self.host.as_str()
+                    } else {
+                        route.host.as_str()
+                    };
+                    let target_port = if route.port != 0 {
+                        route.port
+                    } else {
+                        self.port
+                    };
+                    let q_key = format!("h3://{}:{}", target_host, target_port);
+
+                    self.h3_requests_attempted
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    let header_refs: Vec<(&str, &str)> = client_req
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+                    let body_ref = client_req.body.as_deref();
+
+                    match transport.execute_request(
+                        target_host,
+                        target_port,
+                        &client_req.method,
+                        &client_req.path,
+                        &header_refs,
+                        body_ref,
+                    ) {
+                        Ok(mut resp) => {
+                            self.h3_requests_succeeded
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            if resp.status.0 == 304 && is_revalidating {
+                                self.cache_revalidations
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                self.push_cache_hits
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                                let now_update = std::time::SystemTime::now();
+                                let mut resolved_resp = None;
+
+                                if self
+                                    .enable_http_cache
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    if let Ok(mut cache) = self.http_cache_entries.lock() {
+                                        if let Some(entries) = cache.get_mut(&key) {
+                                            if let Some(pos) = entries.iter().rposition(|entry| {
+                                                entry.matches_request(&client_req.headers)
+                                            }) {
+                                                entries[pos].update_from_304(&resp, now_update);
+                                                resolved_resp = Some(entries[pos].response.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                if resolved_resp.is_none()
+                                    && self
+                                        .enable_push_promises
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    if let Ok(mut cache) = self.push_promise_cache.lock() {
+                                        if let Some(entries) = cache.get_mut(&key) {
+                                            if let Some(pos) = entries.iter().rposition(|entry| {
+                                                entry.matches_request(&client_req.headers)
+                                            }) {
+                                                entries[pos].update_from_304(&resp, now_update);
+                                                resolved_resp = Some(entries[pos].response.clone());
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if let Some(mut fresh_resp) = resolved_resp {
+                                    for resp_interceptor in &self.response_interceptors {
+                                        resp_interceptor(&client_req, &mut fresh_resp);
+                                    }
+                                    return Ok(fresh_resp);
+                                }
+                            }
+
+                            if let Some(alt_svc_val) = resp.headers.get("alt-svc") {
+                                let routes = crate::simd_parser::AltSvcRoute::parse_header_value(
+                                    alt_svc_val,
+                                );
+                                let origin = format!("{}:{}", self.host, self.port);
+                                if let Ok(mut pool_routes) = self.alt_svc_routes.lock() {
+                                    if routes.is_empty()
+                                        && alt_svc_val.trim().eq_ignore_ascii_case("clear")
+                                    {
+                                        pool_routes.remove(&origin);
+                                    } else if !routes.is_empty() {
+                                        pool_routes.insert(origin, routes);
+                                    }
+                                }
+                            }
+
+                            if self.auto_decompress() && resp.headers.has("content-encoding") {
+                                if let Ok(true) = resp.decompress_in_place() {
+                                    self.decompressed_responses
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+
+                            if self
+                                .enable_http_cache
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                && (client_req.method.eq_ignore_ascii_case("GET")
+                                    || client_req.method.eq_ignore_ascii_case("HEAD"))
+                                && resp.status.0 == 200
+                                && !client_no_store
+                            {
+                                let entry = Http2PoolCacheEntry::new(
+                                    client_req.method.clone(),
+                                    client_req.path.clone(),
+                                    resp.clone(),
+                                )
+                                .with_request_headers(client_req.headers.clone());
+                                self.insert_http_cache_entry(key.clone(), entry);
+                            }
+
+                            if !client_req.method.eq_ignore_ascii_case("GET")
+                                && !client_req.method.eq_ignore_ascii_case("HEAD")
+                                && resp.status.0 >= 200
+                                && resp.status.0 < 400
+                            {
+                                self.invalidate_http_cache_path(&client_req.path);
+                            }
+
+                            for resp_interceptor in &self.response_interceptors {
+                                resp_interceptor(&client_req, &mut resp);
+                            }
+                            return Ok(resp);
+                        }
+                        Err(_e) => {
+                            self.h3_fallbacks
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.quarantine_alt_svc_route(&q_key, None);
+                        }
+                    }
+                }
+            }
+        }
+
         let conn_res = self.acquire();
         let (conn_opt, result) = match conn_res {
             Ok(mut conn) => {
@@ -7283,6 +7649,88 @@ impl AsyncHttp2Pool {
             }
         }
 
+        // --- Transparent HTTP/3 renegotiation check for streaming requests ---
+        if self.h3_negotiation_enabled() {
+            if let Some(ref transport) = self.http3_transport {
+                if let Some(route) = self.select_active_unquarantined_alt_svc_route(
+                    None,
+                    "h3",
+                    std::time::Duration::from_secs(0),
+                    true,
+                ) {
+                    let target_host = if route.host.is_empty() {
+                        self.host.as_str()
+                    } else {
+                        route.host.as_str()
+                    };
+                    let target_port = if route.port != 0 {
+                        route.port
+                    } else {
+                        self.port
+                    };
+                    let q_key = format!("h3://{}:{}", target_host, target_port);
+
+                    self.h3_requests_attempted
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    let header_refs: Vec<(&str, &str)> = client_req
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+                    let body_ref = client_req.body.as_deref();
+
+                    match transport.execute_streaming_request(
+                        target_host,
+                        target_port,
+                        &client_req.method,
+                        &client_req.path,
+                        &header_refs,
+                        body_ref,
+                        Box::new(&mut chunk_handler),
+                    ) {
+                        Ok(mut resp) => {
+                            self.h3_requests_succeeded
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            if let Some(alt_svc_val) = resp.headers.get("alt-svc") {
+                                let routes = crate::simd_parser::AltSvcRoute::parse_header_value(
+                                    alt_svc_val,
+                                );
+                                let origin = format!("{}:{}", self.host, self.port);
+                                if let Ok(mut pool_routes) = self.alt_svc_routes.lock() {
+                                    if routes.is_empty()
+                                        && alt_svc_val.trim().eq_ignore_ascii_case("clear")
+                                    {
+                                        pool_routes.remove(&origin);
+                                    } else if !routes.is_empty() {
+                                        pool_routes.insert(origin, routes);
+                                    }
+                                }
+                            }
+
+                            if self.auto_decompress() && resp.headers.has("content-encoding") {
+                                if let Ok(true) = resp.decompress_in_place() {
+                                    self.decompressed_responses
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+
+                            for resp_interceptor in &self.response_interceptors {
+                                resp_interceptor(&client_req, &mut resp);
+                            }
+                            return Ok(resp);
+                        }
+                        Err(_e) => {
+                            self.h3_fallbacks
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.quarantine_alt_svc_route(&q_key, None);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut conn = match self.acquire() {
             Ok(c) => c,
             Err(e) => {
@@ -7649,11 +8097,31 @@ impl AsyncHttp2Pool {
         let key = origin
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("{}:{}", self.host, self.port));
-        self.alt_svc_routes
-            .lock()
-            .ok()
-            .and_then(|routes| routes.get(&key).cloned())
-            .unwrap_or_default()
+        if let Ok(map) = self.alt_svc_routes.lock() {
+            if let Some(routes) = map.get(&key) {
+                return routes.clone();
+            }
+            if origin.is_none() {
+                let https_key = format!("https://{}:{}", self.host, self.port);
+                if let Some(routes) = map.get(&https_key) {
+                    return routes.clone();
+                }
+                let host_only = &self.host;
+                if let Some(routes) = map.get(host_only) {
+                    return routes.clone();
+                }
+            } else if let Some(s) = origin {
+                if let Some(stripped) = s
+                    .strip_prefix("https://")
+                    .or_else(|| s.strip_prefix("http://"))
+                {
+                    if let Some(routes) = map.get(stripped) {
+                        return routes.clone();
+                    }
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// Explicitly record or update alternative service routes for a given origin.
@@ -7771,6 +8239,35 @@ impl AsyncHttp2Pool {
         })
     }
 
+    /// Select an active (non-expired and non-quarantined) alternative service route for a given origin and protocol.
+    pub fn select_active_unquarantined_alt_svc_route(
+        &self,
+        origin: Option<&str>,
+        protocol_id: &str,
+        elapsed: std::time::Duration,
+        allow_persisted: bool,
+    ) -> Option<crate::simd_parser::AltSvcRoute> {
+        let routes = self.get_alt_svc_routes(origin);
+        routes.into_iter().find(|r| {
+            if !r.protocol_id.eq_ignore_ascii_case(protocol_id) {
+                return false;
+            }
+            if allow_persisted && r.persist {
+                // persisted route allowed
+            } else if r.is_expired_since(elapsed) {
+                return false;
+            }
+            let host = if r.host.is_empty() {
+                self.host.as_str()
+            } else {
+                r.host.as_str()
+            };
+            let port = if r.port != 0 { r.port } else { self.port };
+            let q_key = format!("{}://{}:{}", r.protocol_id.to_ascii_lowercase(), host, port);
+            !self.is_alt_svc_quarantined(&q_key)
+        })
+    }
+
     /// Execute a request with automatic transparent migration to an advertised HTTP/3 alternative route if available.
     ///
     /// If an active HTTP/3 alternative route is discovered for the origin (or default origin),
@@ -7795,11 +8292,15 @@ impl AsyncHttp2Pool {
             Option<&[u8]>,
         ) -> io::Result<crate::http::HttpResponse>,
     {
-        // Check for an available HTTP/3 route
-        let h3_route =
-            self.select_active_alt_svc_route(None, "h3", std::time::Duration::from_secs(0), true);
+        // Check for an available unquarantined HTTP/3 route
+        let h3_route = self.select_active_unquarantined_alt_svc_route(
+            None,
+            "h3",
+            std::time::Duration::from_secs(0),
+            true,
+        );
 
-        if let (Some(route), Some(handler)) = (h3_route, http3_handler) {
+        if let Some(route) = h3_route {
             let target_host = if route.host.is_empty() {
                 self.host.as_str()
             } else {
@@ -7810,18 +8311,57 @@ impl AsyncHttp2Pool {
             } else {
                 self.port
             };
+            let q_key = format!("h3://{}:{}", target_host, target_port);
 
-            // Attempt HTTP/3 execution via the provided handler
-            match handler(target_host, target_port, method, path, headers, body) {
-                Ok(resp) => return Ok(resp),
-                Err(e) => {
-                    // On connection/transport error, transparently fall back to HTTP/2
-                    match e.kind() {
-                        io::ErrorKind::ConnectionRefused
-                        | io::ErrorKind::ConnectionReset
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::AddrNotAvailable => {}
-                        _ => return Err(e),
+            if let Some(handler) = http3_handler {
+                self.h3_requests_attempted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match handler(target_host, target_port, method, path, headers, body) {
+                    Ok(resp) => {
+                        self.h3_requests_succeeded
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(resp);
+                    }
+                    Err(e) => {
+                        self.h3_fallbacks
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.quarantine_alt_svc_route(&q_key, None);
+                        match e.kind() {
+                            io::ErrorKind::ConnectionRefused
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::AddrNotAvailable => {}
+                            _ => return Err(e),
+                        }
+                    }
+                }
+            } else if let Some(ref transport) = self.http3_transport {
+                self.h3_requests_attempted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match transport.execute_request(
+                    target_host,
+                    target_port,
+                    method,
+                    path,
+                    headers,
+                    body,
+                ) {
+                    Ok(resp) => {
+                        self.h3_requests_succeeded
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(resp);
+                    }
+                    Err(e) => {
+                        self.h3_fallbacks
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.quarantine_alt_svc_route(&q_key, None);
+                        match e.kind() {
+                            io::ErrorKind::ConnectionRefused
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::AddrNotAvailable => {}
+                            _ => return Err(e),
+                        }
                     }
                 }
             }
@@ -13676,6 +14216,217 @@ mod tests {
 
         let _ = client.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
         let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_transparent_h3_negotiation_success() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let (tcp_stream, _) = listener.accept().expect("accept connection");
+            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+
+            while let Ok(frame) = server.recv_frame() {
+                if let crate::simd_parser::Http2Frame::Headers {
+                    stream_id,
+                    end_stream,
+                    ..
+                } = frame
+                {
+                    if end_stream {
+                        // Advertise HTTP/3 alternative service via Alt-Svc response header
+                        server
+                            .send_response(
+                                stream_id,
+                                &[
+                                    (":status", "200"),
+                                    ("alt-svc", "h3=\":50443\"; ma=86400; persist=1"),
+                                ],
+                                Some(b"first-h2-response"),
+                            )
+                            .expect("send response with alt-svc");
+                        break;
+                    }
+                }
+            }
+            let _ = server.recv_frame();
+            let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+        });
+
+        let h3_called = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h3_called_clone = h3_called.clone();
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2).with_http3_handler(
+            move |h: &str,
+                  p: u16,
+                  m: &str,
+                  path: &str,
+                  _headers: &[(&str, &str)],
+                  _body: Option<&[u8]>| {
+                h3_called_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(h, "127.0.0.1");
+                assert_eq!(p, 50443);
+                assert_eq!(m, "GET");
+                assert_eq!(path, "/second-request");
+                let mut resp = crate::http::HttpResponse::new(crate::http::HttpStatus(200));
+                resp.body = b"migrated-over-h3".to_vec();
+                Ok(resp)
+            },
+        );
+
+        assert!(pool.h3_negotiation_enabled());
+        assert_eq!(pool.h3_requests_attempted(), 0);
+        assert_eq!(pool.h3_requests_succeeded(), 0);
+        assert_eq!(pool.h3_fallbacks(), 0);
+
+        // 1. Initial request goes over HTTP/2, discovering the Alt-Svc header
+        let resp1 = pool
+            .execute_request("GET", "/first-request", &[], None)
+            .expect("first request over h2");
+        assert_eq!(resp1.status.0, 200);
+        assert_eq!(resp1.body, b"first-h2-response");
+        assert_eq!(h3_called.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(pool.h3_requests_attempted(), 0);
+
+        // Verify Alt-Svc was harvested
+        let routes = pool.get_alt_svc_routes(None);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].protocol_id, "h3");
+        assert_eq!(routes[0].port, 50443);
+
+        // 2. Second request to pool automatically and transparently renegotiates to HTTP/3!
+        let resp2 = pool
+            .execute_request("GET", "/second-request", &[], None)
+            .expect("second request migrated to h3");
+        assert_eq!(resp2.status.0, 200);
+        assert_eq!(resp2.body, b"migrated-over-h3");
+        assert_eq!(h3_called.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(pool.h3_requests_attempted(), 1);
+        assert_eq!(pool.h3_requests_succeeded(), 1);
+        assert_eq!(pool.h3_fallbacks(), 0);
+
+        pool.shutdown();
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_transparent_h3_negotiation_fallback_and_quarantine() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let (tcp_stream, _) = listener.accept().expect("accept connection");
+            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+
+            while let Ok(frame) = server.recv_frame() {
+                if let crate::simd_parser::Http2Frame::Headers {
+                    stream_id,
+                    end_stream,
+                    ..
+                } = frame
+                {
+                    if end_stream {
+                        server
+                            .send_response(
+                                stream_id,
+                                &[(":status", "200")],
+                                Some(b"h2-fallback-success"),
+                            )
+                            .expect("send fallback response");
+                    }
+                }
+            }
+        });
+
+        let h3_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h3_attempts_clone = h3_attempts.clone();
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2)
+            .with_http3_handler(
+                move |_: &str, _: u16, _: &str, _: &str, _: &[(&str, &str)], _: Option<&[u8]>| {
+                    h3_attempts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "QUIC UDP port unreachable",
+                    ))
+                },
+            )
+            .with_alt_svc_quarantine_duration(Duration::from_millis(100));
+
+        // Manually record an active H3 route
+        pool.record_alt_svc_routes(
+            format!("127.0.0.1:{}", port),
+            vec![crate::simd_parser::AltSvcRoute::new("h3", "", 50443)],
+        );
+
+        assert_eq!(pool.quarantined_alt_svc_routes_count(), 0);
+
+        // Request should attempt H3, fail with ConnectionRefused, quarantine the route,
+        // and fall back transparently to HTTP/2 without error!
+        let resp = pool
+            .execute_request("GET", "/fallback-test", &[], None)
+            .expect("request should succeed via transparent h2 fallback");
+
+        assert_eq!(resp.status.0, 200);
+        assert_eq!(resp.body, b"h2-fallback-success");
+        assert_eq!(h3_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(pool.h3_requests_attempted(), 1);
+        assert_eq!(pool.h3_requests_succeeded(), 0);
+        assert_eq!(pool.h3_fallbacks(), 1);
+        assert_eq!(pool.quarantined_alt_svc_routes_count(), 1);
+
+        // Next request within quarantine duration should skip H3 and go straight to H2!
+        let resp2 = pool
+            .execute_request("GET", "/quarantined-test", &[], None)
+            .expect("second request skips quarantined h3");
+        assert_eq!(resp2.status.0, 200);
+        assert_eq!(resp2.body, b"h2-fallback-success");
+        // H3 was NOT attempted again
+        assert_eq!(h3_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(pool.h3_requests_attempted(), 1);
+
+        // Wait for quarantine to expire (100ms)
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(pool.sweep_expired_alt_svc_quarantines(), 1);
+        assert_eq!(pool.quarantined_alt_svc_routes_count(), 0);
+
+        pool.shutdown();
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_streaming_h3_negotiation() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 8443, 2).with_http3_handler(
+            |_: &str, _: u16, m: &str, path: &str, _: &[(&str, &str)], _: Option<&[u8]>| {
+                assert_eq!(m, "GET");
+                assert_eq!(path, "/stream");
+                let mut resp = crate::http::HttpResponse::new(crate::http::HttpStatus(200));
+                resp.body = b"chunk1chunk2chunk3".to_vec();
+                Ok(resp)
+            },
+        );
+
+        pool.record_alt_svc_routes(
+            "127.0.0.1:8443",
+            vec![crate::simd_parser::AltSvcRoute::new("h3", "", 8443)],
+        );
+
+        let mut received = Vec::new();
+        let resp = pool
+            .execute_streaming_request("GET", "/stream", &[], None, |chunk| {
+                received.extend_from_slice(chunk);
+            })
+            .expect("streaming request over h3");
+
+        assert_eq!(resp.status.0, 200);
+        assert_eq!(received, b"chunk1chunk2chunk3");
+        assert_eq!(pool.h3_requests_attempted(), 1);
+        assert_eq!(pool.h3_requests_succeeded(), 1);
     }
 
     #[test]
