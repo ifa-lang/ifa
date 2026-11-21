@@ -4948,6 +4948,10 @@ pub struct Http2PoolStats {
     pub stale_error_fallbacks: usize,
     /// Total count of background revalidations completed for stale cache entries.
     pub background_revalidations: usize,
+    /// Total count of HTTP cache entries evicted due to LRU capacity limits or TTL sweeps.
+    pub http_cache_evictions: usize,
+    /// Total count of HTTP cache entries purged due to explicit invalidation or RFC 7234 §4.4 unsafe method updates.
+    pub http_cache_invalidations: usize,
 }
 
 impl Http2PoolStats {
@@ -5180,10 +5184,14 @@ pub struct Http2PoolCacheEntry {
     pub response: crate::http::HttpResponse,
     /// Timestamp when this response was ingested.
     pub received_at: std::time::Instant,
+    /// Timestamp of the most recent read, hit, or revalidation access to this entry.
+    pub last_accessed: std::time::Instant,
     /// Wall-clock system time when this response was received.
     pub response_time: std::time::SystemTime,
-    /// Wall-clock expiration time computed from Cache-Control max-age or Expires.
+    /// Wall-clock expiration time computed from Cache-Control max-age, Expires, or heuristic freshness.
     pub expires_at: Option<std::time::SystemTime>,
+    /// Whether the expiration time of this entry was computed heuristically (RFC 7234 §4.2.2).
+    pub is_heuristic: bool,
     /// Parsed Cache-Control directives (RFC 7234).
     pub directives: crate::http::HttpCacheDirectives,
     /// Extracted ETag validator (RFC 7232), if any.
@@ -5217,17 +5225,29 @@ impl Http2PoolCacheEntry {
             .get("vary")
             .map(crate::simd_parser::Http2Vary::parse);
 
-        let (directives, expires_at) = if let Some(cc) = response.headers.get("cache-control") {
+        let (directives, expires_at, is_heuristic) = if let Some(cc) = response.headers.get("cache-control") {
             let d = crate::http::HttpCacheDirectives::parse(cc);
             let exp = d
                 .max_age
                 .map(|sec| now + std::time::Duration::from_secs(sec));
-            (d, exp)
+            (d, exp, false)
         } else if let Some(exp_str) = response.headers.get("expires") {
             let exp = crate::http::parse_http_date(exp_str);
-            (crate::http::HttpCacheDirectives::default(), exp)
+            (crate::http::HttpCacheDirectives::default(), exp, false)
+        } else if let Some(ref lm_str) = last_modified {
+            if let Some(lm_time) = crate::http::parse_http_date(lm_str) {
+                if let Ok(diff) = now.duration_since(lm_time) {
+                    let heuristic_secs = diff.as_secs() / 10;
+                    let exp = Some(now + std::time::Duration::from_secs(heuristic_secs));
+                    (crate::http::HttpCacheDirectives::default(), exp, true)
+                } else {
+                    (crate::http::HttpCacheDirectives::default(), None, false)
+                }
+            } else {
+                (crate::http::HttpCacheDirectives::default(), None, false)
+            }
         } else {
-            (crate::http::HttpCacheDirectives::default(), None)
+            (crate::http::HttpCacheDirectives::default(), None, false)
         };
 
         Self {
@@ -5236,8 +5256,10 @@ impl Http2PoolCacheEntry {
             request_headers: Vec::new(),
             response,
             received_at: instant,
+            last_accessed: instant,
             response_time: now,
             expires_at,
+            is_heuristic,
             directives,
             etag,
             last_modified,
@@ -5339,6 +5361,27 @@ impl Http2PoolCacheEntry {
         self.directives.no_cache || !self.is_fresh(now, default_ttl)
     }
 
+    /// Touch this cache entry, updating its `last_accessed` timestamp to the current instant.
+    #[inline]
+    pub fn touch(&mut self) {
+        self.last_accessed = std::time::Instant::now();
+    }
+
+    /// Whether the freshness lifetime of this entry was derived heuristically (RFC 7234 §4.2.2).
+    #[inline]
+    pub fn is_heuristic(&self) -> bool {
+        self.is_heuristic
+    }
+
+    /// Calculate the heuristic freshness duration if this entry was derived heuristically.
+    pub fn heuristic_freshness(&self) -> Option<std::time::Duration> {
+        if self.is_heuristic {
+            self.expires_at.and_then(|exp| exp.duration_since(self.response_time).ok())
+        } else {
+            None
+        }
+    }
+
     /// Whether this cached entry possesses validators (ETag or Last-Modified) for conditional request.
     #[inline]
     pub fn can_revalidate(&self) -> bool {
@@ -5352,6 +5395,7 @@ impl Http2PoolCacheEntry {
         now: std::time::SystemTime,
     ) {
         self.response_time = now;
+        self.last_accessed = std::time::Instant::now();
         self.revalidations += 1;
         for (k, v) in not_modified_resp.headers.iter() {
             let lower = k.to_ascii_lowercase();
@@ -5377,8 +5421,18 @@ impl Http2PoolCacheEntry {
                 .directives
                 .max_age
                 .map(|sec| now + std::time::Duration::from_secs(sec));
+            self.is_heuristic = false;
         } else if let Some(exp) = not_modified_resp.headers.get("expires") {
             self.expires_at = crate::http::parse_http_date(exp);
+            self.is_heuristic = false;
+        } else if let Some(ref lm) = self.last_modified {
+            if let Some(lm_time) = crate::http::parse_http_date(lm) {
+                if let Ok(diff) = now.duration_since(lm_time) {
+                    let heuristic_secs = diff.as_secs() / 10;
+                    self.expires_at = Some(now + std::time::Duration::from_secs(heuristic_secs));
+                    self.is_heuristic = true;
+                }
+            }
         }
     }
 }
@@ -5424,6 +5478,9 @@ pub struct AsyncHttp2Pool {
         std::sync::Mutex<std::collections::HashMap<String, Vec<Http2PoolCacheEntry>>>,
     >,
     enable_http_cache: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    max_http_cache_entries: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    http_cache_evictions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    http_cache_invalidations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     cache_revalidations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     stale_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     stale_error_fallbacks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -5434,6 +5491,8 @@ pub struct AsyncHttp2Pool {
 impl AsyncHttp2Pool {
     /// Default maximum concurrent streams permitted per single HTTP/2 connection.
     pub const DEFAULT_MAX_STREAMS: usize = 100;
+    /// Default maximum HTTP client cache entries retained in the pool.
+    pub const DEFAULT_MAX_HTTP_CACHE_ENTRIES: usize = 256;
 
     /// Create a new HTTP/2 client connection pool.
     pub fn new(host: impl Into<String>, port: u16, max_connections: usize) -> Self {
@@ -5469,6 +5528,11 @@ impl AsyncHttp2Pool {
                 std::collections::HashMap::new(),
             )),
             enable_http_cache: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_http_cache_entries: std::sync::Arc::new(
+                std::sync::atomic::AtomicUsize::new(Self::DEFAULT_MAX_HTTP_CACHE_ENTRIES),
+            ),
+            http_cache_evictions: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            http_cache_invalidations: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             cache_revalidations: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             stale_hits: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             stale_error_fallbacks: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -5552,7 +5616,231 @@ impl AsyncHttp2Pool {
     /// Clear all stored HTTP client cache entries.
     pub fn clear_http_cache(&self) {
         if let Ok(mut cache) = self.http_cache_entries.lock() {
+            let count: usize = cache.values().map(|v| v.len()).sum();
             cache.clear();
+            self.http_cache_invalidations
+                .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Configure the maximum number of HTTP client cache entries retained in the pool.
+    /// When the cache exceeds this limit, least-recently-used (LRU) entries are evicted.
+    pub fn with_max_http_cache_entries(self, max_entries: usize) -> Self {
+        self.max_http_cache_entries
+            .store(max_entries.max(1), std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// Set the maximum number of HTTP client cache entries retained in the pool.
+    pub fn set_max_http_cache_entries(&self, max_entries: usize) {
+        self.max_http_cache_entries
+            .store(max_entries.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current maximum capacity of HTTP cache entries retained in the pool.
+    pub fn max_http_cache_entries(&self) -> usize {
+        self.max_http_cache_entries
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total count of HTTP cache entries evicted due to LRU capacity limits or TTL expiration sweeps.
+    pub fn http_cache_evictions(&self) -> usize {
+        self.http_cache_evictions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total count of HTTP cache entries purged due to explicit invalidation or RFC 7234 §4.4 unsafe method updates.
+    pub fn http_cache_invalidations(&self) -> usize {
+        self.http_cache_invalidations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Enforce LRU capacity limit on the HTTP client cache, evicting the least recently used entries.
+    /// Returns the number of evicted entries.
+    pub fn evict_lru_http_cache(&self, max_capacity: usize) -> usize {
+        if let Ok(mut cache) = self.http_cache_entries.lock() {
+            let total: usize = cache.values().map(|v| v.len()).sum();
+            if total > max_capacity {
+                let to_evict = total - max_capacity;
+                return Self::evict_lru_internal(&mut cache, to_evict, &self.http_cache_evictions);
+            }
+        }
+        0
+    }
+
+    /// Internal LRU eviction helper.
+    fn evict_lru_internal(
+        cache: &mut std::collections::HashMap<String, Vec<Http2PoolCacheEntry>>,
+        to_evict: usize,
+        evictions_counter: &std::sync::atomic::AtomicUsize,
+    ) -> usize {
+        if to_evict == 0 || cache.is_empty() {
+            return 0;
+        }
+        let mut items = Vec::new();
+        for (k, vec) in cache.iter() {
+            for (idx, entry) in vec.iter().enumerate() {
+                items.push((k.clone(), idx, entry.last_accessed));
+            }
+        }
+        items.sort_by_key(|item| item.2);
+        let count = to_evict.min(items.len());
+        let victims = &items[..count];
+
+        let mut victims_by_key: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (k, idx, _) in victims {
+            victims_by_key.entry(k.clone()).or_default().push(*idx);
+        }
+
+        let mut evicted_count = 0;
+        for (k, mut indices) in victims_by_key {
+            if let Some(vec) = cache.get_mut(&k) {
+                indices.sort_unstable();
+                indices.dedup();
+                for idx in indices.into_iter().rev() {
+                    if idx < vec.len() {
+                        vec.remove(idx);
+                        evicted_count += 1;
+                    }
+                }
+            }
+        }
+
+        cache.retain(|_, v| !v.is_empty());
+        evictions_counter.fetch_add(evicted_count, std::sync::atomic::Ordering::Relaxed);
+        evicted_count
+    }
+
+    /// Insert or update an HTTP client cache entry into the pool cache, enforcing configured LRU bounds.
+    pub fn insert_http_cache_entry(&self, key: String, entry: Http2PoolCacheEntry) {
+        if !self.http_cache_enabled() || !entry.is_cacheable() {
+            return;
+        }
+        if let Ok(mut cache) = self.http_cache_entries.lock() {
+            let max_entries = self.max_http_cache_entries();
+            let entries = cache.entry(key).or_default();
+            if let Some(pos) = entries.iter().position(|e| e.matches_request(&entry.request_headers)) {
+                entries[pos] = entry;
+            } else {
+                entries.push(entry);
+            }
+
+            let total: usize = cache.values().map(|v| v.len()).sum();
+            if total > max_entries {
+                let to_evict = total - max_entries;
+                Self::evict_lru_internal(&mut cache, to_evict, &self.http_cache_evictions);
+            }
+        }
+    }
+
+    /// Sweep and evict any HTTP client cache entries that are completely expired
+    /// (i.e. not fresh and past any `stale-while-revalidate` or `stale-if-error` window).
+    /// Returns the number of entries evicted.
+    pub fn sweep_http_cache(
+        &self,
+        now: std::time::SystemTime,
+        default_ttl: std::time::Duration,
+    ) -> usize {
+        if let Ok(mut cache) = self.http_cache_entries.lock() {
+            let mut evicted = 0;
+            for entries in cache.values_mut() {
+                let initial_len = entries.len();
+                entries.retain(|entry| {
+                    entry.is_fresh(now, default_ttl)
+                        || entry.is_stale_while_revalidate(now, default_ttl, None)
+                        || entry.is_stale_if_error(now, default_ttl, None)
+                });
+                evicted += initial_len - entries.len();
+            }
+            cache.retain(|_, v| !v.is_empty());
+            self.http_cache_evictions
+                .fetch_add(evicted, std::sync::atomic::Ordering::Relaxed);
+            evicted
+        } else {
+            0
+        }
+    }
+
+    /// Sweep HTTP client cache entries strictly older than `max_age` based on ingestion time.
+    /// Returns the number of entries evicted.
+    pub fn sweep_expired_http_cache(&self, max_age: std::time::Duration) -> usize {
+        let now = std::time::Instant::now();
+        if let Ok(mut cache) = self.http_cache_entries.lock() {
+            let mut evicted = 0;
+            for entries in cache.values_mut() {
+                let initial_len = entries.len();
+                entries.retain(|entry| {
+                    now.duration_since(entry.received_at) <= max_age
+                });
+                evicted += initial_len - entries.len();
+            }
+            cache.retain(|_, v| !v.is_empty());
+            self.http_cache_evictions
+                .fetch_add(evicted, std::sync::atomic::Ordering::Relaxed);
+            evicted
+        } else {
+            0
+        }
+    }
+
+    /// Invalidate and remove all HTTP client cache entries for a specific path (RFC 7234 §4.4).
+    /// Returns the number of invalidated entries.
+    pub fn invalidate_http_cache_path(&self, path: &str) -> usize {
+        if let Ok(mut cache) = self.http_cache_entries.lock() {
+            let mut removed = 0;
+            for entries in cache.values_mut() {
+                let initial = entries.len();
+                entries.retain(|e| e.path != path);
+                removed += initial - entries.len();
+            }
+            cache.retain(|_, v| !v.is_empty());
+            self.http_cache_invalidations
+                .fetch_add(removed, std::sync::atomic::Ordering::Relaxed);
+            removed
+        } else {
+            0
+        }
+    }
+
+    /// Invalidate and remove all HTTP client cache entries matching a path prefix.
+    /// Returns the number of invalidated entries.
+    pub fn invalidate_http_cache_prefix(&self, path_prefix: &str) -> usize {
+        if let Ok(mut cache) = self.http_cache_entries.lock() {
+            let mut removed = 0;
+            for entries in cache.values_mut() {
+                let initial = entries.len();
+                entries.retain(|e| !e.path.starts_with(path_prefix));
+                removed += initial - entries.len();
+            }
+            cache.retain(|_, v| !v.is_empty());
+            self.http_cache_invalidations
+                .fetch_add(removed, std::sync::atomic::Ordering::Relaxed);
+            removed
+        } else {
+            0
+        }
+    }
+
+    /// Invalidate and remove all HTTP client cache entries satisfying a given predicate.
+    /// Returns the number of invalidated entries.
+    pub fn invalidate_http_cache_matching(
+        &self,
+        predicate: impl Fn(&Http2PoolCacheEntry) -> bool,
+    ) -> usize {
+        if let Ok(mut cache) = self.http_cache_entries.lock() {
+            let mut removed = 0;
+            for entries in cache.values_mut() {
+                let initial = entries.len();
+                entries.retain(|e| !predicate(e));
+                removed += initial - entries.len();
+            }
+            cache.retain(|_, v| !v.is_empty());
+            self.http_cache_invalidations
+                .fetch_add(removed, std::sync::atomic::Ordering::Relaxed);
+            removed
+        } else {
+            0
         }
     }
 
@@ -5857,6 +6145,8 @@ impl AsyncHttp2Pool {
             stale_hits: self.stale_hits(),
             stale_error_fallbacks: self.stale_error_fallbacks(),
             background_revalidations: self.background_revalidations(),
+            http_cache_evictions: self.http_cache_evictions(),
+            http_cache_invalidations: self.http_cache_invalidations(),
         }
     }
 
@@ -6223,18 +6513,7 @@ impl AsyncHttp2Pool {
                         resp.clone(),
                     )
                     .with_request_headers(req.headers.clone());
-                    if entry.is_cacheable() {
-                        if let Ok(mut cache) = self.http_cache_entries.lock() {
-                            let entries = cache.entry(key).or_default();
-                            if let Some(pos) =
-                                entries.iter().position(|e| e.matches_request(&req.headers))
-                            {
-                                entries[pos] = entry;
-                            } else {
-                                entries.push(entry);
-                            }
-                        }
-                    }
+                    self.insert_http_cache_entry(key, entry);
                 }
                 self.release(conn);
                 Ok(())
@@ -6356,10 +6635,18 @@ impl AsyncHttp2Pool {
                     {
                         let entry = &mut entries[pos];
                         if !client_no_cache && entry.is_fresh(now_sys, default_ttl) {
+                            entry.touch();
                             entry.hit_count += 1;
                             self.push_cache_hits
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let mut resp = entry.response.clone();
+                            if entry.is_heuristic {
+                                if let Ok(age) = now_sys.duration_since(entry.response_time) {
+                                    if age.as_secs() > 86400 {
+                                        resp.headers.set("warning", "113 - \"Heuristic Expiration\"");
+                                    }
+                                }
+                            }
                             drop(cache);
                             for resp_interceptor in &self.response_interceptors {
                                 resp_interceptor(&client_req, &mut resp);
@@ -6368,6 +6655,7 @@ impl AsyncHttp2Pool {
                         } else if !client_no_cache
                             && entry.is_stale_while_revalidate(now_sys, default_ttl, client_swr)
                         {
+                            entry.touch();
                             entry.hit_count += 1;
                             self.push_cache_hits
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6562,19 +6850,16 @@ impl AsyncHttp2Pool {
                         resp.clone(),
                     )
                     .with_request_headers(client_req.headers.clone());
-                    if entry.is_cacheable() {
-                        if let Ok(mut cache) = self.http_cache_entries.lock() {
-                            let entries = cache.entry(key).or_default();
-                            if let Some(pos) = entries
-                                .iter()
-                                .position(|e| e.matches_request(&client_req.headers))
-                            {
-                                entries[pos] = entry;
-                            } else {
-                                entries.push(entry);
-                            }
-                        }
-                    }
+                    self.insert_http_cache_entry(key, entry);
+                }
+
+                // RFC 7234 §4.4: Invalidate cache for target URI on successful non-safe requests (POST, PUT, DELETE, PATCH)
+                if !client_req.method.eq_ignore_ascii_case("GET")
+                    && !client_req.method.eq_ignore_ascii_case("HEAD")
+                    && resp.status.0 >= 200
+                    && resp.status.0 < 400
+                {
+                    self.invalidate_http_cache_path(&client_req.path);
                 }
 
                 if let Some(conn) = conn_opt {
@@ -6772,10 +7057,18 @@ impl AsyncHttp2Pool {
                     {
                         let entry = &mut entries[pos];
                         if !client_no_cache && entry.is_fresh(now_sys, default_ttl) {
+                            entry.touch();
                             entry.hit_count += 1;
                             self.push_cache_hits
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let mut resp = entry.response.clone();
+                            if entry.is_heuristic {
+                                if let Ok(age) = now_sys.duration_since(entry.response_time) {
+                                    if age.as_secs() > 86400 {
+                                        resp.headers.set("warning", "113 - \"Heuristic Expiration\"");
+                                    }
+                                }
+                            }
                             drop(cache);
                             if !resp.body.is_empty() {
                                 chunk_handler(&resp.body);
@@ -6787,6 +7080,7 @@ impl AsyncHttp2Pool {
                         } else if !client_no_cache
                             && entry.is_stale_while_revalidate(now_sys, default_ttl, client_swr)
                         {
+                            entry.touch();
                             entry.hit_count += 1;
                             self.push_cache_hits
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7043,19 +7337,16 @@ impl AsyncHttp2Pool {
                         resp.clone(),
                     )
                     .with_request_headers(client_req.headers.clone());
-                    if entry.is_cacheable() {
-                        if let Ok(mut cache) = self.http_cache_entries.lock() {
-                            let entries = cache.entry(key).or_default();
-                            if let Some(pos) = entries
-                                .iter()
-                                .position(|e| e.matches_request(&client_req.headers))
-                            {
-                                entries[pos] = entry;
-                            } else {
-                                entries.push(entry);
-                            }
-                        }
-                    }
+                    self.insert_http_cache_entry(key, entry);
+                }
+
+                // RFC 7234 §4.4: Invalidate cache for target URI on successful non-safe requests (POST, PUT, DELETE, PATCH)
+                if !client_req.method.eq_ignore_ascii_case("GET")
+                    && !client_req.method.eq_ignore_ascii_case("HEAD")
+                    && resp.status.0 >= 200
+                    && resp.status.0 < 400
+                {
+                    self.invalidate_http_cache_path(&client_req.path);
                 }
 
                 self.release(conn);
@@ -15506,6 +15797,207 @@ mod tls_alpn_tests {
         );
         assert_eq!(pool.stale_error_fallbacks(), 1);
         assert_eq!(pool.stats().stale_error_fallbacks, 1);
+
+        server_handle.join().expect("server join");
+    }
+
+    #[test]
+    fn test_http2_pool_cache_heuristic_freshness() {
+        let mut resp = crate::http::HttpResponse::new(crate::http::HttpStatus(200));
+        let now = std::time::SystemTime::now();
+        let past = now - std::time::Duration::from_secs(1000);
+        let past_http_date = crate::http::format_http_date(past);
+        resp.headers.set("last-modified", past_http_date.as_str());
+
+        let entry = Http2PoolCacheEntry::new("GET", "/api/heuristic", resp);
+        assert!(entry.is_heuristic());
+        assert!(entry.is_cacheable());
+        // Freshness should be approximately 10% of 1000s = ~100s
+        let freshness = entry.heuristic_freshness().expect("heuristic freshness");
+        assert!(freshness.as_secs() >= 95 && freshness.as_secs() <= 105);
+
+        // Within freshness window (e.g. at now + 50s): fresh
+        assert!(entry.is_fresh(now + std::time::Duration::from_secs(50), std::time::Duration::from_secs(10)));
+        // Past freshness window (e.g. at now + 150s): not fresh
+        assert!(!entry.is_fresh(now + std::time::Duration::from_secs(150), std::time::Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn test_http2_pool_cache_lru_and_sweep() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 8080, 2)
+            .with_http_cache(true)
+            .with_max_http_cache_entries(2);
+
+        assert_eq!(pool.max_http_cache_entries(), 2);
+        assert_eq!(pool.http_cache_evictions(), 0);
+
+        let mut r1 = crate::http::HttpResponse::new(crate::http::HttpStatus(200));
+        r1.headers.set("cache-control", "public, max-age=60");
+        let e1 = Http2PoolCacheEntry::new("GET", "/api/item1", r1);
+
+        let mut r2 = crate::http::HttpResponse::new(crate::http::HttpStatus(200));
+        r2.headers.set("cache-control", "public, max-age=60");
+        let e2 = Http2PoolCacheEntry::new("GET", "/api/item2", r2);
+
+        let mut r3 = crate::http::HttpResponse::new(crate::http::HttpStatus(200));
+        r3.headers.set("cache-control", "public, max-age=60");
+        let e3 = Http2PoolCacheEntry::new("GET", "/api/item3", r3);
+
+        // Insert e1 and e2
+        pool.insert_http_cache_entry("GET:/api/item1".into(), e1);
+        pool.insert_http_cache_entry("GET:/api/item2".into(), e2);
+        assert_eq!(pool.http_cache_count(), 2);
+
+        // Access e1 (touch it) so e2 becomes LRU
+        if let Ok(mut cache) = pool.http_cache_entries.lock() {
+            if let Some(entries) = cache.get_mut("GET:/api/item1") {
+                entries[0].touch();
+            }
+        }
+
+        // Insert e3 -> exceeds capacity 2 -> e2 (LRU) evicted!
+        pool.insert_http_cache_entry("GET:/api/item3".into(), e3);
+        assert_eq!(pool.http_cache_count(), 2);
+        assert_eq!(pool.http_cache_evictions(), 1);
+        assert_eq!(pool.stats().http_cache_evictions, 1);
+
+        // Verify e1 and e3 exist, e2 is gone
+        if let Ok(cache) = pool.http_cache_entries.lock() {
+            assert!(cache.contains_key("GET:/api/item1"));
+            assert!(!cache.contains_key("GET:/api/item2"));
+            assert!(cache.contains_key("GET:/api/item3"));
+        }
+
+        // Test sweep_http_cache with expired TTL
+        let future_time = std::time::SystemTime::now() + std::time::Duration::from_secs(100);
+        let swept = pool.sweep_http_cache(future_time, std::time::Duration::from_secs(10));
+        assert_eq!(swept, 2);
+        assert_eq!(pool.http_cache_count(), 0);
+        assert_eq!(pool.http_cache_evictions(), 3);
+    }
+
+    #[test]
+    fn test_http2_pool_cache_invalidation_methods() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 8080, 2).with_http_cache(true);
+
+        let mut r1 = crate::http::HttpResponse::new(crate::http::HttpStatus(200));
+        r1.headers.set("cache-control", "public, max-age=60");
+        pool.insert_http_cache_entry("GET:/api/users/1".into(), Http2PoolCacheEntry::new("GET", "/api/users/1", r1.clone()));
+        pool.insert_http_cache_entry("GET:/api/users/2".into(), Http2PoolCacheEntry::new("GET", "/api/users/2", r1.clone()));
+        pool.insert_http_cache_entry("GET:/api/products/1".into(), Http2PoolCacheEntry::new("GET", "/api/products/1", r1.clone()));
+        pool.insert_http_cache_entry("GET:/api/orders/99".into(), Http2PoolCacheEntry::new("GET", "/api/orders/99", r1));
+
+        assert_eq!(pool.http_cache_count(), 4);
+        assert_eq!(pool.http_cache_invalidations(), 0);
+
+        // 1. Invalidate single path
+        let removed_single = pool.invalidate_http_cache_path("/api/products/1");
+        assert_eq!(removed_single, 1);
+        assert_eq!(pool.http_cache_count(), 3);
+        assert_eq!(pool.http_cache_invalidations(), 1);
+
+        // 2. Invalidate prefix
+        let removed_prefix = pool.invalidate_http_cache_prefix("/api/users");
+        assert_eq!(removed_prefix, 2);
+        assert_eq!(pool.http_cache_count(), 1);
+        assert_eq!(pool.http_cache_invalidations(), 3);
+
+        // 3. Invalidate matching predicate
+        let removed_pred = pool.invalidate_http_cache_matching(|e| e.path.contains("orders"));
+        assert_eq!(removed_pred, 1);
+        assert_eq!(pool.http_cache_count(), 0);
+        assert_eq!(pool.http_cache_invalidations(), 4);
+        assert_eq!(pool.stats().http_cache_invalidations, 4);
+    }
+
+    #[test]
+    fn test_http2_pool_rfc7234_unsafe_method_invalidation_and_heuristic_warning() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server_handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => continue,
+                }
+            };
+
+            // Request 1: GET /api/record -> Stream 1 (cached)
+            let frame1 = loop {
+                if let Some(f) = server.try_recv_frame().expect("recv frame 1") {
+                    if matches!(f, crate::simd_parser::Http2Frame::Headers { .. }) {
+                        break f;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(frame1.stream_id(), 1);
+            let h1 = [
+                (":status", "200"),
+                ("cache-control", "public, max-age=120"),
+            ];
+            server
+                .send_response(1, &h1, Some(b"INITIAL_RECORD"))
+                .expect("send 200");
+
+            // Request 2: POST /api/record -> Stream 3 (non-safe method: RFC 7234 §4.4 invalidates cached URI!)
+            let frame2 = loop {
+                if let Some(f) = server.try_recv_frame().expect("recv frame 2") {
+                    if matches!(f, crate::simd_parser::Http2Frame::Headers { .. }) {
+                        break f;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(frame2.stream_id(), 3);
+            let h2 = [(":status", "204")];
+            server.send_response(3, &h2, None).expect("send 204");
+
+            // Request 3: GET /api/record -> Stream 5 (must hit origin because previous POST invalidated it!)
+            let frame3 = loop {
+                if let Some(f) = server.try_recv_frame().expect("recv frame 3") {
+                    if matches!(f, crate::simd_parser::Http2Frame::Headers { .. }) {
+                        break f;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(frame3.stream_id(), 5);
+            let h3 = [
+                (":status", "200"),
+                ("cache-control", "public, max-age=120"),
+            ];
+            server
+                .send_response(5, &h3, Some(b"UPDATED_RECORD"))
+                .expect("send 200 updated");
+
+            for _ in 0..10 {
+                let _ = server.try_recv_frame();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2).with_http_cache(true);
+
+        // 1. GET /api/record -> Cached
+        let r1 = pool.execute_request("GET", "/api/record", &[], None).expect("get 1");
+        assert_eq!(r1.body, b"INITIAL_RECORD");
+        assert_eq!(pool.http_cache_count(), 1);
+
+        // 2. POST /api/record -> Success (204 No Content), triggers RFC 7234 §4.4 invalidation
+        let r2 = pool.execute_request("POST", "/api/record", &[], Some(b"update")).expect("post 1");
+        assert_eq!(r2.status.0, 204);
+        assert_eq!(pool.http_cache_count(), 0);
+        assert_eq!(pool.http_cache_invalidations(), 1);
+
+        // 3. GET /api/record -> Fetched from origin because cache was invalidated
+        let r3 = pool.execute_request("GET", "/api/record", &[], None).expect("get 2");
+        assert_eq!(r3.body, b"UPDATED_RECORD");
+        assert_eq!(pool.http_cache_count(), 1);
 
         server_handle.join().expect("server join");
     }

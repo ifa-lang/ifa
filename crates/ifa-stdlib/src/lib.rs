@@ -116,7 +116,7 @@ pub use net::{
     AsyncTcpStream, AsyncTimer, AsyncUdpSocket, AsyncWsConnection, AsyncWsPool, BufferedTcpStream,
     ConnectionInfo, Datagram, EventHub, Http2ClientRequest, Http2MultiplexBenchmarkConfig,
     Http2MultiplexBenchmarkResult, Http2MultiplexComparisonReport, Http2PoolBenchmarkResult,
-    Http2PoolStats, Http2PrioritizedRequest, Http2RequestInterceptor, Http2ResponseInterceptor,
+    Http2PoolCacheEntry, Http2PoolStats, Http2PrioritizedRequest, Http2RequestInterceptor, Http2ResponseInterceptor,
     HubMessage, NetBenchmarkReport, NetBenchmarkResult, SessionId, SessionSink, SocketConfig,
     SseClientStats, SseDecoder, SseServerStats, TcpListener as NetTcpListener, TcpListener,
     TcpServer, TcpStream as NetTcpStream, TcpStream, TokenBucket, UdpSocket as NetUdpSocket,
