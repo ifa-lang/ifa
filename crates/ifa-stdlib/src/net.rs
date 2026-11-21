@@ -6391,6 +6391,416 @@ pub struct SessionLifecycleTelemetry {
     pub last_goaway_stream_id: Option<u32>,
 }
 
+/// TLS 1.3 session ticket and Pre-Shared Key (PSK) emulation for session resumption and 0-RTT early data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsSessionTicket {
+    /// Opaque ticket identifier / token.
+    pub ticket_id: String,
+    /// Origin (domain / authority) for which this session ticket was issued.
+    pub origin: String,
+    /// Master secret / PSK associated with this ticket.
+    pub session_secret: Vec<u8>,
+    /// Cipher suite negotiated during the original handshake.
+    pub cipher_suite: String,
+    /// Maximum early data payload size permitted for 0-RTT resumption (RFC 8446).
+    pub max_early_data_bytes: usize,
+    /// Creation instant of this ticket.
+    pub created_at: std::time::Instant,
+    /// Configured validity duration (lifetime) of this ticket.
+    pub lifetime: std::time::Duration,
+}
+
+impl TlsSessionTicket {
+    /// Default maximum early data payload size for 0-RTT (16 KB, RFC 8446).
+    pub const DEFAULT_MAX_EARLY_DATA: usize = 16384;
+    /// Default session ticket lifetime (24 hours).
+    pub const DEFAULT_LIFETIME: std::time::Duration = std::time::Duration::from_secs(86400);
+
+    /// Create a new TLS session ticket for an origin.
+    pub fn new(
+        ticket_id: impl Into<String>,
+        origin: impl Into<String>,
+        session_secret: Vec<u8>,
+    ) -> Self {
+        Self {
+            ticket_id: ticket_id.into(),
+            origin: origin.into(),
+            session_secret,
+            cipher_suite: "TLS_AES_256_GCM_SHA384".to_string(),
+            max_early_data_bytes: Self::DEFAULT_MAX_EARLY_DATA,
+            created_at: std::time::Instant::now(),
+            lifetime: Self::DEFAULT_LIFETIME,
+        }
+    }
+
+    /// Set cipher suite for this session ticket.
+    pub fn with_cipher_suite(mut self, cipher: impl Into<String>) -> Self {
+        self.cipher_suite = cipher.into();
+        self
+    }
+
+    /// Set maximum 0-RTT early data payload size.
+    pub fn with_max_early_data(mut self, max_bytes: usize) -> Self {
+        self.max_early_data_bytes = max_bytes;
+        self
+    }
+
+    /// Set validity lifetime.
+    pub fn with_lifetime(mut self, lifetime: std::time::Duration) -> Self {
+        self.lifetime = lifetime;
+        self
+    }
+
+    /// Check whether this session ticket is still valid (not expired).
+    pub fn is_valid(&self) -> bool {
+        self.created_at.elapsed() < self.lifetime
+    }
+
+    /// Check if the specified byte count can fit within remaining early data capacity.
+    pub fn can_fit_early_data(&self, bytes: usize) -> bool {
+        bytes <= self.max_early_data_bytes
+    }
+}
+
+/// In-memory cache for TLS session tickets indexed by origin domain.
+#[derive(Debug, Clone, Default)]
+pub struct TlsSessionTicketCache {
+    tickets: std::collections::HashMap<String, TlsSessionTicket>,
+}
+
+impl TlsSessionTicketCache {
+    /// Create an empty ticket cache.
+    pub fn new() -> Self {
+        Self {
+            tickets: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Store a session ticket for an origin.
+    pub fn insert(&mut self, ticket: TlsSessionTicket) {
+        self.tickets.insert(ticket.origin.clone(), ticket);
+    }
+
+    /// Retrieve a valid (non-expired) session ticket for an origin.
+    pub fn get(&self, origin: &str) -> Option<&TlsSessionTicket> {
+        if let Some(ticket) = self.tickets.get(origin) {
+            if ticket.is_valid() {
+                return Some(ticket);
+            }
+        }
+        None
+    }
+
+    /// Invalidate and remove a ticket for an origin.
+    pub fn remove(&mut self, origin: &str) -> Option<TlsSessionTicket> {
+        self.tickets.remove(origin)
+    }
+
+    /// Purge expired tickets from the cache.
+    pub fn evict_expired(&mut self) -> usize {
+        let before = self.tickets.len();
+        self.tickets.retain(|_, ticket| ticket.is_valid());
+        before.saturating_sub(self.tickets.len())
+    }
+
+    /// Clear all tickets.
+    pub fn clear(&mut self) {
+        self.tickets.clear();
+    }
+
+    /// Number of tickets currently stored.
+    pub fn len(&self) -> usize {
+        self.tickets.len()
+    }
+
+    /// Whether the ticket cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.tickets.is_empty()
+    }
+}
+
+/// Mode of session resumption used when reconnecting to an origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumptionMode {
+    /// Full TLS handshake without resumption (e.g., ticket absent or expired).
+    FullHandshake,
+    /// Standard 1-RTT session resumption using a valid TLS session ticket.
+    Resumed1Rtt {
+        /// Ticket identifier used.
+        ticket_id: String,
+    },
+    /// Zero-round-trip (0-RTT) session resumption with early data transmission.
+    ZeroRttEarlyData {
+        /// Ticket identifier used.
+        ticket_id: String,
+        /// Aggregate early data bytes transmitted prior to handshake completion.
+        early_data_bytes: usize,
+    },
+    /// 0-RTT early data was rejected by peer, falling back to 1-RTT handshake.
+    RejectedZeroRttFallback {
+        /// Ticket identifier used.
+        ticket_id: String,
+    },
+}
+
+/// Jitter calculation strategy for dynamic exponential reconnect backoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitterMode {
+    /// Deterministic exponential backoff without jitter.
+    None,
+    /// Full jitter: delay chosen uniformly at random between 0 and capped exponential bound.
+    FullJitter,
+    /// Equal jitter: half deterministic, half randomized.
+    EqualJitter,
+    /// Decorrelated jitter: delay randomized between initial interval and 3x previous delay.
+    DecorrelatedJitter,
+}
+
+/// Dynamic exponential reconnect backoff configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReconnectBackoffConfig {
+    /// Initial backoff interval before first retry (default: 100ms).
+    pub initial_interval: std::time::Duration,
+    /// Maximum backoff ceiling cap (default: 30s).
+    pub max_interval: std::time::Duration,
+    /// Exponential growth multiplier (default: 2.0).
+    pub multiplier: f64,
+    /// Maximum retry attempts before giving up (None = infinite).
+    pub max_retries: Option<usize>,
+    /// Jitter strategy applied to avoid synchronized thundering herd.
+    pub jitter_mode: JitterMode,
+}
+
+impl Default for ReconnectBackoffConfig {
+    fn default() -> Self {
+        Self {
+            initial_interval: std::time::Duration::from_millis(100),
+            max_interval: std::time::Duration::from_secs(30),
+            multiplier: 2.0,
+            max_retries: Some(5),
+            jitter_mode: JitterMode::FullJitter,
+        }
+    }
+}
+
+/// Root cause or trigger of a sudden transport session disconnection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkFailureReason {
+    /// Sudden drop / socket EOF / broken pipe.
+    SuddenDisconnect,
+    /// Connection reset by peer (TCP RST).
+    ConnectionReset,
+    /// HTTP/2 PING or transport keep-alive timeout.
+    KeepAliveTimeout,
+    /// Unrecoverable protocol framing or decoding error.
+    ProtocolError,
+    /// TLS handshake negotiation failure.
+    TlsHandshakeFailed,
+    /// Abrupt peer crash or upstream gateway restart.
+    PeerCrash,
+    /// Custom or application-reported network error.
+    Other(String),
+}
+
+/// Outcome status of an attempt to recover and resume a disconnected session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRecoveryStatus {
+    /// All in-flight streams successfully migrated and replayed onto new session.
+    ResumedFully,
+    /// Partial recovery: idempotent streams replayed, non-idempotent streams safely rejected.
+    ResumedWithPartialReplay,
+    /// Reconnected successfully with zero pending streams.
+    ResumedZeroStreams,
+    /// Reconnection abandoned after exceeding max retry attempts.
+    ExhaustedRetries,
+}
+
+/// Reconnect tracking state and backoff generator for a disconnected transport session.
+#[derive(Debug, Clone)]
+pub struct ReconnectState {
+    /// Session identifier that disconnected.
+    pub session_id: u64,
+    /// Associated origin.
+    pub origin: String,
+    /// Number of reconnect attempts performed.
+    pub attempt_count: usize,
+    /// Current backoff delay applied to this attempt.
+    pub current_delay: std::time::Duration,
+    /// Timestamp of last reconnect attempt.
+    pub last_attempt_at: Option<std::time::Instant>,
+    /// Cumulative downtime elapsed during reconnect cycles.
+    pub cumulative_downtime: std::time::Duration,
+    /// Whether maximum retries have been exceeded.
+    pub is_exhausted: bool,
+    /// Internal PRNG state for jitter calculations (xorshift64).
+    pub prng_state: u64,
+    /// Failure reason recorded when the session dropped.
+    pub failure_reason: NetworkFailureReason,
+    /// In-flight stream descriptors preserved for replay.
+    pub saved_streams: Vec<PooledStreamDescriptor>,
+}
+
+fn xorshift64(state: &mut u64) -> u64 {
+    let mut x = *state;
+    if x == 0 {
+        x = 0x853c49e6748fea9b;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+fn rand_f64(state: &mut u64) -> f64 {
+    (xorshift64(state) as f64) / (u64::MAX as f64)
+}
+
+impl ReconnectState {
+    /// Initialize a new reconnect state for a disconnected session.
+    pub fn new(session_id: u64, origin: impl Into<String>, reason: NetworkFailureReason) -> Self {
+        let origin = origin.into();
+        let mut seed: u64 = session_id.wrapping_mul(0x517cc1b727220a95);
+        for b in origin.bytes() {
+            seed = seed.wrapping_mul(31).wrapping_add(b as u64);
+        }
+        if seed == 0 {
+            seed = 0xa0761d6478bd642f;
+        }
+
+        Self {
+            session_id,
+            origin,
+            attempt_count: 0,
+            current_delay: std::time::Duration::from_millis(0),
+            last_attempt_at: None,
+            cumulative_downtime: std::time::Duration::from_millis(0),
+            is_exhausted: false,
+            prng_state: seed,
+            failure_reason: reason,
+            saved_streams: Vec::new(),
+        }
+    }
+
+    /// Calculate next backoff interval applying configured exponential scaling and jitter mode.
+    pub fn compute_next_backoff(
+        &mut self,
+        config: &ReconnectBackoffConfig,
+    ) -> Option<std::time::Duration> {
+        if self.is_exhausted {
+            return None;
+        }
+
+        if let Some(max_retries) = config.max_retries {
+            if self.attempt_count >= max_retries {
+                self.is_exhausted = true;
+                return None;
+            }
+        }
+
+        let attempt = self.attempt_count;
+        let base_millis =
+            (config.initial_interval.as_millis() as f64) * config.multiplier.powi(attempt as i32);
+        let max_millis = config.max_interval.as_millis() as f64;
+        let capped_millis = base_millis.min(max_millis);
+
+        let delay_millis = match config.jitter_mode {
+            JitterMode::None => capped_millis,
+            JitterMode::FullJitter => {
+                let r = rand_f64(&mut self.prng_state);
+                capped_millis * r
+            }
+            JitterMode::EqualJitter => {
+                let half = capped_millis / 2.0;
+                let r = rand_f64(&mut self.prng_state);
+                half + (half * r)
+            }
+            JitterMode::DecorrelatedJitter => {
+                let prev_millis = self.current_delay.as_millis() as f64;
+                let lower = config.initial_interval.as_millis() as f64;
+                let upper = (prev_millis * 3.0).min(max_millis).max(lower);
+                let r = rand_f64(&mut self.prng_state);
+                lower + (upper - lower) * r
+            }
+        };
+
+        let delay = std::time::Duration::from_millis(delay_millis.round() as u64);
+        self.current_delay = delay;
+        self.attempt_count += 1;
+        self.cumulative_downtime += delay;
+        self.last_attempt_at = Some(std::time::Instant::now());
+
+        Some(delay)
+    }
+
+    /// Reset reconnect progress.
+    pub fn reset(&mut self) {
+        self.attempt_count = 0;
+        self.current_delay = std::time::Duration::from_millis(0);
+        self.cumulative_downtime = std::time::Duration::from_millis(0);
+        self.is_exhausted = false;
+        self.saved_streams.clear();
+    }
+}
+
+/// Comprehensive report of a zero-downtime session resumption and stream replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecoveryReport {
+    /// Identifier of the failed/disconnected session.
+    pub failed_session_id: u64,
+    /// Identifier of the new healthy session receiving replayed streams.
+    pub new_session_id: u64,
+    /// Origin of the sessions.
+    pub origin: String,
+    /// TLS resumption mode negotiated.
+    pub resumption_mode: ResumptionMode,
+    /// Count of idempotent streams safely replayed onto the new session.
+    pub replayed_streams_count: usize,
+    /// Count of non-idempotent streams safely rejected to prevent side effects.
+    pub rejected_streams_count: usize,
+    /// Aggregate payload bytes replayed across all streams.
+    pub replayed_bytes: usize,
+    /// Aggregate early data payload bytes transmitted in 0-RTT.
+    pub zero_rtt_early_bytes: usize,
+    /// Descriptors of the successfully replayed streams.
+    pub replayed_streams: Vec<PooledStreamDescriptor>,
+    /// Stream IDs of rejected non-idempotent streams.
+    pub rejected_stream_ids: Vec<u32>,
+    /// Reconnect backoff delay elapsed before successful recovery.
+    pub backoff_delay: std::time::Duration,
+    /// Recovery status classification.
+    pub recovery_status: SessionRecoveryStatus,
+}
+
+/// Telemetry metrics for transport session reconnects, TLS resumption, and zero-downtime stream replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionResumptionTelemetry {
+    /// Total unexpected disconnects recorded.
+    pub total_disconnects: usize,
+    /// Total reconnect backoff attempts initiated.
+    pub total_reconnect_attempts: usize,
+    /// Total successful session resumptions completed.
+    pub successful_resumptions: usize,
+    /// Resumptions leveraging TLS 1.3 0-RTT early data.
+    pub zero_rtt_resumptions: usize,
+    /// Resumptions using TLS 1-RTT session tickets.
+    pub one_rtt_resumptions: usize,
+    /// Resumptions falling back to full TLS handshakes.
+    pub full_handshake_reconnects: usize,
+    /// Total idempotent streams safely replayed without downtime.
+    pub total_replayed_streams: usize,
+    /// Total non-idempotent streams rejected for side effect safety.
+    pub total_rejected_streams: usize,
+    /// Total payload bytes replayed.
+    pub total_replayed_bytes: usize,
+    /// Total early data payload bytes transmitted via 0-RTT.
+    pub total_zero_rtt_early_bytes: usize,
+    /// Count of active session tickets currently cached in the pool.
+    pub cached_tickets_count: usize,
+    /// Count of sessions currently in reconnect backoff.
+    pub active_reconnecting_sessions: usize,
+}
+
 /// Descriptor and runtime scheduling state of an active transport session (HTTP/2 or HTTP/3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportSessionDescriptor {
@@ -6640,6 +7050,32 @@ pub struct InterSessionDrrArbitrator {
     total_migrated_streams: usize,
     /// Total payload bytes migrated between sessions.
     total_migrated_bytes: usize,
+    /// In-memory cache for TLS session tickets enabling session resumption and 0-RTT PSK emulation.
+    ticket_cache: TlsSessionTicketCache,
+    /// Dynamic exponential reconnect backoff configuration.
+    backoff_config: ReconnectBackoffConfig,
+    /// Reconnect states for sessions undergoing connection recovery.
+    reconnect_states: std::collections::HashMap<u64, ReconnectState>,
+    /// Total unexpected session disconnections recorded.
+    total_disconnects: usize,
+    /// Total reconnect backoff attempts initiated.
+    total_reconnect_attempts: usize,
+    /// Total successful session resumptions completed.
+    successful_resumptions: usize,
+    /// Total resumptions completed using TLS 0-RTT early data.
+    zero_rtt_resumptions: usize,
+    /// Total resumptions completed using TLS 1-RTT session tickets.
+    one_rtt_resumptions: usize,
+    /// Total resumptions falling back to full TLS handshakes.
+    full_handshake_reconnects: usize,
+    /// Total idempotent streams safely replayed onto new sessions.
+    total_replayed_streams: usize,
+    /// Total non-idempotent streams rejected to protect side effect semantics.
+    total_rejected_streams: usize,
+    /// Total payload bytes replayed.
+    total_replayed_bytes: usize,
+    /// Total payload bytes transmitted in 0-RTT early data.
+    total_zero_rtt_early_bytes: usize,
 }
 
 impl InterSessionDrrArbitrator {
@@ -6683,6 +7119,19 @@ impl InterSessionDrrArbitrator {
             total_drained_sessions: 0,
             total_migrated_streams: 0,
             total_migrated_bytes: 0,
+            ticket_cache: TlsSessionTicketCache::new(),
+            backoff_config: ReconnectBackoffConfig::default(),
+            reconnect_states: std::collections::HashMap::new(),
+            total_disconnects: 0,
+            total_reconnect_attempts: 0,
+            successful_resumptions: 0,
+            zero_rtt_resumptions: 0,
+            one_rtt_resumptions: 0,
+            full_handshake_reconnects: 0,
+            total_replayed_streams: 0,
+            total_rejected_streams: 0,
+            total_replayed_bytes: 0,
+            total_zero_rtt_early_bytes: 0,
         }
     }
 
@@ -7967,6 +8416,241 @@ impl InterSessionDrrArbitrator {
     pub fn total_migrated_bytes(&self) -> usize {
         self.total_migrated_bytes
     }
+
+    /// Configure dynamic reconnect backoff parameters on this arbitrator.
+    pub fn configure_reconnect_backoff(&mut self, config: ReconnectBackoffConfig) {
+        self.backoff_config = config;
+    }
+
+    /// Retrieve the current dynamic reconnect backoff configuration.
+    pub fn reconnect_backoff_config(&self) -> &ReconnectBackoffConfig {
+        &self.backoff_config
+    }
+
+    /// Store a TLS session ticket for session resumption and 0-RTT PSK emulation.
+    pub fn store_tls_ticket(&mut self, ticket: TlsSessionTicket) {
+        self.ticket_cache.insert(ticket);
+    }
+
+    /// Retrieve a valid TLS session ticket for an origin if present and not expired.
+    pub fn get_tls_ticket(&self, origin: &str) -> Option<&TlsSessionTicket> {
+        self.ticket_cache.get(origin)
+    }
+
+    /// Invalidate and remove a cached TLS session ticket for an origin.
+    pub fn remove_tls_ticket(&mut self, origin: &str) -> Option<TlsSessionTicket> {
+        self.ticket_cache.remove(origin)
+    }
+
+    /// Clear all cached TLS session tickets.
+    pub fn clear_tls_tickets(&mut self) {
+        self.ticket_cache.clear();
+    }
+
+    /// Record an unexpected network failure or abrupt disconnection on a transport session,
+    /// closing the session, saving in-flight streams, and initiating exponential reconnect backoff with jitter.
+    pub fn record_session_network_drop(
+        &mut self,
+        session_id: u64,
+        reason: NetworkFailureReason,
+    ) -> Option<std::time::Duration> {
+        if let Some(state) = self.reconnect_states.get_mut(&session_id) {
+            let next_delay = state.compute_next_backoff(&self.backoff_config);
+            if next_delay.is_some() {
+                self.total_reconnect_attempts += 1;
+            }
+            return next_delay;
+        }
+
+        let (origin, saved_streams) = {
+            let sess = self.sessions.get_mut(&session_id)?;
+            sess.lifecycle_state = SessionLifecycleState::Closed;
+            sess.pending_bytes = 0;
+            sess.deficit = 0;
+            let streams: Vec<PooledStreamDescriptor> =
+                sess.streams.drain().map(|(_, v)| v).collect();
+            (sess.origin.clone(), streams)
+        };
+
+        self.total_disconnects += 1;
+
+        let mut state = ReconnectState::new(session_id, &origin, reason);
+        state.saved_streams = saved_streams;
+        let next_delay = state.compute_next_backoff(&self.backoff_config);
+        self.total_reconnect_attempts += 1;
+        self.reconnect_states.insert(session_id, state);
+
+        next_delay
+    }
+
+    /// Retrieve the current reconnect state for a disconnected session.
+    pub fn get_reconnect_state(&self, session_id: u64) -> Option<&ReconnectState> {
+        self.reconnect_states.get(&session_id)
+    }
+
+    /// Recover and resume a disconnected transport session onto a new healthy active session,
+    /// negotiating TLS resumption (0-RTT or 1-RTT) and transparently replaying idempotent in-flight streams.
+    pub fn reconnect_and_resume_session(
+        &mut self,
+        failed_session_id: u64,
+        new_session_id: u64,
+        allow_zero_rtt: bool,
+    ) -> Result<SessionRecoveryReport, String> {
+        let mut reconnect_state = self
+            .reconnect_states
+            .remove(&failed_session_id)
+            .ok_or_else(|| {
+                format!(
+                    "No active reconnect state for session {}",
+                    failed_session_id
+                )
+            })?;
+
+        let failed_origin = reconnect_state.origin.clone();
+
+        let target_sess = self
+            .sessions
+            .get(&new_session_id)
+            .ok_or_else(|| format!("Target session {} not found", new_session_id))?;
+
+        if target_sess.origin != failed_origin {
+            let err = format!(
+                "Origin mismatch: failed session origin '{}' does not match target origin '{}'",
+                failed_origin, target_sess.origin
+            );
+            self.reconnect_states
+                .insert(failed_session_id, reconnect_state);
+            return Err(err);
+        }
+
+        if target_sess.lifecycle_state != SessionLifecycleState::Active {
+            let err = format!(
+                "Target session {} is not active (state: {:?})",
+                new_session_id, target_sess.lifecycle_state
+            );
+            self.reconnect_states
+                .insert(failed_session_id, reconnect_state);
+            return Err(err);
+        }
+
+        // Determine TLS session resumption mode
+        let valid_ticket = self.ticket_cache.get(&failed_origin).cloned();
+
+        let (mut resumption_mode, mut remaining_zero_rtt_quota) = match valid_ticket {
+            Some(ticket) => {
+                if allow_zero_rtt && ticket.max_early_data_bytes > 0 {
+                    (
+                        ResumptionMode::ZeroRttEarlyData {
+                            ticket_id: ticket.ticket_id.clone(),
+                            early_data_bytes: 0,
+                        },
+                        ticket.max_early_data_bytes,
+                    )
+                } else {
+                    (
+                        ResumptionMode::Resumed1Rtt {
+                            ticket_id: ticket.ticket_id.clone(),
+                        },
+                        0,
+                    )
+                }
+            }
+            None => (ResumptionMode::FullHandshake, 0),
+        };
+
+        let mut replayed_streams = Vec::new();
+        let mut rejected_stream_ids = Vec::new();
+        let mut total_replayed_bytes = 0;
+        let mut zero_rtt_early_bytes = 0;
+
+        for mut stream in reconnect_state.saved_streams.drain(..) {
+            if stream.is_idempotent {
+                let stream_bytes = stream.pending_bytes;
+                if remaining_zero_rtt_quota > 0 {
+                    let early = remaining_zero_rtt_quota.min(stream_bytes);
+                    remaining_zero_rtt_quota -= early;
+                    zero_rtt_early_bytes += early;
+                }
+
+                stream.original_session_id = stream.original_session_id.or(Some(failed_session_id));
+                stream.session_id = new_session_id;
+                stream.migration_status = StreamMigrationStatus::Migrated;
+
+                total_replayed_bytes += stream_bytes;
+                replayed_streams.push(stream.clone());
+
+                let target_sess_mut = self.sessions.get_mut(&new_session_id).unwrap();
+                target_sess_mut.pending_bytes += stream_bytes;
+                target_sess_mut.total_migrated_in_bytes += stream_bytes;
+                target_sess_mut.total_migrated_in_streams += 1;
+                target_sess_mut.streams.insert(stream.stream_id, stream);
+            } else {
+                rejected_stream_ids.push(stream.stream_id);
+            }
+        }
+
+        if let ResumptionMode::ZeroRttEarlyData {
+            ref mut early_data_bytes,
+            ..
+        } = resumption_mode
+        {
+            *early_data_bytes = zero_rtt_early_bytes;
+            self.zero_rtt_resumptions += 1;
+        } else if let ResumptionMode::Resumed1Rtt { .. } = resumption_mode {
+            self.one_rtt_resumptions += 1;
+        } else {
+            self.full_handshake_reconnects += 1;
+        }
+
+        self.successful_resumptions += 1;
+        self.total_replayed_streams += replayed_streams.len();
+        self.total_rejected_streams += rejected_stream_ids.len();
+        self.total_replayed_bytes += total_replayed_bytes;
+        self.total_zero_rtt_early_bytes += zero_rtt_early_bytes;
+
+        let recovery_status = if rejected_stream_ids.is_empty() {
+            if replayed_streams.is_empty() {
+                SessionRecoveryStatus::ResumedZeroStreams
+            } else {
+                SessionRecoveryStatus::ResumedFully
+            }
+        } else {
+            SessionRecoveryStatus::ResumedWithPartialReplay
+        };
+
+        Ok(SessionRecoveryReport {
+            failed_session_id,
+            new_session_id,
+            origin: failed_origin,
+            resumption_mode,
+            replayed_streams_count: replayed_streams.len(),
+            rejected_streams_count: rejected_stream_ids.len(),
+            replayed_bytes: total_replayed_bytes,
+            zero_rtt_early_bytes,
+            replayed_streams,
+            rejected_stream_ids,
+            backoff_delay: reconnect_state.current_delay,
+            recovery_status,
+        })
+    }
+
+    /// Retrieve session resumption and reconnect telemetry snapshot.
+    pub fn session_resumption_telemetry(&self) -> SessionResumptionTelemetry {
+        SessionResumptionTelemetry {
+            total_disconnects: self.total_disconnects,
+            total_reconnect_attempts: self.total_reconnect_attempts,
+            successful_resumptions: self.successful_resumptions,
+            zero_rtt_resumptions: self.zero_rtt_resumptions,
+            one_rtt_resumptions: self.one_rtt_resumptions,
+            full_handshake_reconnects: self.full_handshake_reconnects,
+            total_replayed_streams: self.total_replayed_streams,
+            total_rejected_streams: self.total_rejected_streams,
+            total_replayed_bytes: self.total_replayed_bytes,
+            total_zero_rtt_early_bytes: self.total_zero_rtt_early_bytes,
+            cached_tickets_count: self.ticket_cache.len(),
+            active_reconnecting_sessions: self.reconnect_states.len(),
+        }
+    }
 }
 
 /// An idle pooled HTTP/2 connection paired with the timestamp at which it became idle.
@@ -8607,6 +9291,79 @@ impl AsyncHttp2Pool {
             arb.total_migrated_bytes()
         } else {
             0
+        }
+    }
+
+    /// Configure dynamic reconnect backoff parameters for handling unexpected disconnections.
+    pub fn configure_reconnect_backoff(&self, config: ReconnectBackoffConfig) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.configure_reconnect_backoff(config);
+        }
+    }
+
+    /// Store a TLS session ticket for session resumption and 0-RTT early data.
+    pub fn store_tls_session_ticket(&self, ticket: TlsSessionTicket) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.store_tls_ticket(ticket);
+        }
+    }
+
+    /// Retrieve a cached, non-expired TLS session ticket for an origin.
+    pub fn get_tls_session_ticket(&self, origin: &str) -> Option<TlsSessionTicket> {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.get_tls_ticket(origin).cloned()
+        } else {
+            None
+        }
+    }
+
+    /// Record a sudden network drop or connection failure on a transport session and compute next backoff delay.
+    pub fn record_session_network_drop(
+        &self,
+        session_id: u64,
+        reason: NetworkFailureReason,
+    ) -> Option<std::time::Duration> {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.record_session_network_drop(session_id, reason)
+        } else {
+            None
+        }
+    }
+
+    /// Recover and resume a disconnected transport session onto a new healthy session,
+    /// leveraging TLS session resumption / 0-RTT early data and safely replaying idempotent in-flight streams.
+    pub fn reconnect_and_resume_session(
+        &self,
+        failed_session_id: u64,
+        new_session_id: u64,
+        allow_zero_rtt: bool,
+    ) -> Result<SessionRecoveryReport, String> {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.reconnect_and_resume_session(failed_session_id, new_session_id, allow_zero_rtt)
+        } else {
+            Err("InterSessionDrrArbitrator lock poisoned".to_string())
+        }
+    }
+
+    /// Retrieve pool-wide session resumption, reconnect backoff, and 0-RTT telemetry.
+    pub fn session_resumption_telemetry(&self) -> SessionResumptionTelemetry {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.session_resumption_telemetry()
+        } else {
+            SessionResumptionTelemetry {
+                total_disconnects: 0,
+                total_reconnect_attempts: 0,
+                successful_resumptions: 0,
+                zero_rtt_resumptions: 0,
+                one_rtt_resumptions: 0,
+                full_handshake_reconnects: 0,
+                total_replayed_streams: 0,
+                total_rejected_streams: 0,
+                total_replayed_bytes: 0,
+                total_zero_rtt_early_bytes: 0,
+                cached_tickets_count: 0,
+                active_reconnecting_sessions: 0,
+            }
         }
     }
 
@@ -22061,5 +22818,330 @@ mod tls_alpn_tests {
             .unwrap();
         assert!(s502_slice.allocated_bytes > 0);
         assert!(s502_slice.remaining_pending_bytes < 4096);
+    }
+
+    #[test]
+    fn test_tls_session_ticket_cache_and_expiration() {
+        let mut cache = TlsSessionTicketCache::new();
+        assert!(cache.is_empty());
+
+        let ticket =
+            TlsSessionTicket::new("ticket-abc-123", "https://auth.example.com", vec![0x42; 32])
+                .with_cipher_suite("TLS_CHACHA20_POLY1305_SHA256")
+                .with_max_early_data(32768)
+                .with_lifetime(std::time::Duration::from_secs(3600));
+
+        assert!(ticket.is_valid());
+        assert!(ticket.can_fit_early_data(16384));
+        assert!(!ticket.can_fit_early_data(65536));
+
+        cache.insert(ticket);
+        assert_eq!(cache.len(), 1);
+
+        let cached = cache.get("https://auth.example.com").unwrap();
+        assert_eq!(cached.ticket_id, "ticket-abc-123");
+        assert_eq!(cached.cipher_suite, "TLS_CHACHA20_POLY1305_SHA256");
+        assert_eq!(cached.max_early_data_bytes, 32768);
+
+        // Unknown origin returns None
+        assert!(cache.get("https://unknown.org").is_none());
+
+        // Expired ticket test
+        let expired_ticket = TlsSessionTicket::new("ticket-old", "https://old.org", vec![0x11; 32])
+            .with_lifetime(std::time::Duration::from_millis(1));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(!expired_ticket.is_valid());
+
+        cache.insert(expired_ticket);
+        assert_eq!(cache.len(), 2);
+        // Expired ticket is not returned by get()
+        assert!(cache.get("https://old.org").is_none());
+
+        // Evict expired cleans it up
+        let evicted = cache.evict_expired();
+        assert_eq!(evicted, 1);
+        assert_eq!(cache.len(), 1);
+
+        // Explicit remove
+        let removed = cache.remove("https://auth.example.com");
+        assert!(removed.is_some());
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_reconnect_backoff_jitter_and_retry_limits() {
+        let mut state = ReconnectState::new(
+            42,
+            "https://api.test",
+            NetworkFailureReason::SuddenDisconnect,
+        );
+
+        // 1. Deterministic mode (JitterMode::None)
+        let config_none = ReconnectBackoffConfig {
+            initial_interval: std::time::Duration::from_millis(100),
+            max_interval: std::time::Duration::from_millis(1000),
+            multiplier: 2.0,
+            max_retries: Some(4),
+            jitter_mode: JitterMode::None,
+        };
+
+        let d1 = state.compute_next_backoff(&config_none).unwrap();
+        assert_eq!(d1, std::time::Duration::from_millis(100)); // 100 * 2^0
+        let d2 = state.compute_next_backoff(&config_none).unwrap();
+        assert_eq!(d2, std::time::Duration::from_millis(200)); // 100 * 2^1
+        let d3 = state.compute_next_backoff(&config_none).unwrap();
+        assert_eq!(d3, std::time::Duration::from_millis(400)); // 100 * 2^2
+        let d4 = state.compute_next_backoff(&config_none).unwrap();
+        assert_eq!(d4, std::time::Duration::from_millis(800)); // 100 * 2^3
+
+        // 5th attempt exceeds max_retries (4)
+        assert!(state.compute_next_backoff(&config_none).is_none());
+        assert!(state.is_exhausted);
+
+        // 2. Full jitter mode
+        state.reset();
+        let config_jitter = ReconnectBackoffConfig {
+            initial_interval: std::time::Duration::from_millis(200),
+            max_interval: std::time::Duration::from_millis(5000),
+            multiplier: 2.0,
+            max_retries: Some(5),
+            jitter_mode: JitterMode::FullJitter,
+        };
+        for attempt in 0..5 {
+            let delay = state.compute_next_backoff(&config_jitter).unwrap();
+            let base_cap = (200.0 * 2.0_f64.powi(attempt as i32)).min(5000.0) as u64;
+            assert!(
+                delay.as_millis() <= (base_cap as u128) + 1,
+                "Delay {} exceeded cap {}",
+                delay.as_millis(),
+                base_cap
+            );
+        }
+        assert!(state.compute_next_backoff(&config_jitter).is_none());
+
+        // 3. Equal jitter mode
+        state.reset();
+        let config_equal = ReconnectBackoffConfig {
+            initial_interval: std::time::Duration::from_millis(400),
+            max_interval: std::time::Duration::from_millis(5000),
+            multiplier: 2.0,
+            max_retries: Some(3),
+            jitter_mode: JitterMode::EqualJitter,
+        };
+        for attempt in 0..3 {
+            let delay = state.compute_next_backoff(&config_equal).unwrap();
+            let base_cap = (400.0 * 2.0_f64.powi(attempt as i32)).min(5000.0) as u64;
+            let half = base_cap / 2;
+            assert!(
+                delay.as_millis() >= (half as u128) - 1,
+                "Equal jitter delay {} was below half cap {}",
+                delay.as_millis(),
+                half
+            );
+            assert!(
+                delay.as_millis() <= (base_cap as u128) + 1,
+                "Equal jitter delay {} exceeded cap {}",
+                delay.as_millis(),
+                base_cap
+            );
+        }
+    }
+
+    #[test]
+    fn test_inter_session_network_drop_and_zero_rtt_resumption() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+
+        // Register session 10 on https://api.cloud.corp
+        arb.register_session(10, "https://api.cloud.corp", TransportProtocol::Http2, 1);
+
+        // Register 2 idempotent streams (GET/HEAD) and 1 non-idempotent stream (POST)
+        arb.register_stream(10, 1, 1024, 1, true); // idempotent
+        arb.register_stream(10, 3, 2048, 1, true); // idempotent
+        arb.register_stream(10, 5, 4096, 1, false); // non-idempotent!
+
+        assert_eq!(arb.get_session(10).unwrap().pending_bytes, 7168);
+        assert_eq!(arb.active_stream_count(10), 3);
+
+        // Cache valid TLS 1.3 session ticket with 4096 bytes 0-RTT allowance
+        let ticket = TlsSessionTicket::new(
+            "tls-ticket-prod-001",
+            "https://api.cloud.corp",
+            vec![0xAA; 32],
+        )
+        .with_max_early_data(4096);
+        arb.store_tls_ticket(ticket);
+
+        // Simulate network drop on session 10
+        let backoff = arb
+            .record_session_network_drop(10, NetworkFailureReason::ConnectionReset)
+            .unwrap();
+        assert!(backoff.as_millis() > 0);
+
+        // Session 10 is now Closed and has 0 pending bytes in active scheduling
+        assert_eq!(
+            arb.session_lifecycle_state(10),
+            Some(SessionLifecycleState::Closed)
+        );
+        assert_eq!(arb.get_session(10).unwrap().pending_bytes, 0);
+
+        // Register new healthy session 20 on https://api.cloud.corp
+        arb.register_session(20, "https://api.cloud.corp", TransportProtocol::Http2, 2);
+
+        // Resume session with 0-RTT enabled
+        let report = arb.reconnect_and_resume_session(10, 20, true).unwrap();
+        assert_eq!(report.failed_session_id, 10);
+        assert_eq!(report.new_session_id, 20);
+        assert_eq!(report.origin, "https://api.cloud.corp");
+        assert_eq!(report.replayed_streams_count, 2); // only streams 1 and 3
+        assert_eq!(report.rejected_streams_count, 1); // stream 5 rejected
+        assert_eq!(report.rejected_stream_ids, vec![5]);
+        assert_eq!(report.replayed_bytes, 3072); // 1024 + 2048
+        assert_eq!(report.zero_rtt_early_bytes, 3072); // fit within 4096 limit
+        assert_eq!(
+            report.recovery_status,
+            SessionRecoveryStatus::ResumedWithPartialReplay
+        );
+
+        match report.resumption_mode {
+            ResumptionMode::ZeroRttEarlyData {
+                ticket_id,
+                early_data_bytes,
+            } => {
+                assert_eq!(ticket_id, "tls-ticket-prod-001");
+                assert_eq!(early_data_bytes, 3072);
+            }
+            _ => panic!("Expected ZeroRttEarlyData resumption mode"),
+        }
+
+        // Verify target session 20 now hosts streams 1 and 3 with 3072 pending bytes
+        assert_eq!(arb.active_stream_count(20), 2);
+        assert_eq!(arb.get_session(20).unwrap().pending_bytes, 3072);
+
+        // Verify telemetry
+        let telem = arb.session_resumption_telemetry();
+        assert_eq!(telem.total_disconnects, 1);
+        assert_eq!(telem.total_reconnect_attempts, 1);
+        assert_eq!(telem.successful_resumptions, 1);
+        assert_eq!(telem.zero_rtt_resumptions, 1);
+        assert_eq!(telem.one_rtt_resumptions, 0);
+        assert_eq!(telem.full_handshake_reconnects, 0);
+        assert_eq!(telem.total_replayed_streams, 2);
+        assert_eq!(telem.total_rejected_streams, 1);
+        assert_eq!(telem.total_replayed_bytes, 3072);
+        assert_eq!(telem.total_zero_rtt_early_bytes, 3072);
+        assert_eq!(telem.cached_tickets_count, 1);
+        assert_eq!(telem.active_reconnecting_sessions, 0);
+    }
+
+    #[test]
+    fn test_full_handshake_fallback_when_no_session_ticket() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+
+        arb.register_session(30, "https://no-ticket.org", TransportProtocol::Http3, 1);
+        arb.register_stream(30, 1, 2048, 1, true);
+
+        // Network drop without cached ticket
+        arb.record_session_network_drop(30, NetworkFailureReason::KeepAliveTimeout);
+
+        arb.register_session(40, "https://no-ticket.org", TransportProtocol::Http3, 1);
+        let report = arb.reconnect_and_resume_session(30, 40, true).unwrap();
+
+        assert_eq!(report.resumption_mode, ResumptionMode::FullHandshake);
+        assert_eq!(report.replayed_streams_count, 1);
+        assert_eq!(report.rejected_streams_count, 0);
+        assert_eq!(report.zero_rtt_early_bytes, 0);
+        assert_eq!(report.recovery_status, SessionRecoveryStatus::ResumedFully);
+
+        let telem = arb.session_resumption_telemetry();
+        assert_eq!(telem.full_handshake_reconnects, 1);
+        assert_eq!(telem.zero_rtt_resumptions, 0);
+    }
+
+    #[test]
+    fn test_error_handling_origin_mismatch_and_inactive_target() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+
+        arb.register_session(70, "https://alpha.com", TransportProtocol::Http2, 1);
+        arb.register_stream(70, 1, 1024, 1, true);
+        arb.record_session_network_drop(70, NetworkFailureReason::SuddenDisconnect);
+
+        // Target with different origin
+        arb.register_session(80, "https://beta.com", TransportProtocol::Http2, 1);
+        let err1 = arb.reconnect_and_resume_session(70, 80, true).unwrap_err();
+        assert!(err1.contains("Origin mismatch"));
+
+        // Target that is Draining
+        arb.register_session(90, "https://alpha.com", TransportProtocol::Http2, 1);
+        arb.start_session_drain(90);
+        let err2 = arb.reconnect_and_resume_session(70, 90, true).unwrap_err();
+        assert!(err2.contains("not active"));
+    }
+
+    #[test]
+    fn test_async_http2_pool_zero_downtime_resumption_integration() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 443, 4);
+
+        // Store TLS ticket on pool
+        let ticket = TlsSessionTicket::new(
+            "pool-ticket-1",
+            "https://pool-gateway.internal",
+            vec![0x77; 32],
+        )
+        .with_max_early_data(8192);
+        pool.store_tls_session_ticket(ticket);
+        assert!(pool
+            .get_tls_session_ticket("https://pool-gateway.internal")
+            .is_some());
+
+        // Register initial session
+        pool.register_transport_session(
+            801,
+            "https://pool-gateway.internal",
+            TransportProtocol::Http2,
+            1,
+        );
+        pool.register_pooled_stream(801, 1, 1024, 1, true);
+        pool.register_pooled_stream(801, 3, 2048, 1, true);
+
+        // Session drops abruptly
+        let delay = pool
+            .record_session_network_drop(801, NetworkFailureReason::ConnectionReset)
+            .unwrap();
+        assert!(delay.as_millis() > 0);
+
+        // Register newly established session
+        pool.register_transport_session(
+            802,
+            "https://pool-gateway.internal",
+            TransportProtocol::Http2,
+            2,
+        );
+
+        // Recover and resume session with 0-RTT early data
+        let report = pool.reconnect_and_resume_session(801, 802, true).unwrap();
+        assert_eq!(report.failed_session_id, 801);
+        assert_eq!(report.new_session_id, 802);
+        assert_eq!(report.replayed_streams_count, 2);
+        assert_eq!(report.replayed_bytes, 3072);
+        assert_eq!(report.zero_rtt_early_bytes, 3072);
+        assert_eq!(report.recovery_status, SessionRecoveryStatus::ResumedFully);
+
+        // Telemetry verification
+        let telem = pool.session_resumption_telemetry();
+        assert_eq!(telem.total_disconnects, 1);
+        assert_eq!(telem.successful_resumptions, 1);
+        assert_eq!(telem.zero_rtt_resumptions, 1);
+        assert_eq!(telem.total_replayed_streams, 2);
+        assert_eq!(telem.total_replayed_bytes, 3072);
+
+        // Bandwidth allocation on new session runs without loss or downtime
+        let slice_report = pool.schedule_inter_session_bandwidth(4096);
+        assert!(slice_report.total_allocated_bytes > 0);
+        let s802 = slice_report
+            .slices
+            .iter()
+            .find(|s| s.session_id == 802)
+            .unwrap();
+        assert!(s802.allocated_bytes > 0);
     }
 }
