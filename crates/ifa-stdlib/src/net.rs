@@ -2902,6 +2902,8 @@ pub struct AsyncHttp2Connection {
     read_buf: Vec<u8>,
     ctrl_ring_buf: [u8; 1024],
     is_closed: bool,
+    /// Optional chunk buffer pool for recycling incoming DATA frames.
+    pub chunk_buffer_pool: Option<Http2ChunkBufferPool>,
 }
 
 impl AsyncHttp2Connection {
@@ -2913,12 +2915,19 @@ impl AsyncHttp2Connection {
             read_buf: Vec::with_capacity(8192),
             ctrl_ring_buf: [0u8; 1024],
             is_closed: false,
+            chunk_buffer_pool: None,
         }
     }
 
     /// Whether this HTTP/2 connection is closed.
     pub fn is_closed(&self) -> bool {
         self.is_closed
+    }
+
+    /// Configure an optional chunk buffer pool for recycling incoming DATA frames.
+    pub fn with_chunk_buffer_pool(mut self, pool: Http2ChunkBufferPool) -> Self {
+        self.chunk_buffer_pool = Some(pool);
+        self
     }
 
     /// Perform HTTP/2 client handshake: sends client connection preface and initial SETTINGS frame.
@@ -2940,6 +2949,7 @@ impl AsyncHttp2Connection {
             read_buf: Vec::with_capacity(8192),
             ctrl_ring_buf: [0u8; 1024],
             is_closed: false,
+            chunk_buffer_pool: None,
         })
     }
 
@@ -2997,6 +3007,7 @@ impl AsyncHttp2Connection {
             read_buf: Vec::with_capacity(8192),
             ctrl_ring_buf: [0u8; 1024],
             is_closed: false,
+            chunk_buffer_pool: None,
         })
     }
 
@@ -4040,7 +4051,13 @@ impl AsyncHttp2Connection {
         let mut decoders: std::collections::HashMap<u32, Http2StreamingResponseDecoder> =
             ordered_streams
                 .iter()
-                .map(|&sid| (sid, Http2StreamingResponseDecoder::new(sid)))
+                .map(|&sid| {
+                    let mut d = Http2StreamingResponseDecoder::new(sid);
+                    if let Some(ref p) = self.chunk_buffer_pool {
+                        d = d.with_buffer_pool(p.clone());
+                    }
+                    (sid, d)
+                })
                 .collect();
 
         // Feed any headers or data already received in session (e.g. if arriving early)
@@ -4132,7 +4149,11 @@ impl AsyncHttp2Connection {
         let mut results = Vec::with_capacity(ordered_streams.len());
         for sid in ordered_streams {
             let res = if let Some(dec) = decoders.remove(&sid) {
-                dec.assemble_response()
+                if dec.buffer_pool.is_some() {
+                    dec.assemble_response_recycling()
+                } else {
+                    dec.assemble_response()
+                }
             } else {
                 Err(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -4954,6 +4975,9 @@ impl AsyncHttp2Pool {
                 }
                 // Quick health check ping
                 if conn.send_ping(*b"h2_probe").is_ok() {
+                    if let Some(ref pool) = self.chunk_buffer_pool {
+                        conn.chunk_buffer_pool = Some(pool.clone());
+                    }
                     self.active_count
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(conn);
@@ -4994,7 +5018,10 @@ impl AsyncHttp2Pool {
             self.record_alpn_negotiated(AlpnProtocol::Http2);
         }
 
-        let conn = AsyncHttp2Connection::client_handshake(stream)?;
+        let mut conn = AsyncHttp2Connection::client_handshake(stream)?;
+        if let Some(ref pool) = self.chunk_buffer_pool {
+            conn.chunk_buffer_pool = Some(pool.clone());
+        }
 
         self.active_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7086,6 +7113,303 @@ pub fn benchmark_http2_pool_performance(
         total_connections_created: total_conns,
         connection_reuse_ratio: connection_reuse_ratio.max(0.0),
         error_count,
+    })
+}
+
+/// Configuration for HTTP/2 multiplexed saturation throughput & latency benchmarking.
+#[derive(Debug, Clone)]
+pub struct Http2MultiplexBenchmarkConfig {
+    /// Number of concurrent multiplexed streams to saturate over the connection/pool.
+    pub stream_count: usize,
+    /// Number of DATA chunks delivered per stream.
+    pub chunks_per_stream: usize,
+    /// Payload size of each DATA chunk in bytes.
+    pub chunk_size_bytes: usize,
+    /// Whether to enable zero-copy chunk slices & chunk buffer pool recycling.
+    pub use_buffer_pool: bool,
+    /// Pre-allocated buffer capacity in the pool (e.g. 16384 bytes).
+    pub buffer_capacity: usize,
+    /// Maximum retained buffers in the pool.
+    pub pool_capacity: usize,
+}
+
+impl Default for Http2MultiplexBenchmarkConfig {
+    fn default() -> Self {
+        Self {
+            stream_count: 20,
+            chunks_per_stream: 3,
+            chunk_size_bytes: 2048,
+            use_buffer_pool: false,
+            buffer_capacity: 8192,
+            pool_capacity: 64,
+        }
+    }
+}
+
+/// Measurement results of an HTTP/2 multiplexed saturation benchmark run.
+#[derive(Debug, Clone)]
+pub struct Http2MultiplexBenchmarkResult {
+    /// Benchmark profile name (e.g. "Standard Allocating" vs "Zero-Copy Recycled Pool").
+    pub name: String,
+    /// Total multiplexed streams processed.
+    pub total_streams: usize,
+    /// Total DATA chunks delivered across all streams.
+    pub total_chunks: usize,
+    /// Total bytes transferred and decoded.
+    pub total_bytes: usize,
+    /// Wall-clock duration taken to complete all multiplexed streams.
+    pub elapsed_duration: Duration,
+    /// Total elapsed time in milliseconds.
+    pub elapsed_ms: f64,
+    /// Decoded data throughput in Megabytes per second (MB/s).
+    pub throughput_mb_s: f64,
+    /// Completed streams per second.
+    pub streams_per_sec: f64,
+    /// Processed chunks per second.
+    pub chunks_per_sec: f64,
+    /// Average latency per completed stream in microseconds (µs).
+    pub avg_stream_latency_us: f64,
+    /// Number of idle pooled buffers available/recycled at benchmark conclusion.
+    pub pooled_buffers_recycled: usize,
+}
+
+/// Comparative evaluation report between standard allocating streams vs zero-copy pooled recycling.
+#[derive(Debug, Clone)]
+pub struct Http2MultiplexComparisonReport {
+    /// Benchmark result with standard allocation strategy.
+    pub standard: Http2MultiplexBenchmarkResult,
+    /// Benchmark result with zero-copy chunk slices and buffer recycling.
+    pub zero_copy_pooled: Http2MultiplexBenchmarkResult,
+    /// Throughput speedup ratio (zero_copy_pooled throughput / standard throughput).
+    pub speedup_ratio: f64,
+    /// Percentage latency reduction achieved by zero-copy pooled recycling.
+    pub latency_reduction_pct: f64,
+    /// Number of buffers successfully preserved/recycled.
+    pub recycled_buffers: usize,
+}
+
+/// Runs a high-precision multiplexed saturation benchmark under concurrent HTTP/2 load.
+///
+/// Spawns an in-process mock HTTP/2 server that receives `config.stream_count` concurrent requests,
+/// acknowledges each stream with HEADERS (`:status 200`), and transmits `config.chunks_per_stream`
+/// multiplexed DATA frames of `config.chunk_size_bytes` each in interleaved order.
+///
+/// Collects all stream responses via `AsyncHttp2Pool::execute_prioritized_batch`, measures total elapsed time,
+/// throughput (MB/s), streams/sec, chunks/sec, and per-stream latency.
+pub fn benchmark_http2_multiplexed_saturation(
+    config: &Http2MultiplexBenchmarkConfig,
+) -> io::Result<Http2MultiplexBenchmarkResult> {
+    let listener = AsyncTcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+
+    let stream_count = config.stream_count;
+    let chunks_per_stream = config.chunks_per_stream;
+    let chunk_size = config.chunk_size_bytes;
+    let payload = vec![0x42u8; chunk_size];
+
+    let server_handle = std::thread::spawn(move || {
+        let mut server = loop {
+            if let Ok(Some((stream, _))) = listener.try_accept() {
+                if let Ok(h2) = AsyncHttp2Connection::server_handshake(stream) {
+                    break h2;
+                }
+            }
+            GLOBAL_SCHEDULER.yield_now();
+            std::thread::sleep(Duration::from_millis(2));
+        };
+
+        let mut received_streams = Vec::with_capacity(stream_count);
+        let mut spins = 0;
+        let start_wait = std::time::Instant::now();
+        while received_streams.len() < stream_count
+            && start_wait.elapsed() < Duration::from_secs(10)
+        {
+            match server.recv_frame() {
+                Ok(crate::simd_parser::Http2Frame::Headers { stream_id, .. }) => {
+                    if !received_streams.contains(&stream_id) {
+                        received_streams.push(stream_id);
+                    }
+                }
+                Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => break,
+                Err(_) => {
+                    spins += 1;
+                    if spins > 50 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                _ => {}
+            }
+        }
+
+        // Send HEADERS response (:status 200) for each stream
+        for &sid in &received_streams {
+            let res_headers = vec![(":status", "200")];
+            let h_frame = server
+                .session
+                .create_headers_frame(sid, &res_headers, false);
+            let _ = server.send_frame(&h_frame);
+        }
+
+        // Send interleaved DATA frames across all streams
+        for c in 0..chunks_per_stream {
+            let is_last = c == chunks_per_stream - 1;
+            for &sid in &received_streams {
+                let _ = server.send_data(sid, &payload, is_last);
+            }
+        }
+
+        // Wait briefly for client to receive and close
+        for _ in 0..10 {
+            if let Ok(Some(crate::simd_parser::Http2Frame::GoAway { .. })) = server.try_recv_frame()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+    });
+
+    let mut pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
+    let chunk_pool = if config.use_buffer_pool {
+        let cp = Http2ChunkBufferPool::new(config.buffer_capacity, config.pool_capacity);
+        pool = pool.with_chunk_buffer_pool(cp.clone());
+        Some(cp)
+    } else {
+        None
+    };
+
+    let batch: Vec<Http2PrioritizedRequest> = (0..stream_count)
+        .map(|i| {
+            Http2PrioritizedRequest::new("GET", format!("/benchmark-stream-{}", i))
+                .with_rfc9218_priority((i % 8) as u8, false)
+        })
+        .collect();
+
+    let start = std::time::Instant::now();
+    let results = pool.execute_prioritized_batch(batch)?;
+    let elapsed = start.elapsed();
+
+    // Verify results
+    if results.len() != stream_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Incomplete benchmark run: expected {} streams, received {}",
+                stream_count,
+                results.len()
+            ),
+        ));
+    }
+    let expected_body_len = chunks_per_stream * chunk_size;
+    for (sid, res) in &results {
+        match res {
+            Ok(resp) => {
+                if resp.status.0 != 200 || resp.body.len() != expected_body_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Stream {} returned status {} body len {} (expected {})",
+                            sid,
+                            resp.status.0,
+                            resp.body.len(),
+                            expected_body_len
+                        ),
+                    ));
+                }
+            }
+            Err(e) => {
+                return Err(io::Error::other(format!("Stream {} failed: {}", sid, e)));
+            }
+        }
+    }
+
+    let recycled_buffers = chunk_pool.as_ref().map(|p| p.idle_count()).unwrap_or(0);
+
+    // Clean up pool connections
+    pool.shutdown();
+    let _ = server_handle.join();
+
+    let total_chunks = stream_count * chunks_per_stream;
+    let total_bytes = total_chunks * chunk_size;
+    let duration_secs = elapsed.as_secs_f64().max(0.000001);
+    let duration_ms = elapsed.as_secs_f64() * 1000.0;
+    let throughput_mb_s = (total_bytes as f64 / (1024.0 * 1024.0)) / duration_secs;
+    let streams_per_sec = (stream_count as f64) / duration_secs;
+    let chunks_per_sec = (total_chunks as f64) / duration_secs;
+    let avg_stream_latency_us = (elapsed.as_micros() as f64) / (stream_count as f64);
+
+    let name = if config.use_buffer_pool {
+        "Zero-Copy Recycled Pool".to_string()
+    } else {
+        "Standard Allocating".to_string()
+    };
+
+    Ok(Http2MultiplexBenchmarkResult {
+        name,
+        total_streams: stream_count,
+        total_chunks,
+        total_bytes,
+        elapsed_duration: elapsed,
+        elapsed_ms: duration_ms,
+        throughput_mb_s,
+        streams_per_sec,
+        chunks_per_sec,
+        avg_stream_latency_us,
+        pooled_buffers_recycled: recycled_buffers,
+    })
+}
+
+/// Executes a comparative multiplexed saturation benchmark suite contrasting standard
+/// heap allocation against zero-copy chunk slices & chunk buffer pool recycling.
+pub fn benchmark_http2_multiplexed_comparison(
+    stream_count: usize,
+    chunks_per_stream: usize,
+    chunk_size_bytes: usize,
+) -> io::Result<Http2MultiplexComparisonReport> {
+    let config_std = Http2MultiplexBenchmarkConfig {
+        stream_count,
+        chunks_per_stream,
+        chunk_size_bytes,
+        use_buffer_pool: false,
+        ..Default::default()
+    };
+
+    let standard = benchmark_http2_multiplexed_saturation(&config_std)?;
+
+    let config_opt = Http2MultiplexBenchmarkConfig {
+        stream_count,
+        chunks_per_stream,
+        chunk_size_bytes,
+        use_buffer_pool: true,
+        buffer_capacity: chunk_size_bytes.max(4096),
+        pool_capacity: (stream_count * chunks_per_stream).max(32),
+    };
+
+    let zero_copy_pooled = benchmark_http2_multiplexed_saturation(&config_opt)?;
+
+    let speedup_ratio = if standard.throughput_mb_s > 0.0 {
+        zero_copy_pooled.throughput_mb_s / standard.throughput_mb_s
+    } else {
+        1.0
+    };
+
+    let latency_reduction_pct = if standard.avg_stream_latency_us > 0.0 {
+        ((standard.avg_stream_latency_us - zero_copy_pooled.avg_stream_latency_us)
+            / standard.avg_stream_latency_us)
+            * 100.0
+    } else {
+        0.0
+    };
+
+    let recycled_buffers = zero_copy_pooled.pooled_buffers_recycled;
+
+    Ok(Http2MultiplexComparisonReport {
+        standard,
+        zero_copy_pooled,
+        speedup_ratio,
+        latency_reduction_pct,
+        recycled_buffers,
     })
 }
 
@@ -12566,5 +12890,46 @@ mod tls_alpn_tests {
         record.extend_from_slice(&hs_len.to_be_bytes()); // record length
         record.extend(hs);
         record
+    }
+
+    #[test]
+    fn test_http2_multiplexed_saturation_benchmark_execution() {
+        let config = Http2MultiplexBenchmarkConfig {
+            stream_count: 6,
+            chunks_per_stream: 2,
+            chunk_size_bytes: 1024,
+            use_buffer_pool: true,
+            buffer_capacity: 2048,
+            pool_capacity: 16,
+        };
+
+        let res = benchmark_http2_multiplexed_saturation(&config)
+            .expect("benchmark http2 multiplexed saturation");
+
+        assert_eq!(res.total_streams, 6);
+        assert_eq!(res.total_chunks, 12);
+        assert_eq!(res.total_bytes, 12 * 1024);
+        assert!(res.elapsed_ms > 0.0);
+        assert!(res.throughput_mb_s > 0.0);
+        assert!(res.streams_per_sec > 0.0);
+        assert!(res.chunks_per_sec > 0.0);
+        assert!(res.avg_stream_latency_us > 0.0);
+        assert_eq!(res.name, "Zero-Copy Recycled Pool");
+        assert!(res.pooled_buffers_recycled > 0);
+    }
+
+    #[test]
+    fn test_http2_multiplexed_comparison_suite() {
+        let report = benchmark_http2_multiplexed_comparison(4, 2, 512)
+            .expect("benchmark http2 multiplexed comparison");
+
+        assert_eq!(report.standard.total_streams, 4);
+        assert_eq!(report.zero_copy_pooled.total_streams, 4);
+        assert_eq!(report.standard.total_bytes, 4 * 2 * 512);
+        assert_eq!(report.zero_copy_pooled.total_bytes, 4 * 2 * 512);
+        assert_eq!(report.standard.name, "Standard Allocating");
+        assert_eq!(report.zero_copy_pooled.name, "Zero-Copy Recycled Pool");
+        assert!(report.speedup_ratio > 0.0);
+        assert!(report.recycled_buffers > 0);
     }
 }

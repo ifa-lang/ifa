@@ -108,12 +108,14 @@ pub use json::{
     FilterOp, FilterPredicate, JsonValue, PatchOperation, PathSegment,
 };
 pub use net::{
+    benchmark_http2_multiplexed_comparison, benchmark_http2_multiplexed_saturation,
     benchmark_http2_pool_performance, benchmark_sse_parsing, benchmark_tcp_throughput,
     benchmark_token_bucket, benchmark_websocket_framing, lookup_mime_type, resolve_host,
     resolve_host_v4, resolve_host_v6, resolve_socket_addrs, run_net_benchmark_suite,
     AsyncHttp2Connection, AsyncHttp2Pool, AsyncSseClient, AsyncSseServer, AsyncTcpListener,
     AsyncTcpStream, AsyncTimer, AsyncUdpSocket, AsyncWsConnection, AsyncWsPool, BufferedTcpStream,
-    ConnectionInfo, Datagram, EventHub, Http2ClientRequest, Http2PoolBenchmarkResult,
+    ConnectionInfo, Datagram, EventHub, Http2ClientRequest, Http2MultiplexBenchmarkConfig,
+    Http2MultiplexBenchmarkResult, Http2MultiplexComparisonReport, Http2PoolBenchmarkResult,
     Http2PoolStats, Http2PrioritizedRequest, Http2RequestInterceptor, Http2ResponseInterceptor,
     HubMessage, NetBenchmarkReport, NetBenchmarkResult, SessionId, SessionSink, SocketConfig,
     SseClientStats, SseDecoder, SseServerStats, TcpListener as NetTcpListener, TcpListener,
