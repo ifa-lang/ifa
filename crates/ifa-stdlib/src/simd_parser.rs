@@ -2457,6 +2457,129 @@ impl Http2PromisedRequest {
     }
 }
 
+/// Parsed HTTP/2 Cache-Control directives conforming to RFC 7234 Section 5.2.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Http2CacheDirectives {
+    /// Directive `no-cache`: response must be revalidated with origin before use.
+    pub no_cache: bool,
+    /// Directive `no-store`: response must never be stored in persistent or shared cache.
+    pub no_store: bool,
+    /// Directive `must-revalidate`: once stale, response must be revalidated before use.
+    pub must_revalidate: bool,
+    /// Directive `public`: response may be cached by any cache.
+    pub is_public: bool,
+    /// Directive `private`: response intended for single user; not cacheable in shared cache.
+    pub is_private: bool,
+    /// Directive `immutable`: content will not change while fresh.
+    pub immutable: bool,
+    /// Directive `max-age=N`: lifetime in seconds.
+    pub max_age_secs: Option<u64>,
+    /// Directive `s-maxage=N`: shared cache lifetime in seconds.
+    pub s_maxage_secs: Option<u64>,
+}
+
+impl Http2CacheDirectives {
+    /// Parse Cache-Control header string into structured directives.
+    pub fn parse(header_value: &str) -> Self {
+        let mut d = Self::default();
+        for item in header_value.split(',') {
+            let part = item.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let mut kv = part.splitn(2, '=');
+            let key = kv.next().unwrap_or("").trim().to_ascii_lowercase();
+            let val = kv.next().map(|v| v.trim().trim_matches('"'));
+            match key.as_str() {
+                "no-cache" => d.no_cache = true,
+                "no-store" => d.no_store = true,
+                "must-revalidate" => d.must_revalidate = true,
+                "public" => d.is_public = true,
+                "private" => d.is_private = true,
+                "immutable" => d.immutable = true,
+                "max-age" => {
+                    if let Some(v) = val {
+                        d.max_age_secs = v.parse::<u64>().ok();
+                    }
+                }
+                "s-maxage" => {
+                    if let Some(v) = val {
+                        d.s_maxage_secs = v.parse::<u64>().ok();
+                    }
+                }
+                _ => {}
+            }
+        }
+        d
+    }
+
+    /// Whether this response is eligible to be stored in client cache under RFC 7234.
+    #[inline]
+    pub fn is_cacheable(&self) -> bool {
+        !self.no_store
+    }
+
+    /// Effective maximum age in seconds, preferring s-maxage if specified.
+    #[inline]
+    pub fn effective_max_age(&self) -> Option<u64> {
+        self.s_maxage_secs.or(self.max_age_secs)
+    }
+}
+
+/// Check whether an HTTP status code is cacheable by default under RFC 7234 Section 3.
+#[inline]
+pub fn is_http_status_cacheable_by_default(status: u16) -> bool {
+    matches!(
+        status,
+        200 | 203 | 204 | 206 | 300 | 301 | 304 | 404 | 405 | 410 | 414 | 501
+    )
+}
+
+/// Extract parsed Cache-Control directives from headers slice.
+pub fn extract_http2_cache_control(headers: &[(String, String)]) -> Option<Http2CacheDirectives> {
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("cache-control") {
+            return Some(Http2CacheDirectives::parse(v));
+        }
+    }
+    None
+}
+
+/// Extract ETag validator string from headers slice (RFC 7232 §2.3).
+pub fn extract_http2_etag(headers: &[(String, String)]) -> Option<String> {
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("etag") {
+            return Some(v.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Extract Last-Modified header string from headers slice (RFC 7232 §2.2).
+pub fn extract_http2_last_modified(headers: &[(String, String)]) -> Option<String> {
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("last-modified") {
+            return Some(v.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Build conditional request headers (If-None-Match, If-Modified-Since) for RFC 7232 revalidation.
+pub fn build_http2_conditional_headers(
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    if let Some(tag) = etag {
+        headers.push(("if-none-match".to_string(), tag.to_string()));
+    }
+    if let Some(lm) = last_modified {
+        headers.push(("if-modified-since".to_string(), lm.to_string()));
+    }
+    headers
+}
+
 /// Multiplexed HTTP/2 Session Manager handling streams, flow control, and HPACK.
 #[derive(Debug)]
 pub struct Http2Session {
@@ -4771,5 +4894,64 @@ mod http2_tests {
             client.streams.get(&4).unwrap().state,
             Http2StreamState::ReservedRemote
         );
+    }
+
+    #[test]
+    fn test_rfc7234_cache_directives_and_conditional_validation_helpers() {
+        let cc_val = "public, max-age=3600, must-revalidate";
+        let directives = Http2CacheDirectives::parse(cc_val);
+        assert!(directives.is_public);
+        assert!(!directives.is_private);
+        assert!(!directives.no_cache);
+        assert!(!directives.no_store);
+        assert!(directives.must_revalidate);
+        assert_eq!(directives.max_age_secs, Some(3600));
+        assert_eq!(directives.effective_max_age(), Some(3600));
+        assert!(directives.is_cacheable());
+
+        let cc_no_store = "no-cache, no-store";
+        let d_no_store = Http2CacheDirectives::parse(cc_no_store);
+        assert!(d_no_store.no_cache);
+        assert!(d_no_store.no_store);
+        assert!(!d_no_store.is_cacheable());
+
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("cache-control".to_string(), "max-age=120, s-maxage=600".to_string()),
+            ("etag".to_string(), "\"33a64df551425fcc\"".to_string()),
+            (
+                "last-modified".to_string(),
+                "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            ),
+        ];
+
+        let extracted_cc = extract_http2_cache_control(&headers).expect("extracted cc");
+        assert_eq!(extracted_cc.max_age_secs, Some(120));
+        assert_eq!(extracted_cc.s_maxage_secs, Some(600));
+        assert_eq!(extracted_cc.effective_max_age(), Some(600));
+
+        let extracted_etag = extract_http2_etag(&headers).expect("extracted etag");
+        assert_eq!(extracted_etag, "\"33a64df551425fcc\"");
+
+        let extracted_lm = extract_http2_last_modified(&headers).expect("extracted lm");
+        assert_eq!(extracted_lm, "Wed, 21 Oct 2015 07:28:00 GMT");
+
+        let cond_headers = build_http2_conditional_headers(
+            Some(&extracted_etag),
+            Some(&extracted_lm),
+        );
+        assert_eq!(cond_headers.len(), 2);
+        assert_eq!(cond_headers[0], ("if-none-match".to_string(), "\"33a64df551425fcc\"".to_string()));
+        assert_eq!(
+            cond_headers[1],
+            (
+                "if-modified-since".to_string(),
+                "Wed, 21 Oct 2015 07:28:00 GMT".to_string()
+            )
+        );
+
+        assert!(is_http_status_cacheable_by_default(200));
+        assert!(is_http_status_cacheable_by_default(304));
+        assert!(!is_http_status_cacheable_by_default(500));
     }
 }

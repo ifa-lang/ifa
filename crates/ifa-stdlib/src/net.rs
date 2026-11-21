@@ -4938,6 +4938,10 @@ pub struct Http2PoolStats {
     pub cached_push_promises: usize,
     /// Total number of requests satisfied directly from proactive push promise cache without network I/O.
     pub push_cache_hits: usize,
+    /// Total number of successful 304 Not Modified revalidations refreshing cached responses.
+    pub cache_revalidations: usize,
+    /// Total number of general HTTP responses currently held in pool client cache (RFC 7234).
+    pub http_cache_entries: usize,
 }
 
 impl Http2PoolStats {
@@ -4963,6 +4967,267 @@ pub struct Http2PushPromiseCacheEntry {
     pub response: crate::http::HttpResponse,
     /// Timestamp when this push promise response was ingested.
     pub received_at: std::time::Instant,
+    /// Wall-clock system time when this response was received.
+    pub response_time: std::time::SystemTime,
+    /// Wall-clock expiration time computed from Cache-Control max-age or Expires.
+    pub expires_at: Option<std::time::SystemTime>,
+    /// Parsed Cache-Control directives (RFC 7234).
+    pub directives: crate::http::HttpCacheDirectives,
+    /// Extracted ETag validator (RFC 7232), if any.
+    pub etag: Option<String>,
+    /// Extracted Last-Modified date header (RFC 7232), if any.
+    pub last_modified: Option<String>,
+    /// Total number of requests served from this cached entry.
+    pub hit_count: usize,
+    /// Total number of successful 304 Not Modified revalidations.
+    pub revalidations: usize,
+}
+
+impl Http2PushPromiseCacheEntry {
+    /// Create a new cached push promise entry with RFC 7234 directives parsing.
+    pub fn new(
+        promised_request: crate::simd_parser::Http2PromisedRequest,
+        response: crate::http::HttpResponse,
+    ) -> Self {
+        let now = std::time::SystemTime::now();
+        let instant = std::time::Instant::now();
+        let etag = response.headers.get("etag").map(|s| s.trim().to_string());
+        let last_modified = response
+            .headers
+            .get("last-modified")
+            .map(|s| s.trim().to_string());
+
+        let (directives, expires_at) = if let Some(cc) = response.headers.get("cache-control") {
+            let d = crate::http::HttpCacheDirectives::parse(cc);
+            let exp = d
+                .max_age
+                .map(|sec| now + std::time::Duration::from_secs(sec));
+            (d, exp)
+        } else if let Some(exp_str) = response.headers.get("expires") {
+            let exp = crate::http::parse_http_date(exp_str);
+            (crate::http::HttpCacheDirectives::default(), exp)
+        } else {
+            (crate::http::HttpCacheDirectives::default(), None)
+        };
+
+        Self {
+            promised_request,
+            response,
+            received_at: instant,
+            response_time: now,
+            expires_at,
+            directives,
+            etag,
+            last_modified,
+            hit_count: 0,
+            revalidations: 0,
+        }
+    }
+
+    /// Check whether this entry is cacheable under RFC 7234 (must not have `no-store`).
+    #[inline]
+    pub fn is_cacheable(&self) -> bool {
+        !self.directives.no_store
+    }
+
+    /// Check whether this cached entry is fresh under RFC 7234 §4.2.
+    pub fn is_fresh(&self, now: std::time::SystemTime, default_ttl: std::time::Duration) -> bool {
+        if self.directives.no_cache {
+            return false;
+        }
+        if let Some(exp) = self.expires_at {
+            now < exp
+        } else {
+            now <= self.response_time + default_ttl
+        }
+    }
+
+    /// Whether this entry requires origin revalidation (RFC 7234 §4.3) before returning.
+    pub fn requires_revalidation(
+        &self,
+        now: std::time::SystemTime,
+        default_ttl: std::time::Duration,
+    ) -> bool {
+        self.directives.no_cache || !self.is_fresh(now, default_ttl)
+    }
+
+    /// Whether this cached entry possesses validators (ETag or Last-Modified) for conditional request.
+    #[inline]
+    pub fn can_revalidate(&self) -> bool {
+        self.etag.is_some() || self.last_modified.is_some()
+    }
+
+    /// Update this cache entry from a 304 Not Modified response (RFC 7234 §4.3.4).
+    pub fn update_from_304(
+        &mut self,
+        not_modified_resp: &crate::http::HttpResponse,
+        now: std::time::SystemTime,
+    ) {
+        self.response_time = now;
+        self.revalidations += 1;
+        for (k, v) in not_modified_resp.headers.iter() {
+            let lower = k.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "date" | "expires" | "cache-control" | "etag" | "last-modified" | "vary"
+            ) {
+                self.response.headers.set(k, v);
+            }
+        }
+        if let Some(etag) = not_modified_resp.headers.get("etag") {
+            self.etag = Some(etag.trim().to_string());
+        }
+        if let Some(lm) = not_modified_resp.headers.get("last-modified") {
+            self.last_modified = Some(lm.trim().to_string());
+        }
+        if let Some(cc) = not_modified_resp.headers.get("cache-control") {
+            self.directives = crate::http::HttpCacheDirectives::parse(cc);
+            self.expires_at = self
+                .directives
+                .max_age
+                .map(|sec| now + std::time::Duration::from_secs(sec));
+        } else if let Some(exp) = not_modified_resp.headers.get("expires") {
+            self.expires_at = crate::http::parse_http_date(exp);
+        }
+    }
+}
+
+/// A cached HTTP/2 client response retained in an [`AsyncHttp2Pool`] (RFC 7234).
+#[derive(Debug, Clone)]
+pub struct Http2PoolCacheEntry {
+    /// HTTP method (e.g. "GET", "HEAD").
+    pub method: String,
+    /// Request path (e.g. "/api/v1/resource").
+    pub path: String,
+    /// The cached HTTP response.
+    pub response: crate::http::HttpResponse,
+    /// Timestamp when this response was ingested.
+    pub received_at: std::time::Instant,
+    /// Wall-clock system time when this response was received.
+    pub response_time: std::time::SystemTime,
+    /// Wall-clock expiration time computed from Cache-Control max-age or Expires.
+    pub expires_at: Option<std::time::SystemTime>,
+    /// Parsed Cache-Control directives (RFC 7234).
+    pub directives: crate::http::HttpCacheDirectives,
+    /// Extracted ETag validator (RFC 7232), if any.
+    pub etag: Option<String>,
+    /// Extracted Last-Modified date header (RFC 7232), if any.
+    pub last_modified: Option<String>,
+    /// Total number of requests served from this cached entry.
+    pub hit_count: usize,
+    /// Total number of successful 304 Not Modified revalidations.
+    pub revalidations: usize,
+}
+
+impl Http2PoolCacheEntry {
+    /// Create a new cached HTTP/2 response entry.
+    pub fn new(
+        method: impl Into<String>,
+        path: impl Into<String>,
+        response: crate::http::HttpResponse,
+    ) -> Self {
+        let now = std::time::SystemTime::now();
+        let instant = std::time::Instant::now();
+        let etag = response.headers.get("etag").map(|s| s.trim().to_string());
+        let last_modified = response
+            .headers
+            .get("last-modified")
+            .map(|s| s.trim().to_string());
+
+        let (directives, expires_at) = if let Some(cc) = response.headers.get("cache-control") {
+            let d = crate::http::HttpCacheDirectives::parse(cc);
+            let exp = d
+                .max_age
+                .map(|sec| now + std::time::Duration::from_secs(sec));
+            (d, exp)
+        } else if let Some(exp_str) = response.headers.get("expires") {
+            let exp = crate::http::parse_http_date(exp_str);
+            (crate::http::HttpCacheDirectives::default(), exp)
+        } else {
+            (crate::http::HttpCacheDirectives::default(), None)
+        };
+
+        Self {
+            method: method.into(),
+            path: path.into(),
+            response,
+            received_at: instant,
+            response_time: now,
+            expires_at,
+            directives,
+            etag,
+            last_modified,
+            hit_count: 0,
+            revalidations: 0,
+        }
+    }
+
+    /// Check whether this entry is cacheable under RFC 7234 (must not have `no-store`).
+    #[inline]
+    pub fn is_cacheable(&self) -> bool {
+        !self.directives.no_store
+    }
+
+    /// Check whether this cached entry is fresh under RFC 7234 §4.2.
+    pub fn is_fresh(&self, now: std::time::SystemTime, default_ttl: std::time::Duration) -> bool {
+        if self.directives.no_cache {
+            return false;
+        }
+        if let Some(exp) = self.expires_at {
+            now < exp
+        } else {
+            now <= self.response_time + default_ttl
+        }
+    }
+
+    /// Whether this entry requires origin revalidation (RFC 7234 §4.3) before returning.
+    pub fn requires_revalidation(
+        &self,
+        now: std::time::SystemTime,
+        default_ttl: std::time::Duration,
+    ) -> bool {
+        self.directives.no_cache || !self.is_fresh(now, default_ttl)
+    }
+
+    /// Whether this cached entry possesses validators (ETag or Last-Modified) for conditional request.
+    #[inline]
+    pub fn can_revalidate(&self) -> bool {
+        self.etag.is_some() || self.last_modified.is_some()
+    }
+
+    /// Update this cache entry from a 304 Not Modified response (RFC 7234 §4.3.4).
+    pub fn update_from_304(
+        &mut self,
+        not_modified_resp: &crate::http::HttpResponse,
+        now: std::time::SystemTime,
+    ) {
+        self.response_time = now;
+        self.revalidations += 1;
+        for (k, v) in not_modified_resp.headers.iter() {
+            let lower = k.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "date" | "expires" | "cache-control" | "etag" | "last-modified" | "vary"
+            ) {
+                self.response.headers.set(k, v);
+            }
+        }
+        if let Some(etag) = not_modified_resp.headers.get("etag") {
+            self.etag = Some(etag.trim().to_string());
+        }
+        if let Some(lm) = not_modified_resp.headers.get("last-modified") {
+            self.last_modified = Some(lm.trim().to_string());
+        }
+        if let Some(cc) = not_modified_resp.headers.get("cache-control") {
+            self.directives = crate::http::HttpCacheDirectives::parse(cc);
+            self.expires_at = self
+                .directives
+                .max_age
+                .map(|sec| now + std::time::Duration::from_secs(sec));
+        } else if let Some(exp) = not_modified_resp.headers.get("expires") {
+            self.expires_at = crate::http::parse_http_date(exp);
+        }
+    }
 }
 
 /// An idle pooled HTTP/2 connection paired with the timestamp at which it became idle.
@@ -4999,6 +5264,10 @@ pub struct AsyncHttp2Pool {
     enable_push_promises: bool,
     push_promises_received: std::sync::atomic::AtomicUsize,
     push_cache_hits: std::sync::atomic::AtomicUsize,
+    http_cache_entries:
+        std::sync::Mutex<std::collections::HashMap<String, Http2PoolCacheEntry>>,
+    enable_http_cache: bool,
+    cache_revalidations: std::sync::atomic::AtomicUsize,
 }
 
 impl AsyncHttp2Pool {
@@ -5031,6 +5300,9 @@ impl AsyncHttp2Pool {
             enable_push_promises: true,
             push_promises_received: std::sync::atomic::AtomicUsize::new(0),
             push_cache_hits: std::sync::atomic::AtomicUsize::new(0),
+            http_cache_entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            enable_http_cache: false,
+            cache_revalidations: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -5065,6 +5337,44 @@ impl AsyncHttp2Pool {
     /// Whether client push promise caching and automated absorption is enabled on this pool.
     pub fn push_promises_enabled(&self) -> bool {
         self.enable_push_promises
+    }
+
+    /// Configure whether transparent RFC 7234 HTTP response caching and conditional revalidation is enabled.
+    pub fn with_http_cache(mut self, enabled: bool) -> Self {
+        self.enable_http_cache = enabled;
+        self
+    }
+
+    /// Set whether transparent RFC 7234 HTTP response caching is enabled on this pool.
+    pub fn set_enable_http_cache(&mut self, enabled: bool) {
+        self.enable_http_cache = enabled;
+    }
+
+    /// Whether transparent RFC 7234 HTTP response caching is enabled on this pool.
+    pub fn http_cache_enabled(&self) -> bool {
+        self.enable_http_cache
+    }
+
+    /// Total count of successful 304 Not Modified conditional revalidations performed by the pool.
+    pub fn cache_revalidations(&self) -> usize {
+        self.cache_revalidations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total count of general HTTP cache entries currently stored in the pool.
+    pub fn http_cache_count(&self) -> usize {
+        if let Ok(cache) = self.http_cache_entries.lock() {
+            cache.len()
+        } else {
+            0
+        }
+    }
+
+    /// Clear all stored HTTP client cache entries.
+    pub fn clear_http_cache(&self) {
+        if let Ok(mut cache) = self.http_cache_entries.lock() {
+            cache.clear();
+        }
     }
 
     /// Total count of push promises ingested and stored in cache.
@@ -5106,9 +5416,13 @@ impl AsyncHttp2Pool {
         }
 
         if let Ok(mut cache) = self.push_promise_cache.lock() {
-            let now = std::time::Instant::now();
             for (promised_req, response) in completed {
                 if !promised_req.is_valid {
+                    continue;
+                }
+                let entry = Http2PushPromiseCacheEntry::new(promised_req.clone(), response);
+                // RFC 7234 §5.2.2.3: do not cache responses marked no-store
+                if !entry.is_cacheable() {
                     continue;
                 }
                 let key = format!(
@@ -5118,14 +5432,7 @@ impl AsyncHttp2Pool {
                 );
                 self.push_promises_received
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                cache
-                    .entry(key)
-                    .or_insert_with(Vec::new)
-                    .push(Http2PushPromiseCacheEntry {
-                        promised_request: promised_req,
-                        response,
-                        received_at: now,
-                    });
+                cache.entry(key).or_insert_with(Vec::new).push(entry);
             }
         }
     }
@@ -5140,13 +5447,13 @@ impl AsyncHttp2Pool {
             return None;
         }
         let key = format!("{}:{}", method.to_ascii_uppercase(), path);
-        let now = std::time::Instant::now();
+        let now_sys = std::time::SystemTime::now();
         let max_age = self.idle_ttl.unwrap_or(std::time::Duration::from_secs(60));
 
         if let Ok(mut cache) = self.push_promise_cache.lock() {
             if let Some(entries) = cache.get_mut(&key) {
                 while let Some(entry) = entries.pop() {
-                    if now.duration_since(entry.received_at) <= max_age {
+                    if entry.is_fresh(now_sys, max_age) {
                         self.push_cache_hits
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if entries.is_empty() {
@@ -5340,6 +5647,8 @@ impl AsyncHttp2Pool {
             retried_requests: self.retried_count(),
             cached_push_promises: self.push_promise_cache_count(),
             push_cache_hits: self.push_cache_hits(),
+            cache_revalidations: self.cache_revalidations(),
+            http_cache_entries: self.http_cache_count(),
         }
     }
 
@@ -5564,16 +5873,101 @@ impl AsyncHttp2Pool {
             }
         }
 
-        // Check proactive push promise cache first: if the server previously pushed this resource
-        // during multiplexing, satisfy the request directly from cache without network round-trip!
-        if self.enable_push_promises {
-            if let Some(mut cached_resp) =
-                self.take_cached_push_response(&client_req.method, &client_req.path)
-            {
-                for resp_interceptor in &self.response_interceptors {
-                    resp_interceptor(&client_req, &mut cached_resp);
+        let key = format!("{}:{}", client_req.method.to_ascii_uppercase(), client_req.path);
+        let now_sys = std::time::SystemTime::now();
+        let default_ttl = self.idle_ttl.unwrap_or(std::time::Duration::from_secs(60));
+
+        let req_cc = client_req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cache-control"))
+            .map(|(_, v)| crate::http::HttpCacheDirectives::parse(v));
+        let client_no_cache = req_cc.as_ref().map(|cc| cc.no_cache).unwrap_or(false);
+        let client_no_store = req_cc.as_ref().map(|cc| cc.no_store).unwrap_or(false);
+
+        // 1. Check proactive push promise cache first (if not client_no_store)
+        if self.enable_push_promises && !client_no_store {
+            if let Ok(mut cache) = self.push_promise_cache.lock() {
+                if let Some(entries) = cache.get_mut(&key) {
+                    if let Some(entry) = entries.last_mut() {
+                        if !client_no_cache && entry.is_fresh(now_sys, default_ttl) {
+                            entry.hit_count += 1;
+                            self.push_cache_hits
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let mut resp = entry.response.clone();
+                            if entry.directives.max_age.is_none() {
+                                entries.pop();
+                            }
+                            drop(cache);
+                            for resp_interceptor in &self.response_interceptors {
+                                resp_interceptor(&client_req, &mut resp);
+                            }
+                            return Ok(resp);
+                        }
+                    }
                 }
-                return Ok(cached_resp);
+            }
+        }
+
+        // 2. Check general HTTP client cache (if enabled and not client_no_store)
+        let mut cached_validator: Option<(Option<String>, Option<String>)> = None;
+        if self.enable_http_cache && !client_no_store {
+            if let Ok(mut cache) = self.http_cache_entries.lock() {
+                if let Some(entry) = cache.get_mut(&key) {
+                    if !client_no_cache && entry.is_fresh(now_sys, default_ttl) {
+                        entry.hit_count += 1;
+                        self.push_cache_hits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut resp = entry.response.clone();
+                        drop(cache);
+                        for resp_interceptor in &self.response_interceptors {
+                            resp_interceptor(&client_req, &mut resp);
+                        }
+                        return Ok(resp);
+                    } else if entry.can_revalidate() {
+                        cached_validator = Some((entry.etag.clone(), entry.last_modified.clone()));
+                    }
+                }
+            }
+        }
+
+        // Also check if push promise cache has a stale entry with validators that can be revalidated
+        if cached_validator.is_none() && self.enable_push_promises && !client_no_store {
+            if let Ok(cache) = self.push_promise_cache.lock() {
+                if let Some(entries) = cache.get(&key) {
+                    if let Some(entry) = entries.last() {
+                        if entry.can_revalidate() {
+                            cached_validator =
+                                Some((entry.etag.clone(), entry.last_modified.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let is_revalidating = cached_validator.is_some();
+        if let Some((ref etag_opt, ref lm_opt)) = cached_validator {
+            if let Some(tag) = etag_opt {
+                if !client_req
+                    .headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("if-none-match"))
+                {
+                    client_req
+                        .headers
+                        .push(("if-none-match".to_string(), tag.clone()));
+                }
+            }
+            if let Some(lm) = lm_opt {
+                if !client_req
+                    .headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("if-modified-since"))
+                {
+                    client_req
+                        .headers
+                        .push(("if-modified-since".to_string(), lm.clone()));
+                }
             }
         }
 
@@ -5588,6 +5982,44 @@ impl AsyncHttp2Pool {
         let result = conn.request(&client_req.method, &client_req.path, &header_refs, body_ref);
         match result {
             Ok(mut resp) => {
+                // If 304 Not Modified received on conditional revalidation, refresh cache and return 200 with cached body!
+                if resp.status.0 == 304 && is_revalidating {
+                    self.cache_revalidations
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.push_cache_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    let now_update = std::time::SystemTime::now();
+                    let mut resolved_resp = None;
+
+                    if self.enable_http_cache {
+                        if let Ok(mut cache) = self.http_cache_entries.lock() {
+                            if let Some(entry) = cache.get_mut(&key) {
+                                entry.update_from_304(&resp, now_update);
+                                resolved_resp = Some(entry.response.clone());
+                            }
+                        }
+                    }
+                    if resolved_resp.is_none() && self.enable_push_promises {
+                        if let Ok(mut cache) = self.push_promise_cache.lock() {
+                            if let Some(entries) = cache.get_mut(&key) {
+                                if let Some(entry) = entries.last_mut() {
+                                    entry.update_from_304(&resp, now_update);
+                                    resolved_resp = Some(entry.response.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(mut fresh_resp) = resolved_resp {
+                        self.release(conn);
+                        for resp_interceptor in &self.response_interceptors {
+                            resp_interceptor(&client_req, &mut fresh_resp);
+                        }
+                        return Ok(fresh_resp);
+                    }
+                }
+
                 // If response contains an "alt-svc" header, automatically record routes on pool
                 if let Some(alt_svc_val) = resp.headers.get("alt-svc") {
                     let routes = crate::simd_parser::AltSvcRoute::parse_header_value(alt_svc_val);
@@ -5600,6 +6032,26 @@ impl AsyncHttp2Pool {
                         }
                     }
                 }
+
+                // If response is cacheable 200 OK and http_cache is enabled, cache it
+                if self.enable_http_cache
+                    && (client_req.method.eq_ignore_ascii_case("GET")
+                        || client_req.method.eq_ignore_ascii_case("HEAD"))
+                    && resp.status.0 == 200
+                    && !client_no_store
+                {
+                    let entry = Http2PoolCacheEntry::new(
+                        client_req.method.clone(),
+                        client_req.path.clone(),
+                        resp.clone(),
+                    );
+                    if entry.is_cacheable() {
+                        if let Ok(mut cache) = self.http_cache_entries.lock() {
+                            cache.insert(key, entry);
+                        }
+                    }
+                }
+
                 self.release(conn);
                 for resp_interceptor in &self.response_interceptors {
                     resp_interceptor(&client_req, &mut resp);
@@ -5673,6 +6125,9 @@ impl AsyncHttp2Pool {
         // Run request interceptors
         for interceptor in &self.request_interceptors {
             if let Some(mut short_circuit_resp) = interceptor(&mut client_req) {
+                if !short_circuit_resp.body.is_empty() {
+                    chunk_handler(&short_circuit_resp.body);
+                }
                 for resp_interceptor in &self.response_interceptors {
                     resp_interceptor(&client_req, &mut short_circuit_resp);
                 }
@@ -5680,18 +6135,107 @@ impl AsyncHttp2Pool {
             }
         }
 
-        // Check proactive push promise cache first
-        if self.enable_push_promises {
-            if let Some(mut cached_resp) =
-                self.take_cached_push_response(&client_req.method, &client_req.path)
-            {
-                if !cached_resp.body.is_empty() {
-                    chunk_handler(&cached_resp.body);
+        let key = format!("{}:{}", client_req.method.to_ascii_uppercase(), client_req.path);
+        let now_sys = std::time::SystemTime::now();
+        let default_ttl = self.idle_ttl.unwrap_or(std::time::Duration::from_secs(60));
+
+        let req_cc = client_req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cache-control"))
+            .map(|(_, v)| crate::http::HttpCacheDirectives::parse(v));
+        let client_no_cache = req_cc.as_ref().map(|cc| cc.no_cache).unwrap_or(false);
+        let client_no_store = req_cc.as_ref().map(|cc| cc.no_store).unwrap_or(false);
+
+        // 1. Check proactive push promise cache first
+        if self.enable_push_promises && !client_no_store {
+            if let Ok(mut cache) = self.push_promise_cache.lock() {
+                if let Some(entries) = cache.get_mut(&key) {
+                    if let Some(entry) = entries.last_mut() {
+                        if !client_no_cache && entry.is_fresh(now_sys, default_ttl) {
+                            entry.hit_count += 1;
+                            self.push_cache_hits
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let mut resp = entry.response.clone();
+                            if entry.directives.max_age.is_none() {
+                                entries.pop();
+                            }
+                            drop(cache);
+                            if !resp.body.is_empty() {
+                                chunk_handler(&resp.body);
+                            }
+                            for resp_interceptor in &self.response_interceptors {
+                                resp_interceptor(&client_req, &mut resp);
+                            }
+                            return Ok(resp);
+                        }
+                    }
                 }
-                for resp_interceptor in &self.response_interceptors {
-                    resp_interceptor(&client_req, &mut cached_resp);
+            }
+        }
+
+        // 2. Check general HTTP client cache
+        let mut cached_validator: Option<(Option<String>, Option<String>)> = None;
+        if self.enable_http_cache && !client_no_store {
+            if let Ok(mut cache) = self.http_cache_entries.lock() {
+                if let Some(entry) = cache.get_mut(&key) {
+                    if !client_no_cache && entry.is_fresh(now_sys, default_ttl) {
+                        entry.hit_count += 1;
+                        self.push_cache_hits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut resp = entry.response.clone();
+                        drop(cache);
+                        if !resp.body.is_empty() {
+                            chunk_handler(&resp.body);
+                        }
+                        for resp_interceptor in &self.response_interceptors {
+                            resp_interceptor(&client_req, &mut resp);
+                        }
+                        return Ok(resp);
+                    } else if entry.can_revalidate() {
+                        cached_validator = Some((entry.etag.clone(), entry.last_modified.clone()));
+                    }
                 }
-                return Ok(cached_resp);
+            }
+        }
+
+        // Also check if push promise cache has a stale entry with validators that can be revalidated
+        if cached_validator.is_none() && self.enable_push_promises && !client_no_store {
+            if let Ok(cache) = self.push_promise_cache.lock() {
+                if let Some(entries) = cache.get(&key) {
+                    if let Some(entry) = entries.last() {
+                        if entry.can_revalidate() {
+                            cached_validator =
+                                Some((entry.etag.clone(), entry.last_modified.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let is_revalidating = cached_validator.is_some();
+        if let Some((ref etag_opt, ref lm_opt)) = cached_validator {
+            if let Some(tag) = etag_opt {
+                if !client_req
+                    .headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("if-none-match"))
+                {
+                    client_req
+                        .headers
+                        .push(("if-none-match".to_string(), tag.clone()));
+                }
+            }
+            if let Some(lm) = lm_opt {
+                if !client_req
+                    .headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("if-modified-since"))
+                {
+                    client_req
+                        .headers
+                        .push(("if-modified-since".to_string(), lm.clone()));
+                }
             }
         }
 
@@ -5714,11 +6258,52 @@ impl AsyncHttp2Pool {
         let result = conn.recv_streaming_response_with_pool(
             stream_id,
             self.chunk_buffer_pool.clone(),
-            chunk_handler,
+            &mut chunk_handler,
         );
 
         match result {
             Ok(mut resp) => {
+                // If 304 Not Modified received on conditional revalidation, deliver cached body to handler and return 200
+                if resp.status.0 == 304 && is_revalidating {
+                    self.cache_revalidations
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.push_cache_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    let now_update = std::time::SystemTime::now();
+                    let mut resolved_resp = None;
+
+                    if self.enable_http_cache {
+                        if let Ok(mut cache) = self.http_cache_entries.lock() {
+                            if let Some(entry) = cache.get_mut(&key) {
+                                entry.update_from_304(&resp, now_update);
+                                resolved_resp = Some(entry.response.clone());
+                            }
+                        }
+                    }
+                    if resolved_resp.is_none() && self.enable_push_promises {
+                        if let Ok(mut cache) = self.push_promise_cache.lock() {
+                            if let Some(entries) = cache.get_mut(&key) {
+                                if let Some(entry) = entries.last_mut() {
+                                    entry.update_from_304(&resp, now_update);
+                                    resolved_resp = Some(entry.response.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(mut fresh_resp) = resolved_resp {
+                        self.release(conn);
+                        if !fresh_resp.body.is_empty() {
+                            chunk_handler(&fresh_resp.body);
+                        }
+                        for resp_interceptor in &self.response_interceptors {
+                            resp_interceptor(&client_req, &mut fresh_resp);
+                        }
+                        return Ok(fresh_resp);
+                    }
+                }
+
                 if let Some(alt_svc_val) = resp.headers.get("alt-svc") {
                     let routes = crate::simd_parser::AltSvcRoute::parse_header_value(alt_svc_val);
                     let origin = format!("{}:{}", self.host, self.port);
@@ -5730,6 +6315,26 @@ impl AsyncHttp2Pool {
                         }
                     }
                 }
+
+                // If response is cacheable 200 OK and http_cache is enabled, cache it
+                if self.enable_http_cache
+                    && (client_req.method.eq_ignore_ascii_case("GET")
+                        || client_req.method.eq_ignore_ascii_case("HEAD"))
+                    && resp.status.0 == 200
+                    && !client_no_store
+                {
+                    let entry = Http2PoolCacheEntry::new(
+                        client_req.method.clone(),
+                        client_req.path.clone(),
+                        resp.clone(),
+                    );
+                    if entry.is_cacheable() {
+                        if let Ok(mut cache) = self.http_cache_entries.lock() {
+                            cache.insert(key, entry);
+                        }
+                    }
+                }
+
                 self.release(conn);
                 for resp_interceptor in &self.response_interceptors {
                     resp_interceptor(&client_req, &mut resp);
@@ -13614,5 +14219,202 @@ mod tls_alpn_tests {
 
         pool.clear_push_promise_cache();
         assert_eq!(pool.push_promise_cache_count(), 0);
+    }
+
+    #[test]
+    fn test_http2_push_promise_rfc7234_freshness_and_no_store() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server_handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            };
+
+            // Stream 1 request
+            for _ in 0..30 {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::Headers { stream_id: 1, .. }) => break,
+                    _ => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+
+            // 1. Send PUSH_PROMISE on stream 2 with no-store (RFC 7234 must not store)
+            let p_no_store = server.session.create_push_promise(
+                1,
+                2,
+                &[(":method", "GET"), (":path", "/sensitive.json"), (":scheme", "http")],
+            );
+            server.send_frame(&p_no_store).expect("send p_no_store");
+            let resp_headers_no_store = [
+                (":status", "200"),
+                ("cache-control", "no-store, private"),
+            ];
+            server
+                .send_response(2, &resp_headers_no_store, Some(b"{\"secret\": 123}"))
+                .expect("send 2");
+
+            // 2. Send PUSH_PROMISE on stream 4 with max-age=3600 (RFC 7234 fresh)
+            let p_fresh = server.session.create_push_promise(
+                1,
+                4,
+                &[(":method", "GET"), (":path", "/bundle.js"), (":scheme", "http")],
+            );
+            server.send_frame(&p_fresh).expect("send p_fresh");
+            let resp_headers_fresh = [
+                (":status", "200"),
+                ("cache-control", "public, max-age=3600"),
+                ("etag", "\"bundle-v1\""),
+            ];
+            server
+                .send_response(4, &resp_headers_fresh, Some(b"console.log('bundle');"))
+                .expect("send 4");
+
+            // 3. Response on stream 1
+            let html_headers = [(":status", "200"), ("content-type", "text/html")];
+            server
+                .send_response(1, &html_headers, Some(b"<html>ready</html>"))
+                .expect("send 1");
+
+            for _ in 0..10 {
+                let _ = server.try_recv_frame();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2).with_push_promises(true);
+
+        // 1. Execute stream 1 request
+        let resp = pool
+            .execute_request("GET", "/index.html", &[], None)
+            .expect("exec index");
+        assert_eq!(resp.status.0, 200);
+
+        // /sensitive.json has no-store -> MUST NOT be in cache!
+        assert!(!pool.has_cached_push_response("GET", "/sensitive.json"));
+
+        // /bundle.js has max-age=3600 -> MUST be in cache!
+        assert!(pool.has_cached_push_response("GET", "/bundle.js"));
+        assert_eq!(pool.push_promise_cache_count(), 1);
+
+        // Consume /bundle.js
+        let resp_bundle = pool
+            .execute_request("GET", "/bundle.js", &[], None)
+            .expect("exec bundle");
+        assert_eq!(resp_bundle.status.0, 200);
+        assert_eq!(resp_bundle.body, b"console.log('bundle');");
+        assert_eq!(pool.push_cache_hits(), 1);
+
+        server_handle.join().expect("server join");
+    }
+
+    #[test]
+    fn test_http2_pool_rfc7232_conditional_revalidation_304() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server_handle = std::thread::spawn(move || {
+            let mut server = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => match AsyncHttp2Connection::server_handshake(stream) {
+                        Ok(conn) => break conn,
+                        Err(_) => continue,
+                    },
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            };
+
+            // Request 1: Initial GET /api/data
+            let mut s1 = 0;
+            for _ in 0..30 {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::Headers { stream_id, .. }) => {
+                        s1 = stream_id;
+                        break;
+                    }
+                    _ => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            assert_eq!(s1, 1);
+            let h1 = [
+                (":status", "200"),
+                ("etag", "\"v1-hash-abc\""),
+                ("cache-control", "public, max-age=60"),
+            ];
+            server
+                .send_response(1, &h1, Some(b"{\"version\": 1, \"status\": \"ok\"}"))
+                .expect("send s1 response");
+
+            // Request 2: Revalidation request with If-None-Match
+            let mut s2 = 0;
+            for _ in 0..30 {
+                match server.recv_frame() {
+                    Ok(crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        ..
+                    }) => {
+                        s2 = stream_id;
+                        break;
+                    }
+                    _ => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            assert_eq!(s2, 3);
+            let s2_stream = server.session.streams.get(&3).expect("stream 3 exists in session");
+            let if_none_match_found = s2_stream.received_headers.iter().any(|(k, v)| {
+                k.eq_ignore_ascii_case("if-none-match") && v == "\"v1-hash-abc\""
+            });
+            assert!(if_none_match_found, "Server must have received If-None-Match header!");
+
+            // Server replies 304 Not Modified with refreshed Cache-Control
+            let h2 = [
+                (":status", "304"),
+                ("etag", "\"v1-hash-abc\""),
+                ("cache-control", "public, max-age=120"),
+            ];
+            server.send_response(3, &h2, None).expect("send 304 response");
+
+            for _ in 0..10 {
+                let _ = server.try_recv_frame();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2).with_http_cache(true);
+        assert!(pool.http_cache_enabled());
+        assert_eq!(pool.cache_revalidations(), 0);
+
+        // 1. Initial request -> 200 OK stored in client cache
+        let resp1 = pool
+            .execute_request("GET", "/api/data", &[], None)
+            .expect("request 1");
+        assert_eq!(resp1.status.0, 200);
+        assert_eq!(resp1.body, b"{\"version\": 1, \"status\": \"ok\"}");
+        assert_eq!(pool.http_cache_count(), 1);
+
+        // 2. Second request forced with Cache-Control: no-cache to trigger conditional revalidation
+        let resp2 = pool
+            .execute_request(
+                "GET",
+                "/api/data",
+                &[("Cache-Control", "no-cache")],
+                None,
+            )
+            .expect("request 2 with revalidation");
+
+        // Transparent resolution: client sees 200 OK with cached body and revalidation count incremented!
+        assert_eq!(resp2.status.0, 200);
+        assert_eq!(resp2.body, b"{\"version\": 1, \"status\": \"ok\"}");
+        assert_eq!(pool.cache_revalidations(), 1);
+        assert_eq!(pool.stats().cache_revalidations, 1);
+        assert_eq!(pool.push_cache_hits(), 1);
+
+        server_handle.join().expect("server join");
     }
 }
