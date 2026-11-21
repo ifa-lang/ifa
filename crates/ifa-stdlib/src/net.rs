@@ -5851,6 +5851,678 @@ pub enum AltSvcSelectionStrategy {
     MaxLatencyPenalty(std::time::Duration),
 }
 
+/// Transport protocol variant for multi-session connection pooling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransportProtocol {
+    /// HTTP/2 (multiplexed TCP/TLS transport, RFC 7540 / RFC 9113).
+    Http2,
+    /// HTTP/3 (multiplexed QUIC/UDP transport, RFC 9000 / RFC 9114).
+    Http3,
+}
+
+impl std::fmt::Display for TransportProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http2 => write!(f, "HTTP/2"),
+            Self::Http3 => write!(f, "HTTP/3"),
+        }
+    }
+}
+
+/// Bandwidth quota and fair-share allocation state configured per origin/domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginBandwidthQuota {
+    /// Target origin / domain identifier (e.g. `https://api.example.com`).
+    pub origin: String,
+    /// Maximum allowed bandwidth allocation in bytes per scheduling epoch/round.
+    pub max_bandwidth_bytes: usize,
+    /// Minimum guaranteed bandwidth allocation in bytes to prevent starvation.
+    pub min_guaranteed_bytes: usize,
+    /// Proportional fair-share weight for hierarchical DRR scheduling (1..=65535).
+    pub weight: u16,
+    /// Top-level accumulated DRR deficit credit.
+    pub deficit: usize,
+    /// Number of consecutive scheduling rounds where this origin had pending data but received zero allocation.
+    pub consecutive_starved_rounds: usize,
+    /// Cumulative total bytes dispatched for this origin across all sessions.
+    pub total_dispatched_bytes: usize,
+}
+
+impl OriginBandwidthQuota {
+    /// Create a new bandwidth quota configuration for an origin.
+    pub fn new(
+        origin: impl Into<String>,
+        max_bandwidth_bytes: usize,
+        min_guaranteed_bytes: usize,
+        weight: u16,
+    ) -> Self {
+        Self {
+            origin: origin.into(),
+            max_bandwidth_bytes: max_bandwidth_bytes.max(min_guaranteed_bytes).max(1),
+            min_guaranteed_bytes: min_guaranteed_bytes.max(1),
+            weight: weight.max(1),
+            deficit: 0,
+            consecutive_starved_rounds: 0,
+            total_dispatched_bytes: 0,
+        }
+    }
+}
+
+/// Descriptor and runtime scheduling state of an active transport session (HTTP/2 or HTTP/3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportSessionDescriptor {
+    /// Unique session identifier within the pool.
+    pub session_id: u64,
+    /// Associated origin / domain identifier.
+    pub origin: String,
+    /// Transport protocol used by this session (HTTP/2 or HTTP/3).
+    pub protocol: TransportProtocol,
+    /// Session priority weight for intra-origin DRR deficit allocation.
+    pub weight: u16,
+    /// Pending outbound payload bytes queued for transmission.
+    pub pending_bytes: usize,
+    /// Transport-level DRR deficit credit accumulated on this session.
+    pub deficit: usize,
+    /// Consecutive scheduling rounds where this session had pending data but received zero allocation.
+    pub consecutive_starved_rounds: usize,
+    /// Total bytes dispatched through this session.
+    pub total_dispatched_bytes: usize,
+}
+
+impl TransportSessionDescriptor {
+    /// Create a new session descriptor.
+    pub fn new(
+        session_id: u64,
+        origin: impl Into<String>,
+        protocol: TransportProtocol,
+        weight: u16,
+    ) -> Self {
+        Self {
+            session_id,
+            origin: origin.into(),
+            protocol,
+            weight: weight.max(1),
+            pending_bytes: 0,
+            deficit: 0,
+            consecutive_starved_rounds: 0,
+            total_dispatched_bytes: 0,
+        }
+    }
+}
+
+/// A slice of transmission bandwidth allocated to a specific session during an arbitration round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDispatchSlice {
+    /// Session ID granted the slice.
+    pub session_id: u64,
+    /// Origin of the session.
+    pub origin: String,
+    /// Transport protocol (HTTP/2 or HTTP/3).
+    pub protocol: TransportProtocol,
+    /// Bytes authorized for transmission in this slice.
+    pub allocated_bytes: usize,
+    /// Remaining pending bytes queued on the session after this slice.
+    pub remaining_pending_bytes: usize,
+    /// Remaining DRR deficit credit on this session after this slice.
+    pub remaining_deficit: usize,
+    /// Whether this allocation was triggered by anti-starvation priority boosting.
+    pub anti_starvation_boost_applied: bool,
+}
+
+/// Comprehensive report of an inter-session fair arbitration round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterSessionFairnessReport {
+    /// Total bandwidth available for allocation in this round (in bytes).
+    pub total_round_capacity: usize,
+    /// Total bytes successfully scheduled and allocated across sessions.
+    pub total_allocated_bytes: usize,
+    /// Slices allocated to sessions in chronological dispatch order.
+    pub slices: Vec<SessionDispatchSlice>,
+    /// Origins that received anti-starvation priority or boost during this round.
+    pub starved_origins_boosted: Vec<String>,
+    /// Sessions that received anti-starvation priority or boost during this round.
+    pub starved_sessions_boosted: Vec<u64>,
+    /// Aggregate residual DRR deficits remaining active across all sessions.
+    pub residual_session_deficits: usize,
+    /// Aggregate residual DRR deficits remaining active across all origins.
+    pub residual_origin_deficits: usize,
+}
+
+/// Hierarchical Deficit Round Robin (DRR) arbitrator for multi-session HTTP/2 & HTTP/3 connection pools.
+///
+/// Features:
+/// 1. Hierarchical Two-Level Arbitration: Level 1 (Origins/Domains) & Level 2 (Transport Sessions).
+/// 2. Strict Origin Bandwidth Quotas (max bytes cap per epoch).
+/// 3. Minimum Guaranteed Bandwidth per origin preventing inter-host starvation.
+/// 4. Transport-Level DRR balancing between HTTP/2 and HTTP/3 sessions.
+/// 5. Starvation detection and anti-starvation boosting for unserved hosts.
+/// 6. Strict DRR credit conservation and deficit zeroing on empty queues.
+#[derive(Debug, Clone)]
+pub struct InterSessionDrrArbitrator {
+    /// Transport DRR base quantum in bytes (default: 1024).
+    base_quantum: usize,
+    /// Consecutive starved rounds required to trigger anti-starvation boost (default: 2).
+    starvation_threshold_rounds: usize,
+    /// Default maximum bandwidth quota for unconfigured origins.
+    default_origin_max_quota: usize,
+    /// Default minimum guaranteed bandwidth for unconfigured origins.
+    default_origin_min_guaranteed: usize,
+    /// Configured origin quotas and states.
+    origins: std::collections::HashMap<String, OriginBandwidthQuota>,
+    /// Registered transport sessions (HTTP/2 and HTTP/3).
+    sessions: std::collections::HashMap<u64, TransportSessionDescriptor>,
+    /// Order of origins for round-robin rotation.
+    origin_order: Vec<String>,
+    /// Rotation index for fair round-robin origin traversal.
+    origin_round_index: usize,
+}
+
+impl InterSessionDrrArbitrator {
+    /// Default transport DRR base quantum (1024 bytes).
+    pub const DEFAULT_BASE_QUANTUM: usize = 1024;
+    /// Default starvation threshold in scheduling rounds (2 rounds).
+    pub const DEFAULT_STARVATION_THRESHOLD_ROUNDS: usize = 2;
+    /// Default maximum bandwidth quota per origin (65536 bytes).
+    pub const DEFAULT_ORIGIN_MAX_QUOTA: usize = 65536;
+    /// Default minimum guaranteed bandwidth per origin (4096 bytes).
+    pub const DEFAULT_ORIGIN_MIN_GUARANTEED: usize = 4096;
+
+    /// Create a new InterSessionDrrArbitrator with configured base quantum.
+    pub fn new(base_quantum: usize) -> Self {
+        Self {
+            base_quantum: base_quantum.max(1),
+            starvation_threshold_rounds: Self::DEFAULT_STARVATION_THRESHOLD_ROUNDS,
+            default_origin_max_quota: Self::DEFAULT_ORIGIN_MAX_QUOTA,
+            default_origin_min_guaranteed: Self::DEFAULT_ORIGIN_MIN_GUARANTEED,
+            origins: std::collections::HashMap::new(),
+            sessions: std::collections::HashMap::new(),
+            origin_order: Vec::new(),
+            origin_round_index: 0,
+        }
+    }
+
+    /// Configure the starvation threshold in consecutive scheduling rounds.
+    pub fn with_starvation_threshold(mut self, threshold: usize) -> Self {
+        self.starvation_threshold_rounds = threshold.max(1);
+        self
+    }
+
+    /// Configure default origin max quota and min guaranteed bandwidth.
+    pub fn with_default_origin_quotas(mut self, max_quota: usize, min_guaranteed: usize) -> Self {
+        self.default_origin_max_quota = max_quota.max(min_guaranteed).max(1);
+        self.default_origin_min_guaranteed = min_guaranteed.max(1);
+        self
+    }
+
+    /// Set the transport DRR base quantum in bytes.
+    pub fn set_base_quantum(&mut self, quantum: usize) {
+        self.base_quantum = quantum.max(1);
+    }
+
+    /// Base quantum configured on this arbitrator.
+    pub fn base_quantum(&self) -> usize {
+        self.base_quantum
+    }
+
+    /// Set the consecutive starved rounds threshold.
+    pub fn set_starvation_threshold(&mut self, threshold: usize) {
+        self.starvation_threshold_rounds = threshold.max(1);
+    }
+
+    /// Starvation threshold configured on this arbitrator.
+    pub fn starvation_threshold(&self) -> usize {
+        self.starvation_threshold_rounds
+    }
+
+    /// Configure explicit bandwidth quota and minimum guaranteed bandwidth for an origin.
+    pub fn configure_origin_quota(
+        &mut self,
+        origin: &str,
+        max_bytes: usize,
+        min_guaranteed: usize,
+        weight: u16,
+    ) {
+        let entry = self.origins.entry(origin.to_string()).or_insert_with(|| {
+            if !self.origin_order.contains(&origin.to_string()) {
+                self.origin_order.push(origin.to_string());
+            }
+            OriginBandwidthQuota::new(origin, max_bytes, min_guaranteed, weight)
+        });
+        entry.max_bandwidth_bytes = max_bytes.max(min_guaranteed).max(1);
+        entry.min_guaranteed_bytes = min_guaranteed.max(1);
+        entry.weight = weight.max(1);
+    }
+
+    /// Retrieve the bandwidth quota configuration for an origin, if registered.
+    pub fn get_origin_quota(&self, origin: &str) -> Option<&OriginBandwidthQuota> {
+        self.origins.get(origin)
+    }
+
+    /// Snapshot map of all registered origins.
+    pub fn origins(&self) -> &std::collections::HashMap<String, OriginBandwidthQuota> {
+        &self.origins
+    }
+
+    /// Register a new transport session into the arbitrator.
+    pub fn register_session(
+        &mut self,
+        session_id: u64,
+        origin: &str,
+        protocol: TransportProtocol,
+        weight: u16,
+    ) {
+        if !self.origins.contains_key(origin) {
+            self.configure_origin_quota(
+                origin,
+                self.default_origin_max_quota,
+                self.default_origin_min_guaranteed,
+                1,
+            );
+        }
+        self.sessions.insert(
+            session_id,
+            TransportSessionDescriptor::new(session_id, origin, protocol, weight),
+        );
+    }
+
+    /// Unregister a transport session upon connection closure.
+    pub fn unregister_session(&mut self, session_id: u64) {
+        self.sessions.remove(&session_id);
+    }
+
+    /// Set queued pending payload bytes on a session.
+    pub fn set_session_pending_bytes(&mut self, session_id: u64, pending_bytes: usize) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            sess.pending_bytes = pending_bytes;
+        }
+    }
+
+    /// Add queued pending payload bytes to a session.
+    pub fn add_session_pending_bytes(&mut self, session_id: u64, additional_bytes: usize) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            sess.pending_bytes += additional_bytes;
+        }
+    }
+
+    /// Retrieve descriptor of a registered session.
+    pub fn get_session(&self, session_id: u64) -> Option<&TransportSessionDescriptor> {
+        self.sessions.get(&session_id)
+    }
+
+    /// Snapshot map of all registered sessions.
+    pub fn sessions(&self) -> &std::collections::HashMap<u64, TransportSessionDescriptor> {
+        &self.sessions
+    }
+
+    /// Total count of registered transport sessions.
+    pub fn sessions_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Total count of registered origins.
+    pub fn origins_count(&self) -> usize {
+        self.origins.len()
+    }
+
+    /// Total aggregate pending payload bytes across all registered sessions.
+    pub fn total_pending_bytes(&self) -> usize {
+        self.sessions.values().map(|s| s.pending_bytes).sum()
+    }
+
+    /// Execute a hierarchical fair-queueing scheduling round across all registered sessions and origins
+    /// with the specified global bandwidth capacity cap.
+    pub fn schedule_round(&mut self, available_bandwidth: usize) -> InterSessionFairnessReport {
+        let mut remaining_bandwidth = available_bandwidth;
+        let mut total_allocated_bytes = 0;
+        let mut slices = Vec::new();
+        let mut starved_origins_boosted = Vec::new();
+        let mut starved_sessions_boosted = Vec::new();
+
+        if available_bandwidth == 0 {
+            let res_sess = self.sessions.values().map(|s| s.deficit).sum();
+            let res_orig = self.origins.values().map(|q| q.deficit).sum();
+            return InterSessionFairnessReport {
+                total_round_capacity: 0,
+                total_allocated_bytes: 0,
+                slices,
+                starved_origins_boosted,
+                starved_sessions_boosted,
+                residual_session_deficits: res_sess,
+                residual_origin_deficits: res_orig,
+            };
+        }
+
+        // Sessions and origins that had pending data at the start of this round
+        let sessions_with_pending_at_start: std::collections::HashSet<u64> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.pending_bytes > 0)
+            .map(|(&id, _)| id)
+            .collect();
+
+        let origins_with_pending_at_start: std::collections::HashSet<String> = self
+            .sessions
+            .values()
+            .filter(|s| s.pending_bytes > 0)
+            .map(|s| s.origin.clone())
+            .collect();
+
+        if sessions_with_pending_at_start.is_empty() {
+            let res_sess = self.sessions.values().map(|s| s.deficit).sum();
+            let res_orig = self.origins.values().map(|q| q.deficit).sum();
+            return InterSessionFairnessReport {
+                total_round_capacity: available_bandwidth,
+                total_allocated_bytes: 0,
+                slices,
+                starved_origins_boosted,
+                starved_sessions_boosted,
+                residual_session_deficits: res_sess,
+                residual_origin_deficits: res_orig,
+            };
+        }
+
+        // Phase 1: Starvation Detection and Anti-Starvation Preemption
+        // Identify origins whose consecutive_starved_rounds >= self.starvation_threshold_rounds
+        let mut starved_origins: Vec<String> = origins_with_pending_at_start
+            .iter()
+            .filter(|&orig| {
+                self.origins
+                    .get(orig)
+                    .map(|q| q.consecutive_starved_rounds >= self.starvation_threshold_rounds)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        starved_origins.sort();
+
+        for origin_name in starved_origins {
+            if remaining_bandwidth == 0 {
+                break;
+            }
+            let (min_guaranteed, max_quota) = self
+                .origins
+                .get(&origin_name)
+                .map(|q| (q.min_guaranteed_bytes, q.max_bandwidth_bytes))
+                .unwrap_or((
+                    self.default_origin_min_guaranteed,
+                    self.default_origin_max_quota,
+                ));
+
+            let origin_pending: usize = self
+                .sessions
+                .values()
+                .filter(|s| s.origin == origin_name)
+                .map(|s| s.pending_bytes)
+                .sum();
+
+            if origin_pending == 0 {
+                continue;
+            }
+
+            let starved_budget = min_guaranteed
+                .min(origin_pending)
+                .min(max_quota)
+                .min(remaining_bandwidth);
+
+            if starved_budget > 0 {
+                starved_origins_boosted.push(origin_name.clone());
+                let mut origin_remaining_starved = starved_budget;
+
+                // Find sessions under this origin with pending data, prioritizing starved sessions
+                let mut origin_session_ids: Vec<u64> = self
+                    .sessions
+                    .iter()
+                    .filter(|(_, s)| s.origin == origin_name && s.pending_bytes > 0)
+                    .map(|(&id, _)| id)
+                    .collect();
+
+                origin_session_ids.sort_by(|&a, &b| {
+                    let sa = &self.sessions[&a];
+                    let sb = &self.sessions[&b];
+                    sb.consecutive_starved_rounds
+                        .cmp(&sa.consecutive_starved_rounds)
+                        .then_with(|| a.cmp(&b))
+                });
+
+                for sid in origin_session_ids {
+                    if origin_remaining_starved == 0 || remaining_bandwidth == 0 {
+                        break;
+                    }
+                    let sess = self.sessions.get_mut(&sid).unwrap();
+                    let grant = sess
+                        .pending_bytes
+                        .min(origin_remaining_starved)
+                        .min(remaining_bandwidth);
+                    if grant > 0 {
+                        sess.pending_bytes -= grant;
+                        sess.total_dispatched_bytes += grant;
+                        sess.consecutive_starved_rounds = 0;
+                        origin_remaining_starved -= grant;
+                        remaining_bandwidth -= grant;
+                        total_allocated_bytes += grant;
+                        if !starved_sessions_boosted.contains(&sid) {
+                            starved_sessions_boosted.push(sid);
+                        }
+                        slices.push(SessionDispatchSlice {
+                            session_id: sid,
+                            origin: origin_name.clone(),
+                            protocol: sess.protocol,
+                            allocated_bytes: grant,
+                            remaining_pending_bytes: sess.pending_bytes,
+                            remaining_deficit: sess.deficit,
+                            anti_starvation_boost_applied: true,
+                        });
+                    }
+                }
+
+                if let Some(quota) = self.origins.get_mut(&origin_name) {
+                    let allocated_for_origin = starved_budget - origin_remaining_starved;
+                    quota.total_dispatched_bytes += allocated_for_origin;
+                    quota.consecutive_starved_rounds = 0;
+                }
+            }
+        }
+
+        // Phase 2: Hierarchical DRR Arbitration across Origins and Transport Sessions
+        for orig in &origins_with_pending_at_start {
+            if !self.origin_order.contains(orig) {
+                self.origin_order.push(orig.clone());
+            }
+            if !self.origins.contains_key(orig) {
+                self.origins.insert(
+                    orig.clone(),
+                    OriginBandwidthQuota::new(
+                        orig,
+                        self.default_origin_max_quota,
+                        self.default_origin_min_guaranteed,
+                        1,
+                    ),
+                );
+            }
+        }
+
+        let origin_count = self.origin_order.len();
+        if origin_count > 0 && remaining_bandwidth > 0 {
+            let start_idx = self.origin_round_index % origin_count;
+            let mut loop_rounds = 0;
+            let max_rounds = 16;
+            let mut origin_allocated_in_round: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+
+            while loop_rounds < max_rounds && remaining_bandwidth > 0 {
+                let mut round_progress = false;
+
+                for i in 0..origin_count {
+                    if remaining_bandwidth == 0 {
+                        break;
+                    }
+                    let idx = (start_idx + i) % origin_count;
+                    let origin_name = self.origin_order[idx].clone();
+
+                    let active_sess_count = self
+                        .sessions
+                        .values()
+                        .filter(|s| s.origin == origin_name && s.pending_bytes > 0)
+                        .count();
+                    if active_sess_count == 0 {
+                        if let Some(q) = self.origins.get_mut(&origin_name) {
+                            q.deficit = 0;
+                        }
+                        continue;
+                    }
+
+                    let max_q = self
+                        .origins
+                        .get(&origin_name)
+                        .map(|q| q.max_bandwidth_bytes)
+                        .unwrap_or(self.default_origin_max_quota);
+                    let allocated_so_far = origin_allocated_in_round
+                        .get(&origin_name)
+                        .copied()
+                        .unwrap_or(0);
+                    let origin_round_remaining = max_q.saturating_sub(allocated_so_far);
+                    if origin_round_remaining == 0 {
+                        continue;
+                    }
+
+                    if let Some(q) = self.origins.get_mut(&origin_name) {
+                        let quantum = self.base_quantum * (q.weight as usize) * active_sess_count;
+                        q.deficit = (q.deficit + quantum).min(origin_round_remaining);
+                    }
+
+                    let cur_origin_deficit = self
+                        .origins
+                        .get(&origin_name)
+                        .map(|q| q.deficit)
+                        .unwrap_or(0);
+                    if cur_origin_deficit == 0 {
+                        continue;
+                    }
+
+                    // Level 2: DRR Transport Session scheduling within this origin
+                    let mut session_ids: Vec<u64> = self
+                        .sessions
+                        .iter()
+                        .filter(|(_, s)| s.origin == origin_name && s.pending_bytes > 0)
+                        .map(|(&id, _)| id)
+                        .collect();
+                    session_ids.sort();
+
+                    for sid in session_ids {
+                        if remaining_bandwidth == 0 {
+                            break;
+                        }
+                        let cur_orig_def = self
+                            .origins
+                            .get(&origin_name)
+                            .map(|q| q.deficit)
+                            .unwrap_or(0);
+                        let allocated_so_far = origin_allocated_in_round
+                            .get(&origin_name)
+                            .copied()
+                            .unwrap_or(0);
+                        let origin_avail = max_q.saturating_sub(allocated_so_far).min(cur_orig_def);
+                        if origin_avail == 0 {
+                            break;
+                        }
+
+                        let sess = self.sessions.get_mut(&sid).unwrap();
+                        sess.deficit += self.base_quantum * (sess.weight as usize);
+
+                        if sess.deficit == 0 || sess.pending_bytes == 0 {
+                            continue;
+                        }
+
+                        let slice = sess
+                            .pending_bytes
+                            .min(sess.deficit)
+                            .min(origin_avail)
+                            .min(remaining_bandwidth);
+
+                        if slice > 0 {
+                            sess.pending_bytes -= slice;
+                            sess.deficit -= slice;
+                            sess.total_dispatched_bytes += slice;
+                            sess.consecutive_starved_rounds = 0;
+
+                            *origin_allocated_in_round
+                                .entry(origin_name.clone())
+                                .or_insert(0) += slice;
+
+                            if let Some(q) = self.origins.get_mut(&origin_name) {
+                                q.deficit = q.deficit.saturating_sub(slice);
+                                q.total_dispatched_bytes += slice;
+                                q.consecutive_starved_rounds = 0;
+                            }
+
+                            remaining_bandwidth -= slice;
+                            total_allocated_bytes += slice;
+                            round_progress = true;
+
+                            slices.push(SessionDispatchSlice {
+                                session_id: sid,
+                                origin: origin_name.clone(),
+                                protocol: sess.protocol,
+                                allocated_bytes: slice,
+                                remaining_pending_bytes: sess.pending_bytes,
+                                remaining_deficit: sess.deficit,
+                                anti_starvation_boost_applied: false,
+                            });
+
+                            if sess.pending_bytes == 0 {
+                                sess.deficit = 0;
+                            }
+                        }
+                    }
+                }
+
+                loop_rounds += 1;
+                if !round_progress {
+                    break;
+                }
+            }
+
+            self.origin_round_index = (self.origin_round_index + 1) % origin_count;
+        }
+
+        // Phase 3: Post-round Starvation accounting & Invariant checks
+        let dispatched_session_ids: std::collections::HashSet<u64> =
+            slices.iter().map(|s| s.session_id).collect();
+        for sid in &sessions_with_pending_at_start {
+            if !dispatched_session_ids.contains(sid) {
+                if let Some(s) = self.sessions.get_mut(sid) {
+                    if s.pending_bytes > 0 {
+                        s.consecutive_starved_rounds += 1;
+                    }
+                }
+            }
+        }
+
+        let dispatched_origins: std::collections::HashSet<String> =
+            slices.iter().map(|s| s.origin.clone()).collect();
+        for orig in &origins_with_pending_at_start {
+            if !dispatched_origins.contains(orig) {
+                if let Some(q) = self.origins.get_mut(orig) {
+                    q.consecutive_starved_rounds += 1;
+                }
+            }
+        }
+
+        let residual_session_deficits = self.sessions.values().map(|s| s.deficit).sum();
+        let residual_origin_deficits = self.origins.values().map(|q| q.deficit).sum();
+
+        InterSessionFairnessReport {
+            total_round_capacity: available_bandwidth,
+            total_allocated_bytes,
+            slices,
+            starved_origins_boosted,
+            starved_sessions_boosted,
+            residual_session_deficits,
+            residual_origin_deficits,
+        }
+    }
+}
+
 /// An idle pooled HTTP/2 connection paired with the timestamp at which it became idle.
 struct PooledConnectionEntry {
     conn: AsyncHttp2Connection,
@@ -5916,6 +6588,8 @@ pub struct AsyncHttp2Pool {
     decompressed_responses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     drr_base_quantum: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     drr_max_frame_size: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    inter_session_arbitrator: std::sync::Arc<std::sync::Mutex<InterSessionDrrArbitrator>>,
+    next_session_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AsyncHttp2Pool {
@@ -5992,6 +6666,10 @@ impl AsyncHttp2Pool {
             decompressed_responses: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             drr_base_quantum: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1024)),
             drr_max_frame_size: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(16384)),
+            inter_session_arbitrator: std::sync::Arc::new(std::sync::Mutex::new(
+                InterSessionDrrArbitrator::new(1024),
+            )),
+            next_session_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 
@@ -6059,6 +6737,94 @@ impl AsyncHttp2Pool {
         } else {
             Vec::new()
         }
+    }
+
+    /// Retrieve the shared inter-session DRR arbitrator managing multi-connection fairness across origins.
+    pub fn inter_session_arbitrator(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<InterSessionDrrArbitrator>> {
+        self.inter_session_arbitrator.clone()
+    }
+
+    /// Configure bandwidth quota and minimum guaranteed bandwidth for a specific origin / domain.
+    pub fn configure_origin_quota(
+        &self,
+        origin: &str,
+        max_bytes: usize,
+        min_guaranteed: usize,
+        weight: u16,
+    ) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.configure_origin_quota(origin, max_bytes, min_guaranteed, weight);
+        }
+    }
+
+    /// Register a transport session (HTTP/2 or HTTP/3) into the pool's inter-session arbitrator.
+    pub fn register_transport_session(
+        &self,
+        session_id: u64,
+        origin: &str,
+        protocol: TransportProtocol,
+        weight: u16,
+    ) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.register_session(session_id, origin, protocol, weight);
+        }
+    }
+
+    /// Unregister a transport session from the pool's inter-session arbitrator upon closure.
+    pub fn unregister_transport_session(&self, session_id: u64) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.unregister_session(session_id);
+        }
+    }
+
+    /// Update queued outbound pending payload bytes for a registered transport session.
+    pub fn update_session_pending_data(&self, session_id: u64, pending_bytes: usize) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.set_session_pending_bytes(session_id, pending_bytes);
+        }
+    }
+
+    /// Perform a hierarchical fair-queueing scheduling round across all registered sessions and origins
+    /// with the specified global bandwidth capacity cap.
+    pub fn schedule_inter_session_bandwidth(
+        &self,
+        available_bandwidth: usize,
+    ) -> InterSessionFairnessReport {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.schedule_round(available_bandwidth)
+        } else {
+            InterSessionFairnessReport {
+                total_round_capacity: available_bandwidth,
+                total_allocated_bytes: 0,
+                slices: Vec::new(),
+                starved_origins_boosted: Vec::new(),
+                starved_sessions_boosted: Vec::new(),
+                residual_session_deficits: 0,
+                residual_origin_deficits: 0,
+            }
+        }
+    }
+
+    /// Set the base quantum for the inter-session DRR arbitrator.
+    pub fn set_inter_session_base_quantum(&self, quantum: usize) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.set_base_quantum(quantum);
+        }
+    }
+
+    /// Set the consecutive starved rounds threshold triggering anti-starvation preemption.
+    pub fn set_starvation_threshold_rounds(&self, rounds: usize) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.set_starvation_threshold(rounds);
+        }
+    }
+
+    /// Allocate a fresh session identifier for pooled connections.
+    pub fn next_session_id(&self) -> u64 {
+        self.next_session_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Configure whether client push promise caching and automated absorption is enabled across connections in this pool.
@@ -7073,6 +7839,10 @@ impl AsyncHttp2Pool {
         if let Some(ref pool) = self.chunk_buffer_pool {
             conn.chunk_buffer_pool = Some(pool.clone());
         }
+
+        let sid = self.next_session_id();
+        let origin = format!("{}:{}", self.host, self.port);
+        self.register_transport_session(sid, &origin, TransportProtocol::Http2, 1);
 
         self.active_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -18669,5 +19439,208 @@ mod tls_alpn_tests {
         );
 
         let _ = server_handle.join();
+    }
+
+    #[test]
+    fn test_inter_session_drr_fairness_http2_and_http3() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+        let origin = "https://api.example.com:443";
+
+        // Register Session 1 (HTTP/2, weight 1) and Session 2 (HTTP/3, weight 1)
+        arb.register_session(1, origin, TransportProtocol::Http2, 1);
+        arb.register_session(2, origin, TransportProtocol::Http3, 1);
+
+        assert_eq!(arb.sessions_count(), 2);
+        assert_eq!(arb.origins_count(), 1);
+
+        // Both sessions have 4096 pending bytes
+        arb.set_session_pending_bytes(1, 4096);
+        arb.set_session_pending_bytes(2, 4096);
+        assert_eq!(arb.total_pending_bytes(), 8192);
+
+        // Schedule a round with 2048 bytes capacity (quantum 1024 for each session)
+        let report = arb.schedule_round(2048);
+        assert_eq!(report.total_round_capacity, 2048);
+        assert_eq!(report.total_allocated_bytes, 2048);
+        assert_eq!(report.slices.len(), 2);
+
+        // Verify fair allocation: Session 1 gets 1024 bytes, Session 2 gets 1024 bytes
+        assert_eq!(report.slices[0].session_id, 1);
+        assert_eq!(report.slices[0].protocol, TransportProtocol::Http2);
+        assert_eq!(report.slices[0].allocated_bytes, 1024);
+        assert_eq!(report.slices[0].remaining_pending_bytes, 3072);
+
+        assert_eq!(report.slices[1].session_id, 2);
+        assert_eq!(report.slices[1].protocol, TransportProtocol::Http3);
+        assert_eq!(report.slices[1].allocated_bytes, 1024);
+        assert_eq!(report.slices[1].remaining_pending_bytes, 3072);
+
+        assert_eq!(arb.total_pending_bytes(), 6144);
+    }
+
+    #[test]
+    fn test_inter_session_hierarchical_multi_origin_bandwidth_quota() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+
+        let origin_api = "https://api.example.com";
+        let origin_cdn = "https://static.cdn.com";
+
+        // API origin is capped at 2048 bytes per round
+        arb.configure_origin_quota(origin_api, 2048, 1024, 1);
+        // CDN origin has a higher cap of 8192 bytes per round
+        arb.configure_origin_quota(origin_cdn, 8192, 1024, 1);
+
+        arb.register_session(10, origin_api, TransportProtocol::Http2, 1);
+        arb.register_session(20, origin_cdn, TransportProtocol::Http3, 1);
+
+        // API has 10000 pending bytes; CDN has 20000 pending bytes
+        arb.set_session_pending_bytes(10, 10000);
+        arb.set_session_pending_bytes(20, 20000);
+
+        // Global round capacity is 15000 bytes
+        let report = arb.schedule_round(15000);
+
+        let api_allocated: usize = report
+            .slices
+            .iter()
+            .filter(|s| s.origin == origin_api)
+            .map(|s| s.allocated_bytes)
+            .sum();
+
+        let cdn_allocated: usize = report
+            .slices
+            .iter()
+            .filter(|s| s.origin == origin_cdn)
+            .map(|s| s.allocated_bytes)
+            .sum();
+
+        // API must not exceed its configured quota of 2048
+        assert!(
+            api_allocated <= 2048,
+            "api exceeded quota: {}",
+            api_allocated
+        );
+        assert_eq!(api_allocated, 2048);
+
+        // CDN must not exceed its configured quota of 8192
+        assert!(
+            cdn_allocated <= 8192,
+            "cdn exceeded quota: {}",
+            cdn_allocated
+        );
+        assert_eq!(cdn_allocated, 8192);
+
+        assert_eq!(report.total_allocated_bytes, api_allocated + cdn_allocated);
+    }
+
+    #[test]
+    fn test_inter_session_inter_host_starvation_prevention() {
+        let mut arb = InterSessionDrrArbitrator::new(1024).with_starvation_threshold(2);
+
+        let origin_dominant = "https://heavy.example.com";
+        let origin_starved = "https://light.example.com";
+
+        arb.configure_origin_quota(origin_dominant, 8192, 1024, 1);
+        arb.configure_origin_quota(origin_starved, 4096, 2048, 1);
+
+        arb.register_session(100, origin_dominant, TransportProtocol::Http2, 1);
+        arb.register_session(200, origin_starved, TransportProtocol::Http3, 1);
+
+        // Manually simulate that light.example.com was starved for 2 rounds
+        if let Some(quota) = arb.origins.get_mut(origin_starved) {
+            quota.consecutive_starved_rounds = 2;
+        }
+        if let Some(sess) = arb.sessions.get_mut(&200) {
+            sess.consecutive_starved_rounds = 2;
+        }
+
+        arb.set_session_pending_bytes(100, 10000);
+        arb.set_session_pending_bytes(200, 2048);
+
+        // Execute scheduling round with 4096 bytes capacity
+        let report = arb.schedule_round(4096);
+
+        // Anti-starvation boost must be triggered for origin_starved and session 200
+        assert_eq!(
+            report.starved_origins_boosted,
+            vec![origin_starved.to_string()]
+        );
+        assert_eq!(report.starved_sessions_boosted, vec![200]);
+
+        // The first slice must belong to the boosted starved session with anti_starvation_boost_applied = true
+        let boosted_slice = report
+            .slices
+            .iter()
+            .find(|s| s.session_id == 200)
+            .expect("starved session served");
+        assert!(boosted_slice.anti_starvation_boost_applied);
+        assert_eq!(boosted_slice.allocated_bytes, 2048);
+        assert_eq!(boosted_slice.remaining_pending_bytes, 0);
+
+        // Consecutive starved rounds counter must be reset to 0
+        assert_eq!(
+            arb.get_origin_quota(origin_starved)
+                .unwrap()
+                .consecutive_starved_rounds,
+            0
+        );
+        assert_eq!(arb.get_session(200).unwrap().consecutive_starved_rounds, 0);
+    }
+
+    #[test]
+    fn test_inter_session_drr_empty_queue_deficit_reset() {
+        let mut arb = InterSessionDrrArbitrator::new(2048);
+        let origin = "https://drain.example.com";
+
+        arb.register_session(1, origin, TransportProtocol::Http2, 1);
+
+        // Session has 500 bytes pending (less than quantum of 2048)
+        arb.set_session_pending_bytes(1, 500);
+
+        let report = arb.schedule_round(4096);
+        assert_eq!(report.total_allocated_bytes, 500);
+
+        // Since session is now completely drained, its deficit must be 0 (RFC DRR property)
+        let sess = arb.get_session(1).unwrap();
+        assert_eq!(sess.pending_bytes, 0);
+        assert_eq!(sess.deficit, 0);
+    }
+
+    #[test]
+    fn test_async_http2_pool_inter_session_arbitration_integration() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 8080, 2);
+
+        // Configure origin quota via pool
+        pool.configure_origin_quota("https://api.mycorp.org", 4096, 1024, 2);
+
+        // Register HTTP/2 and HTTP/3 transport sessions via pool
+        pool.register_transport_session(101, "https://api.mycorp.org", TransportProtocol::Http2, 1);
+        pool.register_transport_session(102, "https://api.mycorp.org", TransportProtocol::Http3, 2);
+
+        // Update pending payload queues
+        pool.update_session_pending_data(101, 2048);
+        pool.update_session_pending_data(102, 4096);
+
+        // Perform pool-level inter-session fair scheduling
+        let report = pool.schedule_inter_session_bandwidth(3072);
+        assert_eq!(report.total_round_capacity, 3072);
+        assert!(report.total_allocated_bytes > 0);
+        assert!(!report.slices.is_empty());
+
+        // Both HTTP/2 and HTTP/3 received bandwidth allocations
+        let has_h2 = report
+            .slices
+            .iter()
+            .any(|s| s.protocol == TransportProtocol::Http2);
+        let has_h3 = report
+            .slices
+            .iter()
+            .any(|s| s.protocol == TransportProtocol::Http3);
+        assert!(has_h2);
+        assert!(has_h3);
+
+        // Clean up session unregistration
+        pool.unregister_transport_session(101);
+        pool.unregister_transport_session(102);
     }
 }
