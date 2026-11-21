@@ -853,6 +853,28 @@ impl Http2Frame {
     pub const FLAG_PADDED: u8 = 0x8;
     pub const FLAG_PRIORITY: u8 = 0x20;
 
+    /// Return the stream ID associated with this frame (0 for connection-level frames).
+    pub fn stream_id(&self) -> u32 {
+        match self {
+            Http2Frame::Data { stream_id, .. } => *stream_id,
+            Http2Frame::Headers { stream_id, .. } => *stream_id,
+            Http2Frame::Priority { stream_id, .. } => *stream_id,
+            Http2Frame::RstStream { stream_id, .. } => *stream_id,
+            Http2Frame::Settings { .. } => 0,
+            Http2Frame::Ping { .. } => 0,
+            Http2Frame::GoAway { last_stream_id, .. } => *last_stream_id,
+            Http2Frame::WindowUpdate { stream_id, .. } => *stream_id,
+            Http2Frame::Continuation { stream_id, .. } => *stream_id,
+            Http2Frame::PushPromise { stream_id, .. } => *stream_id,
+            Http2Frame::PriorityUpdate {
+                prioritized_stream_id,
+                ..
+            } => *prioritized_stream_id,
+            Http2Frame::AltSvc { stream_id, .. } => *stream_id,
+            Http2Frame::Unknown { header, .. } => header.stream_id,
+        }
+    }
+
     /// Encode the HTTP/2 frame into wire bytes (header + payload).
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -2578,6 +2600,101 @@ pub fn build_http2_conditional_headers(
         headers.push(("if-modified-since".to_string(), lm.to_string()));
     }
     headers
+}
+
+/// Parsed HTTP/2 Vary header directives conforming to RFC 7234 Section 4.1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Http2Vary {
+    /// Directive `Vary: *`: The stored response cannot be used to satisfy subsequent requests.
+    Any,
+    /// Selecting request header field names (normalized to lowercase).
+    Headers(Vec<String>),
+}
+
+impl Http2Vary {
+    /// Parse a Vary header field value into an [`Http2Vary`] directive.
+    pub fn parse(header_value: &str) -> Self {
+        let trimmed = header_value.trim();
+        if trimmed == "*" {
+            return Http2Vary::Any;
+        }
+        let mut fields = Vec::new();
+        for item in trimmed.split(',') {
+            let part = item.trim();
+            if part == "*" {
+                return Http2Vary::Any;
+            }
+            if !part.is_empty() {
+                let lower = part.to_ascii_lowercase();
+                if !fields.contains(&lower) {
+                    fields.push(lower);
+                }
+            }
+        }
+        Http2Vary::Headers(fields)
+    }
+
+    /// Whether this Vary specification allows matching secondary requests under RFC 7234 §4.1.
+    #[inline]
+    pub fn is_matchable(&self) -> bool {
+        !matches!(self, Http2Vary::Any)
+    }
+
+    /// Check if the selecting request headers from a stored response match a presented request (RFC 7234 §4.1).
+    pub fn matches_request(
+        &self,
+        stored_req_headers: &[(String, String)],
+        presented_req_headers: &[(String, String)],
+    ) -> bool {
+        match self {
+            Http2Vary::Any => false,
+            Http2Vary::Headers(field_names) => {
+                for name in field_names {
+                    let stored_val =
+                        find_combined_header_case_insensitive(stored_req_headers, name);
+                    let presented_val =
+                        find_combined_header_case_insensitive(presented_req_headers, name);
+                    if stored_val != presented_val {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+    }
+}
+
+/// Helper to find and combine header values case-insensitively.
+pub fn find_combined_header_case_insensitive(
+    headers: &[(String, String)],
+    name: &str,
+) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case(name) {
+            parts.push(v.trim());
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+/// Extract parsed Vary directives from headers slice (RFC 7234 §4.1).
+pub fn extract_http2_vary(headers: &[(String, String)]) -> Option<Http2Vary> {
+    let mut vary_parts = Vec::new();
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("vary") {
+            vary_parts.push(v.trim());
+        }
+    }
+    if vary_parts.is_empty() {
+        None
+    } else {
+        Some(Http2Vary::parse(&vary_parts.join(", ")))
+    }
 }
 
 /// Multiplexed HTTP/2 Session Manager handling streams, flow control, and HPACK.
@@ -4960,5 +5077,57 @@ mod http2_tests {
         assert!(is_http_status_cacheable_by_default(200));
         assert!(is_http_status_cacheable_by_default(304));
         assert!(!is_http_status_cacheable_by_default(500));
+    }
+
+    #[test]
+    fn test_rfc7234_vary_header_directives_and_matching() {
+        let v_any = Http2Vary::parse("*");
+        assert_eq!(v_any, Http2Vary::Any);
+        assert!(!v_any.is_matchable());
+
+        let v_headers = Http2Vary::parse("Accept-Encoding, user-agent, ACCEPT-ENCODING");
+        assert!(v_headers.is_matchable());
+        match &v_headers {
+            Http2Vary::Headers(fields) => {
+                assert_eq!(fields, &["accept-encoding", "user-agent"]);
+            }
+            _ => panic!("Expected Headers variant"),
+        }
+
+        let stored_req = vec![
+            ("accept-encoding".to_string(), "gzip".to_string()),
+            ("user-agent".to_string(), "IFA-Client/1.0".to_string()),
+        ];
+        let presented_matching = vec![
+            ("ACCEPT-ENCODING".to_string(), "gzip".to_string()),
+            ("User-Agent".to_string(), "IFA-Client/1.0".to_string()),
+            ("x-extra".to_string(), "ignored".to_string()),
+        ];
+        let presented_mismatched_enc = vec![
+            ("accept-encoding".to_string(), "br".to_string()),
+            ("user-agent".to_string(), "IFA-Client/1.0".to_string()),
+        ];
+        let presented_missing_agent = vec![("accept-encoding".to_string(), "gzip".to_string())];
+
+        assert!(v_headers.matches_request(&stored_req, &presented_matching));
+        assert!(!v_headers.matches_request(&stored_req, &presented_mismatched_enc));
+        assert!(!v_headers.matches_request(&stored_req, &presented_missing_agent));
+        assert!(!v_any.matches_request(&stored_req, &presented_matching));
+
+        let resp_headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "vary".to_string(),
+                "Accept-Encoding, Accept-Language".to_string(),
+            ),
+        ];
+        let extracted_vary = extract_http2_vary(&resp_headers).expect("extracted vary");
+        assert_eq!(
+            extracted_vary,
+            Http2Vary::Headers(vec![
+                "accept-encoding".to_string(),
+                "accept-language".to_string()
+            ])
+        );
     }
 }
