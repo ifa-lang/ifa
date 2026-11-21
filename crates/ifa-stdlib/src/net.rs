@@ -3360,7 +3360,9 @@ impl AsyncHttp2Connection {
                 let now = std::time::Instant::now();
                 if let Some(last) = self.flow_control_last_observation {
                     let elapsed = now.duration_since(last);
-                    if elapsed >= Duration::from_millis(1) && self.flow_control_bytes_observed >= 4096 {
+                    if elapsed >= Duration::from_millis(1)
+                        && self.flow_control_bytes_observed >= 4096
+                    {
                         self.session
                             .adaptive_flow_controller
                             .record_bandwidth_sample(self.flow_control_bytes_observed, elapsed);
@@ -4194,11 +4196,17 @@ impl AsyncHttp2Connection {
                     if !first_header_observed {
                         first_header_observed = true;
                         if self.auto_tune_flow_control
-                            && self.session.adaptive_flow_controller.smoothed_rtt_us.is_none()
+                            && self
+                                .session
+                                .adaptive_flow_controller
+                                .smoothed_rtt_us
+                                .is_none()
                         {
                             let rtt_us = batch_start.elapsed().as_micros() as u64;
                             if rtt_us > 0 {
-                                self.session.adaptive_flow_controller.record_rtt_sample(rtt_us);
+                                self.session
+                                    .adaptive_flow_controller
+                                    .record_rtt_sample(rtt_us);
                             }
                         }
                     }
@@ -13097,7 +13105,9 @@ mod tls_alpn_tests {
             // Wait for client request headers
             let mut target_stream_id = 0;
             for _ in 0..20 {
-                if let Ok(crate::simd_parser::Http2Frame::Headers { stream_id, .. }) = server.recv_frame() {
+                if let Ok(crate::simd_parser::Http2Frame::Headers { stream_id, .. }) =
+                    server.recv_frame()
+                {
                     target_stream_id = stream_id;
                     break;
                 }
@@ -13105,12 +13115,17 @@ mod tls_alpn_tests {
 
             if target_stream_id > 0 {
                 let res_headers = vec![(":status", "200")];
-                let h_frame = server.session.create_headers_frame(target_stream_id, &res_headers, false);
+                let h_frame =
+                    server
+                        .session
+                        .create_headers_frame(target_stream_id, &res_headers, false);
                 server.send_frame(&h_frame).expect("send headers");
 
                 // Transmit high-throughput data payload
                 let payload = vec![0xAAu8; 32768];
-                server.send_data(target_stream_id, &payload, true).expect("send data");
+                server
+                    .send_data(target_stream_id, &payload, true)
+                    .expect("send data");
 
                 // Keep connection open while client processes frames
                 for _ in 0..20 {
@@ -13120,8 +13135,7 @@ mod tls_alpn_tests {
             }
         });
 
-        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 1)
-            .with_auto_tune_flow_control(true);
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 1).with_auto_tune_flow_control(true);
         assert!(pool.auto_tune_flow_control());
 
         let mut conn = pool.acquire().expect("acquire connection");
@@ -13129,7 +13143,12 @@ mod tls_alpn_tests {
 
         // Simulate high throughput observation
         conn.record_flow_control_observation(5_000_000, Duration::from_millis(100));
-        assert!(conn.session.adaptive_flow_controller.target_connection_window >= 65535);
+        assert!(
+            conn.session
+                .adaptive_flow_controller
+                .target_connection_window
+                >= 65535
+        );
 
         let stream_id = conn
             .send_request(&[(":method", "GET"), (":path", "/auto-tuning")], None)
@@ -13138,7 +13157,12 @@ mod tls_alpn_tests {
         let mut total_received = 0;
         loop {
             let frame = conn.recv_frame().expect("receive frame");
-            if let crate::simd_parser::Http2Frame::Data { stream_id: sid, data, end_stream } = frame {
+            if let crate::simd_parser::Http2Frame::Data {
+                stream_id: sid,
+                data,
+                end_stream,
+            } = frame
+            {
                 assert_eq!(sid, stream_id);
                 total_received += data.len();
                 if end_stream {
