@@ -6801,6 +6801,279 @@ pub struct SessionResumptionTelemetry {
     pub active_reconnecting_sessions: usize,
 }
 
+/// Type of synthetic keep-alive heartbeat probe (RFC 7540 / RFC 9000).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionProbeKind {
+    /// HTTP/2 PING control frame with 8-byte opaque payload (RFC 7540 / RFC 9113 §6.7).
+    Http2Ping,
+    /// HTTP/3 QUIC PATH_CHALLENGE frame with 8-byte random payload (RFC 9000 §19.17 / RFC 9114).
+    Http3PathChallenge,
+}
+
+/// Active in-flight keep-alive probe awaiting acknowledgement from a remote peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveProbe {
+    /// Unique probe sequence identifier.
+    pub probe_id: u64,
+    /// Target transport session ID.
+    pub session_id: u64,
+    /// Probe protocol kind (HTTP/2 PING or HTTP/3 PATH_CHALLENGE).
+    pub probe_kind: SessionProbeKind,
+    /// 8-byte opaque payload or path challenge token.
+    pub payload: [u8; 8],
+    /// Transmission timestamp for RTT and timeout evaluation.
+    pub sent_at: std::time::Instant,
+    /// Timeout duration allotted for acknowledgement before declaring packet loss.
+    pub timeout: std::time::Duration,
+}
+
+/// Health and responsiveness state of a pooled transport session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionHealthState {
+    /// Responsive within standard RTT threshold with zero or negligible packet loss.
+    Healthy,
+    /// Elevated latency, jitter spike, or isolated probe loss.
+    Degraded,
+    /// Silent beyond silence threshold or exceeded consecutive probe failure threshold; unresponsive zombie socket.
+    Zombie,
+    /// Connection terminated, failed keep-alive, or marked dead.
+    Dead,
+}
+
+/// Configuration parameters for active keep-alive heartbeat probing and zombie session detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeartbeatProbeConfig {
+    /// Baseline heartbeat probe interval under healthy conditions (default: 15s).
+    pub base_interval: std::time::Duration,
+    /// Timeout for an outstanding heartbeat probe before marking it lost (default: 3s).
+    pub probe_timeout: std::time::Duration,
+    /// Maximum consecutive probe failures before marking session as Zombie (default: 3).
+    pub max_consecutive_failures: usize,
+    /// Maximum silent duration without inbound frames or traffic before flagging as silent/zombie (default: 30s).
+    pub zombie_silence_threshold: std::time::Duration,
+    /// Enable dynamic probe interval adaptation based on observed jitter and packet loss.
+    pub adaptive_probing: bool,
+    /// Minimum probe interval when accelerating probes under degradation (default: 1s).
+    pub min_adaptive_interval: std::time::Duration,
+    /// Maximum probe interval when backing off under healthy idle conditions (default: 60s).
+    pub max_adaptive_interval: std::time::Duration,
+}
+
+impl Default for HeartbeatProbeConfig {
+    fn default() -> Self {
+        Self {
+            base_interval: std::time::Duration::from_secs(15),
+            probe_timeout: std::time::Duration::from_secs(3),
+            max_consecutive_failures: 3,
+            zombie_silence_threshold: std::time::Duration::from_secs(30),
+            adaptive_probing: true,
+            min_adaptive_interval: std::time::Duration::from_secs(1),
+            max_adaptive_interval: std::time::Duration::from_secs(60),
+        }
+    }
+}
+
+/// Comprehensive health and latency telemetry metrics for a transport session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionHealthMetrics {
+    /// Target session identifier.
+    pub session_id: u64,
+    /// Transport protocol used by this session (HTTP/2 or HTTP/3).
+    pub protocol: TransportProtocol,
+    /// Current health classification.
+    pub state: SessionHealthState,
+    /// Total heartbeat probes dispatched on this session.
+    pub probes_sent: usize,
+    /// Total probe acknowledgements successfully received.
+    pub probes_received: usize,
+    /// Total probes declared lost due to timeout.
+    pub probes_lost: usize,
+    /// Current consecutive failed/timed-out probes.
+    pub consecutive_failures: usize,
+    /// Observed probe loss ratio (probes_lost / probes_sent), 0.0 to 1.0.
+    pub loss_rate: f64,
+    /// Smoothed Round-Trip Time (EWMA filter RFC 6298 / RFC 9002).
+    pub smoothed_rtt: std::time::Duration,
+    /// Round-Trip Time variation / jitter (RFC 6298 / RFC 3550).
+    pub rttvar: std::time::Duration,
+    /// Minimum observed RTT.
+    pub min_rtt: std::time::Duration,
+    /// Maximum observed RTT.
+    pub max_rtt: std::time::Duration,
+    /// Most recent sample RTT.
+    pub last_rtt: std::time::Duration,
+    /// Timestamp of last activity (inbound frame, data, or probe ack).
+    pub last_activity: std::time::Instant,
+    /// Timestamp when the next probe is scheduled.
+    pub next_probe_at: std::time::Instant,
+    /// Composite health score from 0.0 (unusable/dead) to 1.0 (optimal).
+    pub health_score: f64,
+}
+
+/// Aggregate health and latency telemetry across all sessions in the transport pool.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoolHealthTelemetry {
+    /// Total registered sessions tracked in the pool.
+    pub total_sessions: usize,
+    /// Sessions currently healthy and actively routable.
+    pub healthy_sessions: usize,
+    /// Sessions experiencing degradation (elevated RTT or jitter).
+    pub degraded_sessions: usize,
+    /// Sessions identified as zombies (silent or unacknowledged probes).
+    pub zombie_sessions: usize,
+    /// Sessions marked dead or terminated.
+    pub dead_sessions: usize,
+    /// Total probes sent across all pool sessions.
+    pub total_probes_sent: usize,
+    /// Total probe acknowledgements received.
+    pub total_probes_received: usize,
+    /// Total probes timed out / lost.
+    pub total_probes_lost: usize,
+    /// Aggregate packet loss ratio across the pool.
+    pub aggregate_loss_rate: f64,
+    /// Pool-wide average smoothed Round-Trip Time.
+    pub average_smoothed_rtt: std::time::Duration,
+    /// Pool-wide average network jitter (rttvar).
+    pub average_jitter: std::time::Duration,
+    /// Pool-wide average composite health score (0.0 to 1.0).
+    pub average_health_score: f64,
+}
+
+/// Internal tracker for keep-alive probing state and RTT samples on a single session.
+#[derive(Debug, Clone)]
+struct SessionHealthTracker {
+    session_id: u64,
+    protocol: TransportProtocol,
+    state: SessionHealthState,
+    probes_sent: usize,
+    probes_received: usize,
+    probes_lost: usize,
+    consecutive_failures: usize,
+    smoothed_rtt: std::time::Duration,
+    rttvar: std::time::Duration,
+    min_rtt: std::time::Duration,
+    max_rtt: std::time::Duration,
+    last_rtt: std::time::Duration,
+    sample_count: usize,
+    last_activity: std::time::Instant,
+    next_probe_at: std::time::Instant,
+    current_interval: std::time::Duration,
+}
+
+impl SessionHealthTracker {
+    fn new(
+        session_id: u64,
+        protocol: TransportProtocol,
+        now: std::time::Instant,
+        initial_interval: std::time::Duration,
+    ) -> Self {
+        Self {
+            session_id,
+            protocol,
+            state: SessionHealthState::Healthy,
+            probes_sent: 0,
+            probes_received: 0,
+            probes_lost: 0,
+            consecutive_failures: 0,
+            smoothed_rtt: std::time::Duration::from_millis(10),
+            rttvar: std::time::Duration::from_millis(5),
+            min_rtt: std::time::Duration::MAX,
+            max_rtt: std::time::Duration::from_millis(0),
+            last_rtt: std::time::Duration::from_millis(0),
+            sample_count: 0,
+            last_activity: now,
+            next_probe_at: now + initial_interval,
+            current_interval: initial_interval,
+        }
+    }
+
+    fn to_metrics(&self) -> SessionHealthMetrics {
+        let loss_rate = if self.probes_sent == 0 {
+            0.0
+        } else {
+            self.probes_lost as f64 / self.probes_sent as f64
+        };
+
+        let health_score = match self.state {
+            SessionHealthState::Zombie | SessionHealthState::Dead => 0.0,
+            SessionHealthState::Healthy | SessionHealthState::Degraded => {
+                let loss_factor = (1.0 - loss_rate).clamp(0.0, 1.0);
+                let srtt_ms = self.smoothed_rtt.as_millis() as f64;
+                let rttvar_ms = self.rttvar.as_millis() as f64;
+                let rtt_penalty = 100.0 / (100.0 + srtt_ms);
+                let jitter_penalty = 50.0 / (50.0 + rttvar_ms);
+                let raw_score = loss_factor * (0.6 * rtt_penalty + 0.4 * jitter_penalty);
+                (raw_score * 1000.0).round() / 1000.0
+            }
+        };
+
+        SessionHealthMetrics {
+            session_id: self.session_id,
+            protocol: self.protocol,
+            state: self.state,
+            probes_sent: self.probes_sent,
+            probes_received: self.probes_received,
+            probes_lost: self.probes_lost,
+            consecutive_failures: self.consecutive_failures,
+            loss_rate,
+            smoothed_rtt: self.smoothed_rtt,
+            rttvar: self.rttvar,
+            min_rtt: if self.min_rtt == std::time::Duration::MAX {
+                std::time::Duration::from_millis(0)
+            } else {
+                self.min_rtt
+            },
+            max_rtt: self.max_rtt,
+            last_rtt: self.last_rtt,
+            last_activity: self.last_activity,
+            next_probe_at: self.next_probe_at,
+            health_score,
+        }
+    }
+
+    fn record_sample(&mut self, sample: std::time::Duration, now: std::time::Instant) {
+        self.probes_received += 1;
+        self.consecutive_failures = 0;
+        self.last_rtt = sample;
+        self.last_activity = now;
+        if self.sample_count == 0 {
+            self.smoothed_rtt = sample;
+            self.rttvar = sample / 2;
+            self.min_rtt = sample;
+            self.max_rtt = sample;
+        } else {
+            let diff = self.smoothed_rtt.abs_diff(sample);
+            self.rttvar = (self.rttvar * 3 + diff) / 4;
+            self.smoothed_rtt = (self.smoothed_rtt * 7 + sample) / 8;
+            if sample < self.min_rtt {
+                self.min_rtt = sample;
+            }
+            if sample > self.max_rtt {
+                self.max_rtt = sample;
+            }
+        }
+        self.sample_count += 1;
+
+        if self.smoothed_rtt > std::time::Duration::from_millis(250)
+            || self.rttvar > std::time::Duration::from_millis(80)
+        {
+            self.state = SessionHealthState::Degraded;
+        } else {
+            self.state = SessionHealthState::Healthy;
+        }
+    }
+
+    fn record_timeout(&mut self, max_failures: usize) {
+        self.probes_lost += 1;
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= max_failures {
+            self.state = SessionHealthState::Zombie;
+        } else {
+            self.state = SessionHealthState::Degraded;
+        }
+    }
+}
+
 /// Descriptor and runtime scheduling state of an active transport session (HTTP/2 or HTTP/3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportSessionDescriptor {
@@ -6824,6 +7097,8 @@ pub struct TransportSessionDescriptor {
     pub pacing_model: TransportPacingModel,
     /// Lifecycle and draining state of this session.
     pub lifecycle_state: SessionLifecycleState,
+    /// Health, responsiveness, and probing state of this session.
+    pub health_state: SessionHealthState,
     /// Whether an anticipatory GOAWAY frame with maximal stream ID was transmitted.
     pub anticipatory_goaway_sent: bool,
     /// Whether a final GOAWAY frame was transmitted.
@@ -6861,6 +7136,7 @@ impl TransportSessionDescriptor {
             total_dispatched_bytes: 0,
             pacing_model: TransportPacingModel::new(CongestionControlAlgorithm::Bbr),
             lifecycle_state: SessionLifecycleState::Active,
+            health_state: SessionHealthState::Healthy,
             anticipatory_goaway_sent: false,
             final_goaway_sent: false,
             last_goaway_stream_id: None,
@@ -7076,6 +7352,20 @@ pub struct InterSessionDrrArbitrator {
     total_replayed_bytes: usize,
     /// Total payload bytes transmitted in 0-RTT early data.
     total_zero_rtt_early_bytes: usize,
+    /// Active heartbeat probing and health verification configuration.
+    probe_config: HeartbeatProbeConfig,
+    /// Detailed health and RTT trackers per session.
+    session_health: std::collections::HashMap<u64, SessionHealthTracker>,
+    /// Outstanding in-flight probes mapped by 8-byte payload token.
+    active_probes: std::collections::HashMap<[u8; 8], ActiveProbe>,
+    /// Monotonically increasing sequence generator for unique probe payloads.
+    next_probe_id: u64,
+    /// Pool-wide count of probes dispatched.
+    total_probes_sent_pool: usize,
+    /// Pool-wide count of probe acknowledgements received.
+    total_probes_received_pool: usize,
+    /// Pool-wide count of probes timed out / declared lost.
+    total_probes_lost_pool: usize,
 }
 
 impl InterSessionDrrArbitrator {
@@ -7132,6 +7422,13 @@ impl InterSessionDrrArbitrator {
             total_rejected_streams: 0,
             total_replayed_bytes: 0,
             total_zero_rtt_early_bytes: 0,
+            probe_config: HeartbeatProbeConfig::default(),
+            session_health: std::collections::HashMap::new(),
+            active_probes: std::collections::HashMap::new(),
+            next_probe_id: 0,
+            total_probes_sent_pool: 0,
+            total_probes_received_pool: 0,
+            total_probes_lost_pool: 0,
         }
     }
 
@@ -7300,11 +7597,19 @@ impl InterSessionDrrArbitrator {
             session_id,
             TransportSessionDescriptor::new(session_id, origin, protocol, weight),
         );
+        let now = std::time::Instant::now();
+        let interval = self.probe_config.base_interval;
+        self.session_health.insert(
+            session_id,
+            SessionHealthTracker::new(session_id, protocol, now, interval),
+        );
     }
 
     /// Unregister a transport session upon connection closure.
     pub fn unregister_session(&mut self, session_id: u64) {
         self.sessions.remove(&session_id);
+        self.session_health.remove(&session_id);
+        self.active_probes.retain(|_, p| p.session_id != session_id);
     }
 
     /// Set queued pending payload bytes on a session.
@@ -7397,6 +7702,8 @@ impl InterSessionDrrArbitrator {
                 s.pending_bytes > 0
                     && s.lifecycle_state != SessionLifecycleState::Closed
                     && s.lifecycle_state != SessionLifecycleState::Drained
+                    && s.health_state != SessionHealthState::Zombie
+                    && s.health_state != SessionHealthState::Dead
             })
             .map(|(&id, _)| id)
             .collect();
@@ -7404,7 +7711,13 @@ impl InterSessionDrrArbitrator {
         let origins_with_pending_at_start: std::collections::HashSet<String> = self
             .sessions
             .values()
-            .filter(|s| s.pending_bytes > 0)
+            .filter(|s| {
+                s.pending_bytes > 0
+                    && s.lifecycle_state != SessionLifecycleState::Closed
+                    && s.lifecycle_state != SessionLifecycleState::Drained
+                    && s.health_state != SessionHealthState::Zombie
+                    && s.health_state != SessionHealthState::Dead
+            })
             .map(|s| s.origin.clone())
             .collect();
 
@@ -7459,7 +7772,13 @@ impl InterSessionDrrArbitrator {
             let origin_pending: usize = self
                 .sessions
                 .values()
-                .filter(|s| s.origin == origin_name)
+                .filter(|s| {
+                    s.origin == origin_name
+                        && s.lifecycle_state != SessionLifecycleState::Closed
+                        && s.lifecycle_state != SessionLifecycleState::Drained
+                        && s.health_state != SessionHealthState::Zombie
+                        && s.health_state != SessionHealthState::Dead
+                })
                 .map(|s| s.pending_bytes)
                 .sum();
 
@@ -7476,19 +7795,39 @@ impl InterSessionDrrArbitrator {
                 starved_origins_boosted.push(origin_name.clone());
                 let mut origin_remaining_starved = starved_budget;
 
-                // Find sessions under this origin with pending data, prioritizing starved sessions
+                // Find sessions under this origin with pending data, prioritizing starved and healthy sessions
                 let mut origin_session_ids: Vec<u64> = self
                     .sessions
                     .iter()
-                    .filter(|(_, s)| s.origin == origin_name && s.pending_bytes > 0)
+                    .filter(|(_, s)| {
+                        s.origin == origin_name
+                            && s.pending_bytes > 0
+                            && s.lifecycle_state != SessionLifecycleState::Closed
+                            && s.lifecycle_state != SessionLifecycleState::Drained
+                            && s.health_state != SessionHealthState::Zombie
+                            && s.health_state != SessionHealthState::Dead
+                    })
                     .map(|(&id, _)| id)
                     .collect();
 
                 origin_session_ids.sort_by(|&a, &b| {
                     let sa = &self.sessions[&a];
                     let sb = &self.sessions[&b];
-                    sb.consecutive_starved_rounds
-                        .cmp(&sa.consecutive_starved_rounds)
+                    let ha = if sa.health_state == SessionHealthState::Healthy {
+                        0
+                    } else {
+                        1
+                    };
+                    let hb = if sb.health_state == SessionHealthState::Healthy {
+                        0
+                    } else {
+                        1
+                    };
+                    ha.cmp(&hb)
+                        .then_with(|| {
+                            sb.consecutive_starved_rounds
+                                .cmp(&sa.consecutive_starved_rounds)
+                        })
                         .then_with(|| a.cmp(&b))
                 });
 
@@ -7582,7 +7921,14 @@ impl InterSessionDrrArbitrator {
                     let active_sess_count = self
                         .sessions
                         .values()
-                        .filter(|s| s.origin == origin_name && s.pending_bytes > 0)
+                        .filter(|s| {
+                            s.origin == origin_name
+                                && s.pending_bytes > 0
+                                && s.lifecycle_state != SessionLifecycleState::Closed
+                                && s.lifecycle_state != SessionLifecycleState::Drained
+                                && s.health_state != SessionHealthState::Zombie
+                                && s.health_state != SessionHealthState::Dead
+                        })
                         .count();
                     if active_sess_count == 0 {
                         if let Some(q) = self.origins.get_mut(&origin_name) {
@@ -7628,10 +7974,26 @@ impl InterSessionDrrArbitrator {
                                 && s.pending_bytes > 0
                                 && s.lifecycle_state != SessionLifecycleState::Closed
                                 && s.lifecycle_state != SessionLifecycleState::Drained
+                                && s.health_state != SessionHealthState::Zombie
+                                && s.health_state != SessionHealthState::Dead
                         })
                         .map(|(&id, _)| id)
                         .collect();
-                    session_ids.sort();
+                    session_ids.sort_by(|&a, &b| {
+                        let sa = &self.sessions[&a];
+                        let sb = &self.sessions[&b];
+                        let ha = if sa.health_state == SessionHealthState::Healthy {
+                            0
+                        } else {
+                            1
+                        };
+                        let hb = if sb.health_state == SessionHealthState::Healthy {
+                            0
+                        } else {
+                            1
+                        };
+                        ha.cmp(&hb).then_with(|| a.cmp(&b))
+                    });
 
                     for sid in session_ids {
                         if remaining_bandwidth == 0 {
@@ -8201,8 +8563,13 @@ impl InterSessionDrrArbitrator {
     pub fn close_session(&mut self, session_id: u64) -> bool {
         if let Some(sess) = self.sessions.get_mut(&session_id) {
             sess.lifecycle_state = SessionLifecycleState::Closed;
+            sess.health_state = SessionHealthState::Dead;
             sess.pending_bytes = 0;
             sess.deficit = 0;
+            if let Some(health) = self.session_health.get_mut(&session_id) {
+                health.state = SessionHealthState::Dead;
+            }
+            self.active_probes.retain(|_, p| p.session_id != session_id);
             true
         } else {
             false
@@ -8313,6 +8680,8 @@ impl InterSessionDrrArbitrator {
                 id != source_session_id
                     && s.origin == source_origin
                     && s.lifecycle_state == SessionLifecycleState::Active
+                    && s.health_state != SessionHealthState::Zombie
+                    && s.health_state != SessionHealthState::Dead
             })
             .map(|(&id, _)| id)
             .collect();
@@ -8329,7 +8698,23 @@ impl InterSessionDrrArbitrator {
             });
         }
 
-        candidates.sort_by_key(|&id| self.sessions[&id].pending_bytes);
+        candidates.sort_by(|&a, &b| {
+            let ha = if self.sessions[&a].health_state == SessionHealthState::Healthy {
+                0
+            } else {
+                1
+            };
+            let hb = if self.sessions[&b].health_state == SessionHealthState::Healthy {
+                0
+            } else {
+                1
+            };
+            ha.cmp(&hb).then_with(|| {
+                self.sessions[&a]
+                    .pending_bytes
+                    .cmp(&self.sessions[&b].pending_bytes)
+            })
+        });
 
         let mut migrated_streams = Vec::new();
         let mut target_session_ids = Vec::new();
@@ -8465,12 +8850,18 @@ impl InterSessionDrrArbitrator {
         let (origin, saved_streams) = {
             let sess = self.sessions.get_mut(&session_id)?;
             sess.lifecycle_state = SessionLifecycleState::Closed;
+            sess.health_state = SessionHealthState::Dead;
             sess.pending_bytes = 0;
             sess.deficit = 0;
             let streams: Vec<PooledStreamDescriptor> =
                 sess.streams.drain().map(|(_, v)| v).collect();
             (sess.origin.clone(), streams)
         };
+
+        if let Some(health) = self.session_health.get_mut(&session_id) {
+            health.state = SessionHealthState::Dead;
+        }
+        self.active_probes.retain(|_, p| p.session_id != session_id);
 
         self.total_disconnects += 1;
 
@@ -8527,6 +8918,18 @@ impl InterSessionDrrArbitrator {
             let err = format!(
                 "Target session {} is not active (state: {:?})",
                 new_session_id, target_sess.lifecycle_state
+            );
+            self.reconnect_states
+                .insert(failed_session_id, reconnect_state);
+            return Err(err);
+        }
+
+        if target_sess.health_state == SessionHealthState::Zombie
+            || target_sess.health_state == SessionHealthState::Dead
+        {
+            let err = format!(
+                "Target session {} is not healthy (health state: {:?})",
+                new_session_id, target_sess.health_state
             );
             self.reconnect_states
                 .insert(failed_session_id, reconnect_state);
@@ -8649,6 +9052,309 @@ impl InterSessionDrrArbitrator {
             total_zero_rtt_early_bytes: self.total_zero_rtt_early_bytes,
             cached_tickets_count: self.ticket_cache.len(),
             active_reconnecting_sessions: self.reconnect_states.len(),
+        }
+    }
+
+    /// Configure heartbeat probing and health verification parameters.
+    pub fn configure_heartbeat_probes(&mut self, config: HeartbeatProbeConfig) {
+        self.probe_config = config;
+    }
+
+    /// Retrieve active heartbeat probing configuration.
+    pub fn heartbeat_probe_config(&self) -> &HeartbeatProbeConfig {
+        &self.probe_config
+    }
+
+    /// Emit an active keep-alive probe (HTTP/2 PING or HTTP/3 PATH_CHALLENGE) on a transport session.
+    pub fn emit_heartbeat_probe(
+        &mut self,
+        session_id: u64,
+        now: std::time::Instant,
+    ) -> Option<ActiveProbe> {
+        let protocol = match self.sessions.get(&session_id) {
+            Some(sess) if sess.lifecycle_state != SessionLifecycleState::Closed => sess.protocol,
+            _ => return None,
+        };
+
+        let probe_kind = match protocol {
+            TransportProtocol::Http2 => SessionProbeKind::Http2Ping,
+            TransportProtocol::Http3 => SessionProbeKind::Http3PathChallenge,
+        };
+
+        self.next_probe_id += 1;
+        let probe_id = self.next_probe_id;
+        let payload = probe_id.to_be_bytes();
+        let timeout = self.probe_config.probe_timeout;
+
+        let active_probe = ActiveProbe {
+            probe_id,
+            session_id,
+            probe_kind,
+            payload,
+            sent_at: now,
+            timeout,
+        };
+
+        self.active_probes.insert(payload, active_probe.clone());
+        self.total_probes_sent_pool += 1;
+
+        if let Some(health) = self.session_health.get_mut(&session_id) {
+            health.probes_sent += 1;
+            health.next_probe_at = now + health.current_interval;
+        }
+
+        Some(active_probe)
+    }
+
+    /// Scan all active sessions and generate heartbeat probes for those whose scheduled probe deadline has arrived.
+    pub fn generate_scheduled_probes(&mut self, now: std::time::Instant) -> Vec<ActiveProbe> {
+        let mut session_ids_to_probe = Vec::new();
+
+        for (&sid, health) in &self.session_health {
+            if health.state != SessionHealthState::Dead && now >= health.next_probe_at {
+                session_ids_to_probe.push(sid);
+            }
+        }
+        session_ids_to_probe.sort_unstable();
+
+        let mut probes = Vec::new();
+        for sid in session_ids_to_probe {
+            if let Some(probe) = self.emit_heartbeat_probe(sid, now) {
+                probes.push(probe);
+            }
+        }
+
+        probes
+    }
+
+    /// Record receipt of a probe response / acknowledgement (HTTP/2 PING ACK or HTTP/3 PATH_RESPONSE)
+    /// identified by its 8-byte payload. Updates RTT, jitter (rttvar), pacing model, and transitions health status.
+    pub fn record_probe_reply(
+        &mut self,
+        payload: [u8; 8],
+        now: std::time::Instant,
+    ) -> Result<std::time::Duration, String> {
+        let probe = match self.active_probes.remove(&payload) {
+            Some(p) => p,
+            None => {
+                return Err(format!(
+                    "Unrecognized or expired probe payload token: {:02x?}",
+                    payload
+                ));
+            }
+        };
+
+        self.total_probes_received_pool += 1;
+        let rtt = now.saturating_duration_since(probe.sent_at);
+        let sid = probe.session_id;
+
+        if let Some(health) = self.session_health.get_mut(&sid) {
+            health.record_sample(rtt, now);
+            if self.probe_config.adaptive_probing {
+                health.current_interval = match health.state {
+                    SessionHealthState::Healthy => self.probe_config.base_interval,
+                    SessionHealthState::Degraded => self
+                        .probe_config
+                        .min_adaptive_interval
+                        .max(self.probe_config.base_interval / 2),
+                    SessionHealthState::Zombie | SessionHealthState::Dead => {
+                        self.probe_config.min_adaptive_interval
+                    }
+                };
+            }
+            health.next_probe_at = now + health.current_interval;
+
+            let state = health.state;
+            if let Some(sess) = self.sessions.get_mut(&sid) {
+                sess.health_state = state;
+                sess.pacing_model.record_rtt_sample(rtt);
+            }
+        }
+
+        Ok(rtt)
+    }
+
+    /// Check outstanding probes for timeouts. Marks expired probes as lost, increments consecutive
+    /// failures, degrades session health or promotes to Zombie if failures exceed threshold.
+    /// Returns the list of affected session IDs.
+    pub fn check_probe_timeouts(&mut self, now: std::time::Instant) -> Vec<u64> {
+        let max_failures = self.probe_config.max_consecutive_failures;
+        let mut timed_out_payloads = Vec::new();
+
+        for (&payload, probe) in &self.active_probes {
+            if now.saturating_duration_since(probe.sent_at) >= probe.timeout {
+                timed_out_payloads.push((payload, probe.session_id));
+            }
+        }
+
+        let mut affected_sessions = Vec::new();
+        for (payload, sid) in timed_out_payloads {
+            self.active_probes.remove(&payload);
+            self.total_probes_lost_pool += 1;
+            affected_sessions.push(sid);
+
+            if let Some(health) = self.session_health.get_mut(&sid) {
+                health.record_timeout(max_failures);
+                if self.probe_config.adaptive_probing {
+                    health.current_interval = self.probe_config.min_adaptive_interval;
+                }
+                health.next_probe_at = now + health.current_interval;
+
+                let state = health.state;
+                if let Some(sess) = self.sessions.get_mut(&sid) {
+                    sess.health_state = state;
+                }
+            }
+        }
+
+        affected_sessions.sort_unstable();
+        affected_sessions.dedup();
+        affected_sessions
+    }
+
+    /// Record incoming activity (inbound frame or data reception) on a session to reset silence timer.
+    pub fn record_session_activity(&mut self, session_id: u64, now: std::time::Instant) {
+        if let Some(health) = self.session_health.get_mut(&session_id) {
+            health.last_activity = now;
+        }
+    }
+
+    /// Detect silent/zombie sessions where elapsed time since last activity exceeds `zombie_silence_threshold`.
+    /// Transitions affected sessions to `SessionHealthState::Zombie` and returns their IDs.
+    pub fn detect_zombie_sessions(&mut self, now: std::time::Instant) -> Vec<u64> {
+        let threshold = self.probe_config.zombie_silence_threshold;
+        let mut zombies = Vec::new();
+
+        for (&sid, health) in self.session_health.iter_mut() {
+            if health.state != SessionHealthState::Dead
+                && health.state != SessionHealthState::Zombie
+                && now.saturating_duration_since(health.last_activity) >= threshold
+            {
+                health.state = SessionHealthState::Zombie;
+                zombies.push(sid);
+            }
+        }
+
+        for &sid in &zombies {
+            if let Some(sess) = self.sessions.get_mut(&sid) {
+                sess.health_state = SessionHealthState::Zombie;
+            }
+        }
+
+        zombies.sort_unstable();
+        zombies
+    }
+
+    /// Explicitly isolate a zombie session: marks it Zombie, sets draining lifecycle, cancels pending
+    /// probes, and reports the count of preserved streams available for migration or resumption.
+    pub fn isolate_zombie_session(&mut self, session_id: u64) -> Result<usize, String> {
+        if !self.sessions.contains_key(&session_id) {
+            return Err(format!("Session {} does not exist in pool", session_id));
+        }
+
+        self.active_probes.retain(|_, p| p.session_id != session_id);
+
+        if let Some(health) = self.session_health.get_mut(&session_id) {
+            health.state = SessionHealthState::Zombie;
+        }
+
+        let stream_count = if let Some(sess) = self.sessions.get_mut(&session_id) {
+            sess.health_state = SessionHealthState::Zombie;
+            sess.lifecycle_state = SessionLifecycleState::Draining;
+            sess.streams.len()
+        } else {
+            0
+        };
+
+        Ok(stream_count)
+    }
+
+    /// Retrieve health and latency metrics for a specific transport session.
+    pub fn session_health(&self, session_id: u64) -> Option<SessionHealthMetrics> {
+        self.session_health.get(&session_id).map(|h| h.to_metrics())
+    }
+
+    /// Export health and latency metrics across all tracked sessions.
+    pub fn all_session_health(&self) -> Vec<SessionHealthMetrics> {
+        let mut metrics: Vec<SessionHealthMetrics> = self
+            .session_health
+            .values()
+            .map(|h| h.to_metrics())
+            .collect();
+        metrics.sort_by_key(|m| m.session_id);
+        metrics
+    }
+
+    /// Retrieve aggregate health and latency telemetry across all sessions in the transport pool.
+    pub fn pool_health_telemetry(&self) -> PoolHealthTelemetry {
+        let total_sessions = self.sessions.len();
+        let mut healthy_sessions = 0;
+        let mut degraded_sessions = 0;
+        let mut zombie_sessions = 0;
+        let mut dead_sessions = 0;
+        let mut total_probes_sent = 0;
+        let mut total_probes_received = 0;
+        let mut total_probes_lost = 0;
+        let mut sum_srtt_micros: u128 = 0;
+        let mut sum_jitter_micros: u128 = 0;
+        let mut sum_health_score: f64 = 0.0;
+        let mut evaluated_count = 0;
+
+        for health in self.session_health.values() {
+            match health.state {
+                SessionHealthState::Healthy => healthy_sessions += 1,
+                SessionHealthState::Degraded => degraded_sessions += 1,
+                SessionHealthState::Zombie => zombie_sessions += 1,
+                SessionHealthState::Dead => dead_sessions += 1,
+            }
+            total_probes_sent += health.probes_sent;
+            total_probes_received += health.probes_received;
+            total_probes_lost += health.probes_lost;
+
+            let m = health.to_metrics();
+            sum_srtt_micros += m.smoothed_rtt.as_micros();
+            sum_jitter_micros += m.rttvar.as_micros();
+            sum_health_score += m.health_score;
+            evaluated_count += 1;
+        }
+
+        let aggregate_loss_rate = if total_probes_sent == 0 {
+            0.0
+        } else {
+            total_probes_lost as f64 / total_probes_sent as f64
+        };
+
+        let (average_smoothed_rtt, average_jitter, average_health_score) = if evaluated_count == 0 {
+            (
+                std::time::Duration::from_millis(0),
+                std::time::Duration::from_millis(0),
+                1.0,
+            )
+        } else {
+            (
+                std::time::Duration::from_micros(
+                    (sum_srtt_micros / evaluated_count as u128) as u64,
+                ),
+                std::time::Duration::from_micros(
+                    (sum_jitter_micros / evaluated_count as u128) as u64,
+                ),
+                (sum_health_score / evaluated_count as f64 * 1000.0).round() / 1000.0,
+            )
+        };
+
+        PoolHealthTelemetry {
+            total_sessions,
+            healthy_sessions,
+            degraded_sessions,
+            zombie_sessions,
+            dead_sessions,
+            total_probes_sent,
+            total_probes_received,
+            total_probes_lost,
+            aggregate_loss_rate,
+            average_smoothed_rtt,
+            average_jitter,
+            average_health_score,
         }
     }
 }
@@ -9363,6 +10069,161 @@ impl AsyncHttp2Pool {
                 total_zero_rtt_early_bytes: 0,
                 cached_tickets_count: 0,
                 active_reconnecting_sessions: 0,
+            }
+        }
+    }
+
+    /// Configure active heartbeat probing and health verification parameters for the pool.
+    pub fn configure_heartbeat_probes(&self, config: HeartbeatProbeConfig) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.configure_heartbeat_probes(config);
+        }
+    }
+
+    /// Retrieve active heartbeat probe configuration.
+    pub fn heartbeat_probe_config(&self) -> HeartbeatProbeConfig {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.heartbeat_probe_config().clone()
+        } else {
+            HeartbeatProbeConfig::default()
+        }
+    }
+
+    /// Emit an active keep-alive probe (HTTP/2 PING or HTTP/3 PATH_CHALLENGE) on a transport session.
+    pub fn emit_heartbeat_probe(&self, session_id: u64) -> Option<ActiveProbe> {
+        self.emit_heartbeat_probe_at(session_id, std::time::Instant::now())
+    }
+
+    /// Emit an active keep-alive probe with explicit timestamp for deterministic testing.
+    pub fn emit_heartbeat_probe_at(
+        &self,
+        session_id: u64,
+        now: std::time::Instant,
+    ) -> Option<ActiveProbe> {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.emit_heartbeat_probe(session_id, now)
+        } else {
+            None
+        }
+    }
+
+    /// Scan all active sessions and generate heartbeat probes for those whose scheduled probe deadline has arrived.
+    pub fn generate_heartbeat_probes(&self) -> Vec<ActiveProbe> {
+        self.generate_heartbeat_probes_at(std::time::Instant::now())
+    }
+
+    /// Scan all active sessions and generate heartbeat probes at an explicit timestamp.
+    pub fn generate_heartbeat_probes_at(&self, now: std::time::Instant) -> Vec<ActiveProbe> {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.generate_scheduled_probes(now)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Record receipt of a probe response / acknowledgement (HTTP/2 PING ACK or HTTP/3 PATH_RESPONSE).
+    pub fn record_probe_reply(&self, payload: [u8; 8]) -> Result<std::time::Duration, String> {
+        self.record_probe_reply_at(payload, std::time::Instant::now())
+    }
+
+    /// Record receipt of a probe response / acknowledgement at an explicit timestamp.
+    pub fn record_probe_reply_at(
+        &self,
+        payload: [u8; 8],
+        now: std::time::Instant,
+    ) -> Result<std::time::Duration, String> {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.record_probe_reply(payload, now)
+        } else {
+            Err("InterSessionDrrArbitrator lock poisoned".to_string())
+        }
+    }
+
+    /// Check outstanding probes for timeouts and update session degradation or zombie state.
+    pub fn check_probe_timeouts(&self) -> Vec<u64> {
+        self.check_probe_timeouts_at(std::time::Instant::now())
+    }
+
+    /// Check outstanding probes for timeouts at an explicit timestamp.
+    pub fn check_probe_timeouts_at(&self, now: std::time::Instant) -> Vec<u64> {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.check_probe_timeouts(now)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Record incoming activity on a session to reset the silence watchdog timer.
+    pub fn record_session_activity(&self, session_id: u64) {
+        self.record_session_activity_at(session_id, std::time::Instant::now());
+    }
+
+    /// Record incoming activity on a session at an explicit timestamp.
+    pub fn record_session_activity_at(&self, session_id: u64, now: std::time::Instant) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.record_session_activity(session_id, now);
+        }
+    }
+
+    /// Detect silent/zombie sessions exceeding silence threshold.
+    pub fn detect_zombie_sessions(&self) -> Vec<u64> {
+        self.detect_zombie_sessions_at(std::time::Instant::now())
+    }
+
+    /// Detect silent/zombie sessions exceeding silence threshold at an explicit timestamp.
+    pub fn detect_zombie_sessions_at(&self, now: std::time::Instant) -> Vec<u64> {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.detect_zombie_sessions(now)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Explicitly isolate a zombie session to prevent routing black holes.
+    pub fn isolate_zombie_session(&self, session_id: u64) -> Result<usize, String> {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.isolate_zombie_session(session_id)
+        } else {
+            Err("InterSessionDrrArbitrator lock poisoned".to_string())
+        }
+    }
+
+    /// Retrieve health and latency metrics for a specific transport session in the pool.
+    pub fn session_health(&self, session_id: u64) -> Option<SessionHealthMetrics> {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.session_health(session_id)
+        } else {
+            None
+        }
+    }
+
+    /// Export health and latency metrics across all registered sessions in the pool.
+    pub fn all_session_health(&self) -> Vec<SessionHealthMetrics> {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.all_session_health()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Retrieve aggregate health and latency telemetry across all sessions in the transport pool.
+    pub fn pool_health_telemetry(&self) -> PoolHealthTelemetry {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.pool_health_telemetry()
+        } else {
+            PoolHealthTelemetry {
+                total_sessions: 0,
+                healthy_sessions: 0,
+                degraded_sessions: 0,
+                zombie_sessions: 0,
+                dead_sessions: 0,
+                total_probes_sent: 0,
+                total_probes_received: 0,
+                total_probes_lost: 0,
+                aggregate_loss_rate: 0.0,
+                average_smoothed_rtt: std::time::Duration::from_millis(0),
+                average_jitter: std::time::Duration::from_millis(0),
+                average_health_score: 1.0,
             }
         }
     }
@@ -23143,5 +24004,314 @@ mod tls_alpn_tests {
             .find(|s| s.session_id == 802)
             .unwrap();
         assert!(s802.allocated_bytes > 0);
+    }
+
+    #[test]
+    fn test_heartbeat_probe_generation_http2_and_http3() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+        let t0 = std::time::Instant::now();
+
+        arb.register_session(
+            1,
+            "https://api.gateway.internal",
+            TransportProtocol::Http2,
+            1,
+        );
+        arb.register_session(
+            2,
+            "https://quic.gateway.internal",
+            TransportProtocol::Http3,
+            1,
+        );
+
+        // HTTP/2 probe emits Http2Ping with 8-byte payload
+        let probe1 = arb.emit_heartbeat_probe(1, t0).expect("emit probe 1");
+        assert_eq!(probe1.session_id, 1);
+        assert_eq!(probe1.probe_kind, SessionProbeKind::Http2Ping);
+        assert_eq!(probe1.payload.len(), 8);
+
+        // HTTP/3 probe emits Http3PathChallenge with 8-byte payload
+        let probe2 = arb.emit_heartbeat_probe(2, t0).expect("emit probe 2");
+        assert_eq!(probe2.session_id, 2);
+        assert_eq!(probe2.probe_kind, SessionProbeKind::Http3PathChallenge);
+        assert_eq!(probe2.payload.len(), 8);
+
+        assert_ne!(probe1.payload, probe2.payload);
+
+        let h1 = arb.session_health(1).unwrap();
+        let h2 = arb.session_health(2).unwrap();
+        assert_eq!(h1.probes_sent, 1);
+        assert_eq!(h2.probes_sent, 1);
+        assert_eq!(h1.state, SessionHealthState::Healthy);
+        assert_eq!(h2.state, SessionHealthState::Healthy);
+    }
+
+    #[test]
+    fn test_heartbeat_probe_ack_rtt_and_jitter_calculation() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+        let t0 = std::time::Instant::now();
+
+        arb.register_session(
+            10,
+            "https://rtt.gateway.internal",
+            TransportProtocol::Http2,
+            1,
+        );
+
+        // Emit first probe at t0
+        let probe1 = arb.emit_heartbeat_probe(10, t0).unwrap();
+        // Acknowledge after 20ms
+        let t1 = t0 + std::time::Duration::from_millis(20);
+        let rtt1 = arb.record_probe_reply(probe1.payload, t1).unwrap();
+        assert_eq!(rtt1, std::time::Duration::from_millis(20));
+
+        let h1 = arb.session_health(10).unwrap();
+        assert_eq!(h1.probes_received, 1);
+        assert_eq!(h1.smoothed_rtt, std::time::Duration::from_millis(20));
+        assert_eq!(h1.rttvar, std::time::Duration::from_millis(10));
+        assert_eq!(h1.loss_rate, 0.0);
+        assert!(h1.health_score > 0.8);
+
+        // Emit second probe and acknowledge after 40ms
+        let t2 = t1 + std::time::Duration::from_millis(50);
+        let probe2 = arb.emit_heartbeat_probe(10, t2).unwrap();
+        let t3 = t2 + std::time::Duration::from_millis(40);
+        let rtt2 = arb.record_probe_reply(probe2.payload, t3).unwrap();
+        assert_eq!(rtt2, std::time::Duration::from_millis(40));
+
+        let h2 = arb.session_health(10).unwrap();
+        assert_eq!(h2.probes_received, 2);
+        // Smoothed RTT: (7*20 + 40)/8 = 180/8 = 22.5ms = 22500 micros
+        assert_eq!(h2.smoothed_rtt, std::time::Duration::from_micros(22500));
+        assert_eq!(h2.min_rtt, std::time::Duration::from_millis(20));
+        assert_eq!(h2.max_rtt, std::time::Duration::from_millis(40));
+        assert_eq!(h2.state, SessionHealthState::Healthy);
+    }
+
+    #[test]
+    fn test_probe_timeout_consecutive_failures_and_zombie_transition() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+        arb.configure_heartbeat_probes(HeartbeatProbeConfig {
+            base_interval: std::time::Duration::from_secs(10),
+            probe_timeout: std::time::Duration::from_secs(2),
+            max_consecutive_failures: 3,
+            zombie_silence_threshold: std::time::Duration::from_secs(30),
+            adaptive_probing: true,
+            min_adaptive_interval: std::time::Duration::from_secs(1),
+            max_adaptive_interval: std::time::Duration::from_secs(60),
+        });
+
+        let t0 = std::time::Instant::now();
+        arb.register_session(
+            20,
+            "https://failing.gateway.internal",
+            TransportProtocol::Http2,
+            1,
+        );
+
+        // Probe 1 timed out
+        let _p1 = arb.emit_heartbeat_probe(20, t0).unwrap();
+        let timeouts1 = arb.check_probe_timeouts(t0 + std::time::Duration::from_secs(3));
+        assert_eq!(timeouts1, vec![20]);
+        let h1 = arb.session_health(20).unwrap();
+        assert_eq!(h1.consecutive_failures, 1);
+        assert_eq!(h1.state, SessionHealthState::Degraded);
+
+        // Probe 2 timed out
+        let t1 = t0 + std::time::Duration::from_secs(3);
+        let _p2 = arb.emit_heartbeat_probe(20, t1).unwrap();
+        let timeouts2 = arb.check_probe_timeouts(t1 + std::time::Duration::from_secs(3));
+        assert_eq!(timeouts2, vec![20]);
+        let h2 = arb.session_health(20).unwrap();
+        assert_eq!(h2.consecutive_failures, 2);
+        assert_eq!(h2.state, SessionHealthState::Degraded);
+
+        // Probe 3 timed out -> triggers Zombie state!
+        let t2 = t1 + std::time::Duration::from_secs(3);
+        let _p3 = arb.emit_heartbeat_probe(20, t2).unwrap();
+        let timeouts3 = arb.check_probe_timeouts(t2 + std::time::Duration::from_secs(3));
+        assert_eq!(timeouts3, vec![20]);
+        let h3 = arb.session_health(20).unwrap();
+        assert_eq!(h3.consecutive_failures, 3);
+        assert_eq!(h3.state, SessionHealthState::Zombie);
+        assert_eq!(h3.health_score, 0.0);
+        assert_eq!(h3.loss_rate, 1.0);
+    }
+
+    #[test]
+    fn test_silent_session_watchdog_zombie_detection() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+        arb.configure_heartbeat_probes(HeartbeatProbeConfig {
+            base_interval: std::time::Duration::from_secs(15),
+            probe_timeout: std::time::Duration::from_secs(3),
+            max_consecutive_failures: 3,
+            zombie_silence_threshold: std::time::Duration::from_secs(20),
+            adaptive_probing: false,
+            min_adaptive_interval: std::time::Duration::from_secs(1),
+            max_adaptive_interval: std::time::Duration::from_secs(60),
+        });
+
+        let t0 = std::time::Instant::now();
+        arb.register_session(
+            30,
+            "https://silent.gateway.internal",
+            TransportProtocol::Http2,
+            1,
+        );
+
+        // Activity recorded at t0 + 5s
+        arb.record_session_activity(30, t0 + std::time::Duration::from_secs(5));
+
+        // At t0 + 15s (10s since activity) -> not zombie
+        let z1 = arb.detect_zombie_sessions(t0 + std::time::Duration::from_secs(15));
+        assert!(z1.is_empty());
+        assert_eq!(
+            arb.session_health(30).unwrap().state,
+            SessionHealthState::Healthy
+        );
+
+        // At t0 + 30s (25s since activity > 20s threshold) -> detected as Zombie
+        let z2 = arb.detect_zombie_sessions(t0 + std::time::Duration::from_secs(30));
+        assert_eq!(z2, vec![30]);
+        assert_eq!(
+            arb.session_health(30).unwrap().state,
+            SessionHealthState::Zombie
+        );
+    }
+
+    #[test]
+    fn test_zombie_and_dead_sessions_isolated_from_drr_routing() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+
+        // Healthy session 41
+        arb.register_session(41, "https://isolated.org", TransportProtocol::Http2, 1);
+        arb.register_stream(41, 1, 1024, 1, true);
+
+        // Zombie session 42
+        arb.register_session(42, "https://isolated.org", TransportProtocol::Http2, 1);
+        arb.register_stream(42, 3, 2048, 1, true);
+        arb.isolate_zombie_session(42).unwrap();
+
+        assert_eq!(
+            arb.session_health(42).unwrap().state,
+            SessionHealthState::Zombie
+        );
+
+        // Schedule round with 4096 bandwidth
+        let report = arb.schedule_round(4096);
+        assert_eq!(report.slices.len(), 1);
+        assert_eq!(report.slices[0].session_id, 41);
+        assert_eq!(report.slices[0].allocated_bytes, 1024);
+
+        // Zombie session was completely bypassed and received zero bytes
+        assert!(report.slices.iter().all(|s| s.session_id != 42));
+    }
+
+    #[test]
+    fn test_isolate_zombie_session_and_migrate_streams() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+
+        // Session 50 has 2 active streams
+        arb.register_session(
+            50,
+            "https://migrate-zombie.org",
+            TransportProtocol::Http2,
+            1,
+        );
+        arb.register_stream(50, 1, 1024, 1, true);
+        arb.register_stream(50, 3, 2048, 1, true);
+
+        // Isolate zombie session 50
+        let preserved = arb.isolate_zombie_session(50).unwrap();
+        assert_eq!(preserved, 2);
+
+        // Register new healthy session 51
+        arb.register_session(
+            51,
+            "https://migrate-zombie.org",
+            TransportProtocol::Http2,
+            2,
+        );
+
+        // Auto-migrate away from zombie session
+        let report = arb.auto_migrate_draining_session(50).unwrap();
+        assert_eq!(report.migrated_streams_count, 2);
+        assert_eq!(report.total_migrated_bytes, 3072);
+        assert_eq!(report.target_session_ids, vec![51, 51]);
+        assert!(report.source_now_drained);
+
+        // Healthy session 51 dispatches migrated data
+        let round = arb.schedule_round(4096);
+        assert_eq!(round.slices.len(), 1);
+        assert_eq!(round.slices[0].session_id, 51);
+        assert_eq!(round.slices[0].allocated_bytes, 3072);
+    }
+
+    #[test]
+    fn test_async_http2_pool_health_probing_and_telemetry_integration() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 443, 4);
+        let t0 = std::time::Instant::now();
+
+        pool.configure_heartbeat_probes(HeartbeatProbeConfig {
+            base_interval: std::time::Duration::from_secs(10),
+            probe_timeout: std::time::Duration::from_secs(2),
+            max_consecutive_failures: 2,
+            zombie_silence_threshold: std::time::Duration::from_secs(20),
+            adaptive_probing: true,
+            min_adaptive_interval: std::time::Duration::from_secs(1),
+            max_adaptive_interval: std::time::Duration::from_secs(60),
+        });
+
+        // Register 2 sessions in pool
+        pool.register_transport_session(901, "https://pool-health.io", TransportProtocol::Http2, 1);
+        pool.register_transport_session(902, "https://pool-health.io", TransportProtocol::Http3, 2);
+
+        // Emit and reply probe on 901
+        let p901 = pool.emit_heartbeat_probe_at(901, t0).unwrap();
+        let rtt = pool
+            .record_probe_reply_at(p901.payload, t0 + std::time::Duration::from_millis(15))
+            .unwrap();
+        assert_eq!(rtt, std::time::Duration::from_millis(15));
+
+        // Emit probe on 902 but let it time out twice
+        let p902_1 = pool.emit_heartbeat_probe_at(902, t0).unwrap();
+        let _ = pool.check_probe_timeouts_at(t0 + std::time::Duration::from_secs(3));
+        let p902_2 = pool
+            .emit_heartbeat_probe_at(902, t0 + std::time::Duration::from_secs(3))
+            .unwrap();
+        assert_ne!(p901.payload, p902_1.payload);
+        assert_ne!(p902_1.payload, p902_2.payload);
+
+        let timeouts = pool.check_probe_timeouts_at(t0 + std::time::Duration::from_secs(6));
+        assert_eq!(timeouts, vec![902]);
+
+        // 901 is Healthy, 902 is Zombie
+        let h901 = pool.session_health(901).unwrap();
+        let h902 = pool.session_health(902).unwrap();
+        assert_eq!(h901.state, SessionHealthState::Healthy);
+        assert_eq!(h902.state, SessionHealthState::Zombie);
+        assert_eq!(h901.smoothed_rtt, std::time::Duration::from_millis(15));
+        assert_eq!(h902.consecutive_failures, 2);
+        assert_eq!(h902.loss_rate, 1.0);
+
+        // Pool health telemetry
+        let telem = pool.pool_health_telemetry();
+        assert_eq!(telem.total_sessions, 2);
+        assert_eq!(telem.healthy_sessions, 1);
+        assert_eq!(telem.zombie_sessions, 1);
+        assert_eq!(telem.total_probes_sent, 3);
+        assert_eq!(telem.total_probes_received, 1);
+        assert_eq!(telem.total_probes_lost, 2);
+        assert!((telem.aggregate_loss_rate - 2.0 / 3.0).abs() < 0.001);
+
+        // Routing verification: queue data on both, ensure 902 (Zombie) is ignored
+        pool.register_pooled_stream(901, 1, 1024, 1, true);
+        pool.register_pooled_stream(902, 3, 2048, 1, true);
+
+        let round = pool.schedule_inter_session_bandwidth(4096);
+        assert_eq!(round.slices.len(), 1);
+        assert_eq!(round.slices[0].session_id, 901);
+        assert_eq!(round.slices[0].allocated_bytes, 1024);
+        assert!(round.slices.iter().all(|s| s.session_id != 902));
     }
 }
