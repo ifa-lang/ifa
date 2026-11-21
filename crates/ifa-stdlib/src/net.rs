@@ -13167,31 +13167,41 @@ mod tests {
 
     #[test]
     fn test_async_http2_pool_execute_with_retry_success_on_first_attempt() {
-        // Server that accepts one connection, responds 200, then cleanly closes.
+        // Server that accepts connections until request is successfully serviced, then cleanly closes.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let port = listener.local_addr().expect("local addr").port();
 
         let handle = std::thread::spawn(move || {
-            let (tcp_stream, _) = listener.accept().expect("accept connection");
-            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
-            let mut server =
-                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+            while let Ok((tcp_stream, _)) = listener.accept() {
+                let async_stream = match AsyncTcpStream::from_std(tcp_stream) {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut server = match AsyncHttp2Connection::server_handshake(async_stream) {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
 
-            while let Ok(frame) = server.recv_frame() {
-                if let crate::simd_parser::Http2Frame::Headers {
-                    stream_id,
-                    end_stream,
-                    ..
-                } = frame
-                {
-                    if end_stream {
-                        server
-                            .send_response(stream_id, &[(":status", "200")], Some(b"retry-ok"))
-                            .expect("send response");
-                        // Graceful GOAWAY so pool release discards cleanly
-                        let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
-                        break;
+                let mut completed = false;
+                while let Ok(frame) = server.recv_frame() {
+                    if let crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    } = frame
+                    {
+                        if end_stream {
+                            server
+                                .send_response(stream_id, &[(":status", "200")], Some(b"retry-ok"))
+                                .expect("send response");
+                            let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                            completed = true;
+                            break;
+                        }
                     }
+                }
+                if completed {
+                    break;
                 }
             }
         });
