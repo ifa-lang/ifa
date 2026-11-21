@@ -3213,6 +3213,24 @@ impl AsyncHttp2Connection {
         self.stream.write_all(&wire)
     }
 
+    /// Send a pre-coalesced batch of HTTP/2 frames directly across the wire in a single vector write,
+    /// minimizing kernel transitions and syscall overhead on high-frequency transaction streams.
+    pub fn send_frame_batch(
+        &mut self,
+        batch: &crate::simd_parser::Http2FrameBatchSerializer,
+    ) -> io::Result<()> {
+        if self.is_closed {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "HTTP/2 connection is closed",
+            ));
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.stream.write_all(batch.as_bytes())
+    }
+
     /// Send a DATA frame on an existing stream with active flow control chunking (max 16384 bytes)
     /// and adaptive backpressure waiting when flow control windows are exhausted.
     pub fn send_data(&mut self, stream_id: u32, data: &[u8], end_stream: bool) -> io::Result<()> {
@@ -5688,9 +5706,8 @@ pub struct AsyncHttp2Pool {
     quarantined_alt_svc_routes:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
     alt_svc_quarantine_duration: std::time::Duration,
-    alt_svc_metrics: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, AltSvcRouteMetrics>>,
-    >,
+    alt_svc_metrics:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, AltSvcRouteMetrics>>>,
     alt_svc_selection_strategy: std::sync::Arc<std::sync::Mutex<AltSvcSelectionStrategy>>,
     h3_requests_attempted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     h3_requests_succeeded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -6137,9 +6154,7 @@ impl AsyncHttp2Pool {
                     true
                 }
             }
-            AltSvcSelectionStrategy::JitterThreshold(max_jitter) => {
-                alt_metric.rttvar <= max_jitter
-            }
+            AltSvcSelectionStrategy::JitterThreshold(max_jitter) => alt_metric.rttvar <= max_jitter,
             AltSvcSelectionStrategy::MaxLatencyPenalty(penalty) => {
                 if let Some(h2_m) = h2_metric {
                     if h2_m.sample_count > 0 {
@@ -7387,11 +7402,14 @@ impl AsyncHttp2Pool {
                                     {
                                         if let Ok(mut cache) = self.http_cache_entries.lock() {
                                             if let Some(entries) = cache.get_mut(&key) {
-                                                if let Some(pos) = entries.iter().rposition(|entry| {
-                                                    entry.matches_request(&client_req.headers)
-                                                }) {
+                                                if let Some(pos) =
+                                                    entries.iter().rposition(|entry| {
+                                                        entry.matches_request(&client_req.headers)
+                                                    })
+                                                {
                                                     entries[pos].update_from_304(&resp, now_update);
-                                                    resolved_resp = Some(entries[pos].response.clone());
+                                                    resolved_resp =
+                                                        Some(entries[pos].response.clone());
                                                 }
                                             }
                                         }
@@ -7403,11 +7421,14 @@ impl AsyncHttp2Pool {
                                     {
                                         if let Ok(mut cache) = self.push_promise_cache.lock() {
                                             if let Some(entries) = cache.get_mut(&key) {
-                                                if let Some(pos) = entries.iter().rposition(|entry| {
-                                                    entry.matches_request(&client_req.headers)
-                                                }) {
+                                                if let Some(pos) =
+                                                    entries.iter().rposition(|entry| {
+                                                        entry.matches_request(&client_req.headers)
+                                                    })
+                                                {
                                                     entries[pos].update_from_304(&resp, now_update);
-                                                    resolved_resp = Some(entries[pos].response.clone());
+                                                    resolved_resp =
+                                                        Some(entries[pos].response.clone());
                                                 }
                                             }
                                         }
@@ -7422,9 +7443,10 @@ impl AsyncHttp2Pool {
                                 }
 
                                 if let Some(alt_svc_val) = resp.headers.get("alt-svc") {
-                                    let routes = crate::simd_parser::AltSvcRoute::parse_header_value(
-                                        alt_svc_val,
-                                    );
+                                    let routes =
+                                        crate::simd_parser::AltSvcRoute::parse_header_value(
+                                            alt_svc_val,
+                                        );
                                     let origin = format!("{}:{}", self.host, self.port);
                                     if let Ok(mut pool_routes) = self.alt_svc_routes.lock() {
                                         if routes.is_empty()
@@ -8000,9 +8022,10 @@ impl AsyncHttp2Pool {
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                                 if let Some(alt_svc_val) = resp.headers.get("alt-svc") {
-                                    let routes = crate::simd_parser::AltSvcRoute::parse_header_value(
-                                        alt_svc_val,
-                                    );
+                                    let routes =
+                                        crate::simd_parser::AltSvcRoute::parse_header_value(
+                                            alt_svc_val,
+                                        );
                                     let origin = format!("{}:{}", self.host, self.port);
                                     if let Ok(mut pool_routes) = self.alt_svc_routes.lock() {
                                         if routes.is_empty()
@@ -17591,10 +17614,7 @@ mod tls_alpn_tests {
                             server
                                 .send_response(
                                     stream_id,
-                                    &[
-                                        (":status", "200"),
-                                        ("alt-svc", "h3=\":50443\"; ma=86400"),
-                                    ],
+                                    &[(":status", "200"), ("alt-svc", "h3=\":50443\"; ma=86400")],
                                     Some(b"h2-response"),
                                 )
                                 .expect("send response");
@@ -17610,7 +17630,12 @@ mod tls_alpn_tests {
 
         let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2)
             .with_http3_handler(
-                move |_h: &str, _p: u16, _m: &str, _path: &str, _headers: &[(&str, &str)], _b: Option<&[u8]>| {
+                move |_h: &str,
+                      _p: u16,
+                      _m: &str,
+                      _path: &str,
+                      _headers: &[(&str, &str)],
+                      _b: Option<&[u8]>| {
                     h3_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(2));
                     let mut resp = crate::http::HttpResponse::new(crate::http::HttpStatus(200));
@@ -17662,6 +17687,95 @@ mod tls_alpn_tests {
         assert_eq!(h3_dispatches.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         pool.shutdown();
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_connection_send_frame_batch() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let (tcp_stream, _) = listener.accept().expect("accept connection");
+            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+
+            let mut got_headers = false;
+            let mut got_data = false;
+            while let Ok(frame) = server.recv_frame() {
+                match frame {
+                    crate::simd_parser::Http2Frame::Headers { .. } => {
+                        got_headers = true;
+                    }
+                    crate::simd_parser::Http2Frame::Data {
+                        stream_id, data, ..
+                    } => {
+                        got_data = true;
+                        assert_eq!(data, b"high-frequency-batch-body");
+                        server
+                            .send_response(
+                                stream_id,
+                                &[(":status", "200")],
+                                Some(b"batch-received"),
+                            )
+                            .expect("send response");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(got_headers);
+            assert!(got_data);
+        });
+
+        let client_stream =
+            AsyncTcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect client");
+        let mut client =
+            AsyncHttp2Connection::client_handshake(client_stream).expect("client handshake");
+
+        // Encode request headers and data frame in a batch
+        let mut hpack_ctx = crate::simd_parser::HpackContext::new(4096);
+        let mut header_block = Vec::new();
+        hpack_ctx.encode_headers_into(
+            &[
+                (":method", "POST"),
+                (":path", "/batch-stream"),
+                (":scheme", "https"),
+            ],
+            false,
+            &mut header_block,
+        );
+
+        let req_headers_frame = crate::simd_parser::Http2Frame::Headers {
+            stream_id: 1,
+            end_stream: false,
+            end_headers: true,
+            header_block,
+        };
+        let req_data_frame = crate::simd_parser::Http2Frame::Data {
+            stream_id: 1,
+            end_stream: true,
+            data: b"high-frequency-batch-body".to_vec(),
+        };
+
+        let mut batch = crate::simd_parser::Http2FrameBatchSerializer::new();
+        batch.push_frame(&req_headers_frame);
+        batch.push_frame(&req_data_frame);
+
+        client.send_frame_batch(&batch).expect("send frame batch");
+
+        // Receive response
+        let mut got_resp_data = false;
+        while let Ok(frame) = client.recv_frame() {
+            if let crate::simd_parser::Http2Frame::Data { data, .. } = frame {
+                assert_eq!(data, b"batch-received");
+                got_resp_data = true;
+                break;
+            }
+        }
+        assert!(got_resp_data);
+
         let _ = handle.join();
     }
 }

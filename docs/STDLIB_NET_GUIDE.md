@@ -159,6 +159,60 @@ for metric in pool.all_alt_svc_metrics() {
 }
 ```
 
+### High-Frequency HPACK & QPACK Frame Serialization (RFC 7541 / RFC 9204 / RFC 9114)
+
+On high-frequency transaction streams (e.g. financial feeds, reverse proxy gateways, high-throughput microservices), linear header scans and frame-by-frame memory allocations introduce non-negligible CPU and syscall overhead. IFA provides zero-allocation serialization primitives and $O(1)$ static table lookups for both HTTP/2 (HPACK) and HTTP/3 (QPACK):
+
+```rust
+use ifa_stdlib::net::{
+    hpack_static_lookup, qpack_static_lookup, HpackContext, Http2Frame,
+    Http2FrameBatchSerializer, Http3Frame, Http3FrameType, QpackContext,
+};
+
+// 1. O(1) Accelerated static table lookups for common headers
+let (exact_match, name_match) = hpack_static_lookup(":method", "GET");
+assert_eq!(exact_match, Some(2));
+
+// 2. High-throughput zero-allocation header block encoding into pre-allocated buffer
+let mut hpack = HpackContext::new(4096);
+let mut header_buf = Vec::with_capacity(512);
+hpack.encode_headers_into(
+    &[(":method", "GET"), (":path", "/order/book"), (":scheme", "https")],
+    false, /* use_huffman */
+    &mut header_buf,
+);
+
+// 3. Batched multi-frame coalesced writes (reduces syscall overhead)
+let mut batch = Http2FrameBatchSerializer::with_capacity(16384);
+batch.push_frame(&Http2Frame::Headers {
+    stream_id: 1,
+    end_stream: false,
+    end_headers: true,
+    header_block: header_buf,
+});
+batch.push_frame(&Http2Frame::Data {
+    stream_id: 1,
+    end_stream: true,
+    data: b"transaction-data".to_vec(),
+});
+
+// Transmit all coalesced frames in a single vectorized socket write
+// connection.send_frame_batch(&batch)?;
+
+// 4. QPACK (RFC 9204) field compression for HTTP/3 streams
+let mut qpack = QpackContext::new(4096);
+let h3_encoded = qpack.encode_headers(&[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":path", "/"),
+    ("accept-encoding", "gzip, deflate, br"),
+]);
+
+// Wrap directly in an RFC 9114 HTTP/3 HEADERS frame with QUIC variable-length integers
+let h3_frame = Http3Frame::Headers { encoded_fields: h3_encoded };
+let wire_h3 = h3_frame.encode();
+```
+
 ---
 
 ## 3. WebSocket Client & Pooled Multiplexing

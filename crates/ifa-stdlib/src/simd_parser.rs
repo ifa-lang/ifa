@@ -875,8 +875,8 @@ impl Http2Frame {
         }
     }
 
-    /// Encode the HTTP/2 frame into wire bytes (header + payload).
-    pub fn encode(&self) -> Vec<u8> {
+    /// Encode the HTTP/2 frame into wire bytes directly appended to a destination buffer.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
             Http2Frame::Data {
                 stream_id,
@@ -894,10 +894,9 @@ impl Http2Frame {
                     flags,
                     *stream_id,
                 );
-                let mut out = Vec::with_capacity(9 + data.len());
+                out.reserve(9 + data.len());
                 out.extend_from_slice(&header.encode());
                 out.extend_from_slice(data);
-                out
             }
             Http2Frame::Headers {
                 stream_id,
@@ -918,10 +917,9 @@ impl Http2Frame {
                     flags,
                     *stream_id,
                 );
-                let mut out = Vec::with_capacity(9 + header_block.len());
+                out.reserve(9 + header_block.len());
                 out.extend_from_slice(&header.encode());
                 out.extend_from_slice(header_block);
-                out
             }
             Http2Frame::Priority {
                 stream_id,
@@ -930,30 +928,28 @@ impl Http2Frame {
                 weight,
             } => {
                 let header = Http2FrameHeader::new(5, Http2FrameType::Priority, 0, *stream_id);
-                let mut out = Vec::with_capacity(14);
+                out.reserve(14);
                 out.extend_from_slice(&header.encode());
                 let dep =
                     (if *exclusive { 0x8000_0000 } else { 0 }) | (*stream_dependency & 0x7FFF_FFFF);
                 out.extend_from_slice(&dep.to_be_bytes());
                 out.push(*weight);
-                out
             }
             Http2Frame::RstStream {
                 stream_id,
                 error_code,
             } => {
                 let header = Http2FrameHeader::new(4, Http2FrameType::RstStream, 0, *stream_id);
-                let mut out = Vec::with_capacity(13);
+                out.reserve(13);
                 out.extend_from_slice(&header.encode());
                 let err_raw: u32 = (*error_code).into();
                 out.extend_from_slice(&err_raw.to_be_bytes());
-                out
             }
             Http2Frame::Settings { ack, settings } => {
                 let flags = if *ack { Self::FLAG_ACK } else { 0 };
                 let payload_len = if *ack { 0 } else { (settings.len() * 6) as u32 };
                 let header = Http2FrameHeader::new(payload_len, Http2FrameType::Settings, flags, 0);
-                let mut out = Vec::with_capacity(9 + payload_len as usize);
+                out.reserve(9 + payload_len as usize);
                 out.extend_from_slice(&header.encode());
                 if !*ack {
                     for setting in settings {
@@ -962,15 +958,13 @@ impl Http2Frame {
                         out.extend_from_slice(&setting.value.to_be_bytes());
                     }
                 }
-                out
             }
             Http2Frame::Ping { ack, opaque_data } => {
                 let flags = if *ack { Self::FLAG_ACK } else { 0 };
                 let header = Http2FrameHeader::new(8, Http2FrameType::Ping, flags, 0);
-                let mut out = Vec::with_capacity(17);
+                out.reserve(17);
                 out.extend_from_slice(&header.encode());
                 out.extend_from_slice(opaque_data);
-                out
             }
             Http2Frame::GoAway {
                 last_stream_id,
@@ -979,23 +973,21 @@ impl Http2Frame {
             } => {
                 let payload_len = 8 + debug_data.len() as u32;
                 let header = Http2FrameHeader::new(payload_len, Http2FrameType::GoAway, 0, 0);
-                let mut out = Vec::with_capacity(9 + payload_len as usize);
+                out.reserve(9 + payload_len as usize);
                 out.extend_from_slice(&header.encode());
                 out.extend_from_slice(&(last_stream_id & 0x7FFF_FFFF).to_be_bytes());
                 let err_raw: u32 = (*error_code).into();
                 out.extend_from_slice(&err_raw.to_be_bytes());
                 out.extend_from_slice(debug_data);
-                out
             }
             Http2Frame::WindowUpdate {
                 stream_id,
                 window_size_increment,
             } => {
                 let header = Http2FrameHeader::new(4, Http2FrameType::WindowUpdate, 0, *stream_id);
-                let mut out = Vec::with_capacity(13);
+                out.reserve(13);
                 out.extend_from_slice(&header.encode());
                 out.extend_from_slice(&(window_size_increment & 0x7FFF_FFFF).to_be_bytes());
-                out
             }
             Http2Frame::Continuation {
                 stream_id,
@@ -1013,10 +1005,9 @@ impl Http2Frame {
                     flags,
                     *stream_id,
                 );
-                let mut out = Vec::with_capacity(9 + header_block.len());
+                out.reserve(9 + header_block.len());
                 out.extend_from_slice(&header.encode());
                 out.extend_from_slice(header_block);
-                out
             }
             Http2Frame::PushPromise {
                 stream_id,
@@ -1036,11 +1027,10 @@ impl Http2Frame {
                     flags,
                     *stream_id,
                 );
-                let mut out = Vec::with_capacity(9 + payload_len);
+                out.reserve(9 + payload_len);
                 out.extend_from_slice(&header.encode());
                 out.extend_from_slice(&(*promised_stream_id & 0x7FFF_FFFF).to_be_bytes());
                 out.extend_from_slice(header_block);
-                out
             }
             Http2Frame::PriorityUpdate {
                 prioritized_stream_id,
@@ -1048,14 +1038,12 @@ impl Http2Frame {
             } => {
                 let bytes = priority_field_value.as_bytes();
                 let payload_len = 4 + bytes.len();
-                // RFC 9218: PRIORITY_UPDATE frames MUST be sent on stream 0
                 let header =
                     Http2FrameHeader::new(payload_len as u32, Http2FrameType::PriorityUpdate, 0, 0);
-                let mut out = Vec::with_capacity(9 + payload_len);
+                out.reserve(9 + payload_len);
                 out.extend_from_slice(&header.encode());
                 out.extend_from_slice(&(*prioritized_stream_id & 0x7FFF_FFFF).to_be_bytes());
                 out.extend_from_slice(bytes);
-                out
             }
             Http2Frame::AltSvc {
                 stream_id,
@@ -1072,20 +1060,25 @@ impl Http2Frame {
                     0,
                     *stream_id & 0x7FFF_FFFF,
                 );
-                let mut out = Vec::with_capacity(9 + payload_len);
+                out.reserve(9 + payload_len);
                 out.extend_from_slice(&header.encode());
                 out.extend_from_slice(&origin_len.to_be_bytes());
                 out.extend_from_slice(origin_bytes);
                 out.extend_from_slice(alt_svc_bytes);
-                out
             }
             Http2Frame::Unknown { header, payload } => {
-                let mut out = Vec::with_capacity(9 + payload.len());
+                out.reserve(9 + payload.len());
                 out.extend_from_slice(&header.encode());
                 out.extend_from_slice(payload);
-                out
             }
         }
+    }
+
+    /// Encode the HTTP/2 frame into wire bytes (header + payload).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
     }
 
     /// Serialize this frame into a caller-supplied pre-allocated destination buffer
@@ -1610,6 +1603,70 @@ impl<'a> Http2DataFrameSlice<'a> {
     }
 }
 
+/// High-throughput batched frame serializer for HTTP/2 transaction streams.
+/// Pre-allocates and reuses wire buffers across burst transactions,
+/// reducing heap allocations and syscall overhead.
+#[derive(Debug, Clone)]
+pub struct Http2FrameBatchSerializer {
+    buffer: Vec<u8>,
+    frame_count: usize,
+}
+
+impl Default for Http2FrameBatchSerializer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Http2FrameBatchSerializer {
+    pub fn new() -> Self {
+        Self::with_capacity(16384)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(capacity),
+            frame_count: 0,
+        }
+    }
+
+    #[inline]
+    pub fn push_frame(&mut self, frame: &Http2Frame) {
+        frame.encode_into(&mut self.buffer);
+        self.frame_count += 1;
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    #[inline]
+    pub fn frame_count(&self) -> usize {
+        self.frame_count
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+        self.frame_count = 0;
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.buffer
+    }
+}
+
 // -----------------------------------------------------------------------------
 // HPACK Integer & String representation + Static Table (RFC 7541)
 // -----------------------------------------------------------------------------
@@ -1837,6 +1894,81 @@ pub const HPACK_STATIC_TABLE: &[(&str, &str)] = &[
     ("via", ""),
     ("www-authenticate", ""),
 ];
+
+/// Accelerated static table lookup for high-frequency HPACK headers (RFC 7541).
+/// Returns `(matched_exact_idx, matched_name_only_idx)` with 1-based indexing.
+#[inline]
+pub fn hpack_static_lookup(name: &str, value: &str) -> (Option<usize>, Option<usize>) {
+    // Fast-path for the most common HTTP/2 pseudo-headers and frequent headers
+    match name {
+        ":method" => {
+            let matched_idx = match value {
+                "GET" => Some(2),
+                "POST" => Some(3),
+                _ => None,
+            };
+            return (matched_idx, Some(2));
+        }
+        ":path" => {
+            let matched_idx = match value {
+                "/" => Some(4),
+                "/index.html" => Some(5),
+                _ => None,
+            };
+            return (matched_idx, Some(4));
+        }
+        ":scheme" => {
+            let matched_idx = match value {
+                "http" => Some(6),
+                "https" => Some(7),
+                _ => None,
+            };
+            return (matched_idx, Some(6));
+        }
+        ":status" => {
+            let matched_idx = match value {
+                "200" => Some(8),
+                "204" => Some(9),
+                "206" => Some(10),
+                "304" => Some(11),
+                "400" => Some(12),
+                "404" => Some(13),
+                "500" => Some(14),
+                _ => None,
+            };
+            return (matched_idx, Some(8));
+        }
+        ":authority" => {
+            let matched_idx = if value.is_empty() { Some(1) } else { None };
+            return (matched_idx, Some(1));
+        }
+        "accept-encoding" => {
+            let matched_idx = if value == "gzip, deflate" {
+                Some(16)
+            } else {
+                None
+            };
+            return (matched_idx, Some(16));
+        }
+        _ => {}
+    }
+
+    // Fallback scan across full static table
+    let mut matched_idx = None;
+    let mut matched_name_idx = None;
+    for (idx, &(s_name, s_val)) in HPACK_STATIC_TABLE.iter().enumerate() {
+        if s_name.eq_ignore_ascii_case(name) {
+            if matched_name_idx.is_none() {
+                matched_name_idx = Some(idx + 1);
+            }
+            if s_val == value {
+                matched_idx = Some(idx + 1);
+                break;
+            }
+        }
+    }
+    (matched_idx, matched_name_idx)
+}
 
 /// Dynamic table eviction policy for HPACK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2149,18 +2281,13 @@ impl HpackContext {
         }
     }
 
-    /// Encode a list of headers into an HPACK byte block (using static table indexing and literal encoding).
-    pub fn encode_headers(&mut self, headers: &[(&str, &str)]) -> Vec<u8> {
-        self.encode_headers_with_options(headers, false)
-    }
-
-    /// Encode a list of headers into an HPACK byte block with optional Huffman compression.
-    pub fn encode_headers_with_options(
+    /// Encode a list of headers into an HPACK byte block directly appending into caller-supplied output buffer.
+    pub fn encode_headers_into(
         &mut self,
         headers: &[(&str, &str)],
         use_huffman: bool,
-    ) -> Vec<u8> {
-        let mut out = Vec::new();
+        out: &mut Vec<u8>,
+    ) {
         let initial_len = out.len();
         let mut raw_bytes_count = 0;
 
@@ -2168,21 +2295,7 @@ impl HpackContext {
             raw_bytes_count += name.len() + value.len() + 4; // approximate raw HTTP/1.1 ": \r\n"
             self.telemetry.total_headers += 1;
 
-            let mut matched_idx = None;
-            let mut matched_name_idx = None;
-
-            // Search static table
-            for (idx, &(s_name, s_val)) in HPACK_STATIC_TABLE.iter().enumerate() {
-                if s_name.eq_ignore_ascii_case(name) {
-                    if matched_name_idx.is_none() {
-                        matched_name_idx = Some(idx + 1);
-                    }
-                    if s_val == value {
-                        matched_idx = Some(idx + 1);
-                        break;
-                    }
-                }
-            }
+            let (mut matched_idx, mut matched_name_idx) = hpack_static_lookup(name, value);
 
             // Search dynamic table if not exact match in static
             if matched_idx.is_none() {
@@ -2207,14 +2320,14 @@ impl HpackContext {
                 } else {
                     self.telemetry.dynamic_table_hits += 1;
                 }
-                hpack_encode_integer(idx, 7, 0x80, &mut out);
+                hpack_encode_integer(idx, 7, 0x80, out);
             } else if let Some(name_idx) = matched_name_idx {
                 // 2. Literal Header Field with Incremental Indexing — Indexed Name (RFC 7541 Section 6.2.1): 01xxxxxx
                 if use_huffman {
                     self.telemetry.huffman_encoded_literals += 1;
                 }
-                hpack_encode_integer(name_idx, 6, 0x40, &mut out);
-                hpack_encode_string_custom(value.as_bytes(), &mut out, use_huffman);
+                hpack_encode_integer(name_idx, 6, 0x40, out);
+                hpack_encode_string_custom(value.as_bytes(), out, use_huffman);
                 self.add_dynamic_entry(name.to_ascii_lowercase(), value.to_string());
             } else {
                 // 3. Literal Header Field with Incremental Indexing — New Name: 01000000
@@ -2222,25 +2335,35 @@ impl HpackContext {
                     self.telemetry.huffman_encoded_literals += 2;
                 }
                 out.push(0x40);
-                hpack_encode_string_custom(
-                    name.to_ascii_lowercase().as_bytes(),
-                    &mut out,
-                    use_huffman,
-                );
-                hpack_encode_string_custom(value.as_bytes(), &mut out, use_huffman);
+                hpack_encode_string_custom(name.to_ascii_lowercase().as_bytes(), out, use_huffman);
+                hpack_encode_string_custom(value.as_bytes(), out, use_huffman);
                 self.add_dynamic_entry(name.to_ascii_lowercase(), value.to_string());
             }
         }
 
         self.telemetry.raw_bytes += raw_bytes_count;
         self.telemetry.compressed_bytes += out.len() - initial_len;
+    }
 
+    /// Encode a list of headers into an HPACK byte block (using static table indexing and literal encoding).
+    pub fn encode_headers(&mut self, headers: &[(&str, &str)]) -> Vec<u8> {
+        self.encode_headers_with_options(headers, false)
+    }
+
+    /// Encode a list of headers into an HPACK byte block with optional Huffman compression.
+    pub fn encode_headers_with_options(
+        &mut self,
+        headers: &[(&str, &str)],
+        use_huffman: bool,
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(headers.len() * 32);
+        self.encode_headers_into(headers, use_huffman, &mut out);
         out
     }
 
     /// Decode an octet string length and payload slice (RFC 7541 Section 5.2).
     /// Returns the exact slice of the encoded string (including length prefix) and total consumed bytes.
-    fn decode_string_raw(bytes: &[u8]) -> Result<(&[u8], usize), FastHttpError> {
+    pub fn decode_string_raw(bytes: &[u8]) -> Result<(&[u8], usize), FastHttpError> {
         if bytes.is_empty() {
             return Err(FastHttpError::Incomplete);
         }
@@ -2316,6 +2439,707 @@ impl HpackContext {
         }
 
         Ok(out)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// QPACK (RFC 9204) & HTTP/3 Frame Management (RFC 9114)
+// -----------------------------------------------------------------------------
+
+/// QPACK Static Table (RFC 9204 Appendix A).
+/// Contains 99 predefined header fields indexed from 0 to 98.
+pub const QPACK_STATIC_TABLE: [(&str, &str); 99] = [
+    /*  0 */ (":authority", ""),
+    /*  1 */ (":path", "/"),
+    /*  2 */ ("age", "0"),
+    /*  3 */ ("content-disposition", ""),
+    /*  4 */ ("content-length", "0"),
+    /*  5 */ ("cookie", ""),
+    /*  6 */ ("date", ""),
+    /*  7 */ ("etag", ""),
+    /*  8 */ ("if-modified-since", ""),
+    /*  9 */ ("if-none-match", ""),
+    /* 10 */ ("last-modified", ""),
+    /* 11 */ ("link", ""),
+    /* 12 */ ("location", ""),
+    /* 13 */ ("referer", ""),
+    /* 14 */ ("set-cookie", ""),
+    /* 15 */ (":method", "CONNECT"),
+    /* 16 */ (":method", "DELETE"),
+    /* 17 */ (":method", "GET"),
+    /* 18 */ (":method", "HEAD"),
+    /* 19 */ (":method", "OPTIONS"),
+    /* 20 */ (":method", "POST"),
+    /* 21 */ (":method", "PUT"),
+    /* 22 */ (":scheme", "http"),
+    /* 23 */ (":scheme", "https"),
+    /* 24 */ (":status", "103"),
+    /* 25 */ (":status", "200"),
+    /* 26 */ (":status", "304"),
+    /* 27 */ (":status", "404"),
+    /* 28 */ (":status", "503"),
+    /* 29 */ ("accept", "*/*"),
+    /* 30 */ ("accept", "application/dns-message"),
+    /* 31 */ ("accept-encoding", "gzip, deflate, br"),
+    /* 32 */ ("accept-ranges", "bytes"),
+    /* 33 */ ("access-control-allow-headers", "cache-control"),
+    /* 34 */ ("access-control-allow-headers", "content-type"),
+    /* 35 */ ("access-control-allow-origin", "*"),
+    /* 36 */ ("cache-control", "max-age=0"),
+    /* 37 */ ("cache-control", "max-age=2592000"),
+    /* 38 */ ("cache-control", "max-age=604800"),
+    /* 39 */ ("cache-control", "no-cache"),
+    /* 40 */ ("cache-control", "no-store"),
+    /* 41 */ ("cache-control", "public, max-age=31536000"),
+    /* 42 */ ("content-encoding", "br"),
+    /* 43 */ ("content-encoding", "gzip"),
+    /* 44 */ ("content-type", "application/dns-message"),
+    /* 45 */ ("content-type", "application/javascript"),
+    /* 46 */ ("content-type", "application/json"),
+    /* 47 */ ("content-type", "application/x-www-form-urlencoded"),
+    /* 48 */ ("content-type", "image/gif"),
+    /* 49 */ ("content-type", "image/jpeg"),
+    /* 50 */ ("content-type", "image/png"),
+    /* 51 */ ("content-type", "text/css"),
+    /* 52 */ ("content-type", "text/html; charset=utf-8"),
+    /* 53 */ ("content-type", "text/plain"),
+    /* 54 */ ("content-type", "text/plain;charset=utf-8"),
+    /* 55 */ ("range", "bytes=0-"),
+    /* 56 */ ("strict-transport-security", "max-age=31536000"),
+    /* 57 */
+    (
+        "strict-transport-security",
+        "max-age=31536000; includesubdomains",
+    ),
+    /* 58 */
+    (
+        "strict-transport-security",
+        "max-age=31536000; includesubdomains; preload",
+    ),
+    /* 59 */ ("vary", "accept-encoding"),
+    /* 60 */ ("vary", "origin"),
+    /* 61 */ ("x-content-type-options", "nosniff"),
+    /* 62 */ ("x-xss-protection", "1; mode=block"),
+    /* 63 */ (":status", "100"),
+    /* 64 */ (":status", "204"),
+    /* 65 */ (":status", "206"),
+    /* 66 */ (":status", "302"),
+    /* 67 */ (":status", "400"),
+    /* 68 */ (":status", "403"),
+    /* 69 */ (":status", "421"),
+    /* 70 */ (":status", "425"),
+    /* 71 */ (":status", "500"),
+    /* 72 */ ("accept-language", ""),
+    /* 73 */ ("access-control-allow-credentials", "FALSE"),
+    /* 74 */ ("access-control-allow-credentials", "TRUE"),
+    /* 75 */ ("access-control-allow-headers", "*"),
+    /* 76 */ ("access-control-allow-methods", "get"),
+    /* 77 */ ("access-control-allow-methods", "get, post, options"),
+    /* 78 */ ("access-control-allow-methods", "options"),
+    /* 79 */ ("access-control-expose-headers", "content-length"),
+    /* 80 */ ("access-control-request-headers", "content-type"),
+    /* 81 */ ("access-control-request-method", "get"),
+    /* 82 */ ("access-control-request-method", "post"),
+    /* 83 */ ("alt-svc", "clear"),
+    /* 84 */ ("authorization", ""),
+    /* 85 */
+    (
+        "content-security-policy",
+        "script-src 'none'; object-src 'none'; base-uri 'none'",
+    ),
+    /* 86 */ ("early-data", "1"),
+    /* 87 */ ("expect-ct", ""),
+    /* 88 */ ("forwarded", ""),
+    /* 89 */ ("if-range", ""),
+    /* 90 */ ("origin", ""),
+    /* 91 */ ("purpose", "prefetch"),
+    /* 92 */ ("server", ""),
+    /* 93 */ ("timing-allow-origin", "*"),
+    /* 94 */ ("upgrade-insecure-requests", "1"),
+    /* 95 */ ("user-agent", ""),
+    /* 96 */ ("x-forwarded-for", ""),
+    /* 97 */ ("x-frame-options", "deny"),
+    /* 98 */ ("x-frame-options", "sameorigin"),
+];
+
+/// Accelerated static table lookup for high-frequency QPACK headers (RFC 9204).
+/// Returns `(matched_exact_idx, matched_name_only_idx)` with 0-based indexing.
+#[inline]
+pub fn qpack_static_lookup(name: &str, value: &str) -> (Option<usize>, Option<usize>) {
+    match name {
+        ":authority" => {
+            let matched_idx = if value.is_empty() { Some(0) } else { None };
+            return (matched_idx, Some(0));
+        }
+        ":path" => {
+            let matched_idx = if value == "/" { Some(1) } else { None };
+            return (matched_idx, Some(1));
+        }
+        ":method" => {
+            let matched_idx = match value {
+                "CONNECT" => Some(15),
+                "DELETE" => Some(16),
+                "GET" => Some(17),
+                "HEAD" => Some(18),
+                "OPTIONS" => Some(19),
+                "POST" => Some(20),
+                "PUT" => Some(21),
+                _ => None,
+            };
+            return (matched_idx, Some(17));
+        }
+        ":scheme" => {
+            let matched_idx = match value {
+                "http" => Some(22),
+                "https" => Some(23),
+                _ => None,
+            };
+            return (matched_idx, Some(23));
+        }
+        ":status" => {
+            let matched_idx = match value {
+                "100" => Some(63),
+                "103" => Some(24),
+                "200" => Some(25),
+                "204" => Some(64),
+                "206" => Some(65),
+                "302" => Some(66),
+                "304" => Some(26),
+                "400" => Some(67),
+                "403" => Some(68),
+                "404" => Some(27),
+                "421" => Some(69),
+                "425" => Some(70),
+                "500" => Some(71),
+                "503" => Some(28),
+                _ => None,
+            };
+            return (matched_idx, Some(25));
+        }
+        "accept-encoding" => {
+            let matched_idx = if value == "gzip, deflate, br" {
+                Some(31)
+            } else {
+                None
+            };
+            return (matched_idx, Some(31));
+        }
+        "content-type" => {
+            let matched_idx = match value {
+                "application/dns-message" => Some(44),
+                "application/javascript" => Some(45),
+                "application/json" => Some(46),
+                "application/x-www-form-urlencoded" => Some(47),
+                "image/gif" => Some(48),
+                "image/jpeg" => Some(49),
+                "image/png" => Some(50),
+                "text/css" => Some(51),
+                "text/html; charset=utf-8" => Some(52),
+                "text/plain" => Some(53),
+                "text/plain;charset=utf-8" => Some(54),
+                _ => None,
+            };
+            return (matched_idx, Some(46));
+        }
+        _ => {}
+    }
+
+    let mut matched_idx = None;
+    let mut matched_name_idx = None;
+    for (idx, &(s_name, s_val)) in QPACK_STATIC_TABLE.iter().enumerate() {
+        if s_name.eq_ignore_ascii_case(name) {
+            if matched_name_idx.is_none() {
+                matched_name_idx = Some(idx);
+            }
+            if s_val == value {
+                matched_idx = Some(idx);
+                break;
+            }
+        }
+    }
+    (matched_idx, matched_name_idx)
+}
+
+/// Telemetry metrics tracking QPACK field compression efficiency.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QpackTelemetry {
+    pub total_headers: usize,
+    pub static_table_hits: usize,
+    pub dynamic_table_hits: usize,
+    pub literals: usize,
+    pub raw_bytes: usize,
+    pub compressed_bytes: usize,
+}
+
+impl QpackTelemetry {
+    pub fn compression_ratio(&self) -> f64 {
+        if self.raw_bytes == 0 {
+            1.0
+        } else {
+            self.compressed_bytes as f64 / self.raw_bytes as f64
+        }
+    }
+}
+
+/// QPACK (RFC 9204) Field Compression Context for HTTP/3 and QUIC Streams.
+#[derive(Debug, Clone)]
+pub struct QpackContext {
+    pub max_table_size: usize,
+    pub dynamic_table: Vec<(String, String)>,
+    pub telemetry: QpackTelemetry,
+}
+
+impl Default for QpackContext {
+    fn default() -> Self {
+        Self::new(4096)
+    }
+}
+
+impl QpackContext {
+    pub fn new(max_table_size: usize) -> Self {
+        Self {
+            max_table_size,
+            dynamic_table: Vec::new(),
+            telemetry: QpackTelemetry::default(),
+        }
+    }
+
+    /// Add an entry to the QPACK dynamic table.
+    pub fn add_dynamic_entry(&mut self, name: String, value: String) {
+        let entry_size = name.len() + value.len() + 32;
+        if entry_size > self.max_table_size {
+            self.dynamic_table.clear();
+            return;
+        }
+        self.dynamic_table.insert(0, (name, value));
+        let mut cur_size: usize = self
+            .dynamic_table
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 32)
+            .sum();
+        while cur_size > self.max_table_size && !self.dynamic_table.is_empty() {
+            if let Some((k, v)) = self.dynamic_table.pop() {
+                cur_size -= k.len() + v.len() + 32;
+            }
+        }
+    }
+
+    /// Retrieve entry from dynamic table by 0-based relative index.
+    pub fn get_dynamic_entry(&self, index: usize) -> Option<(&str, &str)> {
+        self.dynamic_table
+            .get(index)
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+    }
+
+    /// Encode headers into an output buffer with zero unnecessary heap allocations.
+    pub fn encode_headers_into(
+        &mut self,
+        headers: &[(&str, &str)],
+        use_huffman: bool,
+        out: &mut Vec<u8>,
+    ) {
+        let initial_len = out.len();
+        let mut raw_bytes_count = 0;
+
+        // Section Prefix (RFC 9204 §4.5.1):
+        // When dynamic table is not referenced in this field section,
+        // Required Insert Count (RIC) is 0 (encoded as 0x00),
+        // and Sign bit + Delta Base is 0 (encoded as 0x00).
+        out.push(0x00);
+        out.push(0x00);
+
+        for &(name, value) in headers {
+            raw_bytes_count += name.len() + value.len() + 4;
+            self.telemetry.total_headers += 1;
+
+            let (matched_idx, matched_name_idx) = qpack_static_lookup(name, value);
+
+            if let Some(idx) = matched_idx {
+                // 1. Indexed Field Line with Static Reference (RFC 9204 §4.5.2): 11xxxxxx (T=1, 6-bit prefix)
+                self.telemetry.static_table_hits += 1;
+                hpack_encode_integer(idx, 6, 0xC0, out);
+            } else if let Some(name_idx) = matched_name_idx {
+                // 2. Literal Field Line with Name Reference — Static Name (RFC 9204 §4.5.4): 0101xxxx (N=0, T=1, 4-bit prefix)
+                self.telemetry.literals += 1;
+                hpack_encode_integer(name_idx, 4, 0x50, out);
+                hpack_encode_string_custom(value.as_bytes(), out, use_huffman);
+            } else {
+                // 3. Literal Field Line with Literal Name (RFC 9204 §4.5.6): 0010xxxx (N=0, 3-bit prefix 0x20)
+                self.telemetry.literals += 1;
+                out.push(0x20);
+                hpack_encode_string_custom(name.to_ascii_lowercase().as_bytes(), out, use_huffman);
+                hpack_encode_string_custom(value.as_bytes(), out, use_huffman);
+            }
+        }
+
+        self.telemetry.raw_bytes += raw_bytes_count;
+        self.telemetry.compressed_bytes += out.len() - initial_len;
+    }
+
+    /// Encode headers into a newly allocated vector without Huffman compression.
+    pub fn encode_headers(&mut self, headers: &[(&str, &str)]) -> Vec<u8> {
+        self.encode_headers_with_options(headers, false)
+    }
+
+    /// Encode headers into a newly allocated vector with optional Huffman compression.
+    pub fn encode_headers_with_options(
+        &mut self,
+        headers: &[(&str, &str)],
+        use_huffman: bool,
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(headers.len() * 32);
+        self.encode_headers_into(headers, use_huffman, &mut out);
+        out
+    }
+
+    /// Decode an encoded field section into a list of (name, value) headers.
+    pub fn decode_headers(&mut self, bytes: &[u8]) -> Result<Vec<(String, String)>, FastHttpError> {
+        if bytes.len() < 2 {
+            return Err(FastHttpError::Incomplete);
+        }
+
+        // 1. Decode Section Prefix (RFC 9204 §4.5.1)
+        let (_ric, ric_consumed) = hpack_decode_integer(bytes, 8)?;
+        if bytes.len() < ric_consumed {
+            return Err(FastHttpError::Incomplete);
+        }
+        let (_delta_base, db_consumed) = hpack_decode_integer(&bytes[ric_consumed..], 7)?;
+        let mut offset = ric_consumed + db_consumed;
+
+        let mut out = Vec::new();
+
+        while offset < bytes.len() {
+            let b = bytes[offset];
+            if (b & 0x80) != 0 {
+                // Indexed Field Line (RFC 9204 §4.5.2)
+                let is_static = (b & 0x40) != 0;
+                let (idx, consumed) = hpack_decode_integer(&bytes[offset..], 6)?;
+                offset += consumed;
+                if is_static {
+                    if idx < QPACK_STATIC_TABLE.len() {
+                        let (n, v) = QPACK_STATIC_TABLE[idx];
+                        out.push((n.to_string(), v.to_string()));
+                    } else {
+                        return Err(FastHttpError::InvalidHeader);
+                    }
+                } else if let Some((n, v)) = self.get_dynamic_entry(idx) {
+                    out.push((n.to_string(), v.to_string()));
+                } else {
+                    return Err(FastHttpError::InvalidHeader);
+                }
+            } else if (b & 0x40) != 0 {
+                // Literal Field Line with Name Reference (RFC 9204 §4.5.4)
+                let is_static = (b & 0x10) != 0;
+                let (name_idx, consumed) = hpack_decode_integer(&bytes[offset..], 4)?;
+                offset += consumed;
+                let name = if is_static {
+                    if name_idx < QPACK_STATIC_TABLE.len() {
+                        QPACK_STATIC_TABLE[name_idx].0.to_string()
+                    } else {
+                        return Err(FastHttpError::InvalidHeader);
+                    }
+                } else if let Some((n, _)) = self.get_dynamic_entry(name_idx) {
+                    n.to_string()
+                } else {
+                    return Err(FastHttpError::InvalidHeader);
+                };
+
+                let (raw_val, val_consumed) = HpackContext::decode_string_raw(&bytes[offset..])?;
+                offset += val_consumed;
+                let (val_bytes, _) = hpack_decode_string(raw_val)?;
+                let val = String::from_utf8_lossy(&val_bytes).into_owned();
+                out.push((name, val));
+            } else if (b & 0x20) != 0 {
+                // Literal Field Line with Literal Name (RFC 9204 §4.5.6)
+                offset += 1;
+                let (raw_name, name_consumed) = HpackContext::decode_string_raw(&bytes[offset..])?;
+                offset += name_consumed;
+                let (name_bytes, _) = hpack_decode_string(raw_name)?;
+                let name = String::from_utf8_lossy(&name_bytes).into_owned();
+
+                let (raw_val, val_consumed) = HpackContext::decode_string_raw(&bytes[offset..])?;
+                offset += val_consumed;
+                let (val_bytes, _) = hpack_decode_string(raw_val)?;
+                let val = String::from_utf8_lossy(&val_bytes).into_owned();
+                out.push((name, val));
+            } else {
+                offset += 1;
+            }
+        }
+
+        Ok(out)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// QUIC Variable-Length Integer (RFC 9000 §16) & HTTP/3 Frame Parsing (RFC 9114)
+// -----------------------------------------------------------------------------
+
+/// Encode a 62-bit unsigned integer into QUIC variable-length format (RFC 9000 Section 16).
+#[inline]
+pub fn quic_encode_varint(val: u64, out: &mut Vec<u8>) {
+    if val <= 0x3F {
+        out.push(val as u8);
+    } else if val <= 0x3FFF {
+        out.push((0x40 | ((val >> 8) & 0x3F)) as u8);
+        out.push((val & 0xFF) as u8);
+    } else if val <= 0x3FFF_FFFF {
+        out.push((0x80 | ((val >> 24) & 0x3F)) as u8);
+        out.push(((val >> 16) & 0xFF) as u8);
+        out.push(((val >> 8) & 0xFF) as u8);
+        out.push((val & 0xFF) as u8);
+    } else {
+        out.push((0xC0 | ((val >> 56) & 0x3F)) as u8);
+        out.push(((val >> 48) & 0xFF) as u8);
+        out.push(((val >> 40) & 0xFF) as u8);
+        out.push(((val >> 32) & 0xFF) as u8);
+        out.push(((val >> 24) & 0xFF) as u8);
+        out.push(((val >> 16) & 0xFF) as u8);
+        out.push(((val >> 8) & 0xFF) as u8);
+        out.push((val & 0xFF) as u8);
+    }
+}
+
+/// Decode a QUIC variable-length integer from a byte slice.
+/// Returns `(value, bytes_consumed)`.
+pub fn quic_decode_varint(bytes: &[u8]) -> Result<(u64, usize), FastHttpError> {
+    if bytes.is_empty() {
+        return Err(FastHttpError::Incomplete);
+    }
+    let first = bytes[0];
+    let len = match first >> 6 {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        _ => unreachable!(),
+    };
+    if bytes.len() < len {
+        return Err(FastHttpError::Incomplete);
+    }
+    let mut val = (first & 0x3F) as u64;
+    for &b in &bytes[1..len] {
+        val = (val << 8) | (b as u64);
+    }
+    Ok((val, len))
+}
+
+/// HTTP/3 Frame Types (RFC 9114 Section 7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Http3FrameType {
+    Data,
+    Headers,
+    CancelPush,
+    Settings,
+    PushPromise,
+    GoAway,
+    MaxPushId,
+    Unknown(u64),
+}
+
+impl From<u64> for Http3FrameType {
+    fn from(v: u64) -> Self {
+        match v {
+            0x00 => Self::Data,
+            0x01 => Self::Headers,
+            0x03 => Self::CancelPush,
+            0x04 => Self::Settings,
+            0x05 => Self::PushPromise,
+            0x07 => Self::GoAway,
+            0x0d => Self::MaxPushId,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+impl From<Http3FrameType> for u64 {
+    fn from(ft: Http3FrameType) -> Self {
+        match ft {
+            Http3FrameType::Data => 0x00,
+            Http3FrameType::Headers => 0x01,
+            Http3FrameType::CancelPush => 0x03,
+            Http3FrameType::Settings => 0x04,
+            Http3FrameType::PushPromise => 0x05,
+            Http3FrameType::GoAway => 0x07,
+            Http3FrameType::MaxPushId => 0x0d,
+            Http3FrameType::Unknown(v) => v,
+        }
+    }
+}
+
+/// HTTP/3 Protocol Frame representation (RFC 9114).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Http3Frame {
+    Data {
+        payload: Vec<u8>,
+    },
+    Headers {
+        encoded_fields: Vec<u8>,
+    },
+    CancelPush {
+        push_id: u64,
+    },
+    Settings {
+        settings: Vec<(u64, u64)>,
+    },
+    PushPromise {
+        push_id: u64,
+        encoded_fields: Vec<u8>,
+    },
+    GoAway {
+        stream_or_push_id: u64,
+    },
+    MaxPushId {
+        push_id: u64,
+    },
+    Unknown {
+        frame_type: u64,
+        payload: Vec<u8>,
+    },
+}
+
+impl Http3Frame {
+    pub fn frame_type(&self) -> Http3FrameType {
+        match self {
+            Self::Data { .. } => Http3FrameType::Data,
+            Self::Headers { .. } => Http3FrameType::Headers,
+            Self::CancelPush { .. } => Http3FrameType::CancelPush,
+            Self::Settings { .. } => Http3FrameType::Settings,
+            Self::PushPromise { .. } => Http3FrameType::PushPromise,
+            Self::GoAway { .. } => Http3FrameType::GoAway,
+            Self::MaxPushId { .. } => Http3FrameType::MaxPushId,
+            Self::Unknown { frame_type, .. } => Http3FrameType::Unknown(*frame_type),
+        }
+    }
+
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        let frame_type_num: u64 = self.frame_type().into();
+        match self {
+            Self::Data { payload } => {
+                quic_encode_varint(frame_type_num, out);
+                quic_encode_varint(payload.len() as u64, out);
+                out.extend_from_slice(payload);
+            }
+            Self::Headers { encoded_fields } => {
+                quic_encode_varint(frame_type_num, out);
+                quic_encode_varint(encoded_fields.len() as u64, out);
+                out.extend_from_slice(encoded_fields);
+            }
+            Self::CancelPush { push_id } => {
+                let mut payload = Vec::with_capacity(8);
+                quic_encode_varint(*push_id, &mut payload);
+                quic_encode_varint(frame_type_num, out);
+                quic_encode_varint(payload.len() as u64, out);
+                out.extend_from_slice(&payload);
+            }
+            Self::Settings { settings } => {
+                let mut payload = Vec::with_capacity(settings.len() * 16);
+                for &(k, v) in settings {
+                    quic_encode_varint(k, &mut payload);
+                    quic_encode_varint(v, &mut payload);
+                }
+                quic_encode_varint(frame_type_num, out);
+                quic_encode_varint(payload.len() as u64, out);
+                out.extend_from_slice(&payload);
+            }
+            Self::PushPromise {
+                push_id,
+                encoded_fields,
+            } => {
+                let mut payload = Vec::with_capacity(8 + encoded_fields.len());
+                quic_encode_varint(*push_id, &mut payload);
+                payload.extend_from_slice(encoded_fields);
+                quic_encode_varint(frame_type_num, out);
+                quic_encode_varint(payload.len() as u64, out);
+                out.extend_from_slice(&payload);
+            }
+            Self::GoAway { stream_or_push_id } => {
+                let mut payload = Vec::with_capacity(8);
+                quic_encode_varint(*stream_or_push_id, &mut payload);
+                quic_encode_varint(frame_type_num, out);
+                quic_encode_varint(payload.len() as u64, out);
+                out.extend_from_slice(&payload);
+            }
+            Self::MaxPushId { push_id } => {
+                let mut payload = Vec::with_capacity(8);
+                quic_encode_varint(*push_id, &mut payload);
+                quic_encode_varint(frame_type_num, out);
+                quic_encode_varint(payload.len() as u64, out);
+                out.extend_from_slice(&payload);
+            }
+            Self::Unknown {
+                frame_type,
+                payload,
+            } => {
+                quic_encode_varint(*frame_type, out);
+                quic_encode_varint(payload.len() as u64, out);
+                out.extend_from_slice(payload);
+            }
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<(Self, usize), FastHttpError> {
+        let (ft_val, ft_consumed) = quic_decode_varint(bytes)?;
+        let (len_val, len_consumed) = quic_decode_varint(&bytes[ft_consumed..])?;
+        let header_len = ft_consumed + len_consumed;
+        let payload_len = len_val as usize;
+        if bytes.len() < header_len + payload_len {
+            return Err(FastHttpError::Incomplete);
+        }
+        let payload = &bytes[header_len..header_len + payload_len];
+        let total_consumed = header_len + payload_len;
+
+        let frame = match Http3FrameType::from(ft_val) {
+            Http3FrameType::Data => Http3Frame::Data {
+                payload: payload.to_vec(),
+            },
+            Http3FrameType::Headers => Http3Frame::Headers {
+                encoded_fields: payload.to_vec(),
+            },
+            Http3FrameType::CancelPush => {
+                let (push_id, _) = quic_decode_varint(payload)?;
+                Http3Frame::CancelPush { push_id }
+            }
+            Http3FrameType::Settings => {
+                let mut settings = Vec::new();
+                let mut off = 0;
+                while off < payload.len() {
+                    let (k, k_len) = quic_decode_varint(&payload[off..])?;
+                    off += k_len;
+                    let (v, v_len) = quic_decode_varint(&payload[off..])?;
+                    off += v_len;
+                    settings.push((k, v));
+                }
+                Http3Frame::Settings { settings }
+            }
+            Http3FrameType::PushPromise => {
+                let (push_id, p_len) = quic_decode_varint(payload)?;
+                Http3Frame::PushPromise {
+                    push_id,
+                    encoded_fields: payload[p_len..].to_vec(),
+                }
+            }
+            Http3FrameType::GoAway => {
+                let (stream_or_push_id, _) = quic_decode_varint(payload)?;
+                Http3Frame::GoAway { stream_or_push_id }
+            }
+            Http3FrameType::MaxPushId => {
+                let (push_id, _) = quic_decode_varint(payload)?;
+                Http3Frame::MaxPushId { push_id }
+            }
+            Http3FrameType::Unknown(code) => Http3Frame::Unknown {
+                frame_type: code,
+                payload: payload.to_vec(),
+            },
+        };
+
+        Ok((frame, total_consumed))
     }
 }
 
@@ -5129,5 +5953,239 @@ mod http2_tests {
                 "accept-language".to_string()
             ])
         );
+    }
+
+    #[test]
+    fn test_hpack_static_lookup_and_encode_into() {
+        // Pseudo-headers exact hits
+        assert_eq!(hpack_static_lookup(":method", "GET"), (Some(2), Some(2)));
+        assert_eq!(hpack_static_lookup(":method", "POST"), (Some(3), Some(2)));
+        assert_eq!(hpack_static_lookup(":method", "PATCH"), (None, Some(2)));
+        assert_eq!(hpack_static_lookup(":path", "/"), (Some(4), Some(4)));
+        assert_eq!(hpack_static_lookup(":scheme", "https"), (Some(7), Some(6)));
+        assert_eq!(hpack_static_lookup(":status", "200"), (Some(8), Some(8)));
+        assert_eq!(hpack_static_lookup(":status", "404"), (Some(13), Some(8)));
+        assert_eq!(
+            hpack_static_lookup("accept-encoding", "gzip, deflate"),
+            (Some(16), Some(16))
+        );
+
+        let mut ctx1 = HpackContext::new(4096);
+        let mut ctx2 = HpackContext::new(4096);
+        let headers = [
+            (":method", "GET"),
+            (":path", "/"),
+            (":scheme", "https"),
+            ("user-agent", "IFA-HighFrequencyClient/1.0"),
+        ];
+
+        let mut buf = Vec::new();
+        ctx1.encode_headers_into(&headers, false, &mut buf);
+        let direct_encoded = ctx2.encode_headers(&headers);
+        assert_eq!(buf.as_slice(), direct_encoded.as_slice());
+
+        let mut dec_ctx = HpackContext::new(4096);
+        let decoded = dec_ctx.decode_headers(&buf).expect("decode headers");
+        assert_eq!(decoded.len(), 4);
+        assert_eq!(decoded[0], (":method".to_string(), "GET".to_string()));
+        assert_eq!(decoded[1], (":path".to_string(), "/".to_string()));
+        assert_eq!(decoded[2], (":scheme".to_string(), "https".to_string()));
+        assert_eq!(
+            decoded[3],
+            (
+                "user-agent".to_string(),
+                "IFA-HighFrequencyClient/1.0".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_http2_frame_batch_serializer_high_frequency() {
+        let mut batch = Http2FrameBatchSerializer::new();
+        assert!(batch.is_empty());
+        assert_eq!(batch.frame_count(), 0);
+
+        let f_headers = Http2Frame::Headers {
+            stream_id: 1,
+            end_stream: false,
+            end_headers: true,
+            header_block: vec![0x82, 0x84], // :method GET, :path /
+        };
+        let f_data = Http2Frame::Data {
+            stream_id: 1,
+            end_stream: true,
+            data: b"payload-stream-1".to_vec(),
+        };
+        let f_window = Http2Frame::WindowUpdate {
+            stream_id: 0,
+            window_size_increment: 65535,
+        };
+
+        batch.push_frame(&f_headers);
+        batch.push_frame(&f_data);
+        batch.push_frame(&f_window);
+
+        assert_eq!(batch.frame_count(), 3);
+        assert!(!batch.is_empty());
+
+        let bytes = batch.as_bytes();
+        // Decode all 3 frames sequentially from continuous buffer
+        let mut offset = 0;
+
+        // Frame 1: Headers
+        let hdr1 = Http2FrameHeader::decode(&bytes[offset..offset + 9]).expect("hdr1");
+        offset += 9;
+        let p1 = &bytes[offset..offset + hdr1.length as usize];
+        offset += hdr1.length as usize;
+        let dec1 = Http2Frame::decode(&hdr1, p1).expect("dec1");
+        assert_eq!(dec1.stream_id(), 1);
+
+        // Frame 2: Data
+        let hdr2 = Http2FrameHeader::decode(&bytes[offset..offset + 9]).expect("hdr2");
+        offset += 9;
+        let p2 = &bytes[offset..offset + hdr2.length as usize];
+        offset += hdr2.length as usize;
+        let dec2 = Http2Frame::decode(&hdr2, p2).expect("dec2");
+        match dec2 {
+            Http2Frame::Data {
+                stream_id,
+                end_stream,
+                data,
+            } => {
+                assert_eq!(stream_id, 1);
+                assert!(end_stream);
+                assert_eq!(data, b"payload-stream-1");
+            }
+            _ => panic!("Expected Data frame"),
+        }
+
+        // Frame 3: WindowUpdate
+        let hdr3 = Http2FrameHeader::decode(&bytes[offset..offset + 9]).expect("hdr3");
+        offset += 9;
+        let p3 = &bytes[offset..offset + hdr3.length as usize];
+        offset += hdr3.length as usize;
+        let dec3 = Http2Frame::decode(&hdr3, p3).expect("dec3");
+        assert!(matches!(dec3, Http2Frame::WindowUpdate { .. }));
+        assert_eq!(offset, bytes.len());
+
+        batch.clear();
+        assert!(batch.is_empty());
+        assert_eq!(batch.frame_count(), 0);
+    }
+
+    #[test]
+    fn test_qpack_static_table_and_lookup() {
+        assert_eq!(QPACK_STATIC_TABLE.len(), 99);
+        assert_eq!(QPACK_STATIC_TABLE[0], (":authority", ""));
+        assert_eq!(QPACK_STATIC_TABLE[1], (":path", "/"));
+        assert_eq!(QPACK_STATIC_TABLE[17], (":method", "GET"));
+        assert_eq!(QPACK_STATIC_TABLE[20], (":method", "POST"));
+        assert_eq!(QPACK_STATIC_TABLE[23], (":scheme", "https"));
+        assert_eq!(QPACK_STATIC_TABLE[25], (":status", "200"));
+        assert_eq!(QPACK_STATIC_TABLE[26], (":status", "304"));
+        assert_eq!(QPACK_STATIC_TABLE[27], (":status", "404"));
+        assert_eq!(
+            QPACK_STATIC_TABLE[31],
+            ("accept-encoding", "gzip, deflate, br")
+        );
+        assert_eq!(QPACK_STATIC_TABLE[98], ("x-frame-options", "sameorigin"));
+
+        // Fast lookup
+        assert_eq!(qpack_static_lookup(":authority", ""), (Some(0), Some(0)));
+        assert_eq!(qpack_static_lookup(":path", "/"), (Some(1), Some(1)));
+        assert_eq!(qpack_static_lookup(":path", "/api/v1"), (None, Some(1)));
+        assert_eq!(qpack_static_lookup(":method", "GET"), (Some(17), Some(17)));
+        assert_eq!(qpack_static_lookup(":method", "POST"), (Some(20), Some(17)));
+        assert_eq!(
+            qpack_static_lookup(":scheme", "https"),
+            (Some(23), Some(23))
+        );
+        assert_eq!(qpack_static_lookup(":status", "200"), (Some(25), Some(25)));
+        assert_eq!(
+            qpack_static_lookup("accept-encoding", "gzip, deflate, br"),
+            (Some(31), Some(31))
+        );
+    }
+
+    #[test]
+    fn test_qpack_encode_decode_roundtrip() {
+        let mut ctx = QpackContext::new(4096);
+        let headers = [
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            ("accept-encoding", "gzip, deflate, br"),
+            ("x-custom-transaction", "txn_987654321"),
+        ];
+
+        let encoded = ctx.encode_headers(&headers);
+        assert!(encoded.len() > 2); // Section prefix (2 bytes) + fields
+        assert!(ctx.telemetry.static_table_hits >= 4);
+        assert_eq!(ctx.telemetry.literals, 1);
+
+        let decoded = ctx.decode_headers(&encoded).expect("qpack decode headers");
+        assert_eq!(decoded.len(), 5);
+        assert_eq!(decoded[0], (":method".to_string(), "GET".to_string()));
+        assert_eq!(decoded[1], (":scheme".to_string(), "https".to_string()));
+        assert_eq!(decoded[2], (":path".to_string(), "/".to_string()));
+        assert_eq!(
+            decoded[3],
+            (
+                "accept-encoding".to_string(),
+                "gzip, deflate, br".to_string()
+            )
+        );
+        assert_eq!(
+            decoded[4],
+            (
+                "x-custom-transaction".to_string(),
+                "txn_987654321".to_string()
+            )
+        );
+
+        // Test with Huffman encoding enabled
+        let encoded_huff = ctx.encode_headers_with_options(&headers, true);
+        let decoded_huff = ctx
+            .decode_headers(&encoded_huff)
+            .expect("qpack decode huffman headers");
+        assert_eq!(decoded_huff, decoded);
+    }
+
+    #[test]
+    fn test_quic_varint_and_http3_frames() {
+        // Varint tests
+        let test_vals = [0u64, 42, 63, 64, 16383, 16384, 1073741823, 1073741824];
+        for &val in &test_vals {
+            let mut out = Vec::new();
+            quic_encode_varint(val, &mut out);
+            let (decoded_val, consumed) = quic_decode_varint(&out).expect("decode varint");
+            assert_eq!(val, decoded_val);
+            assert_eq!(consumed, out.len());
+        }
+
+        // Http3Frame tests
+        let f_headers = Http3Frame::Headers {
+            encoded_fields: vec![0x00, 0x00, 0xD1, 0xD7], // QPACK headers block
+        };
+        let encoded_hdr = f_headers.encode();
+        let (dec_hdr, c1) = Http3Frame::decode(&encoded_hdr).expect("decode h3 headers");
+        assert_eq!(c1, encoded_hdr.len());
+        assert_eq!(dec_hdr, f_headers);
+
+        let f_data = Http3Frame::Data {
+            payload: b"quic-http3-streaming-payload".to_vec(),
+        };
+        let encoded_data = f_data.encode();
+        let (dec_data, c2) = Http3Frame::decode(&encoded_data).expect("decode h3 data");
+        assert_eq!(c2, encoded_data.len());
+        assert_eq!(dec_data, f_data);
+
+        let f_settings = Http3Frame::Settings {
+            settings: vec![(0x06, 262144), (0x07, 100)],
+        };
+        let encoded_settings = f_settings.encode();
+        let (dec_settings, c3) = Http3Frame::decode(&encoded_settings).expect("decode h3 settings");
+        assert_eq!(c3, encoded_settings.len());
+        assert_eq!(dec_settings, f_settings);
     }
 }
