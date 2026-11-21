@@ -2303,6 +2303,18 @@ impl HpackContext {
         }
     }
 
+    /// Export the dynamic table entries in chronological order.
+    pub fn export_dynamic_table(&self) -> Vec<(String, String)> {
+        self.dynamic_table.clone()
+    }
+
+    /// Import dynamic table entries into this context, applying the eviction policy and maximum table size.
+    pub fn import_dynamic_table(&mut self, entries: &[(String, String)]) {
+        for (name, val) in entries {
+            self.add_dynamic_entry(name.clone(), val.clone());
+        }
+    }
+
     /// Encode a list of headers into an HPACK byte block directly appending into caller-supplied output buffer.
     pub fn encode_headers_into(
         &mut self,
@@ -2703,11 +2715,15 @@ impl QpackTelemetry {
     }
 }
 
+/// Dynamic table eviction policy alias for HPACK and QPACK compression contexts.
+pub type DynamicTableEvictionPolicy = HpackEvictionPolicy;
+
 /// QPACK (RFC 9204) Field Compression Context for HTTP/3 and QUIC Streams.
 #[derive(Debug, Clone)]
 pub struct QpackContext {
     pub max_table_size: usize,
     pub dynamic_table: Vec<(String, String)>,
+    pub eviction_policy: HpackEvictionPolicy,
     pub telemetry: QpackTelemetry,
 }
 
@@ -2722,16 +2738,49 @@ impl QpackContext {
         Self {
             max_table_size,
             dynamic_table: Vec::new(),
+            eviction_policy: HpackEvictionPolicy::Fifo,
             telemetry: QpackTelemetry::default(),
         }
     }
 
-    /// Add an entry to the QPACK dynamic table.
+    /// Set the dynamic table eviction policy (e.g. Fifo or Lru).
+    pub fn with_eviction_policy(mut self, policy: HpackEvictionPolicy) -> Self {
+        self.eviction_policy = policy;
+        self
+    }
+
+    /// Set the dynamic table eviction policy mutably.
+    pub fn set_eviction_policy(&mut self, policy: HpackEvictionPolicy) {
+        self.eviction_policy = policy;
+    }
+
+    /// Export the dynamic table entries in chronological order.
+    pub fn export_dynamic_table(&self) -> Vec<(String, String)> {
+        self.dynamic_table.clone()
+    }
+
+    /// Import dynamic table entries into this context, applying the eviction policy and maximum table size.
+    pub fn import_dynamic_table(&mut self, entries: &[(String, String)]) {
+        for (name, val) in entries {
+            self.add_dynamic_entry(name.clone(), val.clone());
+        }
+    }
+
+    /// Add an entry to the QPACK dynamic table with configurable eviction (FIFO or LRU).
     pub fn add_dynamic_entry(&mut self, name: String, value: String) {
         let entry_size = name.len() + value.len() + 32;
         if entry_size > self.max_table_size {
             self.dynamic_table.clear();
             return;
+        }
+        if self.eviction_policy == HpackEvictionPolicy::Lru {
+            if let Some(pos) = self
+                .dynamic_table
+                .iter()
+                .position(|(n, v)| n == &name && v == &value)
+            {
+                self.dynamic_table.remove(pos);
+            }
         }
         self.dynamic_table.insert(0, (name, value));
         let mut cur_size: usize = self
@@ -2751,6 +2800,21 @@ impl QpackContext {
         self.dynamic_table
             .get(index)
             .map(|(n, v)| (n.as_str(), v.as_str()))
+    }
+
+    /// Retrieve entry from dynamic table by 0-based relative index and touch it if LRU policy is active.
+    pub fn get_and_touch_entry(&mut self, index: usize) -> Option<(String, String)> {
+        if index < self.dynamic_table.len() {
+            if self.eviction_policy == HpackEvictionPolicy::Lru && index > 0 {
+                let entry = self.dynamic_table.remove(index);
+                self.dynamic_table.insert(0, entry);
+                Some(self.dynamic_table[0].clone())
+            } else {
+                Some(self.dynamic_table[index].clone())
+            }
+        } else {
+            None
+        }
     }
 
     /// Encode headers into an output buffer with zero unnecessary heap allocations.
@@ -2780,17 +2844,43 @@ impl QpackContext {
                 // 1. Indexed Field Line with Static Reference (RFC 9204 §4.5.2): 11xxxxxx (T=1, 6-bit prefix)
                 self.telemetry.static_table_hits += 1;
                 hpack_encode_integer(idx, 6, 0xC0, out);
-            } else if let Some(name_idx) = matched_name_idx {
-                // 2. Literal Field Line with Name Reference — Static Name (RFC 9204 §4.5.4): 0101xxxx (N=0, T=1, 4-bit prefix)
-                self.telemetry.literals += 1;
-                hpack_encode_integer(name_idx, 4, 0x50, out);
-                hpack_encode_string_custom(value.as_bytes(), out, use_huffman);
             } else {
-                // 3. Literal Field Line with Literal Name (RFC 9204 §4.5.6): 0010xxxx (N=0, 3-bit prefix 0x20)
-                self.telemetry.literals += 1;
-                out.push(0x20);
-                hpack_encode_string_custom(name.to_ascii_lowercase().as_bytes(), out, use_huffman);
-                hpack_encode_string_custom(value.as_bytes(), out, use_huffman);
+                // Check dynamic table for exact match or name match
+                let mut dyn_matched_idx = None;
+                let mut dyn_matched_name_idx = None;
+                for (d_idx, (d_name, d_val)) in self.dynamic_table.iter().enumerate() {
+                    if d_name.eq_ignore_ascii_case(name) {
+                        if dyn_matched_name_idx.is_none() {
+                            dyn_matched_name_idx = Some(d_idx);
+                        }
+                        if d_val == value {
+                            dyn_matched_idx = Some(d_idx);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(d_idx) = dyn_matched_idx {
+                    // Indexed Field Line with Dynamic Reference (RFC 9204 §4.5.2): 10xxxxxx (T=0, 6-bit prefix)
+                    self.telemetry.dynamic_table_hits += 1;
+                    hpack_encode_integer(d_idx, 6, 0x80, out);
+                } else if let Some(name_idx) = matched_name_idx {
+                    // 2. Literal Field Line with Name Reference — Static Name (RFC 9204 §4.5.4): 0101xxxx (N=0, T=1, 4-bit prefix)
+                    self.telemetry.literals += 1;
+                    hpack_encode_integer(name_idx, 4, 0x50, out);
+                    hpack_encode_string_custom(value.as_bytes(), out, use_huffman);
+                } else if let Some(d_name_idx) = dyn_matched_name_idx {
+                    // 2b. Literal Field Line with Name Reference — Dynamic Name (RFC 9204 §4.5.4): 0100xxxx (N=0, T=0, 4-bit prefix)
+                    self.telemetry.literals += 1;
+                    hpack_encode_integer(d_name_idx, 4, 0x40, out);
+                    hpack_encode_string_custom(value.as_bytes(), out, use_huffman);
+                } else {
+                    // 3. Literal Field Line with Literal Name (RFC 9204 §4.5.6): 0010xxxx (N=0, 3-bit prefix 0x20)
+                    self.telemetry.literals += 1;
+                    out.push(0x20);
+                    hpack_encode_string_custom(name.to_ascii_lowercase().as_bytes(), out, use_huffman);
+                    hpack_encode_string_custom(value.as_bytes(), out, use_huffman);
+                }
             }
         }
 
@@ -6863,6 +6953,40 @@ mod http2_tests {
             .decode_headers(&encoded_huff)
             .expect("qpack decode huffman headers");
         assert_eq!(decoded_huff, decoded);
+    }
+
+    #[test]
+    fn test_qpack_dynamic_table_indexing_and_lru() {
+        let mut ctx = QpackContext::new(200).with_eviction_policy(HpackEvictionPolicy::Lru);
+        ctx.add_dynamic_entry("x-api-version".to_string(), "v2.5".to_string());
+        ctx.add_dynamic_entry("x-auth-token".to_string(), "secret-token-123".to_string());
+
+        assert_eq!(ctx.dynamic_table.len(), 2);
+        assert_eq!(ctx.get_dynamic_entry(0), Some(("x-auth-token", "secret-token-123")));
+        assert_eq!(ctx.get_dynamic_entry(1), Some(("x-api-version", "v2.5")));
+
+        let headers = [
+            (":method", "POST"),
+            ("x-auth-token", "secret-token-123"),
+            ("x-api-version", "v2.5"),
+        ];
+
+        let encoded = ctx.encode_headers(&headers);
+        assert_eq!(ctx.telemetry.static_table_hits, 1);
+        assert_eq!(ctx.telemetry.dynamic_table_hits, 2);
+        assert_eq!(ctx.telemetry.literals, 0);
+
+        let decoded = ctx.decode_headers(&encoded).expect("decode dynamic qpack");
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0], (":method".to_string(), "POST".to_string()));
+        assert_eq!(decoded[1], ("x-auth-token".to_string(), "secret-token-123".to_string()));
+        assert_eq!(decoded[2], ("x-api-version".to_string(), "v2.5".to_string()));
+
+        // Test export & import
+        let exported = ctx.export_dynamic_table();
+        let mut new_ctx = QpackContext::new(200);
+        new_ctx.import_dynamic_table(&exported);
+        assert_eq!(new_ctx.dynamic_table.len(), 2);
     }
 
     #[test]

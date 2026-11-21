@@ -121,6 +121,8 @@ pub use net::{
     Http2MultiplexComparisonReport, Http2PoolBenchmarkResult, Http2PoolCacheEntry, Http2PoolStats,
     Http2PrioritizedRequest, Http2RequestInterceptor, Http2ResponseInterceptor, Http3ChunkHandler,
     Http3Transport, HubMessage, NetBenchmarkReport, NetBenchmarkResult, SessionId, SessionSink,
+    SharedHeaderDictionary, SharedHeaderEntry, HeaderCompressionTelemetry, HeaderStateMigrationReport,
+    UnifiedHeaderCompressionManager,
     SocketConfig, SseClientStats, SseDecoder, SseServerStats, TcpListener as NetTcpListener,
     TcpListener, TcpServer, TcpStream as NetTcpStream, TcpStream, TokenBucket,
     UdpSocket as NetUdpSocket, UdpSocket, WsClient, WsDemux, WsFrame, WsMessage, WsOpcode,
@@ -133,8 +135,8 @@ pub use process::{
 };
 pub use simd_parser::{
     find_byte_vectorized, find_crlf_vectorized, parse_http_request_fast, parse_http_response_fast,
-    qpack_static_lookup, quic_decode_varint, quic_encode_varint, AltSvcRoute, FastHttpError,
-    FastHttpRequest, FastHttpResponse, HpackContext, HpackEvictionPolicy, Http2ErrorCode,
+    qpack_static_lookup, quic_decode_varint, quic_encode_varint, AltSvcRoute, DynamicTableEvictionPolicy,
+    FastHttpError, FastHttpRequest, FastHttpResponse, HpackContext, HpackEvictionPolicy, Http2ErrorCode,
     Http2Frame, Http2FrameBatchSerializer, Http2FrameHeader, Http2FrameType, Http2Session,
     Http2Setting, Http2SettingId, Http2Stream, Http2StreamState, Http3Frame, Http3FrameType,
     QpackContext, QpackTelemetry, HPACK_STATIC_TABLE, QPACK_STATIC_TABLE,

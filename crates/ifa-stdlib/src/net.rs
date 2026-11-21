@@ -7659,6 +7659,592 @@ pub struct InterfaceMigrationTelemetry {
     pub total_failover_migrated_bytes: usize,
 }
 
+/// A single header entry retained in a cross-session shared dynamic dictionary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedHeaderEntry {
+    /// Canonical header field name (case-insensitive in HTTP/2 & HTTP/3).
+    pub name: String,
+    /// Header field value.
+    pub value: String,
+    /// RFC 7541 / RFC 9204 byte size overhead: `name.len() + value.len() + 32`.
+    pub size: usize,
+    /// Number of times this entry has been referenced or matched across sessions.
+    pub access_count: usize,
+    /// Last access timestamp for LRU eviction calculation.
+    pub last_accessed: std::time::Instant,
+    /// Timestamp when this entry was first indexed in the shared dictionary.
+    pub first_added: std::time::Instant,
+    /// Session identifier that originally inserted or touched this entry, if available.
+    pub source_session: Option<u64>,
+    /// Protocol (HTTP/2 or HTTP/3) on which the entry was observed.
+    pub source_protocol: Option<TransportProtocol>,
+}
+
+impl SharedHeaderEntry {
+    /// Create a new shared header entry with RFC 7541/9204 overhead accounting.
+    pub fn new(
+        name: impl Into<String>,
+        value: impl Into<String>,
+        session_id: Option<u64>,
+        protocol: Option<TransportProtocol>,
+        now: std::time::Instant,
+    ) -> Self {
+        let name = name.into();
+        let value = value.into();
+        let size = name.len() + value.len() + 32;
+        Self {
+            name,
+            value,
+            size,
+            access_count: 1,
+            last_accessed: now,
+            first_added: now,
+            source_session: session_id,
+            source_protocol: protocol,
+        }
+    }
+}
+
+/// An origin-scoped shared dynamic header dictionary shared across HTTP/2 (HPACK) and HTTP/3 (QPACK) sessions.
+#[derive(Debug, Clone)]
+pub struct SharedHeaderDictionary {
+    origin: String,
+    max_table_size: usize,
+    eviction_policy: crate::simd_parser::HpackEvictionPolicy,
+    entries: Vec<SharedHeaderEntry>,
+    total_insertions: usize,
+    total_evictions: usize,
+    total_hits: usize,
+    total_misses: usize,
+}
+
+impl SharedHeaderDictionary {
+    /// Create a new shared header dictionary with the specified capacity limit in bytes.
+    pub fn new(origin: impl Into<String>, max_table_size: usize) -> Self {
+        Self {
+            origin: origin.into(),
+            max_table_size,
+            eviction_policy: crate::simd_parser::HpackEvictionPolicy::Lru,
+            entries: Vec::new(),
+            total_insertions: 0,
+            total_evictions: 0,
+            total_hits: 0,
+            total_misses: 0,
+        }
+    }
+
+    /// Set the eviction policy for this shared dictionary (FIFO or LRU).
+    pub fn with_eviction_policy(mut self, policy: crate::simd_parser::HpackEvictionPolicy) -> Self {
+        self.eviction_policy = policy;
+        self
+    }
+
+    /// Set the eviction policy mutably.
+    pub fn set_eviction_policy(&mut self, policy: crate::simd_parser::HpackEvictionPolicy) {
+        self.eviction_policy = policy;
+    }
+
+    /// Target origin host or domain for this dictionary.
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// Maximum configured table size in bytes.
+    pub fn max_table_size(&self) -> usize {
+        self.max_table_size
+    }
+
+    /// Update the maximum table size, evicting excess entries if necessary.
+    pub fn set_max_table_size(&mut self, max_size: usize) {
+        self.max_table_size = max_size;
+        while self.current_size() > self.max_table_size && !self.entries.is_empty() {
+            self.entries.pop();
+            self.total_evictions += 1;
+        }
+    }
+
+    /// Current dynamic table byte size (including RFC 32-byte per-entry overhead).
+    pub fn current_size(&self) -> usize {
+        self.entries.iter().map(|e| e.size).sum()
+    }
+
+    /// Number of active dynamic entries currently in this dictionary.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether this dictionary is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Clear all entries from the dictionary.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Insert or update a header in the shared dynamic dictionary.
+    pub fn insert(
+        &mut self,
+        name: String,
+        value: String,
+        session_id: Option<u64>,
+        protocol: Option<TransportProtocol>,
+        now: std::time::Instant,
+    ) -> bool {
+        let entry_size = name.len() + value.len() + 32;
+        if entry_size > self.max_table_size {
+            self.clear();
+            return false;
+        }
+
+        // Check if identical entry exists
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|e| e.name.eq_ignore_ascii_case(&name) && e.value == value)
+        {
+            if self.eviction_policy == crate::simd_parser::HpackEvictionPolicy::Lru {
+                let mut entry = self.entries.remove(pos);
+                entry.access_count += 1;
+                entry.last_accessed = now;
+                entry.source_session = session_id;
+                entry.source_protocol = protocol;
+                self.entries.insert(0, entry);
+            } else {
+                let entry = &mut self.entries[pos];
+                entry.access_count += 1;
+                entry.last_accessed = now;
+            }
+            return true;
+        }
+
+        let new_entry = SharedHeaderEntry::new(name, value, session_id, protocol, now);
+        self.entries.insert(0, new_entry);
+        self.total_insertions += 1;
+
+        while self.current_size() > self.max_table_size && !self.entries.is_empty() {
+            self.entries.pop();
+            self.total_evictions += 1;
+        }
+
+        true
+    }
+
+    /// Look up an exact (name, value) match in the dictionary.
+    pub fn lookup(&mut self, name: &str, value: &str, now: std::time::Instant) -> Option<usize> {
+        let matched = self
+            .entries
+            .iter()
+            .position(|e| e.name.eq_ignore_ascii_case(name) && e.value == value);
+
+        if let Some(pos) = matched {
+            self.total_hits += 1;
+            self.entries[pos].access_count += 1;
+            self.entries[pos].last_accessed = now;
+            if self.eviction_policy == crate::simd_parser::HpackEvictionPolicy::Lru && pos > 0 {
+                let entry = self.entries.remove(pos);
+                self.entries.insert(0, entry);
+                Some(0)
+            } else {
+                Some(pos)
+            }
+        } else {
+            self.total_misses += 1;
+            None
+        }
+    }
+
+    /// Look up a name-only match in the dictionary.
+    pub fn lookup_name(&mut self, name: &str, now: std::time::Instant) -> Option<usize> {
+        let matched = self
+            .entries
+            .iter()
+            .position(|e| e.name.eq_ignore_ascii_case(name));
+
+        if let Some(pos) = matched {
+            self.total_hits += 1;
+            self.entries[pos].access_count += 1;
+            self.entries[pos].last_accessed = now;
+            Some(pos)
+        } else {
+            None
+        }
+    }
+
+    /// Retrieve entry by 0-based index.
+    pub fn get_entry(&self, index: usize) -> Option<(&str, &str)> {
+        self.entries
+            .get(index)
+            .map(|e| (e.name.as_str(), e.value.as_str()))
+    }
+
+    /// Retrieve full entry metadata by 0-based index.
+    pub fn get_entry_full(&self, index: usize) -> Option<&SharedHeaderEntry> {
+        self.entries.get(index)
+    }
+
+    /// Export entries as name/value pairs in insertion order.
+    pub fn export_entries(&self) -> Vec<(String, String)> {
+        self.entries
+            .iter()
+            .map(|e| (e.name.clone(), e.value.clone()))
+            .collect()
+    }
+
+    /// All entries retained in the dictionary.
+    pub fn entries(&self) -> &[SharedHeaderEntry] {
+        &self.entries
+    }
+
+    /// Query cumulative stats (insertions, evictions, hits, misses).
+    pub fn stats(&self) -> (usize, usize, usize, usize) {
+        (
+            self.total_insertions,
+            self.total_evictions,
+            self.total_hits,
+            self.total_misses,
+        )
+    }
+}
+
+/// Telemetry metrics for cross-session unified HPACK/QPACK header compression.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeaderCompressionTelemetry {
+    /// Number of times dynamic tables were synchronized into the shared dictionary.
+    pub cross_session_syncs: usize,
+    /// Number of migrations from HTTP/2 (HPACK) to HTTP/3 (QPACK) preserving dynamic state.
+    pub hpack_to_qpack_migrations: usize,
+    /// Number of migrations from HTTP/3 (QPACK) to HTTP/2 (HPACK) preserving dynamic state.
+    pub qpack_to_hpack_migrations: usize,
+    /// Number of migrations between sessions of the same protocol preserving dynamic state.
+    pub same_protocol_migrations: usize,
+    /// Total entries inserted into cross-session shared dictionaries.
+    pub shared_dictionary_insertions: usize,
+    /// Total entries evicted from shared dictionaries due to table size limits.
+    pub shared_dictionary_evictions: usize,
+    /// Total header lookups satisfied by the shared dictionary.
+    pub shared_dictionary_hits: usize,
+    /// Total header lookups that missed the shared dictionary.
+    pub shared_dictionary_misses: usize,
+    /// Total uncompressed raw header bytes processed.
+    pub total_raw_header_bytes: usize,
+    /// Total compressed header bytes transmitted across sessions.
+    pub total_compressed_header_bytes: usize,
+    /// Estimated raw payload bytes saved by cross-session shared state reuse.
+    pub bytes_saved_by_cross_session_state: usize,
+}
+
+impl HeaderCompressionTelemetry {
+    /// Calculate current header compression ratio (compressed / raw).
+    pub fn compression_ratio(&self) -> f64 {
+        if self.total_raw_header_bytes == 0 {
+            1.0
+        } else {
+            self.total_compressed_header_bytes as f64 / self.total_raw_header_bytes as f64
+        }
+    }
+
+    /// Calculate dictionary hit rate (hits / (hits + misses)).
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.shared_dictionary_hits + self.shared_dictionary_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.shared_dictionary_hits as f64 / total as f64
+        }
+    }
+}
+
+/// Detailed outcome of migrating header compression dynamic table state between sessions or protocols.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderStateMigrationReport {
+    /// Origin host or domain for which compression state was migrated.
+    pub origin: String,
+    /// Source session ID.
+    pub source_session_id: u64,
+    /// Target session ID.
+    pub target_session_id: u64,
+    /// Source transport protocol.
+    pub source_protocol: TransportProtocol,
+    /// Target transport protocol.
+    pub target_protocol: TransportProtocol,
+    /// Number of dynamic table entries successfully migrated.
+    pub entries_migrated: usize,
+    /// Total payload bytes of migrated dynamic entries.
+    pub total_bytes_migrated: usize,
+    /// Resulting dynamic table byte size on target session.
+    pub dictionary_size_after: usize,
+    /// Whether the state migration completed successfully.
+    pub success: bool,
+}
+
+/// Unified dynamic header compression manager maintaining cross-session shared dictionaries
+/// and coordinating lossless state transfer between HPACK (HTTP/2) and QPACK (HTTP/3) sessions.
+#[derive(Debug, Clone)]
+pub struct UnifiedHeaderCompressionManager {
+    pub default_max_table_size: usize,
+    pub eviction_policy: crate::simd_parser::HpackEvictionPolicy,
+    pub dictionaries: HashMap<String, SharedHeaderDictionary>,
+    pub telemetry: HeaderCompressionTelemetry,
+}
+
+impl Default for UnifiedHeaderCompressionManager {
+    fn default() -> Self {
+        Self::new(4096)
+    }
+}
+
+impl UnifiedHeaderCompressionManager {
+    /// Create a new unified header compression manager with default per-origin capacity in bytes.
+    pub fn new(default_max_table_size: usize) -> Self {
+        Self {
+            default_max_table_size,
+            eviction_policy: crate::simd_parser::HpackEvictionPolicy::Lru,
+            dictionaries: HashMap::new(),
+            telemetry: HeaderCompressionTelemetry::default(),
+        }
+    }
+
+    /// Configure eviction policy for dictionaries managed by this instance.
+    pub fn with_eviction_policy(mut self, policy: crate::simd_parser::HpackEvictionPolicy) -> Self {
+        self.eviction_policy = policy;
+        for dict in self.dictionaries.values_mut() {
+            dict.set_eviction_policy(policy);
+        }
+        self
+    }
+
+    /// Set eviction policy mutably.
+    pub fn set_eviction_policy(&mut self, policy: crate::simd_parser::HpackEvictionPolicy) {
+        self.eviction_policy = policy;
+        for dict in self.dictionaries.values_mut() {
+            dict.set_eviction_policy(policy);
+        }
+    }
+
+    /// Get or create the shared header dictionary for the specified origin.
+    pub fn get_or_create_dictionary(&mut self, origin: &str) -> &mut SharedHeaderDictionary {
+        let max_size = self.default_max_table_size;
+        let policy = self.eviction_policy;
+        self.dictionaries
+            .entry(origin.to_string())
+            .or_insert_with(|| SharedHeaderDictionary::new(origin, max_size).with_eviction_policy(policy))
+    }
+
+    /// Borrow the shared header dictionary for the specified origin, if present.
+    pub fn get_dictionary(&self, origin: &str) -> Option<&SharedHeaderDictionary> {
+        self.dictionaries.get(origin)
+    }
+
+    /// Mutably borrow the shared header dictionary for the specified origin, if present.
+    pub fn get_dictionary_mut(&mut self, origin: &str) -> Option<&mut SharedHeaderDictionary> {
+        self.dictionaries.get_mut(origin)
+    }
+
+    /// Synchronize an HTTP/2 HPACK dynamic table into the origin's shared dictionary.
+    pub fn sync_hpack_to_shared(
+        &mut self,
+        origin: &str,
+        session_id: u64,
+        hpack: &crate::simd_parser::HpackContext,
+        now: std::time::Instant,
+    ) -> usize {
+        let entries = hpack.export_dynamic_table();
+        let count = entries.len();
+        let dict = self.get_or_create_dictionary(origin);
+        for (name, val) in entries.into_iter().rev() {
+            dict.insert(name, val, Some(session_id), Some(TransportProtocol::Http2), now);
+        }
+        self.telemetry.cross_session_syncs += 1;
+        count
+    }
+
+    /// Synchronize an HTTP/3 QPACK dynamic table into the origin's shared dictionary.
+    pub fn sync_qpack_to_shared(
+        &mut self,
+        origin: &str,
+        session_id: u64,
+        qpack: &crate::simd_parser::QpackContext,
+        now: std::time::Instant,
+    ) -> usize {
+        let entries = qpack.export_dynamic_table();
+        let count = entries.len();
+        let dict = self.get_or_create_dictionary(origin);
+        for (name, val) in entries.into_iter().rev() {
+            dict.insert(name, val, Some(session_id), Some(TransportProtocol::Http3), now);
+        }
+        self.telemetry.cross_session_syncs += 1;
+        count
+    }
+
+    /// Warm an HTTP/2 HPACK context using dynamic entries from the origin's shared dictionary.
+    pub fn warm_hpack_from_shared(
+        &self,
+        origin: &str,
+        hpack: &mut crate::simd_parser::HpackContext,
+    ) -> usize {
+        if let Some(dict) = self.get_dictionary(origin) {
+            let entries = dict.export_entries();
+            let count = entries.len();
+            for (name, val) in entries.into_iter().rev() {
+                hpack.add_dynamic_entry(name, val);
+            }
+            count
+        } else {
+            0
+        }
+    }
+
+    /// Warm an HTTP/3 QPACK context using dynamic entries from the origin's shared dictionary.
+    pub fn warm_qpack_from_shared(
+        &self,
+        origin: &str,
+        qpack: &mut crate::simd_parser::QpackContext,
+    ) -> usize {
+        if let Some(dict) = self.get_dictionary(origin) {
+            let entries = dict.export_entries();
+            let count = entries.len();
+            for (name, val) in entries.into_iter().rev() {
+                qpack.add_dynamic_entry(name, val);
+            }
+            count
+        } else {
+            0
+        }
+    }
+
+    /// Record a failover or session migration event, retaining dynamic compression entries.
+    pub fn record_failover_migration(
+        &mut self,
+        origin: &str,
+        _session_id: u64,
+        _protocol: TransportProtocol,
+        _now: std::time::Instant,
+    ) {
+        self.telemetry.same_protocol_migrations += 1;
+        let _ = self.get_or_create_dictionary(origin);
+    }
+
+    /// Losslessly migrate dynamic header compression state across sessions or protocols.
+    #[allow(clippy::too_many_arguments)]
+    pub fn migrate_compression_state(
+        &mut self,
+        origin: &str,
+        source_session_id: u64,
+        source_proto: TransportProtocol,
+        target_session_id: u64,
+        target_proto: TransportProtocol,
+        from_hpack: Option<&crate::simd_parser::HpackContext>,
+        from_qpack: Option<&crate::simd_parser::QpackContext>,
+        to_hpack: Option<&mut crate::simd_parser::HpackContext>,
+        to_qpack: Option<&mut crate::simd_parser::QpackContext>,
+        now: std::time::Instant,
+    ) -> HeaderStateMigrationReport {
+        // Collect dynamic entries from source
+        let mut source_entries = Vec::new();
+        if let Some(hpack) = from_hpack {
+            source_entries = hpack.export_dynamic_table();
+        } else if let Some(qpack) = from_qpack {
+            source_entries = qpack.export_dynamic_table();
+        } else if let Some(dict) = self.get_dictionary(origin) {
+            source_entries = dict.export_entries();
+        }
+
+        let entries_count = source_entries.len();
+        let total_bytes: usize = source_entries.iter().map(|(n, v)| n.len() + v.len() + 32).sum();
+
+        // Sync into shared dictionary
+        {
+            let dict = self.get_or_create_dictionary(origin);
+            for (n, v) in source_entries.iter().rev() {
+                dict.insert(
+                    n.clone(),
+                    v.clone(),
+                    Some(source_session_id),
+                    Some(source_proto),
+                    now,
+                );
+            }
+        }
+
+        // Warm target context
+        if let Some(target_h) = to_hpack {
+            for (n, v) in source_entries.iter().rev() {
+                target_h.add_dynamic_entry(n.clone(), v.clone());
+            }
+        }
+        if let Some(target_q) = to_qpack {
+            for (n, v) in source_entries.iter().rev() {
+                target_q.add_dynamic_entry(n.clone(), v.clone());
+            }
+        }
+
+        // Update telemetry
+        match (source_proto, target_proto) {
+            (TransportProtocol::Http2, TransportProtocol::Http3) => {
+                self.telemetry.hpack_to_qpack_migrations += 1;
+            }
+            (TransportProtocol::Http3, TransportProtocol::Http2) => {
+                self.telemetry.qpack_to_hpack_migrations += 1;
+            }
+            _ => {
+                self.telemetry.same_protocol_migrations += 1;
+            }
+        }
+
+        let saved_bytes: usize = source_entries.iter().map(|(n, v)| n.len() + v.len()).sum();
+        self.telemetry.bytes_saved_by_cross_session_state += saved_bytes;
+
+        let dict_size = self
+            .get_dictionary(origin)
+            .map(|d| d.current_size())
+            .unwrap_or(0);
+
+        HeaderStateMigrationReport {
+            origin: origin.to_string(),
+            source_session_id,
+            target_session_id,
+            source_protocol: source_proto,
+            target_protocol: target_proto,
+            entries_migrated: entries_count,
+            total_bytes_migrated: total_bytes,
+            dictionary_size_after: dict_size,
+            success: true,
+        }
+    }
+
+    /// Retrieve cumulative telemetry across all shared dictionaries and migrations.
+    pub fn telemetry(&self) -> HeaderCompressionTelemetry {
+        let mut telem = self.telemetry;
+        let mut insertions = 0;
+        let mut evictions = 0;
+        let mut hits = 0;
+        let mut misses = 0;
+
+        for dict in self.dictionaries.values() {
+            let (ins, ev, h, m) = dict.stats();
+            insertions += ins;
+            evictions += ev;
+            hits += h;
+            misses += m;
+        }
+
+        telem.shared_dictionary_insertions = insertions;
+        telem.shared_dictionary_evictions = evictions;
+        telem.shared_dictionary_hits = hits;
+        telem.shared_dictionary_misses = misses;
+
+        telem
+    }
+
+    /// Record uncompressed and compressed header byte counts for telemetry.
+    pub fn record_compression(&mut self, raw_bytes: usize, compressed_bytes: usize) {
+        self.telemetry.total_raw_header_bytes += raw_bytes;
+        self.telemetry.total_compressed_header_bytes += compressed_bytes;
+    }
+}
+
 /// Hierarchical Deficit Round Robin (DRR) arbitrator for multi-session HTTP/2 & HTTP/3 connection pools.
 ///
 /// Features:
@@ -10833,6 +11419,9 @@ pub struct AsyncHttp2Pool {
     drr_max_frame_size: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     inter_session_arbitrator: std::sync::Arc<std::sync::Mutex<InterSessionDrrArbitrator>>,
     next_session_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    enable_shared_header_compression: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shared_header_compression_manager:
+        std::sync::Arc<std::sync::Mutex<UnifiedHeaderCompressionManager>>,
 }
 
 impl AsyncHttp2Pool {
@@ -10913,7 +11502,39 @@ impl AsyncHttp2Pool {
                 InterSessionDrrArbitrator::new(1024),
             )),
             next_session_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            enable_shared_header_compression: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(true),
+            ),
+            shared_header_compression_manager: std::sync::Arc::new(std::sync::Mutex::new(
+                UnifiedHeaderCompressionManager::new(4096),
+            )),
         }
+    }
+
+    /// Configure whether cross-session unified header compression is enabled on this pool (default: true).
+    pub fn with_shared_header_compression(self, enabled: bool) -> Self {
+        self.enable_shared_header_compression
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// Configure the default maximum table size for shared dynamic header dictionaries in bytes.
+    pub fn with_shared_header_dictionary_size(self, max_size: usize) -> Self {
+        if let Ok(mut mgr) = self.shared_header_compression_manager.lock() {
+            mgr.default_max_table_size = max_size;
+        }
+        self
+    }
+
+    /// Configure the eviction policy for shared dynamic header dictionaries (FIFO or LRU).
+    pub fn with_shared_header_eviction_policy(
+        self,
+        policy: crate::simd_parser::HpackEvictionPolicy,
+    ) -> Self {
+        if let Ok(mut mgr) = self.shared_header_compression_manager.lock() {
+            mgr.set_eviction_policy(policy);
+        }
+        self
     }
 
     /// Configure a shared chunk buffer pool to reuse byte allocations across high-frequency streaming requests.
@@ -11842,7 +12463,7 @@ impl AsyncHttp2Pool {
         interface_name: &str,
         now: std::time::Instant,
     ) -> MultiInterfaceFailoverReport {
-        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+        let report = if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
             arb.handle_interface_down(interface_name, now)
         } else {
             MultiInterfaceFailoverReport {
@@ -11855,7 +12476,22 @@ impl AsyncHttp2Pool {
                 bytes_preserved: 0,
                 events: Vec::new(),
             }
+        };
+
+        if self
+            .enable_shared_header_compression
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Ok(mut mgr) = self.shared_header_compression_manager.lock() {
+                for ev in &report.events {
+                    if ev.success {
+                        mgr.record_failover_migration(&ev.origin, ev.session_id, ev.protocol, now);
+                    }
+                }
+            }
         }
+
+        report
     }
 
     /// Telemetry export of interface failover and QUIC connection migration operations across the pool.
@@ -11874,6 +12510,135 @@ impl AsyncHttp2Pool {
                 anti_amplification_throttled_bytes: 0,
                 total_failover_migrated_streams: 0,
                 total_failover_migrated_bytes: 0,
+            }
+        }
+    }
+
+    /// Retrieve current telemetry metrics for cross-session unified header compression.
+    pub fn shared_header_compression_telemetry(&self) -> HeaderCompressionTelemetry {
+        if let Ok(mgr) = self.shared_header_compression_manager.lock() {
+            mgr.telemetry()
+        } else {
+            HeaderCompressionTelemetry::default()
+        }
+    }
+
+    /// Synchronize an HTTP/2 HPACK dynamic table into the cross-session shared dictionary.
+    pub fn sync_session_hpack_to_shared(
+        &self,
+        origin: &str,
+        session_id: u64,
+        hpack: &crate::simd_parser::HpackContext,
+    ) -> usize {
+        if !self
+            .enable_shared_header_compression
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return 0;
+        }
+        if let Ok(mut mgr) = self.shared_header_compression_manager.lock() {
+            mgr.sync_hpack_to_shared(origin, session_id, hpack, std::time::Instant::now())
+        } else {
+            0
+        }
+    }
+
+    /// Synchronize an HTTP/3 QPACK dynamic table into the cross-session shared dictionary.
+    pub fn sync_session_qpack_to_shared(
+        &self,
+        origin: &str,
+        session_id: u64,
+        qpack: &crate::simd_parser::QpackContext,
+    ) -> usize {
+        if !self
+            .enable_shared_header_compression
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return 0;
+        }
+        if let Ok(mut mgr) = self.shared_header_compression_manager.lock() {
+            mgr.sync_qpack_to_shared(origin, session_id, qpack, std::time::Instant::now())
+        } else {
+            0
+        }
+    }
+
+    /// Warm an HTTP/2 HPACK context using dynamic entries from the origin's shared dictionary.
+    pub fn warm_hpack_from_shared(
+        &self,
+        origin: &str,
+        hpack: &mut crate::simd_parser::HpackContext,
+    ) -> usize {
+        if !self
+            .enable_shared_header_compression
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return 0;
+        }
+        if let Ok(mgr) = self.shared_header_compression_manager.lock() {
+            mgr.warm_hpack_from_shared(origin, hpack)
+        } else {
+            0
+        }
+    }
+
+    /// Warm an HTTP/3 QPACK context using dynamic entries from the origin's shared dictionary.
+    pub fn warm_qpack_from_shared(
+        &self,
+        origin: &str,
+        qpack: &mut crate::simd_parser::QpackContext,
+    ) -> usize {
+        if !self
+            .enable_shared_header_compression
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return 0;
+        }
+        if let Ok(mgr) = self.shared_header_compression_manager.lock() {
+            mgr.warm_qpack_from_shared(origin, qpack)
+        } else {
+            0
+        }
+    }
+
+    /// Seamlessly migrate dynamic header compression state between sessions or protocols.
+    #[allow(clippy::too_many_arguments)]
+    pub fn migrate_session_header_compression(
+        &self,
+        origin: &str,
+        source_session_id: u64,
+        source_proto: TransportProtocol,
+        target_session_id: u64,
+        target_proto: TransportProtocol,
+        from_hpack: Option<&crate::simd_parser::HpackContext>,
+        from_qpack: Option<&crate::simd_parser::QpackContext>,
+        to_hpack: Option<&mut crate::simd_parser::HpackContext>,
+        to_qpack: Option<&mut crate::simd_parser::QpackContext>,
+    ) -> HeaderStateMigrationReport {
+        if let Ok(mut mgr) = self.shared_header_compression_manager.lock() {
+            mgr.migrate_compression_state(
+                origin,
+                source_session_id,
+                source_proto,
+                target_session_id,
+                target_proto,
+                from_hpack,
+                from_qpack,
+                to_hpack,
+                to_qpack,
+                std::time::Instant::now(),
+            )
+        } else {
+            HeaderStateMigrationReport {
+                origin: origin.to_string(),
+                source_session_id,
+                target_session_id,
+                source_protocol: source_proto,
+                target_protocol: target_proto,
+                entries_migrated: 0,
+                total_bytes_migrated: 0,
+                dictionary_size_after: 0,
+                success: false,
             }
         }
     }
@@ -26609,5 +27374,257 @@ mod tls_alpn_tests {
         assert_eq!(telem.http2_transparent_failovers, 1);
         assert_eq!(telem.total_failover_migrated_streams, 2);
         assert_eq!(telem.total_failover_migrated_bytes, 7500);
+    }
+
+    #[test]
+    fn test_shared_header_dictionary_insertion_and_lru() {
+        let now = std::time::Instant::now();
+        // Max size 150 bytes: enough for ~2 entries (each entry ~32 bytes overhead + name + value)
+        let mut dict = SharedHeaderDictionary::new("https://api.example.com", 150)
+            .with_eviction_policy(crate::simd_parser::HpackEvictionPolicy::Lru);
+
+        assert_eq!(dict.origin(), "https://api.example.com");
+        assert_eq!(dict.len(), 0);
+        assert!(dict.is_empty());
+
+        // Insert entry 1: name "authorization" (13) + "Bearer xyz" (10) + 32 = 55 bytes
+        assert!(dict.insert(
+            "authorization".to_string(),
+            "Bearer xyz".to_string(),
+            Some(101),
+            Some(TransportProtocol::Http2),
+            now,
+        ));
+        assert_eq!(dict.len(), 1);
+        assert_eq!(dict.current_size(), 55);
+
+        // Insert entry 2: name "x-request-id" (12) + "req-1" (5) + 32 = 49 bytes
+        assert!(dict.insert(
+            "x-request-id".to_string(),
+            "req-1".to_string(),
+            Some(101),
+            Some(TransportProtocol::Http2),
+            now,
+        ));
+        assert_eq!(dict.len(), 2);
+        assert_eq!(dict.current_size(), 104);
+
+        // Lookup exact match
+        let lookup_idx = dict.lookup("authorization", "Bearer xyz", now);
+        assert_eq!(lookup_idx, Some(0)); // touched and moved to index 0 due to LRU
+
+        // Insert entry 3: name "x-client-ver" (12) + "v1.0" (4) + 32 = 48 bytes -> total 104 + 48 = 152 > 150, evicts LRU (x-request-id)
+        assert!(dict.insert(
+            "x-client-ver".to_string(),
+            "v1.0".to_string(),
+            Some(102),
+            Some(TransportProtocol::Http3),
+            now,
+        ));
+        assert_eq!(dict.len(), 2); // 1 evicted
+        let entries = dict.export_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], ("x-client-ver".to_string(), "v1.0".to_string()));
+        assert_eq!(entries[1], ("authorization".to_string(), "Bearer xyz".to_string()));
+
+        let (ins, ev, hits, misses) = dict.stats();
+        assert_eq!(ins, 3);
+        assert_eq!(ev, 1);
+        assert_eq!(hits, 1);
+        assert_eq!(misses, 0);
+    }
+
+    #[test]
+    fn test_unified_header_compression_hpack_to_qpack_migration() {
+        let now = std::time::Instant::now();
+        let mut mgr = UnifiedHeaderCompressionManager::new(4096);
+
+        // 1. Simulate active HTTP/2 session encoding headers
+        let mut hpack_ctx = crate::simd_parser::HpackContext::new(4096);
+        hpack_ctx.add_dynamic_entry("authorization".to_string(), "Bearer secret-token-42".to_string());
+        hpack_ctx.add_dynamic_entry("x-customer-id".to_string(), "cust-887766".to_string());
+        hpack_ctx.add_dynamic_entry("user-agent".to_string(), "IFA-Native-Agent/2.0".to_string());
+
+        // 2. Prepare fresh HTTP/3 QPACK session
+        let mut qpack_ctx = crate::simd_parser::QpackContext::new(4096);
+        assert_eq!(qpack_ctx.dynamic_table.len(), 0);
+
+        // 3. Migrate compression state from HTTP/2 to HTTP/3 session
+        let report = mgr.migrate_compression_state(
+            "https://cloud.example.org",
+            201,
+            TransportProtocol::Http2,
+            301,
+            TransportProtocol::Http3,
+            Some(&hpack_ctx),
+            None,
+            None,
+            Some(&mut qpack_ctx),
+            now,
+        );
+
+        assert!(report.success);
+        assert_eq!(report.origin, "https://cloud.example.org");
+        assert_eq!(report.source_session_id, 201);
+        assert_eq!(report.target_session_id, 301);
+        assert_eq!(report.entries_migrated, 3);
+        assert_eq!(qpack_ctx.dynamic_table.len(), 3);
+
+        // Verify HTTP/3 QPACK can now compress headers using the migrated dynamic entries
+        let headers_to_send = [
+            (":method", "POST"),
+            ("authorization", "Bearer secret-token-42"),
+            ("x-customer-id", "cust-887766"),
+        ];
+
+        let encoded = qpack_ctx.encode_headers(&headers_to_send);
+        assert_eq!(qpack_ctx.telemetry.static_table_hits, 1); // :method POST
+        assert_eq!(qpack_ctx.telemetry.dynamic_table_hits, 2); // authorization & x-customer-id
+        assert_eq!(qpack_ctx.telemetry.literals, 0);
+
+        // Verify decode roundtrip
+        let decoded = qpack_ctx.decode_headers(&encoded).expect("decode migrated qpack");
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0], (":method".to_string(), "POST".to_string()));
+        assert_eq!(decoded[1], ("authorization".to_string(), "Bearer secret-token-42".to_string()));
+        assert_eq!(decoded[2], ("x-customer-id".to_string(), "cust-887766".to_string()));
+
+        let telem = mgr.telemetry();
+        assert_eq!(telem.hpack_to_qpack_migrations, 1);
+        assert!(telem.bytes_saved_by_cross_session_state > 0);
+    }
+
+    #[test]
+    fn test_unified_header_compression_qpack_to_hpack_migration() {
+        let now = std::time::Instant::now();
+        let mut mgr = UnifiedHeaderCompressionManager::new(4096);
+
+        // HTTP/3 QPACK session populates dynamic table
+        let mut qpack_ctx = crate::simd_parser::QpackContext::new(4096);
+        qpack_ctx.add_dynamic_entry("x-auth-session".to_string(), "sess-999".to_string());
+        qpack_ctx.add_dynamic_entry("x-service-mesh".to_string(), "cluster-west".to_string());
+
+        // Target HTTP/2 HPACK session
+        let mut hpack_ctx = crate::simd_parser::HpackContext::new(4096);
+        assert_eq!(hpack_ctx.dynamic_table.len(), 0);
+
+        let report = mgr.migrate_compression_state(
+            "https://mesh.internal.net",
+            401,
+            TransportProtocol::Http3,
+            501,
+            TransportProtocol::Http2,
+            None,
+            Some(&qpack_ctx),
+            Some(&mut hpack_ctx),
+            None,
+            now,
+        );
+
+        assert!(report.success);
+        assert_eq!(report.entries_migrated, 2);
+        assert_eq!(hpack_ctx.dynamic_table.len(), 2);
+
+        // HTTP/2 HPACK encodes using transferred dynamic entries
+        let mut out = Vec::new();
+        hpack_ctx.encode_headers_into(
+            &[("x-auth-session", "sess-999"), ("x-service-mesh", "cluster-west")],
+            false,
+            &mut out,
+        );
+        assert_eq!(hpack_ctx.telemetry.dynamic_table_hits, 2);
+
+        let telem = mgr.telemetry();
+        assert_eq!(telem.qpack_to_hpack_migrations, 1);
+    }
+
+    #[test]
+    fn test_async_http2_pool_shared_header_compression_integration() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 443, 2)
+            .with_shared_header_compression(true)
+            .with_shared_header_dictionary_size(8192)
+            .with_shared_header_eviction_policy(crate::simd_parser::HpackEvictionPolicy::Lru);
+
+        // 1. Session 1 (HTTP/2) syncs headers into pool shared dictionary
+        let mut hpack_sess1 = crate::simd_parser::HpackContext::new(4096);
+        hpack_sess1.add_dynamic_entry("authorization".to_string(), "Bearer token-abc".to_string());
+        hpack_sess1.add_dynamic_entry("content-type".to_string(), "application/json".to_string());
+
+        let synced = pool.sync_session_hpack_to_shared("https://api.example.com", 1, &hpack_sess1);
+        assert_eq!(synced, 2);
+
+        // 2. Session 2 (HTTP/3) connects to same origin and warms from shared dictionary
+        let mut qpack_sess2 = crate::simd_parser::QpackContext::new(4096);
+        let warmed = pool.warm_qpack_from_shared("https://api.example.com", &mut qpack_sess2);
+        assert_eq!(warmed, 2);
+        assert_eq!(qpack_sess2.dynamic_table.len(), 2);
+
+        // 3. Migrate directly between sessions via pool
+        let mut new_hpack_sess3 = crate::simd_parser::HpackContext::new(4096);
+        let report = pool.migrate_session_header_compression(
+            "https://api.example.com",
+            2,
+            TransportProtocol::Http3,
+            3,
+            TransportProtocol::Http2,
+            None,
+            Some(&qpack_sess2),
+            Some(&mut new_hpack_sess3),
+            None,
+        );
+
+        assert!(report.success);
+        assert_eq!(report.entries_migrated, 2);
+        assert_eq!(new_hpack_sess3.dynamic_table.len(), 2);
+
+        let telem = pool.shared_header_compression_telemetry();
+        assert_eq!(telem.cross_session_syncs, 1);
+        assert_eq!(telem.qpack_to_hpack_migrations, 1);
+        assert!(telem.bytes_saved_by_cross_session_state > 0);
+    }
+
+    #[test]
+    fn test_failover_preserves_shared_header_compression() {
+        let now = std::time::Instant::now();
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 443, 2).with_shared_header_compression(true);
+
+        pool.register_network_interface(NetworkInterface::new(
+            "eth0",
+            NetworkInterfaceType::Ethernet,
+            "192.168.1.10:50000".parse().unwrap(),
+            true,
+            10,
+        ));
+        pool.register_network_interface(NetworkInterface::new(
+            "wlan0",
+            NetworkInterfaceType::Wifi,
+            "10.0.0.2:50001".parse().unwrap(),
+            true,
+            20,
+        ));
+
+        pool.register_transport_session(
+            701,
+            "https://failover-hcomp.com",
+            TransportProtocol::Http3,
+            1,
+        );
+
+        pool.assign_session_network_path(
+            701,
+            "eth0",
+            "192.168.1.10:50000".parse().unwrap(),
+            "1.1.1.1:443".parse().unwrap(),
+            now,
+        )
+        .unwrap();
+
+        // Interface eth0 goes down
+        let report = pool.handle_interface_down("eth0", now);
+        assert_eq!(report.sessions_affected, 1);
+        assert_eq!(report.quic_migrations, 1);
+
+        let hcomp_telem = pool.shared_header_compression_telemetry();
+        assert_eq!(hcomp_telem.same_protocol_migrations, 1);
     }
 }
