@@ -10253,6 +10253,7 @@ mod tests {
                 if let Ok(async_stream) = AsyncTcpStream::from_std(tcp_stream) {
                     if let Ok(mut server) = AsyncHttp2Connection::server_handshake(async_stream) {
                         let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                        std::thread::sleep(Duration::from_millis(20));
                     }
                 }
             }
@@ -10261,32 +10262,27 @@ mod tests {
             if let Ok((tcp_stream, _)) = listener.accept() {
                 if let Ok(async_stream) = AsyncTcpStream::from_std(tcp_stream) {
                     if let Ok(mut server) = AsyncHttp2Connection::server_handshake(async_stream) {
-                        let stream_id = loop {
-                            match server.recv_frame() {
-                                Ok(crate::simd_parser::Http2Frame::Headers {
-                                    stream_id: sid,
-                                    end_stream,
-                                    ..
-                                }) => {
-                                    if end_stream {
-                                        break sid;
-                                    }
-                                }
-                                Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => return,
-                                Err(_) => return,
-                                _ => {}
+                        while let Ok(frame) = server.recv_frame() {
+                            if let crate::simd_parser::Http2Frame::Headers {
+                                stream_id,
+                                end_stream: true,
+                                ..
+                            } = frame
+                            {
+                                let h = server.session.create_headers_frame(
+                                    stream_id,
+                                    &[(":status", "200")],
+                                    false,
+                                );
+                                let _ = server.send_frame(&h);
+                                let _ = server.send_data(stream_id, b"stream-1-", false);
+                                let _ = server.send_data(stream_id, b"stream-2", true);
+                                let _ =
+                                    server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                                std::thread::sleep(Duration::from_millis(60));
+                                break;
                             }
-                        };
-
-                        let h = server.session.create_headers_frame(
-                            stream_id,
-                            &[(":status", "200")],
-                            false,
-                        );
-                        let _ = server.send_frame(&h);
-                        let _ = server.send_data(stream_id, b"stream-1-", false);
-                        let _ = server.send_data(stream_id, b"stream-2", true);
-                        let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                        }
                     }
                 }
             }
