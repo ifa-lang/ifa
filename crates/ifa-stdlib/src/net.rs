@@ -4405,6 +4405,8 @@ pub struct Http2PoolStats {
     pub last_alpn_negotiated: Option<AlpnProtocol>,
     /// Total number of idle connections evicted by TTL expiration or capacity bounds.
     pub evicted_connections: usize,
+    /// Total number of requests successfully retried after transient failure or GOAWAY.
+    pub retried_requests: usize,
 }
 
 impl Http2PoolStats {
@@ -4434,6 +4436,9 @@ pub struct AsyncHttp2Pool {
     port: u16,
     max_connections: usize,
     max_concurrent_streams_per_conn: usize,
+    max_retries: usize,
+    retry_backoff: std::time::Duration,
+    retried_count: std::sync::atomic::AtomicUsize,
     idle_ttl: Option<std::time::Duration>,
     idle_pool: std::sync::Mutex<Vec<PooledConnectionEntry>>,
     active_count: std::sync::atomic::AtomicUsize,
@@ -4458,6 +4463,9 @@ impl AsyncHttp2Pool {
             port,
             max_connections: max_connections.max(1),
             max_concurrent_streams_per_conn: Self::DEFAULT_MAX_STREAMS,
+            max_retries: 0,
+            retry_backoff: std::time::Duration::from_millis(10),
+            retried_count: std::sync::atomic::AtomicUsize::new(0),
             idle_ttl: None,
             idle_pool: std::sync::Mutex::new(Vec::new()),
             active_count: std::sync::atomic::AtomicUsize::new(0),
@@ -4468,6 +4476,51 @@ impl AsyncHttp2Pool {
             request_interceptors: Vec::new(),
             response_interceptors: Vec::new(),
             alt_svc_routes: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Configure the default maximum number of adaptive retries for requests executed on this pool
+    /// upon encountering retryable GOAWAY frames or transient connection resets.
+    pub fn with_max_retries(mut self, retries: usize) -> Self {
+        self.max_retries = retries;
+        self
+    }
+
+    /// Configure the base backoff duration applied between adaptive retries.
+    pub fn with_retry_backoff(mut self, backoff: std::time::Duration) -> Self {
+        self.retry_backoff = backoff;
+        self
+    }
+
+    /// Total count of requests successfully retried after transient failure or GOAWAY.
+    pub fn retried_count(&self) -> usize {
+        self.retried_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Check whether an error encountered during request execution is transient or
+    /// eligible for adaptive retry on a fresh connection.
+    pub fn is_transient_or_retryable_error(&self, err: &io::Error) -> bool {
+        if let Some(ec) = self.last_goaway_error() {
+            if ec.is_fatal_protocol_violation() || ec.is_rate_limit_or_calm() {
+                return false;
+            }
+            if ec.is_retryable() {
+                return true;
+            }
+        }
+        match err.kind() {
+            io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::TimedOut => true,
+            _ => {
+                let msg = err.to_string();
+                (msg.contains("GOAWAY") || msg.contains("reset")) && !msg.contains("PROTOCOL_ERROR")
+            }
         }
     }
 
@@ -4582,6 +4635,7 @@ impl AsyncHttp2Pool {
             last_goaway_error: self.last_goaway_error(),
             last_alpn_negotiated: self.last_alpn_negotiated(),
             evicted_connections: self.evicted_count(),
+            retried_requests: self.retried_count(),
         }
     }
 
@@ -4732,6 +4786,11 @@ impl AsyncHttp2Pool {
                 Ok(responses)
             }
             Err(e) => {
+                if let Some((_, err, _)) = conn.last_received_goaway() {
+                    if let Ok(mut last_err) = self.last_goaway_error.lock() {
+                        *last_err = Some(err);
+                    }
+                }
                 self.active_count
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 Err(e)
@@ -4745,8 +4804,23 @@ impl AsyncHttp2Pool {
     /// If an interceptor returns `Some(HttpResponse)`, the network call is short-circuited
     /// and that response is returned immediately (still running any registered response interceptors).
     ///
+    /// If `max_retries` is configured > 0, transparent adaptive retry on transient reset or retryable GOAWAY is active.
     /// Any registered response interceptors are executed on the resulting response before returning.
     pub fn execute_request(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> io::Result<crate::http::HttpResponse> {
+        if self.max_retries > 0 {
+            return self.execute_request_with_retry(method, path, headers, body, self.max_retries);
+        }
+        self.execute_request_single(method, path, headers, body)
+    }
+
+    /// Execute a single attempt of an HTTP/2 request using a pooled connection without retry loop.
+    pub fn execute_request_single(
         &self,
         method: &str,
         path: &str,
@@ -4802,6 +4876,11 @@ impl AsyncHttp2Pool {
                 Ok(resp)
             }
             Err(e) => {
+                if let Some((_, err, _)) = conn.last_received_goaway() {
+                    if let Ok(mut last_err) = self.last_goaway_error.lock() {
+                        *last_err = Some(err);
+                    }
+                }
                 // If connection failed, it is dropped and not released back to the pool
                 self.active_count
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -4812,7 +4891,35 @@ impl AsyncHttp2Pool {
 
     /// Execute an HTTP/2 request using a pooled connection with streaming response chunks
     /// delivered to `chunk_handler` progressively as each chunked DATA frame arrives from the server.
+    ///
+    /// If `max_retries` is configured > 0, transparent adaptive retry on transient reset or retryable GOAWAY is active
+    /// provided no chunk was delivered to `chunk_handler` yet.
     pub fn execute_streaming_request<F>(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        chunk_handler: F,
+    ) -> io::Result<crate::http::HttpResponse>
+    where
+        F: FnMut(&[u8]),
+    {
+        if self.max_retries > 0 {
+            return self.execute_streaming_request_with_retry(
+                method,
+                path,
+                headers,
+                body,
+                self.max_retries,
+                chunk_handler,
+            );
+        }
+        self.execute_streaming_request_single(method, path, headers, body, chunk_handler)
+    }
+
+    /// Execute a single attempt of an HTTP/2 streaming request using a pooled connection without retry loop.
+    pub fn execute_streaming_request_single<F>(
         &self,
         method: &str,
         path: &str,
@@ -4879,6 +4986,11 @@ impl AsyncHttp2Pool {
                 Ok(resp)
             }
             Err(e) => {
+                if let Some((_, err, _)) = conn.last_received_goaway() {
+                    if let Ok(mut last_err) = self.last_goaway_error.lock() {
+                        *last_err = Some(err);
+                    }
+                }
                 self.active_count
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 Err(e)
@@ -5229,37 +5341,94 @@ impl AsyncHttp2Pool {
                 self.clear_goaway_error();
             }
 
-            match self.execute_request(method, path, headers, body) {
-                Ok(resp) => return Ok(resp),
-                Err(e) => {
-                    // Check if the error is a retryable GOAWAY
-                    let goaway_retryable = self
-                        .last_goaway_error()
-                        .map(|ec| ec.is_retryable())
-                        .unwrap_or(false);
-
-                    if !goaway_retryable && attempt == max_retries {
-                        return Err(e);
+            match self.execute_request_single(method, path, headers, body) {
+                Ok(resp) => {
+                    if attempt > 0 {
+                        self.retried_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    if !goaway_retryable {
-                        // Non-GOAWAY transient error (e.g. WouldBlock / connection reset)
-                        // only retry if it looks like a connectivity issue
-                        match e.kind() {
-                            io::ErrorKind::ConnectionRefused
-                            | io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::BrokenPipe
-                            | io::ErrorKind::TimedOut => {}
-                            _ => return Err(e),
-                        }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    if !self.is_transient_or_retryable_error(&e) || attempt == max_retries {
+                        return Err(e);
                     }
                     self.clear_goaway_error();
                     last_err = Some(e);
-                    // Brief linear back-off: 10 ms × (attempt + 1)
-                    std::thread::sleep(std::time::Duration::from_millis(10 * (attempt as u64 + 1)));
+                    // Adaptive back-off: retry_backoff × (attempt + 1)
+                    let backoff = self.retry_backoff * (attempt as u32 + 1);
+                    std::thread::sleep(backoff);
                 }
             }
         }
         Err(last_err.unwrap_or_else(|| io::Error::other("HTTP/2 retry exhausted")))
+    }
+
+    /// Execute an HTTP/2 streaming request using a pooled connection with automatic adaptive retry
+    /// on transient connection reset or retryable GOAWAY frames.
+    ///
+    /// If an error occurs before any chunk is delivered to `chunk_handler`, the request is
+    /// transparently retried on a fresh connection up to `max_retries` times.
+    /// Once the first chunk has been delivered to `chunk_handler`, retry is inhibited to prevent
+    /// duplicate delivery of partial stream data.
+    pub fn execute_streaming_request_with_retry<F>(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        max_retries: usize,
+        mut chunk_handler: F,
+    ) -> io::Result<crate::http::HttpResponse>
+    where
+        F: FnMut(&[u8]),
+    {
+        let mut last_err: Option<io::Error> = None;
+        for attempt in 0..=max_retries {
+            if let Some(err_code) = self.last_goaway_error() {
+                if err_code.is_fatal_protocol_violation() || err_code.is_rate_limit_or_calm() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!(
+                            "HTTP/2 pool: non-retryable GOAWAY received ({})",
+                            err_code.name()
+                        ),
+                    ));
+                }
+                self.clear_goaway_error();
+            }
+
+            let mut chunks_delivered = false;
+            let result =
+                self.execute_streaming_request_single(method, path, headers, body, |chunk| {
+                    chunks_delivered = true;
+                    chunk_handler(chunk);
+                });
+
+            match result {
+                Ok(resp) => {
+                    if attempt > 0 {
+                        self.retried_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    // If any chunk was already delivered, we cannot safely replay the stream
+                    if chunks_delivered {
+                        return Err(e);
+                    }
+                    if !self.is_transient_or_retryable_error(&e) || attempt == max_retries {
+                        return Err(e);
+                    }
+                    self.clear_goaway_error();
+                    last_err = Some(e);
+                    let backoff = self.retry_backoff * (attempt as u32 + 1);
+                    std::thread::sleep(backoff);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| io::Error::other("HTTP/2 streaming retry exhausted")))
     }
 }
 
@@ -9735,6 +9904,140 @@ mod tests {
     }
 
     #[test]
+    fn test_async_http2_pool_adaptive_retry_on_goaway_transient() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            // First connection: accept and immediately terminate with graceful GOAWAY
+            if let Ok((tcp_stream, _)) = listener.accept() {
+                if let Ok(async_stream) = AsyncTcpStream::from_std(tcp_stream) {
+                    if let Ok(mut server) = AsyncHttp2Connection::server_handshake(async_stream) {
+                        let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                    }
+                }
+            }
+
+            // Second connection: accept and successfully reply to the retried request
+            if let Ok((tcp_stream, _)) = listener.accept() {
+                if let Ok(async_stream) = AsyncTcpStream::from_std(tcp_stream) {
+                    if let Ok(mut server) = AsyncHttp2Connection::server_handshake(async_stream) {
+                        while let Ok(frame) = server.recv_frame() {
+                            if let crate::simd_parser::Http2Frame::Headers {
+                                stream_id,
+                                end_stream,
+                                ..
+                            } = frame
+                            {
+                                if end_stream {
+                                    let _ = server.send_response(
+                                        stream_id,
+                                        &[(":status", "200")],
+                                        Some(b"adaptive-retry-success"),
+                                    );
+                                    let _ = server
+                                        .send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(15));
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2)
+            .with_max_retries(2)
+            .with_retry_backoff(Duration::from_millis(5));
+
+        let resp = pool
+            .execute_request("GET", "/retry-test", &[], None)
+            .expect("request should succeed on adaptive retry");
+
+        assert_eq!(resp.status.0, 200);
+        assert_eq!(resp.body, b"adaptive-retry-success");
+        assert_eq!(pool.retried_count(), 1);
+        assert_eq!(pool.stats().retried_requests, 1);
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_async_http2_pool_adaptive_retry_streaming_transient() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            // First connection: accept and abruptly close/reset with GOAWAY
+            if let Ok((tcp_stream, _)) = listener.accept() {
+                if let Ok(async_stream) = AsyncTcpStream::from_std(tcp_stream) {
+                    if let Ok(mut server) = AsyncHttp2Connection::server_handshake(async_stream) {
+                        let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                    }
+                }
+            }
+
+            // Second connection: accept and stream chunked data
+            if let Ok((tcp_stream, _)) = listener.accept() {
+                if let Ok(async_stream) = AsyncTcpStream::from_std(tcp_stream) {
+                    if let Ok(mut server) = AsyncHttp2Connection::server_handshake(async_stream) {
+                        let stream_id = loop {
+                            match server.recv_frame() {
+                                Ok(crate::simd_parser::Http2Frame::Headers {
+                                    stream_id: sid,
+                                    end_stream,
+                                    ..
+                                }) => {
+                                    if end_stream {
+                                        break sid;
+                                    }
+                                }
+                                Ok(crate::simd_parser::Http2Frame::GoAway { .. }) => return,
+                                Err(_) => return,
+                                _ => {}
+                            }
+                        };
+
+                        let h = server.session.create_headers_frame(
+                            stream_id,
+                            &[(":status", "200")],
+                            false,
+                        );
+                        let _ = server.send_frame(&h);
+                        let _ = server.send_data(stream_id, b"stream-1-", false);
+                        let _ = server.send_data(stream_id, b"stream-2", true);
+                        let _ = server.send_goaway(crate::simd_parser::Http2ErrorCode::NoError);
+                    }
+                }
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(15));
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2)
+            .with_max_retries(2)
+            .with_retry_backoff(Duration::from_millis(5));
+
+        let mut chunks_received = Vec::new();
+        let resp = pool
+            .execute_streaming_request("GET", "/stream-retry", &[], None, |chunk| {
+                chunks_received.push(chunk.to_vec());
+            })
+            .expect("streaming request should succeed on adaptive retry");
+
+        assert_eq!(resp.status.0, 200);
+        assert_eq!(resp.body, b"stream-1-stream-2");
+        assert_eq!(chunks_received.len(), 2);
+        assert_eq!(chunks_received[0], b"stream-1-");
+        assert_eq!(chunks_received[1], b"stream-2");
+        assert_eq!(pool.retried_count(), 1);
+        assert_eq!(pool.stats().retried_requests, 1);
+
+        pool.shutdown();
+        let _ = handle.join();
+    }
+
+    #[test]
     fn test_async_http2_pool_stats_telemetry() {
         let pool = AsyncHttp2Pool::new("127.0.0.1", 8080, 5).with_max_concurrent_streams(50);
         let stats = pool.stats();
@@ -9746,6 +10049,7 @@ mod tests {
         assert_eq!(stats.last_goaway_error, None);
         assert_eq!(stats.last_alpn_negotiated, None);
         assert_eq!(stats.total_connections(), 0);
+        assert_eq!(stats.retried_requests, 0);
         assert!(!stats.is_exhausted());
 
         pool.record_alpn_negotiated(AlpnProtocol::Http2);
