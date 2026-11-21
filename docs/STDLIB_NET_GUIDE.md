@@ -126,6 +126,39 @@ assert_eq!(pool.h3_requests_succeeded(), 1);
 assert_eq!(pool.h3_fallbacks(), 0);
 ```
 
+### Dynamic Transport Selection via Latency and Jitter Telemetry (RFC 6298 / RFC 9002)
+
+To prevent suboptimal migrations when HTTP/3 routes suffer from high packet loss or congested UDP paths, `AsyncHttp2Pool` tracks Round-Trip Time (RTT) and network jitter (RTT variance) per route according to standard EWMA filters (RFC 6298 §2 / RFC 9002 §5.3). The pool dynamically selects between native HTTP/2 and alternative HTTP/3 transports using configurable strategies:
+
+```rust
+use ifa_stdlib::net::{AltSvcSelectionStrategy, AsyncHttp2Pool};
+use std::time::Duration;
+
+let pool = AsyncHttp2Pool::new("127.0.0.1", 443, 4)
+    .with_http3_handler(h3_transport_handler)
+    // Dynamic selection strategy based on measured telemetry
+    .with_alt_svc_selection_strategy(AltSvcSelectionStrategy::LowestLatency);
+
+// Supported selection strategies:
+// 1. AltSvcSelectionStrategy::PreferAltSvc - Always prefer advertised Alt-Svc (default)
+// 2. AltSvcSelectionStrategy::LowestLatency - Select route with lowest smoothed RTT
+// 3. AltSvcSelectionStrategy::LowestJitter - Select route with lowest RTT variance (jitter)
+// 4. AltSvcSelectionStrategy::CompositeEffectiveLatency - Compare smoothed RTT + jitter
+// 5. AltSvcSelectionStrategy::JitterThreshold(Duration) - Enforce maximum tolerable jitter
+// 6. AltSvcSelectionStrategy::MaxLatencyPenalty(Duration) - Enforce maximum tolerable latency overhead
+
+// Inspect real-time route metrics:
+for metric in pool.all_alt_svc_metrics() {
+    println!(
+        "Route: {}, RTT: {:?}, Jitter: {:?}, Error Rate: {:.1}%",
+        metric.route_key,
+        metric.smoothed_rtt(),
+        metric.jitter(),
+        metric.failure_rate() * 100.0
+    );
+}
+```
+
 ---
 
 ## 3. WebSocket Client & Pooled Multiplexing

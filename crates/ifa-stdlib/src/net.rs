@@ -5526,6 +5526,134 @@ where
     }
 }
 
+/// Telemetry and latency statistics for an alternative service route or native transport (RFC 7838 / RFC 9002).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AltSvcRouteMetrics {
+    /// Route identifier or target key, e.g. "h3://127.0.0.1:50443" or "h2://127.0.0.1:443".
+    pub route_key: String,
+    /// Total number of successful latency samples collected.
+    pub sample_count: usize,
+    /// Smoothed Round-Trip Time (RTT) using EWMA filter (RFC 6298 §2 / RFC 9002 §5.3).
+    pub smoothed_rtt: std::time::Duration,
+    /// Round-Trip Time variation / network jitter (RFC 6298 §2 / RFC 3550).
+    pub rttvar: std::time::Duration,
+    /// Minimum observed RTT for this route.
+    pub min_rtt: std::time::Duration,
+    /// Maximum observed RTT for this route.
+    pub max_rtt: std::time::Duration,
+    /// Most recent sample RTT.
+    pub last_rtt: std::time::Duration,
+    /// Timestamp of the last sample or state update.
+    pub last_updated: std::time::Instant,
+    /// Count of successful request dispatches over this route.
+    pub success_count: usize,
+    /// Count of failed attempts or fallbacks over this route.
+    pub failure_count: usize,
+}
+
+impl AltSvcRouteMetrics {
+    /// Create a new metrics tracker for an alternative service route.
+    pub fn new(route_key: impl Into<String>) -> Self {
+        Self {
+            route_key: route_key.into(),
+            sample_count: 0,
+            smoothed_rtt: std::time::Duration::from_millis(0),
+            rttvar: std::time::Duration::from_millis(0),
+            min_rtt: std::time::Duration::MAX,
+            max_rtt: std::time::Duration::from_millis(0),
+            last_rtt: std::time::Duration::from_millis(0),
+            last_updated: std::time::Instant::now(),
+            success_count: 0,
+            failure_count: 0,
+        }
+    }
+
+    /// Record a measured Round-Trip Time (RTT) sample according to RFC 6298 / RFC 9002 EWMA filters:
+    ///
+    /// For the first measurement:
+    ///   `smoothed_rtt = R`
+    ///   `rttvar = R / 2`
+    /// Subsequent measurements:
+    ///   `rttvar = (3/4) * rttvar + (1/4) * |smoothed_rtt - R|`
+    ///   `smoothed_rtt = (7/8) * smoothed_rtt + (1/8) * R`
+    pub fn record_sample(&mut self, sample: std::time::Duration) {
+        if self.sample_count == 0 {
+            self.smoothed_rtt = sample;
+            self.rttvar = sample / 2;
+            self.min_rtt = sample;
+            self.max_rtt = sample;
+        } else {
+            let diff = self.smoothed_rtt.abs_diff(sample);
+            self.rttvar = (self.rttvar * 3 + diff) / 4;
+            self.smoothed_rtt = (self.smoothed_rtt * 7 + sample) / 8;
+            if sample < self.min_rtt {
+                self.min_rtt = sample;
+            }
+            if sample > self.max_rtt {
+                self.max_rtt = sample;
+            }
+        }
+        self.last_rtt = sample;
+        self.sample_count += 1;
+        self.success_count += 1;
+        self.last_updated = std::time::Instant::now();
+    }
+
+    /// Record a transport failure or fallback for this route.
+    pub fn record_failure(&mut self) {
+        self.failure_count += 1;
+        self.last_updated = std::time::Instant::now();
+    }
+
+    /// Current network jitter (RTT variance).
+    #[inline]
+    pub fn jitter(&self) -> std::time::Duration {
+        self.rttvar
+    }
+
+    /// Smoothed Round-Trip Time (RTT).
+    #[inline]
+    pub fn smoothed_rtt(&self) -> std::time::Duration {
+        self.smoothed_rtt
+    }
+
+    /// Composite effective latency taking network jitter into account (`smoothed_rtt + rttvar`).
+    #[inline]
+    pub fn effective_latency(&self) -> std::time::Duration {
+        self.smoothed_rtt + self.rttvar
+    }
+
+    /// Error or failure rate between 0.0 and 1.0.
+    #[inline]
+    pub fn failure_rate(&self) -> f64 {
+        let total = self.success_count + self.failure_count;
+        if total == 0 {
+            0.0
+        } else {
+            self.failure_count as f64 / total as f64
+        }
+    }
+}
+
+/// Strategy used by the HTTP/2 pool to dynamically select between HTTP/2 native transport
+/// and alternative service routes (e.g. HTTP/3 / QUIC) based on measured transport metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AltSvcSelectionStrategy {
+    /// Always prefer advertised and unquarantined alternative service routes (RFC 7838 default).
+    #[default]
+    PreferAltSvc,
+    /// Dynamically select the route (HTTP/2 or HTTP/3) with the lowest smoothed RTT.
+    LowestLatency,
+    /// Dynamically select the route with the lowest network jitter (RTT variance).
+    LowestJitter,
+    /// Dynamically select based on composite effective latency (`smoothed_rtt + rttvar`).
+    CompositeEffectiveLatency,
+    /// Only select HTTP/3 if its network jitter does not exceed the configured threshold.
+    JitterThreshold(std::time::Duration),
+    /// Only select HTTP/3 if its smoothed RTT does not exceed HTTP/2 by more than a configured margin.
+    MaxLatencyPenalty(std::time::Duration),
+}
+
 /// An idle pooled HTTP/2 connection paired with the timestamp at which it became idle.
 struct PooledConnectionEntry {
     conn: AsyncHttp2Connection,
@@ -5560,6 +5688,10 @@ pub struct AsyncHttp2Pool {
     quarantined_alt_svc_routes:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
     alt_svc_quarantine_duration: std::time::Duration,
+    alt_svc_metrics: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, AltSvcRouteMetrics>>,
+    >,
+    alt_svc_selection_strategy: std::sync::Arc<std::sync::Mutex<AltSvcSelectionStrategy>>,
     h3_requests_attempted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     h3_requests_succeeded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     h3_fallbacks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -5622,6 +5754,12 @@ impl AsyncHttp2Pool {
                 std::collections::HashMap::new(),
             )),
             alt_svc_quarantine_duration: std::time::Duration::from_secs(300),
+            alt_svc_metrics: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            alt_svc_selection_strategy: std::sync::Arc::new(std::sync::Mutex::new(
+                AltSvcSelectionStrategy::PreferAltSvc,
+            )),
             h3_requests_attempted: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             h3_requests_succeeded: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             h3_fallbacks: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -5868,6 +6006,151 @@ impl AsyncHttp2Pool {
             initial - map.len()
         } else {
             0
+        }
+    }
+
+    /// Configure the dynamic route selection strategy for alternative service routes.
+    pub fn with_alt_svc_selection_strategy(self, strategy: AltSvcSelectionStrategy) -> Self {
+        if let Ok(mut strat) = self.alt_svc_selection_strategy.lock() {
+            *strat = strategy;
+        }
+        self
+    }
+
+    /// Set the dynamic route selection strategy for alternative service routes.
+    pub fn set_alt_svc_selection_strategy(&self, strategy: AltSvcSelectionStrategy) {
+        if let Ok(mut strat) = self.alt_svc_selection_strategy.lock() {
+            *strat = strategy;
+        }
+    }
+
+    /// Current dynamic route selection strategy.
+    pub fn alt_svc_selection_strategy(&self) -> AltSvcSelectionStrategy {
+        self.alt_svc_selection_strategy
+            .lock()
+            .map(|s| *s)
+            .unwrap_or(AltSvcSelectionStrategy::PreferAltSvc)
+    }
+
+    /// Record a measured Round-Trip Time (RTT) sample for a transport route key.
+    pub fn record_alt_svc_metric(&self, route_key: &str, rtt: std::time::Duration) {
+        if let Ok(mut metrics) = self.alt_svc_metrics.lock() {
+            metrics
+                .entry(route_key.to_string())
+                .or_insert_with(|| AltSvcRouteMetrics::new(route_key))
+                .record_sample(rtt);
+        }
+    }
+
+    /// Record a transport failure or fallback for a route key.
+    pub fn record_alt_svc_failure(&self, route_key: &str) {
+        if let Ok(mut metrics) = self.alt_svc_metrics.lock() {
+            metrics
+                .entry(route_key.to_string())
+                .or_insert_with(|| AltSvcRouteMetrics::new(route_key))
+                .record_failure();
+        }
+    }
+
+    /// Retrieve the telemetry metrics for a specific route key if available.
+    pub fn get_alt_svc_metric(&self, route_key: &str) -> Option<AltSvcRouteMetrics> {
+        self.alt_svc_metrics
+            .lock()
+            .ok()
+            .and_then(|m| m.get(route_key).cloned())
+    }
+
+    /// Snapshot all collected alternative service and native transport metrics.
+    pub fn all_alt_svc_metrics(&self) -> Vec<AltSvcRouteMetrics> {
+        if let Ok(m) = self.alt_svc_metrics.lock() {
+            m.values().cloned().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Clear all collected alternative service transport metrics.
+    pub fn clear_alt_svc_metrics(&self) {
+        if let Ok(mut m) = self.alt_svc_metrics.lock() {
+            m.clear();
+        }
+    }
+
+    /// Decide whether the pool should migrate to an advertised alternative service route
+    /// based on quarantine status, configured selection strategy, and collected telemetry.
+    pub fn should_migrate_to_alt_svc(&self, alt_route_key: &str) -> bool {
+        if self.is_alt_svc_quarantined(alt_route_key) {
+            return false;
+        }
+
+        let strategy = self.alt_svc_selection_strategy();
+        if strategy == AltSvcSelectionStrategy::PreferAltSvc {
+            return true;
+        }
+
+        let metrics_map = match self.alt_svc_metrics.lock() {
+            Ok(m) => m,
+            Err(_) => return true,
+        };
+
+        // If no samples exist yet for the alternative route, allow migration to probe and collect metrics
+        let alt_metric = match metrics_map.get(alt_route_key) {
+            Some(m) if m.sample_count > 0 => m,
+            _ => return true,
+        };
+
+        let h2_key = format!("h2://{}:{}", self.host, self.port);
+        let h2_metric = metrics_map.get(&h2_key);
+
+        match strategy {
+            AltSvcSelectionStrategy::PreferAltSvc => true,
+            AltSvcSelectionStrategy::LowestLatency => {
+                if let Some(h2_m) = h2_metric {
+                    if h2_m.sample_count > 0 {
+                        alt_metric.smoothed_rtt <= h2_m.smoothed_rtt
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            }
+            AltSvcSelectionStrategy::LowestJitter => {
+                if let Some(h2_m) = h2_metric {
+                    if h2_m.sample_count > 0 {
+                        alt_metric.rttvar <= h2_m.rttvar
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            }
+            AltSvcSelectionStrategy::CompositeEffectiveLatency => {
+                if let Some(h2_m) = h2_metric {
+                    if h2_m.sample_count > 0 {
+                        alt_metric.effective_latency() <= h2_m.effective_latency()
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            }
+            AltSvcSelectionStrategy::JitterThreshold(max_jitter) => {
+                alt_metric.rttvar <= max_jitter
+            }
+            AltSvcSelectionStrategy::MaxLatencyPenalty(penalty) => {
+                if let Some(h2_m) = h2_metric {
+                    if h2_m.sample_count > 0 {
+                        alt_metric.smoothed_rtt <= h2_m.smoothed_rtt + penalty
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            }
         }
     }
 
@@ -6752,7 +7035,14 @@ impl AsyncHttp2Pool {
             .collect();
         let body_ref = req.body.as_deref();
 
+        let start = std::time::Instant::now();
         let result = conn.request(&req.method, &req.path, &header_refs, body_ref);
+        let elapsed = start.elapsed();
+        let h2_key = format!("h2://{}:{}", self.host, self.port);
+        match &result {
+            Ok(_) => self.record_alt_svc_metric(&h2_key, elapsed),
+            Err(_) => self.record_alt_svc_failure(&h2_key),
+        }
         match result {
             Ok(resp) => {
                 let key = format!("{}:{}", req.method.to_ascii_uppercase(), req.path);
@@ -7057,140 +7347,146 @@ impl AsyncHttp2Pool {
                     };
                     let q_key = format!("h3://{}:{}", target_host, target_port);
 
-                    self.h3_requests_attempted
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if self.should_migrate_to_alt_svc(&q_key) {
+                        self.h3_requests_attempted
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                    let header_refs: Vec<(&str, &str)> = client_req
-                        .headers
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.as_str()))
-                        .collect();
-                    let body_ref = client_req.body.as_deref();
+                        let header_refs: Vec<(&str, &str)> = client_req
+                            .headers
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.as_str()))
+                            .collect();
+                        let body_ref = client_req.body.as_deref();
 
-                    match transport.execute_request(
-                        target_host,
-                        target_port,
-                        &client_req.method,
-                        &client_req.path,
-                        &header_refs,
-                        body_ref,
-                    ) {
-                        Ok(mut resp) => {
-                            self.h3_requests_succeeded
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                            if resp.status.0 == 304 && is_revalidating {
-                                self.cache_revalidations
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                self.push_cache_hits
+                        let h3_start = std::time::Instant::now();
+                        match transport.execute_request(
+                            target_host,
+                            target_port,
+                            &client_req.method,
+                            &client_req.path,
+                            &header_refs,
+                            body_ref,
+                        ) {
+                            Ok(mut resp) => {
+                                self.record_alt_svc_metric(&q_key, h3_start.elapsed());
+                                self.h3_requests_succeeded
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                                let now_update = std::time::SystemTime::now();
-                                let mut resolved_resp = None;
+                                if resp.status.0 == 304 && is_revalidating {
+                                    self.cache_revalidations
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    self.push_cache_hits
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                                    let now_update = std::time::SystemTime::now();
+                                    let mut resolved_resp = None;
+
+                                    if self
+                                        .enable_http_cache
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        if let Ok(mut cache) = self.http_cache_entries.lock() {
+                                            if let Some(entries) = cache.get_mut(&key) {
+                                                if let Some(pos) = entries.iter().rposition(|entry| {
+                                                    entry.matches_request(&client_req.headers)
+                                                }) {
+                                                    entries[pos].update_from_304(&resp, now_update);
+                                                    resolved_resp = Some(entries[pos].response.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if resolved_resp.is_none()
+                                        && self
+                                            .enable_push_promises
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        if let Ok(mut cache) = self.push_promise_cache.lock() {
+                                            if let Some(entries) = cache.get_mut(&key) {
+                                                if let Some(pos) = entries.iter().rposition(|entry| {
+                                                    entry.matches_request(&client_req.headers)
+                                                }) {
+                                                    entries[pos].update_from_304(&resp, now_update);
+                                                    resolved_resp = Some(entries[pos].response.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(mut fresh_resp) = resolved_resp {
+                                        for resp_interceptor in &self.response_interceptors {
+                                            resp_interceptor(&client_req, &mut fresh_resp);
+                                        }
+                                        return Ok(fresh_resp);
+                                    }
+                                }
+
+                                if let Some(alt_svc_val) = resp.headers.get("alt-svc") {
+                                    let routes = crate::simd_parser::AltSvcRoute::parse_header_value(
+                                        alt_svc_val,
+                                    );
+                                    let origin = format!("{}:{}", self.host, self.port);
+                                    if let Ok(mut pool_routes) = self.alt_svc_routes.lock() {
+                                        if routes.is_empty()
+                                            && alt_svc_val.trim().eq_ignore_ascii_case("clear")
+                                        {
+                                            pool_routes.remove(&origin);
+                                        } else if !routes.is_empty() {
+                                            pool_routes.insert(origin, routes);
+                                        }
+                                    }
+                                }
+
+                                if self.auto_decompress() && resp.headers.has("content-encoding") {
+                                    if let Ok(true) = resp.decompress_in_place() {
+                                        self.decompressed_responses
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
 
                                 if self
                                     .enable_http_cache
                                     .load(std::sync::atomic::Ordering::Relaxed)
+                                    && (client_req.method.eq_ignore_ascii_case("GET")
+                                        || client_req.method.eq_ignore_ascii_case("HEAD"))
+                                    && resp.status.0 == 200
+                                    && !client_no_store
                                 {
-                                    if let Ok(mut cache) = self.http_cache_entries.lock() {
-                                        if let Some(entries) = cache.get_mut(&key) {
-                                            if let Some(pos) = entries.iter().rposition(|entry| {
-                                                entry.matches_request(&client_req.headers)
-                                            }) {
-                                                entries[pos].update_from_304(&resp, now_update);
-                                                resolved_resp = Some(entries[pos].response.clone());
-                                            }
-                                        }
-                                    }
+                                    let entry = Http2PoolCacheEntry::new(
+                                        client_req.method.clone(),
+                                        client_req.path.clone(),
+                                        resp.clone(),
+                                    )
+                                    .with_request_headers(client_req.headers.clone());
+                                    self.insert_http_cache_entry(key.clone(), entry);
                                 }
-                                if resolved_resp.is_none()
-                                    && self
-                                        .enable_push_promises
-                                        .load(std::sync::atomic::Ordering::Relaxed)
+
+                                if !client_req.method.eq_ignore_ascii_case("GET")
+                                    && !client_req.method.eq_ignore_ascii_case("HEAD")
+                                    && resp.status.0 >= 200
+                                    && resp.status.0 < 400
                                 {
-                                    if let Ok(mut cache) = self.push_promise_cache.lock() {
-                                        if let Some(entries) = cache.get_mut(&key) {
-                                            if let Some(pos) = entries.iter().rposition(|entry| {
-                                                entry.matches_request(&client_req.headers)
-                                            }) {
-                                                entries[pos].update_from_304(&resp, now_update);
-                                                resolved_resp = Some(entries[pos].response.clone());
-                                            }
-                                        }
-                                    }
+                                    self.invalidate_http_cache_path(&client_req.path);
                                 }
 
-                                if let Some(mut fresh_resp) = resolved_resp {
-                                    for resp_interceptor in &self.response_interceptors {
-                                        resp_interceptor(&client_req, &mut fresh_resp);
-                                    }
-                                    return Ok(fresh_resp);
+                                for resp_interceptor in &self.response_interceptors {
+                                    resp_interceptor(&client_req, &mut resp);
                                 }
+                                return Ok(resp);
                             }
-
-                            if let Some(alt_svc_val) = resp.headers.get("alt-svc") {
-                                let routes = crate::simd_parser::AltSvcRoute::parse_header_value(
-                                    alt_svc_val,
-                                );
-                                let origin = format!("{}:{}", self.host, self.port);
-                                if let Ok(mut pool_routes) = self.alt_svc_routes.lock() {
-                                    if routes.is_empty()
-                                        && alt_svc_val.trim().eq_ignore_ascii_case("clear")
-                                    {
-                                        pool_routes.remove(&origin);
-                                    } else if !routes.is_empty() {
-                                        pool_routes.insert(origin, routes);
-                                    }
-                                }
+                            Err(_e) => {
+                                self.record_alt_svc_failure(&q_key);
+                                self.h3_fallbacks
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                self.quarantine_alt_svc_route(&q_key, None);
                             }
-
-                            if self.auto_decompress() && resp.headers.has("content-encoding") {
-                                if let Ok(true) = resp.decompress_in_place() {
-                                    self.decompressed_responses
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-
-                            if self
-                                .enable_http_cache
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                                && (client_req.method.eq_ignore_ascii_case("GET")
-                                    || client_req.method.eq_ignore_ascii_case("HEAD"))
-                                && resp.status.0 == 200
-                                && !client_no_store
-                            {
-                                let entry = Http2PoolCacheEntry::new(
-                                    client_req.method.clone(),
-                                    client_req.path.clone(),
-                                    resp.clone(),
-                                )
-                                .with_request_headers(client_req.headers.clone());
-                                self.insert_http_cache_entry(key.clone(), entry);
-                            }
-
-                            if !client_req.method.eq_ignore_ascii_case("GET")
-                                && !client_req.method.eq_ignore_ascii_case("HEAD")
-                                && resp.status.0 >= 200
-                                && resp.status.0 < 400
-                            {
-                                self.invalidate_http_cache_path(&client_req.path);
-                            }
-
-                            for resp_interceptor in &self.response_interceptors {
-                                resp_interceptor(&client_req, &mut resp);
-                            }
-                            return Ok(resp);
-                        }
-                        Err(_e) => {
-                            self.h3_fallbacks
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            self.quarantine_alt_svc_route(&q_key, None);
                         }
                     }
                 }
             }
         }
 
+        let h2_start = std::time::Instant::now();
         let conn_res = self.acquire();
         let (conn_opt, result) = match conn_res {
             Ok(mut conn) => {
@@ -7212,6 +7508,13 @@ impl AsyncHttp2Pool {
             }
             Err(e) => (None, Err(e)),
         };
+
+        let h2_elapsed = h2_start.elapsed();
+        let h2_key = format!("h2://{}:{}", self.host, self.port);
+        match &result {
+            Ok(_) => self.record_alt_svc_metric(&h2_key, h2_elapsed),
+            Err(_) => self.record_alt_svc_failure(&h2_key),
+        }
 
         match result {
             Ok(mut resp) => {
@@ -7670,67 +7973,73 @@ impl AsyncHttp2Pool {
                     };
                     let q_key = format!("h3://{}:{}", target_host, target_port);
 
-                    self.h3_requests_attempted
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if self.should_migrate_to_alt_svc(&q_key) {
+                        self.h3_requests_attempted
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                    let header_refs: Vec<(&str, &str)> = client_req
-                        .headers
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.as_str()))
-                        .collect();
-                    let body_ref = client_req.body.as_deref();
+                        let header_refs: Vec<(&str, &str)> = client_req
+                            .headers
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.as_str()))
+                            .collect();
+                        let body_ref = client_req.body.as_deref();
 
-                    match transport.execute_streaming_request(
-                        target_host,
-                        target_port,
-                        &client_req.method,
-                        &client_req.path,
-                        &header_refs,
-                        body_ref,
-                        Box::new(&mut chunk_handler),
-                    ) {
-                        Ok(mut resp) => {
-                            self.h3_requests_succeeded
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let h3_start = std::time::Instant::now();
+                        match transport.execute_streaming_request(
+                            target_host,
+                            target_port,
+                            &client_req.method,
+                            &client_req.path,
+                            &header_refs,
+                            body_ref,
+                            Box::new(&mut chunk_handler),
+                        ) {
+                            Ok(mut resp) => {
+                                self.record_alt_svc_metric(&q_key, h3_start.elapsed());
+                                self.h3_requests_succeeded
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                            if let Some(alt_svc_val) = resp.headers.get("alt-svc") {
-                                let routes = crate::simd_parser::AltSvcRoute::parse_header_value(
-                                    alt_svc_val,
-                                );
-                                let origin = format!("{}:{}", self.host, self.port);
-                                if let Ok(mut pool_routes) = self.alt_svc_routes.lock() {
-                                    if routes.is_empty()
-                                        && alt_svc_val.trim().eq_ignore_ascii_case("clear")
-                                    {
-                                        pool_routes.remove(&origin);
-                                    } else if !routes.is_empty() {
-                                        pool_routes.insert(origin, routes);
+                                if let Some(alt_svc_val) = resp.headers.get("alt-svc") {
+                                    let routes = crate::simd_parser::AltSvcRoute::parse_header_value(
+                                        alt_svc_val,
+                                    );
+                                    let origin = format!("{}:{}", self.host, self.port);
+                                    if let Ok(mut pool_routes) = self.alt_svc_routes.lock() {
+                                        if routes.is_empty()
+                                            && alt_svc_val.trim().eq_ignore_ascii_case("clear")
+                                        {
+                                            pool_routes.remove(&origin);
+                                        } else if !routes.is_empty() {
+                                            pool_routes.insert(origin, routes);
+                                        }
                                     }
                                 }
-                            }
 
-                            if self.auto_decompress() && resp.headers.has("content-encoding") {
-                                if let Ok(true) = resp.decompress_in_place() {
-                                    self.decompressed_responses
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if self.auto_decompress() && resp.headers.has("content-encoding") {
+                                    if let Ok(true) = resp.decompress_in_place() {
+                                        self.decompressed_responses
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                 }
-                            }
 
-                            for resp_interceptor in &self.response_interceptors {
-                                resp_interceptor(&client_req, &mut resp);
+                                for resp_interceptor in &self.response_interceptors {
+                                    resp_interceptor(&client_req, &mut resp);
+                                }
+                                return Ok(resp);
                             }
-                            return Ok(resp);
-                        }
-                        Err(_e) => {
-                            self.h3_fallbacks
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            self.quarantine_alt_svc_route(&q_key, None);
+                            Err(_e) => {
+                                self.record_alt_svc_failure(&q_key);
+                                self.h3_fallbacks
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                self.quarantine_alt_svc_route(&q_key, None);
+                            }
                         }
                     }
                 }
             }
         }
 
+        let h2_start = std::time::Instant::now();
         let mut conn = match self.acquire() {
             Ok(c) => c,
             Err(e) => {
@@ -7804,6 +8113,13 @@ impl AsyncHttp2Pool {
             self.chunk_buffer_pool.clone(),
             &mut chunk_handler,
         );
+
+        let h2_elapsed = h2_start.elapsed();
+        let h2_key = format!("h2://{}:{}", self.host, self.port);
+        match &result {
+            Ok(_) => self.record_alt_svc_metric(&h2_key, h2_elapsed),
+            Err(_) => self.record_alt_svc_failure(&h2_key),
+        }
 
         match result {
             Ok(mut resp) => {
@@ -8239,6 +8555,78 @@ impl AsyncHttp2Pool {
         })
     }
 
+    /// Select the best alternative service route matching `protocol_id` based on active quarantine
+    /// and transport latency/jitter metrics under the configured `AltSvcSelectionStrategy`.
+    pub fn select_best_alt_svc_route(
+        &self,
+        origin: Option<&str>,
+        protocol_id: &str,
+        elapsed: std::time::Duration,
+        allow_persisted: bool,
+    ) -> Option<crate::simd_parser::AltSvcRoute> {
+        let routes = self.get_alt_svc_routes(origin);
+        let mut eligible: Vec<crate::simd_parser::AltSvcRoute> = routes
+            .into_iter()
+            .filter(|r| {
+                if !r.protocol_id.eq_ignore_ascii_case(protocol_id) {
+                    return false;
+                }
+                if allow_persisted && r.persist {
+                    // persisted route allowed
+                } else if r.is_expired_since(elapsed) {
+                    return false;
+                }
+                let host = if r.host.is_empty() {
+                    self.host.as_str()
+                } else {
+                    r.host.as_str()
+                };
+                let port = if r.port != 0 { r.port } else { self.port };
+                let q_key = format!("{}://{}:{}", r.protocol_id.to_ascii_lowercase(), host, port);
+                !self.is_alt_svc_quarantined(&q_key)
+            })
+            .collect();
+
+        if eligible.is_empty() {
+            return None;
+        }
+
+        if eligible.len() == 1 {
+            return eligible.pop();
+        }
+
+        let strategy = self.alt_svc_selection_strategy();
+        if strategy == AltSvcSelectionStrategy::PreferAltSvc {
+            return Some(eligible.remove(0));
+        }
+
+        let default_host = &self.host;
+        let default_port = self.port;
+        if let Ok(metrics) = self.alt_svc_metrics.lock() {
+            eligible.sort_by_key(|r| {
+                let h = if r.host.is_empty() {
+                    default_host.as_str()
+                } else {
+                    r.host.as_str()
+                };
+                let p = if r.port != 0 { r.port } else { default_port };
+                let q_key = format!("{}://{}:{}", r.protocol_id.to_ascii_lowercase(), h, p);
+                if let Some(m) = metrics.get(&q_key) {
+                    match strategy {
+                        AltSvcSelectionStrategy::LowestLatency => m.smoothed_rtt,
+                        AltSvcSelectionStrategy::LowestJitter => m.rttvar,
+                        AltSvcSelectionStrategy::CompositeEffectiveLatency => m.effective_latency(),
+                        _ => m.smoothed_rtt,
+                    }
+                } else {
+                    std::time::Duration::ZERO
+                }
+            });
+        }
+
+        Some(eligible.remove(0))
+    }
+
     /// Select an active (non-expired and non-quarantined) alternative service route for a given origin and protocol.
     pub fn select_active_unquarantined_alt_svc_route(
         &self,
@@ -8247,25 +8635,7 @@ impl AsyncHttp2Pool {
         elapsed: std::time::Duration,
         allow_persisted: bool,
     ) -> Option<crate::simd_parser::AltSvcRoute> {
-        let routes = self.get_alt_svc_routes(origin);
-        routes.into_iter().find(|r| {
-            if !r.protocol_id.eq_ignore_ascii_case(protocol_id) {
-                return false;
-            }
-            if allow_persisted && r.persist {
-                // persisted route allowed
-            } else if r.is_expired_since(elapsed) {
-                return false;
-            }
-            let host = if r.host.is_empty() {
-                self.host.as_str()
-            } else {
-                r.host.as_str()
-            };
-            let port = if r.port != 0 { r.port } else { self.port };
-            let q_key = format!("{}://{}:{}", r.protocol_id.to_ascii_lowercase(), host, port);
-            !self.is_alt_svc_quarantined(&q_key)
-        })
+        self.select_best_alt_svc_route(origin, protocol_id, elapsed, allow_persisted)
     }
 
     /// Execute a request with automatic transparent migration to an advertised HTTP/3 alternative route if available.
@@ -8313,54 +8683,62 @@ impl AsyncHttp2Pool {
             };
             let q_key = format!("h3://{}:{}", target_host, target_port);
 
-            if let Some(handler) = http3_handler {
-                self.h3_requests_attempted
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                match handler(target_host, target_port, method, path, headers, body) {
-                    Ok(resp) => {
-                        self.h3_requests_succeeded
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Ok(resp);
-                    }
-                    Err(e) => {
-                        self.h3_fallbacks
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        self.quarantine_alt_svc_route(&q_key, None);
-                        match e.kind() {
-                            io::ErrorKind::ConnectionRefused
-                            | io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::TimedOut
-                            | io::ErrorKind::AddrNotAvailable => {}
-                            _ => return Err(e),
+            if self.should_migrate_to_alt_svc(&q_key) {
+                if let Some(handler) = http3_handler {
+                    self.h3_requests_attempted
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let start = std::time::Instant::now();
+                    match handler(target_host, target_port, method, path, headers, body) {
+                        Ok(resp) => {
+                            self.record_alt_svc_metric(&q_key, start.elapsed());
+                            self.h3_requests_succeeded
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(resp);
+                        }
+                        Err(e) => {
+                            self.record_alt_svc_failure(&q_key);
+                            self.h3_fallbacks
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.quarantine_alt_svc_route(&q_key, None);
+                            match e.kind() {
+                                io::ErrorKind::ConnectionRefused
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::AddrNotAvailable => {}
+                                _ => return Err(e),
+                            }
                         }
                     }
-                }
-            } else if let Some(ref transport) = self.http3_transport {
-                self.h3_requests_attempted
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                match transport.execute_request(
-                    target_host,
-                    target_port,
-                    method,
-                    path,
-                    headers,
-                    body,
-                ) {
-                    Ok(resp) => {
-                        self.h3_requests_succeeded
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Ok(resp);
-                    }
-                    Err(e) => {
-                        self.h3_fallbacks
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        self.quarantine_alt_svc_route(&q_key, None);
-                        match e.kind() {
-                            io::ErrorKind::ConnectionRefused
-                            | io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::TimedOut
-                            | io::ErrorKind::AddrNotAvailable => {}
-                            _ => return Err(e),
+                } else if let Some(ref transport) = self.http3_transport {
+                    self.h3_requests_attempted
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let start = std::time::Instant::now();
+                    match transport.execute_request(
+                        target_host,
+                        target_port,
+                        method,
+                        path,
+                        headers,
+                        body,
+                    ) {
+                        Ok(resp) => {
+                            self.record_alt_svc_metric(&q_key, start.elapsed());
+                            self.h3_requests_succeeded
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(resp);
+                        }
+                        Err(e) => {
+                            self.record_alt_svc_failure(&q_key);
+                            self.h3_fallbacks
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.quarantine_alt_svc_route(&q_key, None);
+                            match e.kind() {
+                                io::ErrorKind::ConnectionRefused
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::AddrNotAvailable => {}
+                                _ => return Err(e),
+                            }
                         }
                     }
                 }
@@ -17059,5 +17437,231 @@ mod tls_alpn_tests {
         );
         assert_eq!(entry.response.headers.get("content-encoding"), None);
         assert_eq!(entry.response.body, b"Payload inside Http2PoolCacheEntry");
+    }
+
+    #[test]
+    fn test_alt_svc_route_metrics_ewma_and_jitter_calculation() {
+        let mut metrics = AltSvcRouteMetrics::new("h3://127.0.0.1:50443");
+        assert_eq!(metrics.sample_count, 0);
+        assert_eq!(metrics.jitter(), Duration::from_millis(0));
+        assert_eq!(metrics.failure_rate(), 0.0);
+
+        // First sample: RTT = 100ms
+        metrics.record_sample(Duration::from_millis(100));
+        assert_eq!(metrics.sample_count, 1);
+        assert_eq!(metrics.smoothed_rtt(), Duration::from_millis(100));
+        // RFC 6298: rttvar = sample / 2 = 50ms
+        assert_eq!(metrics.jitter(), Duration::from_millis(50));
+        assert_eq!(metrics.min_rtt, Duration::from_millis(100));
+        assert_eq!(metrics.max_rtt, Duration::from_millis(100));
+        assert_eq!(metrics.effective_latency(), Duration::from_millis(150));
+
+        // Second sample: RTT = 60ms
+        // diff = |100 - 60| = 40ms
+        // rttvar = (3 * 50 + 40) / 4 = 190 / 4 = 47.5ms (47ms or 47500us)
+        // smoothed_rtt = (7 * 100 + 60) / 8 = 760 / 8 = 95ms
+        metrics.record_sample(Duration::from_millis(60));
+        assert_eq!(metrics.sample_count, 2);
+        assert_eq!(metrics.smoothed_rtt(), Duration::from_millis(95));
+        assert_eq!(metrics.jitter(), Duration::from_micros(47500));
+        assert_eq!(metrics.min_rtt, Duration::from_millis(60));
+        assert_eq!(metrics.max_rtt, Duration::from_millis(100));
+
+        // Record a failure
+        metrics.record_failure();
+        assert_eq!(metrics.failure_count, 1);
+        assert_eq!(metrics.success_count, 2);
+        assert!((metrics.failure_rate() - (1.0 / 3.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_alt_svc_selection_strategies_and_routing_decision() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 8443, 2);
+        let h2_key = "h2://127.0.0.1:8443";
+        let h3_key = "h3://127.0.0.1:50443";
+
+        // Baseline: PreferAltSvc (default)
+        assert_eq!(
+            pool.alt_svc_selection_strategy(),
+            AltSvcSelectionStrategy::PreferAltSvc
+        );
+        assert!(pool.should_migrate_to_alt_svc(h3_key));
+
+        // Seed initial metrics:
+        // H2 native: 30ms RTT, jitter 5ms
+        // H3 alternative: 80ms RTT (higher latency), jitter 25ms (higher jitter)
+        pool.record_alt_svc_metric(h2_key, Duration::from_millis(30));
+        pool.record_alt_svc_metric(h3_key, Duration::from_millis(80));
+
+        // 1. LowestLatency strategy: H2 (30ms) is faster than H3 (80ms) -> do NOT migrate!
+        pool.set_alt_svc_selection_strategy(AltSvcSelectionStrategy::LowestLatency);
+        assert!(!pool.should_migrate_to_alt_svc(h3_key));
+
+        // If H3 improves and records multiple fast samples (e.g. 10ms)
+        for _ in 0..10 {
+            pool.record_alt_svc_metric(h3_key, Duration::from_millis(10));
+        }
+        let m3 = pool.get_alt_svc_metric(h3_key).expect("h3 metric");
+        assert!(m3.smoothed_rtt() < Duration::from_millis(30));
+        assert!(pool.should_migrate_to_alt_svc(h3_key));
+
+        // 2. LowestJitter strategy
+        pool.clear_alt_svc_metrics();
+        // H2: first sample 40ms -> jitter = 20ms; second sample 40ms -> jitter = 15ms
+        pool.record_alt_svc_metric(h2_key, Duration::from_millis(40));
+        pool.record_alt_svc_metric(h2_key, Duration::from_millis(40));
+        // H3: first sample 40ms -> jitter = 20ms; second sample 100ms -> jitter = (3*20 + 60)/4 = 30ms
+        pool.record_alt_svc_metric(h3_key, Duration::from_millis(40));
+        pool.record_alt_svc_metric(h3_key, Duration::from_millis(100));
+
+        pool.set_alt_svc_selection_strategy(AltSvcSelectionStrategy::LowestJitter);
+        assert!(!pool.should_migrate_to_alt_svc(h3_key));
+
+        // 3. JitterThreshold strategy: threshold 25ms -> H3 jitter is 30ms (> 25ms) -> rejected
+        pool.set_alt_svc_selection_strategy(AltSvcSelectionStrategy::JitterThreshold(
+            Duration::from_millis(25),
+        ));
+        assert!(!pool.should_migrate_to_alt_svc(h3_key));
+
+        pool.set_alt_svc_selection_strategy(AltSvcSelectionStrategy::JitterThreshold(
+            Duration::from_millis(35),
+        ));
+        assert!(pool.should_migrate_to_alt_svc(h3_key));
+
+        // 4. MaxLatencyPenalty strategy
+        pool.clear_alt_svc_metrics();
+        pool.record_alt_svc_metric(h2_key, Duration::from_millis(50));
+        pool.record_alt_svc_metric(h3_key, Duration::from_millis(70)); // +20ms penalty
+
+        pool.set_alt_svc_selection_strategy(AltSvcSelectionStrategy::MaxLatencyPenalty(
+            Duration::from_millis(10),
+        ));
+        assert!(!pool.should_migrate_to_alt_svc(h3_key)); // 20ms > 10ms penalty -> false
+
+        pool.set_alt_svc_selection_strategy(AltSvcSelectionStrategy::MaxLatencyPenalty(
+            Duration::from_millis(30),
+        ));
+        assert!(pool.should_migrate_to_alt_svc(h3_key)); // 20ms <= 30ms penalty -> true
+
+        // 5. Quarantined route is always rejected regardless of metrics
+        pool.quarantine_alt_svc_route(h3_key, Some(Duration::from_secs(60)));
+        assert!(!pool.should_migrate_to_alt_svc(h3_key));
+    }
+
+    #[test]
+    fn test_select_best_alt_svc_route_ordering_by_metrics() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 8443, 2)
+            .with_alt_svc_selection_strategy(AltSvcSelectionStrategy::LowestLatency);
+
+        let r1 = crate::simd_parser::AltSvcRoute::new("h3", "alt1.example.com", 443);
+        let r2 = crate::simd_parser::AltSvcRoute::new("h3", "alt2.example.com", 443);
+        pool.record_alt_svc_routes("127.0.0.1:8443", vec![r1, r2]);
+
+        // Route 1: 90ms latency
+        pool.record_alt_svc_metric("h3://alt1.example.com:443", Duration::from_millis(90));
+        // Route 2: 25ms latency
+        pool.record_alt_svc_metric("h3://alt2.example.com:443", Duration::from_millis(25));
+
+        let best = pool
+            .select_best_alt_svc_route(None, "h3", Duration::ZERO, true)
+            .expect("best route found");
+        assert_eq!(best.host, "alt2.example.com");
+    }
+
+    #[test]
+    fn test_http2_pool_dynamic_alt_svc_telemetry_integration() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let handle = std::thread::spawn(move || {
+            let (tcp_stream, _) = listener.accept().expect("accept connection");
+            let async_stream = AsyncTcpStream::from_std(tcp_stream).expect("async stream");
+            let mut server =
+                AsyncHttp2Connection::server_handshake(async_stream).expect("server handshake");
+
+            for _ in 0..2 {
+                while let Ok(frame) = server.recv_frame() {
+                    if let crate::simd_parser::Http2Frame::Headers {
+                        stream_id,
+                        end_stream,
+                        ..
+                    } = frame
+                    {
+                        if end_stream {
+                            server
+                                .send_response(
+                                    stream_id,
+                                    &[
+                                        (":status", "200"),
+                                        ("alt-svc", "h3=\":50443\"; ma=86400"),
+                                    ],
+                                    Some(b"h2-response"),
+                                )
+                                .expect("send response");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let h3_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h3_clone = h3_dispatches.clone();
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2)
+            .with_http3_handler(
+                move |_h: &str, _p: u16, _m: &str, _path: &str, _headers: &[(&str, &str)], _b: Option<&[u8]>| {
+                    h3_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(2));
+                    let mut resp = crate::http::HttpResponse::new(crate::http::HttpStatus(200));
+                    resp.body = b"h3-response".to_vec();
+                    Ok(resp)
+                },
+            )
+            .with_alt_svc_selection_strategy(AltSvcSelectionStrategy::LowestLatency);
+
+        // 1. Initial request goes over HTTP/2 and records H2 latency metric
+        let resp1 = pool
+            .execute_request("GET", "/initial", &[], None)
+            .expect("first req");
+        assert_eq!(resp1.body, b"h2-response");
+
+        let h2_metric = pool
+            .get_alt_svc_metric(&format!("h2://127.0.0.1:{}", port))
+            .expect("h2 metric recorded");
+        assert_eq!(h2_metric.sample_count, 1);
+        assert!(h2_metric.smoothed_rtt() > Duration::ZERO);
+
+        // 2. Second request: H3 has 0 samples, so probe request goes over H3
+        let resp2 = pool
+            .execute_request("GET", "/probe-h3", &[], None)
+            .expect("second req");
+        assert_eq!(resp2.body, b"h3-response");
+        assert_eq!(h3_dispatches.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let h3_metric = pool
+            .get_alt_svc_metric("h3://127.0.0.1:50443")
+            .expect("h3 metric recorded");
+        assert_eq!(h3_metric.sample_count, 1);
+        assert!(h3_metric.smoothed_rtt() >= Duration::from_millis(1));
+
+        // 3. Now verify metrics list snapshot
+        let all_metrics = pool.all_alt_svc_metrics();
+        assert_eq!(all_metrics.len(), 2);
+
+        // If we artificially force H3 to have very high latency
+        for _ in 0..5 {
+            pool.record_alt_svc_metric("h3://127.0.0.1:50443", Duration::from_millis(500));
+        }
+        // H3 is now significantly slower than H2. Under LowestLatency, subsequent requests prefer H2!
+        let resp3 = pool
+            .execute_request("GET", "/back-to-h2", &[], None)
+            .expect("third req");
+        assert_eq!(resp3.body, b"h2-response");
+        // H3 dispatch count did NOT increase
+        assert_eq!(h3_dispatches.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        pool.shutdown();
+        let _ = handle.join();
     }
 }
