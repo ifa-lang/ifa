@@ -22909,7 +22909,7 @@ mod tls_alpn_tests {
         };
         for attempt in 0..5 {
             let delay = state.compute_next_backoff(&config_jitter).unwrap();
-            let base_cap = (200.0 * 2.0_f64.powi(attempt as i32)).min(5000.0) as u64;
+            let base_cap = (200.0 * 2.0_f64.powi(attempt)).min(5000.0) as u64;
             assert!(
                 delay.as_millis() <= (base_cap as u128) + 1,
                 "Delay {} exceeded cap {}",
@@ -22930,7 +22930,7 @@ mod tls_alpn_tests {
         };
         for attempt in 0..3 {
             let delay = state.compute_next_backoff(&config_equal).unwrap();
-            let base_cap = (400.0 * 2.0_f64.powi(attempt as i32)).min(5000.0) as u64;
+            let base_cap = (400.0 * 2.0_f64.powi(attempt)).min(5000.0) as u64;
             let half = base_cap / 2;
             assert!(
                 delay.as_millis() >= (half as u128) - 1,
