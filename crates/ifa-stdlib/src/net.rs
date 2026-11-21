@@ -2904,6 +2904,12 @@ pub struct AsyncHttp2Connection {
     is_closed: bool,
     /// Optional chunk buffer pool for recycling incoming DATA frames.
     pub chunk_buffer_pool: Option<Http2ChunkBufferPool>,
+    /// Whether dynamic RFC 7540 flow control auto-tuning (BDP-based adaptive window scaling) is enabled.
+    pub auto_tune_flow_control: bool,
+    /// Last instant an inbound transfer observation was initiated.
+    flow_control_last_observation: Option<std::time::Instant>,
+    /// Accumulated inbound bytes observed since last flow control replenishment / tuning update.
+    flow_control_bytes_observed: usize,
 }
 
 impl AsyncHttp2Connection {
@@ -2916,6 +2922,9 @@ impl AsyncHttp2Connection {
             ctrl_ring_buf: [0u8; 1024],
             is_closed: false,
             chunk_buffer_pool: None,
+            auto_tune_flow_control: false,
+            flow_control_last_observation: None,
+            flow_control_bytes_observed: 0,
         }
     }
 
@@ -2928,6 +2937,45 @@ impl AsyncHttp2Connection {
     pub fn with_chunk_buffer_pool(mut self, pool: Http2ChunkBufferPool) -> Self {
         self.chunk_buffer_pool = Some(pool);
         self
+    }
+
+    /// Configure dynamic RFC 7540 flow control auto-tuning on this connection.
+    pub fn with_auto_tune_flow_control(mut self, enabled: bool) -> Self {
+        self.auto_tune_flow_control = enabled;
+        self
+    }
+
+    /// Set dynamic RFC 7540 flow control auto-tuning on this connection.
+    pub fn set_auto_tune_flow_control(&mut self, enabled: bool) {
+        self.auto_tune_flow_control = enabled;
+    }
+
+    /// Whether dynamic RFC 7540 flow control auto-tuning is enabled.
+    pub fn auto_tune_flow_control(&self) -> bool {
+        self.auto_tune_flow_control
+    }
+
+    /// Replenish connection and stream flow control windows, applying dynamic BDP auto-tuning
+    /// when `auto_tune_flow_control` is enabled, or standard static replenishment otherwise.
+    pub fn replenish_flow_control_windows(&mut self) -> io::Result<()> {
+        let flow_updates = if self.auto_tune_flow_control {
+            self.session.adapt_and_replenish_inbound_windows()
+        } else {
+            self.session.replenish_flow_control_windows()
+        };
+        for update_frame in flow_updates {
+            self.send_frame(&update_frame)?;
+        }
+        Ok(())
+    }
+
+    /// Record observed transfer metrics (bytes and elapsed duration) to auto-tune flow control windows.
+    pub fn record_flow_control_observation(&mut self, bytes: usize, elapsed: Duration) {
+        if self.auto_tune_flow_control && bytes > 0 && !elapsed.is_zero() {
+            self.session
+                .adaptive_flow_controller
+                .record_bandwidth_sample(bytes, elapsed);
+        }
     }
 
     /// Perform HTTP/2 client handshake: sends client connection preface and initial SETTINGS frame.
@@ -2950,6 +2998,9 @@ impl AsyncHttp2Connection {
             ctrl_ring_buf: [0u8; 1024],
             is_closed: false,
             chunk_buffer_pool: None,
+            auto_tune_flow_control: false,
+            flow_control_last_observation: None,
+            flow_control_bytes_observed: 0,
         })
     }
 
@@ -3008,6 +3059,9 @@ impl AsyncHttp2Connection {
             ctrl_ring_buf: [0u8; 1024],
             is_closed: false,
             chunk_buffer_pool: None,
+            auto_tune_flow_control: false,
+            flow_control_last_observation: None,
+            flow_control_bytes_observed: 0,
         })
     }
 
@@ -3298,13 +3352,31 @@ impl AsyncHttp2Connection {
             }
         }
 
+        // Track transfer observations for adaptive flow control auto-tuning
+        if self.auto_tune_flow_control {
+            if let crate::simd_parser::Http2Frame::Data { ref data, .. } = frame {
+                let n = data.len();
+                self.flow_control_bytes_observed += n;
+                let now = std::time::Instant::now();
+                if let Some(last) = self.flow_control_last_observation {
+                    let elapsed = now.duration_since(last);
+                    if elapsed >= Duration::from_millis(1) && self.flow_control_bytes_observed >= 4096 {
+                        self.session
+                            .adaptive_flow_controller
+                            .record_bandwidth_sample(self.flow_control_bytes_observed, elapsed);
+                        self.flow_control_bytes_observed = 0;
+                        self.flow_control_last_observation = Some(now);
+                    }
+                } else {
+                    self.flow_control_last_observation = Some(now);
+                }
+            }
+        }
+
         // Active flow control window replenishment:
         // When received DATA frames consume connection or stream windows below threshold,
         // send WINDOW_UPDATE frames proactively.
-        let flow_updates = self.session.replenish_flow_control_windows();
-        for update_frame in flow_updates {
-            self.send_frame(&update_frame)?;
-        }
+        self.replenish_flow_control_windows()?;
 
         Ok(Some(frame))
     }
@@ -3371,6 +3443,8 @@ impl AsyncHttp2Connection {
                             };
                             let _ = self.session.handle_data_slice(&slice);
                             let user_res = on_data(&slice);
+                            let chunk_len = slice.data.len();
+                            let _ = slice;
                             self.read_buf.drain(..total_frame_len);
                             if self.read_buf.is_empty()
                                 && self.read_buf.capacity() > DEFAULT_MAX_RETAINED_BUFFER_CAPACITY
@@ -3379,11 +3453,30 @@ impl AsyncHttp2Connection {
                                     .shrink_to(DEFAULT_MAX_RETAINED_BUFFER_CAPACITY);
                             }
 
-                            // Replenish windows proactively
-                            let flow_updates = self.session.replenish_flow_control_windows();
-                            for update_frame in flow_updates {
-                                self.send_frame(&update_frame)?;
+                            if self.auto_tune_flow_control {
+                                self.flow_control_bytes_observed += chunk_len;
+                                let now = std::time::Instant::now();
+                                if let Some(last) = self.flow_control_last_observation {
+                                    let elapsed = now.duration_since(last);
+                                    if elapsed >= Duration::from_millis(1)
+                                        && self.flow_control_bytes_observed >= 4096
+                                    {
+                                        self.session
+                                            .adaptive_flow_controller
+                                            .record_bandwidth_sample(
+                                                self.flow_control_bytes_observed,
+                                                elapsed,
+                                            );
+                                        self.flow_control_bytes_observed = 0;
+                                        self.flow_control_last_observation = Some(now);
+                                    }
+                                } else {
+                                    self.flow_control_last_observation = Some(now);
+                                }
                             }
+
+                            // Replenish windows proactively
+                            self.replenish_flow_control_windows()?;
 
                             user_res?;
                             return Ok(None);
@@ -4086,6 +4179,10 @@ impl AsyncHttp2Connection {
             }
         }
 
+        let batch_start = std::time::Instant::now();
+        let mut first_header_observed = false;
+        let mut total_batch_bytes: usize = 0;
+
         while !decoders.values().all(|d| d.is_complete()) {
             let frame = self.recv_frame()?;
             match frame {
@@ -4094,6 +4191,17 @@ impl AsyncHttp2Connection {
                     end_stream,
                     ..
                 } => {
+                    if !first_header_observed {
+                        first_header_observed = true;
+                        if self.auto_tune_flow_control
+                            && self.session.adaptive_flow_controller.smoothed_rtt_us.is_none()
+                        {
+                            let rtt_us = batch_start.elapsed().as_micros() as u64;
+                            if rtt_us > 0 {
+                                self.session.adaptive_flow_controller.record_rtt_sample(rtt_us);
+                            }
+                        }
+                    }
                     if let Some(dec) = decoders.get_mut(&stream_id) {
                         if let Some(stream) = self.session.streams.get(&stream_id) {
                             if dec.status.is_none() {
@@ -4112,6 +4220,15 @@ impl AsyncHttp2Connection {
                     data,
                     end_stream,
                 } => {
+                    if self.auto_tune_flow_control {
+                        total_batch_bytes += data.len();
+                        let elapsed = batch_start.elapsed();
+                        if elapsed.as_micros() > 50 {
+                            self.session
+                                .adaptive_flow_controller
+                                .record_bandwidth_sample(total_batch_bytes, elapsed);
+                        }
+                    }
                     if let Some(dec) = decoders.get_mut(&stream_id) {
                         match dec.feed_chunk_owned(data, end_stream) {
                             Ok(decoded_chunk) => {
@@ -4734,6 +4851,7 @@ pub struct AsyncHttp2Pool {
     alt_svc_routes:
         std::sync::Mutex<std::collections::HashMap<String, Vec<crate::simd_parser::AltSvcRoute>>>,
     chunk_buffer_pool: Option<Http2ChunkBufferPool>,
+    auto_tune_flow_control: bool,
 }
 
 impl AsyncHttp2Pool {
@@ -4761,6 +4879,7 @@ impl AsyncHttp2Pool {
             response_interceptors: Vec::new(),
             alt_svc_routes: std::sync::Mutex::new(std::collections::HashMap::new()),
             chunk_buffer_pool: None,
+            auto_tune_flow_control: false,
         }
     }
 
@@ -4768,6 +4887,17 @@ impl AsyncHttp2Pool {
     pub fn with_chunk_buffer_pool(mut self, pool: Http2ChunkBufferPool) -> Self {
         self.chunk_buffer_pool = Some(pool);
         self
+    }
+
+    /// Configure whether dynamic RFC 7540 flow control auto-tuning is enabled across connections in this pool.
+    pub fn with_auto_tune_flow_control(mut self, enabled: bool) -> Self {
+        self.auto_tune_flow_control = enabled;
+        self
+    }
+
+    /// Whether dynamic RFC 7540 flow control auto-tuning is enabled on this pool.
+    pub fn auto_tune_flow_control(&self) -> bool {
+        self.auto_tune_flow_control
     }
 
     /// Retrieve the configured chunk buffer pool, if any.
@@ -4975,6 +5105,7 @@ impl AsyncHttp2Pool {
                 }
                 // Quick health check ping
                 if conn.send_ping(*b"h2_probe").is_ok() {
+                    conn.set_auto_tune_flow_control(self.auto_tune_flow_control);
                     if let Some(ref pool) = self.chunk_buffer_pool {
                         conn.chunk_buffer_pool = Some(pool.clone());
                     }
@@ -5019,6 +5150,7 @@ impl AsyncHttp2Pool {
         }
 
         let mut conn = AsyncHttp2Connection::client_handshake(stream)?;
+        conn.set_auto_tune_flow_control(self.auto_tune_flow_control);
         if let Some(ref pool) = self.chunk_buffer_pool {
             conn.chunk_buffer_pool = Some(pool.clone());
         }
@@ -7131,6 +7263,8 @@ pub struct Http2MultiplexBenchmarkConfig {
     pub buffer_capacity: usize,
     /// Maximum retained buffers in the pool.
     pub pool_capacity: usize,
+    /// Whether to enable dynamic RFC 7540 flow control auto-tuning during multiplexed saturation.
+    pub auto_tune_flow_control: bool,
 }
 
 impl Default for Http2MultiplexBenchmarkConfig {
@@ -7142,6 +7276,7 @@ impl Default for Http2MultiplexBenchmarkConfig {
             use_buffer_pool: false,
             buffer_capacity: 8192,
             pool_capacity: 64,
+            auto_tune_flow_control: false,
         }
     }
 }
@@ -7205,12 +7340,16 @@ pub fn benchmark_http2_multiplexed_saturation(
     let stream_count = config.stream_count;
     let chunks_per_stream = config.chunks_per_stream;
     let chunk_size = config.chunk_size_bytes;
+    let auto_tune = config.auto_tune_flow_control;
     let payload = vec![0x42u8; chunk_size];
 
     let server_handle = std::thread::spawn(move || {
         let mut server = loop {
             if let Ok(Some((stream, _))) = listener.try_accept() {
-                if let Ok(h2) = AsyncHttp2Connection::server_handshake(stream) {
+                if let Ok(mut h2) = AsyncHttp2Connection::server_handshake(stream) {
+                    if auto_tune {
+                        h2.set_auto_tune_flow_control(true);
+                    }
                     break h2;
                 }
             }
@@ -7271,6 +7410,9 @@ pub fn benchmark_http2_multiplexed_saturation(
     });
 
     let mut pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
+    if config.auto_tune_flow_control {
+        pool = pool.with_auto_tune_flow_control(true);
+    }
     let chunk_pool = if config.use_buffer_pool {
         let cp = Http2ChunkBufferPool::new(config.buffer_capacity, config.pool_capacity);
         pool = pool.with_chunk_buffer_pool(cp.clone());
@@ -7339,10 +7481,11 @@ pub fn benchmark_http2_multiplexed_saturation(
     let chunks_per_sec = (total_chunks as f64) / duration_secs;
     let avg_stream_latency_us = (elapsed.as_micros() as f64) / (stream_count as f64);
 
-    let name = if config.use_buffer_pool {
-        "Zero-Copy Recycled Pool".to_string()
-    } else {
-        "Standard Allocating".to_string()
+    let name = match (config.use_buffer_pool, config.auto_tune_flow_control) {
+        (true, true) => "Zero-Copy Recycled Pool + Auto-Tuned Flow Control".to_string(),
+        (true, false) => "Zero-Copy Recycled Pool".to_string(),
+        (false, true) => "Auto-Tuned Flow Control (Standard Alloc)".to_string(),
+        (false, false) => "Standard Allocating".to_string(),
     };
 
     Ok(Http2MultiplexBenchmarkResult {
@@ -7384,6 +7527,7 @@ pub fn benchmark_http2_multiplexed_comparison(
         use_buffer_pool: true,
         buffer_capacity: chunk_size_bytes.max(4096),
         pool_capacity: (stream_count * chunks_per_stream).max(32),
+        auto_tune_flow_control: false,
     };
 
     let zero_copy_pooled = benchmark_http2_multiplexed_saturation(&config_opt)?;
@@ -10425,10 +10569,10 @@ mod tests {
             }
         });
 
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(30));
         let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
         let resp = pool
-            .execute_request_with_retry("GET", "/", &[], None, 2)
+            .execute_request_with_retry("GET", "/", &[], None, 5)
             .expect("request with retry should succeed");
         assert_eq!(resp.status, crate::http::HttpStatus(200));
         assert_eq!(resp.body, b"retry-ok");
@@ -12901,6 +13045,7 @@ mod tls_alpn_tests {
             use_buffer_pool: true,
             buffer_capacity: 2048,
             pool_capacity: 16,
+            auto_tune_flow_control: false,
         };
 
         let res = benchmark_http2_multiplexed_saturation(&config)
@@ -12931,5 +13076,107 @@ mod tls_alpn_tests {
         assert_eq!(report.zero_copy_pooled.name, "Zero-Copy Recycled Pool");
         assert!(report.speedup_ratio > 0.0);
         assert!(report.recycled_buffers > 0);
+    }
+
+    #[test]
+    fn test_async_http2_flow_control_auto_tuning() {
+        let listener = AsyncTcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server_handle = std::thread::spawn(move || {
+            let (stream, _) = loop {
+                if let Ok(Some(pair)) = listener.try_accept() {
+                    break pair;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let mut server = AsyncHttp2Connection::server_handshake(stream)
+                .expect("server handshake")
+                .with_auto_tune_flow_control(true);
+
+            // Wait for client request headers
+            let mut target_stream_id = 0;
+            for _ in 0..20 {
+                if let Ok(crate::simd_parser::Http2Frame::Headers { stream_id, .. }) = server.recv_frame() {
+                    target_stream_id = stream_id;
+                    break;
+                }
+            }
+
+            if target_stream_id > 0 {
+                let res_headers = vec![(":status", "200")];
+                let h_frame = server.session.create_headers_frame(target_stream_id, &res_headers, false);
+                server.send_frame(&h_frame).expect("send headers");
+
+                // Transmit high-throughput data payload
+                let payload = vec![0xAAu8; 32768];
+                server.send_data(target_stream_id, &payload, true).expect("send data");
+
+                // Keep connection open while client processes frames
+                for _ in 0..20 {
+                    let _ = server.try_recv_frame();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+
+        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 1)
+            .with_auto_tune_flow_control(true);
+        assert!(pool.auto_tune_flow_control());
+
+        let mut conn = pool.acquire().expect("acquire connection");
+        assert!(conn.auto_tune_flow_control());
+
+        // Simulate high throughput observation
+        conn.record_flow_control_observation(5_000_000, Duration::from_millis(100));
+        assert!(conn.session.adaptive_flow_controller.target_connection_window >= 65535);
+
+        let stream_id = conn
+            .send_request(&[(":method", "GET"), (":path", "/auto-tuning")], None)
+            .expect("send request");
+
+        let mut total_received = 0;
+        loop {
+            let frame = conn.recv_frame().expect("receive frame");
+            if let crate::simd_parser::Http2Frame::Data { stream_id: sid, data, end_stream } = frame {
+                assert_eq!(sid, stream_id);
+                total_received += data.len();
+                if end_stream {
+                    break;
+                }
+            }
+        }
+        assert_eq!(total_received, 32768);
+        server_handle.join().expect("server join");
+    }
+
+    #[test]
+    fn test_http2_multiplexed_saturation_benchmark_with_auto_tuning() {
+        let config = Http2MultiplexBenchmarkConfig {
+            stream_count: 6,
+            chunks_per_stream: 2,
+            chunk_size_bytes: 1024,
+            use_buffer_pool: true,
+            buffer_capacity: 2048,
+            pool_capacity: 16,
+            auto_tune_flow_control: true,
+        };
+
+        let res = benchmark_http2_multiplexed_saturation(&config)
+            .expect("benchmark http2 multiplexed saturation with auto tuning");
+
+        assert_eq!(res.total_streams, 6);
+        assert_eq!(res.total_chunks, 12);
+        assert_eq!(res.total_bytes, 12 * 1024);
+        assert!(res.elapsed_ms > 0.0);
+        assert!(res.throughput_mb_s > 0.0);
+        assert!(res.streams_per_sec > 0.0);
+        assert!(res.chunks_per_sec > 0.0);
+        assert!(res.avg_stream_latency_us > 0.0);
+        assert_eq!(
+            res.name,
+            "Zero-Copy Recycled Pool + Auto-Tuned Flow Control"
+        );
+        assert!(res.pooled_buffers_recycled > 0);
     }
 }

@@ -1954,7 +1954,8 @@ impl AdaptiveFlowController {
 
     /// Recompute the optimal Bandwidth-Delay Product (BDP) window size.
     pub fn recompute_target_window(&mut self) -> i32 {
-        if let (Some(rtt_us), Some(bps)) = (self.smoothed_rtt_us, self.estimated_bandwidth_bps) {
+        let rtt_us = self.smoothed_rtt_us.unwrap_or(5_000);
+        if let Some(bps) = self.estimated_bandwidth_bps {
             let rtt_secs = rtt_us as f64 / 1_000_000.0;
             let bdp_bytes = bps as f64 * rtt_secs;
             let target_with_headroom = (bdp_bytes * self.config.bdp_headroom) as i32;
@@ -2567,10 +2568,17 @@ impl Http2Session {
             // Urgency 0-1: 4x default window (256 KB)
             // Urgency 2-3: 2x default window (128 KB)
             // Urgency 4-7: 1x default window (64 KB)
-            let adaptive_target = match stream.priority_params.urgency {
+            let base_target = match stream.priority_params.urgency {
                 0..=1 => Self::DEFAULT_INITIAL_WINDOW_SIZE * 4,
                 2..=3 => Self::DEFAULT_INITIAL_WINDOW_SIZE * 2,
                 _ => Self::DEFAULT_INITIAL_WINDOW_SIZE,
+            };
+            // Dynamically scale stream inbound window capacity with BDP if target connection window was scaled up
+            let adaptive_target = if target_conn_win > Self::DEFAULT_INITIAL_WINDOW_SIZE {
+                let stream_bdp_target = target_conn_win / 2;
+                base_target.max(stream_bdp_target)
+            } else {
+                base_target
             };
             if adaptive_target > stream.target_local_window_size {
                 stream.target_local_window_size = adaptive_target;
