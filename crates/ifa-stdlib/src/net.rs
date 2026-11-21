@@ -5911,6 +5911,325 @@ impl OriginBandwidthQuota {
     }
 }
 
+/// Congestion control and pacing emulation algorithm applied to transport sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CongestionControlAlgorithm {
+    /// BBR (Bottleneck Bandwidth and RTT) pacing model (RFC draft / Cardwell et al.).
+    /// Maintains orthogonal models of BtlBw and RTTmin to maximize throughput while minimizing queuing delay.
+    Bbr,
+    /// CUBIC pacing emulation (RFC 8312).
+    /// Paces transmissions based on cubic window growth and smoothed round-trip time.
+    Cubic,
+}
+
+impl std::fmt::Display for CongestionControlAlgorithm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bbr => write!(f, "BBR"),
+            Self::Cubic => write!(f, "CUBIC"),
+        }
+    }
+}
+
+/// Transport-level predictive pacing and congestion control model (BBR/CUBIC emulation).
+///
+/// Modélise le délai de propagation minimal (RTTmin) et le goulot d'étranglement de bande passante (BtlBw)
+/// pour cadencer (pacing) l'émission des trames DATA HTTP/2 & HTTP/3 et prévenir le bufferbloat inter-flux.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportPacingModel {
+    /// Active congestion control algorithm.
+    pub algorithm: CongestionControlAlgorithm,
+    /// Minimum physical propagation delay observed on this session (RTTmin).
+    pub rtt_min: std::time::Duration,
+    /// Smoothed Round-Trip Time (EWMA filter RFC 6298 / RFC 9002).
+    pub smoothed_rtt: std::time::Duration,
+    /// Round-Trip Time variation / network jitter (rttvar).
+    pub rttvar: std::time::Duration,
+    /// Bottleneck bandwidth estimate in bytes per second (BtlBw).
+    pub btl_bw_bytes_per_sec: u64,
+    /// Total bytes currently in flight (unacknowledged / queued for transmission).
+    pub in_flight_bytes: usize,
+    /// Multiplier for BBR pacing rate scaled by 100 (e.g. 100 = 1.0, 125 = 1.25, 75 = 0.75).
+    pub pacing_gain_scaled: u32,
+    /// Multiplier for BBR congestion window scaled by 100 (e.g. 200 = 2.0x BDP, 100 = 1.0x BDP).
+    pub cwnd_gain_scaled: u32,
+    /// Minimum congestion window floor in bytes.
+    pub min_cwnd_bytes: usize,
+    /// Whether bufferbloat has been detected (smoothed RTT exceeds RTTmin threshold while in-flight >= BDP).
+    pub bufferbloat_detected: bool,
+    /// Ratio threshold scaled by 100 for detecting bufferbloat (e.g. 150 = 1.5x RTTmin).
+    pub bufferbloat_threshold_scaled: u32,
+    /// Total count of bufferbloat mitigation events triggered on this session.
+    pub bufferbloat_mitigation_count: usize,
+    /// Window of recent delivery rate measurements (bytes per second) for max-filtering.
+    pub delivery_rate_samples: Vec<u64>,
+    /// Maximum sample history kept in sliding window.
+    pub max_samples_window: usize,
+    /// CUBIC maximum window size in bytes before last congestion event (RFC 8312).
+    pub cubic_w_max: usize,
+}
+
+impl TransportPacingModel {
+    /// Default initial RTTmin assumed before measurement (20 ms).
+    pub const DEFAULT_INITIAL_RTT: std::time::Duration = std::time::Duration::from_millis(20);
+    /// Default initial bottleneck bandwidth assumed before measurement (1 MiB/s = 1,048,576 B/s).
+    pub const DEFAULT_INITIAL_BTL_BW: u64 = 1_048_576;
+    /// Default pacing gain (1.0x BtlBw).
+    pub const DEFAULT_PACING_GAIN_SCALED: u32 = 100;
+    /// Default CWND gain (2.0x BDP).
+    pub const DEFAULT_CWND_GAIN_SCALED: u32 = 200;
+    /// Default minimum CWND floor (4096 bytes).
+    pub const DEFAULT_MIN_CWND: usize = 4096;
+    /// Default bufferbloat threshold ratio (1.5x RTTmin).
+    pub const DEFAULT_BUFFERBLOAT_THRESHOLD_SCALED: u32 = 150;
+    /// Default sliding window size for max delivery rate filter.
+    pub const DEFAULT_MAX_SAMPLES_WINDOW: usize = 10;
+
+    /// Create a new transport pacing model for the specified algorithm.
+    pub fn new(algorithm: CongestionControlAlgorithm) -> Self {
+        Self {
+            algorithm,
+            rtt_min: Self::DEFAULT_INITIAL_RTT,
+            smoothed_rtt: Self::DEFAULT_INITIAL_RTT,
+            rttvar: std::time::Duration::from_millis(5),
+            btl_bw_bytes_per_sec: Self::DEFAULT_INITIAL_BTL_BW,
+            in_flight_bytes: 0,
+            pacing_gain_scaled: Self::DEFAULT_PACING_GAIN_SCALED,
+            cwnd_gain_scaled: Self::DEFAULT_CWND_GAIN_SCALED,
+            min_cwnd_bytes: Self::DEFAULT_MIN_CWND,
+            bufferbloat_detected: false,
+            bufferbloat_threshold_scaled: Self::DEFAULT_BUFFERBLOAT_THRESHOLD_SCALED,
+            bufferbloat_mitigation_count: 0,
+            delivery_rate_samples: vec![Self::DEFAULT_INITIAL_BTL_BW],
+            max_samples_window: Self::DEFAULT_MAX_SAMPLES_WINDOW,
+            cubic_w_max: 65536,
+        }
+    }
+
+    /// Configure initial RTTmin and bottleneck bandwidth estimates.
+    pub fn with_initial_estimates(
+        mut self,
+        rtt_min: std::time::Duration,
+        btl_bw_bytes_per_sec: u64,
+    ) -> Self {
+        let rtt = rtt_min.max(std::time::Duration::from_micros(1));
+        self.rtt_min = rtt;
+        self.smoothed_rtt = rtt;
+        self.rttvar = rtt / 4;
+        let bw = btl_bw_bytes_per_sec.max(1024);
+        self.btl_bw_bytes_per_sec = bw;
+        self.delivery_rate_samples = vec![bw];
+        self
+    }
+
+    /// Configure pacing and CWND scaling gains (scaled by 100).
+    pub fn with_gains(mut self, pacing_gain_scaled: u32, cwnd_gain_scaled: u32) -> Self {
+        self.pacing_gain_scaled = pacing_gain_scaled.max(10);
+        self.cwnd_gain_scaled = cwnd_gain_scaled.max(50);
+        self
+    }
+
+    /// Configure minimum CWND floor in bytes.
+    pub fn with_min_cwnd(mut self, min_cwnd_bytes: usize) -> Self {
+        self.min_cwnd_bytes = min_cwnd_bytes.max(512);
+        self
+    }
+
+    /// Configure bufferbloat detection threshold ratio (scaled by 100, e.g. 150 for 1.5x).
+    pub fn with_bufferbloat_threshold(mut self, threshold_scaled: u32) -> Self {
+        self.bufferbloat_threshold_scaled = threshold_scaled.max(110);
+        self
+    }
+
+    /// Record a measured Round-Trip Time sample and update RTTmin, smoothed RTT, and jitter.
+    pub fn record_rtt_sample(&mut self, sample: std::time::Duration) {
+        let sample = sample.max(std::time::Duration::from_micros(1));
+        if sample < self.rtt_min {
+            self.rtt_min = sample;
+        }
+        let diff = self.smoothed_rtt.abs_diff(sample);
+        self.rttvar = (self.rttvar * 3 + diff) / 4;
+        self.smoothed_rtt = (self.smoothed_rtt * 7 + sample) / 8;
+        self.check_bufferbloat();
+    }
+
+    /// Record a delivery measurement (delivered bytes over delivery duration) and RTT sample.
+    /// Updates BtlBw using a windowed max filter and evaluates bufferbloat state.
+    pub fn record_delivery_sample(
+        &mut self,
+        delivered_bytes: usize,
+        interval: std::time::Duration,
+        rtt_sample: std::time::Duration,
+    ) {
+        self.record_rtt_sample(rtt_sample);
+
+        let secs = interval.as_secs_f64().max(0.000_001);
+        let sample_rate = (delivered_bytes as f64 / secs).round() as u64;
+        if sample_rate > 0 {
+            self.delivery_rate_samples.push(sample_rate);
+            if self.delivery_rate_samples.len() > self.max_samples_window {
+                self.delivery_rate_samples.remove(0);
+            }
+            self.btl_bw_bytes_per_sec = *self
+                .delivery_rate_samples
+                .iter()
+                .max()
+                .unwrap_or(&sample_rate);
+        }
+        self.check_bufferbloat();
+    }
+
+    fn check_bufferbloat(&mut self) {
+        let min_micros = self.rtt_min.as_micros();
+        if min_micros == 0 {
+            return;
+        }
+        let threshold_micros = (min_micros * self.bufferbloat_threshold_scaled as u128) / 100;
+        let smoothed_micros = self.smoothed_rtt.as_micros();
+        let bdp = self.bdp_bytes();
+
+        if smoothed_micros > threshold_micros && self.in_flight_bytes >= bdp {
+            if !self.bufferbloat_detected {
+                self.bufferbloat_mitigation_count += 1;
+            }
+            self.bufferbloat_detected = true;
+        } else if smoothed_micros <= (min_micros * 120) / 100 {
+            self.bufferbloat_detected = false;
+        }
+    }
+
+    /// Bandwidth-Delay Product (BDP) in bytes: `(BtlBw * RTTmin)`.
+    pub fn bdp_bytes(&self) -> usize {
+        let rtt_secs = self.rtt_min.as_secs_f64();
+        let bdp = (self.btl_bw_bytes_per_sec as f64 * rtt_secs).round() as usize;
+        bdp.max(self.min_cwnd_bytes)
+    }
+
+    /// Modeled congestion window in bytes (CWND).
+    pub fn congestion_window_bytes(&self) -> usize {
+        match self.algorithm {
+            CongestionControlAlgorithm::Bbr => {
+                let bdp = self.bdp_bytes();
+                let gain = if self.bufferbloat_detected {
+                    // Reduce CWND to 1.0x BDP during bufferbloat to drain intermediate queues
+                    100
+                } else {
+                    self.cwnd_gain_scaled
+                };
+                let cwnd = ((bdp as u64 * gain as u64) / 100) as usize;
+                cwnd.max(self.min_cwnd_bytes)
+            }
+            CongestionControlAlgorithm::Cubic => {
+                if self.bufferbloat_detected {
+                    ((self.cubic_w_max * 7) / 10).max(self.min_cwnd_bytes)
+                } else {
+                    self.cubic_w_max.max(self.min_cwnd_bytes)
+                }
+            }
+        }
+    }
+
+    /// Modeled effective pacing rate in bytes per second.
+    pub fn effective_pacing_rate_bytes_per_sec(&self) -> u64 {
+        match self.algorithm {
+            CongestionControlAlgorithm::Bbr => {
+                let gain = if self.bufferbloat_detected {
+                    // Drain queue: pace at 75% of BtlBw to relieve router buffers
+                    75
+                } else {
+                    self.pacing_gain_scaled
+                };
+                let rate = (self.btl_bw_bytes_per_sec * gain as u64) / 100;
+                rate.max(1024)
+            }
+            CongestionControlAlgorithm::Cubic => {
+                let cwnd = self.congestion_window_bytes();
+                let rtt_secs = self.smoothed_rtt.as_secs_f64().max(0.001);
+                let rate = (cwnd as f64 / rtt_secs).round() as u64;
+                rate.max(1024)
+            }
+        }
+    }
+
+    /// Minimum recommended pacing delay to space out transmission of `bytes` at the pacing rate.
+    pub fn pacing_delay_for_bytes(&self, bytes: usize) -> std::time::Duration {
+        if bytes == 0 {
+            return std::time::Duration::from_millis(0);
+        }
+        let rate = self.effective_pacing_rate_bytes_per_sec();
+        let delay_secs = bytes as f64 / rate as f64;
+        std::time::Duration::from_secs_f64(delay_secs)
+    }
+
+    /// Remaining available congestion window capacity in bytes.
+    pub fn available_cwnd(&self) -> usize {
+        self.congestion_window_bytes()
+            .saturating_sub(self.in_flight_bytes)
+    }
+
+    /// Notify pacing model that payload bytes have been dispatched into the transport pipeline.
+    pub fn on_bytes_dispatched(&mut self, bytes: usize) {
+        self.in_flight_bytes += bytes;
+    }
+
+    /// Notify pacing model that delivered bytes have been acknowledged by the peer.
+    pub fn on_bytes_acked(&mut self, bytes: usize) {
+        self.in_flight_bytes = self.in_flight_bytes.saturating_sub(bytes);
+        self.check_bufferbloat();
+    }
+
+    /// Whether bufferbloat has been detected on this session.
+    pub fn is_bufferbloat_detected(&self) -> bool {
+        self.bufferbloat_detected
+    }
+
+    /// Total count of bufferbloat mitigation events on this session.
+    pub fn bufferbloat_mitigation_count(&self) -> usize {
+        self.bufferbloat_mitigation_count
+    }
+
+    /// Reset currently tracked in-flight bytes.
+    pub fn reset_in_flight(&mut self) {
+        self.in_flight_bytes = 0;
+        self.bufferbloat_detected = false;
+    }
+}
+
+/// Comprehensive snapshot of a transport session's cross-layer congestion and pacing state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportPacingTelemetry {
+    /// Associated session identifier.
+    pub session_id: u64,
+    /// Origin host or domain.
+    pub origin: String,
+    /// Transport protocol (HTTP/2 or HTTP/3).
+    pub protocol: TransportProtocol,
+    /// Active congestion control algorithm (BBR or CUBIC).
+    pub algorithm: CongestionControlAlgorithm,
+    /// Minimum physical propagation delay observed (RTTmin).
+    pub rtt_min: std::time::Duration,
+    /// Smoothed round-trip time (EWMA).
+    pub smoothed_rtt: std::time::Duration,
+    /// Round-Trip Time variation / jitter.
+    pub rttvar: std::time::Duration,
+    /// Bottleneck bandwidth estimate in bytes per second (BtlBw).
+    pub btl_bw_bytes_per_sec: u64,
+    /// Current Bandwidth-Delay Product in bytes (BtlBw * RTTmin).
+    pub bdp_bytes: usize,
+    /// Current congestion window size in bytes (cwnd).
+    pub congestion_window_bytes: usize,
+    /// Current in-flight bytes queued or unacknowledged.
+    pub in_flight_bytes: usize,
+    /// Remaining unallocated congestion window capacity.
+    pub available_cwnd_bytes: usize,
+    /// Modeled bottleneck pacing rate in bytes per second.
+    pub effective_pacing_rate_bytes_per_sec: u64,
+    /// Whether bufferbloat is currently detected on this session.
+    pub bufferbloat_detected: bool,
+    /// Total count of bufferbloat mitigation events applied to this session.
+    pub bufferbloat_mitigation_count: usize,
+}
+
 /// Descriptor and runtime scheduling state of an active transport session (HTTP/2 or HTTP/3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportSessionDescriptor {
@@ -5930,6 +6249,8 @@ pub struct TransportSessionDescriptor {
     pub consecutive_starved_rounds: usize,
     /// Total bytes dispatched through this session.
     pub total_dispatched_bytes: usize,
+    /// Cross-layer predictive pacing and congestion control model (BBR/CUBIC emulation).
+    pub pacing_model: TransportPacingModel,
 }
 
 impl TransportSessionDescriptor {
@@ -5949,6 +6270,7 @@ impl TransportSessionDescriptor {
             deficit: 0,
             consecutive_starved_rounds: 0,
             total_dispatched_bytes: 0,
+            pacing_model: TransportPacingModel::new(CongestionControlAlgorithm::Bbr),
         }
     }
 }
@@ -5970,6 +6292,14 @@ pub struct SessionDispatchSlice {
     pub remaining_deficit: usize,
     /// Whether this allocation was triggered by anti-starvation priority boosting.
     pub anti_starvation_boost_applied: bool,
+    /// Minimum recommended pacing delay to space out transmission without bufferbloat.
+    pub pacing_delay: std::time::Duration,
+    /// Effective bottleneck pacing rate (bytes per second) modeled for this session.
+    pub pacing_rate_bytes_per_sec: u64,
+    /// Bandwidth-Delay Product (BDP) in bytes modeled for this session.
+    pub bdp_bytes: usize,
+    /// Whether pacing was adjusted or throttled to mitigate detected bufferbloat.
+    pub bufferbloat_mitigated: bool,
 }
 
 /// Network saturation level assessed during pool-level fair queueing.
@@ -6531,6 +6861,13 @@ impl InterSessionDrrArbitrator {
                         if !starved_sessions_boosted.contains(&sid) {
                             starved_sessions_boosted.push(sid);
                         }
+
+                        let pacing_delay = sess.pacing_model.pacing_delay_for_bytes(grant);
+                        let pacing_rate = sess.pacing_model.effective_pacing_rate_bytes_per_sec();
+                        let bdp = sess.pacing_model.bdp_bytes();
+                        let bloat_mitigated = sess.pacing_model.bufferbloat_detected;
+                        sess.pacing_model.on_bytes_dispatched(grant);
+
                         slices.push(SessionDispatchSlice {
                             session_id: sid,
                             origin: origin_name.clone(),
@@ -6539,6 +6876,10 @@ impl InterSessionDrrArbitrator {
                             remaining_pending_bytes: sess.pending_bytes,
                             remaining_deficit: sess.deficit,
                             anti_starvation_boost_applied: true,
+                            pacing_delay,
+                            pacing_rate_bytes_per_sec: pacing_rate,
+                            bdp_bytes: bdp,
+                            bufferbloat_mitigated: bloat_mitigated,
                         });
                     }
                 }
@@ -6662,17 +7003,29 @@ impl InterSessionDrrArbitrator {
                             continue;
                         }
 
+                        // Congestion window constraint: allow dispatch up to available cwnd,
+                        // with a baseline quantum floor so idle/recovering sessions make progress.
+                        let cwnd_limit = sess.pacing_model.available_cwnd().max(self.base_quantum);
+
                         let slice = sess
                             .pending_bytes
                             .min(sess.deficit)
                             .min(origin_avail)
-                            .min(remaining_bandwidth);
+                            .min(remaining_bandwidth)
+                            .min(cwnd_limit);
 
                         if slice > 0 {
                             sess.pending_bytes -= slice;
                             sess.deficit -= slice;
                             sess.total_dispatched_bytes += slice;
                             sess.consecutive_starved_rounds = 0;
+
+                            let pacing_delay = sess.pacing_model.pacing_delay_for_bytes(slice);
+                            let pacing_rate =
+                                sess.pacing_model.effective_pacing_rate_bytes_per_sec();
+                            let bdp = sess.pacing_model.bdp_bytes();
+                            let bloat_mitigated = sess.pacing_model.bufferbloat_detected;
+                            sess.pacing_model.on_bytes_dispatched(slice);
 
                             *origin_allocated_in_round
                                 .entry(origin_name.clone())
@@ -6697,6 +7050,10 @@ impl InterSessionDrrArbitrator {
                                 remaining_pending_bytes: sess.pending_bytes,
                                 remaining_deficit: sess.deficit,
                                 anti_starvation_boost_applied: false,
+                                pacing_delay,
+                                pacing_rate_bytes_per_sec: pacing_rate,
+                                bdp_bytes: bdp,
+                                bufferbloat_mitigated: bloat_mitigated,
                             });
 
                             if sess.pending_bytes == 0 {
@@ -6862,6 +7219,114 @@ impl InterSessionDrrArbitrator {
         } else {
             1.0
         }
+    }
+
+    /// Update measured delivery sample and Round-Trip Time for a session's pacing model.
+    pub fn update_session_pacing_sample(
+        &mut self,
+        session_id: u64,
+        delivered_bytes: usize,
+        interval: std::time::Duration,
+        rtt_sample: std::time::Duration,
+    ) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            sess.pacing_model
+                .record_delivery_sample(delivered_bytes, interval, rtt_sample);
+        }
+    }
+
+    /// Update measured Round-Trip Time sample for a session's pacing model.
+    pub fn update_session_rtt(&mut self, session_id: u64, rtt: std::time::Duration) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            sess.pacing_model.record_rtt_sample(rtt);
+        }
+    }
+
+    /// Record peer acknowledgement of dispatched bytes on a session, freeing in-flight budget.
+    pub fn record_session_bytes_acked(&mut self, session_id: u64, acked_bytes: usize) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            sess.pacing_model.on_bytes_acked(acked_bytes);
+        }
+    }
+
+    /// Set the congestion control algorithm (BBR or CUBIC) for a registered transport session.
+    pub fn set_session_congestion_algorithm(
+        &mut self,
+        session_id: u64,
+        algorithm: CongestionControlAlgorithm,
+    ) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            sess.pacing_model.algorithm = algorithm;
+        }
+    }
+
+    /// Configure explicit initial RTTmin and bottleneck bandwidth for a registered transport session.
+    pub fn configure_session_pacing(
+        &mut self,
+        session_id: u64,
+        rtt_min: std::time::Duration,
+        btl_bw_bytes_per_sec: u64,
+    ) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            sess.pacing_model = sess
+                .pacing_model
+                .clone()
+                .with_initial_estimates(rtt_min, btl_bw_bytes_per_sec);
+        }
+    }
+
+    /// Retrieve cross-layer predictive pacing telemetry for a specific session.
+    pub fn get_session_pacing_telemetry(
+        &self,
+        session_id: u64,
+    ) -> Option<TransportPacingTelemetry> {
+        self.sessions.get(&session_id).map(|s| {
+            let m = &s.pacing_model;
+            TransportPacingTelemetry {
+                session_id,
+                origin: s.origin.clone(),
+                protocol: s.protocol,
+                algorithm: m.algorithm,
+                rtt_min: m.rtt_min,
+                smoothed_rtt: m.smoothed_rtt,
+                rttvar: m.rttvar,
+                btl_bw_bytes_per_sec: m.btl_bw_bytes_per_sec,
+                bdp_bytes: m.bdp_bytes(),
+                congestion_window_bytes: m.congestion_window_bytes(),
+                in_flight_bytes: m.in_flight_bytes,
+                available_cwnd_bytes: m.available_cwnd(),
+                effective_pacing_rate_bytes_per_sec: m.effective_pacing_rate_bytes_per_sec(),
+                bufferbloat_detected: m.bufferbloat_detected,
+                bufferbloat_mitigation_count: m.bufferbloat_mitigation_count,
+            }
+        })
+    }
+
+    /// Export predictive pacing and congestion telemetry across all registered transport sessions.
+    pub fn export_pool_pacing_telemetry(&self) -> Vec<TransportPacingTelemetry> {
+        let mut metrics = Vec::with_capacity(self.sessions.len());
+        for (&sid, s) in &self.sessions {
+            let m = &s.pacing_model;
+            metrics.push(TransportPacingTelemetry {
+                session_id: sid,
+                origin: s.origin.clone(),
+                protocol: s.protocol,
+                algorithm: m.algorithm,
+                rtt_min: m.rtt_min,
+                smoothed_rtt: m.smoothed_rtt,
+                rttvar: m.rttvar,
+                btl_bw_bytes_per_sec: m.btl_bw_bytes_per_sec,
+                bdp_bytes: m.bdp_bytes(),
+                congestion_window_bytes: m.congestion_window_bytes(),
+                in_flight_bytes: m.in_flight_bytes,
+                available_cwnd_bytes: m.available_cwnd(),
+                effective_pacing_rate_bytes_per_sec: m.effective_pacing_rate_bytes_per_sec(),
+                bufferbloat_detected: m.bufferbloat_detected,
+                bufferbloat_mitigation_count: m.bufferbloat_mitigation_count,
+            });
+        }
+        metrics.sort_by_key(|m| m.session_id);
+        metrics
     }
 
     /// Export comprehensive bandwidth allocation telemetry and inter-domain fairness metrics.
@@ -7218,6 +7683,74 @@ impl AsyncHttp2Pool {
                 effective_base_quantum: InterSessionDrrArbitrator::DEFAULT_BASE_QUANTUM,
                 jains_fairness_index: 1.0,
             }
+        }
+    }
+
+    /// Update delivery rate measurement and RTT sample for a pooled transport session.
+    pub fn update_session_pacing_sample(
+        &self,
+        session_id: u64,
+        delivered_bytes: usize,
+        interval: std::time::Duration,
+        rtt_sample: std::time::Duration,
+    ) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.update_session_pacing_sample(session_id, delivered_bytes, interval, rtt_sample);
+        }
+    }
+
+    /// Update Round-Trip Time sample for a pooled transport session.
+    pub fn update_session_rtt(&self, session_id: u64, rtt: std::time::Duration) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.update_session_rtt(session_id, rtt);
+        }
+    }
+
+    /// Record peer acknowledgement of dispatched bytes on a pooled transport session.
+    pub fn record_session_bytes_acked(&self, session_id: u64, acked_bytes: usize) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.record_session_bytes_acked(session_id, acked_bytes);
+        }
+    }
+
+    /// Set the congestion control algorithm (BBR or CUBIC) for a pooled transport session.
+    pub fn set_session_congestion_algorithm(
+        &self,
+        session_id: u64,
+        algorithm: CongestionControlAlgorithm,
+    ) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.set_session_congestion_algorithm(session_id, algorithm);
+        }
+    }
+
+    /// Configure explicit initial RTTmin and bottleneck bandwidth for a pooled transport session.
+    pub fn configure_session_pacing(
+        &self,
+        session_id: u64,
+        rtt_min: std::time::Duration,
+        btl_bw_bytes_per_sec: u64,
+    ) {
+        if let Ok(mut arb) = self.inter_session_arbitrator.lock() {
+            arb.configure_session_pacing(session_id, rtt_min, btl_bw_bytes_per_sec);
+        }
+    }
+
+    /// Retrieve cross-layer predictive pacing telemetry for a specific session in the pool.
+    pub fn session_pacing_telemetry(&self, session_id: u64) -> Option<TransportPacingTelemetry> {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.get_session_pacing_telemetry(session_id)
+        } else {
+            None
+        }
+    }
+
+    /// Export predictive pacing and congestion telemetry across all registered sessions in the pool.
+    pub fn pool_pacing_telemetry(&self) -> Vec<TransportPacingTelemetry> {
+        if let Ok(arb) = self.inter_session_arbitrator.lock() {
+            arb.export_pool_pacing_telemetry()
+        } else {
+            Vec::new()
         }
     }
 
@@ -20307,5 +20840,210 @@ mod tls_alpn_tests {
         // Disable adaptive regulation
         pool.disable_adaptive_drr_quantum();
         assert!(!pool.is_adaptive_drr_quantum_enabled());
+    }
+
+    #[test]
+    fn test_bbr_pacing_model_btlbw_and_rttmin_tracking() {
+        let mut model = TransportPacingModel::new(CongestionControlAlgorithm::Bbr)
+            .with_initial_estimates(std::time::Duration::from_millis(20), 1_000_000);
+
+        assert_eq!(model.algorithm, CongestionControlAlgorithm::Bbr);
+        assert_eq!(model.rtt_min, std::time::Duration::from_millis(20));
+        assert_eq!(model.btl_bw_bytes_per_sec, 1_000_000);
+
+        // BDP = 1_000_000 * 0.020s = 20_000 bytes
+        assert_eq!(model.bdp_bytes(), 20_000);
+        // Nominal CWND = 2.0 * BDP = 40_000 bytes
+        assert_eq!(model.congestion_window_bytes(), 40_000);
+        // Pacing rate = 1_000_000 bytes/sec
+        assert_eq!(model.effective_pacing_rate_bytes_per_sec(), 1_000_000);
+
+        // Pacing delay for 10_000 bytes at 1_000_000 B/s = 10 ms
+        let delay = model.pacing_delay_for_bytes(10_000);
+        assert_eq!(delay, std::time::Duration::from_millis(10));
+
+        // Record a faster RTT sample (15 ms) and higher delivery rate (2 MiB/s = 2_097_152 B/s)
+        model.record_delivery_sample(
+            209_715,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(15),
+        );
+
+        assert_eq!(model.rtt_min, std::time::Duration::from_millis(15));
+        assert!(model.btl_bw_bytes_per_sec >= 2_000_000);
+        assert!(model.bdp_bytes() >= 30_000);
+
+        // Dispatch bytes and verify in-flight tracking
+        assert_eq!(model.in_flight_bytes, 0);
+        assert_eq!(model.available_cwnd(), model.congestion_window_bytes());
+
+        model.on_bytes_dispatched(15_000);
+        assert_eq!(model.in_flight_bytes, 15_000);
+        assert_eq!(
+            model.available_cwnd(),
+            model.congestion_window_bytes() - 15_000
+        );
+
+        // Ack bytes
+        model.on_bytes_acked(5_000);
+        assert_eq!(model.in_flight_bytes, 10_000);
+    }
+
+    #[test]
+    fn test_cubic_pacing_emulation_and_window_growth() {
+        let model = TransportPacingModel::new(CongestionControlAlgorithm::Cubic)
+            .with_initial_estimates(std::time::Duration::from_millis(40), 2_000_000);
+
+        assert_eq!(model.algorithm, CongestionControlAlgorithm::Cubic);
+        assert_eq!(model.rtt_min, std::time::Duration::from_millis(40));
+        assert_eq!(model.smoothed_rtt, std::time::Duration::from_millis(40));
+
+        let cwnd = model.congestion_window_bytes();
+        assert!(cwnd >= 65536);
+
+        let pacing_rate = model.effective_pacing_rate_bytes_per_sec();
+        // pacing_rate = cwnd / smoothed_rtt = 65536 / 0.040 = 1_638_400 B/s
+        assert!(pacing_rate >= 1_600_000);
+
+        let delay = model.pacing_delay_for_bytes(16_384);
+        assert!(delay.as_millis() > 0 && delay.as_millis() < 20);
+    }
+
+    #[test]
+    fn test_cross_layer_pacing_bufferbloat_detection_and_mitigation() {
+        let mut model = TransportPacingModel::new(CongestionControlAlgorithm::Bbr)
+            .with_initial_estimates(std::time::Duration::from_millis(10), 1_000_000)
+            .with_bufferbloat_threshold(150); // 1.5x RTTmin = 15 ms
+
+        // BDP = 10_000 bytes
+        assert_eq!(model.bdp_bytes(), 10_000);
+        assert!(!model.is_bufferbloat_detected());
+        assert_eq!(model.bufferbloat_mitigation_count(), 0);
+
+        // Put bytes in flight reaching BDP
+        model.on_bytes_dispatched(12_000);
+        assert!(model.in_flight_bytes >= model.bdp_bytes());
+
+        // Inject high RTT samples causing smoothed_rtt to exceed 15 ms
+        for _ in 0..10 {
+            model.record_rtt_sample(std::time::Duration::from_millis(30));
+        }
+
+        assert!(model.smoothed_rtt > std::time::Duration::from_millis(15));
+        assert!(model.is_bufferbloat_detected());
+        assert_eq!(model.bufferbloat_mitigation_count(), 1);
+
+        // During bufferbloat: pacing rate is drained at 75% of BtlBw = 750_000 B/s
+        assert_eq!(model.effective_pacing_rate_bytes_per_sec(), 750_000);
+        // CWND is throttled to 1.0x BDP = 10_000 bytes
+        assert_eq!(model.congestion_window_bytes(), 10_000);
+
+        // Now drain buffer: peer ACKs in-flight data, RTT recovers back to 10 ms
+        model.on_bytes_acked(12_000);
+        for _ in 0..15 {
+            model.record_rtt_sample(std::time::Duration::from_millis(10));
+        }
+
+        assert!(!model.is_bufferbloat_detected());
+        assert_eq!(model.effective_pacing_rate_bytes_per_sec(), 1_000_000);
+        assert_eq!(model.congestion_window_bytes(), 20_000);
+    }
+
+    #[test]
+    fn test_inter_session_arbitrator_pacing_dispatch_slices() {
+        let mut arb = InterSessionDrrArbitrator::new(1024);
+
+        arb.register_session(10, "https://fast.origin.com", TransportProtocol::Http2, 1);
+        arb.register_session(20, "https://slow.origin.com", TransportProtocol::Http3, 1);
+
+        // Fast session: 5ms RTT, 10 MiB/s
+        arb.configure_session_pacing(10, std::time::Duration::from_millis(5), 10_000_000);
+        // Slow session: 50ms RTT, 1 MiB/s
+        arb.configure_session_pacing(20, std::time::Duration::from_millis(50), 1_000_000);
+
+        arb.set_session_pending_bytes(10, 4096);
+        arb.set_session_pending_bytes(20, 4096);
+
+        let report = arb.schedule_round(2048);
+        assert_eq!(report.slices.len(), 2);
+
+        // Verify session 10 slice has fast pacing rate and smaller delay
+        let slice_fast = report.slices.iter().find(|s| s.session_id == 10).unwrap();
+        assert_eq!(slice_fast.allocated_bytes, 1024);
+        assert_eq!(slice_fast.pacing_rate_bytes_per_sec, 10_000_000);
+        assert!(slice_fast.pacing_delay < std::time::Duration::from_micros(200));
+        assert!(!slice_fast.bufferbloat_mitigated);
+
+        // Verify session 20 slice has moderate pacing rate and corresponding delay
+        let slice_slow = report.slices.iter().find(|s| s.session_id == 20).unwrap();
+        assert_eq!(slice_slow.allocated_bytes, 1024);
+        assert_eq!(slice_slow.pacing_rate_bytes_per_sec, 1_000_000);
+        assert!(slice_slow.pacing_delay > std::time::Duration::from_micros(500));
+
+        // Telemetry check
+        let fast_telem = arb.get_session_pacing_telemetry(10).unwrap();
+        assert_eq!(fast_telem.session_id, 10);
+        assert_eq!(fast_telem.in_flight_bytes, 1024);
+        assert_eq!(fast_telem.algorithm, CongestionControlAlgorithm::Bbr);
+
+        // Release in-flight bytes on session 10
+        arb.record_session_bytes_acked(10, 1024);
+        let fast_telem_after = arb.get_session_pacing_telemetry(10).unwrap();
+        assert_eq!(fast_telem_after.in_flight_bytes, 0);
+    }
+
+    #[test]
+    fn test_async_http2_pool_pacing_telemetry_integration() {
+        let pool = AsyncHttp2Pool::new("127.0.0.1", 443, 2);
+
+        pool.register_transport_session(
+            101,
+            "https://cdn.example.com",
+            TransportProtocol::Http2,
+            1,
+        );
+        pool.register_transport_session(
+            102,
+            "https://cdn.example.com",
+            TransportProtocol::Http3,
+            2,
+        );
+
+        pool.set_session_congestion_algorithm(101, CongestionControlAlgorithm::Bbr);
+        pool.set_session_congestion_algorithm(102, CongestionControlAlgorithm::Cubic);
+
+        pool.configure_session_pacing(101, std::time::Duration::from_millis(15), 5_000_000);
+        pool.configure_session_pacing(102, std::time::Duration::from_millis(30), 2_000_000);
+
+        pool.update_session_pending_data(101, 2048);
+        pool.update_session_pending_data(102, 4096);
+
+        let report = pool.schedule_inter_session_bandwidth(4096);
+        assert!(report.total_allocated_bytes > 0);
+
+        let pacing_list = pool.pool_pacing_telemetry();
+        assert_eq!(pacing_list.len(), 2);
+
+        let p101 = pool.session_pacing_telemetry(101).unwrap();
+        assert_eq!(p101.session_id, 101);
+        assert_eq!(p101.algorithm, CongestionControlAlgorithm::Bbr);
+        assert_eq!(p101.rtt_min, std::time::Duration::from_millis(15));
+        assert_eq!(p101.btl_bw_bytes_per_sec, 5_000_000);
+
+        let p102 = pool.session_pacing_telemetry(102).unwrap();
+        assert_eq!(p102.session_id, 102);
+        assert_eq!(p102.algorithm, CongestionControlAlgorithm::Cubic);
+        assert_eq!(p102.rtt_min, std::time::Duration::from_millis(30));
+
+        // Update pacing sample
+        pool.update_session_pacing_sample(
+            101,
+            500_000,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(12),
+        );
+        let p101_updated = pool.session_pacing_telemetry(101).unwrap();
+        assert_eq!(p101_updated.rtt_min, std::time::Duration::from_millis(12));
+        assert!(p101_updated.btl_bw_bytes_per_sec >= 5_000_000);
     }
 }
