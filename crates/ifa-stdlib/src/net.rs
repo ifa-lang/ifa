@@ -13207,7 +13207,8 @@ mod tests {
         });
 
         std::thread::sleep(Duration::from_millis(60));
-        let pool = AsyncHttp2Pool::new("127.0.0.1", port, 2);
+        let pool =
+            AsyncHttp2Pool::new("127.0.0.1", port, 2).with_retry_backoff(Duration::from_millis(50));
         let resp = pool
             .execute_request_with_retry("GET", "/", &[], None, 5)
             .expect("request with retry should succeed");
